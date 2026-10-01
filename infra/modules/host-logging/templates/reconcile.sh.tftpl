@@ -184,6 +184,7 @@ try:
     os.stat(root)
 except FileNotFoundError:
     if allow_missing_first_install:
+        print(kind, 0, 0)
         raise SystemExit(0)
     raise SystemExit(2)
 except OSError:

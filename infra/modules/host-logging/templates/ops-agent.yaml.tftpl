@@ -35,40 +35,27 @@ logging:
       include_paths:
         - /var/log/google-cloud-ops-agent/subagents/logging-module.log
   processors:
-    # This is a provenance filter, not an application-data filter. Capture the
-    # journal-managed fields into resource labels before parsing. Resource
-    # labels are outside the application JSON merge, so spoofed labels and
-    # _SYSTEMD_UNIT values cannot change source attribution.
+    # This is a provenance filter, not an application-data filter. The
+    # receiver-provided _SYSTEMD_UNIT and _TRANSPORT fields are journal-managed
+    # and are evaluated before parsing application JSON.
     exclude_non_platform_sources:
       type: exclude_logs
       match_any:
-        - 'NOT (resource.labels._superserve_journal_unit =~ "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-osconfig-agent|google-guest-agent|google-cloud-ops-agent(-[^.]*)?|superserve-otel-collector|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\.service$" OR resource.labels._superserve_journal_transport = "kernel")'
+        - 'NOT (jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-osconfig-agent|google-guest-agent|google-cloud-ops-agent(-[^.]*)?|superserve-otel-collector|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\.service$" OR jsonPayload._TRANSPORT = "kernel")'
     capture_journal_provenance:
       type: modify_fields
       fields:
-        resource.labels._superserve_journal_unit:
+        labels.journal_unit:
           copy_from: jsonPayload._SYSTEMD_UNIT
-        resource.labels._superserve_journal_transport:
+        labels.journal_transport:
           copy_from: jsonPayload._TRANSPORT
     parse_application_json:
       type: parse_json
-      # The selected release supports an explicit journald MESSAGE source;
-      # keeping this explicit makes the parser outcome observable in the
-      # generated Fluent Bit configuration. The application timestamp uses
-      # strptime syntax rather than a language-specific timestamp name.
-      field: MESSAGE
+      # parse_json consumes the receiver's MESSAGE field; field is not a
+      # supported parse_json option. The application timestamp uses strptime
+      # syntax rather than a language-specific timestamp name.
       time_key: timestamp
       time_format: "%Y-%m-%dT%H:%M:%S.%L%Z"
-      # Ops Agent 2.71 exposes the parser outcome as a field that can be
-      # copied by a following modify_fields processor.  The marker is kept in
-      # trusted resource labels and is never read from application JSON.
-      parse_failure_field: resource.labels._superserve_parse_failure
-    mark_parse_failure:
-      type: modify_fields
-      fields:
-        labels.parse_failure:
-          copy_from: resource.labels._superserve_parse_failure
-          omit_if: 'NOT resource.labels._superserve_parse_failure:*'
     map_application_severity:
       type: modify_fields
       fields:
@@ -84,13 +71,12 @@ logging:
           # configuration validator.
           omit_if: 'NOT jsonPayload.severity:* OR severity:*'
     reset_promoted_special_fields:
-      # parse_json can promote labels/httpRequest and other Cloud Logging
-      # special fields. Remove the complete application-controlled set before
-      # rebuilding the positive allowlist and trusted platform labels.
+      # parse_json may promote Cloud Logging LogEntry fields from application
+      # JSON. Remove those application-controlled values before restoring the
+      # trusted platform labels below; no application field may replace
+      # provenance or manufacture an httpRequest/trace record.
       type: modify_fields
       fields:
-        labels:
-          omit_if: 'labels:*'
         httpRequest:
           omit_if: 'httpRequest:*'
         operation:
@@ -105,6 +91,15 @@ logging:
           omit_if: 'traceSampled:*'
         insertId:
           omit_if: 'insertId:*'
+    mark_parse_failure:
+      # The selected agent has no parse_failure_field option. A malformed
+      # MESSAGE remains present after parse_json; mark that condition using a
+      # trusted static label before the application payload is dropped.
+      type: modify_fields
+      fields:
+        labels.parse_failure:
+          static_value: "true"
+          omit_if: 'NOT jsonPayload.MESSAGE:*'
     add_platform_context:
       type: modify_fields
       fields:
@@ -123,11 +118,7 @@ logging:
         labels.instance_id:
           copy_from: resource.labels.instance_id
         labels.unit:
-          copy_from: resource.labels._superserve_journal_unit
-        labels.journal_unit:
-          copy_from: resource.labels._superserve_journal_unit
-        labels.journal_transport:
-          copy_from: resource.labels._superserve_journal_transport
+          copy_from: labels.journal_unit
     redact_sensitive_fields:
       type: modify_fields
       fields:
@@ -193,7 +184,7 @@ logging:
           # Parsing failures must not retain a raw application MESSAGE; it can
           # contain request, response, file, or command content. The positive
           # payload allowlist below also removes MESSAGE for host units.
-          omit_if: 'jsonPayload.MESSAGE:* AND resource.labels._superserve_journal_unit =~ "^(superserve-vmd|proxy(-[^.]*)?)\.service$"'
+          omit_if: 'jsonPayload.MESSAGE:* AND jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?)\.service$"'
     allowlisted_application_fields:
       # Parsed application JSON is not an export contract by itself: unknown
       # keys can contain credentials, request/file contents, or commands. Copy
@@ -229,13 +220,13 @@ logging:
       type: modify_fields
       fields:
         jsonPayload:
-          omit_if: 'jsonPayload:* AND resource.labels._superserve_journal_unit =~ "^(superserve-vmd|proxy(-[^.]*)?|(superserve-)?secretsproxy(-[^.]*)?)\.service$"'
+          omit_if: 'jsonPayload:* AND jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?|(superserve-)?secretsproxy(-[^.]*)?)\.service$"'
     allowlisted_heartbeat:
       type: modify_fields
       fields:
         labels.host_logging_heartbeat:
-          copy_from: jsonPayload.host_logging_heartbeat
-          omit_if: 'NOT resource.labels._superserve_journal_unit = "superserve-host-logging-heartbeat.service"'
+          static_value: "true"
+          omit_if: 'NOT jsonPayload._SYSTEMD_UNIT = "superserve-host-logging-heartbeat.service"'
     exclude_debug_after_parse:
       type: exclude_logs
       match_any:
@@ -251,13 +242,8 @@ logging:
         receivers:
           - vmd_proxy_journald
         processors:
-          # Capture receiver-provided journal provenance before evaluating the
-          # source filter. Incoming records do not yet contain the custom
-          # labels written by capture_journal_provenance.
-          - capture_journal_provenance
-          # Reject unrelated journal traffic only after trusted provenance is
-          # present. Severity filtering still happens after JSON parsing.
           - exclude_non_platform_sources
+          - capture_journal_provenance
           - parse_application_json
           - map_application_severity
           - map_legacy_application_severity

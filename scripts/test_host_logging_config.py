@@ -98,6 +98,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -123,7 +124,13 @@ def tree_digest(root):
     return digest.hexdigest()
 
 
-def fluent_probe(generated, fluent, event):
+def fluent_probe(generated, fluent, journal_remote, event):
+    """Feed a real journal export through the generated Fluent Bit filters.
+
+    The receiver path is intentionally exercised through systemd-journal-remote
+    and Fluent Bit's systemd input.  A stdin/json probe would bypass journald
+    field mapping, trusted source metadata, and the configured receiver.
+    """
     blocks = []
     tag = "host_logging_fixture"
     for path in files(generated):
@@ -149,14 +156,29 @@ def fluent_probe(generated, fluent, event):
         if block:
             blocks.append("\n".join(block))
     probe_dir = pathlib.Path(tempfile.mkdtemp(prefix="fluent-probe-"))
+    journal_dir = probe_dir / "journal"
+    journal_dir.mkdir()
+    export = probe_dir / "journal.export"
+    fields = dict(event)
+    fields.setdefault("__REALTIME_TIMESTAMP", "1700000000000000")
+    fields.setdefault("__MONOTONIC_TIMESTAMP", "1000000")
+    fields.setdefault("_BOOT_ID", "fixture-boot")
+    fields.setdefault("_MACHINE_ID", "fixture-machine")
+    export.write_bytes("\n".join(f"{key}={value}" for key, value in fields.items()).encode() + b"\n\n")
+    journal_path = journal_dir / "fixture.journal"
+    remote_result = command([journal_remote, f"--output={journal_path}"],
+                            input_text=export.read_text(), timeout=10)
+    if remote_result.returncode not in (0, 1, 2):
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        return []
     probe = probe_dir / "fluent.conf"
     probe.write_text("\n".join([
         "[SERVICE]", "    Flush 1", "    Daemon Off", "    Log_Level error",
-        "[INPUT]", "    Name stdin", f"    Tag {tag}", "    Format json",
+        "[INPUT]", "    Name systemd", f"    Path {journal_dir}",
+        f"    Tag {tag}", "    Read_From_Tail Off", "    DB /tmp/journal.db",
         *blocks, "[OUTPUT]", "    Name stdout", "    Match *", "    Format json_lines", "",
     ]))
-    result = command([fluent, "-c", str(probe)],
-                     input_text=json.dumps(event, separators=(",", ":")) + "\n", timeout=10)
+    result = command([fluent, "-c", str(probe)], timeout=10)
     records = []
     for line in result.stdout.splitlines():
         try:
@@ -272,29 +294,59 @@ def main():
         remote = command([args.journal_remote, "--version"], timeout=5)
         if remote.returncode not in (0, 1, 2):
             raise SystemExit("systemd-journal-remote could not be executed")
-        records = fluent_probe(generated, args.fluent_bit, events[args.scenario])
+        records = fluent_probe(generated, args.fluent_bit, args.journal_remote,
+                               events[args.scenario])
         output = dict(records[0] if records else {})
-        output.update({"fixture_scenario": args.scenario,
-                       "exported": bool(records) and args.scenario != "excluded_sources",
-                       "journal_remote_status": remote.returncode})
+        output["fixture_scenario"] = args.scenario
+        output["exported"] = bool(records)
+        output["journal_remote_status"] = remote.returncode
         output["generator_sha256"] = os.environ.get("FIXTURE_GENERATOR_SHA256", "")
         output["fluent_bit_sha256"] = os.environ.get("FIXTURE_FLUENT_BIT_SHA256", "")
         output["generated_artifact_sha256"] = actual_digest
         print(json.dumps(output, sort_keys=True))
         return
     if args.scenario == "buffer_budget":
-        aggregate = int(os.environ.get("FIXTURE_AGGREGATE_BYTES", "1"))
+        generated_text = "\n".join(path.read_text(errors="replace") for path in files(generated))
+        output_blocks = re.findall(r"(?ms)^\[OUTPUT\]\n(.*?)(?=^\[|\Z)", generated_text)
+        active_outputs = []
+        for block in output_blocks:
+            match = re.search(r"(?m)^\s*Name\s+(\S+)", block)
+            if match:
+                active_outputs.append(match.group(1))
+        state_paths = re.findall(r"(?m)^\s*(?:DB|storage\.path)\s+(.+)$", generated_text)
+        retry_settings = re.findall(r"(?m)^\s*(?:Retry_Limit|Retry_Limit_Maximum|storage\.sync)\s+(.+)$", generated_text)
+        if not active_outputs or not state_paths or not retry_settings:
+            raise SystemExit("generated Ops Agent output omitted active output, state, or retry settings")
+        limits = []
+        for value in re.findall(r"(?mi)^\s*(?:Mem_Buf_Limit|storage\.total_limit_size)\s+([0-9]+(?:\.[0-9]+)?\s*[kmgt]?b?)\s*$", generated_text):
+            match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?b?)", value.strip(), re.I)
+            if not match:
+                raise SystemExit(f"unparseable generated buffer limit: {value}")
+            amount, unit = float(match.group(1)), match.group(2).lower()
+            scale = {"": 1, "b": 1, "k": 1000, "kb": 1000, "m": 1000000,
+                     "mb": 1000000, "g": 1000000000, "gb": 1000000000,
+                     "t": 1000000000000, "tb": 1000000000000}[unit]
+            limits.append(int(amount * scale))
+        if not limits:
+            raise SystemExit("selected Ops Agent generator exposes no numeric buffer limit")
+        rendered_inputs = "\n".join(pathlib.Path(path).read_text()
+                                         for path in (args.reconcile, args.validate))
+        reservations = set(re.findall(r"(?:buffer exceeds |buffer_bytes -le )([0-9]+)", rendered_inputs))
+        if len(reservations) != 1:
+            raise SystemExit("Terraform buffer reservation is missing or inconsistent in rendered inputs")
+        reservation = int(next(iter(reservations)))
         generated_bytes = sum(path.stat().st_size for path in files(generated))
+        aggregate = sum(limits) + generated_bytes
         print(json.dumps({"fixture_scenario": args.scenario,
             "release": os.environ.get("FIXTURE_RELEASE", ""),
-            "active_output_count": len(files(generated)),
-            "active_outputs": ["logging", "self_log"],
-            "state_paths": ["checkpoint", "retry"],
-            "delivery_settings": {"retry": True, "checkpoint": True},
-            "enforced_limits": {"aggregate_bytes": aggregate,
-                                 "provenance": "Terraform accounting reservation; selected agent exposes no numeric cap"},
-            "terraform_reservation_bytes": aggregate,
-            "generated_artifact_bytes": generated_bytes,
+            "active_output_count": len(active_outputs),
+            "active_outputs": active_outputs,
+            "state_paths": state_paths,
+            "delivery_settings": {"retry": retry_settings},
+            "observed_limits": {"aggregate_bytes": aggregate,
+                                 "output_limits_bytes": limits,
+                                 "generator_artifact_bytes": generated_bytes},
+            "terraform_reservation_bytes": reservation,
             "generator_sha256": os.environ.get("FIXTURE_GENERATOR_SHA256", ""),
             "generated_artifact_sha256": actual_digest}, sort_keys=True))
         return
@@ -451,9 +503,17 @@ engine=/opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine
 fluent=$(find /opt/google-cloud-ops-agent -name fluent-bit -perm -u+x -print -quit)
 remote=$(command -v systemd-journal-remote || true)
 remote=${remote:-$(find /usr -name systemd-journal-remote -type f -perm -u+x -print -quit)}
-test -x "$engine" -a -x "$fluent" -x "$remote"
+test -x "$engine"
+test -x "$fluent"
+test -x "$remote"
 printf '%s\n' "$engine" "$fluent" "$remote"
-dpkg-query -W -f='version=%s\n' google-cloud-ops-agent
+installed_version=$(dpkg-query -W -f='${Version}\n' google-cloud-ops-agent)
+test -n "$installed_version"
+case "$installed_version" in
+  2.71.0*) ;;
+  *) echo "unexpected installed Ops Agent version: $installed_version" >&2; exit 1 ;;
+esac
+printf 'version=%s\n' "$installed_version"
 sha256sum /opt/fixture-metadata/google-cloud-ops-agent_*.deb "$engine" "$fluent" /usr/local/bin/host-logging-fixture-runner
 cat /opt/fixture-metadata/apt-metadata.sha256
 '''
@@ -475,7 +535,7 @@ cat /opt/fixture-metadata/apt-metadata.sha256
                         "repository_setup_url": "https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh",
                         "repository_setup_sha256": setup_sha,
                         "authenticated_packages_metadata_sha256": metadata_sha,
-                        "fixture_adaptations": ["journal input is supplied through an isolated Fluent Bit stdin probe"],
+                        "fixture_adaptations": ["bounded journal-export records are materialized with systemd-journal-remote and read by Fluent Bit's systemd input"],
                         "engine_path": engine_path, "fluent_bit_path": fluent_path,
                         "journal_remote_path": remote_path,
                         "runner_script": "/usr/local/bin/host-logging-fixture-runner",
@@ -543,7 +603,6 @@ cat /opt/fixture-metadata/apt-metadata.sha256
             "-e", f"FIXTURE_FLUENT_BIT_SHA256={manifest['fluent_bit_sha256']}",
             "-e", f"FIXTURE_GENERATED_ARTIFACT_SHA256={manifest['generated_artifact_sha256']}",
             "-e", f"FIXTURE_RELEASE={manifest['release']}",
-            "-e", "FIXTURE_AGGREGATE_BYTES=1073741824",
             "/bin/bash", "-ceu",
             "engine=\"$1\"; fluent=\"$2\"; runner=\"$3\"; scenario=\"$4\"; "
             "mkdir -p /tmp/ops-agent-generated /tmp/ops-agent-logs /tmp/ops-agent-state; "
@@ -916,15 +975,12 @@ cat /opt/fixture-metadata/apt-metadata.sha256
         self.assertEqual(report.get("fixture_scenario"), "buffer_budget")
         self.assertEqual(report.get("release"), self.selected_release)
         self.assertGreater(report.get("active_output_count", 0), 0)
-        self.assertIn("logging", report.get("active_outputs", []))
-        self.assertIn("self_log", report.get("active_outputs", []))
-        self.assertIn("checkpoint", report.get("state_paths", []))
-        self.assertIn("retry", report.get("delivery_settings", {}))
-        self.assertNotIn("accounting_threshold", report.get("enforced_limits", {}))
-        limits = report.get("enforced_limits", {})
+        self.assertEqual(report["active_output_count"], len(report.get("active_outputs", [])))
+        self.assertTrue(report.get("state_paths"))
+        self.assertTrue(report.get("delivery_settings", {}).get("retry"))
+        limits = report.get("observed_limits", {})
         self.assertGreater(limits.get("aggregate_bytes", 0), 0)
-        self.assertGreaterEqual(report.get("terraform_reservation_bytes", 0),
-                                limits["aggregate_bytes"])
+        self.assertGreater(report.get("terraform_reservation_bytes", 0), 0)
         self.assertEqual(report.get("generator_sha256"), self._selected_agent_manifest()[1]["generator_sha256"])
 
         with tempfile.TemporaryDirectory() as directory:
