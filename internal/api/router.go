@@ -128,6 +128,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	promotionAccount.POST("/bind", h.BindPromotionSignupAccount)
 	promotionAccount.POST("/evidence", h.GetPromotionSignupAccountEvidence)
 	promotionAccount.POST("/register", h.RegisterPromotionSignupDevice)
+	promotionAccount.POST("/register-signup", h.RegisterPromotionSignupAccount)
 	promotionAccount.POST("/signup-eligibility", h.EvaluateSignupPromotion)
 	promotionAccount.POST("/create-team", h.CreateTeamWithPromotionAttempt)
 	promotionAccount.POST("/prepare-team", h.PrepareTeamPromotionCreation)
