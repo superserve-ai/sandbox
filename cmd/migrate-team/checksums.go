@@ -30,6 +30,8 @@ var checksumExclusions = map[string]map[string]bool{
 	// holds is not part of what the copy promises to preserve.
 	"team":                      {"active_sandbox_count": true},
 	"retained_storage_interval": {"id": true},
+	"sandbox_storage_baseline":  {"id": true},
+	"retained_storage_measurement_obligation": {"id": true},
 }
 
 // rowChecksums returns hash → occurrence count for the team's rows of one
