@@ -61,7 +61,7 @@ resource "google_monitoring_alert_policy" "host_logging_export_failures" {
   conditions {
     display_name = "Ops Agent export errors on ${each.value.instance_name}"
     condition_matched_log {
-      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"google-cloud-ops-agent\") AND (severity>=ERROR OR textPayload =~ \"(?i)(failed to flush chunk|exporting failed|permission denied)\" OR jsonPayload.MESSAGE =~ \"(?i)(failed to flush chunk|exporting failed|permission denied)\")"
+      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"ops_agent_self_logs\") AND (severity>=ERROR OR textPayload =~ \"(?i)(failed to flush chunk|exporting failed|permission denied|drop|dropped)\" OR jsonPayload.MESSAGE =~ \"(?i)(failed to flush chunk|exporting failed|permission denied|drop|dropped)\")"
     }
   }
 
@@ -101,17 +101,24 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     }
   }
 
-  # Monitoring conditions are typed one-per-block. The retained-log absence
-  # signal remains separate from the independent expected-host evaluation.
+  # Monitoring conditions are typed one-per-block. Use PromQL absent_over_time
+  # over the logs-based metric so a never-seen host produces an explicit
+  # unhealthy result; condition_absent only evaluates series that already
+  # exist. The metric name is the Cloud Monitoring PromQL form of the
+  # logging.googleapis.com/user/... type.
   conditions {
     display_name = "Ops Agent delivery lag on ${each.value.instance_name}"
-    condition_absent {
-      filter   = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.host_logging_heartbeat[each.key].name}\" AND metric.labels.collector_host_id=\"${each.value.instance_id}\""
-      duration = format("%ds", var.host_logging_alerts.lag_threshold_seconds)
-      aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_SUM"
-      }
+    condition_prometheus_query_language {
+      query = <<-EOT
+        absent_over_time({
+          "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_heartbeat[each.key].name}",
+          "collector_host_id" = "${each.value.instance_id}",
+          "monitored_resource" = "gce_instance"
+        }[${var.host_logging_alerts.lag_threshold_seconds}s]) == 1
+      EOT
+      duration                  = "0s"
+      evaluation_interval       = "60s"
+      disable_metric_validation = true
     }
   }
 

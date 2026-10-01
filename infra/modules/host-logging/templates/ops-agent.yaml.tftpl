@@ -10,9 +10,9 @@
 # release uses its documented built-in disk buffer cap (introduced in 2.28);
 # no unsupported environment variable or generated Fluent Bit setting is used.
 global:
-  # Ops Agent 2.52 supports disabling its own Fluent Bit self-log ingestion;
-  # this keeps the managed journald path from feeding a second high-volume
-  # self-log stream while nested self-logs remain locally rotatable.
+  # The built-in self-log pipeline is disabled only to avoid duplicate file
+  # ingestion; self-log ingestion remains enabled through the explicit,
+  # bounded receiver below, which is the single producer for export failures.
   default_self_log_file_collection: false
 
 logging:
@@ -23,6 +23,13 @@ logging:
       # Reconciliation bounds the journald source and logging subagent with
       # persistent journal/free-space limits and a systemd CPU/memory quota.
       type: systemd_journald
+    ops_agent_self_log_files:
+      # The logging subagent writes supported flush/drop diagnostics here.
+      # An explicit receiver gives the alert a stable log ID without adding a
+      # second default pipeline for the same file.
+      type: files
+      include_paths:
+        - /var/log/google-cloud-ops-agent/subagents/logging-module.log
   processors:
     # This is a provenance filter, not an application-data filter. The
     # _SYSTEMD_UNIT and _TRANSPORT fields are journal-managed and cannot be
@@ -166,6 +173,9 @@ logging:
           - add_platform_context
           - redact_sensitive_fields
           - exclude_debug_after_parse
+      ops_agent_self_logs:
+        receivers:
+          - ops_agent_self_log_files
 metrics:
   receivers:
     hostmetrics:

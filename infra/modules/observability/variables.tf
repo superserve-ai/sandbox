@@ -50,7 +50,10 @@ variable "host_logging_alerts" {
     display_prefix        = string
     lag_threshold_seconds = optional(number, 300)
     heartbeat_duration    = optional(string, "600s")
-    heartbeat_metric_type = optional(string, "workload.googleapis.com/otelcol_process_uptime")
+    # The standalone collector scrapes its Prometheus endpoint and exports
+    # the native self metric through the GMP exporter. PromQL therefore uses
+    # the native series name, not the Cloud Monitoring workload namespace.
+    heartbeat_metric_type = optional(string, "otelcol_process_uptime")
     expected_hosts = map(object({
       instance_name = string
       instance_id   = string

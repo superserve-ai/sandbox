@@ -130,12 +130,12 @@ fi
 # last working delivery history.
 storage_scan_result=$(mktemp)
 storage_scan_deadline=$(( $(date +%s) + ${storage_scan_timeout_seconds} ))
-storage_scan_remaining() {
+storage_accounting_remaining() {
   remaining=$((storage_scan_deadline - $(date +%s)))
   [ "$remaining" -gt 0 ] || return 1
   printf '%ss' "$remaining"
 }
-storage_scan_timeout=$(storage_scan_remaining) || {
+storage_scan_timeout=$(storage_accounting_remaining) || {
   logger -t superserve-host-logging -p err "storage accounting deadline expired before scan"
   exit 1
 }
@@ -454,18 +454,26 @@ systemctl is-active --quiet superserve-host-logging-heartbeat.timer || { rollbac
 activation_committed=1
 
 # Reclaim only disposable retention stores after successful activation. The
-# selected release's checkpoint/buffer state is never copied or deleted. One
-# deadline covers journal vacuum, explicit rotation, and bounded store passes.
-storage_scan_timeout=$(storage_scan_remaining) || {
-  logger -t superserve-host-logging -p warning "disposable retention cleanup skipped after storage deadline"
-  exit 100
+# selected release's checkpoint/buffer state is never copied or deleted. This
+# remediation budget starts after package/configuration activation so slow
+# installs and restarts cannot consume the entire cleanup window.
+storage_remediation_deadline=$(( $(date +%s) + ${storage_scan_timeout_seconds} ))
+storage_remediation_remaining() {
+  remaining=$((storage_remediation_deadline - $(date +%s)))
+  [ "$remaining" -gt 0 ] || return 1
+  printf '%ss' "$remaining"
 }
-if ! timeout "$storage_scan_timeout" bash -c '
-  set +e
+storage_remediation_timeout=$(storage_remediation_remaining) || {
+  logger -t superserve-host-logging -p err "disposable retention cleanup skipped after remediation deadline"
+  exit 1
+}
+if ! timeout "$storage_remediation_timeout" bash -c '
+  set -u
   journal_max="$1"; self_log_dir="$2"; self_limit="$3"; syslog_limit="$4"; max_entries="$5"
-  journalctl --vacuum-size="$${journal_max}B" >/dev/null 2>&1 || true
-  logrotate -f /etc/logrotate.d/superserve-google-cloud-ops-agent >/dev/null 2>&1 || true
-  logrotate -f /etc/logrotate.d/superserve-host-syslog >/dev/null 2>&1 || true
+  cleanup_failed=0
+  journalctl --vacuum-size="$${journal_max}B" >/dev/null 2>&1 || cleanup_failed=1
+  logrotate -f /etc/logrotate.d/superserve-google-cloud-ops-agent >/dev/null 2>&1 || cleanup_failed=1
+  logrotate -f /etc/logrotate.d/superserve-host-syslog >/dev/null 2>&1 || cleanup_failed=1
   reclaim() {
     kind="$1"; root="$2"; limit="$3"; count=0; total=0; capped=0; scan_limit=$((max_entries + 1))
     files=(); sizes=()
@@ -484,22 +492,30 @@ if ! timeout "$storage_scan_timeout" bash -c '
       [ "$total" -gt "$limit" ] || break
       path="$${files[$i]}"; size="$${sizes[$i]}"
       case "$path" in
-        *.log.*|/var/log/syslog.*) rm -f -- "$path" && total=$((total - size)) ;;
+        *.log.*|/var/log/syslog.*) rm -f -- "$path" && total=$((total - size)) || cleanup_failed=1 ;;
       esac
     done
     for i in "$${!files[@]}"; do
       [ "$total" -gt "$limit" ] || break
       path="$${files[$i]}"
       case "$path" in
-        *.log|/var/log/syslog) size="$${sizes[$i]}"; : >"$path" && total=$((total - size)) ;;
+        *.log|/var/log/syslog) size="$${sizes[$i]}"; : >"$path" && total=$((total - size)) || cleanup_failed=1 ;;
       esac
     done
-    [ "$capped" -eq 0 ] || logger -t superserve-host-logging -p warning "$${kind} cleanup reached its bounded entry cap"
-    [ "$total" -le "$limit" ] || logger -t superserve-host-logging -p warning "$${kind} disposable store remains above its bounded size after cleanup"
+    if [ "$capped" -ne 0 ]; then
+      logger -t superserve-host-logging -p err "$${kind} cleanup reached its bounded entry cap"
+      cleanup_failed=1
+    fi
+    if [ "$total" -gt "$limit" ]; then
+      logger -t superserve-host-logging -p err "$${kind} disposable store remains above its bounded size after cleanup"
+      cleanup_failed=1
+    fi
   }
   reclaim self_log "$self_log_dir" "$self_limit"
   reclaim syslog /var/log "$syslog_limit"
+  [ "$cleanup_failed" -eq 0 ]
 ' _ "$journal_max_use_bytes" "$self_log_dir" "${agent_self_log_max_bytes}" "${syslog_max_bytes}" "${storage_scan_max_entries}"; then
-  logger -t superserve-host-logging -p warning "disposable retention cleanup exceeded bounded deadline"
+  logger -t superserve-host-logging -p err "disposable retention cleanup incomplete or exceeded bounded deadline"
+  exit 1
 fi
 exit 100

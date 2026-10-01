@@ -29,10 +29,12 @@ metrics before log export is constrained. Reconciliation manages explicit
 logrotate bounds for the disposable self-log and legacy syslog stores and
 checks the combined buffer budget before activation; successful activation
 then vacuums journald. It never deletes checkpoints or pending buffers; an
-oversized disposable store is reported and reclaimed in a bounded post-commit
-pass, while an oversized supported buffer is reported without blocking
-exporter recovery. Recursive accounting uses one bounded scan deadline and a
-fixed enumeration cap so rotated-file growth cannot amplify OS Config retries.
+oversized disposable store is reported and reclaimed in a separately bounded
+post-commit pass, while an oversized supported buffer is reported without
+blocking exporter recovery. Incomplete or skipped reclamation returns
+noncompliance so the next OS Config run remains observable. Recursive
+accounting uses one bounded scan deadline and a fixed enumeration cap so
+rotated-file growth cannot amplify OS Config retries.
 Staging must measure combined growth before
 production. The configured 4 GiB journal maximum is counted conservatively in
 the combined free-space precondition without adding a second recursive
@@ -47,9 +49,12 @@ a failed reconciliation restores the previous package, service/configuration
 state, and delivery state. The policy never
 restarts VMD or mutates identity/admission files. A managed minute heartbeat
 supplies a timestamped log-based freshness signal keyed by the stable VM
-identity, while runtime host ID and incarnation remain distinct; the
-standalone OTel uptime alert remains independent for exporter failure and
-never-seen/replacement-host detection.
+identity, while runtime host ID and incarnation remain distinct. Ops Agent's
+supported logging-module self log is collected through one bounded explicit
+file receiver for flush/drop diagnostics. The standalone OTel uptime alert
+remains independent of log export; the log freshness query uses the logs-based
+metric directly and emits an unhealthy result even before a host has produced
+its first heartbeat.
 
 Each enrolled runtime identity receives only `roles/logging.logWriter` here;
 the existing metric-writer and workload grants remain owned by their roots.
@@ -75,4 +80,6 @@ before enabling production roots. Keep the standalone OTel collector healthy
 through each exercise. Roll back by selecting the prior
 `assignment_revision`/template in version control and applying the same root;
 the reconciliation validates that candidate and leaves checkpoints and the
-last working configuration intact on failure.
+last working configuration intact on failure. Production workflows require an
+accepted staging evidence document for the exact `assignment_revision` before
+they apply a host-logging revision; no evidence is fabricated by Terraform.

@@ -58,6 +58,8 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn("agent_self_log_max_bytes", self.reconcile)
         self.assertIn("syslog_max_bytes", self.reconcile)
         self.assertIn("heartbeat_interval_seconds", self.reconcile)
+        self.assertIn("storage_remediation_deadline", self.reconcile)
+        self.assertIn("disposable retention cleanup incomplete", self.reconcile)
 
     def test_validation_and_enforcement_render_identical_metrics_dropin(self):
         expected_comment = "# Keep the standalone application-metrics collector below the logging"
@@ -73,6 +75,13 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn("exit 100", self.reconcile)
         self.assertIn("storage_scan_deadline", self.reconcile)
         self.assertIn("logrotate -f", self.reconcile)
+
+    def test_cleanup_and_failure_alert_producers_are_bounded(self):
+        self.assertEqual(self.validate.count("trap "), 1)
+        self.assertIn("cleanup()", self.validate)
+        self.assertIn("storage_scan_result", self.validate)
+        self.assertIn("ops_agent_self_log_files", self.config)
+        self.assertIn("ops_agent_self_logs", self.config)
 
 
 if __name__ == "__main__":

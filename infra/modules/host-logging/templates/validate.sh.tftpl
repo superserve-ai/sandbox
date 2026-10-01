@@ -20,8 +20,22 @@ syslog_logrotate='/etc/logrotate.d/superserve-host-syslog'
 identity_file='/etc/sandbox/host-identity.json'
 buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
 self_log_dir='/var/log/google-cloud-ops-agent'
+rendered_config=''
 storage_scan_result=''
+expected_journald=''
+expected_resource=''
+expected_metrics_resource=''
+expected_agent_metrics_resource=''
+expected_agent_logrotate=''
+expected_syslog_logrotate=''
 journal_max_use_bytes=${journal_max_use_bytes}
+
+cleanup() {
+  rm -f "$rendered_config" "$storage_scan_result" "$expected_journald" \
+    "$expected_resource" "$expected_metrics_resource" "$expected_agent_metrics_resource" \
+    "$expected_agent_logrotate" "$expected_syslog_logrotate" 2>/dev/null || true
+}
+trap 'status=$?; cleanup; exit "$status"' EXIT
 
 # 100 means fully compliant; 101 asks OS Config to run enforce. Any invalid
 # candidate is an error and must not be treated as repairable drift.
@@ -39,7 +53,6 @@ esac
 command -v google-cloud-ops-agent >/dev/null 2>&1 || exit 101
 
 rendered_config=$(mktemp)
-trap 'rm -f "$rendered_config" "$storage_scan_result"' EXIT
 sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
   "$candidate_config_path" >"$rendered_config"
 if grep -qE '__HOST_ID__|__INCARNATION_ID__' "$rendered_config"; then
@@ -55,7 +68,6 @@ drift=0
 if ! cmp -s "$rendered_config" "$config_path" 2>/dev/null; then drift=1; fi
 if [ -s "$config_path" ] && ! timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$config_path" >/dev/null 2>&1; then drift=1; fi
 expected_journald=$(mktemp)
-trap 'rm -f "$rendered_config" "$expected_journald"' EXIT
 install -m 0644 "$journald_candidate_path" "$expected_journald"
 grep -Fq "SystemMaxUse=${journal_max_use_bytes}B" "$expected_journald" || exit 1
 grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B" "$expected_journald" || exit 1
@@ -64,10 +76,8 @@ if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "Sy
 if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B"; then drift=1; fi
 
 expected_resource=$(mktemp)
-trap 'rm -f "$rendered_config" "$expected_journald" "$expected_resource"' EXIT
 expected_metrics_resource=$(mktemp)
 expected_agent_metrics_resource=$(mktemp)
-trap 'rm -f "$rendered_config" "$expected_journald" "$expected_resource" "$expected_metrics_resource" "$expected_agent_metrics_resource"' EXIT
 cat >"$expected_resource" <<'RESOURCES'
 [Service]
 CPUQuota=${agent_cpu_limit_millicores / 10}%
@@ -91,7 +101,6 @@ if ! cmp -s "$expected_metrics_resource" "$metrics_resource_dropin" 2>/dev/null;
 
 expected_agent_logrotate=$(mktemp)
 expected_syslog_logrotate=$(mktemp)
-trap 'rm -f "$rendered_config" "$expected_journald" "$expected_resource" "$expected_metrics_resource" "$expected_agent_metrics_resource" "$expected_agent_logrotate" "$expected_syslog_logrotate"' EXIT
 cat >"$expected_agent_logrotate" <<'ROTATE'
 /var/log/google-cloud-ops-agent/*.log /var/log/google-cloud-ops-agent/subagents/*.log {
   size ${ceil(agent_self_log_max_bytes / 2 / 1048576)}M

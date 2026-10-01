@@ -40,8 +40,9 @@ run "host_logging_alerts_contract" {
     condition = alltrue([
       for policy in values(google_monitoring_alert_policy.host_logging_lag) :
       alltrue([for condition in policy.conditions : (
-        (length(condition.condition_absent) == 1 && length(condition.condition_threshold) == 0) ||
-        (length(condition.condition_absent) == 0 && length(condition.condition_threshold) == 1)
+        (length(condition.condition_prometheus_query_language) == 1 &&
+          strcontains(one(condition.condition_prometheus_query_language).query, "absent_over_time(") &&
+          one(condition.condition_prometheus_query_language).disable_metric_validation)
       )])
     ])
     error_message = "Each Monitoring condition block must contain exactly one supported condition type."
@@ -55,5 +56,21 @@ run "host_logging_alerts_contract" {
       one(policy.conditions).condition_prometheus_query_language[0].disable_metric_validation
     ])
     error_message = "Heartbeat absence must alert on an empty expected-host series, including never-seen replacements."
+  }
+
+  assert {
+    condition = alltrue([
+      for policy in values(google_monitoring_alert_policy.host_logging_export_failures) :
+      strcontains(one(policy.conditions).condition_matched_log.filter, "log_id(\"ops_agent_self_logs\")")
+    ])
+    error_message = "Export failure alert must consume the explicit bounded Ops Agent self-log receiver."
+  }
+
+  assert {
+    condition = alltrue([
+      for policy in values(google_monitoring_alert_policy.host_logging_heartbeat) :
+      strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "otelcol_process_uptime")
+    ])
+    error_message = "Independent heartbeat must select the GMP-exported collector self metric."
   }
 }

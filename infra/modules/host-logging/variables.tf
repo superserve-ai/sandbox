@@ -26,7 +26,7 @@ variable "assignment_name" {
 variable "assignment_revision" {
   description = "Versioned configuration revision used for reconciliation and rollback."
   type        = string
-  default     = "2026-09-30"
+  default     = "2026-10-01"
 }
 
 variable "selector_labels" {
