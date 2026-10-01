@@ -92,7 +92,10 @@ The migration phases are `preserve`, `verify`, `overlap`, `drain`, `retire`, and
 start guard stop OTel when the deadline expires. Drain requires measured cloud
 receipt and duplicate/gap counts. Retirement requires receipt and empty-buffer
 evidence for every enrolled instance plus a local overlap snapshot for that
-same instance, policy, and baseline. It disables all Ops Agent logging pipelines
+same instance, policy, and baseline. A bounded local check also requires a fresh
+successful export, an empty queue with no in-flight requests, no new export
+failures, and an unchanged collector process. Its metrics endpoint listens only
+on loopback. Retirement disables all Ops Agent logging pipelines
 while preserving metrics configuration and receiver definitions. Applying the
 Ops Agent configuration briefly restarts that agent; the independent application
 metrics collector is not changed by migration. Rollback restores the exact
@@ -132,8 +135,9 @@ provider ID, so a recent predecessor heartbeat may postpone detection by at
 most the five-minute freshness window plus the configured alert duration.
 Optional authoritative incarnation inventory enables stricter fencing without
 changing host identity provisioning. Source timestamps prevent replay from
-extending that freshness window. Lag is sampled only on minute heartbeats,
-so metric volume scales with hosts rather than application log volume. Export
+extending that freshness window. Cloud-side freshness queries use the original timestamps of minute heartbeats,
+so queue delay cannot make stale history appear current and metric volume scales
+with hosts rather than application log volume. Export
 failure events complement absence detection but cannot be delivered during a
 complete export outage.
 

@@ -114,7 +114,6 @@ processors:
           - set(body["diagnostic"], "service stopped") where attributes["_private"]["journal"]["_PID"] == "1" and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "^Stopped ")
           - set(attributes["host_logging_export_error"], "true") where attributes["journal_unit"] == "superserve-otel-logs.service" and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)(export.*fail|permission denied|drop|storage.*full|queue.*full|cursor.*(fail|invalid))")
           - set(attributes["host_logging_heartbeat"], "true") where attributes["journal_unit"] == "superserve-host-logging-heartbeat.service"
-          - set(attributes["host_logging_retained_history_lag_seconds"], (UnixNano(Now()) - time_unix_nano) / 1000000000) where attributes["host_logging_heartbeat"] == "true"
           - delete_key(attributes, "_private")
   filter/info_plus:
     error_mode: propagate
@@ -160,4 +159,10 @@ service:
       level: info
       encoding: json
     metrics:
-      level: none
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 18888
