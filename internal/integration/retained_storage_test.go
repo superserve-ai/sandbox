@@ -1032,7 +1032,7 @@ func TestRetainedStorageBaselineProvenance(t *testing.T) {
 	exec(`INSERT INTO template(id,team_id,name,status,build_spec,rootfs_path,snapshot_path,mem_path,vcpu,memory_mib,disk_mib)
 	 VALUES($1,(SELECT team_id FROM sandbox WHERE id=$2),'provenance-template','ready','{}'::jsonb,'/example/current/rootfs.ext4','/example/current/vmstate.snap','/example/current/mem.snap',1,1024,1024)`, missing, f.sandboxID)
 	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,template_id)
- SELECT $1,team_id,'missing-provenance','paused',host_id,1,1,0,created_at,$3 FROM sandbox WHERE id=$2`, missing, f.sandboxID, missing)
+	 SELECT $1,team_id,'missing-provenance','paused',host_id,1,1,1,created_at,$3 FROM sandbox WHERE id=$2`, missing, f.sandboxID, missing)
 	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
  SELECT id,team_id,host_id,0,created_at FROM sandbox WHERE id=$1`, missing)
 	var unknown bool
