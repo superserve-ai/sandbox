@@ -532,7 +532,11 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 	for _, m := range measurements {
 		if m.Retained != nil {
 			if len(measurements) != 1 || totalMeasurements != 1 || m.SandboxID != "" || m.AllocatedBytes != 0 {
-				return errStorageReportInvalidPayload
+				// The durable row has already passed the ingress shape check. If a
+				// processor sees a retained envelope that is incomplete or has been
+				// superseded, keep it retryable so the first measurement remains a
+				// settlement fence instead of discarding the evidence as zero.
+				return retainedStorageIncompleteError("retained report envelope is incomplete")
 			}
 			if err := applyRetainedStorage(ctx, tx, hostID, receivedAt, m.Retained, reportID); err != nil {
 				return err
@@ -807,6 +811,13 @@ func finishStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string,
 // than a terminal state so billing cannot treat unapplied data as settled.
 func storageReportErrorIsTerminal(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Retained inventory failures may wrap the generic invalid-payload marker
+	// for compatibility with direct callers, but they are still retryable: the
+	// durable report or its owner set is the evidence needed to keep settlement
+	// blocked until a valid first measurement arrives.
+	if errors.Is(err, errStorageReportRetainedIncomplete) {
 		return false
 	}
 	// Database constraints can reflect deployment skew or a repairable schema

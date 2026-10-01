@@ -643,10 +643,36 @@ func TestIntegration_RetainedFailedFirstMeasurementBlocksSettlement(t *testing.T
 				t.Fatalf("first measurement has prior intervals: %d %v", count, err)
 			}
 			complete(false)
+			if !legacy {
+				// Drive the processor with a valid retained envelope that is
+				// incomplete against the authoritative failed-owner set. The
+				// failure must remain retryable with its payload intact; a
+				// processor-generated terminal state must not release settlement.
+				exec(`INSERT INTO retained_storage_measurement_obligation(team_id,owner_kind,owner_id,host_id,effective_at)
+ VALUES($1,'sandbox',$2,$3,$4)`, team, f.sandboxID, f.hostID, f.receivedAt)
+				emptyPayload, marshalErr := json.Marshal([]storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{}}}})
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
+				exec(`UPDATE host_storage_report SET state='pending',payload=$2,next_measurement_index=0,attempts=7,next_attempt_at=now() WHERE report_id=$1`, f.reportID, emptyPayload)
+				if !processOneStorageReport(ctx, f.pool) {
+					t.Fatal("processor did not claim the incomplete first retained report")
+				}
+				var state string
+				var retainedPayload []byte
+				if err := f.pool.QueryRow(ctx, `SELECT state,payload FROM host_storage_report WHERE report_id=$1`, f.reportID).Scan(&state, &retainedPayload); err != nil {
+					t.Fatal(err)
+				}
+				if state != "retry_exhausted" || len(retainedPayload) == 0 {
+					t.Fatalf("processor terminalized first retained failure: state=%s payload=%d", state, len(retainedPayload))
+				}
+				complete(false)
+				exec(`UPDATE host_storage_report SET state='processing',next_measurement_index=0,processing_generation=2 WHERE report_id=$1`, f.reportID)
+			}
 			// Resolving the legacy receipt into the durable stream must keep the
 			// same fence until its first measurable retained quantity is applied.
 			exec(`DELETE FROM legacy_host_storage_report`)
-			exec(`UPDATE host_storage_report SET state='processing' WHERE report_id=$1`, f.reportID)
+			exec(`UPDATE host_storage_report SET state='processing',processing_generation=2 WHERE report_id=$1`, f.reportID)
 			complete(false)
 			if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, f.receivedAt, measurements, 1, 1); err != nil {
 				t.Fatal(err)

@@ -77,7 +77,7 @@ CROSS JOIN (SELECT count(*) FROM opened_measurement_obligation) obligation_fence
 WHERE feature_enabled('billing_metrics_write', a.team_id)
   AND NOT EXISTS (
     SELECT 1 FROM retained_storage_cutover c
-      WHERE c.team_id = a.team_id AND c.started_at <= now()
+    WHERE c.team_id = a.team_id AND c.host_id = a.host_id AND c.started_at <= now()
   )
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
 `

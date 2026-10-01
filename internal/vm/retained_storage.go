@@ -34,32 +34,65 @@ func (s *StateStore) retainedLiveRecords() ([]VMRecord, error) {
 }
 
 func (s *StateStore) retainedLiveRecordsContext(ctx context.Context) ([]VMRecord, error) {
+	budget := retainedScanBudget{}
+	return s.retainedLiveRecordsWithBudget(ctx, &budget)
+}
+
+// retainedScanBudget is shared by the live and archived projections. Keeping
+// the counters in one object prevents a host with a full live set and a full
+// archive set from decoding two independent owner/payload budgets.
+type retainedScanBudget struct {
+	visited int
+	bytes   int
+	owners  int
+}
+
+func (b *retainedScanBudget) accountEntry(ctx context.Context, key, value []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.visited++
+	if b.visited > retainedstorage.MaxVisitedEntries {
+		return fmt.Errorf("retained record scan budget exceeded")
+	}
+	b.bytes += len(key) + len(value)
+	if b.bytes > retainedstorage.MaxPayloadBytes {
+		return fmt.Errorf("retained record budget exceeded")
+	}
+	return nil
+}
+
+func (b *retainedScanBudget) reserveOwner() error {
+	if b.owners >= retainedstorage.MaxOwners {
+		return fmt.Errorf("retained owner budget exceeded")
+	}
+	b.owners++
+	return nil
+}
+
+func (s *StateStore) retainedLiveRecordsWithBudget(ctx context.Context, budget *retainedScanBudget) ([]VMRecord, error) {
 	records := make([]VMRecord, 0)
-	bytes := 0
-	visited := 0
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketName).ForEach(func(k, v []byte) error {
-			if err := ctx.Err(); err != nil {
+			if err := budget.accountEntry(ctx, k, v); err != nil {
 				return err
-			}
-			visited++
-			if visited > retainedstorage.MaxVisitedEntries {
-				return fmt.Errorf("retained record scan budget exceeded")
 			}
 			// Charge encoded input before any key filtering or JSON decode. A
 			// UUID-keyed oversized record must not allocate an unbounded decode
 			// buffer inside the Bolt read transaction, and excluded records still
 			// consume the scan's independent input budget.
-			bytes += len(k) + len(v)
-			if bytes > retainedstorage.MaxPayloadBytes {
-				return fmt.Errorf("retained record budget exceeded")
-			}
 			// The records bucket also contains build and warm-pool entries. Their
 			// values are not part of retained inventory, so reject non-UUID keys
 			// before decoding them; a large unrelated fleet must not consume the
 			// inventory's JSON/decode budget.
 			if _, err := uuid.Parse(string(k)); err != nil {
 				return nil
+			}
+			if isBuildVM(string(k)) {
+				return nil
+			}
+			if err := budget.reserveOwner(); err != nil {
+				return err
 			}
 			var rec VMRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
@@ -92,11 +125,12 @@ func (s *StateStore) retainedRecords() ([]VMRecord, error) {
 }
 
 func (s *StateStore) retainedRecordsContext(ctx context.Context) ([]VMRecord, error) {
-	live, err := s.retainedLiveRecordsContext(ctx)
+	budget := retainedScanBudget{}
+	live, err := s.retainedLiveRecordsWithBudget(ctx, &budget)
 	if err != nil {
 		return nil, err
 	}
-	archived, err := s.retainedArchivedRecordsContext(ctx)
+	archived, err := s.retainedArchivedRecordsWithBudget(ctx, &budget)
 	if err != nil {
 		return nil, err
 	}

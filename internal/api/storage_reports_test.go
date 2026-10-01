@@ -23,6 +23,8 @@ func TestStorageReportErrorIsTerminal(t *testing.T) {
 	}{
 		{name: "stale incarnation", err: errStorageReportStaleIncarnation, want: true},
 		{name: "invalid payload", err: errStorageReportInvalidPayload, want: true},
+		{name: "retained inventory incomplete", err: errStorageReportRetainedIncomplete, want: false},
+		{name: "retained inventory wrapping invalid payload", err: fmt.Errorf("%w: %w", errStorageReportRetainedIncomplete, errStorageReportInvalidPayload), want: false},
 		{name: "missing database row", err: pgx.ErrNoRows, want: false},
 		{name: "constraint violation", err: &pgconn.PgError{Code: "23514"}, want: false},
 		{name: "data exception", err: &pgconn.PgError{Code: "22003"}, want: false},

@@ -1285,3 +1285,66 @@ func TestRetainedCleanupPreservesDiscoveryAtomically(t *testing.T) {
 		}
 	}
 }
+
+func TestSettledRetainingStorageClearsTransitionFlagsForInventory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*VMRecord)
+	}{
+		{name: "teardown", set: func(r *VMRecord) { r.TeardownPending = "restore" }},
+		{name: "unverified", set: func(r *VMRecord) { r.Unverified = true }},
+		{name: "wake", set: func(r *VMRecord) { r.WakePending = true; r.WakeToken = "wake" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			runDir := filepath.Join(root, "run")
+			if err := os.MkdirAll(runDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			statePath := filepath.Join(root, "state.db")
+			store, err := OpenStateStore(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			id := uuid.NewString()
+			dir := filepath.Join(runDir, id)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			rec := VMRecord{ID: id, Status: StatusPaused, SourceSnapshotID: uuid.NewString(),
+				DiskPath: filepath.Join(dir, "overlay.ext4"), SnapshotPath: filepath.Join(dir, "vmstate.snap"),
+				MemFilePath: filepath.Join(dir, "mem.snap")}
+			tc.set(&rec)
+			for _, path := range []string{rec.DiskPath, rec.SnapshotPath, rec.MemFilePath} {
+				if err := os.WriteFile(path, []byte("retained"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.Put(rec); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ReleaseRetainingStorage(id); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = OpenStateStore(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mgr := &Manager{state: store, cfg: ManagerConfig{RunDir: runDir, SnapshotDir: filepath.Join(root, "snapshots")}}
+			inv, err := mgr.retainedStorageInventoryWithPersistence(t.Context(), func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+				return []retainedstorage.Extent{{Device: "fixture", Start: 0, Length: 4096}}, "fixture", nil
+			}, false)
+			if err != nil {
+				t.Fatalf("settled archive blocked inventory after restart: %v", err)
+			}
+			if len(inv.Owners) != 1 || inv.Owners[0].ID != id {
+				t.Fatalf("inventory owners = %#v, want %s", inv.Owners, id)
+			}
+			_ = store.Close()
+		})
+	}
+}

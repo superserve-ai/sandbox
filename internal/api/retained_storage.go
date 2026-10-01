@@ -14,9 +14,16 @@ import (
 // applyRetainedStorage runs within the durable report's cursor transaction.
 // A complete physical-address epoch is indivisible: splitting owners across
 // chunks could deduplicate a recycled address against an earlier allocation.
+func retainedStorageIncompleteError(reason string) error {
+	// Keep the historical invalid-payload identity for direct receiver callers,
+	// while the retained-specific marker takes precedence in processor
+	// terminalization so the durable evidence remains settlement-blocking.
+	return fmt.Errorf("%w: %w: %s", errStorageReportRetainedIncomplete, errStorageReportInvalidPayload, reason)
+}
+
 func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time.Time, inv *retainedstorage.Inventory, reportIDs ...uuid.UUID) error {
 	if err := inv.Validate(); err != nil {
-		return fmt.Errorf("%w: %v", errStorageReportInvalidPayload, err)
+		return retainedStorageIncompleteError(err.Error())
 	}
 	payload, err := json.Marshal(inv.Owners)
 	if err != nil {
@@ -40,7 +47,7 @@ SELECT EXISTS (
 		return err
 	}
 	if missingBaseline {
-		return fmt.Errorf("%w: full-copy baseline provenance is unavailable", errStorageReportRetainedIncomplete)
+		return retainedStorageIncompleteError("full-copy baseline provenance is unavailable")
 	}
 	// Lock only owners whose contribution is new or changed. A host-wide lock
 	// (or locking an unchanged fleet) would make a periodic inventory contend
@@ -154,7 +161,7 @@ SELECT EXISTS (
 		return err
 	}
 	if !complete {
-		return fmt.Errorf("%w: retained inventory is incomplete or superseded", errStorageReportRetainedIncomplete)
+		return retainedStorageIncompleteError("retained inventory is incomplete or superseded")
 	}
 	_, err = tx.Exec(ctx, `WITH supplied AS MATERIALIZED (
   SELECT o.kind,o.id,o.generation,o.extents,

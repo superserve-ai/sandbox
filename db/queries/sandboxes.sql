@@ -329,7 +329,7 @@ WHERE feature_enabled('billing_metrics_write', a.team_id)
   -- host report owns the quantity; do not charge the template baseline here.
   AND NOT EXISTS (
     SELECT 1 FROM retained_storage_cutover c
-    WHERE c.team_id = a.team_id AND c.started_at <= now()
+    WHERE c.team_id = a.team_id AND c.host_id = a.host_id AND c.started_at <= now()
   )
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 

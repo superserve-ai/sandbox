@@ -7551,9 +7551,6 @@ func (m *Manager) deleteState(vmID string) {
 		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
 		return
 	}
-	if err := m.state.DeleteRetainedRecord(vmID); err != nil {
-		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete retained storage metadata from BoltDB")
-	}
 }
 
 // reviveTeardownCtxKey marks a context as belonging to revival's own

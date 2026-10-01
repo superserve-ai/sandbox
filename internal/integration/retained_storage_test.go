@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -459,12 +460,39 @@ func TestRetainedStoragePostCutoverActivationUnknown(t *testing.T) {
 	f := newStorageReportFixture(t, "paused", false)
 	ctx := t.Context()
 	team := sandboxTeamID(t, f.sandboxID)
+	// A team-wide cutover on one host must not suppress legacy quantity for a
+	// newly activated owner on another host that has not entered retained
+	// reporting. The host-scoped authority keeps that owner's accounting live.
+	otherHost := "retained-cross-host-" + uuid.NewString()
+	otherID := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at)
+ VALUES($1,$2,'cross-host-activation','paused',$3,1,1024,8,clock_timestamp())`, otherID, team, otherHost); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM sandbox WHERE id=$1`, otherID) })
 	var cutover time.Time
 	if err := testPool.QueryRow(ctx, `SELECT clock_timestamp() - interval '1 minute'`).Scan(&cutover); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover); err != nil {
 		t.Fatal(err)
+	}
+	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: otherID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
+		t.Fatal(err)
+	}
+	var legacyDisk int
+	if err := testPool.QueryRow(ctx, `SELECT disk_mib FROM sandbox_storage_interval WHERE sandbox_id=$1 AND ended_at IS NULL`, otherID).Scan(&legacyDisk); err != nil {
+		t.Fatal(err)
+	}
+	if legacyDisk != 8 {
+		t.Fatalf("cross-host activation lost its legacy accounting: disk_mib=%d", legacyDisk)
+	}
+	var crossHostObligations int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_measurement_obligation WHERE owner_id=$1`, otherID).Scan(&crossHostObligations); err != nil {
+		t.Fatal(err)
+	}
+	if crossHostObligations != 0 {
+		t.Fatalf("cross-host activation incorrectly created a retained obligation: %d", crossHostObligations)
 	}
 	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: f.sandboxID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
 		t.Fatal(err)
@@ -508,6 +536,13 @@ func TestRetainedStoragePostCutoverActivationUnknown(t *testing.T) {
 	if resolved == nil {
 		t.Fatal("compatible retained receipt did not resolve activation obligation")
 	}
+	var initialGap float64
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, effective.Add(-time.Minute), effective).Scan(&initialGap); err != nil {
+		t.Fatal(err)
+	}
+	if initialGap != 0 {
+		t.Fatalf("initial retained measurement gap was billed: %v MiB-seconds", initialGap)
+	}
 	// A later structurally valid but incomplete processor payload is retryable
 	// and keeps its immutable payload. The product decision about any
 	// retrospective pre-receipt gap is intentionally not asserted here.
@@ -534,36 +569,66 @@ func TestRetainedStoragePostCutoverActivationUnknown(t *testing.T) {
 }
 
 func TestRetainedStorageActivationSettlementRace(t *testing.T) {
-	f := newStorageReportFixture(t, "paused", false)
-	ctx := t.Context()
-	team := sandboxTeamID(t, f.sandboxID)
-	var boundary time.Time
-	if err := testPool.QueryRow(ctx, `SELECT clock_timestamp() - interval '1 second'`).Scan(&boundary); err != nil {
-		t.Fatal(err)
-	}
-	var complete bool
-	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, boundary).Scan(&complete); err != nil {
-		t.Fatal(err)
-	}
-	if !complete {
-		t.Fatal("settlement was fenced before the activation transaction existed")
-	}
-	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, boundary.Add(-time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: f.sandboxID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
-		t.Fatal(err)
-	}
-	var effective time.Time
-	if err := testPool.QueryRow(ctx, `SELECT effective_at FROM retained_storage_measurement_obligation WHERE owner_kind='sandbox' AND owner_id=$1`, f.sandboxID).Scan(&effective); err != nil {
-		t.Fatal(err)
-	}
-	boundary = effective.Add(time.Minute)
-	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, boundary).Scan(&complete); err != nil {
-		t.Fatal(err)
-	}
-	if complete {
-		t.Fatalf("committed activation was invisible to settlement: effective_at=%s queried_boundary=%s", effective, boundary)
+	for _, commit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "rollback", true: "commit"}[commit], func(t *testing.T) {
+			f := newStorageReportFixture(t, "paused", false)
+			ctx := t.Context()
+			team := sandboxTeamID(t, f.sandboxID)
+			var boundary time.Time
+			if err := testPool.QueryRow(ctx, `SELECT clock_timestamp() - interval '1 second'`).Scan(&boundary); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, boundary.Add(-time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			// Start settlement first to exercise the older-transaction case.
+			settlement, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer settlement.Rollback(context.Background())
+			if _, err := settlement.Exec(ctx, `SELECT 1`); err != nil {
+				t.Fatal(err)
+			}
+			activation, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			queries := db.New(activation)
+			if err := queries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: f.sandboxID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
+				t.Fatal(err)
+			}
+			var effective time.Time
+			if err := activation.QueryRow(ctx, `SELECT effective_at FROM retained_storage_measurement_obligation WHERE owner_kind='sandbox' AND owner_id=$1`, f.sandboxID).Scan(&effective); err != nil {
+				t.Fatal(err)
+			}
+			if err := billing.FenceStorageReportReceipts(ctx, settlement, team); !errors.Is(err, billing.ErrStorageReportsIncomplete) {
+				t.Fatalf("settlement crossed uncommitted activation: %v", err)
+			}
+			if commit {
+				if err := activation.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := activation.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			_ = settlement.Rollback(ctx)
+			settlement, err = testPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer settlement.Rollback(context.Background())
+			if err := billing.FenceStorageReportReceipts(ctx, settlement, team); err != nil {
+				t.Fatal(err)
+			}
+			var complete bool
+			if err := settlement.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, effective.Add(time.Minute)).Scan(&complete); err != nil {
+				t.Fatal(err)
+			}
+			if complete == commit {
+				t.Fatalf("settlement completeness after activation commit=%t: complete=%t", commit, complete)
+			}
+		})
 	}
 }
 

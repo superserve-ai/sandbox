@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	bolt "go.etcd.io/bbolt"
 )
@@ -771,28 +772,26 @@ func (s *StateStore) retainedArchivedRecords() ([]VMRecord, error) {
 }
 
 func (s *StateStore) retainedArchivedRecordsContext(ctx context.Context) ([]VMRecord, error) {
+	budget := retainedScanBudget{}
+	return s.retainedArchivedRecordsWithBudget(ctx, &budget)
+}
+
+func (s *StateStore) retainedArchivedRecordsWithBudget(ctx context.Context, budget *retainedScanBudget) ([]VMRecord, error) {
 	var records []VMRecord
-	bytes := 0
-	visited := 0
 	err := s.db.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(retainedRecordBucketName)
 		if bucket == nil {
 			return nil
 		}
 		return bucket.ForEach(func(key, value []byte) error {
-			if err := ctx.Err(); err != nil {
+			if err := budget.accountEntry(ctx, key, value); err != nil {
 				return err
 			}
-			visited++
-			if visited > retainedstorage.MaxVisitedEntries {
-				return fmt.Errorf("retained archive scan budget exceeded")
+			if _, err := uuid.Parse(string(key)); err != nil {
+				return nil
 			}
-			if len(records) >= retainedstorage.MaxOwners {
-				return fmt.Errorf("retained owner budget exceeded")
-			}
-			bytes += len(key) + len(value)
-			if bytes > retainedstorage.MaxPayloadBytes {
-				return fmt.Errorf("retained record budget exceeded")
+			if err := budget.reserveOwner(); err != nil {
+				return err
 			}
 			var rec VMRecord
 			if err := json.Unmarshal(value, &rec); err != nil {
