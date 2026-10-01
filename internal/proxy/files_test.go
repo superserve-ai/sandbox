@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -260,14 +261,32 @@ func TestFiles_TokenReusable(t *testing.T) {
 }
 
 func TestFiles_SandboxNotRunningReturns503(t *testing.T) {
-	env := newFilesTestEnv(t)
-	env.resolver.info.Status = "paused"
-	tok := env.validToken()
-	req := env.buildRequest(http.MethodGet, "/f.txt", tok, nil)
-	w := httptest.NewRecorder()
-	env.handler.ServeHTTP(w, req)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", w.Code)
+	for _, state := range []string{"paused", "stopped"} {
+		t.Run(state, func(t *testing.T) {
+			env := newFilesTestEnv(t)
+			env.resolver.info.Status = state
+			req := env.buildRequest(http.MethodGet, "/f.txt", env.validToken(), nil)
+			w := httptest.NewRecorder()
+			env.handler.ServeHTTP(w, req)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", w.Code)
+			}
+			if got := w.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("content type = %q, want application/json", got)
+			}
+			var body struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Error.Code != "sandbox_unavailable" || body.Error.Message != "sandbox is "+state {
+				t.Fatalf("unexpected unavailable error: %s", w.Body)
+			}
+		})
 	}
 }
 

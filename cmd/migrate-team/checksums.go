@@ -29,6 +29,9 @@ var checksumExclusions = map[string]map[string]bool{
 	// team_sandbox_counter, which is not copied); the stale snapshot it
 	// holds is not part of what the copy promises to preserve.
 	"team": {"active_sandbox_count": true},
+	// Ownership versions fence one cell's routing history. The destination
+	// trigger initializes new rows and retains its own versions on re-copy.
+	"sandbox": {"routing_version": true},
 }
 
 // rowChecksums returns hash → occurrence count for the team's rows of one

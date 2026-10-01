@@ -117,7 +117,7 @@ def main() -> int:
     if peer_listen not in ("", "auto") and not peer_listen.endswith(":5009"):
         print("ERROR: PEER_PROXY_LISTEN_ADDR must use port 5009", file=sys.stderr)
         return 1
-    peer_max_streams = os.environ.get("PEER_PROXY_MAX_STREAMS", "") or "128"
+    peer_max_streams = os.environ.get("PEER_PROXY_MAX_STREAMS", "") or "1024"
     if not peer_max_streams.isascii() or not peer_max_streams.isdecimal() or not 1 <= int(peer_max_streams) <= 2147483647:
         print("ERROR: PEER_PROXY_MAX_STREAMS must be a positive 32-bit integer", file=sys.stderr)
         return 1

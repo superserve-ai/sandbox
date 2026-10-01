@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,9 +14,16 @@ import (
 type authzFailure struct {
 	Status  int
 	Message string
+	Code    string
 }
 
 func (f *authzFailure) write(w http.ResponseWriter) {
+	if f.Code != "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.Status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": f.Code, "message": f.Message}})
+		return
+	}
 	http.Error(w, f.Message, f.Status)
 }
 
@@ -44,17 +52,20 @@ func (h *Handler) authorizeSandboxRequest(
 			return InstanceInfo{}, &authzFailure{
 				Status:  http.StatusNotFound,
 				Message: "sandbox not found",
+				Code:    "sandbox_route_stale",
 			}
 		}
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusServiceUnavailable,
 			Message: "sandbox unavailable",
+			Code:    "sandbox_unavailable",
 		}
 	}
 	if info.Status != "running" {
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusServiceUnavailable,
 			Message: fmt.Sprintf("sandbox is %s", info.Status),
+			Code:    "sandbox_unavailable",
 		}
 	}
 

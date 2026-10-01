@@ -63,12 +63,13 @@ type Handler struct {
 	// are equivalent for validation — the proxy only checks whether a
 	// Host ends in one of them and echoes the Host back, it never picks
 	// one to construct a URL from.
-	domains      []string
-	resolver     Resolver
-	transports   *transportCache
-	sandboxConns *connLimiter
-	ipConns      *connLimiter
-	log          zerolog.Logger
+	domains            []string
+	resolver           Resolver
+	transports         *transportCache
+	sandboxConns       *connLimiter
+	ipConns            *connLimiter
+	authenticatedConns *connLimiter
+	log                zerolog.Logger
 	// recorder receives per-exec latency phases; nil (the default) records
 	// nothing. Set via WithTelemetry.
 	recorder telemetry.Recorder
@@ -135,12 +136,13 @@ func (h *Handler) WithTelemetry(r telemetry.Recorder) *Handler {
 
 func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handler {
 	h := &Handler{
-		domains:      domains,
-		resolver:     resolver,
-		transports:   newTransportCache(),
-		sandboxConns: newConnLimiter(maxConnsPerSandbox),
-		ipConns:      newConnLimiter(maxConnsPerIP),
-		log:          log,
+		domains:            domains,
+		resolver:           resolver,
+		transports:         newTransportCache(),
+		sandboxConns:       newConnLimiter(maxConnsPerSandbox),
+		ipConns:            newConnLimiter(maxConnsPerIP),
+		authenticatedConns: newConnLimiter(1024),
+		log:                log,
 	}
 	return h
 }
