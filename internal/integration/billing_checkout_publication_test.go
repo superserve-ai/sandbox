@@ -413,3 +413,24 @@ func TestIntegration_BillingCheckoutPublicationWithoutEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestIntegration_BillingCheckoutPublicationRejectsExplicitUnmatchedGeneration(t *testing.T) {
+	tx := localIdentityTransaction(t, false)
+	defer tx.Rollback(context.Background())
+	actor, team, intent := uuid.New(), uuid.New(), uuid.New()
+	rolloutExec(t, tx, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+	rolloutExec(t, tx, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "example-team-"+team.String())
+	rolloutExec(t, tx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
+	rolloutExec(t, tx, `SELECT begin_stripe_checkout_with_publication_decision($1,$2,$3,'use','request','publication_failed',$4)`, team, actor, intent, uuid.New())
+	var generation time.Time
+	if err := tx.QueryRow(context.Background(), `SELECT checkout_initializing_at FROM team_billing_account WHERE team_id=$1`, team).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	if err := tx.QueryRow(context.Background(), `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,'unmatched-generation','subscription',$3,true)`, team, actor, generation.Add(time.Second)).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "authority_unavailable" {
+		t.Fatalf("explicit unmatched generation fell through to legacy credit lookup: %s", state)
+	}
+}

@@ -1040,24 +1040,6 @@ func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (strin
 // Tables without a primary key fall back to DO NOTHING with a warning;
 // validate's per-row checksums remain the backstop either way.
 func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
-	if t.name == "team_billing_account" {
-		// Insert-only retries can encounter conflicting authority. Count parity
-		// alone must not publish customer routing before that conflict is found.
-		for _, name := range []string{"stripe_checkout_publication_decision", "stripe_checkout_publication_subscription"} {
-			spec, _ := tableByName(name)
-			source, err := rowChecksums(ctx, src, spec, teamID, nil)
-			if err != nil {
-				return 0, 0, err
-			}
-			target, err := rowChecksums(ctx, dst, spec, teamID, nil)
-			if err != nil {
-				return 0, 0, err
-			}
-			if sourceOnly, targetOnly := diffChecksums(source, target); sourceOnly+targetOnly != 0 {
-				return 0, 0, fmt.Errorf("%s: content drift before billing account publication", name)
-			}
-		}
-	}
 	selectQ := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.effectiveCopyScope())
 	conflict, err := conflictClause(ctx, dst, t.name)
 	if err != nil {
@@ -1081,6 +1063,9 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 		}
 		payload, err := json.Marshal(batch)
 		if err != nil {
+			return err
+		}
+		if err := verifyRetainedBatch(ctx, dst, t.name, batch); err != nil {
 			return err
 		}
 		tag, err := dst.Exec(ctx, insertQ, payload)
@@ -1116,6 +1101,21 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 	}
 	if err := flush(); err != nil {
 		return copied, 0, err
+	}
+	if retainedAfterPurgeTables[t.name] {
+		// The source row count is already known from the streaming copy. A
+		// single destination count catches destination-only retained rows
+		// without another historical JSON checksum pass; differing rows with
+		// matching keys were checked by verifyRetainedBatch above.
+		var destinationRows int64
+		if err := dst.QueryRow(ctx,
+			fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.effectiveCopyScope()), teamID).
+			Scan(&destinationRows); err != nil {
+			return copied, 0, fmt.Errorf("count retained %s rows: %w", t.name, err)
+		}
+		if destinationRows != total {
+			return copied, 0, fmt.Errorf("%s: content drift before billing account publication", t.name)
+		}
 	}
 	return copied, total - copied, nil
 }

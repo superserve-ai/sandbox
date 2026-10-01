@@ -104,6 +104,104 @@ func diffChecksums(src, dst map[string]int) (srcOnly, dstOnly int) {
 	return srcOnly, dstOnly
 }
 
+// verifyRetainedBatch checks immutable publication rows that already exist in
+// the destination while copyTable is streaming the source. The join is keyed
+// by each table's primary key, so a retry probes at most one bounded copy
+// batch through the destination index instead of rescanning all retained
+// generations and decoding/hash-canonicalizing them a second time.
+func verifyRetainedBatch(ctx context.Context, dst *pgxpool.Pool, table string, batch []json.RawMessage) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	payload, err := json.Marshal(batch)
+	if err != nil {
+		return err
+	}
+	var query string
+	switch table {
+	case "stripe_checkout_publication_decision":
+		query = `SELECT to_jsonb(t) FROM stripe_checkout_publication_decision t
+			JOIN jsonb_to_recordset($1::jsonb) AS incoming(team_id uuid, checkout_generation timestamptz)
+			  ON incoming.team_id=t.team_id AND incoming.checkout_generation=t.checkout_generation`
+	case "stripe_checkout_publication_subscription":
+		query = `SELECT to_jsonb(t) FROM stripe_checkout_publication_subscription t
+			JOIN jsonb_to_recordset($1::jsonb) AS incoming(team_id uuid, subscription_id text)
+			  ON incoming.team_id=t.team_id AND incoming.subscription_id=t.subscription_id`
+	default:
+		return nil
+	}
+
+	source := make(map[string]string, len(batch))
+	for _, raw := range batch {
+		key, err := retainedAuthorityKey(table, raw)
+		if err != nil {
+			return err
+		}
+		hash, err := checksumRow(table, raw, nil)
+		if err != nil {
+			return err
+		}
+		source[key] = hash
+	}
+	rows, err := dst.Query(ctx, query, payload)
+	if err != nil {
+		return fmt.Errorf("check immutable %s batch: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw json.RawMessage
+		if err := rows.Scan(&raw); err != nil {
+			return err
+		}
+		key, err := retainedAuthorityKey(table, raw)
+		if err != nil {
+			return err
+		}
+		hash, err := checksumRow(table, raw, nil)
+		if err != nil {
+			return err
+		}
+		if source[key] != hash {
+			return fmt.Errorf("%s: content drift before billing account publication", table)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func retainedAuthorityKey(table string, raw json.RawMessage) (string, error) {
+	var row map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&row); err != nil {
+		return "", err
+	}
+	teamID, ok := row["team_id"].(string)
+	if !ok || teamID == "" {
+		return "", fmt.Errorf("%s row has no team_id", table)
+	}
+	var suffix string
+	switch table {
+	case "stripe_checkout_publication_decision":
+		var ok bool
+		suffix, ok = row["checkout_generation"].(string)
+		if !ok || suffix == "" {
+			return "", fmt.Errorf("%s row has no checkout_generation", table)
+		}
+	case "stripe_checkout_publication_subscription":
+		var ok bool
+		suffix, ok = row["subscription_id"].(string)
+		if !ok || suffix == "" {
+			return "", fmt.Errorf("%s row has no subscription_id", table)
+		}
+	default:
+		return "", fmt.Errorf("unsupported retained table %s", table)
+	}
+	return teamID + "\x00" + suffix, nil
+}
+
 // contentDriftUnderLock re-compares the mutation-prone tables — sandbox
 // rows and secret bindings — between the locked source transaction and the
 // dest, transform-aware, so purge's deletes act on exactly the rows

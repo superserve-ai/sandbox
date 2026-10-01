@@ -123,7 +123,7 @@ CREATE OR REPLACE FUNCTION reserve_stripe_promotion_with_device(p_team_id uuid, 
     p_event_id text, p_subscription_id text, p_checkout_generation timestamptz,
     p_has_checkout_generation boolean)
 RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-DECLARE v_decision text; v_result text; v_fingerprint text; v_publication_failed boolean; v_actor_conflict boolean;
+DECLARE v_decision text; v_result text; v_fingerprint text; v_publication_failed boolean; v_actor_conflict boolean; v_generation_found boolean;
 BEGIN
     SET LOCAL lock_timeout = '5s';
     -- Release holds this lock while clearing the reservation; the replay check must follow it.
@@ -134,6 +134,17 @@ BEGIN
           AND stripe_activation_credit_reservation_event_id IS NOT DISTINCT FROM p_event_id) THEN
         RETURN reserve_stripe_promotion_for_subscription_event_state_without_device(p_team_id, p_user_id,
             p_event_id, p_subscription_id, p_checkout_generation, p_has_checkout_generation);
+    END IF;
+    -- An explicitly supplied generation must resolve to its own immutable
+    -- record once this team has publication history. Never fall through to
+    -- legacy evidence lookup for an unknown generation: a callback with a
+    -- stale or fabricated generation is not proof of credit eligibility.
+    IF p_has_checkout_generation THEN
+        SELECT EXISTS (SELECT 1 FROM stripe_checkout_publication_decision
+            WHERE team_id=p_team_id AND checkout_generation=p_checkout_generation)
+            INTO v_generation_found;
+    ELSE
+        v_generation_found := false;
     END IF;
     -- The immutable generation decision is checked under the reservation user
     -- lock and before any identity/device lookup. Existing financial obligations
@@ -169,6 +180,14 @@ BEGIN
         RETURN 'authority_unavailable';
     END IF;
     IF v_actor_conflict THEN RETURN 'ineligible'; END IF;
+    IF p_has_checkout_generation AND NOT v_generation_found
+       AND EXISTS (SELECT 1 FROM stripe_checkout_publication_decision WHERE team_id=p_team_id) THEN
+        IF EXISTS (SELECT 1 FROM team_billing_account
+            WHERE team_id=p_team_id AND stripe_activation_credit_reserved_at IS NOT NULL) THEN
+            RETURN 'blocked';
+        END IF;
+        RETURN 'authority_unavailable';
+    END IF;
     IF NOT p_has_checkout_generation AND p_subscription_id IS NOT NULL
        AND EXISTS (SELECT 1 FROM stripe_checkout_publication_decision WHERE team_id=p_team_id)
        AND NOT EXISTS (SELECT 1 FROM stripe_checkout_publication_subscription
