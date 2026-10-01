@@ -46,6 +46,7 @@ func TestIntegration_InvoiceAutomaticEnrollment(t *testing.T) {
 		wrongMeter, inactivePrice bool
 		change                    string
 		reads                     int
+		resumesAt                 int64
 	}
 	var mu sync.Mutex
 	subs := map[string]*providerSub{"sub_" + team.String(): {}}
@@ -115,7 +116,7 @@ func TestIntegration_InvoiceAutomaticEnrollment(t *testing.T) {
 				}
 			}
 			if r.Method == http.MethodPost {
-				if r.Form.Get("pause_collection[behavior]") != "keep_as_draft" {
+				if r.Form.Get("pause_collection[behavior]") != "keep_as_draft" || r.Form.Has("pause_collection[resumes_at]") {
 					t.Error("invalid hold")
 				}
 				sub.held = true
@@ -142,7 +143,7 @@ func TestIntegration_InvoiceAutomaticEnrollment(t *testing.T) {
 			}
 			out = map[string]any{"id": id, "customer": customer, "status": status, "items": map[string]any{"data": items, "has_more": false}}
 			if sub.held {
-				out.(map[string]any)["pause_collection"] = map[string]any{"behavior": "keep_as_draft"}
+				out.(map[string]any)["pause_collection"] = map[string]any{"behavior": "keep_as_draft", "resumes_at": sub.resumesAt}
 			}
 		case r.URL.Path == "/v1/subscription_items":
 			sub := subs[r.Form.Get("subscription")]
@@ -361,6 +362,18 @@ func TestIntegration_InvoiceAutomaticEnrollment(t *testing.T) {
 		if !s.held || !s.item || s.holds != 1 || s.adds != 1 {
 			t.Fatalf("restored mapping duplicated mutation: %+v", s)
 		}
+	}
+	timed, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	addPricing(timed.String())
+	mu.Lock()
+	subs["sub_"+timed.String()] = &providerSub{held: true, item: true, resumesAt: time.Now().Add(time.Hour).Unix()}
+	mu.Unlock()
+	if worked, err := handler().InvoiceEnrollmentTickForTest(t.Context()); !worked || err == nil || !strings.Contains(err.Error(), "hold was not retained") {
+		t.Fatalf("scheduled resume accepted as indefinite hold: %v %v", worked, err)
+	}
+	var committed bool
+	if err := testPool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM billing_invoice_account WHERE team_id=$1)`, timed).Scan(&committed); err != nil || committed {
+		t.Fatalf("scheduled hold enrollment committed: %v %v", committed, err)
 	}
 }
 

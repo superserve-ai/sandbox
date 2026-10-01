@@ -163,7 +163,7 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 		if countItems(s) != 1 {
 			return a, fmt.Errorf("rounding item changed before collection hold")
 		}
-		if err = c.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(a.Subscription), url.Values{"pause_collection[behavior]": {"keep_as_draft"}, "pause_collection[resumes_at]": {""}}, nil, ""); err != nil {
+		if err = c.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(a.Subscription), url.Values{"pause_collection[behavior]": {"keep_as_draft"}}, nil, ""); err != nil {
 			return a, err
 		}
 		s, err = c.invoiceSubscription(ctx, a.Subscription)
