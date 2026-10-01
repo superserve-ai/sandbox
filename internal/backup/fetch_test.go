@@ -693,3 +693,64 @@ func TestHostBaseResolvesOnceUnderConcurrentCallers(t *testing.T) {
 		t.Fatalf("materialized the base %d times, want once", clones)
 	}
 }
+
+// Materializing a base is shared between callers, so one caller's
+// cancellation can be reported to another whose own context is live. That
+// must not cost the complete restore already on disk.
+func TestFetchGenerationKeepsARestoreWhenAnotherCallersResolutionIsCancelled(t *testing.T) {
+	stubClone(t, copyClone)
+	store := newMemBlobs()
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writePauseFixture(t, dir, "pause A")
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+
+	dest := filepath.Join(t.TempDir(), task.SandboxID)
+	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A restore holding no copy of its base, so resolving it has to
+	// materialize one and will join the flight held below.
+	own := filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))
+	if err := os.Remove(own); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another caller owns the materialization and its context dies.
+	release := make(chan struct{})
+	leading := make(chan struct{})
+	go func() {
+		close(leading)
+		_, _, _ = stagingFlights.Do(own, func() (any, error) {
+			<-release
+			return "", context.Canceled
+		})
+	}()
+	<-leading
+	// The bucket is unreachable for this caller, so the local restore is
+	// the only copy there is: clearing it would be unrecoverable.
+	offline := breakingReader{inner: store, named: ""}
+	done := make(chan error, 1)
+	go func() {
+		_, err := FetchGeneration(context.Background(), offline, task.SandboxID, task.Generation, dest, nil)
+		done <- err
+	}()
+	// Long enough for the joining caller to reach the held flight; if it
+	// misses, it leads its own and succeeds, which this test also allows.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want either success or the shared cancellation", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, ManifestObject)); err != nil {
+		t.Fatalf("the complete restore was discarded: %v", err)
+	}
+}

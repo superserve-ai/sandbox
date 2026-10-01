@@ -153,8 +153,17 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 	// would materialize and hash gigabytes inside the fetch budget, for a
 	// directory the clear below is about to remove.
 	if m, err := RestoredGeneration(destDir); err == nil && m.Generation == generation && manifestOwner(m) == owner {
-		if done, err := RestoredDisk(ctx, destDir); err == nil {
+		done, err := RestoredDisk(ctx, destDir)
+		if err == nil {
 			return done, nil
+		}
+		// A resolution the context cut short establishes nothing, and the
+		// materialization of a base is shared, so the cancellation may
+		// belong to another caller entirely while this one's context is
+		// still live. Either way the clear below would trade a complete
+		// local restore for a fetch that may not be possible at all.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return Restored{}, err
 		}
 	}
 	// A reuse check the context cut short establishes nothing about what
