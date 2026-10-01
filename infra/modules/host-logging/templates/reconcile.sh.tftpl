@@ -75,19 +75,19 @@ systemctl is-active --quiet superserve-host-logging-queue-guard.service 2>/dev/n
 
 rollback() {
   local rc=$?
-  [ "${activation_committed:-0}" -eq 1 ] && { cleanup; exit "$rc"; }
-  if [ "${changed_binary:-0}" -eq 1 ]; then restore_one binary "$binary"; fi
-  if [ "${changed_config:-0}" -eq 1 ]; then restore_one config "$active_config"; fi
-  if [ "${changed_service:-0}" -eq 1 ]; then restore_one service "$active_service"; fi
-  if [ "${changed_dropin:-0}" -eq 1 ]; then restore_one dropin "$dropin"; fi
-  if [ "${changed_identity_env:-0}" -eq 1 ]; then restore_one identity_env "$identity_env"; fi
-  if [ "${changed_heartbeat_service:-0}" -eq 1 ]; then restore_one heartbeat_service "$heartbeat_service"; fi
-  if [ "${changed_heartbeat_timer:-0}" -eq 1 ]; then restore_one heartbeat_timer "$heartbeat_timer"; fi
-  if [ "${changed_queue_guard_service:-0}" -eq 1 ]; then restore_one queue_guard_service "$queue_guard_service"; fi
+  [ "$${activation_committed:-0}" -eq 1 ] && { cleanup; exit "$rc"; }
+  if [ "$${changed_binary:-0}" -eq 1 ]; then restore_one binary "$binary"; fi
+  if [ "$${changed_config:-0}" -eq 1 ]; then restore_one config "$active_config"; fi
+  if [ "$${changed_service:-0}" -eq 1 ]; then restore_one service "$active_service"; fi
+  if [ "$${changed_dropin:-0}" -eq 1 ]; then restore_one dropin "$dropin"; fi
+  if [ "$${changed_identity_env:-0}" -eq 1 ]; then restore_one identity_env "$identity_env"; fi
+  if [ "$${changed_heartbeat_service:-0}" -eq 1 ]; then restore_one heartbeat_service "$heartbeat_service"; fi
+  if [ "$${changed_heartbeat_timer:-0}" -eq 1 ]; then restore_one heartbeat_timer "$heartbeat_timer"; fi
+  if [ "$${changed_queue_guard_service:-0}" -eq 1 ]; then restore_one queue_guard_service "$queue_guard_service"; fi
   systemctl daemon-reload >/dev/null 2>&1 || true
-  if [ "$service_was_active" -eq 1 ]; then
+  if [ "$${activation_started:-0}" -eq 1 ] && [ "$service_was_active" -eq 1 ]; then
     systemctl restart superserve-otel-logs.service >/dev/null 2>&1 || true
-  else
+  elif [ "$${activation_started:-0}" -eq 1 ]; then
     systemctl stop superserve-otel-logs.service >/dev/null 2>&1 || true
   fi
   if [ "$timer_was_active" -eq 1 ]; then
@@ -115,12 +115,14 @@ changed_identity_env=0
 changed_heartbeat_service=0
 changed_heartbeat_timer=0
 changed_queue_guard_service=0
+activation_started=0
 
-used=$(du -sb "$queue" "$cursor" 2>/dev/null | awk '{total += $1} END {print total + 0}') || used=0
-allowance=$((used + used / 10 + 65536))
-test "$allowance" -le '${otel_queue_max_bytes}'
+# Admission is enforced by the bounded persistent exporter queue and the
+# host filesystem free-space reserve; avoid an unbounded recursive queue scan
+# in reconciliation.
 free=$(df -Pk "$state_dir" 2>/dev/null | awk 'NR==2 {print $4 * 1024}')
-test -n "$free" && test "$free" -ge '${journal_keep_free_bytes}'
+queue_reserve=$(( ${journal_keep_free_bytes} + ${otel_queue_max_bytes} ))
+test -n "$free" && test "$free" -ge "$queue_reserve"
 
 # Validate the candidate with the exact release before changing active state.
 stage="$attempt/stage"
@@ -171,12 +173,16 @@ After=superserve-otel-logs.service
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'while :; do used=\$(du -sb "$queue" "$cursor" 2>/dev/null | awk "{t += \\\$1} END {print t + 0}"); allowance=\$((used + used / 10 + 65536)); if [ "\$allowance" -gt ${otel_queue_max_bytes} ]; then logger -t superserve-otel-logs -p warning "queue_full retained_bytes=\$used budget=${otel_queue_max_bytes}"; systemctl stop superserve-otel-logs.service; exit 1; fi; sleep 2; done'
+ExecStart=/bin/sh -c 'while :; do free=\$(df -Pk "${state_dir}" 2>/dev/null | awk "NR==2 {print \\$4 * 1024}"); reserve=$(( ${journal_keep_free_bytes} + ${otel_queue_max_bytes} )); if [ -z "\$free" ] || [ "\$free" -lt "\$reserve" ]; then logger -t superserve-otel-logs -p warning "queue_full free_bytes=\$${free:-0} reserve=\$reserve"; fi; sleep 15; done'
 Restart=always
-RestartSec=2s
+RestartSec=15s
+CPUQuota=5%
+MemoryMax=32M
+Nice=19
+IOSchedulingClass=idle
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=${cursor} ${queue}
+ReadWritePaths=${cursor_dir} ${queue_dir}
 
 [Install]
 WantedBy=multi-user.target
@@ -230,6 +236,7 @@ systemctl enable superserve-otel-logs.service >/dev/null
 systemctl enable superserve-host-logging-heartbeat.timer >/dev/null
 systemctl enable superserve-host-logging-queue-guard.service >/dev/null
 if [ "$changed_binary" -eq 1 ] || [ "$changed_config" -eq 1 ] || [ "$changed_service" -eq 1 ] || [ "$service_was_active" -eq 0 ]; then
+  activation_started=1
   systemctl restart superserve-otel-logs.service
 fi
 systemctl is-active --quiet superserve-otel-logs.service

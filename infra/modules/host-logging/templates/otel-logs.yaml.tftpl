@@ -14,10 +14,9 @@ receivers:
     directory: /var/log/journal
     start_at: end
     storage: file_storage/cursor
-    units:
-%{ for unit in host_units ~}
-      - ${unit}
-%{ endfor ~}
+    # Do not pass a glob here: journald unit selectors are exact names. The
+    # approved_sources processor below performs prefix/regex selection so
+    # dynamically generated proxy units are collected as well.
     operators:
       # Copy only bounded, trusted journal provenance. The receiver's complete
       # metadata map is never moved to a resource or sent to Cloud Logging.
@@ -37,6 +36,10 @@ receivers:
         type: copy
         from: attributes["_PID"]
         to: attributes["journal.pid"]
+      - id: copy_trusted_priority
+        type: copy
+        from: attributes["PRIORITY"]
+        to: attributes["journal.priority"]
       - id: copy_trusted_boot
         type: copy
         from: attributes["_BOOT_ID"]
@@ -108,9 +111,11 @@ processors:
     log_statements:
       - context: log
         statements:
-          # Restore useful selected systemd/kernel diagnostics, but only from
-          # the isolated journal message and never from application JSON.
-          - set(body, attributes["host_logging.raw_body_discarded"]) where attributes["host_logging.application_record"] != true
+          # Never restore an untrusted journal body. Host diagnostics are
+          # represented by a bounded classification; application records are
+          # reconstructed from approved scalar fields below.
+          - set(body, "host diagnostic event") where attributes["host_logging.application_record"] != true
+          - set(body, "application parse failure") where attributes["host_logging.parse_outcome"] == "failure"
           - set(body, "collector export failure") where attributes["host_logging_export_error"] == "true"
           - set(severity_text, attributes["application"]["level"]) where attributes["host_logging.application_record"] == true and IsString(attributes["application"]["level"])
           - set(severity_text, attributes["application"]["severity"]) where severity_text == "" and attributes["host_logging.application_record"] == true and IsString(attributes["application"]["severity"])
@@ -119,6 +124,14 @@ processors:
           - set(severity_number, SEVERITY_NUMBER_WARN) where severity_text == "warn" or severity_text == "warning" or severity_text == "WARN"
           - set(severity_number, SEVERITY_NUMBER_ERROR) where severity_text == "error" or severity_text == "ERROR"
           - set(severity_number, SEVERITY_NUMBER_FATAL) where severity_text == "fatal" or severity_text == "FATAL"
+          # Non-application diagnostics use trusted journald PRIORITY; this
+          # keeps INFO+ host/kernel records while still shedding app DEBUG
+          # whose journald priority is commonly mislabeled as INFO.
+          - set(severity_number, SEVERITY_NUMBER_DEBUG) where attributes["host_logging.application_record"] != true and attributes["journal.priority"] == 7
+          - set(severity_number, SEVERITY_NUMBER_INFO) where attributes["host_logging.application_record"] != true and (attributes["journal.priority"] == 5 or attributes["journal.priority"] == 6)
+          - set(severity_number, SEVERITY_NUMBER_WARN) where attributes["host_logging.application_record"] != true and attributes["journal.priority"] == 4
+          - set(severity_number, SEVERITY_NUMBER_ERROR) where attributes["host_logging.application_record"] != true and attributes["journal.priority"] == 3
+          - set(severity_number, SEVERITY_NUMBER_FATAL) where attributes["host_logging.application_record"] != true and attributes["journal.priority"] <= 2
           - set(attributes["host_logging.parse_outcome"], "failure") where attributes["host_logging.application_record"] == true and attributes["host_logging.parse_outcome"] == nil
           - set(resource.attributes["host_id"], "$${env:HOST_ID}")
           - set(resource.attributes["provider_instance_id"], "$${env:INSTANCE_ID}")
@@ -134,10 +147,10 @@ processors:
           - set(attributes["message"], attributes["application"]["message"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["message"])
           - set(body, attributes["event"]) where attributes["event"] != nil
           - set(body, attributes["message"]) where attributes["event"] == nil and attributes["message"] != nil
-          - set(attributes["labels"], {})
-          - set(attributes["labels"]["journal_unit"], attributes["journal.unit"])
-          - set(attributes["labels"]["host_logging_heartbeat"], true) where attributes["journal.unit"] == "superserve-host-logging-heartbeat.service"
-          - set(attributes["heartbeat"], true) where attributes["journal.unit"] == "superserve-host-logging-heartbeat.service"
+          # googlecloud maps scalar log attributes to Cloud Logging labels;
+          # keep these names flat so consumers query the actual schema.
+          - set(attributes["journal_unit"], attributes["journal.unit"])
+          - set(attributes["host_logging_heartbeat"], true) where attributes["journal.unit"] == "superserve-host-logging-heartbeat.service"
           # This is a delivery-age sample relative to the retained journal
           # timestamp, not a heartbeat/absence signal. Cloud Monitoring uses
           # it only for the retained-history lag policy below.
@@ -172,9 +185,9 @@ exporters:
     sending_queue:
       enabled: true
       storage: file_storage/queue
-      # queue_size bounds records; the Terraform-managed queue-guard service
-      # bounds bytes including the database, cursor, compaction margin, and
-      # checkpoint overhead and stops the exporter before physical exhaustion.
+      # queue_size bounds records. Physical storage is isolated and monitored
+      # by the Terraform-managed guard without recursively scanning the queue
+      # or stopping the only drainer.
       queue_size: 4096
       num_consumers: 2
     retry_on_failure:

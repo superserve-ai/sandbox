@@ -33,7 +33,6 @@ locals {
       "superserve-host-logging-heartbeat.service",
       "proxy.service",
       "proxy-generation.service",
-      "proxy-*.service",
     ], host.proxy_units)
   ]))
 

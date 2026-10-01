@@ -4,6 +4,9 @@ locals {
     for key, host in var.host_logging_alerts.expected_hosts : key => host
     if try(host.active, true)
   } : {}
+  active_host_logging_incarnations = {
+    for key, host in local.active_host_logging_alerts : key => coalesce(host.incarnation, "unknown")
+  }
 }
 
 # A host-generated minute heartbeat is converted to a logs-based metric. The
@@ -16,7 +19,7 @@ resource "google_logging_metric" "host_logging_heartbeat" {
 
   project = var.project_id
   name    = "superserve_host_logging_heartbeat_${each.key}"
-  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\""
+  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.incarnation=\"${local.active_host_logging_incarnations[each.key]}\""
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -27,6 +30,11 @@ resource "google_logging_metric" "host_logging_heartbeat" {
       value_type  = "STRING"
       description = "Stable VM identity for the active host incarnation."
     }
+    labels {
+      key         = "incarnation"
+      value_type  = "STRING"
+      description = "Expected serving-host incarnation from the trusted log payload."
+    }
   }
 
   label_extractors = {
@@ -35,6 +43,7 @@ resource "google_logging_metric" "host_logging_heartbeat" {
     # producer, metric, inventory, and alert matching. Runtime host_id,
     # instance name, and incarnation remain separate log labels.
     collector_host_id = "EXTRACT(resource.labels.instance_id)"
+    incarnation       = "EXTRACT(labels.incarnation)"
   }
 }
 
@@ -61,7 +70,7 @@ resource "google_monitoring_alert_policy" "host_logging_export_failures" {
   conditions {
     display_name = "OTel logs export errors on ${each.value.instance_name}"
     condition_matched_log {
-      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND (jsonPayload.host_logging_export_error=\"true\" OR jsonPayload.message =~ \"(?i)(export failed|permission denied|\\bdrop\\b|\\bdropped\\b)\")"
+      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND (labels.host_logging_export_error=\"true\" OR labels.message =~ \"(?i)(export failed|permission denied|\\bdrop\\b|\\bdropped\\b)\" OR textPayload =~ \"(?i)(export failed|permission denied|\\bdrop\\b|\\bdropped\\b)\")"
     }
   }
 
@@ -147,8 +156,8 @@ resource "google_logging_metric" "host_logging_delivery_lag" {
 
   project         = var.project_id
   name            = "superserve_host_logging_delivery_lag_${each.key}"
-  filter          = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND jsonPayload.host_logging_retained_history_lag_seconds:*"
-  value_extractor = "EXTRACT(jsonPayload.host_logging_retained_history_lag_seconds)"
+  filter          = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.host_logging_retained_history_lag_seconds:*"
+  value_extractor = "EXTRACT(labels.host_logging_retained_history_lag_seconds)"
 
   metric_descriptor {
     metric_kind = "GAUGE"
@@ -157,9 +166,11 @@ resource "google_logging_metric" "host_logging_delivery_lag" {
   }
 }
 
-# The standalone metrics collector's self metric is independent of the OTel
-# logs export path. A broken exporter therefore cannot make this absence
-# signal appear healthy.
+# This policy is driven by the logs-based heartbeat metric above, not the
+# standalone metrics collector. Missing or never-seen log heartbeats therefore
+# remain visible even while metrics continue to report healthy. The
+# heartbeat_metric_type input is retained for configuration compatibility but
+# is intentionally not used as the absence source.
 resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   for_each = local.active_host_logging_alerts
 
@@ -179,15 +190,14 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   conditions {
     display_name = "Serving host heartbeat absent on ${each.value.instance_name}"
     condition_prometheus_query_language {
-      # PromQL absent() returns an explicit one-valued result when the
-      # expected label set has never produced a series. Metric-absence and
-      # missing-data policies cannot create that initial series. The selector
-      # uses the standalone collector's independent identity, so log export
-      # failure cannot satisfy or silence this condition.
+      # PromQL absent() returns an explicit one-valued result when the expected
+      # log heartbeat series has never produced a point. The incarnation label
+      # prevents stale replay or a replacement host from satisfying this one.
       query                     = <<-EOT
         absent({
-          "__name__" = "${var.host_logging_alerts.heartbeat_metric_type}",
-          "collector_host_id" = "${coalesce(each.value.collector_host_id, each.value.instance_name)}"
+          "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_heartbeat[each.key].name}",
+          "collector_host_id" = "${each.value.instance_id}",
+          "incarnation" = "${local.active_host_logging_incarnations[each.key]}"
         }) == 1
       EOT
       duration                  = var.host_logging_alerts.heartbeat_duration
@@ -197,7 +207,7 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   }
 
   documentation {
-    content   = "The standalone metrics collector heartbeat for ${each.value.instance_name} was absent. This metric is delivered on the existing application-metrics path, separately from OTel log export, so a broken exporter cannot satisfy the expected-host signal.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_heartbeat", "")}"
+    content   = "The expected OTel host-log heartbeat for ${each.value.instance_name} was absent or stale. This signal is derived from Cloud Logging receipt and remains independent of the application-metrics collector.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_heartbeat", "")}"
     mime_type = "text/markdown"
   }
 

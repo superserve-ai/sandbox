@@ -86,14 +86,13 @@ systemctl is-active --quiet superserve-otel-logs.service 2>/dev/null || mark_div
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer 2>/dev/null || mark_diverged
 systemctl is-active --quiet superserve-host-logging-queue-guard.service 2>/dev/null || mark_diverged
 
-# Include queue database, cursor/checkpoint files, compaction margin, and
-# collector bookkeeping. Validation never creates or repairs these paths.
+# Validate the filesystem reserve without recursively walking queue files.
+# The queue itself remains persistent and is bounded by the collector's
+# admission limit; validation never creates or repairs state.
 if [ -d "$queue" ] && [ -d "$cursor" ]; then
-  used=$(du -sb "$queue" "$cursor" 2>/dev/null | awk '{total += $1} END {print total + 0}') || unreadable=1
-  allowance=$((used + used / 10 + 65536))
-  [ "$allowance" -le '${otel_queue_max_bytes}' ] || mark_diverged
   free=$(df -Pk "$state_dir" 2>/dev/null | awk 'NR==2 {print $4 * 1024}') || unreadable=1
-  [ -n "${free:-}" ] && [ "$free" -ge '${journal_keep_free_bytes}' ] || mark_diverged
+  reserve=$(( ${journal_keep_free_bytes} + ${otel_queue_max_bytes} ))
+  [ -n "$${free:-}" ] && [ "$free" -ge "$reserve" ] || mark_diverged
 fi
 
 [ "$unreadable" -eq 0 ] || exit 1
