@@ -206,7 +206,7 @@ func TestRetainedBaselineProvenance(t *testing.T) {
 	}
 	first := inventory(state)
 	baseline := first.Owners[0].Baseline
-	if baseline.Path != base || baseline.AllocatedBytes != 1<<20 || baseline.Generation != first.Owners[0].Generation {
+	if baseline.Path != base || baseline.AllocatedBytes != 1<<20 || baseline.Generation == first.Owners[0].Generation || len(baseline.Generation) != 64 {
 		t.Fatalf("baseline provenance = %#v, owner generation = %q", baseline, first.Owners[0].Generation)
 	}
 	if err := state.Close(); err != nil {
@@ -229,6 +229,101 @@ func TestRetainedBaselineProvenance(t *testing.T) {
 	third := inventory(reopened)
 	if third.Owners[0].Generation == first.Owners[0].Generation {
 		t.Fatal("replacement allocation reused the prior retained generation")
+	}
+	t.Run("private-owner-changes", testRetainedBaselineGenerationIgnoresPrivateOwnerChanges)
+}
+
+func testRetainedBaselineGenerationIgnoresPrivateOwnerChanges(t *testing.T) {
+	root := t.TempDir()
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	base := filepath.Join(root, "shared-rootfs.ext4")
+	diskA := filepath.Join(root, "a", "overlay.ext4")
+	diskB := filepath.Join(root, "b", "overlay.ext4")
+	for _, path := range []string{base, diskA, diskB} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("initial allocation"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstID, secondID := uuid.NewString(), uuid.NewString()
+	for _, rec := range []VMRecord{
+		{ID: firstID, SourceSnapshotID: uuid.NewString(), Status: StatusRunning, DiskPath: diskA, RootfsPath: base},
+		{ID: secondID, SourceSnapshotID: uuid.NewString(), Status: StatusRunning, DiskPath: diskB, RootfsPath: base},
+	} {
+		if err := state.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	measure := func(f *os.File, _ int) ([]retainedstorage.Extent, string, error) {
+		info, err := f.Stat()
+		if err != nil {
+			return nil, "", err
+		}
+		generation := "private"
+		if filepath.Clean(f.Name()) == filepath.Clean(base) {
+			generation = "baseline"
+		}
+		generation += ":" + strconv.FormatInt(info.Size(), 10)
+		return []retainedstorage.Extent{{Device: "fs", Start: 1 << 20, Length: 4096}}, generation, nil
+	}
+	inventory := func() *retainedstorage.Inventory {
+		t.Helper()
+		m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: filepath.Join(root, "snapshots")}}
+		inv, err := m.retainedStorageInventory(t.Context(), measure)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return inv
+	}
+	first := inventory()
+	if len(first.Owners) != 2 || first.Owners[0].Baseline == nil || first.Owners[1].Baseline == nil {
+		t.Fatalf("shared-baseline inventory = %#v", first.Owners)
+	}
+	if first.Owners[0].Baseline.Generation != first.Owners[1].Baseline.Generation {
+		t.Fatalf("shared baseline generations differ: %#v", first.Owners)
+	}
+	if first.Owners[0].Generation == first.Owners[1].Generation {
+		t.Fatal("private owner generations unexpectedly matched")
+	}
+	baselineGeneration := first.Owners[0].Baseline.Generation
+	var originalChangedGeneration string
+	for _, owner := range first.Owners {
+		if owner.ID == firstID {
+			originalChangedGeneration = owner.Generation
+		}
+	}
+	if err := os.WriteFile(diskA, []byte("private replacement with a new size"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second := inventory()
+	var changed, unchanged *retainedstorage.Owner
+	for i := range second.Owners {
+		if second.Owners[i].ID == firstID {
+			changed = &second.Owners[i]
+		} else {
+			unchanged = &second.Owners[i]
+		}
+	}
+	if changed == nil || unchanged == nil || changed.Baseline.Generation != baselineGeneration || unchanged.Baseline.Generation != baselineGeneration {
+		t.Fatalf("private replacement changed shared baseline provenance: %#v", second.Owners)
+	}
+	if changed.Generation == originalChangedGeneration {
+		t.Fatal("private replacement did not advance owner generation")
+	}
+	if err := os.WriteFile(base, []byte("baseline replacement with a new size"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	third := inventory()
+	for _, owner := range third.Owners {
+		if owner.Baseline == nil || owner.Baseline.Generation == baselineGeneration {
+			t.Fatalf("baseline replacement reused shared provenance: %#v", third.Owners)
+		}
 	}
 }
 

@@ -84,7 +84,14 @@ WITH bounds AS MATERIALIZED (
    COALESCE(b.path, s.base_path) baseline_path,
    b.generation baseline_generation,
    b.allocated_bytes baseline_allocated_bytes,
-   (s.template_id IS NOT NULL AND s.base_path IS NULL AND b.path IS NULL) unresolved_baseline
+   -- A post-cutover base_path without a persisted measured generation cannot
+   -- be matched safely to retained coverage.  Path equality alone is not
+   -- provenance: treating this as an empty generation would charge the
+   -- legacy manifest alongside the retained baseline.  Pre-cutover history
+   -- remains eligible for the legacy path-based union below.
+   ((s.template_id IS NOT NULL AND s.base_path IS NULL AND b.path IS NULL)
+    OR (i.team_cutover IS NOT NULL AND s.base_path IS NOT NULL AND b.path IS NULL
+        AND COALESCE(i.artifact_retention_end,i.request_now)>i.team_cutover)) unresolved_baseline
   FROM sandbox s
   JOIN legacy_intervals i ON i.sandbox_id=s.id
   LEFT JOIN LATERAL (
@@ -100,7 +107,9 @@ WITH bounds AS MATERIALIZED (
     AND COALESCE(i.artifact_retention_end,i.request_now)>p_start
 ), artifact_refs AS MATERIALIZED (
   SELECT a.interval_host_id,a.team_cutover,p.path,
-   CASE WHEN p.path=a.baseline_path THEN 'baseline:'||a.baseline_path||':'||COALESCE(a.baseline_generation,'')
+   CASE WHEN p.path=a.baseline_path THEN
+          CASE WHEN a.baseline_generation IS NULL THEN NULL
+               ELSE 'baseline:'||a.baseline_path||':'||a.baseline_generation END
         ELSE 'private:'||a.id::text||':'||p.path END allocation_identity,
    CASE WHEN p.path=a.baseline_path THEN COALESCE(a.baseline_allocated_bytes,am_snapshot.allocated_bytes,am_template.allocated_bytes)
         ELSE COALESCE(am_snapshot.allocated_bytes,am_template.allocated_bytes) END artifact_bytes,
@@ -158,7 +167,12 @@ WITH bounds AS MATERIALIZED (
 ), final_value AS (
   SELECT CASE WHEN EXISTS (
       SELECT 1 FROM artifact_refs WHERE range_end>range_start AND artifact_bytes IS NULL
-    ) OR EXISTS (SELECT 1 FROM artifact_bounds WHERE unresolved_baseline) THEN NULL::numeric
+    ) OR EXISTS (
+      SELECT 1 FROM artifact_bounds a
+      WHERE a.unresolved_baseline
+        AND GREATEST(a.billing_started_at,a.team_cutover,p_start)
+            < LEAST(COALESCE(a.retention_end,a.request_now),p_end)
+    ) THEN NULL::numeric
     ELSE (CASE WHEN p_floor_legacy_artifacts THEN FLOOR(artifacts.amount) ELSE artifacts.amount END)
       +overlays.amount+retained_storage_mib_seconds(p_team,p_start,p_end) END amount
   FROM artifacts,overlays

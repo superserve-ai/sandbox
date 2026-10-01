@@ -412,6 +412,7 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 		seen := map[string]bool{}
 		digest := sha256.New()
 		var baselineBytes int64
+		var baselineGeneration string
 		sort.Strings(paths)
 		for _, path := range paths {
 			if err := ctx.Err(); err != nil {
@@ -448,6 +449,12 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 			remaining -= len(extents)
 			owner.Extents = append(owner.Extents, extents...)
 			if baselinePath != "" && filepath.Clean(path) == filepath.Clean(baselinePath) {
+				// The shared baseline identity is derived solely from the
+				// authoritative allocation generation returned for that file.
+				// Do not fold private owner artifacts into this identity: their
+				// replacement must advance the owner generation without making
+				// a still-shared baseline look like a new allocation.
+				baselineGeneration = generation
 				for _, extent := range extents {
 					if baselineBytes > math.MaxInt64-extent.Length {
 						return fmt.Errorf("retained baseline allocation overflow")
@@ -460,7 +467,11 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 		}
 		owner.Generation = hex.EncodeToString(digest.Sum(nil))
 		if baselinePath != "" {
-			owner.Baseline = &retainedstorage.Baseline{Path: baselinePath, Generation: owner.Generation, AllocatedBytes: baselineBytes}
+			if baselineGeneration == "" {
+				return fmt.Errorf("retained baseline allocation generation unavailable")
+			}
+			baselineDigest := sha256.Sum256([]byte(baselineGeneration))
+			owner.Baseline = &retainedstorage.Baseline{Path: baselinePath, Generation: hex.EncodeToString(baselineDigest[:]), AllocatedBytes: baselineBytes}
 		}
 		inv.Owners = append(inv.Owners, owner)
 		return nil

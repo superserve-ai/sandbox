@@ -828,6 +828,54 @@ func TestRetainedStorageHistorySweepQualification(t *testing.T) {
 }
 
 func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
+	t.Run("missing-post-cutover-baseline-proof-fences-settlement", func(t *testing.T) {
+		f := newStorageReportFixture(t, "paused", false)
+		team := sandboxTeamID(t, f.sandboxID)
+		ctx := t.Context()
+		tx, err := testPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(context.Background())
+		exec := func(q string, args ...any) {
+			t.Helper()
+			if _, err := tx.Exec(ctx, q, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cutover := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+		start, retainedStart, end := cutover.Add(10*time.Second), cutover.Add(40*time.Second), cutover.Add(time.Minute)
+		legacyOwner := uuid.New()
+		snapshotA, snapshotB := uuid.New(), uuid.New()
+		const path = "/example/rollback-shared-rootfs.ext4"
+		exec(`UPDATE sandbox SET created_at=$2,base_path=$3 WHERE id=$1`, f.sandboxID, start, path)
+		exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,base_path,snapshot_id)
+ VALUES($1,$2,'rollback-legacy-owner','paused',$3,1,1024,2,$4,$5,NULL)`, legacyOwner, team, f.hostID, start, path)
+		exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES
+	 ($1,$2,$3,$4,'pause'),($5,$6,$3,$4,'pause')`, snapshotA, f.sandboxID, team, path, snapshotB, legacyOwner)
+		exec(`UPDATE sandbox SET snapshot_id=$2 WHERE id=$1`, f.sandboxID, snapshotA)
+		exec(`UPDATE sandbox SET snapshot_id=$2 WHERE id=$1`, legacyOwner, snapshotB)
+		exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
+ VALUES($1,'rootfs.ext4',$3,1048576,1048576,$4),($2,'rootfs.ext4',$3,1048576,1048576,$4)`, snapshotA, snapshotB, path, strings.Repeat("0", 64))
+		// Owner A has already established retained provenance. Owner B was
+		// created by rollback and has no sandbox_storage_baseline row; matching
+		// base_path strings are not generation proof.
+		exec(`INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover)
+		exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
+ VALUES($1,$2,$3,2,$4),($5,$2,$3,2,$4)`, f.sandboxID, team, f.hostID, start, legacyOwner)
+		exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,started_at)
+ VALUES($1,$2,$3,$4,$5,$6,$7)`, f.sandboxID, team, f.hostID, path, strings.Repeat("a", 64), 1048576, start)
+		exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at,baseline_path,baseline_generation,baseline_allocated_bytes)
+ VALUES($1,$2,'sandbox',$3,$4,'[{"device":"fs","start":0,"length":1048576}]',$5,$6,$7,$8,1048576)`, f.hostID, team, f.sandboxID, strings.Repeat("b", 64), retainedStart, end, path, strings.Repeat("a", 64))
+		var unknown bool
+		if err := tx.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false) IS NULL`, team, retainedStart, end).Scan(&unknown); err != nil {
+			t.Fatal(err)
+		}
+		if !unknown {
+			t.Fatal("post-cutover rollback owner without generation proof was billable")
+		}
+	})
+
 	for _, reassigned := range []bool{false, true} {
 		t.Run(fmt.Sprintf("reassigned-%t", reassigned), func(t *testing.T) {
 			f := newStorageReportFixture(t, "paused", false)
