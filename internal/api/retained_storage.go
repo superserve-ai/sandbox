@@ -21,6 +21,22 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 	if err != nil {
 		return err
 	}
+	// A full-copy template owner has a required shared baseline.  Without the
+	// verified path/generation object the observation is incomplete, not zero;
+	// keep the durable report retryable so settlement retains its fence.
+	var missingBaseline bool
+	if err := tx.QueryRow(ctx, `WITH supplied AS (
+  SELECT * FROM jsonb_to_recordset($1::jsonb) AS o(kind text,id uuid,baseline_path text)
+)
+SELECT EXISTS (
+  SELECT 1 FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
+  WHERE s.template_id IS NOT NULL AND s.base_path IS NULL AND o.baseline_path IS NULL
+)`, payload).Scan(&missingBaseline); err != nil {
+		return err
+	}
+	if missingBaseline {
+		return fmt.Errorf("%w: full-copy baseline provenance is unavailable", errStorageReportRetainedIncomplete)
+	}
 	// Lock only owners whose contribution is new or changed. A host-wide lock
 	// (or locking an unchanged fleet) would make a periodic inventory contend
 	// with unrelated pause/resume/destroy writes.
@@ -115,7 +131,7 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 		return fmt.Errorf("%w: retained inventory is incomplete or superseded", errStorageReportRetainedIncomplete)
 	}
 	_, err = tx.Exec(ctx, `WITH supplied AS MATERIALIZED (
-  SELECT * FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb)
+  SELECT * FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline_path text,baseline_generation text,baseline_allocated_bytes bigint)
  ), eligible AS MATERIALIZED (
   SELECT o.*,s.team_id,s.destroyed_at lifetime_end FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
   WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
@@ -149,16 +165,44 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
  ), closed AS (
   UPDATE retained_storage_interval i SET ended_at=$2 FROM current c WHERE i.id=c.interval_id
    AND c.old_started_at<$2
-   AND (c.old_generation IS DISTINCT FROM c.generation OR c.old_extents IS DISTINCT FROM c.extents)
+   AND (c.old_generation IS DISTINCT FROM c.generation OR c.old_extents IS DISTINCT FROM c.extents
+        OR i.baseline_path IS DISTINCT FROM c.baseline_path OR i.baseline_generation IS DISTINCT FROM c.baseline_generation
+        OR i.baseline_allocated_bytes IS DISTINCT FROM c.baseline_allocated_bytes)
   RETURNING i.id
  ), replaced AS (
-  UPDATE retained_storage_interval i SET generation=c.generation,extents=c.extents,ended_at=LEAST(c.lifetime_end,c.old_ended_at)
+  UPDATE retained_storage_interval i SET generation=c.generation,extents=c.extents,
+      baseline_path=c.baseline_path,baseline_generation=c.baseline_generation,
+      baseline_allocated_bytes=c.baseline_allocated_bytes,ended_at=LEAST(c.lifetime_end,c.old_ended_at)
   FROM current c WHERE i.id=c.interval_id AND c.old_started_at=$2
-   AND (c.old_generation IS DISTINCT FROM c.generation OR c.old_extents IS DISTINCT FROM c.extents)
+   AND (c.old_generation IS DISTINCT FROM c.generation OR c.old_extents IS DISTINCT FROM c.extents
+        OR i.baseline_path IS DISTINCT FROM c.baseline_path OR i.baseline_generation IS DISTINCT FROM c.baseline_generation
+        OR i.baseline_allocated_bytes IS DISTINCT FROM c.baseline_allocated_bytes)
   RETURNING i.id
- ) INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
- SELECT $1,c.team_id,c.kind,c.id,c.generation,c.extents,$2,LEAST(c.lifetime_end,c.old_ended_at) FROM current c
+ ) INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at,baseline_path,baseline_generation,baseline_allocated_bytes)
+ SELECT $1,c.team_id,c.kind,c.id,c.generation,c.extents,$2,LEAST(c.lifetime_end,c.old_ended_at),
+        c.baseline_path,c.baseline_generation,c.baseline_allocated_bytes FROM current c
  LEFT JOIN closed ON closed.id=c.interval_id
  WHERE c.interval_id IS NULL OR closed.id IS NOT NULL`, hostID, at, payload)
+	if err != nil {
+		return err
+	}
+	// Bind verified baseline evidence to every legacy stay that was active at
+	// this receipt. This is additive history; later template metadata cannot
+	// rewrite the mapping.
+	_, err = tx.Exec(ctx, `WITH supplied AS MATERIALIZED (
+  SELECT * FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline_path text,baseline_generation text,baseline_allocated_bytes bigint)
+), eligible AS (
+  SELECT o.*,s.team_id,s.host_id FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
+  WHERE o.baseline_path IS NOT NULL AND s.host_id=$1 AND s.created_at<=$2
+), stays AS (
+  SELECT i.sandbox_id,i.team_id,i.host_id,i.started_at,i.ended_at,e.baseline_path,e.baseline_generation,e.baseline_allocated_bytes
+  FROM sandbox_storage_interval i JOIN eligible e ON e.id=i.sandbox_id AND e.team_id=i.team_id AND e.host_id=i.host_id
+  WHERE i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
+)
+INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,observed_at,started_at,ended_at)
+SELECT sandbox_id,team_id,host_id,baseline_path,baseline_generation,baseline_allocated_bytes,$2,started_at,ended_at
+FROM stays
+ON CONFLICT (sandbox_id,host_id,path,generation,started_at) DO UPDATE
+ SET allocated_bytes=EXCLUDED.allocated_bytes,ended_at=EXCLUDED.ended_at`, hostID, at, payload)
 	return err
 }

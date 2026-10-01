@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -403,13 +404,14 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 	observations := make([]retainedFileObservation, 0)
 	dependencyUpdates := make([]struct{ original, resolved VMRecord }, 0)
 	remaining := retainedstorage.MaxExtents
-	add := func(kind, id string, paths []string) error {
+	add := func(kind, id string, paths []string, baselinePath string) error {
 		if len(inv.Owners) >= retainedstorage.MaxOwners {
 			return fmt.Errorf("retained owner budget exceeded")
 		}
 		owner := retainedstorage.Owner{Kind: kind, ID: id, Extents: make([]retainedstorage.Extent, 0)}
 		seen := map[string]bool{}
 		digest := sha256.New()
+		var baselineBytes int64
 		sort.Strings(paths)
 		for _, path := range paths {
 			if err := ctx.Err(); err != nil {
@@ -445,10 +447,21 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 			}
 			remaining -= len(extents)
 			owner.Extents = append(owner.Extents, extents...)
+			if baselinePath != "" && filepath.Clean(path) == filepath.Clean(baselinePath) {
+				for _, extent := range extents {
+					if baselineBytes > math.MaxInt64-extent.Length {
+						return fmt.Errorf("retained baseline allocation overflow")
+					}
+					baselineBytes += extent.Length
+				}
+			}
 			fmt.Fprintf(digest, "%s\x00%s\x00", path, generation)
 			observations = append(observations, retainedFileObservation{path, info})
 		}
 		owner.Generation = hex.EncodeToString(digest.Sum(nil))
+		if baselinePath != "" {
+			owner.Baseline = &retainedstorage.Baseline{Path: baselinePath, Generation: owner.Generation, AllocatedBytes: baselineBytes}
+		}
 		inv.Owners = append(inv.Owners, owner)
 		return nil
 	}
@@ -464,7 +477,11 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 		if rec.BaseMemPath != resolved.BaseMemPath || rec.RootfsPath != resolved.RootfsPath || rec.DeltaDir != resolved.DeltaDir {
 			dependencyUpdates = append(dependencyUpdates, struct{ original, resolved VMRecord }{rec, resolved})
 		}
-		if err := add("sandbox", rec.ID, paths); err != nil {
+		baselinePath := resolved.RootfsPath
+		if baselinePath == "" {
+			baselinePath = resolved.BasePath
+		}
+		if err := add("sandbox", rec.ID, paths, baselinePath); err != nil {
 			return nil, err
 		}
 	}
@@ -516,7 +533,7 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 			if err != nil {
 				return nil, err
 			}
-			if err := add("snapshot", man.SnapshotID, paths); err != nil {
+			if err := add("snapshot", man.SnapshotID, paths, man.BasePath); err != nil {
 				return nil, err
 			}
 		}

@@ -857,11 +857,13 @@ func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
 			if reassigned {
 				exec(`UPDATE sandbox SET created_at=$2 WHERE id=$1`, f.sandboxID, cutover.Add(-time.Minute))
 				// A prior stay on this host must not clip a later legacy stay.
-				exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
- VALUES($1,$2,'sandbox',$3,$4,'[{"device":"fs","start":0,"length":1048576}]',$5,$6)`, f.hostID, team, f.sandboxID, strings.Repeat("a", 64), cutover, cutover.Add(5*time.Second))
+				exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at,baseline_path,baseline_generation,baseline_allocated_bytes)
+ VALUES($1,$2,'sandbox',$3,$4,'[{"device":"fs","start":0,"length":1048576}]',$5,$6,$7,$8,1048576)`, f.hostID, team, f.sandboxID, strings.Repeat("a", 64), cutover, cutover.Add(5*time.Second), path, strings.Repeat("b", 64))
 			}
 			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
  VALUES($1,$3,$4,2,$5),($2,$3,$4,2,$6)`, f.sandboxID, second, team, f.hostID, start, secondStart)
+			exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,started_at)
+ VALUES($1,$2,$3,$4,$5,1048576,$6),($7,$2,$3,$4,$5,1048576,$8)`, f.sandboxID, team, f.hostID, path, strings.Repeat("b", 64), start, second, secondStart)
 			assertUsage := func(from, to time.Time, want float64) {
 				t.Helper()
 				for _, floor := range []bool{false, true} {
@@ -887,8 +889,8 @@ func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
 			// old permanent cutover or an earlier visit by the same owner.
 			for i, id := range []uuid.UUID{f.sandboxID, second} {
 				extents := fmt.Sprintf(`[{"device":"fs","start":0,"length":1048576},{"device":"fs","start":%d,"length":1048576}]`, (i+1)*1048576)
-				exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
- VALUES($1,$2,'sandbox',$3,$4,$5,$6,$7)`, f.hostID, team, id, strings.Repeat("b", 64), extents, retainedStart, end)
+				exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at,baseline_path,baseline_generation,baseline_allocated_bytes)
+ VALUES($1,$2,'sandbox',$3,$4,$5,$6,$7,$8,$9,1048576)`, f.hostID, team, id, strings.Repeat("b", 64), extents, retainedStart, end, path, strings.Repeat("b", 64))
 			}
 			assertUsage(start, retainedStart, 30+20*5)
 			assertUsage(retainedStart, end, 20*3)
@@ -916,10 +918,10 @@ func TestRetainedStorageTemplateRebuildKeepsPersistedBaselineGeneration(t *testi
 	cutover := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	start, retainedStart, end := cutover.Add(10*time.Second), cutover.Add(40*time.Second), cutover.Add(time.Minute)
 	templateID, rollbackOwner := uuid.New(), uuid.New()
-	oldSnapshotPath := "/example/templates/base/build-a/vmstate.snap"
-	oldRootfsPath := "/example/templates/base/build-a/rootfs.ext4"
-	newSnapshotPath := "/example/templates/base/build-b/vmstate.snap"
-	newRootfsPath := "/example/templates/base/build-b/rootfs.ext4"
+	oldSnapshotPath := "/example/snapshotdir/templates/base/build-a/vmstate.snap"
+	oldRootfsPath := "/example/rundir/templates/base/build-a/rootfs.ext4"
+	newSnapshotPath := "/example/snapshotdir/templates/base/build-b/vmstate.snap"
+	newRootfsPath := "/example/rundir/templates/base/build-b/rootfs.ext4"
 	// The template row now points at build B, while each owner keeps the
 	// build-specific snapshot path it was created from.
 	exec(`INSERT INTO template(id,team_id,name,status,build_spec,rootfs_path,snapshot_path,mem_path,vcpu,memory_mib,disk_mib)
@@ -931,18 +933,24 @@ func TestRetainedStorageTemplateRebuildKeepsPersistedBaselineGeneration(t *testi
  VALUES($1,$2,'example-rollback-generation','paused',$3,1,1024,2,$4,$5,$6)`, rollbackOwner, team, f.hostID, start.Add(10*time.Second), templateID, newSnapshotPath)
 	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
  VALUES($1,$2,$3,2,$4),($5,$2,$3,2,$6)`, f.sandboxID, team, f.hostID, start, rollbackOwner, start.Add(10*time.Second))
+	// The host report persists the exact full-copy roots it measured.  The
+	// runtime and snapshot directories are intentionally unrelated; no sibling
+	// path inference is valid here.
+	exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,started_at)
+ VALUES($1,$2,$3,$4,$5,1048576,$6),($7,$2,$3,$8,$9,1048576,$10)`,
+		f.sandboxID, team, f.hostID, oldRootfsPath, strings.Repeat("a", 64), start,
+		rollbackOwner, newRootfsPath, strings.Repeat("b", 64), start.Add(10*time.Second))
 	exec(`INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover)
-	exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
- VALUES($1,$2,'sandbox',$3,'generation-a','[{"device":"fs","start":0,"length":1048576}]',$4,$5)`, f.hostID, team, f.sandboxID, retainedStart, end)
+	exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at,baseline_path,baseline_generation,baseline_allocated_bytes)
+ VALUES($1,$2,'sandbox',$3,'generation-a','[{"device":"fs","start":0,"length":1048576}]',$4,$5,$6,$7,1048576)`,
+		f.hostID, team, f.sandboxID, retainedStart, end, oldRootfsPath, strings.Repeat("a", 64))
 	var got float64
 	if err := tx.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, start, end).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
-	// Overlay usage is 120 + 100 MiB-seconds. Build A contributes its
-	// baseline for 30 seconds, build B for 50 seconds, and the retained
-	// generation contributes 20 seconds. A mutable template path would merge
-	// the two generations and undercount this result.
-	const want = 310.0
+	// Derive each interval independently: A overlay 2*30, B overlay 2*40,
+	// A baseline 1*30, B baseline 1*40, and retained A 1*20 = 230.
+	const want = 230.0
 	if got != want {
 		t.Fatalf("storage after template rebuild = %v, want %v", got, want)
 	}

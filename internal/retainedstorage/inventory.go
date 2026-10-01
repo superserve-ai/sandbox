@@ -37,6 +37,16 @@ type Owner struct {
 	ID         string   `json:"id"`
 	Generation string   `json:"generation"`
 	Extents    []Extent `json:"extents"`
+	// Baseline is the verified persisted full-copy or overlay base retained by
+	// this owner. It is deliberately explicit: consumers must not infer a
+	// sibling path from snapshot_path or consult mutable template metadata.
+	Baseline *Baseline `json:"baseline,omitempty"`
+}
+
+type Baseline struct {
+	Path           string `json:"path"`
+	Generation     string `json:"generation"`
+	AllocatedBytes int64  `json:"allocated_bytes"`
 }
 
 // Inventory is a complete observation, never a sparse list of successful stats.
@@ -59,6 +69,15 @@ func (v Inventory) Validate() error {
 		}
 		if _, err := hex.DecodeString(o.Generation); err != nil {
 			return fmt.Errorf("invalid retained generation")
+		}
+		if o.Baseline != nil {
+			if o.Baseline.Path == "" || len(o.Baseline.Path) > 4096 || o.Baseline.Path[0] != '/' ||
+				len(o.Baseline.Generation) != 64 || o.Baseline.AllocatedBytes < 0 {
+				return fmt.Errorf("invalid retained baseline")
+			}
+			if _, err := hex.DecodeString(o.Baseline.Generation); err != nil {
+				return fmt.Errorf("invalid retained baseline generation")
+			}
 		}
 		key := o.Kind + o.ID
 		if seen[key] {
