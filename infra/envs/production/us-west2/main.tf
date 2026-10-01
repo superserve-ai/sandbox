@@ -448,8 +448,8 @@ module "observability" {
   labels = local.common_labels
 }
 
-# One adopted zonal assignment owns the complete Ops Agent convergence for the
-# serving host and replacement host selected by the same Terraform labels.
+# One dedicated zonal assignment owns OTel log convergence for the serving host
+# and replacement host selected by the same Terraform labels.
 module "host_logging" {
   source = "../../../modules/host-logging"
 
@@ -457,7 +457,7 @@ module "host_logging" {
   zone            = local.zone
   environment     = local.environment
   region          = local.region
-  assignment_name = "goog-ops-agent-v2-template-1-7-0-us-west2-a"
+  assignment_name = "superserve-otel-host-logging-us-west2-a"
   selector_labels = {
     application = "sandbox-host"
     environment = local.environment

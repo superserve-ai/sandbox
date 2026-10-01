@@ -28,12 +28,19 @@ def plan(environment, region, hosts):
         })
     resources.extend([
         {
-            "address": f'module.host_logging.google_storage_bucket_object.ops_agent_config["{host}"]',
+            "address": f'module.host_logging.google_storage_bucket_object.otel_config["{host}"]',
             "change": {"after": {"content": (
                 f"labels.environment: {environment}\nlabels.region: {region}\n"
                 f"# {host}: host_id={host}-identity\n"
                 "receivers: systemd_journald\n"
             )}},
+        }
+        for host in hosts
+    ])
+    resources.extend([
+        {
+            "address": f'module.host_logging.google_storage_bucket_object.otel_service["{host}"]',
+            "change": {"after": {"content": "ExecStart=otelcol-contrib --config /etc/superserve/host-logging/otel-logs.yaml\n"}},
         }
         for host in hosts
     ])
@@ -60,7 +67,7 @@ class HostLoggingDigestTests(unittest.TestCase):
         for mutation in ("script", "pipeline", "resource_limit", "alert"):
             changed = copy.deepcopy(baseline)
             content_item = next(item for item in changed["resource_changes"]
-                                if "google_storage_bucket_object.ops_agent_config" in item["address"])
+                                if "google_storage_bucket_object.otel_config" in item["address"])
             if mutation == "script":
                 content_item["change"]["after"]["content"] += "drop: debug\n"
             elif mutation == "pipeline":
@@ -86,7 +93,7 @@ class HostLoggingDigestTests(unittest.TestCase):
         ):
             changed = copy.deepcopy(baseline)
             item = next(entry for entry in changed["resource_changes"]
-                        if "google_storage_bucket_object.ops_agent_config" in entry["address"])
+                        if "google_storage_bucket_object.otel_config" in entry["address"])
             item["change"]["after_unknown"] = unknown
             cases.append(("functional", changed))
 
@@ -94,7 +101,7 @@ class HostLoggingDigestTests(unittest.TestCase):
         # must not make the complete digest unavailable.
         metadata = copy.deepcopy(baseline)
         metadata_item = next(entry for entry in metadata["resource_changes"]
-                             if "google_storage_bucket_object.ops_agent_config" in entry["address"])
+                             if "google_storage_bucket_object.otel_config" in entry["address"])
         metadata_item["change"]["after_unknown"] = {"generation": True, "etag": True}
         self.assertRegex(MODULE.deployment_content_digest(metadata), r"^[0-9a-f]{64}$")
 

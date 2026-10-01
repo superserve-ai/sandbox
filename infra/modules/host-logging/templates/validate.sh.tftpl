@@ -1,246 +1,39 @@
-#!/bin/sh
-# OS Config's SHELL interpreter invokes /bin/sh. Re-exec through Bash before
-# using arrays, process substitution, or pipefail on supported Ubuntu images.
-if [ -z "$${BASH_VERSION:-}" ]; then
-  exec /bin/bash "$0" "$@"
-fi
+#!/usr/bin/env bash
 set -euo pipefail
 
-candidate_config_path='${candidate_config_path}'
-config_path='/etc/google-cloud-ops-agent/config.yaml'
-journald_dropin='/etc/systemd/journald.conf.d/30-superserve-host-logging.conf'
-journald_candidate_path='${journald_candidate_path}'
-logging_resource_dropin='/etc/systemd/system/google-cloud-ops-agent-fluent-bit.service.d/30-superserve-resources.conf'
-agent_metrics_resource_dropin='/etc/systemd/system/google-cloud-ops-agent-opentelemetry-collector.service.d/30-superserve-resources.conf'
-metrics_resource_dropin='/etc/systemd/system/superserve-otel-collector.service.d/30-superserve-resources.conf'
-heartbeat_service='/etc/systemd/system/superserve-host-logging-heartbeat.service'
-heartbeat_timer='/etc/systemd/system/superserve-host-logging-heartbeat.timer'
-agent_logrotate='/etc/logrotate.d/superserve-google-cloud-ops-agent'
-syslog_logrotate='/etc/logrotate.d/superserve-host-syslog'
-identity_file='/etc/sandbox/host-identity.json'
-buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
-self_log_dir='/var/log/google-cloud-ops-agent'
-rendered_config=''
-storage_scan_result=''
-generated_dir=''
-fixture_logs=''
-fixture_state=''
-expected_journald=''
-expected_resource=''
-expected_metrics_resource=''
-expected_agent_metrics_resource=''
-expected_agent_logrotate=''
-expected_syslog_logrotate=''
-journal_max_use_bytes=${journal_max_use_bytes}
+state_dir=/var/lib/superserve/host-logging
+candidate='${candidate_config_path}'
+service_candidate="$state_dir/otel-logs.service.candidate"
+binary='${otel_binary_path}'
+cursor='${cursor_dir}'
+queue='${queue_dir}'
 
-cleanup() {
-  rm -f "$rendered_config" "$storage_scan_result" "$expected_journald" \
-    "$expected_resource" "$expected_metrics_resource" "$expected_agent_metrics_resource" \
-    "$expected_agent_logrotate" "$expected_syslog_logrotate" 2>/dev/null || true
-  rm -rf "$generated_dir" "$fixture_logs" "$fixture_state" 2>/dev/null || true
-}
-trap 'status=$?; cleanup; exit "$status"' EXIT
+test -s "$candidate"
+test -s "$service_candidate"
+test -s /etc/sandbox/host-identity.json
+grep -q '^receivers:' "$candidate"
+grep -q '^  journald:' "$candidate"
+grep -q 'storage: file_storage/cursor' "$candidate"
+grep -q 'storage: file_storage/queue' "$candidate"
+grep -q 'googlecloud:' "$candidate"
+grep -q 'filter/info_plus:' "$candidate"
+grep -q 'parse_application_message' "$candidate"
+grep -q 'clear_untrusted_body' "$candidate"
+grep -q 'host_logging.parse_outcome' "$candidate"
+grep -q 'ProtectSystem=strict' "$service_candidate"
 
-# 100 means fully compliant; 101 asks OS Config to run enforce. Any invalid
-# candidate is an error and must not be treated as repairable drift.
-test -s "$candidate_config_path" || exit 1
-test -s "$identity_file" || exit 101
-host_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host_id"])' "$identity_file")
-incarnation_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["incarnation_id"])' "$identity_file")
-instance_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["instance_id"])' "$identity_file")
-test -n "$host_id" && test -n "$incarnation_id" && test -n "$instance_id" || exit 101
+test "$(stat -c '%a' "$candidate" 2>/dev/null || stat -f '%Lp' "$candidate")" = "644"
+test "$(stat -c '%a' "$service_candidate" 2>/dev/null || stat -f '%Lp' "$service_candidate")" = "644"
 
-installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
-case "$installed_version" in
-  ${ops_agent_package_version}*) ;;
-  *) exit 101 ;;
-esac
-engine='/opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine'
-test -x "$engine" || exit 101
-
-run_engine_validation() {
-  input="$1"
-  rm -rf "$generated_dir" "$fixture_logs" "$fixture_state" 2>/dev/null || true
-  generated_dir=$(mktemp -d)
-  fixture_logs=$(mktemp -d)
-  fixture_state=$(mktemp -d)
-  timeout "${package_operation_timeout_seconds}s" "$engine" \
-    -in "$input" -service fluentbit -out "$generated_dir" \
-    -logs "$fixture_logs" -state "$fixture_state" >/dev/null 2>&1
-}
-
-rendered_config=$(mktemp)
-sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
-  -e "s|__INSTANCE_ID__|$instance_id|g" \
-  "$candidate_config_path" >"$rendered_config"
-if grep -qE '__HOST_ID__|__INCARNATION_ID__|__INSTANCE_ID__' "$rendered_config"; then
-  exit 101
-fi
-if ! run_engine_validation "$rendered_config"; then
-  # The candidate itself is invalid, so OS Config must surface an error rather
-  # than repeatedly re-running enforce against a broken revision.
-  exit 1
+# The archive digest and release are checked by reconcile before activation;
+# this check only validates an already installed candidate without changing it.
+if [ -x "$binary" ]; then
+  "$binary" --version 2>/dev/null | grep -F '${otel_release_version}' >/dev/null
 fi
 
-drift=0
-if ! cmp -s "$rendered_config" "$config_path" 2>/dev/null; then drift=1; fi
-if [ -s "$config_path" ] && ! run_engine_validation "$config_path"; then drift=1; fi
-expected_journald=$(mktemp)
-install -m 0644 "$journald_candidate_path" "$expected_journald"
-grep -Fq "SystemMaxUse=${journal_max_use_bytes}B" "$expected_journald" || exit 1
-grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B" "$expected_journald" || exit 1
-if ! cmp -s "$expected_journald" "$journald_dropin" 2>/dev/null; then drift=1; fi
-if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "SystemMaxUse=${journal_max_use_bytes}B"; then drift=1; fi
-if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B"; then drift=1; fi
-
-expected_resource=$(mktemp)
-expected_metrics_resource=$(mktemp)
-expected_agent_metrics_resource=$(mktemp)
-cat >"$expected_resource" <<'RESOURCES'
-[Service]
-CPUQuota=${agent_cpu_limit_millicores / 10}%
-MemoryMax=${agent_memory_limit_mb}M
-RESOURCES
-cat >"$expected_metrics_resource" <<'RESOURCES'
-[Service]
-# Keep the standalone application-metrics collector below the logging
-# subagent under host pressure; its existing queue/memory-limiter sheds first.
-CPUQuota=${agent_cpu_limit_millicores / 20}%
-MemoryMax=${agent_memory_limit_mb / 2}M
-RESOURCES
-cat >"$expected_agent_metrics_resource" <<'RESOURCES'
-[Service]
-CPUQuota=${agent_cpu_limit_millicores / 20}%
-MemoryMax=${agent_memory_limit_mb / 2}M
-RESOURCES
-if ! cmp -s "$expected_resource" "$logging_resource_dropin" 2>/dev/null; then drift=1; fi
-if ! cmp -s "$expected_agent_metrics_resource" "$agent_metrics_resource_dropin" 2>/dev/null; then drift=1; fi
-if ! cmp -s "$expected_metrics_resource" "$metrics_resource_dropin" 2>/dev/null; then drift=1; fi
-
-expected_agent_logrotate=$(mktemp)
-expected_syslog_logrotate=$(mktemp)
-cat >"$expected_agent_logrotate" <<'ROTATE'
-/var/log/google-cloud-ops-agent/*.log /var/log/google-cloud-ops-agent/subagents/*.log {
-  size ${ceil(agent_self_log_max_bytes / 2 / 1048576)}M
-  rotate 1
-  compress
-  missingok
-  notifempty
-  copytruncate
-}
-ROTATE
-cat >"$expected_syslog_logrotate" <<'ROTATE'
-/var/log/syslog {
-  size ${ceil(syslog_max_bytes / 3 / 1048576)}M
-  rotate 2
-  compress
-  missingok
-  notifempty
-  copytruncate
-}
-ROTATE
-if ! cmp -s "$expected_agent_logrotate" "$agent_logrotate" 2>/dev/null; then drift=1; fi
-if ! cmp -s "$expected_syslog_logrotate" "$syslog_logrotate" 2>/dev/null; then drift=1; fi
-
-systemctl is-enabled --quiet google-cloud-ops-agent.service || drift=1
-systemctl is-active --quiet google-cloud-ops-agent.service || drift=1
-systemctl is-active --quiet google-cloud-ops-agent-fluent-bit.service || drift=1
-systemctl is-active --quiet google-cloud-ops-agent-opentelemetry-collector.service || drift=1
-systemctl is-active --quiet superserve-otel-collector.service || drift=1
-systemctl is-enabled --quiet superserve-host-logging-heartbeat.timer || drift=1
-systemctl is-active --quiet superserve-host-logging-heartbeat.timer || drift=1
-
-# The selected Ops Agent release owns a platform-managed buffer. The configured
-# reservation is an accounting/compliance threshold, not a claim that the
-# agent exposes or enforces that numeric limit. Missing or unreadable stores
-# fail closed; only never-created optional stores on first install count as
-# empty.
-storage_scan_result=$(mktemp)
-if [ -z "$installed_version" ] && [ ! -e "$config_path" ] && [ ! -e "$buffer_dir" ] && [ ! -e "$self_log_dir" ]; then
-  export SUPER_SERVE_FIRST_INSTALL=1
-else
-  unset SUPER_SERVE_FIRST_INSTALL
-fi
-if ! timeout "${storage_scan_timeout_seconds}s" bash -c '
-  set -euo pipefail
-  buffer_dir="$1"; self_log_dir="$2"; max_entries="$3"; output="$4"
-  scan_store() {
-    kind="$1"; root="$2"; scan_limit=$((max_entries + 1))
-    python3 - "$kind" "$root" "$max_entries" <<'PY'
-import os
-import sys
-
-kind, root, limit_text = sys.argv[1:]
-limit = int(limit_text)
-queue = [root]
-visited = 0
-bytes_total = 0
-capped = False
-allow_missing_first_install = kind in {"buffer", "self_log"} and os.environ.get("SUPER_SERVE_FIRST_INSTALL") == "1"
-try:
-    os.stat(root)
-except FileNotFoundError:
-    if allow_missing_first_install:
-        print(kind, 0, 0)
-        raise SystemExit(0)
-    raise SystemExit(2)
-except OSError:
-    raise SystemExit(2)
-while queue:
-    current = queue.pop(0)
-    try:
-        os.stat(root)
-    except OSError:
-        raise SystemExit(2)
-    try:
-        with os.scandir(current) as entries:
-            for entry in entries:
-                if visited >= limit + 1:
-                    capped = True
-                    break
-                visited += 1
-                if entry.is_dir(follow_symlinks=False):
-                    if kind != "syslog":
-                        queue.append(entry.path)
-                elif entry.is_file(follow_symlinks=False):
-                    if kind != "syslog" or entry.name == "syslog" or entry.name.startswith("syslog."):
-                        bytes_total += entry.stat(follow_symlinks=False).st_size
-    except OSError:
-        raise SystemExit(2)
-    if capped:
-        break
-print(kind, bytes_total, int(capped or visited > limit))
-PY
-  }
-  scan_store buffer "$buffer_dir"
-  scan_store self_log "$self_log_dir"
-  scan_store syslog /var/log
-' _ "$buffer_dir" "$self_log_dir" "${storage_scan_max_entries}" "$storage_scan_result" >"$storage_scan_result"; then
-  exit 1
-fi
-storage_bytes=0; buffer_bytes=0; self_log_bytes=0; syslog_bytes=0
-storage_scan_capped=0
-seen_buffer=0; seen_self_log=0; seen_syslog=0
-while read -r kind size capped; do
-  test -n "$kind" || exit 1
-  case "$size" in (''|*[!0-9]*) exit 1 ;; esac
-  case "$capped" in (0) ;; (1) storage_scan_capped=1 ;; (*) exit 1 ;; esac
-  storage_bytes=$((storage_bytes + size))
-  case "$kind" in
-    buffer) [ "$seen_buffer" -eq 0 ] || exit 1; seen_buffer=1; buffer_bytes=$size ;;
-    self_log) [ "$seen_self_log" -eq 0 ] || exit 1; seen_self_log=1; self_log_bytes=$size ;;
-    syslog) [ "$seen_syslog" -eq 0 ] || exit 1; seen_syslog=1; syslog_bytes=$size ;;
-    *) exit 1 ;;
-  esac
-done < "$storage_scan_result"
-[ "$seen_buffer" -eq 1 ] && [ "$seen_self_log" -eq 1 ] && [ "$seen_syslog" -eq 1 ] || exit 1
-[ "$storage_scan_capped" -eq 0 ] || drift=1
-[ "$self_log_bytes" -le ${agent_self_log_max_bytes} ] || drift=1
-[ "$syslog_bytes" -le ${syslog_max_bytes} ] || drift=1
-[ "$buffer_bytes" -le ${agent_buffer_bytes} ] || drift=1
-[ $((journal_max_use_bytes + storage_bytes)) -le ${journal_keep_free_bytes} ] || drift=1
-
-if [ "$drift" -ne 0 ]; then
-  exit 101
-fi
-exit 100
+mkdir -p "$cursor" "$queue"
+chmod 0700 "$cursor" "$queue"
+test "${journal_max_use_bytes}" -gt 0
+test "${journal_keep_free_bytes}" -gt 0
+test "$(du -sb "$queue" | awk '{print $1}')" -le "${otel_queue_max_bytes}"
+exit 0

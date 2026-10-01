@@ -10,66 +10,87 @@ terraform {
 }
 
 locals {
-  config_path             = "/etc/google-cloud-ops-agent/config.yaml"
-  candidate_config_path   = "/var/lib/superserve/host-logging/config.yaml.candidate"
-  journald_dropin         = "/etc/systemd/journald.conf.d/30-superserve-host-logging.conf"
-  journald_candidate_path = "/var/lib/superserve/host-logging/journald.conf.candidate"
-  reconciliation_id       = "${var.assignment_name}-${var.assignment_revision}"
+  state_dir              = "/var/lib/superserve/host-logging"
+  candidate_config_path  = "${local.state_dir}/otel-logs.yaml.candidate"
+  candidate_service_path = "${local.state_dir}/otel-logs.service.candidate"
+  journald_dropin        = "/etc/systemd/journald.conf.d/30-superserve-host-logging.conf"
+  journald_candidate     = "${local.state_dir}/journald.conf.candidate"
+  cursor_dir             = "${local.state_dir}/cursor"
+  queue_dir              = "${local.state_dir}/export-queue"
+
   host_units = distinct(flatten([
-    for host in values(var.enrolled_hosts) : concat(
-      ["superserve-vmd.service", "systemd.service", "systemd-journald.service", "systemd-logind.service", "google-osconfig-agent.service", "google-guest-agent.service", "google-cloud-ops-agent.service", "superserve-otel-collector.service", "unbound.service", "secretsproxy.service", "superserve-secretsproxy.service", "superserve-host-logging-heartbeat.service", "proxy-*.service", "proxy-generation@.service"],
-      host.proxy_units,
-    )
+    for host in values(var.enrolled_hosts) : concat([
+      "superserve-vmd.service",
+      "systemd-journald.service",
+      "systemd-logind.service",
+      "google-osconfig-agent.service",
+      "google-guest-agent.service",
+      "superserve-otel-collector.service",
+      "superserve-otel-logs.service",
+      "unbound.service",
+      "secretsproxy.service",
+      "superserve-secretsproxy.service",
+      "superserve-host-logging-heartbeat.service",
+      "proxy.service",
+      "proxy-generation.service",
+      "proxy-*.service",
+    ], host.proxy_units)
   ]))
-  ops_agent_config = templatefile("${path.module}/templates/ops-agent.yaml.tftpl", {
-    environment               = var.environment
-    region                    = var.region
-    assignment_name           = var.assignment_name
-    assignment_revision       = var.assignment_revision
-    host_units                = local.host_units
-    enrolled_hosts            = var.enrolled_hosts
-    ops_agent_package_version = var.ops_agent_package_version
+
+  otel_config = templatefile("${path.module}/templates/otel-logs.yaml.tftpl", {
+    environment         = var.environment
+    region              = var.region
+    assignment_name     = var.assignment_name
+    assignment_revision = var.assignment_revision
+    release_version     = var.otel_release_version
+    host_units          = local.host_units
+    cursor_dir          = local.cursor_dir
+    queue_dir           = local.queue_dir
+  })
+  otel_service = templatefile("${path.module}/templates/otel-logs.service.tftpl", {
+    binary_path     = var.otel_binary_path
+    config_path     = "/etc/superserve/host-logging/otel-logs.yaml"
+    cursor_dir      = local.cursor_dir
+    queue_dir       = local.queue_dir
+    memory_limit_mb = var.otel_memory_limit_mb
+    cpu_limit       = var.otel_cpu_limit
   })
   reconcile_script = templatefile("${path.module}/templates/reconcile.sh.tftpl", {
-    config_path                       = local.config_path
     candidate_config_path             = local.candidate_config_path
+    candidate_service_path            = local.candidate_service_path
     journald_dropin                   = local.journald_dropin
-    journald_candidate_path           = local.journald_candidate_path
-    ops_agent_config                  = local.ops_agent_config
+    journald_candidate_path           = local.journald_candidate
+    state_dir                         = local.state_dir
+    cursor_dir                        = local.cursor_dir
+    queue_dir                         = local.queue_dir
     journal_max_use_bytes             = var.journal_max_use_bytes
     journal_keep_free_bytes           = var.journal_keep_free_bytes
-    agent_memory_limit_mb             = var.agent_memory_limit_mb
-    agent_cpu_limit_millicores        = var.agent_cpu_limit_millicores
-    agent_buffer_bytes                = var.agent_buffer_bytes
-    agent_self_log_max_bytes          = var.agent_self_log_max_bytes
-    syslog_max_bytes                  = var.syslog_max_bytes
-    storage_scan_timeout_seconds      = var.storage_scan_timeout_seconds
-    storage_scan_max_entries          = var.storage_scan_max_entries
+    otel_config                       = local.otel_config
+    otel_service                      = local.otel_service
+    otel_release_version              = var.otel_release_version
+    otel_release_url                  = var.otel_release_url
+    otel_release_sha256               = var.otel_release_sha256
+    otel_binary_path                  = var.otel_binary_path
     package_operation_timeout_seconds = var.package_operation_timeout_seconds
     heartbeat_interval_seconds        = var.heartbeat_interval_seconds
-    ops_agent_package_version         = var.ops_agent_package_version
+    otel_queue_max_bytes              = var.otel_queue_max_bytes
   })
   validate_script = templatefile("${path.module}/templates/validate.sh.tftpl", {
-    candidate_config_path             = local.candidate_config_path
-    journald_candidate_path           = local.journald_candidate_path
-    journal_max_use_bytes             = var.journal_max_use_bytes
-    journal_keep_free_bytes           = var.journal_keep_free_bytes
-    agent_cpu_limit_millicores        = var.agent_cpu_limit_millicores
-    agent_memory_limit_mb             = var.agent_memory_limit_mb
-    ops_agent_package_version         = var.ops_agent_package_version
-    agent_buffer_bytes                = var.agent_buffer_bytes
-    agent_self_log_max_bytes          = var.agent_self_log_max_bytes
-    syslog_max_bytes                  = var.syslog_max_bytes
-    storage_scan_timeout_seconds      = var.storage_scan_timeout_seconds
-    storage_scan_max_entries          = var.storage_scan_max_entries
-    package_operation_timeout_seconds = var.package_operation_timeout_seconds
-    heartbeat_interval_seconds        = var.heartbeat_interval_seconds
+    candidate_config_path   = local.candidate_config_path
+    journald_candidate_path = local.journald_candidate
+    otel_release_version    = var.otel_release_version
+    otel_binary_path        = var.otel_binary_path
+    cursor_dir              = local.cursor_dir
+    queue_dir               = local.queue_dir
+    journal_max_use_bytes   = var.journal_max_use_bytes
+    journal_keep_free_bytes = var.journal_keep_free_bytes
+    otel_queue_max_bytes    = var.otel_queue_max_bytes
   })
 }
 
-# The assignment is the single Terraform owner for installation and runtime
-# configuration. Existing zonal assignments are adopted with imports in each
-# environment root; no second automatic installer is created.
+# The dedicated log process has one Terraform/OS Config owner. It remains
+# separate from the existing metrics collector and from any legacy policy
+# retained during the controlled east migration.
 resource "google_os_config_os_policy_assignment" "host_logging" {
   project  = var.project_id
   location = var.zone
@@ -77,42 +98,43 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
 
   instance_filter {
     all = false
-
-    inclusion_labels {
-      labels = var.selector_labels
-    }
+    inclusion_labels { labels = var.selector_labels }
   }
 
   os_policies {
-    id   = "superserve-host-logging"
+    id   = "superserve-otel-host-logging"
     mode = "ENFORCEMENT"
 
     resource_groups {
-      inventory_filters {
-        # All managed serving images are Ubuntu 22.04/24.04.  Keeping the
-        # filter aligned with the image family is required for the assignment
-        # to converge on both existing and replacement hosts.
-        os_short_name = "ubuntu"
-      }
+      inventory_filters { os_short_name = "ubuntu" }
 
-      # Package installation is intentionally owned by reconcile.sh after the
-      # selected artifact and candidate configuration pass diagnosis. An
-      # independent apt resource would mutate the active package before that
-      # transaction can capture rollback state.
       resources {
-        id = "ops-agent-config"
+        id = "otel-logs-config"
         file {
-          state         = "PRESENT"
-          path          = local.candidate_config_path
-          permissions   = "0644"
+          state       = "PRESENT"
+          path        = local.candidate_config_path
+          permissions = "0644"
           file {
-            # The nested source block contains only the authenticated remote
-            # object. Path, desired state, and permissions belong to the
-            # FileResource itself in the locked Google provider schema.
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
-              object     = google_storage_bucket_object.ops_agent_config.name
-              generation = tostring(google_storage_bucket_object.ops_agent_config.generation)
+              object     = google_storage_bucket_object.otel_config.name
+              generation = tostring(google_storage_bucket_object.otel_config.generation)
+            }
+          }
+        }
+      }
+
+      resources {
+        id = "otel-logs-service"
+        file {
+          state       = "PRESENT"
+          path        = local.candidate_service_path
+          permissions = "0644"
+          file {
+            gcs {
+              bucket     = google_storage_bucket.host_logging_artifacts.name
+              object     = google_storage_bucket_object.otel_service.name
+              generation = tostring(google_storage_bucket_object.otel_service.generation)
             }
           }
         }
@@ -121,10 +143,10 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "journald-retention"
         file {
-          state         = "CONTENTS_MATCH"
-          path          = local.journald_candidate_path
-          permissions   = "0644"
-          content       = <<-EOT
+          state       = "CONTENTS_MATCH"
+          path        = local.journald_candidate
+          permissions = "0644"
+          content     = <<-EOT
             [Journal]
             Storage=persistent
             SystemMaxUse=${var.journal_max_use_bytes}B
@@ -136,9 +158,9 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "validate-script"
         file {
-          state         = "PRESENT"
-          path          = "/var/lib/superserve/host-logging/validate.sh"
-          permissions   = "0755"
+          state       = "PRESENT"
+          path        = "${local.state_dir}/validate.sh"
+          permissions = "0755"
           file {
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
@@ -152,9 +174,9 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "reconcile-script"
         file {
-          state         = "PRESENT"
-          path          = "/var/lib/superserve/host-logging/reconcile.sh"
-          permissions   = "0755"
+          state       = "PRESENT"
+          path        = "${local.state_dir}/reconcile.sh"
+          permissions = "0755"
           file {
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
@@ -170,15 +192,11 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
         exec {
           validate {
             interpreter = "SHELL"
-            file {
-              local_path = "/var/lib/superserve/host-logging/validate.sh"
-            }
+            file { local_path = "${local.state_dir}/validate.sh" }
           }
           enforce {
             interpreter = "SHELL"
-            file {
-              local_path = "/var/lib/superserve/host-logging/reconcile.sh"
-            }
+            file { local_path = "${local.state_dir}/reconcile.sh" }
           }
         }
       }
@@ -186,34 +204,26 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
   }
 
   rollout {
-    disruption_budget {
-      fixed = 1
-    }
+    disruption_budget { fixed = 1 }
     min_wait_duration = "60s"
   }
 
   lifecycle {
     prevent_destroy = true
-
     precondition {
-      condition     = var.journal_max_use_bytes + var.agent_buffer_bytes + var.agent_self_log_max_bytes + var.syslog_max_bytes <= var.journal_keep_free_bytes
-      error_message = "Combined journal, conservative Ops Agent buffer reservation, self-log, and syslog budgets must fit within the host free-space reserve; the reservation is accounting evidence, not an asserted Ops Agent cap."
+      condition     = var.journal_max_use_bytes > 0 && var.journal_keep_free_bytes > 0
+      error_message = "Journald limits must be positive."
     }
   }
 
   depends_on = [google_storage_bucket_iam_member.artifact_reader]
 }
 
-# The Ops Agent writes through the host's attached runtime identity. Keep this
-# grant narrow and derive it from the same descriptors used by the assignment.
 resource "google_project_iam_member" "log_writer" {
-  for_each = toset([
-    for host in values(var.enrolled_hosts) : host.service_account_email
-  ])
-
-  project = var.project_id
-  role    = "roles/logging.logWriter"
-  member  = "serviceAccount:${each.value}"
+  for_each = toset([for host in values(var.enrolled_hosts) : host.service_account_email])
+  project  = var.project_id
+  role     = "roles/logging.logWriter"
+  member   = "serviceAccount:${each.value}"
 }
 
 resource "google_storage_bucket" "host_logging_artifacts" {
@@ -221,16 +231,20 @@ resource "google_storage_bucket" "host_logging_artifacts" {
   name                        = "superserve-host-logging-${var.environment}-${replace(var.region, "-", "")}"
   location                    = var.region
   uniform_bucket_level_access = true
-
   versioning { enabled = true }
-
   lifecycle { prevent_destroy = true }
 }
 
-resource "google_storage_bucket_object" "ops_agent_config" {
+resource "google_storage_bucket_object" "otel_config" {
   bucket  = google_storage_bucket.host_logging_artifacts.name
-  name    = "${var.assignment_name}/${var.assignment_revision}/config.yaml"
-  content = local.ops_agent_config
+  name    = "${var.assignment_name}/${var.assignment_revision}/otel-logs.yaml"
+  content = local.otel_config
+}
+
+resource "google_storage_bucket_object" "otel_service" {
+  bucket  = google_storage_bucket.host_logging_artifacts.name
+  name    = "${var.assignment_name}/${var.assignment_revision}/otel-logs.service"
+  content = local.otel_service
 }
 
 resource "google_storage_bucket_object" "reconcile_script" {
@@ -246,25 +260,12 @@ resource "google_storage_bucket_object" "validate_script" {
 }
 
 resource "google_storage_bucket_iam_member" "artifact_reader" {
-  for_each = toset([
-    for host in values(var.enrolled_hosts) : host.service_account_email
-  ])
-
-  bucket = google_storage_bucket.host_logging_artifacts.name
-  role   = "roles/storage.objectViewer"
-  member = "serviceAccount:${each.value}"
+  for_each = toset([for host in values(var.enrolled_hosts) : host.service_account_email])
+  bucket   = google_storage_bucket.host_logging_artifacts.name
+  role     = "roles/storage.objectViewer"
+  member   = "serviceAccount:${each.value}"
 }
 
 output "assignment_name" {
   value = google_os_config_os_policy_assignment.host_logging.name
-}
-
-output "configuration_revision" {
-  value = var.assignment_revision
-}
-
-output "runtime_identities" {
-  value = sort(distinct([
-    for host in values(var.enrolled_hosts) : host.service_account_email
-  ]))
 }

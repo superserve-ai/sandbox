@@ -15,7 +15,8 @@ import sys
 
 _CONTENT_RESOURCES = (
     "google_os_config_os_policy_assignment.host_logging",
-    "google_storage_bucket_object.ops_agent_config",
+    "google_storage_bucket_object.otel_config",
+    "google_storage_bucket_object.otel_service",
     "google_storage_bucket_object.reconcile_script",
     "google_storage_bucket_object.validate_script",
 )
@@ -32,7 +33,8 @@ def _unknown_allowed(address, path):
     """Permit provider metadata only at explicit resource-root paths."""
     resource = address.split("[")[0]
     return resource in {
-        "module.host_logging.google_storage_bucket_object.ops_agent_config",
+        "module.host_logging.google_storage_bucket_object.otel_config",
+        "module.host_logging.google_storage_bucket_object.otel_service",
         "module.host_logging.google_storage_bucket_object.reconcile_script",
         "module.host_logging.google_storage_bucket_object.validate_script",
     } and len(path) == 1 and path[0] in {"generation", "etag"}
@@ -121,7 +123,7 @@ def _canonical_after(address, after):
         member = copied.get("member")
         if isinstance(member, str) and member.startswith("serviceAccount:"):
             copied["member"] = "serviceAccount:<deployment-identity>"
-    if ".google_storage_bucket_object.ops_agent_config" in address:
+    if ".google_storage_bucket_object.otel_config" in address:
         content = copied.get("content")
         if isinstance(content, str):
             # These lines are rendered from the module's explicit deployment
@@ -197,7 +199,7 @@ def requires_evidence(plan: dict) -> bool:
 
 def configuration_revision(plan: dict) -> str:
     for item in (plan.get("resource_changes") or []):
-        if item.get("address") != "module.host_logging.google_storage_bucket_object.ops_agent_config":
+        if item.get("address") != "module.host_logging.google_storage_bucket_object.otel_config":
             continue
         name = ((item.get("change") or {}).get("after") or {}).get("name", "")
         parts = name.split("/")

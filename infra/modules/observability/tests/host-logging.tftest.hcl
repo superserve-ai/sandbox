@@ -69,9 +69,9 @@ run "host_logging_alerts_contract" {
   assert {
     condition = alltrue([
       for policy in values(google_monitoring_alert_policy.host_logging_export_failures) :
-      strcontains(one(policy.conditions).condition_matched_log.filter, "log_id(\"ops_agent_self_log_files\")")
+      strcontains(one(policy.conditions).condition_matched_log.filter, "log_id(\"superserve_host_logs\")")
     ])
-    error_message = "Export failure alert must consume the explicit bounded Ops Agent self-log receiver."
+    error_message = "Export failure alert must consume the dedicated OTel host-log stream."
   }
 
   assert {

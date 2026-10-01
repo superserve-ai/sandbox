@@ -1,747 +1,165 @@
-#!/bin/sh
-# OS Config's SHELL interpreter invokes /bin/sh. Re-exec through Bash before
-# using arrays, process substitution, or pipefail on supported Ubuntu images.
-if [ -z "$${BASH_VERSION:-}" ]; then
-  exec /bin/bash "$0" "$@"
-fi
+#!/usr/bin/env bash
 set -euo pipefail
 
-config_path='${config_path}'
-candidate_config_path='${candidate_config_path}'
-journald_dropin='${journald_dropin}'
-journald_candidate_path='${journald_candidate_path}'
-resource_dir='/etc/systemd/system'
-logging_resource_dropin="$resource_dir/google-cloud-ops-agent-fluent-bit.service.d/30-superserve-resources.conf"
-agent_metrics_resource_dropin="$resource_dir/google-cloud-ops-agent-opentelemetry-collector.service.d/30-superserve-resources.conf"
-metrics_resource_dropin="$resource_dir/superserve-otel-collector.service.d/30-superserve-resources.conf"
-heartbeat_service="$resource_dir/superserve-host-logging-heartbeat.service"
-heartbeat_timer="$resource_dir/superserve-host-logging-heartbeat.timer"
-agent_logrotate='/etc/logrotate.d/superserve-google-cloud-ops-agent'
-syslog_logrotate='/etc/logrotate.d/superserve-host-syslog'
-identity_file='/etc/sandbox/host-identity.json'
-buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
-self_log_dir='/var/log/google-cloud-ops-agent'
-dropin_candidate=''
-logging_resource_candidate=''
-metrics_resource_candidate=''
-agent_metrics_resource_candidate=''
-heartbeat_service_candidate=''
-heartbeat_timer_candidate=''
-agent_logrotate_candidate=''
-syslog_logrotate_candidate=''
-old_config=''
-old_dropin=''
-old_logging_resource=''
-old_metrics_resource=''
-old_agent_metrics_resource=''
-old_heartbeat_service=''
-old_heartbeat_timer=''
-old_agent_logrotate=''
-old_syslog_logrotate=''
-old_package_version=''
-package_change_attempted=0
-package_stage_dir=''
-staged_agent=''
-staged_engine=''
-engine_generated_dir=''
-engine_fixture_logs=''
-engine_fixture_state=''
-storage_scan_result=''
-pretransition_installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
-if [ -z "$pretransition_installed_version" ] && [ ! -e "$config_path" ] && [ ! -e "$buffer_dir" ] && [ ! -e "$self_log_dir" ]; then
-  export SUPER_SERVE_FIRST_INSTALL=1
-else
-  unset SUPER_SERVE_FIRST_INSTALL
-fi
-rollback_package_dir=''
-rollback_package_deb=''
+state_dir='${state_dir}'
+candidate='${candidate_config_path}'
+service_candidate='${candidate_service_path}'
+active_dir=/etc/superserve/host-logging
+active_config="$active_dir/otel-logs.yaml"
+active_service=/etc/systemd/system/superserve-otel-logs.service
+heartbeat_service=/etc/systemd/system/superserve-host-logging-heartbeat.service
+heartbeat_timer=/etc/systemd/system/superserve-host-logging-heartbeat.timer
+binary='${otel_binary_path}'
+cursor='${cursor_dir}'
+queue='${queue_dir}'
+dropin='${journald_dropin}'
+dropin_candidate='${journald_candidate_path}'
+archive_dir="$state_dir/releases"
+package_dir="$state_dir/package"
 activation_committed=0
-rollback_completed=0
-rollback_in_progress=0
-journal_max_use_bytes=${journal_max_use_bytes}
+working_config=''
+working_service=''
+working_dropin=''
+working_binary=''
+working_heartbeat_service=''
+working_heartbeat_timer=''
+had_config=0
+had_service=0
+had_dropin=0
+had_binary=0
+had_heartbeat_service=0
+had_heartbeat_timer=0
+binary_changed=0
+service_was_active=0
 
-# OS Config runs this script only after validate returned 101.  The candidate
-# is rendered with the provider-bound identity on the host, then validated by
-# the packaged generation engine
-# before any working file is touched.
-test -s "$candidate_config_path"
-test -s "$identity_file"
-host_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host_id"])' "$identity_file")
-incarnation_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["incarnation_id"])' "$identity_file")
-instance_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["instance_id"])' "$identity_file")
-test -n "$host_id"
-test -n "$incarnation_id"
-test -n "$instance_id"
-
-config_dir=$(dirname "$config_path")
-install -d -m 0755 "$config_dir" "$(dirname "$journald_dropin")" \
-  "$(dirname "$logging_resource_dropin")" "$(dirname "$agent_metrics_resource_dropin")" \
-  "$(dirname "$metrics_resource_dropin")"
-rendered_config=$(mktemp "$config_dir/.config.yaml.XXXXXX")
-cleanup() {
-  rm -f "$rendered_config" "$dropin_candidate" "$logging_resource_candidate" "$agent_metrics_resource_candidate" "$metrics_resource_candidate" "$heartbeat_service_candidate" "$heartbeat_timer_candidate" "$agent_logrotate_candidate" "$syslog_logrotate_candidate" "$old_config" "$old_dropin" "$old_logging_resource" "$old_agent_metrics_resource" "$old_metrics_resource" "$old_heartbeat_service" "$old_heartbeat_timer" "$old_agent_logrotate" "$old_syslog_logrotate" "$storage_scan_result" 2>/dev/null || true
-  rm -rf "$package_stage_dir" "$rollback_package_dir" "$engine_generated_dir" "$engine_fixture_logs" "$engine_fixture_state" 2>/dev/null || true
+rollback() {
+  [ "$activation_committed" -eq 1 ] && return 0
+  if [ -n "$working_config" ] && [ -f "$working_config" ]; then install -m 0644 "$working_config" "$active_config"; fi
+  if [ "$had_config" -eq 0 ]; then rm -f "$active_config"; fi
+  if [ -n "$working_service" ] && [ -f "$working_service" ]; then install -m 0644 "$working_service" "$active_service"; fi
+  if [ "$had_service" -eq 0 ]; then rm -f "$active_service"; fi
+  if [ -n "$working_dropin" ] && [ -f "$working_dropin" ]; then install -m 0644 "$working_dropin" "$dropin"; fi
+  if [ "$had_dropin" -eq 0 ]; then rm -f "$dropin"; fi
+  if [ -n "$working_binary" ] && [ -f "$working_binary" ]; then install -m 0755 "$working_binary" "$binary"; fi
+  if [ "$had_binary" -eq 0 ]; then rm -f "$binary"; fi
+  if [ -n "$working_heartbeat_service" ] && [ -f "$working_heartbeat_service" ]; then install -m 0644 "$working_heartbeat_service" "$heartbeat_service"; fi
+  if [ "$had_heartbeat_service" -eq 0 ]; then rm -f "$heartbeat_service"; fi
+  if [ -n "$working_heartbeat_timer" ] && [ -f "$working_heartbeat_timer" ]; then install -m 0644 "$working_heartbeat_timer" "$heartbeat_timer"; fi
+  if [ "$had_heartbeat_timer" -eq 0 ]; then rm -f "$heartbeat_timer"; fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [ "$service_was_active" -eq 1 ]; then systemctl restart superserve-otel-logs.service >/dev/null 2>&1 || true; fi
 }
-trap 'exit 143' INT TERM
-trap 'status=$?; cleanup; exit "$status"' EXIT
-sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
-  -e "s|__INSTANCE_ID__|$instance_id|g" \
-  "$candidate_config_path" >"$rendered_config"
-chmod 0644 "$rendered_config"
+trap rollback EXIT
 
-# Keep the Terraform-rendered source inventory aligned with the journald
-# allowlist before the candidate can replace the working configuration. These
-# representative platform records cover the in-host proxy identity and the
-# systemd lifecycle stream without treating application payload as provenance.
-required_source_units=(
-  "superserve-secretsproxy.service"
-  "systemd.service"
-)
-for unit in "$${required_source_units[@]}"; do
-  if ! grep -Fq "# enrolled unit: $unit" "$rendered_config"; then
-    logger -t superserve-host-logging -p err "required journald source inventory missing: $unit"
-    exit 1
-  fi
-done
+mkdir -p "$state_dir" "$active_dir" "$archive_dir" "$cursor" "$queue" /etc/systemd/journald.conf.d
+chmod 0700 "$cursor" "$queue"
+test -s "$candidate" && test -s "$service_candidate"
+test "$(du -sb "$queue" | awk '{print $1}')" -le '${otel_queue_max_bytes}'
+systemctl is-active --quiet superserve-otel-logs.service && service_was_active=1 || true
 
-# Validate with the selected release before changing an already-running
-# package.  When the selected version is not installed, download and extract
-# that package into a private staging directory and run its packaged engine;
-# the active package and its delivery state remain untouched during this test.
-run_engine_validation() {
-  engine="$1"
-  input="$2"
-  rm -rf "$engine_generated_dir" "$engine_fixture_logs" "$engine_fixture_state" 2>/dev/null || true
-  engine_generated_dir=$(mktemp -d)
-  engine_fixture_logs=$(mktemp -d)
-  engine_fixture_state=$(mktemp -d)
-  timeout "${package_operation_timeout_seconds}s" "$engine" \
-    -in "$input" -service fluentbit -out "$engine_generated_dir" \
-    -logs "$engine_fixture_logs" -state "$engine_fixture_state" >/dev/null 2>&1
-}
+# Identity is an input, never an output. A replacement host is not activated
+# until the provisioner has installed its authoritative identity document.
+identity_file=/etc/sandbox/host-identity.json
+identity_env=/etc/sandbox/host-logging-identity.env
+test -s "$identity_file" || { logger -t superserve-otel-logs -p warning "host identity is not provisioned; deferring activation"; exit 1; }
+instance_id=$(sed -n 's/.*"instance_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
+incarnation_id=$(sed -n 's/.*"incarnation_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
+host_id=$(sed -n 's/.*"host_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
+test -n "$instance_id" && test -n "$incarnation_id" && test -n "$host_id"
+printf 'HOST_ID=%s\nINSTANCE_ID=%s\nINCARNATION_ID=%s\n' "$host_id" "$instance_id" "$incarnation_id" > "$identity_env.new"
+install -m 0600 "$identity_env.new" "$identity_env"
+rm -f "$identity_env.new"
 
-installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
-if [[ "$installed_version" == ${ops_agent_package_version}* ]] && command -v google-cloud-ops-agent >/dev/null 2>&1; then
-  test -x /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine
-  run_engine_validation /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine "$rendered_config" || exit 1
+if [ -f "$binary" ]; then cp -a "$binary" "$archive_dir/active-binary.$$.bak"; working_binary="$archive_dir/active-binary.$$.bak"; had_binary=1; fi
+if [ -f "$heartbeat_service" ]; then cp -a "$heartbeat_service" "$archive_dir/active-heartbeat-service.$$.bak"; working_heartbeat_service="$archive_dir/active-heartbeat-service.$$.bak"; had_heartbeat_service=1; fi
+if [ -f "$heartbeat_timer" ]; then cp -a "$heartbeat_timer" "$archive_dir/active-heartbeat-timer.$$.bak"; working_heartbeat_timer="$archive_dir/active-heartbeat-timer.$$.bak"; had_heartbeat_timer=1; fi
+
+# Stage and verify the exact release before touching the active binary. The
+# checksum is the release authority; no package manager or manual SSH path is
+# used for activation.
+if [ ! -x "$binary" ] || ! "$binary" --version 2>/dev/null | grep -F '${otel_release_version}' >/dev/null; then
+  mkdir -p "$package_dir"
+  archive="$package_dir/otelcol-contrib-${otel_release_version}.tar.gz"
+  timeout '${package_operation_timeout_seconds}s' curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 '${otel_release_url}' -o "$archive"
+  echo '${otel_release_sha256}  '"$archive" | sha256sum -c - >/dev/null
+  stage="$package_dir/stage"
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  tar -xzf "$archive" -C "$stage"
+  staged=$(find "$stage" -type f -name otelcol-contrib -perm -u+x -print -quit)
+  test -n "$staged"
+  install -D -m 0755 "$staged" "$binary.new"
+  "$binary.new" validate --config "$candidate"
+  install -D -m 0755 "$binary.new" "$binary"
+  binary_changed=1
 else
-  package_stage_dir=$(mktemp -d /tmp/superserve-host-logging-package.XXXXXX)
-  # apt-get download is isolated from the active package before validation.
-  if ! (cd "$package_stage_dir" && timeout "${package_operation_timeout_seconds}s" apt-get -o Acquire::Retries=2 download "google-cloud-ops-agent=${ops_agent_package_version}") >/dev/null 2>&1; then
-    logger -t superserve-host-logging -p err "unable to stage Ops Agent ${ops_agent_package_version} for pre-activation validation"
-    exit 1
-  fi
-  package_deb=$(find "$package_stage_dir" -maxdepth 1 -type f -name 'google-cloud-ops-agent_*.deb' -print -quit)
-  test -n "$package_deb"
-  timeout "${package_operation_timeout_seconds}s" dpkg-deb --extract "$package_deb" "$package_stage_dir/root"
-  staged_agent=$(find "$package_stage_dir/root" -name google-cloud-ops-agent -perm -u+x -print -quit)
-  staged_engine=$(find "$package_stage_dir/root" -name google_cloud_ops_agent_engine -perm -u+x -print -quit)
-  test -n "$staged_agent" -a -n "$staged_engine"
-  run_engine_validation "$staged_engine" "$rendered_config" || exit 1
+  "$binary" validate --config "$candidate"
 fi
 
-# Keep a local copy of the previously installed package before any dpkg
-# mutation. Rollback must not depend on the repository still serving an older
-# revision after a later activation failure.
-if [ -n "$installed_version" ] && [[ "$installed_version" != ${ops_agent_package_version}* ]]; then
-  rollback_package_dir=$(mktemp -d /tmp/superserve-host-logging-rollback.XXXXXX)
-  if ! (cd "$rollback_package_dir" && timeout "${package_operation_timeout_seconds}s" apt-get -o Acquire::Retries=2 download "google-cloud-ops-agent=$installed_version") >/dev/null 2>&1; then
-    logger -t superserve-host-logging -p err "unable to stage installed Ops Agent $${installed_version} for rollback"
-    exit 1
-  fi
-  rollback_package_deb=$(find "$rollback_package_dir" -maxdepth 1 -type f -name 'google-cloud-ops-agent_*.deb' -print -quit)
-  test -n "$rollback_package_deb"
-fi
+if [ -f "$active_config" ]; then cp -a "$active_config" "$archive_dir/active-config.$$.bak"; had_config=1; fi
+if [ -f "$active_service" ]; then cp -a "$active_service" "$archive_dir/active-service.$$.bak"; had_service=1; fi
+if [ -f "$dropin" ]; then cp -a "$dropin" "$archive_dir/active-journald.$$.bak"; had_dropin=1; fi
+working_config="$archive_dir/active-config.$$.bak"
+working_service="$archive_dir/active-service.$$.bak"
+working_dropin="$archive_dir/active-journald.$$.bak"
 
-# Check retained stores before activation. Checkpoint and buffer files are
-# never deleted. Disposable retention cleanup runs only after the new policy
-# is healthy so a failed package/configuration transition cannot discard the
-# last working delivery history.
-storage_scan_result=$(mktemp)
-storage_scan_deadline=$(( $(date +%s) + ${storage_scan_timeout_seconds} ))
-storage_accounting_remaining() {
-  remaining=$((storage_scan_deadline - $(date +%s)))
-  [ "$remaining" -gt 0 ] || return 1
-  printf '%ss' "$remaining"
-}
-storage_scan_timeout=$(storage_accounting_remaining) || {
-  logger -t superserve-host-logging -p err "storage accounting deadline expired before scan"
-  exit 1
-}
-if ! timeout "$storage_scan_timeout" bash -c '
-  set -euo pipefail
-  buffer_dir="$1"; self_log_dir="$2"; max_entries="$3"; output="$4"
-  scan_store() {
-    kind="$1"; root="$2"; scan_limit=$((max_entries + 1))
-    python3 - "$kind" "$root" "$max_entries" <<'PY'
-import os
-import sys
+cat > "$dropin_candidate" <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=${journal_max_use_bytes}B
+SystemKeepFree=${journal_keep_free_bytes}B
+EOF
+install -m 0644 "$dropin_candidate" "$dropin.new"
+systemd-analyze verify "$dropin.new" >/dev/null 2>&1 || true
 
-kind, root, limit_text = sys.argv[1:]
-limit = int(limit_text)
-queue = [root]
-visited = 0
-bytes_total = 0
-capped = False
-allow_missing_first_install = kind in {"buffer", "self_log"} and os.environ.get("SUPER_SERVE_FIRST_INSTALL") == "1"
-try:
-    os.stat(root)
-except FileNotFoundError:
-    if allow_missing_first_install:
-        print(kind, 0, 0)
-        raise SystemExit(0)
-    raise SystemExit(2)
-except OSError:
-    raise SystemExit(2)
-while queue:
-    current = queue.pop(0)
-    try:
-        os.stat(root)
-    except OSError:
-        raise SystemExit(2)
-    try:
-        with os.scandir(current) as entries:
-            for entry in entries:
-                if visited >= limit + 1:
-                    capped = True
-                    break
-                visited += 1
-                if entry.is_dir(follow_symlinks=False):
-                    if kind != "syslog":
-                        queue.append(entry.path)
-                elif entry.is_file(follow_symlinks=False):
-                    if kind != "syslog" or entry.name == "syslog" or entry.name.startswith("syslog."):
-                        bytes_total += entry.stat(follow_symlinks=False).st_size
-    except OSError:
-        raise SystemExit(2)
-    if capped:
-        break
-print(kind, bytes_total, int(capped or visited > limit))
-PY
-  }
-  scan_store buffer "$buffer_dir"
-  scan_store self_log "$self_log_dir"
-  scan_store syslog /var/log
-' _ "$buffer_dir" "$self_log_dir" "${storage_scan_max_entries}" "$storage_scan_result" >"$storage_scan_result"; then
-  logger -t superserve-host-logging -p err "storage accounting exceeded ${storage_scan_timeout_seconds}s bounded scan budget"
-  exit 1
-fi
-storage_bytes=0; buffer_bytes=0; self_log_bytes=0; syslog_bytes=0
-storage_scan_capped=0
-seen_buffer=0; seen_self_log=0; seen_syslog=0
-while read -r kind size capped; do
-  test -n "$kind" || exit 1
-  case "$size" in (''|*[!0-9]*) exit 1 ;; esac
-  case "$capped" in (0) ;; (1) storage_scan_capped=1 ;; (*) exit 1 ;; esac
-  storage_bytes=$((storage_bytes + size))
-  case "$kind" in
-    buffer) [ "$seen_buffer" -eq 0 ] || exit 1; seen_buffer=1; buffer_bytes=$size ;;
-    self_log) [ "$seen_self_log" -eq 0 ] || exit 1; seen_self_log=1; self_log_bytes=$size ;;
-    syslog) [ "$seen_syslog" -eq 0 ] || exit 1; seen_syslog=1; syslog_bytes=$size ;;
-    *) exit 1 ;;
-  esac
-done < "$storage_scan_result"
-[ "$seen_buffer" -eq 1 ] && [ "$seen_self_log" -eq 1 ] && [ "$seen_syslog" -eq 1 ] || exit 1
-[ "$storage_scan_capped" -eq 0 ] || {
-  logger -t superserve-host-logging -p err "storage accounting is incomplete at the entry bound"
-  exit 1
-}
-if [ "$self_log_bytes" -gt ${agent_self_log_max_bytes} ]; then
-  logger -t superserve-host-logging -p warning "Ops Agent self-log store exceeds ${agent_self_log_max_bytes} byte bound; disposable retention will be reclaimed after activation"
-fi
-if [ "$syslog_bytes" -gt ${syslog_max_bytes} ]; then
-  logger -t superserve-host-logging -p warning "retained syslog store exceeds ${syslog_max_bytes} byte bound; disposable retention will be reclaimed after activation"
-fi
-if [ "$buffer_bytes" -gt ${agent_buffer_bytes} ]; then
-  logger -t superserve-host-logging -p warning "Ops Agent buffer exceeds ${agent_buffer_bytes} byte budget; checkpoint and pending buffer state will be preserved"
-fi
-if [ $((journal_max_use_bytes + storage_bytes)) -gt ${journal_keep_free_bytes} ]; then
-  logger -t superserve-host-logging -p warning "combined journal and auxiliary logging stores exceed ${journal_keep_free_bytes} byte free-space objective; disposable retention will be reclaimed after activation"
-fi
-
-test -s "$journald_candidate_path"
-dropin_candidate=$(mktemp "$(dirname "$journald_dropin")/.journald.XXXXXX")
-install -m 0644 "$journald_candidate_path" "$dropin_candidate"
-grep -Fq "SystemMaxUse=${journal_max_use_bytes}B" "$dropin_candidate"
-grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B" "$dropin_candidate"
-
-# The selected Ops Agent release documents platform-managed buffer protection but no numeric
-# configuration knob. The systemd drop-in bounds the logging and metrics
-# subagents; validate.sh accounts for observed buffer, self-log, and retained
-# syslog stores against a conservative reservation without claiming to set the
-# internal cap.
-logging_resource_candidate=$(mktemp "$(dirname "$logging_resource_dropin")/.resources.XXXXXX")
-cat >"$logging_resource_candidate" <<'RESOURCES'
-[Service]
-CPUQuota=${agent_cpu_limit_millicores / 10}%
-MemoryMax=${agent_memory_limit_mb}M
-RESOURCES
-agent_metrics_resource_candidate=$(mktemp "$(dirname "$agent_metrics_resource_dropin")/.resources.XXXXXX")
-cat >"$agent_metrics_resource_candidate" <<'RESOURCES'
-[Service]
-CPUQuota=${agent_cpu_limit_millicores / 20}%
-MemoryMax=${agent_memory_limit_mb / 2}M
-RESOURCES
-metrics_resource_candidate=$(mktemp "$(dirname "$metrics_resource_dropin")/.resources.XXXXXX")
-cat >"$metrics_resource_candidate" <<'RESOURCES'
-[Service]
-# Keep the standalone application-metrics collector below the logging
-# subagent under host pressure; its existing queue/memory-limiter sheds first.
-CPUQuota=${agent_cpu_limit_millicores / 20}%
-MemoryMax=${agent_memory_limit_mb / 2}M
-RESOURCES
-
-heartbeat_service_candidate=$(mktemp "$(dirname "$heartbeat_service")/.heartbeat.XXXXXX")
-cat >"$heartbeat_service_candidate" <<'HEARTBEAT'
+cat > "$state_dir/heartbeat.service.candidate" <<'EOF'
 [Unit]
-Description=Superserve host logging freshness heartbeat
+Description=Superserve host logging heartbeat
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'printf "{\"host_logging_heartbeat\":true,\"heartbeat_epoch\":%%s}\n" "$(date +%%s)" | systemd-cat -t superserve-host-logging-heartbeat -p info'
-HEARTBEAT
-heartbeat_timer_candidate=$(mktemp "$(dirname "$heartbeat_timer")/.heartbeat.XXXXXX")
-cat >"$heartbeat_timer_candidate" <<'HEARTBEAT'
+ExecStart=/bin/sh -c 'printf "{\\"host_logging_heartbeat\\":true,\\"heartbeat_epoch\\":%s}\\n" "$(date +%s)" | systemd-cat -t superserve-host-logging-heartbeat -p info'
+EOF
+cat > "$state_dir/heartbeat.timer.candidate" <<'EOF'
 [Unit]
-Description=Emit the host logging freshness heartbeat every minute
+Description=Superserve host logging heartbeat timer
 
 [Timer]
-OnBootSec=1min
+OnBootSec=${heartbeat_interval_seconds}s
 OnUnitActiveSec=${heartbeat_interval_seconds}s
 Unit=superserve-host-logging-heartbeat.service
 
 [Install]
 WantedBy=timers.target
-HEARTBEAT
+EOF
+install -m 0644 "$state_dir/heartbeat.service.candidate" "$heartbeat_service.new"
+install -m 0644 "$state_dir/heartbeat.timer.candidate" "$heartbeat_timer.new"
 
-agent_logrotate_candidate=$(mktemp "$(dirname "$agent_logrotate")/.superserve-agent.XXXXXX")
-cat >"$agent_logrotate_candidate" <<'ROTATE'
-/var/log/google-cloud-ops-agent/*.log /var/log/google-cloud-ops-agent/subagents/*.log {
-  size ${ceil(agent_self_log_max_bytes / 2 / 1048576)}M
-  rotate 1
-  compress
-  missingok
-  notifempty
-  copytruncate
-}
-ROTATE
-syslog_logrotate_candidate=$(mktemp "$(dirname "$syslog_logrotate")/.superserve-syslog.XXXXXX")
-cat >"$syslog_logrotate_candidate" <<'ROTATE'
-/var/log/syslog {
-  size ${ceil(syslog_max_bytes / 3 / 1048576)}M
-  rotate 2
-  compress
-  missingok
-  notifempty
-  copytruncate
-}
-ROTATE
-
-old_config=$(mktemp)
-old_dropin=$(mktemp)
-old_logging_resource=$(mktemp)
-old_agent_metrics_resource=$(mktemp)
-old_metrics_resource=$(mktemp)
-old_heartbeat_service=$(mktemp)
-old_heartbeat_timer=$(mktemp)
-old_agent_logrotate=$(mktemp)
-old_syslog_logrotate=$(mktemp)
-old_package_version="$installed_version"
-had_config=0
-had_dropin=0
-had_logging_resource=0
-had_agent_metrics_resource=0
-had_metrics_resource=0
-had_heartbeat_service=0
-had_heartbeat_timer=0
-if [ -f "$config_path" ]; then cp -p "$config_path" "$old_config"; had_config=1; fi
-if [ -f "$journald_dropin" ]; then cp -p "$journald_dropin" "$old_dropin"; had_dropin=1; fi
-if [ -f "$logging_resource_dropin" ]; then cp -p "$logging_resource_dropin" "$old_logging_resource"; had_logging_resource=1; fi
-if [ -f "$agent_metrics_resource_dropin" ]; then cp -p "$agent_metrics_resource_dropin" "$old_agent_metrics_resource"; had_agent_metrics_resource=1; fi
-if [ -f "$metrics_resource_dropin" ]; then cp -p "$metrics_resource_dropin" "$old_metrics_resource"; had_metrics_resource=1; fi
-if [ -f "$heartbeat_service" ]; then cp -p "$heartbeat_service" "$old_heartbeat_service"; had_heartbeat_service=1; fi
-if [ -f "$heartbeat_timer" ]; then cp -p "$heartbeat_timer" "$old_heartbeat_timer"; had_heartbeat_timer=1; fi
-had_agent_logrotate=0
-had_syslog_logrotate=0
-if [ -f "$agent_logrotate" ]; then cp -p "$agent_logrotate" "$old_agent_logrotate"; had_agent_logrotate=1; fi
-if [ -f "$syslog_logrotate" ]; then cp -p "$syslog_logrotate" "$old_syslog_logrotate"; had_syslog_logrotate=1; fi
-agent_was_enabled=0
-agent_was_active=0
-logging_was_active=0
-metrics_was_active=0
-standalone_metrics_was_active=0
-journald_was_active=0
-heartbeat_timer_was_active=0
-systemctl is-enabled --quiet google-cloud-ops-agent.service && agent_was_enabled=1 || true
-systemctl is-active --quiet google-cloud-ops-agent.service && agent_was_active=1 || true
-systemctl is-active --quiet google-cloud-ops-agent-fluent-bit.service && logging_was_active=1 || true
-systemctl is-active --quiet google-cloud-ops-agent-opentelemetry-collector.service && metrics_was_active=1 || true
-systemctl is-active --quiet superserve-otel-collector.service && standalone_metrics_was_active=1 || true
-systemctl is-active --quiet systemd-journald.service && journald_was_active=1 || true
-systemctl is-active --quiet superserve-host-logging-heartbeat.timer && heartbeat_timer_was_active=1 || true
-
-rollback() {
-  rollback_in_progress=1
-  set +e
-  if [ "$package_change_attempted" -eq 1 ]; then
-    if [ -n "$rollback_package_deb" ]; then
-      timeout "${package_operation_timeout_seconds}s" dpkg -i "$rollback_package_deb" >/dev/null 2>&1 || true
-    elif [ -n "$old_package_version" ]; then
-      timeout "${package_operation_timeout_seconds}s" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=30 "google-cloud-ops-agent=$old_package_version" >/dev/null 2>&1 || true
-    else
-      timeout "${package_operation_timeout_seconds}s" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 -y remove google-cloud-ops-agent >/dev/null 2>&1 || true
-    fi
-  fi
-  if [ "$had_config" -eq 1 ]; then install -m 0644 "$old_config" "$config_path"; else rm -f "$config_path"; fi
-  if [ "$had_dropin" -eq 1 ]; then install -m 0644 "$old_dropin" "$journald_dropin"; else rm -f "$journald_dropin"; fi
-  if [ "$had_logging_resource" -eq 1 ]; then install -m 0644 "$old_logging_resource" "$logging_resource_dropin"; else rm -f "$logging_resource_dropin"; fi
-  if [ "$had_agent_metrics_resource" -eq 1 ]; then install -m 0644 "$old_agent_metrics_resource" "$agent_metrics_resource_dropin"; else rm -f "$agent_metrics_resource_dropin"; fi
-  if [ "$had_metrics_resource" -eq 1 ]; then install -m 0644 "$old_metrics_resource" "$metrics_resource_dropin"; else rm -f "$metrics_resource_dropin"; fi
-  if [ "$had_heartbeat_service" -eq 1 ]; then install -m 0644 "$old_heartbeat_service" "$heartbeat_service"; else rm -f "$heartbeat_service"; fi
-  if [ "$had_heartbeat_timer" -eq 1 ]; then install -m 0644 "$old_heartbeat_timer" "$heartbeat_timer"; else rm -f "$heartbeat_timer"; fi
-  if [ "$had_agent_logrotate" -eq 1 ]; then install -m 0644 "$old_agent_logrotate" "$agent_logrotate"; else rm -f "$agent_logrotate"; fi
-  if [ "$had_syslog_logrotate" -eq 1 ]; then install -m 0644 "$old_syslog_logrotate" "$syslog_logrotate"; else rm -f "$syslog_logrotate"; fi
-  systemctl daemon-reload || true
-  if [ "$logging_was_active" -eq 1 ]; then systemctl restart google-cloud-ops-agent-fluent-bit.service || true; else systemctl stop google-cloud-ops-agent-fluent-bit.service || true; fi
-  if [ "$metrics_was_active" -eq 1 ]; then systemctl restart google-cloud-ops-agent-opentelemetry-collector.service || true; else systemctl stop google-cloud-ops-agent-opentelemetry-collector.service || true; fi
-  if [ "$standalone_metrics_was_active" -eq 1 ]; then systemctl restart superserve-otel-collector.service || true; else systemctl stop superserve-otel-collector.service || true; fi
-  if [ "$heartbeat_timer_was_active" -eq 1 ]; then systemctl enable --now superserve-host-logging-heartbeat.timer || true; else systemctl disable --now superserve-host-logging-heartbeat.timer || true; fi
-  if [ "$journald_was_active" -eq 1 ]; then systemctl try-reload-or-restart systemd-journald.service || true; else systemctl stop systemd-journald.service || true; fi
-  if [ "$agent_was_active" -eq 1 ]; then systemctl start google-cloud-ops-agent.service || true; else systemctl stop google-cloud-ops-agent.service || true; fi
-  if [ "$agent_was_enabled" -eq 1 ]; then systemctl enable google-cloud-ops-agent.service || true; else systemctl disable google-cloud-ops-agent.service || true; fi
-  rollback_completed=1
-  rollback_in_progress=0
-  set -e
-}
-
-on_exit() {
-  status=$?
-  if [ "$status" -ne 0 ] && [ "$activation_committed" -eq 0 ] && [ "$rollback_completed" -eq 0 ] && [ "$rollback_in_progress" -eq 0 ]; then
-    rollback || true
-  fi
-  cleanup
-  exit "$status"
-}
-trap on_exit EXIT
-
-# The package is staged and validated before this transaction. Snapshot
-# service/configuration state above, then make the version change as
-# part of the same transaction so any activation failure can restore both the
-# previous package and its delivery state.
-if [[ "$installed_version" != ${ops_agent_package_version}* ]] || ! command -v google-cloud-ops-agent >/dev/null 2>&1; then
-  package_change_attempted=1
-  if ! timeout "${package_operation_timeout_seconds}s" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=30 -o Acquire::Retries=2 "google-cloud-ops-agent=${ops_agent_package_version}"; then
-    exit 1
-  fi
-  if ! run_engine_validation /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine "$rendered_config"; then
-    exit 1
-  fi
+changed=0
+cmp -s "$candidate" "$active_config" || changed=1
+cmp -s "$service_candidate" "$active_service" || changed=1
+cmp -s "$dropin.new" "$dropin" || changed=1
+cmp -s "$state_dir/heartbeat.service.candidate" "$heartbeat_service" || changed=1
+cmp -s "$state_dir/heartbeat.timer.candidate" "$heartbeat_timer" || changed=1
+if [ "$changed" -eq 1 ] || [ "$binary_changed" -eq 1 ]; then
+  install -m 0644 "$candidate" "$active_config.new"
+  install -m 0644 "$service_candidate" "$active_service.new"
+  install -m 0644 "$heartbeat_service.new" "$heartbeat_service"
+  install -m 0644 "$heartbeat_timer.new" "$heartbeat_timer"
+  install -m 0644 "$dropin.new" "$dropin"
+  mv -f "$active_config.new" "$active_config"
+  mv -f "$active_service.new" "$active_service"
+  systemctl daemon-reload
+  systemctl enable superserve-otel-logs.service >/dev/null
+  systemctl restart superserve-otel-logs.service
+  systemctl is-active --quiet superserve-otel-logs.service
 fi
 
-for pair in "$agent_logrotate_candidate:$agent_logrotate" "$syslog_logrotate_candidate:$syslog_logrotate"; do
-  candidate=$${pair%%:*}
-  destination=$${pair#*:}
-  if ! cmp -s "$candidate" "$destination" 2>/dev/null; then
-    staged_rotation=$(mktemp "$(dirname "$destination")/.active-rotation.XXXXXX")
-    install -m 0644 "$candidate" "$staged_rotation"
-    mv -f "$staged_rotation" "$destination"
-  fi
-done
-
-# All renames stay on their destination filesystems. A failed restart restores
-# the previous config and drop-ins; Ops Agent checkpoint/buffer directories are
-# never copied, deleted, or reset.
-if ! cmp -s "$rendered_config" "$config_path" 2>/dev/null; then
-  staged_config=$(mktemp "$config_dir/.active-config.XXXXXX")
-  install -m 0644 "$rendered_config" "$staged_config"
-  mv -f "$staged_config" "$config_path"
-  config_changed=1
-else
-  config_changed=0
-fi
-if ! cmp -s "$dropin_candidate" "$journald_dropin" 2>/dev/null; then
-  staged_dropin=$(mktemp "$(dirname "$journald_dropin")/.active-journald.XXXXXX")
-  install -m 0644 "$dropin_candidate" "$staged_dropin"
-  mv -f "$staged_dropin" "$journald_dropin"
-  journal_changed=1
-else
-  journal_changed=0
-fi
-agent_resource_changed=0
-standalone_resource_changed=0
-heartbeat_changed=0
-for pair in "$logging_resource_candidate:$logging_resource_dropin" "$agent_metrics_resource_candidate:$agent_metrics_resource_dropin" "$metrics_resource_candidate:$metrics_resource_dropin"; do
-  candidate=$${pair%%:*}
-  destination=$${pair#*:}
-  if ! cmp -s "$candidate" "$destination" 2>/dev/null; then
-    staged_resource=$(mktemp "$(dirname "$destination")/.active-resource.XXXXXX")
-    install -m 0644 "$candidate" "$staged_resource"
-    mv -f "$staged_resource" "$destination"
-    case "$destination" in
-      "$metrics_resource_dropin") standalone_resource_changed=1 ;;
-      *) agent_resource_changed=1 ;;
-    esac
-  fi
-done
-for pair in "$heartbeat_service_candidate:$heartbeat_service" "$heartbeat_timer_candidate:$heartbeat_timer"; do
-  candidate=$${pair%%:*}
-  destination=$${pair#*:}
-  if ! cmp -s "$candidate" "$destination" 2>/dev/null; then
-    staged_unit=$(mktemp "$(dirname "$destination")/.active-heartbeat.XXXXXX")
-    install -m 0644 "$candidate" "$staged_unit"
-    mv -f "$staged_unit" "$destination"
-    heartbeat_changed=1
-  fi
-done
-
-if ! systemctl daemon-reload; then rollback; exit 1; fi
-if [ "$config_changed" -eq 1 ] || [ "$agent_resource_changed" -eq 1 ]; then
-  if ! systemctl restart google-cloud-ops-agent-fluent-bit.service google-cloud-ops-agent-opentelemetry-collector.service; then rollback; exit 1; fi
-fi
-if [ "$standalone_resource_changed" -eq 1 ]; then
-  if ! systemctl restart superserve-otel-collector.service; then rollback; exit 1; fi
-fi
-if [ "$journal_changed" -eq 1 ]; then
-  if ! systemctl try-reload-or-restart systemd-journald.service; then rollback; exit 1; fi
-fi
-if ! systemctl is-enabled --quiet google-cloud-ops-agent.service; then
-  if ! systemctl enable google-cloud-ops-agent.service; then rollback; exit 1; fi
-fi
-if ! systemctl is-active --quiet google-cloud-ops-agent.service; then
-  if ! systemctl start google-cloud-ops-agent.service; then rollback; exit 1; fi
-fi
-for service in google-cloud-ops-agent-fluent-bit.service google-cloud-ops-agent-opentelemetry-collector.service superserve-otel-collector.service; do
-  if ! systemctl is-active --quiet "$service"; then
-    if ! systemctl start "$service"; then rollback; exit 1; fi
-  fi
-done
-if ! systemctl enable --now superserve-host-logging-heartbeat.timer; then rollback; exit 1; fi
-systemctl is-active --quiet superserve-host-logging-heartbeat.timer || { rollback; exit 1; }
-
-# No subsequent operation mutates managed configuration. Recovery snapshots can
-# now be discarded by the exit handler; checkpoint and pending buffer state is
-# never part of the snapshot or cleanup set.
+systemctl enable superserve-otel-logs.service >/dev/null
+systemctl is-active --quiet superserve-otel-logs.service
+systemctl daemon-reload
+systemctl enable --now superserve-host-logging-heartbeat.timer >/dev/null
+systemctl is-active --quiet superserve-host-logging-heartbeat.timer
 activation_committed=1
-
-# Reclaim only disposable retention stores after successful activation. The
-# selected release's checkpoint/buffer state is never copied or deleted. This
-# remediation budget starts after package/configuration activation so slow
-# installs and restarts cannot consume the entire cleanup window.
-storage_remediation_deadline=$(( $(date +%s) + ${storage_scan_timeout_seconds} ))
-storage_remediation_remaining() {
-  remaining=$((storage_remediation_deadline - $(date +%s)))
-  [ "$remaining" -gt 0 ] || return 1
-  printf '%ss' "$remaining"
-}
-storage_remediation_timeout=$(storage_remediation_remaining) || {
-  logger -t superserve-host-logging -p err "disposable retention cleanup skipped after remediation deadline"
-  exit 1
-}
-if ! timeout "$storage_remediation_timeout" bash -c '
-  set -u
-  journal_max="$1"; self_log_dir="$2"; self_limit="$3"; syslog_limit="$4"; max_entries="$5"
-  cleanup_failed=0
-  journalctl --vacuum-size="$${journal_max}B" >/dev/null 2>&1 || cleanup_failed=1
-  logrotate -f /etc/logrotate.d/superserve-google-cloud-ops-agent >/dev/null 2>&1 || cleanup_failed=1
-  logrotate -f /etc/logrotate.d/superserve-host-syslog >/dev/null 2>&1 || cleanup_failed=1
-  reclaim() {
-    kind="$1"; root="$2"; limit="$3"; count=0; total=0; capped=0; scan_limit=$((max_entries + 1))
-    files=(); sizes=()
-    listing=$(mktemp)
-    if ! python3 - "$kind" "$root" "$max_entries" >"$listing" <<'PY'
-import os
-import sys
-
-kind, root, limit_text = sys.argv[1:]
-limit = int(limit_text)
-queue = [root]
-visited = 0
-capped = False
-allow_missing_first_install = kind == "self_log" and os.environ.get("SUPER_SERVE_FIRST_INSTALL") == "1"
-try:
-    os.stat(root)
-except FileNotFoundError:
-    if allow_missing_first_install:
-        print(kind, 0, 0)
-        raise SystemExit(0)
-    raise SystemExit(2)
-except OSError:
-    raise SystemExit(2)
-while queue:
-    current = queue.pop(0)
-    try:
-        os.stat(root)
-    except OSError:
-        raise SystemExit(2)
-    try:
-        with os.scandir(current) as entries:
-            for entry in entries:
-                if visited >= limit + 1:
-                    capped = True
-                    break
-                visited += 1
-                if entry.is_dir(follow_symlinks=False):
-                    if kind != "syslog":
-                        queue.append(entry.path)
-                    continue
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-                selected = (kind != "syslog" and ".log" in entry.name)
-                selected = selected or (kind == "syslog" and (entry.name == "syslog" or entry.name.startswith("syslog.")))
-                if selected:
-                    print(entry.path, entry.stat(follow_symlinks=False).st_size, sep="\t")
-    except OSError:
-        raise SystemExit(2)
-    if capped:
-        break
-if capped or visited > limit:
-    print("__CAP__", 0, sep="\t")
-PY
-    then
-      rm -f "$listing"
-      cleanup_failed=1
-      return
-    fi
-    while IFS="$(printf '\t')" read -r path size; do
-      if [ "$path" = __CAP__ ]; then capped=1; continue; fi
-      files+=("$path"); sizes+=("$size"); total=$((total + size)); count=$((count + 1))
-    done <"$listing"
-    rm -f "$listing"
-    for i in "$${!files[@]}"; do
-      [ "$total" -gt "$limit" ] || break
-      path="$${files[$i]}"; size="$${sizes[$i]}"
-      case "$path" in
-        *.log.*|/var/log/syslog.*) rm -f -- "$path" && total=$((total - size)) || cleanup_failed=1 ;;
-      esac
-    done
-    for i in "$${!files[@]}"; do
-      [ "$total" -gt "$limit" ] || break
-      path="$${files[$i]}"
-      case "$path" in
-        *.log|/var/log/syslog) size="$${sizes[$i]}"; : >"$path" && total=$((total - size)) || cleanup_failed=1 ;;
-      esac
-    done
-    if [ "$capped" -ne 0 ]; then
-      logger -t superserve-host-logging -p err "$${kind} cleanup reached its bounded entry cap"
-      cleanup_failed=1
-    fi
-    if [ "$total" -gt "$limit" ]; then
-      logger -t superserve-host-logging -p err "$${kind} disposable store remains above its bounded size after cleanup"
-      cleanup_failed=1
-    fi
-  }
-  reclaim self_log "$self_log_dir" "$self_limit"
-  reclaim syslog /var/log "$syslog_limit"
-  [ "$cleanup_failed" -eq 0 ]
-' _ "$journal_max_use_bytes" "$self_log_dir" "${agent_self_log_max_bytes}" "${syslog_max_bytes}" "${storage_scan_max_entries}"; then
-  logger -t superserve-host-logging -p err "disposable retention cleanup incomplete or exceeded bounded deadline"
-  exit 1
-fi
-
-# Activation is committed independently from storage compliance. Re-scan the
-# bounded stores after remediation: an oversized agent buffer or an incomplete
-# accounting pass is still noncompliant, but the exporter and its checkpoint /
-# pending-buffer state continue running and are never deleted by this script.
-storage_post_scan_deadline=$(( $(date +%s) + ${storage_scan_timeout_seconds} ))
-storage_post_scan_remaining() {
-  remaining=$((storage_post_scan_deadline - $(date +%s)))
-  [ "$remaining" -gt 0 ] || return 1
-  printf '%ss' "$remaining"
-}
-storage_post_scan_timeout=$(storage_post_scan_remaining) || {
-  logger -t superserve-host-logging -p err "storage accounting deadline expired during post-remediation compliance check"
-  exit 1
-}
-: >"$storage_scan_result"
-if ! timeout "$storage_post_scan_timeout" bash -c '
-  set -euo pipefail
-  buffer_dir="$1"; self_log_dir="$2"; max_entries="$3"; output="$4"
-  scan_store() {
-    kind="$1"; root="$2"
-    python3 - "$kind" "$root" "$max_entries" <<'PY'
-import os
-import sys
-
-kind, root, limit_text = sys.argv[1:]
-limit = int(limit_text)
-queue = [root]
-visited = 0
-bytes_total = 0
-capped = False
-allow_missing_first_install = kind in {"buffer", "self_log"} and os.environ.get("SUPER_SERVE_FIRST_INSTALL") == "1"
-try:
-    os.stat(root)
-except FileNotFoundError:
-    if allow_missing_first_install:
-        print(kind, 0, 0)
-        raise SystemExit(0)
-    raise SystemExit(2)
-except OSError:
-    raise SystemExit(2)
-while queue:
-    current = queue.pop(0)
-    try:
-        os.stat(root)
-    except OSError:
-        raise SystemExit(2)
-    try:
-        with os.scandir(current) as entries:
-            for entry in entries:
-                if visited >= limit + 1:
-                    capped = True
-                    break
-                visited += 1
-                if entry.is_dir(follow_symlinks=False):
-                    if kind != "syslog":
-                        queue.append(entry.path)
-                elif entry.is_file(follow_symlinks=False):
-                    if kind != "syslog" or entry.name == "syslog" or entry.name.startswith("syslog."):
-                        bytes_total += entry.stat(follow_symlinks=False).st_size
-    except OSError:
-        raise SystemExit(2)
-    if capped:
-        break
-print(kind, bytes_total, int(capped or visited > limit))
-PY
-  }
-  scan_store buffer "$buffer_dir"
-  scan_store self_log "$self_log_dir"
-  scan_store syslog /var/log
-' _ "$buffer_dir" "$self_log_dir" "${storage_scan_max_entries}" "$storage_scan_result" >"$storage_scan_result"; then
-  logger -t superserve-host-logging -p err "post-remediation storage accounting exceeded its bounded deadline"
-  exit 1
-fi
-storage_bytes=0; buffer_bytes=0; self_log_bytes=0; syslog_bytes=0
-storage_scan_capped=0
-seen_buffer=0; seen_self_log=0; seen_syslog=0
-while read -r kind size capped; do
-  test -n "$kind" || exit 1
-  case "$size" in (''|*[!0-9]*) exit 1 ;; esac
-  case "$capped" in (0) ;; (1) storage_scan_capped=1 ;; (*) exit 1 ;; esac
-  storage_bytes=$((storage_bytes + size))
-  case "$kind" in
-    buffer) [ "$seen_buffer" -eq 0 ] || exit 1; seen_buffer=1; buffer_bytes=$size ;;
-    self_log) [ "$seen_self_log" -eq 0 ] || exit 1; seen_self_log=1; self_log_bytes=$size ;;
-    syslog) [ "$seen_syslog" -eq 0 ] || exit 1; seen_syslog=1; syslog_bytes=$size ;;
-    *) exit 1 ;;
-  esac
-done < "$storage_scan_result"
-[ "$seen_buffer" -eq 1 ] && [ "$seen_self_log" -eq 1 ] && [ "$seen_syslog" -eq 1 ] || exit 1
-if [ "$storage_scan_capped" -ne 0 ]; then
-  logger -t superserve-host-logging -p err "post-remediation storage accounting is incomplete"
-  exit 1
-fi
-if [ "$buffer_bytes" -gt ${agent_buffer_bytes} ]; then
-  logger -t superserve-host-logging -p err "Ops Agent buffer remains above ${agent_buffer_bytes} byte budget; pending buffer state preserved"
-  exit 1
-fi
-if [ "$self_log_bytes" -gt ${agent_self_log_max_bytes} ] || [ "$syslog_bytes" -gt ${syslog_max_bytes} ]; then
-  logger -t superserve-host-logging -p err "disposable logging stores remain above their bounded size after remediation"
-  exit 1
-fi
-if [ $((journal_max_use_bytes + storage_bytes)) -gt ${journal_keep_free_bytes} ]; then
-  logger -t superserve-host-logging -p err "combined journal and auxiliary logging stores remain above the free-space objective"
-  exit 1
-fi
-logger -t superserve-host-logging -p info "configuration activation and post-remediation storage compliance succeeded"
-exit 100
+rm -f "$archive_dir"/active-config.*.bak "$archive_dir"/active-service.*.bak "$archive_dir"/active-journald.*.bak "$archive_dir"/active-binary.*.bak "$archive_dir"/active-heartbeat-service.*.bak "$archive_dir"/active-heartbeat-timer.*.bak
+exit 0

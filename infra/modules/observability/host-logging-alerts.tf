@@ -59,9 +59,9 @@ resource "google_monitoring_alert_policy" "host_logging_export_failures" {
   }
 
   conditions {
-    display_name = "Ops Agent export errors on ${each.value.instance_name}"
+    display_name = "OTel logs export errors on ${each.value.instance_name}"
     condition_matched_log {
-      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"ops_agent_self_log_files\") AND jsonPayload.message =~ \"(?i)(failed to flush chunk|exporting failed|permission denied|\\bdrop\\b|\\bdropped\\b)\""
+      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND (jsonPayload.host_logging_export_error=\"true\" OR jsonPayload.message =~ \"(?i)(export failed|permission denied|\\bdrop\\b|\\bdropped\\b)\")"
     }
   }
 
@@ -71,7 +71,7 @@ resource "google_monitoring_alert_policy" "host_logging_export_failures" {
   }
 
   documentation {
-    content   = "Ops Agent reported an export error on ${each.value.instance_name}. Check agent health, Cloud Logging permissions, network egress, and retained journal/buffer growth before restarting anything.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_export", "")}"
+    content   = "The dedicated OTel logs collector reported an export error on ${each.value.instance_name}. Check collector health, Cloud Logging permissions, network egress, and retained journal/queue growth before restarting anything.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_export", "")}"
     mime_type = "text/markdown"
   }
 
@@ -107,7 +107,7 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
   # exist. The metric name is the Cloud Monitoring PromQL form of the
   # logging.googleapis.com/user/... type.
   conditions {
-    display_name = "Ops Agent delivery lag on ${each.value.instance_name}"
+    display_name = "OTel logs delivery lag on ${each.value.instance_name}"
     condition_prometheus_query_language {
       query                     = <<-EOT
         absent_over_time({
@@ -129,7 +129,7 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
   }
 
   documentation {
-    content   = "Retained host logs are arriving later than the configured ${var.host_logging_alerts.lag_threshold_seconds}s threshold on ${each.value.instance_name}. Distinguish outage catch-up from a persistent gap and account for journal/buffer expiry.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_lag", "")}"
+    content   = "Retained host logs are arriving later than the configured ${var.host_logging_alerts.lag_threshold_seconds}s threshold on ${each.value.instance_name}. Distinguish outage catch-up from a persistent gap and account for journal/queue expiry.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_lag", "")}"
     mime_type = "text/markdown"
   }
 
@@ -143,8 +143,8 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
   })
 }
 
-# The standalone OTel collector's self metric is independent of the Ops
-# Agent/export path. A broken exporter therefore cannot make this absence
+# The standalone metrics collector's self metric is independent of the OTel
+# logs export path. A broken exporter therefore cannot make this absence
 # signal appear healthy.
 resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   for_each = local.active_host_logging_alerts
@@ -168,8 +168,8 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
       # PromQL absent() returns an explicit one-valued result when the
       # expected label set has never produced a series. Metric-absence and
       # missing-data policies cannot create that initial series. The selector
-      # uses the standalone collector's independent identity, so Ops Agent
-      # export failure cannot satisfy or silence this condition.
+      # uses the standalone collector's independent identity, so log export
+      # failure cannot satisfy or silence this condition.
       query                     = <<-EOT
         absent({
           "__name__" = "${var.host_logging_alerts.heartbeat_metric_type}",
@@ -183,7 +183,7 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   }
 
   documentation {
-    content   = "The standalone OTel collector heartbeat for ${each.value.instance_name} was absent. This metric is delivered on the existing application-metrics path, separately from Ops Agent log export, so a broken exporter cannot satisfy the expected-host signal.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_heartbeat", "")}"
+    content   = "The standalone metrics collector heartbeat for ${each.value.instance_name} was absent. This metric is delivered on the existing application-metrics path, separately from OTel log export, so a broken exporter cannot satisfy the expected-host signal.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_heartbeat", "")}"
     mime_type = "text/markdown"
   }
 

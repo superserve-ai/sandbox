@@ -1,0 +1,24 @@
+[Unit]
+Description=Superserve OpenTelemetry host logs collector
+Wants=network-online.target
+After=network-online.target systemd-journald.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=-/etc/sandbox/host-identity.env
+EnvironmentFile=-/etc/sandbox/host-logging-identity.env
+ExecStart=${binary_path} --config ${config_path}
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${cursor_dir} ${queue_dir} /var/log/journal
+MemoryMax=${memory_limit_mb}M
+CPUQuota=${cpu_limit}
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

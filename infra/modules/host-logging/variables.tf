@@ -19,18 +19,18 @@ variable "region" {
 }
 
 variable "assignment_name" {
-  description = "Existing or new zonal OS Config assignment identity."
+  description = "Dedicated OTel logs OS Config assignment identity."
   type        = string
 }
 
 variable "assignment_revision" {
-  description = "Versioned configuration revision used for reconciliation and rollback."
+  description = "Immutable rendered revision used for reconciliation and rollback."
   type        = string
-  default     = "2026-10-01"
+  default     = "2026-10-01-otel-1"
 }
 
 variable "selector_labels" {
-  description = "Narrow labels selecting only the intended serving hosts."
+  description = "Narrow labels selecting only intended serving hosts."
   type        = map(string)
   default     = {}
 }
@@ -51,7 +51,6 @@ variable "journal_max_use_bytes" {
   description = "Initial persistent journal budget (4 GiB)."
   type        = number
   default     = 4294967296
-
   validation {
     condition     = var.journal_max_use_bytes > 0
     error_message = "journal_max_use_bytes must be positive."
@@ -62,73 +61,74 @@ variable "journal_keep_free_bytes" {
   description = "Persistent journal free-space reserve (10 GiB)."
   type        = number
   default     = 10737418240
-
   validation {
     condition     = var.journal_keep_free_bytes > 0
     error_message = "journal_keep_free_bytes must be positive."
   }
 }
 
-variable "agent_buffer_bytes" {
-  description = "Conservative free-space reservation for the selected release's platform-managed Ops Agent buffer; the selected release does not expose a configurable numeric cap, so this value is an accounting/enforcement threshold rather than a claimed agent limit."
-  type        = number
-  default     = 1073741824
-
+variable "otel_release_version" {
+  description = "Pinned released OpenTelemetry Collector Contrib version."
+  type        = string
+  default     = "0.104.0"
   validation {
-    condition     = var.agent_buffer_bytes > 0
-    error_message = "agent_buffer_bytes must be positive."
+    condition     = can(regex("^0\\.[0-9]+\\.[0-9]+$", var.otel_release_version))
+    error_message = "otel_release_version must be a pinned semantic release."
   }
 }
 
-variable "agent_self_log_max_bytes" {
-  description = "Per-file size bound used by the host log rotation policy for Ops Agent self-logs."
-  type        = number
-  default     = 268435456
-
+variable "otel_release_url" {
+  description = "Authenticated package URL for the selected amd64 OTel Contrib release."
+  type        = string
+  default     = "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.104.0/otelcol-contrib_0.104.0_linux_amd64.tar.gz"
   validation {
-    condition     = var.agent_self_log_max_bytes > 0
-    error_message = "agent_self_log_max_bytes must be positive."
+    condition     = can(regex("^https://", var.otel_release_url))
+    error_message = "otel_release_url must use HTTPS."
   }
 }
 
-variable "syslog_max_bytes" {
-  description = "Size bound used by the host log rotation policy for retained syslog files."
-  type        = number
-  default     = 268435456
-
+variable "otel_release_sha256" {
+  description = "SHA-256 digest of the selected OTel Contrib archive."
+  type        = string
+  # This immutable value is replaced only by a reviewed release manifest;
+  # staging must reject an archive whose bytes do not match it.
+  default = "8931c2f158339a7607de1356224444be778c5da9608b9fd5be52aafee7c414c5"
   validation {
-    condition     = var.syslog_max_bytes > 0
-    error_message = "syslog_max_bytes must be positive."
+    condition     = can(regex("^[0-9a-f]{64}$", var.otel_release_sha256))
+    error_message = "otel_release_sha256 must be a reviewed 64-character hexadecimal digest."
   }
 }
 
-variable "storage_scan_timeout_seconds" {
-  description = "Maximum wall-clock budget for one bounded buffer/self-log/syslog accounting or remediation pass."
-  type        = number
-  default     = 5
-
+variable "otel_binary_path" {
+  description = "Dedicated binary path; it must not overlap the metrics collector."
+  type        = string
+  default     = "/opt/superserve/otelcol-contrib/bin/otelcol-contrib"
   validation {
-    condition     = var.storage_scan_timeout_seconds >= 1
-    error_message = "storage_scan_timeout_seconds must be at least one second."
+    condition     = !strcontains(var.otel_binary_path, "superserve-otel-collector")
+    error_message = "The logs binary path must remain distinct from the metrics collector."
   }
 }
 
-variable "storage_scan_max_entries" {
-  description = "Maximum number of filesystem entries (including directories) visited in one bounded storage accounting or remediation pass."
+variable "otel_memory_limit_mb" {
+  description = "Bounded OTel logs service memory budget in MiB."
   type        = number
-  default     = 32
-
+  default     = 512
   validation {
-    condition     = var.storage_scan_max_entries >= 1
-    error_message = "storage_scan_max_entries must be at least one."
+    condition     = var.otel_memory_limit_mb > 0
+    error_message = "otel_memory_limit_mb must be positive."
   }
+}
+
+variable "otel_cpu_limit" {
+  description = "Bounded OTel logs service CPU quota."
+  type        = string
+  default     = "1000m"
 }
 
 variable "package_operation_timeout_seconds" {
-  description = "Wall-clock bound for each staged or active Ops Agent package operation, including rollback."
+  description = "Bound for release download and staged package operations."
   type        = number
   default     = 120
-
   validation {
     condition     = var.package_operation_timeout_seconds >= 30
     error_message = "package_operation_timeout_seconds must be at least 30 seconds."
@@ -136,45 +136,21 @@ variable "package_operation_timeout_seconds" {
 }
 
 variable "heartbeat_interval_seconds" {
-  description = "Per-host heartbeat period; reconciliation performs no fleet-sized heartbeat loop."
+  description = "Managed heartbeat period; no fleet-sized loop is used."
   type        = number
   default     = 60
-
   validation {
     condition     = var.heartbeat_interval_seconds >= 30
     error_message = "heartbeat_interval_seconds must be at least 30 seconds."
   }
 }
 
-variable "agent_memory_limit_mb" {
-  description = "Bounded Ops Agent memory budget in MiB."
+variable "otel_queue_max_bytes" {
+  description = "Explicit disk budget for the persistent OTel exporter queue."
   type        = number
-  default     = 512
-
+  default     = 2147483648
   validation {
-    condition     = var.agent_memory_limit_mb > 0
-    error_message = "agent_memory_limit_mb must be positive."
-  }
-}
-
-variable "agent_cpu_limit_millicores" {
-  description = "Bounded Ops Agent CPU budget in millicores."
-  type        = number
-  default     = 1000
-
-  validation {
-    condition     = var.agent_cpu_limit_millicores > 0
-    error_message = "agent_cpu_limit_millicores must be positive."
-  }
-}
-
-variable "ops_agent_package_version" {
-  description = "Pinned Ops Agent package version selected after staging verification; its supported buffer semantics and generator output must be recorded before rollout."
-  type        = string
-  default     = "2.71.0"
-
-  validation {
-    condition     = can(regex("^2\\.(2[89]|[3-9][0-9]|[1-9][0-9]{2,})", var.ops_agent_package_version))
-    error_message = "ops_agent_package_version must be Ops Agent 2.28.0 or newer so the documented platform-managed buffer protection is available; numeric limits require release evidence."
+    condition     = var.otel_queue_max_bytes > 0
+    error_message = "otel_queue_max_bytes must be positive."
   }
 }

@@ -45,7 +45,7 @@ variable "host_maintenance_event_alerts" {
 }
 
 variable "host_logging_alerts" {
-  description = "Ops Agent failure/lag alerts plus independent expected-host freshness signals for every active serving host."
+  description = "OTel logs failure/lag alerts plus independent expected-host freshness signals for every active serving host."
   type = object({
     display_prefix        = string
     lag_threshold_seconds = optional(number, 300)
@@ -58,7 +58,7 @@ variable "host_logging_alerts" {
       instance_name = string
       instance_id   = string
       # The stable numeric VM identity is explicit so replacements cannot
-      # inherit a predecessor's heartbeat series. The Ops Agent log heartbeat
+      # inherit a predecessor's heartbeat series. The OTel log heartbeat
       # matches resource.labels.instance_id; runtime host_id, VM name, and
       # incarnation stay separate.
       # Retired hosts remain in inventory with active=false until their alert

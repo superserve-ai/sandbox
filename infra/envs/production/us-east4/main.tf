@@ -534,9 +534,9 @@ module "observability" {
   labels = local.common_labels
 }
 
-# One adopted zonal assignment owns Ops Agent installation/configuration for the
-# serving host and its replacements. East's existing enrollment label remains
-# unchanged while the common managed configuration is reconciled.
+# One dedicated zonal assignment owns OTel logs for the serving host and its
+# replacements. East's existing legacy delivery remains independent until the
+# staged OTel cutover is evidenced.
 module "host_logging" {
   source = "../../../modules/host-logging"
 
@@ -544,7 +544,7 @@ module "host_logging" {
   zone            = local.zone
   environment     = local.environment
   region          = local.region
-  assignment_name = "goog-ops-agent-v2-template-1-7-0-us-east4-a"
+  assignment_name = "superserve-otel-host-logging-us-east4-a"
   selector_labels = {
     application = "sandbox-host"
     environment = local.environment

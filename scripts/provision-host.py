@@ -135,7 +135,8 @@ HOST_LOGGING_RESOURCES = {
     'google_os_config_os_policy_assignment.host_logging',
     'google_project_iam_member.log_writer',
     'google_storage_bucket_iam_member.artifact_reader',
-    'google_storage_bucket_object.ops_agent_config',
+    'google_storage_bucket_object.otel_config',
+    'google_storage_bucket_object.otel_service',
     'google_storage_bucket_object.reconcile_script',
     'google_storage_bucket_object.validate_script',
 }
@@ -219,7 +220,7 @@ def validate_host_logging_update(change, vm_change, config, host, region):
     """Allow only selected-host-bound logging dependencies in a VM plan.
 
     Host creation/replacement can change identity-derived values embedded in
-    rendered Ops Agent artifacts and assignments. Keep those updates inside the
+    rendered OTel artifacts and assignments. Keep those updates inside the
     Terraform-owned host-logging module, require the selected host reference,
     and reject any functional policy/IAM mutation or unconstrained unknown.
     """
