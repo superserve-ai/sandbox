@@ -201,3 +201,5 @@ production proof; capture deployed results before declaring the target met.
 Automatic proxy deployment waits for the same-release schema migration workflow
 when a push includes migrations. Manual dispatch requires the operator to apply
 migrations before deploying, matching the API deployment contract.
+If the pushed range cannot be established, automatic rollout requires a successful
+same-release migration run; an absent run is not proof that the schema is ready.

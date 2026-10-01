@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 type hintHosts map[string]SandboxRoute
@@ -259,6 +260,58 @@ func TestHintedRemoteExecAndPreDispatchFallback(t *testing.T) {
 			}
 			if spy.opens.Load() != want+1 {
 				t.Fatal("open count", spy.opens.Load())
+			}
+		})
+	}
+}
+
+func TestHintedPeerOpenFailureRecoversBeforeExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		lookupErr  error
+		status     int
+		outcome    string
+		executions int32
+	}{
+		{"local", nil, http.StatusOK, "local", 1},
+		{"missing", ErrInstanceNotFound, http.StatusNotFound, "not_found", 0},
+		{"lookup unavailable", errors.New("database unavailable"), http.StatusBadGateway, "peer_error", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newExecTestEnv(t)
+			id := uuid.NewString()
+			env.handler.transports.items[id] = env.handler.transports.items[env.sandboxID]
+			env.sandboxID = id
+			var executions atomic.Int32
+			upstream := env.upstream.Config.Handler
+			env.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				executions.Add(1)
+				upstream.ServeHTTP(w, r)
+			})
+			lookups, opens := 0, 0
+			var outcomes []string
+			router := NewRoutingHandler([]string{env.domain}, "local", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+				lookups++
+				return SandboxRoute{HostID: "local"}, tc.lookupErr
+			}), routePeerFunc(func(context.Context, string, PeerEndpoint) (PeerStream, error) {
+				opens++
+				return nil, errors.New("failed before request bytes")
+			}), env.handler, zerolog.Nop(), routingOutcomeRecorderFunc(func(_ context.Context, outcome telemetry.RoutingOutcome) {
+				outcomes = append(outcomes, outcome.Outcome)
+			})).WithRoutingHints(hintHosts{"former-owner": {HostID: "former-owner", ProxyAddr: "10.0.0.2:5009", Generation: 1}}, freshTestRevocations())
+			req := httptest.NewRequest(http.MethodPost, "http://boxd-"+id+"."+env.domain+"/exec", strings.NewReader(`{"command":"echo"}`))
+			req.Header.Set(accessTokenHeader, env.validToken())
+			req.Header.Set(routingHintHeader, auth.SignRoutingHint(env.seedKey, id, "former-owner", env.domain, time.Now(), 1))
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.status || executions.Load() != tc.executions || lookups != 1 || opens != 1 {
+				t.Fatalf("status=%d body=%s executions=%d lookups=%d opens=%d", w.Code, w.Body, executions.Load(), lookups, opens)
+			}
+			if len(outcomes) != 1 || outcomes[0] != tc.outcome {
+				t.Fatalf("outcomes=%v", outcomes)
+			}
+			if tc.name == "missing" && (w.Header().Get("Content-Type") != "application/json" || !strings.Contains(w.Body.String(), `"sandbox_route_stale"`)) {
+				t.Fatalf("missing stale-route signal: %s", w.Body)
 			}
 		})
 	}

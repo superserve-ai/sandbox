@@ -128,8 +128,14 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil && hinted {
 		hinted = false
 		fresh, resolveErr := h.ownership.ResolveSandbox(r.Context(), id)
+		if errors.Is(resolveErr, ErrInstanceNotFound) {
+			h.record(r.Context(), "not_found", "")
+			(&authzFailure{Status: http.StatusNotFound, Message: "sandbox not found", Code: "sandbox_route_stale"}).write(w)
+			return
+		}
 		if resolveErr == nil {
 			if fresh.HostID == h.localHostID {
+				h.record(r.Context(), "local", fresh.HostID)
 				h.local.ServeHTTP(w, r)
 				return
 			}

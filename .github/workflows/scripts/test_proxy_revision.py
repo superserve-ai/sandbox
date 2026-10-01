@@ -20,7 +20,7 @@ class ProxyRevisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name, body in {
-                'git': 'case "$1" in diff) printf "%s\\n" "$CHANGED_PATH";; checkout) test "$3" = release;; esac',
+                'git': 'case "$1" in fetch) exit "${FETCH_FAILURE:-0}";; diff) printf "%s\\n" "$CHANGED_PATH";; checkout) test "$3" = release;; esac',
                 'gh': 'case "$2" in *head_sha=release*) printf "%s\\n" "$MIGRATION_RESULT";; *) exit 9;; esac',
                 'sleep': 'exit 0',
             }.items():
@@ -39,6 +39,10 @@ class ProxyRevisionTests(unittest.TestCase):
             proc = subprocess.run(['bash', '-c', script], env=dict(env, CHANGED_PATH='internal/proxy/router.go',
                                   MIGRATION_RESULT='completed failure'), capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            for result, success in [('completed success', True), ('absent absent', False)]:
+                proc = subprocess.run(['bash', '-c', script], env=dict(env, FETCH_FAILURE='1',
+                                      MIGRATION_RESULT=result), capture_output=True, text=True)
+                self.assertEqual(proc.returncode == 0, success, proc.stderr)
             manual = script.replace('if [ "push" != "push" ]', 'if [ "workflow_dispatch" != "push" ]')
             proc = subprocess.run(['bash', '-c', manual], env=dict(env, MIGRATION_RESULT='completed failure'),
                                   capture_output=True, text=True)
