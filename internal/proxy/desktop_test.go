@@ -272,3 +272,28 @@ func TestDesktopProxy_CORSPreflightAllowsRoutingHint(t *testing.T) {
 		}
 	}
 }
+
+func TestDesktopProxy_UsageSweepIsTimeGated(t *testing.T) {
+	env := newDesktopProxyTestEnv(t)
+	info := InstanceInfo{VMIP: "10.0.0.1"}
+	stale := time.Now().Add(-2 * desktopUsageWindow)
+
+	// A sweep that ran recently must leave expired entries alone.
+	env.handler.desktopUsageMu.Lock()
+	env.handler.desktopUsageLast["old\x00desktop_input"] = stale
+	env.handler.desktopUsageSweptAt = time.Now()
+	env.handler.desktopUsageMu.Unlock()
+	env.handler.captureDesktopUsage("sbx-a", "desktop_screenshot", info)
+	if _, ok := env.handler.desktopUsageLast["old\x00desktop_input"]; !ok {
+		t.Fatal("expired entry was swept before the window elapsed")
+	}
+
+	// Once the window has elapsed, the next call sweeps it.
+	env.handler.desktopUsageMu.Lock()
+	env.handler.desktopUsageSweptAt = stale
+	env.handler.desktopUsageMu.Unlock()
+	env.handler.captureDesktopUsage("sbx-b", "desktop_screenshot", info)
+	if _, ok := env.handler.desktopUsageLast["old\x00desktop_input"]; ok {
+		t.Fatal("expired entry survived a due sweep")
+	}
+}

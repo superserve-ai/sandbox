@@ -48,9 +48,11 @@ func (h *Handler) captureDesktopUsage(instanceID, event string, info InstanceInf
 	key := instanceID + "\x00" + event
 
 	h.desktopUsageMu.Lock()
-	// ponytail: linear sweep keyed off map size; an LRU if fleets of
-	// concurrently-active desktop sandboxes ever exceed ~4k.
-	if len(h.desktopUsageLast) > 4096 {
+	// Drop expired entries at most once per window: the sweep is linear in
+	// the number of active (sandbox, event) pairs, so it must not run on
+	// every RPC once the map is large.
+	if now.Sub(h.desktopUsageSweptAt) > desktopUsageWindow {
+		h.desktopUsageSweptAt = now
 		for k, t := range h.desktopUsageLast {
 			if now.Sub(t) > desktopUsageWindow {
 				delete(h.desktopUsageLast, k)

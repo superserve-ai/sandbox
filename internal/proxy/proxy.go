@@ -97,8 +97,9 @@ type Handler struct {
 
 	// desktopUsageLast debounces desktop usage events (see
 	// captureDesktopUsage); keyed by instanceID+event.
-	desktopUsageMu   sync.Mutex
-	desktopUsageLast map[string]time.Time
+	desktopUsageMu      sync.Mutex
+	desktopUsageLast    map[string]time.Time
+	desktopUsageSweptAt time.Time
 
 	// allowedOrigins is the set of browser origins allowed for CORS on
 	// data-plane endpoints (/files). Shared with the terminal origin check.
