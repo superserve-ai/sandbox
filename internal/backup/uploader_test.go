@@ -3567,3 +3567,64 @@ func TestImmutableSourceSkipsThePreStreamHashInUploadFile(t *testing.T) {
 		t.Fatalf("the stream's own verdict did not abandon the generation: %s", out)
 	}
 }
+
+// slowStore consumes a stream in pieces, letting the clock run between
+// them as a bandwidth-capped transfer does.
+type slowStore struct {
+	*memStore
+	advance func()
+}
+
+func (s *slowStore) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
+	var buf bytes.Buffer
+	for {
+		s.advance()
+		n, err := io.CopyN(&buf, r, 8)
+		if err != nil {
+			if n == 0 && errors.Is(err, io.EOF) {
+				break
+			}
+			if !errors.Is(err, io.EOF) {
+				return false, err
+			}
+			break
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[object] = buf.Bytes()
+	return true, nil
+}
+
+// Renewal has to come from the stream itself. Calling RenewClaim directly
+// proves the journal's half; this proves the half that matters in
+// production, where a slow upload keeps its task only because the reader
+// calls through on the same clock the lease is stamped from.
+func TestStreamingUploadRenewsItsClaim(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	// Ahead of the wall clock: a renewal that compared wall time against
+	// a lease stamped from this clock would see a negative interval and
+	// never fire, losing the task the upload is still streaming.
+	start := time.Now().Add(100 * time.Hour)
+	claimed, ok, err := j.Next(start)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	before := soleClaimUntil(t, j)
+
+	now := start
+	store := &slowStore{memStore: newMemStore(), advance: func() { now = now.Add(claimRenewEvery) }}
+	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop(), Now: func() time.Time { return now }}
+	if _, _, _, err := u.uploadFile(context.Background(), &claimed, claimed.Files[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	after := soleClaimUntil(t, j)
+	if !after.After(before) {
+		t.Fatalf("the lease did not move while the upload streamed: %v then %v", before, after)
+	}
+}

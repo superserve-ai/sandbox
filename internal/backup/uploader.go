@@ -1069,6 +1069,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		// takes the task, and the upload restarts from zero every time.
 		progress: func() { u.renewClaim(task) },
 		every:    claimRenewEvery,
+		now:      u.clock,
 		last:     u.clock(),
 	}
 	created, err := u.Store.Create(ctx, object, reader)
@@ -1285,9 +1286,24 @@ type limitedReader struct {
 	// per every. Tying it to the stream rather than to a timer is what
 	// keeps a lease renewal honest: a stalled upload stops renewing and
 	// is correctly taken over.
+	//
+	// now reads the same clock the lease is stamped from. Comparing a
+	// wall-clock reading against a timestamp taken from an overridden
+	// clock could hold a renewal off indefinitely, and the upload would
+	// lose the task it is still streaming.
 	progress func()
 	every    time.Duration
+	now      func() time.Time
 	last     time.Time
+}
+
+// clock reads the lease's own clock, falling back to the wall clock for
+// the readers that renew nothing.
+func (l *limitedReader) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
 }
 
 func (l *limitedReader) Read(p []byte) (int, error) {
@@ -1299,7 +1315,7 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	}
 	n, err := l.r.Read(p)
 	if n > 0 && l.progress != nil {
-		if now := time.Now(); now.Sub(l.last) >= l.every {
+		if now := l.clock(); now.Sub(l.last) >= l.every {
 			l.last = now
 			l.progress()
 		}

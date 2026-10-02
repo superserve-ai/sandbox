@@ -930,3 +930,18 @@ func TestRenewClaimKeepsAStreamingTaskClaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// soleClaimUntil reads the lease of the single claimed task, so a test
+// can watch a renewal move it.
+func soleClaimUntil(t *testing.T, j *Journal) time.Time {
+	t.Helper()
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.claims) != 1 {
+		t.Fatalf("claims = %d, want exactly one", len(j.claims))
+	}
+	for _, c := range j.claims {
+		return c.until
+	}
+	return time.Time{}
+}
