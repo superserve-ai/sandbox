@@ -5,7 +5,7 @@
 ALTER FUNCTION storage_mib_seconds_segmented(uuid,timestamptz,timestamptz,boolean)
   RENAME TO storage_mib_seconds_segmented_before_delta_reconciliation;
 
-CREATE FUNCTION retained_template_delta_mib_seconds(
+CREATE OR REPLACE FUNCTION retained_template_delta_mib_seconds(
   p_team uuid, p_start timestamptz, p_end timestamptz
 ) RETURNS numeric LANGUAGE sql STABLE AS $$
 WITH bounds AS (
@@ -51,9 +51,8 @@ FROM (
 ) q
 $$;
 
--- Rebind the public wrapper created by the initial retained-obligation
--- migration. Its unknown/obligation behavior remains authoritative; only the
--- corrected segmented quantity changes.
+-- Preserve the prospective first-receipt policy: resolved or ended obligations
+-- leave their initial measurement gap unbilled, rather than unknown.
 CREATE OR REPLACE FUNCTION storage_mib_seconds(
   p_team uuid,p_start timestamptz,p_end timestamptz,
   p_floor_legacy_artifacts boolean DEFAULT true
@@ -61,7 +60,8 @@ CREATE OR REPLACE FUNCTION storage_mib_seconds(
 SELECT CASE WHEN EXISTS (
   SELECT 1 FROM retained_storage_measurement_obligation o
   WHERE o.team_id=p_team AND o.effective_at<LEAST(p_end,billing_request_now())
-    AND COALESCE(o.resolved_at,o.ended_at,billing_request_now())>p_start
+    AND o.resolved_at IS NULL AND o.ended_at IS NULL
+    AND billing_request_now()>p_start
 ) THEN NULL::numeric
 ELSE storage_mib_seconds_segmented(p_team,p_start,p_end,p_floor_legacy_artifacts)
 END

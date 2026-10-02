@@ -69,12 +69,11 @@ opened_measurement_obligation AS (
     )
   ON CONFLICT (owner_kind, owner_id) WHERE resolved_at IS NULL AND ended_at IS NULL DO NOTHING
   RETURNING owner_id
-)
+),
+opened_storage AS (
 INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
-CROSS JOIN (SELECT count(*) FROM retained_fence) retained_fence_guard
-CROSS JOIN (SELECT count(*) FROM opened_measurement_obligation) obligation_fence
 WHERE feature_enabled('billing_metrics_write', a.team_id)
   -- After retained physical reporting has cut over, activation.disk_mib is
   -- provisioned capacity rather than a trusted measurement. The next durable
@@ -84,6 +83,9 @@ WHERE feature_enabled('billing_metrics_write', a.team_id)
     WHERE c.team_id = a.team_id AND c.host_id = a.host_id AND c.started_at <= now()
   )
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+)
+-- Evaluate the fence even when cutover suppresses the legacy interval insert.
+SELECT count(*) FROM retained_fence
 `
 
 type ActivateSandboxParams struct {

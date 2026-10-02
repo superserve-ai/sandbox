@@ -617,6 +617,7 @@ func TestRetainedStorageActivationSettlementRace(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer activation.Rollback(context.Background())
 			queries := db.New(activation)
 			if err := queries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: f.sandboxID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
 				t.Fatal(err)
