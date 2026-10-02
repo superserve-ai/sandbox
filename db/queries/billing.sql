@@ -179,6 +179,7 @@ upserted AS (
           )
     )
       AND storage_reports_complete_through(usage.team_id, usage.period_end)
+      AND usage.storage_mib_seconds IS NOT NULL
     ON CONFLICT (team_id, period_start, period_end) DO UPDATE
     SET vcpu_seconds = EXCLUDED.vcpu_seconds,
         memory_mib_seconds = EXCLUDED.memory_mib_seconds,
@@ -254,6 +255,7 @@ usage AS (
     FROM compute, storage
     WHERE feature_enabled('billing_hourly_rollups', sqlc.arg(team_id)::uuid)
       AND storage_reports_complete_through(sqlc.arg(team_id)::uuid, sqlc.arg(hour_end)::timestamptz)
+      AND storage.storage_mib_seconds IS NOT NULL
 )
 INSERT INTO team_billing_usage_hourly (
     team_id, hour_start, hour_end,

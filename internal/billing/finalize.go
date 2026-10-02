@@ -26,6 +26,11 @@ const billingMoneyScale = 6
 // advanced by the storage worker.
 var ErrStorageReportsIncomplete = errors.New("storage reports are incomplete for billing period")
 
+// ErrStorageUsageUnavailable marks a nullable canonical storage result at a
+// read boundary. Consumers must surface this as unavailable rather than
+// coercing it to zero or writing it into a not-null ledger column.
+var ErrStorageUsageUnavailable = errors.New("storage usage is unavailable")
+
 const (
 	defaultBillingFinalizationPollInterval = 1 * time.Minute
 	defaultBillingFinalizationBatchSize    = 25

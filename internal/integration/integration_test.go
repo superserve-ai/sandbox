@@ -4106,12 +4106,9 @@ func TestIntegration_GetTeamBillingUsagePreservesUnmeasuredArtifact(t *testing.T
 	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
 		t.Fatalf("link snapshot: %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256)
-		VALUES ($1, 'unmeasured-rootfs.ext4', $2, $3, $4)
-	`, snapshotID, artifactPath, logicalArtifactBytes, strings.Repeat("0", 64)); err != nil {
-		t.Fatalf("seed unmeasured artifact: %v", err)
-	}
+	// Without a measured manifest, the template's logical size is not a
+	// physical allocation. Omitting allocated_bytes on an inserted manifest
+	// would instead use the schema's explicit-zero default.
 	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, artifactPath, logicalArtifactBytes); err != nil {
 		t.Fatalf("set template artifact: %v", err)
 	}
@@ -4133,7 +4130,10 @@ func TestIntegration_GetTeamBillingUsagePreservesUnmeasuredArtifact(t *testing.T
 		t.Fatalf("unmeasured artifact returned numeric storage: %v", usage.StorageGibSeconds)
 	}
 	// A measured zero permits overlay billing; a missing allocation does not.
-	if _, err := testPool.Exec(ctx, `UPDATE artifact_manifest SET allocated_bytes=0 WHERE snapshot_id=$1 AND path=$2`, snapshotID, artifactPath); err != nil {
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+		VALUES ($1, 'unmeasured-rootfs.ext4', $2, $3, 0, $4)
+	`, snapshotID, artifactPath, logicalArtifactBytes, strings.Repeat("0", 64)); err != nil {
 		t.Fatalf("record explicit zero artifact allocation: %v", err)
 	}
 	usage, err = testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{

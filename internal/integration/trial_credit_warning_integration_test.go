@@ -457,6 +457,17 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if sample.SpentUsd.Valid {
+		t.Fatalf("unresolved retained base returned numeric spend: %v", sample.SpentUsd)
+	}
+	// Removing the template link does not release the retained base path.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET base_path = NULL WHERE team_id = $1`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	sample, err = testQueries.GetRecentTrialBurnSample(ctx, teamID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	spent, err = sample.SpentUsd.Float64Value()
 	if err != nil || !spent.Valid || spent.Float64 != 0 {
 		t.Fatalf("empty storage spend = %v, error = %v, want zero", spent, err)

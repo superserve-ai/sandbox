@@ -266,6 +266,10 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	if !usage.StorageGibSeconds.Valid || !usage.BillableStorageGibSeconds.Valid {
+		respondErrorMsg(c, "storage_unavailable", "Storage usage is temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	trialRunway, err = h.DB.GetTeamTrialRunway(c.Request.Context(), teamID)
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing trial runway read failed")
