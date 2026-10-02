@@ -971,8 +971,19 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 			// row's token (Enqueue), and the report must carry the newest
 			// or the control plane refuses it as another pause's.
 			var rowTask Task
-			if json.Unmarshal(existing, &rowTask) == nil && rowTask.PauseToken != "" {
-				nt.PauseToken = rowTask.PauseToken
+			if json.Unmarshal(existing, &rowTask) == nil {
+				if rowTask.PauseToken != "" {
+					nt.PauseToken = rowTask.PauseToken
+				}
+				// And whatever sizes that re-enqueue measured, for the
+				// same reason: this is the last durable moment, and the
+				// completion record it writes stops any later sweep from
+				// correcting the number. Sizes only — these entries carry
+				// the exact objects the upload wrote, which the queued row
+				// never knew. Copied first, so the caller's slice is not
+				// rewritten underneath it.
+				nt.Files = append([]TaskFile(nil), task.Files...)
+				mergeAllocations(nt.Files, rowTask.Files)
 			}
 			// An undelivered entry that carries object paths must not be
 			// demoted by a pathless re-completion (an unchanged re-pause

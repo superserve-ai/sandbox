@@ -978,3 +978,62 @@ func TestEnqueueAdoptsAllocationsOnDedupe(t *testing.T) {
 		t.Fatalf("allocated = %d, want the measurement the re-enqueue carried", got.Files[0].AllocatedBytes)
 	}
 }
+
+// The ack is the last durable moment: it deletes the row and writes the
+// completion record that stops any later sweep from correcting the
+// number. A re-enqueue that measured sizes after the final artifact
+// verified must still reach the notification, and must not cost the
+// finalized object paths the upload actually wrote.
+func TestAckAdoptsAllocationsMeasuredDuringTheUpload(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(500, 0)
+	queued := func(alloc int64) Task {
+		return Task{
+			SandboxID: "sb-late", Generation: "gen", EnqueuedAt: now,
+			Files: []TaskFile{{
+				Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
+				AllocatedBytes: alloc,
+			}},
+		}
+	}
+	if err := j.Enqueue(queued(0)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	if err := j.RecordVerification(claimed, "k\x00sandboxes/sb-late/gen/rootfs", now); err != nil {
+		t.Fatal(err)
+	}
+	// An unchanged re-pause lands after the last artifact verified, while
+	// the manifest is being published.
+	if err := j.Enqueue(queued(4096)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The upload acks with what IT finalized: the objects it wrote, and
+	// the sizes it was handed at claim time.
+	finalized := claimed
+	finalized.Files = []TaskFile{{
+		Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
+		Object: "sandboxes/sb-late/gen/rootfs.p0000",
+	}}
+	if _, err := j.Ack(finalized, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || len(pending[0].Files) != 1 {
+		t.Fatalf("notifications = %+v", pending)
+	}
+	if got := pending[0].Files[0].AllocatedBytes; got != 4096 {
+		t.Fatalf("notified allocated = %d, want the size measured during the upload", got)
+	}
+	if got := pending[0].Files[0].Object; got != "sandboxes/sb-late/gen/rootfs.p0000" {
+		t.Fatalf("notified object = %q, want the object the upload wrote", got)
+	}
+}
