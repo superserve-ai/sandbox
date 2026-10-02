@@ -9,8 +9,13 @@ import unittest
 
 class ProxyRevisionTests(unittest.TestCase):
     def test_schema_gate_waits_for_successful_same_release_migration(self):
-        workflow = Path(__file__).parents[1].joinpath('deploy-proxy.yml').read_text()
-        step = workflow.split('      - name: Wait for same-SHA CD Migrate to succeed\n', 1)[1].split('\n  deploy-staging:', 1)[0]
+        for name in ('deploy-proxy.yml', 'deploy-api.yml', 'terraform-cd.yml'):
+            with self.subTest(workflow=name):
+                self.check_schema_gate(name)
+
+    def check_schema_gate(self, name):
+        workflow = Path(__file__).parents[1].joinpath(name).read_text()
+        step = workflow.split('      - name: Wait for same-SHA CD Migrate to succeed\n', 1)[1].split('\n  deploy-staging:', 1)[0].split('\n  build-api-image:', 1)[0]
         script = textwrap.dedent(step.split('        run: |\n', 1)[1])
         substitutions = {'github.event_name': 'push', 'github.event.before': 'before',
                          'github.sha': 'release', 'github.repository': 'example/repo',
@@ -19,12 +24,12 @@ class ProxyRevisionTests(unittest.TestCase):
             script = script.replace('${{ ' + key + ' }}', value)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name, body in {
+            for command, body in {
                 'git': 'case "$1" in fetch) exit "${FETCH_FAILURE:-0}";; diff) printf "%s\\n" "$CHANGED_PATH";; checkout) test "$3" = release;; esac',
                 'gh': 'case "$2" in *head_sha=release*) printf "%s\\n" "$MIGRATION_RESULT";; *) exit 9;; esac',
                 'sleep': 'exit 0',
             }.items():
-                path = root / name
+                path = root / command
                 path.write_text('#!/bin/sh\n' + body + '\n')
                 path.chmod(0o755)
             env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
@@ -36,18 +41,27 @@ class ProxyRevisionTests(unittest.TestCase):
                     proc = subprocess.run(['bash', '-c', script], env=dict(env, MIGRATION_RESULT=result),
                                           capture_output=True, text=True)
                     self.assertEqual(proc.returncode == 0, success, proc.stderr)
+            for path in ('supabase/shared-auth-history/setup.sql', 'scripts/migrate_database.py',
+                         '.github/workflows/cd.yml'):
+                for result, success in [('completed success', True), ('completed failure', False)]:
+                    with self.subTest(path=path, result=result):
+                        proc = subprocess.run(['bash', '-c', script],
+                                              env=dict(env, CHANGED_PATH=path, MIGRATION_RESULT=result),
+                                              capture_output=True, text=True)
+                        self.assertEqual(proc.returncode == 0, success, proc.stderr)
             proc = subprocess.run(['bash', '-c', script], env=dict(env, CHANGED_PATH='internal/proxy/router.go',
                                   MIGRATION_RESULT='completed failure'), capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            for result, success in [('completed success', True), ('absent absent', False)]:
+            for result, success in [('completed success', True), ('absent absent', name != 'deploy-proxy.yml')]:
                 proc = subprocess.run(['bash', '-c', script], env=dict(env, FETCH_FAILURE='1',
                                       MIGRATION_RESULT=result), capture_output=True, text=True)
                 self.assertEqual(proc.returncode == 0, success, proc.stderr)
             manual = script.replace('if [ "push" != "push" ]', 'if [ "workflow_dispatch" != "push" ]')
             proc = subprocess.run(['bash', '-c', manual], env=dict(env, MIGRATION_RESULT='completed failure'),
                                   capture_output=True, text=True)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("      - 'supabase/migrations/**'", workflow)
+            self.assertEqual(proc.returncode == 0, name != "terraform-cd.yml", proc.stderr)
+        if name == "deploy-proxy.yml":
+            self.assertIn("      - 'supabase/migrations/**'", workflow)
 
     def test_revision_gate_accepts_only_main_history_and_matching_original_run(self):
         workflow = Path(__file__).parents[1].joinpath('deploy-proxy.yml').read_text()

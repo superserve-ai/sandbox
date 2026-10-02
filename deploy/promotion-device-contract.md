@@ -14,7 +14,10 @@ The shared Auth PostgreSQL project owns `signup_device_attempt` and
 `supabase/shared-auth-migrations/` in timestamp order **once to that project**,
 separately from each regional migration chain. The immutability script revokes
 Supabase's direct application-role table grants and guards accepted facts.
-This store is server only, independent of East or West promotion databases.
+This store is server only and has separate authority from regional promotion
+state, even when it shares East's PostgreSQL project. Subsequent regional
+migrations must use the [database-specific migration inputs](regional-migrations.md)
+so that this completed Auth setup is recognized without replaying it.
 Verified attempts and account bindings are retained indefinitely, including after
 account deletion;
 unverified attempts may be purged only after their verification window closes.
