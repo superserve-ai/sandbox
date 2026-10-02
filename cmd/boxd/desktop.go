@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image/png"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -239,15 +240,31 @@ func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) 
 	if err != nil {
 		return nil, fmt.Errorf("resolve import: %w", err)
 	}
-	out, err := cmd.Output()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, wrapExecErr("import -window root", err)
+		return nil, fmt.Errorf("import -window root: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("import -window root: %w", err)
+	}
+	// Read one byte past the cap at most, so an oversized frame is rejected
+	// without ever being buffered; killing import makes Wait return promptly.
+	out, readErr := io.ReadAll(io.LimitReader(stdout, maxScreenshotBytes+1))
+	if readErr != nil || len(out) > maxScreenshotBytes {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		if readErr != nil {
+			return nil, fmt.Errorf("import -window root: read: %w", readErr)
+		}
+		return nil, fmt.Errorf("import -window root: screenshot exceeds %d bytes", maxScreenshotBytes)
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, wrapExecErrOutput("import -window root", stderr.Bytes(), err)
 	}
 	if len(out) == 0 {
 		return nil, errors.New("import -window root: empty output")
-	}
-	if len(out) > maxScreenshotBytes {
-		return nil, fmt.Errorf("import -window root: screenshot is %d bytes, limit is %d", len(out), maxScreenshotBytes)
 	}
 	return out, nil
 }

@@ -1145,3 +1145,20 @@ func TestSendActions_ValidationErrorNeverShellsOut(t *testing.T) {
 		t.Errorf("error = %v, want CodeInvalidArgument", err)
 	}
 }
+
+func TestCaptureScreenshot_RejectsOversizeFrame(t *testing.T) {
+	withFakeBin(t, map[string]string{
+		"xdotool": `echo "800 600"
+`,
+		// One byte over the cap; the service must stop reading, not buffer it.
+		"import": fmt.Sprintf(`head -c %d /dev/zero
+`, maxScreenshotBytes+1),
+	})
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := s.captureScreenshot(ctx)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("captureScreenshot: err = %v, want size-limit error", err)
+	}
+}
