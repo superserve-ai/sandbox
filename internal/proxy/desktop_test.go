@@ -263,7 +263,12 @@ func TestDesktopProxy_CORSPreflightAllowsRoutingHint(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("preflight status = %d, want 204", w.Code)
 	}
-	if got := w.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "X-Superserve-Routing-Hint") {
-		t.Errorf("Access-Control-Allow-Headers = %q, want it to include X-Superserve-Routing-Hint", got)
+	got := w.Header().Get("Access-Control-Allow-Headers")
+	// The routing hint is part of the data-plane contract; X-User-Agent is on
+	// Connect's list of headers a browser transport may send.
+	for _, want := range []string{"X-Superserve-Routing-Hint", "X-User-Agent"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Access-Control-Allow-Headers = %q, want it to include %s", got, want)
+		}
 	}
 }
