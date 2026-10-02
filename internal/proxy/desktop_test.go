@@ -225,3 +225,45 @@ func TestDesktopProxy_UsageDebounce(t *testing.T) {
 		t.Fatal("expected a stale debounce entry to re-emit and refresh its timestamp")
 	}
 }
+
+// On a multi-host cell the ownership router only forwards paths it knows;
+// anything else is served locally and fails on a non-owner proxy.
+func TestDesktopProxy_RoutableThroughOwnershipRouter(t *testing.T) {
+	env := newDesktopProxyTestEnv(t)
+	paths := []string{
+		desktopScreenshotPath, desktopStreamPath, desktopSendPointerPath,
+		desktopSendKeyPath, desktopScrollPath, desktopResizePath, desktopSendActionsPath,
+	}
+	for _, p := range paths {
+		if !env.handler.canRouteBoxdRequest(env.request(http.MethodPost, p, env.validToken(), nil), env.sandboxID) {
+			t.Errorf("%s: authenticated desktop request is not routable", p)
+		}
+		if env.handler.canRouteBoxdRequest(env.request(http.MethodPost, p, "wrong-token", nil), env.sandboxID) {
+			t.Errorf("%s: bad token must not route", p)
+		}
+		if env.handler.canRouteBoxdRequest(env.request(http.MethodOptions, p, "", nil), env.sandboxID) {
+			t.Errorf("%s: preflight must not route", p)
+		}
+	}
+	env.handler.desktopEnabled = false
+	if env.handler.canRouteBoxdRequest(env.request(http.MethodPost, desktopScreenshotPath, env.validToken(), nil), env.sandboxID) {
+		t.Error("desktop disabled but request is routable")
+	}
+}
+
+func TestDesktopProxy_CORSPreflightAllowsRoutingHint(t *testing.T) {
+	env := newDesktopProxyTestEnv(t)
+	env.handler.allowedOrigins = []string{"https://console.superserve.ai"}
+	req := env.request(http.MethodOptions, desktopScreenshotPath, "", nil)
+	req.Header.Set("Origin", "https://console.superserve.ai")
+	w := httptest.NewRecorder()
+
+	env.handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "X-Superserve-Routing-Hint") {
+		t.Errorf("Access-Control-Allow-Headers = %q, want it to include X-Superserve-Routing-Hint", got)
+	}
+}

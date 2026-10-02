@@ -80,7 +80,7 @@ func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceI
 		if h.originAllowed(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, Content-Type, Connect-Protocol-Version, Connect-Timeout-Ms")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, X-Superserve-Routing-Hint, Content-Type, Connect-Protocol-Version, Connect-Timeout-Ms")
 			w.Header().Set("Access-Control-Max-Age", "3600")
 		}
 		if r.Method == http.MethodOptions {
