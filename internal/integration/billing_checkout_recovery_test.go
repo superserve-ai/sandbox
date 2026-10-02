@@ -498,6 +498,16 @@ func TestIntegration_CheckoutRecoveryCannotCrossConcurrentTransitions(t *testing
 			case "actor_changed":
 				other := canonicalStripeActor(t, uuid.NewString()+"@example.com", true)
 				_, err = testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_checkout_actor_id=$2 WHERE team_id=$1`, f.team, other)
+				if err == nil || !strings.Contains(err.Error(), "Checkout generation actor conflict") {
+					t.Fatalf("generation actor mutation was not rejected: %v", err)
+				}
+				before, counts := f.snapshot(t), f.stripe.createCounts()
+				unblock()
+				if w := waitCheckoutRecoveryResult(t, result); w.Code != http.StatusOK {
+					t.Fatalf("unchanged generation recovery: %d %s", w.Code, w.Body.String())
+				}
+				f.assertUnchanged(t, before, counts)
+				return
 			case "customer_changed":
 				_, err = testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, f.team, "cus_replaced_"+f.team.String())
 			case "session_changed":

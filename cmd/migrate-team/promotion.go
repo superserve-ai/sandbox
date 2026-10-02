@@ -71,6 +71,38 @@ func lockSourcePromotionMigration(ctx context.Context, tx pgx.Tx, teamID uuid.UU
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-team:' || $1::uuid::text)::bigint)`, teamID); err != nil {
 		return fmt.Errorf("lock source promotion team: %w", err)
 	}
+	// Checkout begin, webhook projection, and the retention trigger all
+	// serialize through the billing-account row. Hold it for the copy
+	// transaction so the account and its immutable generation facts are a
+	// consistent snapshot before destination ownership becomes reachable.
+	if _, err := tx.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id = $1 FOR UPDATE`, teamID); err != nil {
+		return fmt.Errorf("lock source billing account: %w", err)
+	}
+	// An unresolved Checkout may still reach Stripe after the copy snapshot.
+	// Reject cutover before fencing the source, for old and new API writers.
+	var generationAuthority bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('public.stripe_checkout_generation_authority') IS NOT NULL`).Scan(&generationAuthority); err != nil {
+		return fmt.Errorf("check Checkout publication authority: %w", err)
+	}
+	var unresolvedCheckout bool
+	if generationAuthority {
+		if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM stripe_checkout_generation_authority d
+			JOIN team_billing_account a
+			  ON a.team_id = d.team_id
+			 AND a.checkout_initializing_at = d.checkout_generation
+			WHERE d.team_id = $1
+			  AND a.checkout_completed_at IS NULL
+			  AND a.checkout_subscription_id IS NULL
+		)`, teamID).Scan(&unresolvedCheckout); err != nil {
+			return fmt.Errorf("check open Checkout publication generations: %w", err)
+		}
+	}
+	if unresolvedCheckout {
+		return fmt.Errorf("refusing to migrate: unresolved Checkout publication generation requires recovery before regional cutover")
+	}
 	var currentActors []uuid.UUID
 	if err := tx.QueryRow(ctx, actorSQL, teamID).Scan(&currentActors); err != nil {
 		return fmt.Errorf("recheck source promotion actors: %w", err)
@@ -303,7 +335,8 @@ func mergeCanonicalPromotionState(ctx context.Context, src querier, dst *pgxpool
 		'evidence', COALESCE((SELECT jsonb_agg(e ORDER BY evidence_version) FROM promotion_identity_evidence e
 		 WHERE evidence_version IN (SELECT evidence_version FROM history
 		 UNION SELECT stripe_checkout_identity_evidence_version FROM team_billing_account WHERE team_id=$1
-		 UNION SELECT stripe_activation_identity_evidence_version FROM team_billing_account WHERE team_id=$1)),'[]'),
+		 UNION SELECT stripe_activation_identity_evidence_version FROM team_billing_account WHERE team_id=$1
+		 UNION SELECT identity_evidence_version FROM stripe_checkout_generation_authority WHERE team_id=$1)),'[]'),
 		'history', COALESCE((SELECT jsonb_agg(h ORDER BY history_key) FROM history h),'[]'),
 		'outcomes', COALESCE((SELECT jsonb_agg(o) FROM team_signup_promotion_outcome o WHERE team_id=$1),'[]')),
 		EXISTS(SELECT 1 FROM identities WHERE stripe_reserved_team_id IS NOT NULL)

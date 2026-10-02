@@ -4,8 +4,12 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,10 +18,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/api"
+	appconfig "github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/promotiontest"
 )
@@ -452,44 +458,47 @@ func seedFixture(t *testing.T) *fixture {
 		VALUES ($1, $2, 'still-running', 'active', 1, 1024, $3, '10.0.0.9')`, f.sbActive, f.teamC, sourceHostID)
 
 	f.expectedCounts = map[string]int64{
-		"profile":                             2,
-		"team":                                1,
-		"team_member":                         2,
-		"team_memberships":                    2,
-		"user_role_assignments":               2,
-		"api_key":                             2,
-		"secret":                              1,
-		"template":                            1,
-		"template_build":                      1,
-		"sandbox":                             4,
-		"snapshot":                            2,
-		"artifact_manifest":                   2,
-		"backup_generation":                   2,
-		"sandbox_secret":                      1,
-		"sandbox_secret_detached":             1,
-		"sandbox_active_interval":             2,
-		"sandbox_compute_billing_interval":    2,
-		"sandbox_storage_interval":            2,
-		"team_billing_usage":                  1,
-		"team_billing_usage_hourly":           2,
-		"team_billing_period":                 1,
-		"billing_period_anomaly":              1,
-		"billing_rollup_job":                  1,
-		"billing_rollup_team_backfill_state":  1,
-		"team_feature_flag":                   2,
-		"team_billing_account":                0,
-		"team_storage_billing_activation":     0,
-		"stripe_checkout_expiration_evidence": 2,
-		"team_trial_eligibility_cache":        0,
-		"team_pricing_plan":                   1,
-		"team_credit_grant":                   1,
-		"team_credit_ledger":                  1,
-		"quota_alert_state":                   1,
-		"trial_credit_warning_state":          1,
-		"trial_credit_warning_delivery":       2,
-		"activity":                            3,
-		"sandbox_revocation":                  1,
-		"revoked_proxy_token":                 1,
+		"profile":                                  2,
+		"team":                                     1,
+		"team_member":                              2,
+		"team_memberships":                         2,
+		"user_role_assignments":                    2,
+		"api_key":                                  2,
+		"secret":                                   1,
+		"template":                                 1,
+		"template_build":                           1,
+		"sandbox":                                  4,
+		"snapshot":                                 2,
+		"artifact_manifest":                        2,
+		"backup_generation":                        2,
+		"sandbox_secret":                           1,
+		"sandbox_secret_detached":                  1,
+		"sandbox_active_interval":                  2,
+		"sandbox_compute_billing_interval":         2,
+		"sandbox_storage_interval":                 2,
+		"team_billing_usage":                       1,
+		"team_billing_usage_hourly":                2,
+		"team_billing_period":                      1,
+		"billing_period_anomaly":                   1,
+		"billing_rollup_job":                       1,
+		"billing_rollup_team_backfill_state":       1,
+		"team_feature_flag":                        2,
+		"team_billing_account":                     0,
+		"stripe_checkout_generation_authority":     0,
+		"stripe_checkout_publication_decision":     0,
+		"stripe_checkout_publication_subscription": 0,
+		"team_storage_billing_activation":          0,
+		"stripe_checkout_expiration_evidence":      2,
+		"team_trial_eligibility_cache":             0,
+		"team_pricing_plan":                        1,
+		"team_credit_grant":                        1,
+		"team_credit_ledger":                       1,
+		"quota_alert_state":                        1,
+		"trial_credit_warning_state":               1,
+		"trial_credit_warning_delivery":            2,
+		"activity":                                 3,
+		"sandbox_revocation":                       1,
+		"revoked_proxy_token":                      1,
 	}
 
 	f.expectedDirs = []string{
@@ -1441,8 +1450,8 @@ func TestCanonicalPromotionMigration(t *testing.T) {
 		if err := srcPool.QueryRow(ctx, `SELECT evidence_version FROM promotion_identity_current WHERE user_id=$1`, user).Scan(&version); err != nil {
 			t.Fatal(err)
 		}
-		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_checkout_actor_id,stripe_checkout_identity_evidence_version,checkout_initializing_at)
-			VALUES($1,$2,$3,now())`, cfg.teamID, user, version)
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_checkout_actor_id,stripe_checkout_identity_evidence_version,checkout_initializing_at,checkout_completed_at,checkout_subscription_id)
+			VALUES($1,$2,$3,now(),now(),'sub_resolved')`, cfg.teamID, user, version)
 		for range 2 {
 			if err := run(ctx, cfg); err != nil {
 				t.Fatal(err)
@@ -1584,6 +1593,225 @@ func TestStripeEntitlementMigration(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		t.Fatal("expected operation to wait on the source promotion lock")
+	}
+	t.Run("lost response blocks cutover before durable fence", func(t *testing.T) {
+		cfg, actor := newFixture()
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id) VALUES($1)`, cfg.teamID)
+		mustExec(t, srcPool, `SELECT begin_stripe_checkout_with_publication_decision($1,$2,$3,'use','request','publication_failed',$4)`, cfg.teamID, actor, uuid.New(), uuid.New())
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "unresolved Checkout publication") {
+			t.Fatalf("lost response must prevent cutover: %v", err)
+		}
+		if got := scanString(t, srcPool, `SELECT count(*)::text FROM stripe_promotion_migration_fence WHERE team_id=$1`, cfg.teamID); got != "0" {
+			t.Fatal("rejected cutover committed source fence")
+		}
+		if got := scanString(t, dstPool, `SELECT count(*)::text FROM team WHERE id=$1`, cfg.teamID); got != "0" {
+			t.Fatal("rejected cutover published destination ownership")
+		}
+		mustExec(t, srcPool, `UPDATE team_billing_account SET checkout_subscription_id='sub_resolved', checkout_completed_at=now() WHERE team_id=$1`, cfg.teamID)
+		// The original payer can leave before migration. Retained authority
+		// still requires their profile at the destination.
+		mustExec(t, srcPool, `DELETE FROM team_member WHERE team_id=$1`, cfg.teamID)
+		mustExec(t, srcPool, `DELETE FROM team_memberships WHERE team_id=$1`, cfg.teamID)
+		owner := uuid.New()
+		mustExec(t, srcPool, `INSERT INTO profile(id,email) VALUES($1,$2)`, owner, owner.String()+"@example.com")
+		mustExec(t, srcPool, `INSERT INTO team_member(team_id,profile_id,role) VALUES($1,$2,'owner')`, cfg.teamID, owner)
+		mustExec(t, srcPool, `INSERT INTO team_memberships(team_id,user_id,status) VALUES($1,$2,'active')`, cfg.teamID, owner)
+		mustExec(t, srcPool, `INSERT INTO user_role_assignments(team_id,user_id,scope_type,role_id) SELECT $1,$2,'team',id FROM roles WHERE name='team_owner'`, cfg.teamID, owner)
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("resolved cutover: %v", err)
+		}
+		if got := scanString(t, dstPool, `SELECT count(*)::text FROM profile WHERE id=$1`, actor); got != "1" {
+			t.Fatal("former payer profile missing")
+		}
+		for _, table := range []string{"stripe_checkout_generation_authority", "stripe_checkout_publication_decision", "stripe_checkout_publication_subscription"} {
+			if got := scanString(t, dstPool, `SELECT count(*)::text FROM `+table+` WHERE team_id=$1`, cfg.teamID); got != "1" {
+				t.Fatalf("missing copied %s", table)
+			}
+		}
+		cfg.phase = phasePurge
+		cfg.confirmTeamName = "stripe-move-" + cfg.teamID.String()
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		for _, table := range []string{"stripe_checkout_generation_authority", "stripe_checkout_publication_decision", "stripe_checkout_publication_subscription"} {
+			if got := scanString(t, srcPool, `SELECT count(*)::text FROM `+table+` WHERE team_id=$1`, cfg.teamID); got != "1" {
+				t.Fatalf("purge removed %s", table)
+			}
+		}
+	})
+	t.Run("legacy open generation blocks cutover", func(t *testing.T) {
+		cfg, actor := newFixture()
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,checkout_initializing_at,stripe_checkout_actor_id) VALUES($1,clock_timestamp(),$2)`, cfg.teamID, actor)
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "unresolved Checkout publication") {
+			t.Fatalf("legacy lost response crossed cutover: %v", err)
+		}
+	})
+	t.Run("legacy retry waiting on cutover observes durable fence", func(t *testing.T) {
+		cfg, actor := newFixture()
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,checkout_initializing_at,stripe_checkout_actor_id,checkout_request_key) VALUES($1,clock_timestamp(),$2,'legacy')`, cfg.teamID, actor)
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err = tx.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, cfg.teamID); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			// The old binary resumes by appending an attempt to this row.
+			_, err := srcPool.Exec(ctx, `UPDATE team_billing_account SET checkout_pending_attempt_ids=array_append(checkout_pending_attempt_ids,$2::uuid) WHERE team_id=$1`, cfg.teamID, uuid.New())
+			done <- err
+		}()
+		waitForLockWaiter(t, tx.Conn().PgConn().PID())
+		if _, err = tx.Exec(ctx, `INSERT INTO stripe_promotion_migration_fence(team_id) VALUES($1)`, cfg.teamID); err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = <-done; err == nil || !strings.Contains(err.Error(), "Checkout account migrated") {
+			t.Fatalf("delayed retry crossed cutover: %v", err)
+		}
+	})
+	t.Run("legacy admission waiting on cutover observes durable fence", func(t *testing.T) {
+		cfg, actor := newFixture()
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id) VALUES($1)`, cfg.teamID)
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if err = lockSourcePromotionMigration(ctx, tx, cfg.teamID); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, err := srcPool.Exec(ctx, `UPDATE team_billing_account SET checkout_initializing_at=clock_timestamp(),stripe_checkout_actor_id=$2,checkout_request_key='legacy' WHERE team_id=$1`, cfg.teamID, actor)
+			done <- err
+		}()
+		waitForLockWaiter(t, tx.Conn().PgConn().PID())
+		if _, err = tx.Exec(ctx, `INSERT INTO stripe_promotion_migration_fence(team_id) VALUES($1)`, cfg.teamID); err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = <-done; err == nil || !strings.Contains(err.Error(), "Checkout account migrated") {
+			t.Fatalf("delayed old writer crossed cutover: %v", err)
+		}
+	})
+	t.Run("interrupted publication copy preserves paid-only activation", func(t *testing.T) {
+		cfg, actor := newFixture()
+		customer, subscription := "cus_"+cfg.teamID.String(), "sub_"+cfg.teamID.String()
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, cfg.teamID, customer)
+		mustExec(t, srcPool, `SELECT begin_stripe_checkout_with_publication_decision($1,$2,$3,'use','request','publication_failed',$4)`, cfg.teamID, actor, uuid.New(), uuid.New())
+		mustExec(t, srcPool, `UPDATE team_billing_account SET checkout_subscription_id=$2,
+			stripe_subscription_id=$2,stripe_subscription_status='incomplete' WHERE team_id=$1`, cfg.teamID, subscription)
+		mustExec(t, srcPool, `UPDATE team_billing_account SET checkout_initializing_at=NULL,
+			checkout_pending_attempt_ids='{}',checkout_request_key=NULL WHERE team_id=$1`, cfg.teamID)
+		// Fail the first membership copy, after customer routing has committed.
+		mustExec(t, dstPool, `CREATE FUNCTION test_interrupt_publication_copy() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN RAISE EXCEPTION 'interrupted publication copy'; END $$`)
+		mustExec(t, dstPool, `CREATE TRIGGER test_interrupt_publication_copy BEFORE INSERT ON team_member
+			FOR EACH STATEMENT EXECUTE FUNCTION test_interrupt_publication_copy()`)
+		// Also interrupt authority copied after routing, so an account-first
+		// regression cannot hide the unsafe window by finishing both tables.
+		mustExec(t, dstPool, `CREATE FUNCTION test_interrupt_late_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				IF EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=NEW.team_id) THEN
+					RAISE EXCEPTION 'interrupted publication copy';
+				END IF;
+				RETURN NEW;
+			END $$`)
+		mustExec(t, dstPool, `CREATE TRIGGER test_interrupt_late_publication BEFORE INSERT ON stripe_checkout_publication_decision
+			FOR EACH ROW EXECUTE FUNCTION test_interrupt_late_publication()`)
+		t.Cleanup(func() {
+			mustExec(t, dstPool, `DROP TRIGGER IF EXISTS test_interrupt_publication_copy ON team_member`)
+			mustExec(t, dstPool, `DROP FUNCTION test_interrupt_publication_copy()`)
+			mustExec(t, dstPool, `DROP TRIGGER IF EXISTS test_interrupt_late_publication ON stripe_checkout_publication_decision`)
+			mustExec(t, dstPool, `DROP FUNCTION test_interrupt_late_publication()`)
+		})
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "interrupted publication copy") {
+			t.Fatalf("expected interruption after customer publication: %v", err)
+		}
+		if got := scanString(t, dstPool, `SELECT count(*)::text FROM team_member WHERE team_id=$1`, cfg.teamID); got != "0" {
+			t.Fatal("membership unexpectedly published")
+		}
+		const secret = "example-webhook-secret"
+		h := api.NewHandlers(nil, db.New(dstPool), &appconfig.Config{StripeWebhookSecret: secret})
+		h.Pool = dstPool
+		router := gin.New()
+		router.POST("/stripe/webhook", h.HandleStripeWebhook)
+		activate := func(eventID string) {
+			t.Helper()
+			now := time.Now().Unix()
+			payload, err := json.Marshal(map[string]any{"id": eventID, "type": "customer.subscription.updated", "created": now,
+				"data": map[string]any{"object": map[string]any{"id": subscription, "customer": customer, "status": "active",
+					"current_period_start": now, "current_period_end": now + 86400*30,
+					"metadata": map[string]string{"activation_user_id": actor.String()}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mac := hmac.New(sha256.New, []byte(secret))
+			fmt.Fprintf(mac, "%d.%s", now, payload)
+			req := httptest.NewRequest(http.MethodPost, "/stripe/webhook", strings.NewReader(string(payload)))
+			req.Header.Set("Stripe-Signature", fmt.Sprintf("t=%d,v1=%x", now, mac.Sum(nil)))
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("destination activation: %d %s", w.Code, w.Body.String())
+			}
+			var paidOnly bool
+			if err := dstPool.QueryRow(ctx, `SELECT trial_ended_at IS NOT NULL AND stripe_subscription_status='active'
+				AND stripe_activation_credit_reserved_at IS NULL AND stripe_activation_credit_granted_at IS NULL
+				FROM team_billing_account WHERE team_id=$1`, cfg.teamID).Scan(&paidOnly); err != nil || !paidOnly {
+				t.Fatalf("interrupted copy lost paid-only authority: %t %v", paidOnly, err)
+			}
+			if got := scanString(t, dstPool, `SELECT reason FROM stripe_promotion_outcome WHERE event_id=$1`, eventID); got != "authority_unavailable" {
+				t.Fatalf("destination promotion outcome: %s", got)
+			}
+		}
+		activate("evt_interrupted_" + cfg.teamID.String())
+		mustExec(t, dstPool, `DROP TRIGGER test_interrupt_publication_copy ON team_member`)
+		mustExec(t, dstPool, `DROP TRIGGER test_interrupt_late_publication ON stripe_checkout_publication_decision`)
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("resume copy: %v", err)
+		}
+		activate("evt_resumed_" + cfg.teamID.String())
+	})
+	for _, conflict := range []string{"decision", "subscription", "generation"} {
+		t.Run("conflicting publication "+conflict+" blocks customer routing", func(t *testing.T) {
+			cfg, actor := newFixture()
+			generation := time.Now().UTC().Truncate(time.Microsecond)
+			for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+				decision := "publication_failed"
+				if conflict == "decision" && pool == dstPool {
+					decision = "standard"
+				}
+				authorityActor := actor
+				if conflict == "generation" && pool == dstPool {
+					authorityActor = uuid.New()
+				}
+				mustExec(t, pool, `INSERT INTO stripe_checkout_generation_authority(team_id,checkout_generation,user_id) VALUES($1,$2,$3)`, cfg.teamID, generation, authorityActor)
+				mustExec(t, pool, `INSERT INTO stripe_checkout_publication_decision
+					(team_id,checkout_generation,user_id,operation_id,home_region,request_key,decision)
+					VALUES($1,$2,$3,$1,'use','request',$4)`, cfg.teamID, generation, actor, decision)
+			}
+			mustExec(t, srcPool, `INSERT INTO stripe_checkout_publication_subscription VALUES($1,'sub_source',$2)`, cfg.teamID, generation)
+			if conflict == "subscription" {
+				mustExec(t, dstPool, `INSERT INTO stripe_checkout_publication_subscription VALUES($1,'sub_unproven',$2)`, cfg.teamID, generation)
+			}
+			mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, cfg.teamID, "cus_"+cfg.teamID.String())
+			for i := 0; i < 2; i++ {
+				if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "content drift before billing account publication") {
+					t.Fatalf("conflicting authority must stop copy and retry: %v", err)
+				}
+				if got := scanString(t, dstPool, `SELECT count(*)::text FROM team_billing_account WHERE team_id=$1`, cfg.teamID); got != "0" {
+					t.Fatal("conflicting authority published customer routing")
+				}
+			}
+		})
 	}
 	t.Run("uncommitted reservation is observed before ownership copy", func(t *testing.T) {
 		cfg, actor := newFixture()

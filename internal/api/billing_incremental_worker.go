@@ -104,6 +104,13 @@ func (h *Handlers) StartIncrementalBillingService(ctx context.Context) {
 	}()
 }
 
+// Only already-frozen, enrolled periods can continue exporting after cancellation.
+const canceledInvoiceExportRecovery = `a.stripe_subscription_status='canceled' AND EXISTS(
+    SELECT 1 FROM billing_invoice_account v JOIN team_billing_period p USING(team_id)
+    JOIN billing_incremental_period i USING(team_id,period_start,period_end)
+    WHERE v.team_id=a.team_id AND v.customer_id=a.stripe_customer_id AND v.subscription_id=a.stripe_subscription_id
+      AND v.enrolled_at<p.period_end AND p.period_end<=now() AND p.status='exporting' AND p.finalized_at IS NULL)`
+
 func (h *Handlers) discoverIncrementalBillingWork(ctx context.Context) error {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -140,8 +147,8 @@ func (h *Handlers) discoverIncrementalBillingWork(ctx context.Context) error {
 	}
 	for _, team := range teams {
 		_, err = tx.Exec(ctx, `INSERT INTO billing_export_work(team_id,next_run_at)
-            SELECT team_id,now()+interval '1 second'*(get_byte(uuid_send(team_id),0)%60) FROM team_billing_account
-            WHERE team_id=$1 AND stripe_subscription_status='active' AND commercial_billing_anchor IS NOT NULL
+            SELECT team_id,now()+interval '1 second'*(get_byte(uuid_send(team_id),0)%60) FROM team_billing_account a
+            WHERE team_id=$1 AND (stripe_subscription_status='active' OR (`+canceledInvoiceExportRecovery+`)) AND commercial_billing_anchor IS NOT NULL
               AND stripe_customer_id IS NOT NULL AND feature_enabled('billing_export_enabled',team_id)
             ON CONFLICT(team_id) DO UPDATE SET seed_after=NULL,seed_complete=false,next_run_at=EXCLUDED.next_run_at
             WHERE $2::boolean`, team, resetExisting)
@@ -164,16 +171,17 @@ func (h *Handlers) incrementalBillingTick(ctx context.Context, cadence time.Dura
 	token := uuid.New()
 	var team uuid.UUID
 	var dueLagSeconds float64
-	var reconcileOnly bool
+	var reconcileOnly, canceledRecovery bool
 	err := h.Pool.QueryRow(ctx, `WITH candidate AS (
         SELECT w.team_id,least(w.next_run_at,w.next_reconcile_at) AS due_at,
-          w.next_reconcile_at<w.next_run_at AS reconcile_only FROM billing_export_work w JOIN team_billing_account a USING(team_id)
+          a.stripe_subscription_status='active' AND w.next_reconcile_at<w.next_run_at AS reconcile_only,
+          a.stripe_subscription_status='canceled' AS canceled_recovery FROM billing_export_work w JOIN team_billing_account a USING(team_id)
         WHERE least(w.next_run_at,w.next_reconcile_at)<=now() AND (w.lease_until IS NULL OR w.lease_until<=now())
-          AND a.stripe_subscription_status='active' AND feature_enabled('billing_export_enabled',w.team_id)
+          AND (a.stripe_subscription_status='active' OR (`+canceledInvoiceExportRecovery+`)) AND feature_enabled('billing_export_enabled',w.team_id)
         ORDER BY least(w.next_run_at,w.next_reconcile_at),w.team_id LIMIT 1 FOR UPDATE OF w SKIP LOCKED)
         UPDATE billing_export_work w SET lease_token=$1,lease_until=now()+interval '2 minutes',
           updated_at=now()
-        FROM candidate c WHERE w.team_id=c.team_id RETURNING w.team_id,extract(epoch FROM clock_timestamp()-c.due_at)::float8,c.reconcile_only`, token).Scan(&team, &dueLagSeconds, &reconcileOnly)
+        FROM candidate c WHERE w.team_id=c.team_id RETURNING w.team_id,extract(epoch FROM clock_timestamp()-c.due_at)::float8,c.reconcile_only,c.canceled_recovery`, token).Scan(&team, &dueLagSeconds, &reconcileOnly, &canceledRecovery)
 	if err == pgx.ErrNoRows {
 		return false, 0, nil
 	}
@@ -185,7 +193,9 @@ func (h *Handlers) incrementalBillingTick(ctx context.Context, cadence time.Dura
 	var measured int
 	var more bool
 	var workErr error
-	if reconcileOnly {
+	if canceledRecovery {
+		workErr = h.exportCanceledInvoicePeriods(ctx, team)
+	} else if reconcileOnly {
 		workErr = h.reconcileIncrementalBillingTeam(ctx, team)
 	} else {
 		measured, more, workErr = h.processIncrementalBillingTeam(ctx, team)
@@ -213,16 +223,53 @@ func (h *Handlers) incrementalBillingTick(ctx context.Context, cadence time.Dura
 	_, ackErr := h.Pool.Exec(ackCtx, `UPDATE billing_export_work SET lease_token=NULL,lease_until=NULL,
         last_error=CASE WHEN $5 THEN last_error ELSE $3 END,
         reconcile_error=CASE WHEN $5 THEN $3 ELSE reconcile_error END,
-        next_reconcile_at=CASE WHEN $5 THEN now()+($4*interval '1 second') ELSE next_reconcile_at END,
+        next_reconcile_at=CASE WHEN $5 OR $6 THEN now()+($4*interval '1 second') ELSE next_reconcile_at END,
         next_run_at=CASE WHEN $5 THEN next_run_at ELSE greatest(now()+interval '1 minute',least(
           now()+($4*interval '1 second')+interval '1 second'*(get_byte(uuid_send(team_id),0)%60),
           COALESCE((SELECT min(e.next_attempt_at) FROM billing_export_event e JOIN billing_export_allocation a ON a.id=e.allocation_id
             WHERE a.team_id=$1 AND e.active AND e.status IN ('pending','uncertain')),'infinity'::timestamptz))) END,updated_at=now()
-        WHERE team_id=$1 AND lease_token=$2`, team, token, message, delay.Seconds(), reconcileOnly)
+        WHERE team_id=$1 AND lease_token=$2`, team, token, message, delay.Seconds(), reconcileOnly, canceledRecovery)
 	if ackErr != nil {
 		return true, measured, ackErr
 	}
 	return true, measured, workErr
+}
+
+func (h *Handlers) exportCanceledInvoicePeriods(ctx context.Context, team uuid.UUID) error {
+	rows, err := h.Pool.Query(ctx, `SELECT p.period_start,p.period_end FROM team_billing_period p
+        JOIN billing_incremental_period i USING(team_id,period_start,period_end)
+        JOIN billing_invoice_account v USING(team_id) JOIN team_billing_account a USING(team_id)
+        WHERE p.team_id=$1 AND a.stripe_subscription_status='canceled'
+          AND v.customer_id=a.stripe_customer_id AND v.subscription_id=a.stripe_subscription_id
+          AND v.enrolled_at<p.period_end AND p.period_end<=now() AND p.status='exporting' AND p.finalized_at IS NULL
+        ORDER BY i.last_reconcile_attempt_at NULLS FIRST,p.period_start LIMIT 2`, team)
+	if err != nil {
+		return err
+	}
+	var periods []billing.ExportPeriod
+	for rows.Next() {
+		p := billing.ExportPeriod{TeamID: team}
+		if err = rows.Scan(&p.Start, &p.End); err != nil {
+			rows.Close()
+			return err
+		}
+		periods = append(periods, p)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, p := range periods {
+		if err = h.markIncrementalReconciliationAttempt(ctx, p); err == nil {
+			_, err = h.exportIncrementalPeriod(ctx, p)
+		}
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func (h *Handlers) processIncrementalBillingTeam(ctx context.Context, team uuid.UUID) (int, bool, error) {

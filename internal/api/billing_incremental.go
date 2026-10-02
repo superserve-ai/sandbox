@@ -505,11 +505,15 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 		if pinned, ok := reader.(*pinnedMeterSummaryReader); ok {
 			meterID = pinned.meterID
 		}
+		policy := meterPrecisionPolicy
+		if decision.Outcome == "invoice_cent_reconciliation_required" {
+			policy = "invoice-cent-v1"
+		}
 		log.Info().Str("team_id", p.TeamID.String()).Str("resource", item.ResourceType).Str("event_name", item.EventName).
 			Str("meter_id", meterID).
 			Time("query_start", start).Time("query_end", end).Str("local_quantity", item.Quantity).
 			Str("reserved_quantity", totals.Reserved).Str("submitted_quantity", totals.Submitted).Str("provider_quantity", counted).
-			Str("difference", decision.Difference).Str("precision_bound", decision.Bound).Str("policy", meterPrecisionPolicy).
+			Str("difference", decision.Difference).Str("precision_bound", decision.Bound).Str("policy", policy).
 			Str("outcome", decision.Outcome).Err(decision.Err).Msg("billing meter reconciliation decision")
 	}()
 	if countErr != nil {
@@ -523,6 +527,26 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 		if _, err := meterDecimal(value); err != nil {
 			decision.Err = errors.Join(billing.ErrExportRecoveryRequired, err)
 			return
+		}
+	}
+	if h.Pool != nil {
+		a, enrolled, err := h.invoiceAccountForPeriod(ctx, p)
+		if err != nil {
+			decision.Err = err
+			return
+		}
+		if enrolled && a.EnrolledAt.Before(p.End) {
+			if err = h.verifyInvoiceExportHold(ctx, p); err != nil {
+				decision.Err = err
+				return
+			}
+			provider, pe := meterDecimal(counted)
+			reserved, re := meterDecimal(totals.Reserved)
+			if pe == nil && re == nil && invoiceQuantityEquivalent(provider, reserved) {
+				decision.Outcome = "invoice_cent_reconciliation_required"
+				decision.Difference = new(big.Rat).Sub(provider, reserved).RatString()
+				return
+			}
 		}
 	}
 	var needsEvidence bool
@@ -750,6 +774,14 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	if err != nil {
 		return result, err
 	}
+	scope, _, err := h.invoiceAccountForPeriod(ctx, p)
+	if err != nil {
+		return result, err
+	}
+	historical := scope.ReplacementSubscription != ""
+	if historical {
+		account.StripeCustomerID = &scope.Customer
+	}
 	var shadowHandoff bool
 	if err := h.Pool.QueryRow(ctx, `
 		SELECT EXISTS(
@@ -760,7 +792,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	`, p.TeamID, p.Start, p.End).Scan(&shadowHandoff); err != nil {
 		return result, err
 	}
-	if account.StripeCustomerID == nil || (!account.CommercialBillingAnchor.Valid && !shadowHandoff) {
+	if account.StripeCustomerID == nil || (!account.CommercialBillingAnchor.Valid && !shadowHandoff && !historical) {
 		return result, fmt.Errorf("active subscription, customer and commercial anchor are required")
 	}
 	if account.StripeSubscriptionStatus == nil || *account.StripeSubscriptionStatus != "active" {
@@ -777,7 +809,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 			return result, fmt.Errorf("active subscription, customer and commercial anchor are required")
 		}
 	}
-	if account.CommercialBillingAnchor.Valid {
+	if account.CommercialBillingAnchor.Valid && !historical {
 		start, end, ok := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, p.Start)
 		if !ok || !start.Equal(p.Start) || !end.Equal(p.End) {
 			return result, fmt.Errorf("period does not match commercial anchor")
@@ -789,6 +821,9 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	reader, ok := h.Stripe.(stripeMeterSummaryReader)
 	if !ok {
 		return result, fmt.Errorf("Stripe reconciliation is not configured")
+	}
+	if err := h.verifyInvoiceExportHold(ctx, p); err != nil {
+		return result, err
 	}
 	store := billing.ExportStore{Pool: h.Pool}
 	storage, err := h.billingStorageBillingEnabledForWindow(ctx, p.TeamID, p.End)
@@ -953,6 +988,9 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		return result, err
 	}
 	if closing {
+		if err := h.reconcileInvoicePeriod(ctx, p); err != nil {
+			return result, err
+		}
 		mapping, err := billing.RevalidateMeterCloseMapping(ctx, h.Pool, p, h.ResolveActiveBillingMeter)
 		if err != nil {
 			return result, err
@@ -1126,6 +1164,13 @@ func (h *Handlers) reconcileIncrementalPeriod(ctx context.Context, p billing.Exp
 	account, err := h.DB.GetTeamBillingAccount(ctx, p.TeamID)
 	if err != nil {
 		return result, err
+	}
+	scope, _, err := h.invoiceAccountForPeriod(ctx, p)
+	if err != nil {
+		return result, err
+	}
+	if scope.ReplacementSubscription != "" {
+		account.StripeCustomerID = &scope.Customer
 	}
 	reader, ok := h.Stripe.(stripeMeterSummaryReader)
 	if !ok || account.StripeCustomerID == nil {

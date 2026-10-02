@@ -99,6 +99,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
 		api.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetTeamBillingExportPreview)
 		api.POST("/stripe/checkout-session", h.CreateStripeCheckoutSession)
+		api.POST("/stripe/checkout-session/publication-decision", PromotionAccountAuth(), h.CreateStripeCheckoutSession)
 		api.POST("/stripe/checkout-session/recover", h.RecoverStripeCheckoutSession)
 		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
 
@@ -145,6 +146,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	{
 		// Billing recovery requires a credential unavailable to VMD hosts.
 		operator.POST("/teams/:team_id/billing/storage", h.ReconcileStorageBilling)
+		operator.POST("/teams/:team_id/billing/invoice-reconciliation", h.EnrollInvoiceReconciliation)
 		operator.POST("/teams/:team_id/billing/periods/:period_id/adopt-exports", h.AdoptBillingExports)
 		operator.POST("/billing/export-events/:event_id/recover", h.RecoverBillingExport)
 		operator.POST("/teams/:team_id/billing/periods/:period_id/measure-correction", h.MeasureBillingCorrection)
