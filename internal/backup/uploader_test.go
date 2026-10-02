@@ -1079,7 +1079,7 @@ func TestFailedVerificationWriteNotCarriedIntoTask(t *testing.T) {
 	db.Close()
 
 	u := &Uploader{Journal: j, Store: newMemStore()}
-	_, _, _, err = u.uploadFile(context.Background(), &task, task.Files[0])
+	_, _, _, err = u.uploadFile(context.Background(), &task, task.Files[0], func() {})
 	if err == nil {
 		t.Fatal("uploadFile succeeded despite a failed verification write")
 	}
@@ -3619,7 +3619,8 @@ func TestStreamingUploadRenewsItsClaim(t *testing.T) {
 	now := start
 	store := &slowStore{memStore: newMemStore(), advance: func() { now = now.Add(claimRenewEvery) }}
 	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop(), Now: func() time.Time { return now }}
-	if _, _, _, err := u.uploadFile(context.Background(), &claimed, claimed.Files[0]); err != nil {
+	// The task's own gate, so the renewal path is the production one.
+	if _, _, _, err := u.uploadFile(context.Background(), &claimed, claimed.Files[0], u.claimRenewer(&claimed)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3627,4 +3628,53 @@ func TestStreamingUploadRenewsItsClaim(t *testing.T) {
 	if !after.After(before) {
 		t.Fatalf("the lease did not move while the upload streamed: %v then %v", before, after)
 	}
+}
+
+// The lease covers a task, not an object. Two artifacts that each take
+// most of the interval but not all of it still add up past it, so a gate
+// created per object would renew nothing while the lease ran out.
+func TestClaimRenewalSpansTheWholeTask(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	task.Files[0].BasePath = ""
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().Add(100 * time.Hour)
+	claimed, ok, err := j.Next(start)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	before := soleClaimUntil(t, j)
+
+	now := start
+	// Each object spends most of the interval, none spends all of it.
+	perObject := claimRenewEvery - claimRenewEvery/5
+	objects := 0
+	store := &perObjectClock{memStore: newMemStore(), tick: func() {
+		objects++
+		now = now.Add(perObject)
+	}}
+	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop(), Now: func() time.Time { return now }}
+	if _, _, _, err := u.uploadTask(context.Background(), &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if objects < 2 {
+		t.Fatalf("objects streamed = %d, want the task's artifacts", objects)
+	}
+	if after := soleClaimUntil(t, j); !after.After(before) {
+		t.Fatalf("the lease never moved across %d objects spending %v each", objects, perObject)
+	}
+}
+
+// perObjectClock lets the clock run once per object, as a transfer that
+// takes real time for each artifact does.
+type perObjectClock struct {
+	*memStore
+	tick func()
+}
+
+func (p *perObjectClock) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
+	p.tick()
+	return p.memStore.Create(ctx, object, r)
 }

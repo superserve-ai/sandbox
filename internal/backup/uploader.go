@@ -635,13 +635,17 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 		Generation:      task.Generation,
 		VMDVersion:      u.VMDVersion,
 	}
+	// One gate for the whole task: a lease has to survive four artifacts
+	// that each stream for less than the interval, and the extent scan
+	// and pre-stream hash that spend the lease without shipping a byte.
+	renew := u.claimRenewer(task)
 	uploadedBases := map[string]bool{}
 	// objectPaths mirrors gen.Files entry for entry with the exact bucket
 	// object each upload wrote (the value handed to the store), so the
 	// finalized report below names objects without re-deriving them.
 	var objectPaths []string
 	for _, file := range task.Files {
-		mf, obj, n, err := u.uploadFile(ctx, task, file)
+		mf, obj, n, err := u.uploadFile(ctx, task, file, renew)
 		streamed += n
 		if err != nil {
 			if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
@@ -675,7 +679,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				}
 				return false, nil, streamed, err
 			}
-			bmf, bobj, n, err := u.uploadFile(ctx, task, bf)
+			bmf, bobj, n, err := u.uploadFile(ctx, task, bf, renew)
 			streamed += n
 			if err != nil {
 				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
@@ -926,6 +930,23 @@ func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
 	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
 }
 
+// claimRenewer returns the task's renewal gate: callable as often as a
+// caller likes, acting only once per claimRenewEvery. Task-scoped on
+// purpose — per call it would restart the interval for every artifact,
+// and a task whose files each stream for less than the interval would
+// never renew at all while its lease ran out.
+func (u *Uploader) claimRenewer(task *Task) func() {
+	last := u.clock()
+	return func() {
+		now := u.clock()
+		if now.Sub(last) < claimRenewEvery {
+			return
+		}
+		last = now
+		u.renewClaim(task)
+	}
+}
+
 // renewClaim keeps this attempt's lease alive while it streams. Failure
 // needs no handling here: a lease already lost means Ack and Nack refuse
 // this attempt anyway, and the worker that took the task is the one whose
@@ -960,7 +981,7 @@ func immutableSource(task *Task, file TaskFile) bool {
 // rather than re-deriving it. shipped counts bytes written into a newly
 // created object (zero on dedupes, skips, and failures that abort the
 // create), so byte accounting reflects storage actually done.
-func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_ ManifestFile, objectPath string, shipped int64, _ error) {
+func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile, renew func()) (_ ManifestFile, objectPath string, shipped int64, _ error) {
 	if file.Name == ManifestObject {
 		return ManifestFile{}, "", 0, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
 	}
@@ -1045,6 +1066,9 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	// pages already dropped, so both passes reach the platters.
 	if !immutableSource(task, file) {
 		sum, err := hashApparent(ctx, f, extents, apparent)
+		// A full read of a multi-GB artifact is progress the lease has to
+		// survive even though nothing shipped.
+		renew()
 		if err != nil {
 			return ManifestFile{}, "", 0, fmt.Errorf("verify %s: %w", file.Path, err)
 		}
@@ -1067,10 +1091,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		// A bandwidth-capped multi-GB artifact can outrun the claim TTL;
 		// without this the lease expires mid-stream, a sibling worker
 		// takes the task, and the upload restarts from zero every time.
-		progress: func() { u.renewClaim(task) },
-		every:    claimRenewEvery,
-		now:      u.clock,
-		last:     u.clock(),
+		progress: renew,
 	}
 	created, err := u.Store.Create(ctx, object, reader)
 	if err != nil {
@@ -1282,28 +1303,11 @@ type limitedReader struct {
 	r       io.Reader
 	limiter *rate.Limiter
 	ctx     context.Context
-	// progress is called while bytes are actually flowing, at most once
-	// per every. Tying it to the stream rather than to a timer is what
-	// keeps a lease renewal honest: a stalled upload stops renewing and
-	// is correctly taken over.
-	//
-	// now reads the same clock the lease is stamped from. Comparing a
-	// wall-clock reading against a timestamp taken from an overridden
-	// clock could hold a renewal off indefinitely, and the upload would
-	// lose the task it is still streaming.
+	// progress is called while bytes are actually flowing, and decides
+	// for itself how often to act. Tying it to the stream rather than to
+	// a timer is what keeps a lease renewal honest: a stalled upload
+	// stops renewing and is correctly taken over.
 	progress func()
-	every    time.Duration
-	now      func() time.Time
-	last     time.Time
-}
-
-// clock reads the lease's own clock, falling back to the wall clock for
-// the readers that renew nothing.
-func (l *limitedReader) clock() time.Time {
-	if l.now != nil {
-		return l.now()
-	}
-	return time.Now()
 }
 
 func (l *limitedReader) Read(p []byte) (int, error) {
@@ -1315,10 +1319,7 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	}
 	n, err := l.r.Read(p)
 	if n > 0 && l.progress != nil {
-		if now := l.clock(); now.Sub(l.last) >= l.every {
-			l.last = now
-			l.progress()
-		}
+		l.progress()
 	}
 	if n > 0 && l.limiter != nil {
 		if werr := l.limiter.WaitN(l.ctx, n); werr != nil {

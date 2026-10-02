@@ -1129,6 +1129,12 @@ func mergeRow(existing []byte, task *Task) {
 	if cur.Staged && !task.Staged {
 		task.Files = cur.Files
 		task.Staged = true
+	} else {
+		// A re-enqueue that landed while this attempt ran may have
+		// measured sizes the claimed copy never had; without this the
+		// write-back reverts the row to the claim-time blanks and the
+		// finalized report names a generation of unknown size.
+		mergeAllocations(task.Files, cur.Files)
 	}
 	// A promotion that landed while this attempt ran must survive the
 	// write-back, or the retry would demote the row to the snapshot's
