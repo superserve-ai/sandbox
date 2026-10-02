@@ -7,6 +7,16 @@ resource "google_service_account" "controlplane_runtime" {
   description  = "Cloud Run control plane for the staging cell; never attach to a VMD host."
 }
 
+# Operators publish secret versions; Terraform owns metadata and runtime access.
+resource "google_secret_manager_secret" "operator_api_token" {
+  project   = local.project_id
+  secret_id = "operator-api-token-staging"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
 resource "google_secret_manager_secret" "promotion_auth_database_url" {
   project   = local.project_id
   secret_id = "promotion-auth-database-url-${local.resource_suffix}"
@@ -94,6 +104,7 @@ locals {
       google_secret_manager_secret.stripe_secret_key.secret_id,
       google_secret_manager_secret.stripe_webhook_secret.secret_id,
       google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id,
+      google_secret_manager_secret.operator_api_token.secret_id,
     ],
   ))
 }
