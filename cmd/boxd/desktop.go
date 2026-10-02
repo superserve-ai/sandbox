@@ -58,7 +58,7 @@ const xdotoolTimeout = 5 * time.Second
 const desktopResizeTimeout = 15 * time.Second
 
 // maxConsecutiveCaptureFailures ends the stream after this many capture
-// failures in a row, so a permanently broken X server (crashed Xvfb, no
+// failures in a row, so a permanently broken X server (crashed Xvnc, no
 // DISPLAY) doesn't spin the ticker forever; a transient single failure is
 // logged and skipped so one bad frame doesn't kill a long-lived stream.
 const maxConsecutiveCaptureFailures = 5
@@ -574,7 +574,7 @@ func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.Des
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
 
-	// Xvfb exposes only its initial mode. Generate and attach a CVT modeline
+	// The X server exposes only its initial mode. Generate and attach a CVT modeline
 	// before selecting it so arbitrary supported desktop sizes work rather than
 	// only resolutions that happened to exist at boot.
 	resizeCtx, cancel := context.WithTimeout(ctx, desktopResizeTimeout)
