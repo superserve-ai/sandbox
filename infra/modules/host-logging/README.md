@@ -147,3 +147,12 @@ before staging. Production additionally requires actual Cloud Logging receipt,
 72-hour sizing and bounded catch-up evidence, constrained-resource lifecycle
 latency, alert delivery, replacement-host enrollment, and tested legacy cutover
 and rollback. Local fixture results do not substitute for those observations.
+
+The manual host-provisioning guard accepts logging alert identity substitutions
+only when the complete planned query/filter is known and otherwise unchanged.
+Terraform normally makes the entire string unknown when a replacement or absent
+VM receives a new instance ID, so those provisioning plans are blocked. An old
+instance ID and a configuration reference do not prove the new query is safe.
+Do not bypass the guard: a separately reviewed logging rollout with the required
+staging evidence is needed. Automatic provisioning with unresolved logging alert
+identities requires additional proof of the unchanged query/filter template.

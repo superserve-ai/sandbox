@@ -254,8 +254,11 @@ def _identity_only_monitoring_change(change, vm_change, identity_path):
 
     def unchanged(left, right, pending, path=()):
         if path == identity_path:
-            if pending is True:
-                return
+            # Terraform hides the whole interpolated string when the VM ID is
+            # unknown, including any simultaneous window/predicate changes.
+            require(pending is not True,
+                    'Unresolved host logging alert query/filter: identity-only change cannot be verified; '
+                    'use a separately reviewed, evidence-gated logging rollout')
             if left == right:
                 return
             require(isinstance(left, str) and isinstance(right, str) and new_id,
