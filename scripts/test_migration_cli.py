@@ -31,8 +31,9 @@ class MigrationCLITest(unittest.TestCase):
         if result.returncode:
             raise RuntimeError(result.stdout)
         for _ in range(60):
+            # The image's temporary initialization server only accepts sockets.
             if run("docker", "exec", cls.container,
-                   "pg_isready", "-U", "postgres").returncode == 0:
+                   "pg_isready", "-h", "127.0.0.1", "-U", "postgres").returncode == 0:
                 break
             time.sleep(0.5)
         else:
@@ -42,8 +43,9 @@ class MigrationCLITest(unittest.TestCase):
 
     def setUp(self):
         self.database = "test_" + uuid.uuid4().hex[:12]
-        self.assertEqual(run("docker", "exec", self.container, "createdb",
-                             "-U", "postgres", self.database).returncode, 0)
+        result = run("docker", "exec", self.container, "createdb",
+                     "-U", "postgres", self.database)
+        self.assertEqual(result.returncode, 0, result.stdout)
         self.temp = tempfile.TemporaryDirectory(prefix="migration-cli-")
         self.addCleanup(self.temp.cleanup)
         self.project = Path(self.temp.name)
