@@ -44,7 +44,11 @@ class FakeStripe(Stripe):
             return {"id": self.account_response}
         kind = next(k for k, p in PATHS.items() if p == path)
         if method == "GET":
-            return {"data": copy.deepcopy(self.data[kind]), "has_more": False}
+            rows = self.data[kind]
+            if kind == "price":
+                active = (params or {}).get("active", "true") == "true"
+                rows = [row for row in rows if row["active"] is active]
+            return {"data": copy.deepcopy(rows), "has_more": False}
         if not self.apply:
             raise AssertionError("Write attempted in preview")
         obj = copy.deepcopy(catalog()[kind][0])
@@ -137,6 +141,34 @@ class ProvisionTests(unittest.TestCase):
         stripe.data["meter"][0]["livemode"] = True
         with self.assertRaises(ProvisionError):
             self.run_quiet(stripe)
+
+    def test_archived_storage_prices_abort_before_any_write(self):
+        for apply in (False, True):
+            for active_price in (False, True):
+                with self.subTest(apply=apply, active_price=active_price):
+                    data = catalog()
+                    archived = {**data["price"][0], "id": "price_archived", "active": False}
+                    data["price"] = data["price"] + [archived] if active_price else [archived]
+                    stripe = FakeStripe(data, apply=apply)
+                    with self.assertRaises(ProvisionError):
+                        self.run_quiet(stripe)
+                    self.assertTrue(all(method == "GET" for method, _, _ in stripe.calls))
+
+    def test_price_inventory_paginates_both_states_with_separate_cursors(self):
+        stripe = Stripe("rk_test_fixture", False, "acct_example")
+        def page(item_id, more):
+            return {"data": [{"id": item_id, "livemode": False}], "has_more": more}
+        with patch.object(stripe, "request", side_effect=[
+            page("price_active_1", True), page("price_active_2", False),
+            page("price_archived_1", True), page("price_archived_2", False),
+        ]) as request:
+            self.assertEqual(len(stripe.inventory("price")), 4)
+            self.assertEqual([call.args[2] for call in request.call_args_list], [
+                {"limit": 100, "active": "true"},
+                {"limit": 100, "active": "true", "starting_after": "price_active_1"},
+                {"limit": 100, "active": "false"},
+                {"limit": 100, "active": "false", "starting_after": "price_archived_1"},
+            ])
 
     def test_paginated_inventory_and_incomplete_response(self):
         stripe = Stripe("rk_test_fixture", False, "acct_example")
