@@ -106,6 +106,13 @@ type Task struct {
 	// the uploader-owned staging tree; the dedupe upgrade in Enqueue is
 	// one-way toward staged.
 	Staged bool `json:"staged,omitempty"`
+	// Immutable records that this task's own artifacts are never written
+	// again after capture, so the upload need not re-read them to prove
+	// they still match. Distinct from Staged: these are not copies the
+	// uploader owns but originals nothing writes any more, and a shared
+	// base entry is excluded because it still names the host's live
+	// template (see immutableSource).
+	Immutable bool `json:"immutable,omitempty"`
 	// ClaimToken fences resolution against lease steals: Next stamps the
 	// claim's token here, and Ack/Nack refuse to touch a row whose live
 	// claim carries a different token (the lease expired and another
@@ -434,6 +441,12 @@ func (j *Journal) Enqueue(task Task) error {
 					cur.Files = task.Files
 					cur.Staged = true
 					changed = true
+				} else if mergeAllocations(cur.Files, task.Files) {
+					// Same staging state, so the queued paths stand; the
+					// sizes this enqueue measured still belong on them,
+					// or a row queued before they were carried reports a
+					// generation of unknown size forever.
+					changed = true
 				}
 				// Priority promotion, one-way toward more urgent: a live
 				// pause re-enqueueing a generation the backfill queued at
@@ -580,6 +593,70 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 		task.ClaimToken = j.claimSeq
 	}
 	return task, found, nil
+}
+
+// claimRenewEvery is how often a streaming upload re-stamps its lease.
+// A third of the TTL leaves two missed renewals of headroom before a
+// task that really is wedged becomes claimable again.
+const claimRenewEvery = claimTTL / 3
+
+// RenewClaim re-stamps the caller's lease while the caller still owns it,
+// so an upload slower than claimTTL is not stolen mid-stream and started
+// again from zero, forever, burning the bandwidth the rest of the queue
+// needs. Reports whether the lease is still the caller's; a false means
+// another worker holds the task and this attempt's Ack or Nack will be
+// refused anyway.
+//
+// Renewal belongs to callers that are making progress, never to a timer
+// alone: the TTL exists to recover a wedged worker, and a lease renewed
+// regardless of progress would never let that happen.
+func (j *Journal) RenewClaim(task Task, now time.Time) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	renewed := false
+	_ = j.db.View(func(tx *bolt.Tx) error {
+		qk := currentKey(tx, &task)
+		if tx.Bucket(journalBucket).Get(qk) == nil {
+			return nil
+		}
+		c, held := j.claims[string(qk)]
+		// A lease already past its expiry is not the caller's to extend,
+		// whoever still holds the token: it is claimable from this moment
+		// on, and renewing it would let a worker that wedged for an hour
+		// win a race against the recovery the expiry exists to allow.
+		if !held || c.token != task.ClaimToken || !c.until.After(now) {
+			return nil
+		}
+		j.claims[string(qk)] = claim{until: now.Add(claimTTL), token: c.token}
+		renewed = true
+		return nil
+	})
+	return renewed
+}
+
+// mergeAllocations fills in allocations a queued task is MISSING from an
+// incoming one, reporting whether anything was adopted. Missing means the
+// manifest could not measure it (negative), never zero: a fully sparse
+// artifact measures zero legitimately, and a generation's identity covers
+// apparent content rather than physical layout, so the same generation
+// re-enqueued from a differently laid out file carries a different
+// allocation for the same bytes. Adopting that over a real zero would
+// report the other layout's footprint for the paths this row keeps.
+func mergeAllocations(queued, incoming []TaskFile) bool {
+	adopted := false
+	for i := range queued {
+		if queued[i].AllocatedBytes >= 0 {
+			continue
+		}
+		for _, in := range incoming {
+			if in.Name == queued[i].Name && in.AllocatedBytes >= 0 {
+				queued[i].AllocatedBytes = in.AllocatedBytes
+				adopted = true
+				break
+			}
+		}
+	}
+	return adopted
 }
 
 // errClaimStolen reports a resolution refused because the caller's lease
@@ -901,8 +978,19 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 			// row's token (Enqueue), and the report must carry the newest
 			// or the control plane refuses it as another pause's.
 			var rowTask Task
-			if json.Unmarshal(existing, &rowTask) == nil && rowTask.PauseToken != "" {
-				nt.PauseToken = rowTask.PauseToken
+			if json.Unmarshal(existing, &rowTask) == nil {
+				if rowTask.PauseToken != "" {
+					nt.PauseToken = rowTask.PauseToken
+				}
+				// And whatever sizes that re-enqueue measured, for the
+				// same reason: this is the last durable moment, and the
+				// completion record it writes stops any later sweep from
+				// correcting the number. Sizes only — these entries carry
+				// the exact objects the upload wrote, which the queued row
+				// never knew. Copied first, so the caller's slice is not
+				// rewritten underneath it.
+				nt.Files = append([]TaskFile(nil), task.Files...)
+				mergeAllocations(nt.Files, rowTask.Files)
 			}
 			// An undelivered entry that carries object paths must not be
 			// demoted by a pathless re-completion (an unchanged re-pause
@@ -914,6 +1002,10 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 				var cur Task
 				if json.Unmarshal(prevOutbox, &cur) == nil &&
 					filesCarryObjects(cur.Files) && !filesCarryObjects(nt.Files) {
+					// The kept entry owns the paths, this completion owns
+					// the sizes: a measurement only this pass made must
+					// not be demoted along with the pathless manifest.
+					mergeAllocations(cur.Files, nt.Files)
 					nt.Files = cur.Files
 					nt.FilesFinal = cur.FilesFinal
 				}
@@ -1059,6 +1151,12 @@ func mergeRow(existing []byte, task *Task) {
 	if cur.Staged && !task.Staged {
 		task.Files = cur.Files
 		task.Staged = true
+	} else {
+		// A re-enqueue that landed while this attempt ran may have
+		// measured sizes the claimed copy never had; without this the
+		// write-back reverts the row to the claim-time blanks and the
+		// finalized report names a generation of unknown size.
+		mergeAllocations(task.Files, cur.Files)
 	}
 	// A promotion that landed while this attempt ran must survive the
 	// write-back, or the retry would demote the row to the snapshot's

@@ -2044,3 +2044,38 @@ func TestMarkerReuseRotatesOwnershipWithPauseToken(t *testing.T) {
 		t.Fatal("refreshed marker deleted by the old ownership token")
 	}
 }
+
+// The manifest measures what each artifact really occupies, and the row
+// the control plane stores comes from the enqueued task: dropped there,
+// every sandbox generation records zero and nothing can size a backup.
+func TestEnqueueCarriesAllocatedBytes(t *testing.T) {
+	var got backup.Task
+	m := &Manager{log: zerolog.Nop()}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		got = task
+		return nil
+	})
+
+	manifest := []ManifestEntry{
+		{FileName: "rootfs.ext4", Path: "/disk", SizeBytes: 1 << 30, AllocatedBytes: 4 << 20, SHA256: "d"},
+		// The manifest's sentinel for an allocation it could not measure.
+		{FileName: "vmstate.snap", Path: "/snap", SizeBytes: 4096, AllocatedBytes: -1, SHA256: "s"},
+	}
+	// Carried as measured, sentinel included: only the sentinel can tell
+	// an allocation that is missing from one that is genuinely zero, and
+	// a dedupe downstream has to make exactly that distinction. The
+	// rendering for readers outside the host is where it becomes zero.
+	want := []int64{4 << 20, -1}
+	if ok, _, _ := m.enqueueBackup("vm-1", manifest, backup.PriorityPause, ""); !ok {
+		t.Fatal("enqueue refused a complete manifest")
+	}
+
+	if len(got.Files) != len(manifest) {
+		t.Fatalf("files = %d, want %d", len(got.Files), len(manifest))
+	}
+	for i, f := range got.Files {
+		if f.AllocatedBytes != want[i] {
+			t.Fatalf("%s allocated = %d, want %d", f.Name, f.AllocatedBytes, want[i])
+		}
+	}
+}

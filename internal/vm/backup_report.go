@@ -112,7 +112,7 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	for _, f := range files {
 		body.Files = append(body.Files, backupReportFile{
 			Name:        f.Name,
-			RuntimePath: f.RuntimePath, AllocatedBytes: f.AllocatedBytes,
+			RuntimePath: f.RuntimePath, AllocatedBytes: backup.ReportedAllocation(f.AllocatedBytes),
 			SizeBytes:  f.Size,
 			SHA256:     f.SHA256,
 			BaseSHA256: f.BaseSHA256,

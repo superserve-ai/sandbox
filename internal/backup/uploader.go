@@ -635,13 +635,17 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 		Generation:      task.Generation,
 		VMDVersion:      u.VMDVersion,
 	}
+	// One gate for the whole task: a lease has to survive four artifacts
+	// that each stream for less than the interval, and the extent scan
+	// and pre-stream hash that spend the lease without shipping a byte.
+	renew := u.claimRenewer(task)
 	uploadedBases := map[string]bool{}
 	// objectPaths mirrors gen.Files entry for entry with the exact bucket
 	// object each upload wrote (the value handed to the store), so the
 	// finalized report below names objects without re-deriving them.
 	var objectPaths []string
 	for _, file := range task.Files {
-		mf, obj, n, err := u.uploadFile(ctx, task, file)
+		mf, obj, n, err := u.uploadFile(ctx, task, file, renew)
 		streamed += n
 		if err != nil {
 			if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
@@ -675,7 +679,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 				}
 				return false, nil, streamed, err
 			}
-			bmf, bobj, n, err := u.uploadFile(ctx, task, bf)
+			bmf, bobj, n, err := u.uploadFile(ctx, task, bf, renew)
 			streamed += n
 			if err != nil {
 				if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
@@ -926,13 +930,58 @@ func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
 	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
 }
 
+// claimRenewer returns the task's renewal gate: callable as often as a
+// caller likes, acting only once per claimRenewEvery. Task-scoped on
+// purpose — per call it would restart the interval for every artifact,
+// and a task whose files each stream for less than the interval would
+// never renew at all while its lease ran out.
+func (u *Uploader) claimRenewer(task *Task) func() {
+	last := u.clock()
+	return func() {
+		now := u.clock()
+		if now.Sub(last) < claimRenewEvery {
+			return
+		}
+		last = now
+		u.renewClaim(task)
+	}
+}
+
+// renewClaim keeps this attempt's lease alive while it streams. Failure
+// needs no handling here: a lease already lost means Ack and Nack refuse
+// this attempt anyway, and the worker that took the task is the one whose
+// resolution counts.
+func (u *Uploader) renewClaim(task *Task) {
+	if u.Journal == nil {
+		return
+	}
+	u.Journal.RenewClaim(*task, u.clock())
+}
+
+// immutableSource reports whether this entry's bytes cannot change while
+// the upload runs, so reading them twice proves nothing the stream hash
+// does not.
+//
+// A staged task owns every path it names, bases included: those are
+// copies the uploader made, and nothing else writes them. A task marked
+// immutable names artifacts that are never written again after capture,
+// which covers its own files but NOT a shared base — that entry still
+// points at the host's live template, which a rebuild can replace, and
+// the pre-check is what catches it before bytes ship.
+func immutableSource(task *Task, file TaskFile) bool {
+	if task.Staged {
+		return true
+	}
+	return task.Immutable && !file.Shared
+}
+
 // uploadFile ships one artifact object. objectPath is the exact bucket
 // object the artifact lives under (the same value handed to the store),
 // returned so completion bookkeeping records the path actually written
 // rather than re-deriving it. shipped counts bytes written into a newly
 // created object (zero on dedupes, skips, and failures that abort the
 // create), so byte accounting reflects storage actually done.
-func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_ ManifestFile, objectPath string, shipped int64, _ error) {
+func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile, renew func()) (_ ManifestFile, objectPath string, shipped int64, _ error) {
 	if file.Name == ManifestObject {
 		return ManifestFile{}, "", 0, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
 	}
@@ -941,6 +990,11 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		return ManifestFile{}, "", 0, err
 	}
 	defer f.Close()
+	// Enter the artifact's preparation on a fresh lease: the extent scan
+	// is metadata work with no cancellation of its own, so the honest
+	// bound on it is to start it with a full lease rather than whatever
+	// the previous artifact left.
+	renew()
 	extents, apparent, err := Extents(f)
 	if err != nil {
 		return ManifestFile{}, "", 0, fmt.Errorf("extents %s: %w", file.Path, err)
@@ -999,7 +1053,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 				Object:         objectName,
 				SHA256:         file.SHA256,
 				Size:           apparent,
-				AllocatedBytes: file.AllocatedBytes,
+				AllocatedBytes: ReportedAllocation(file.AllocatedBytes),
 				PackedSize:     PackedSize(extents),
 				Extents:        extents,
 			}, object, 0, nil
@@ -1009,14 +1063,25 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	// before any bytes ship: a cheap early abort for the common mutation
 	// case (the sandbox resumed before the drain). After the shared skip
 	// above, so an already-verified base is never re-read at all.
-	sum, err := hashApparent(ctx, f, extents, apparent)
-	if err != nil {
-		return ManifestFile{}, "", 0, fmt.Errorf("verify %s: %w", file.Path, err)
-	}
-	if sum != file.SHA256 {
-		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
-			Msg("backup source changed since pause; abandoning generation")
-		return ManifestFile{}, "", 0, errSourceChanged
+	//
+	// Skipped when nothing can change the source under us: the abort it
+	// exists for cannot fire, and the stream hasher below digests the same
+	// bytes again anyway, so it is a second full read of a multi-GB
+	// artifact — on the array serving live VM disk I/O, with the staging
+	// pages already dropped, so both passes reach the platters.
+	if !immutableSource(task, file) {
+		// Renewing as it reads, not after: the read itself can outlast
+		// the lease, and a thief would then create the object this
+		// attempt is about to write.
+		sum, err := hashApparentProgress(ctx, f, extents, apparent, renew)
+		if err != nil {
+			return ManifestFile{}, "", 0, fmt.Errorf("verify %s: %w", file.Path, err)
+		}
+		if sum != file.SHA256 {
+			task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
+				Msg("backup source changed since pause; abandoning generation")
+			return ManifestFile{}, "", 0, errSourceChanged
+		}
 	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
 	// shipped (packed bytes as streamed, zeros for the holes), closing the
@@ -1025,8 +1090,14 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	// digest. On mismatch the generation is abandoned before its manifest
 	// object is written, and a generation without its completion marker is
 	// never restored from; the orphaned artifact object is inert.
-	hasher := newApparentStreamHasher(NewPackedReader(f, extents), extents, apparent)
-	reader := &limitedReader{r: hasher, limiter: u.Limiter, ctx: ctx}
+	hasher := newApparentStreamHasher(NewPackedReader(f, extents), extents, apparent, renew)
+	reader := &limitedReader{
+		r: hasher, limiter: u.Limiter, ctx: ctx,
+		// A bandwidth-capped multi-GB artifact can outrun the claim TTL;
+		// without this the lease expires mid-stream, a sibling worker
+		// takes the task, and the upload restarts from zero every time.
+		progress: renew,
+	}
 	created, err := u.Store.Create(ctx, object, reader)
 	if err != nil {
 		return ManifestFile{}, "", 0, storeError{err}
@@ -1113,7 +1184,10 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		// discriminator, and without it the generation is abandoned
 		// rather than completed over bytes nothing can vouch for (this
 		// identity cannot read them back).
-		task.logOwner(u.Log.Warn().Str("object", object)).
+		// Through lossEvent like every sibling abandonment: for a staged
+		// task these bytes existed and nothing can vouch for them any
+		// more, which is an error an alert has to see, not a warning.
+		task.logOwner(u.lossEvent(task).Str("object", object)).
 			Msg("deduped object has no verification history; abandoning generation")
 		return ManifestFile{}, "", 0, errSourceChanged
 	} else {
@@ -1143,7 +1217,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		BasePath:       file.BasePath,
 		BaseSHA256:     file.BaseSHA256,
 		Size:           apparent,
-		AllocatedBytes: file.AllocatedBytes,
+		AllocatedBytes: ReportedAllocation(file.AllocatedBytes),
 		PackedSize:     PackedSize(extents),
 		Extents:        extents,
 	}, object, shipped, nil
@@ -1172,11 +1246,33 @@ func HashFileApparent(ctx context.Context, path string) (string, int64, error) {
 	return sum, apparent, nil
 }
 
+// ReportedAllocation renders an allocation for a reader outside this
+// host. Unavailable and genuinely zero are the same thing to a consumer
+// that sums sizes, and the control plane stores what it is given
+// verbatim, so the sentinel must not survive the boundary: a negative
+// would make a generation shrink the totals it belongs to. Inside the
+// pipeline the sentinel stays, because only it can tell a measurement
+// that is missing from one that is zero.
+func ReportedAllocation(allocated int64) int64 {
+	if allocated < 0 {
+		return 0
+	}
+	return allocated
+}
+
 // hashApparent digests the file's full apparent content from its extent
 // table: data extents from disk, holes as zeros without touching disk.
 // This must equal the pause manifest's digest, and restore recomputes the
 // same thing after rebuilding the sparse file.
 func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent int64) (string, error) {
+	return hashApparentProgress(ctx, f, extents, apparent, nil)
+}
+
+// hashApparentProgress is hashApparent reporting as it reads, for a
+// caller whose lease is running while it hashes: a full read of a
+// multi-GB artifact on contended storage can outlast the lease on its
+// own, and a renewal that waits for the hash to return comes too late.
+func hashApparentProgress(ctx context.Context, f *os.File, extents []Extent, apparent int64, progress func()) (string, error) {
 	h := sha256.New()
 	zeros := make([]byte, 1<<20)
 	var pos int64
@@ -1184,6 +1280,9 @@ func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent in
 		for pos < upTo {
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if progress != nil {
+				progress()
 			}
 			n := upTo - pos
 			if n > int64(len(zeros)) {
@@ -1203,7 +1302,7 @@ func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent in
 		// shutdown join waits on this loop, and an uncancelable multi-GB
 		// read on a slow filesystem would outlive the join's deadline and
 		// leave the loop touching closed dependencies.
-		if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: io.NewSectionReader(f, e.Offset, e.Length)}); err != nil {
+		if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: io.NewSectionReader(f, e.Offset, e.Length), progress: progress}); err != nil {
 			return "", err
 		}
 		pos = e.Offset + e.Length
@@ -1219,13 +1318,21 @@ func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent in
 type ctxReader struct {
 	ctx context.Context
 	r   io.Reader
+	// progress is called per read, not per extent: a single dense extent
+	// can be the whole artifact, so extent boundaries are no granularity
+	// at all for a caller holding a lease.
+	progress func()
 }
 
 func (c *ctxReader) Read(p []byte) (int, error) {
 	if err := c.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return c.r.Read(p)
+	n, err := c.r.Read(p)
+	if n > 0 && c.progress != nil {
+		c.progress()
+	}
+	return n, err
 }
 
 // limitedReader applies the bandwidth cap per read. A nil limiter means
@@ -1234,6 +1341,11 @@ type limitedReader struct {
 	r       io.Reader
 	limiter *rate.Limiter
 	ctx     context.Context
+	// progress is called while bytes are actually flowing, and decides
+	// for itself how often to act. Tying it to the stream rather than to
+	// a timer is what keeps a lease renewal honest: a stalled upload
+	// stops renewing and is correctly taken over.
+	progress func()
 }
 
 func (l *limitedReader) Read(p []byte) (int, error) {
@@ -1244,6 +1356,9 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 		}
 	}
 	n, err := l.r.Read(p)
+	if n > 0 && l.progress != nil {
+		l.progress()
+	}
 	if n > 0 && l.limiter != nil {
 		if werr := l.limiter.WaitN(l.ctx, n); werr != nil {
 			return n, werr
@@ -1265,14 +1380,24 @@ type apparentStreamHasher struct {
 	pos      int64 // apparent offset hashed so far
 	zeros    []byte
 	consumed int64 // total packed bytes seen
+	// progress is reported while hashing holes too: the apparent zeros of
+	// a very sparse artifact are hashed without a byte being read, so a
+	// caller holding a lease gets no other signal from this work.
+	progress func()
 }
 
-func newApparentStreamHasher(r io.Reader, extents []Extent, apparent int64) *apparentStreamHasher {
-	return &apparentStreamHasher{r: r, extents: extents, apparent: apparent, h: sha256.New(), zeros: make([]byte, 64<<10)}
+func newApparentStreamHasher(r io.Reader, extents []Extent, apparent int64, progress func()) *apparentStreamHasher {
+	return &apparentStreamHasher{
+		r: r, extents: extents, apparent: apparent,
+		h: sha256.New(), zeros: make([]byte, 64<<10), progress: progress,
+	}
 }
 
 func (a *apparentStreamHasher) hashZerosTo(target int64) {
 	for a.pos < target {
+		if a.progress != nil {
+			a.progress()
+		}
 		n := target - a.pos
 		if n > int64(len(a.zeros)) {
 			n = int64(len(a.zeros))

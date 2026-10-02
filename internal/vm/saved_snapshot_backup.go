@@ -125,6 +125,11 @@ func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotMan
 		SnapshotID: man.SnapshotID,
 		Generation: backup.GenerationKey(files),
 		Files:      files,
+		// A saved snapshot is written once at capture and never again, so
+		// the upload reads its artifacts once rather than hashing them
+		// before the stream and again as it ships. Its base is excluded
+		// from that: the entry names the host's live template.
+		Immutable: true,
 		// Below pauses: a pause's generation is the only copy of state
 		// the sandbox is still changing.
 		Priority: backup.PriorityCheckpoint,
