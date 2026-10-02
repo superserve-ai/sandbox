@@ -480,6 +480,18 @@ type BillingInvoiceAccount struct {
 	LastError           *string            `json:"last_error"`
 }
 
+type BillingInvoiceCalendar struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	PeriodStart        time.Time `json:"period_start"`
+	PeriodEnd          time.Time `json:"period_end"`
+	CustomerID         string    `json:"customer_id"`
+	SubscriptionID     string    `json:"subscription_id"`
+	InvoiceStart       time.Time `json:"invoice_start"`
+	InvoiceEnd         time.Time `json:"invoice_end"`
+	BillingCycleAnchor int64     `json:"billing_cycle_anchor"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
 type BillingInvoiceClose struct {
 	TeamID            uuid.UUID          `json:"team_id"`
 	PeriodStart       time.Time          `json:"period_start"`

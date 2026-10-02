@@ -18,6 +18,12 @@ import (
 )
 
 func TestIntegration_InvoiceCentRecoveryAndCredits(t *testing.T) {
+	for _, offset := range []time.Duration{0, 4 * 24 * time.Hour} {
+		t.Run("calendar_offset_"+offset.String(), func(t *testing.T) { testInvoiceCentRecoveryAndCredits(t, offset) })
+	}
+}
+
+func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 	for _, tc := range []struct {
 		name                     string
 		target, provider, credit int64
@@ -32,6 +38,7 @@ func TestIntegration_InvoiceCentRecoveryAndCredits(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store, p := seedIncrementalPeriod(t)
+			invoiceStart, invoiceEnd := p.Start.Add(offset), p.End.Add(offset)
 			customer, subscription := "cus_"+p.TeamID.String(), "sub_"+p.TeamID.String()
 			seconds, quantity := "105499.999999", "29.305555555278"
 			if tc.target == 106 {
@@ -85,7 +92,7 @@ func TestIntegration_InvoiceCentRecoveryAndCredits(t *testing.T) {
 						value++
 					}
 				}
-				return map[string]any{"id": id, "amount": value, "currency": "usd", "period": map[string]any{"start": p.Start.Unix(), "end": p.End.Unix()}, "pricing": map[string]any{"unit_amount_decimal": amount, "price_details": map[string]any{"price": pr}}, "parent": map[string]any{"subscription_item_details": map[string]any{"subscription": subscription, "subscription_item": "si_" + pr, "proration": false}}}
+				return map[string]any{"id": id, "amount": value, "currency": "usd", "period": map[string]any{"start": invoiceStart.Unix(), "end": invoiceEnd.Unix()}, "pricing": map[string]any{"unit_amount_decimal": amount, "price_details": map[string]any{"price": pr}}, "parent": map[string]any{"subscription_item_details": map[string]any{"subscription": subscription, "subscription_item": "si_" + pr, "proration": false}}}
 			}
 			invoice := func() map[string]any {
 				subtotal := tc.provider + adjustment
@@ -116,7 +123,7 @@ func TestIntegration_InvoiceCentRecoveryAndCredits(t *testing.T) {
 				if net > 0 && net < 50 {
 					due, ending = 0, net
 				}
-				return map[string]any{"id": invoiceID, "customer": customer, "currency": "usd", "billing_reason": "subscription_cycle", "period_start": p.Start.Unix(), "period_end": p.End.Unix(), "status": status, "auto_advance": auto, "subtotal": subtotal, "total": net, "amount_due": due, "starting_balance": 0, "ending_balance": ending, "discounts": discounts, "total_discount_amounts": discountAmounts, "total_pretax_credit_amounts": credits, "parent": map[string]any{"subscription_details": map[string]any{"subscription": subscription}}, "lines": map[string]any{"data": []any{line("il_cpu", "price_cpu", "3.6", tc.provider), line("il_round", "price_round", "1", adjustment), line("il_storage", "price_storage", "0.0108", 0)}, "has_more": false}}
+				return map[string]any{"id": invoiceID, "customer": customer, "currency": "usd", "billing_reason": "subscription_cycle", "period_start": invoiceStart.Unix(), "period_end": invoiceEnd.Unix(), "status": status, "auto_advance": auto, "subtotal": subtotal, "total": net, "amount_due": due, "starting_balance": 0, "ending_balance": ending, "discounts": discounts, "total_discount_amounts": discountAmounts, "total_pretax_credit_amounts": credits, "parent": map[string]any{"subscription_details": map[string]any{"subscription": subscription}}, "lines": map[string]any{"data": []any{line("il_cpu", "price_cpu", "3.6", tc.provider), line("il_round", "price_round", "1", adjustment), line("il_storage", "price_storage", "0.0108", 0)}, "has_more": false}}
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_ = r.ParseForm()
@@ -137,12 +144,12 @@ func TestIntegration_InvoiceCentRecoveryAndCredits(t *testing.T) {
 					}
 					out = map[string]any{"data": data, "has_more": false}
 				case "/v1/subscriptions/" + replacement:
-					out = map[string]any{"id": replacement, "customer": customer, "status": "active", "items": map[string]any{"data": []any{map[string]any{"id": "si_cpu_new", "price": price("price_cpu", "mtr_cpu", "3.6")}, map[string]any{"id": "si_round_new", "price": price("price_round", "mtr_round", "1")}, map[string]any{"id": "si_storage_new", "price": price("price_storage", "mtr_storage", "0.0108")}}}}
+					out = map[string]any{"id": replacement, "customer": customer, "billing_cycle_anchor": invoiceStart.Unix(), "status": "active", "items": map[string]any{"data": []any{map[string]any{"id": "si_cpu_new", "current_period_start": invoiceStart.Unix(), "current_period_end": invoiceEnd.Unix(), "price": price("price_cpu", "mtr_cpu", "3.6")}, map[string]any{"id": "si_round_new", "price": price("price_round", "mtr_round", "1")}, map[string]any{"id": "si_storage_new", "current_period_start": invoiceStart.Unix(), "current_period_end": invoiceEnd.Unix(), "price": price("price_storage", "mtr_storage", "0.0108")}}}}
 					if replacementHeld {
 						out.(map[string]any)["pause_collection"] = map[string]any{"behavior": "keep_as_draft"}
 					}
 				case "/v1/subscriptions/" + subscription:
-					out = map[string]any{"id": subscription, "customer": customer, "status": subscriptionStatus, "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": []any{map[string]any{"id": "si_cpu", "price": price("price_cpu", "mtr_cpu", "3.6")}, map[string]any{"id": "si_round", "price": price("price_round", "mtr_round", "1")}, map[string]any{"id": "si_storage", "price": price("price_storage", "mtr_storage", "0.0108")}}}}
+					out = map[string]any{"id": subscription, "customer": customer, "billing_cycle_anchor": invoiceStart.Unix(), "status": subscriptionStatus, "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": []any{map[string]any{"id": "si_cpu", "current_period_start": invoiceStart.Unix(), "current_period_end": invoiceEnd.Unix(), "price": price("price_cpu", "mtr_cpu", "3.6")}, map[string]any{"id": "si_round", "price": price("price_round", "mtr_round", "1")}, map[string]any{"id": "si_storage", "current_period_start": invoiceStart.Unix(), "current_period_end": invoiceEnd.Unix(), "price": price("price_storage", "mtr_storage", "0.0108")}}}}
 				case "/v1/billing/meters":
 					data := []any{}
 					for _, m := range []struct{ id, event string }{{"mtr_cpu", "example_cpu_hours"}, {"mtr_round", "round"}, {"mtr_storage", "storage_gib_hours"}} {
@@ -152,6 +159,9 @@ func TestIntegration_InvoiceCentRecoveryAndCredits(t *testing.T) {
 				case "/v1/billing/meters/mtr_storage/event_summaries":
 					out = map[string]any{"data": []any{}, "has_more": false}
 				case "/v1/billing/meters/mtr_cpu/event_summaries":
+					if offset > 0 && tc.fault == "" && (r.URL.Query().Get("start_time") != strconv.FormatInt(invoiceStart.Unix(), 10) || r.URL.Query().Get("end_time") != strconv.FormatInt(invoiceEnd.Unix(), 10)) {
+						t.Errorf("provider usage queried outside mapped invoice: %s", r.URL)
+					}
 					if tc.fault == "canceled" && usageEvents == 0 {
 						out = map[string]any{"data": []any{}, "has_more": false}
 						break
@@ -352,6 +362,23 @@ func TestIntegration_InvoiceCentRecoveryAndCredits(t *testing.T) {
 			}
 			if events != wantEvents || finalizations != 1 || releases != 1 {
 				t.Fatalf("duplicate provider writes: events=%d finalize=%d release=%d", events, finalizations, releases)
+			}
+			if offset > 0 && tc.name == "up full" {
+				next := billing.ExportPeriod{TeamID: p.TeamID, Start: p.End, End: p.End.AddDate(0, 1, 0)}
+				correctionExec(t, `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, next.TeamID, next.Start, next.End)
+				h := newHandler()
+				h.Now = func() time.Time { return next.Start.Add(time.Hour) }
+				if err := h.VerifyInvoiceExportHoldForTest(t.Context(), next); err == nil || !strings.Contains(err.Error(), "waiting for mapped invoice cycle") {
+					t.Fatalf("next-period export was not deferred: %v", err)
+				}
+				h.Now = func() time.Time { return invoiceEnd.Add(time.Hour) }
+				if err := h.VerifyInvoiceExportHoldForTest(t.Context(), next); err != nil {
+					t.Fatalf("next-period export did not resume: %v", err)
+				}
+				var nextStart, nextEnd time.Time
+				if err := testPool.QueryRow(t.Context(), `SELECT invoice_start,invoice_end FROM billing_invoice_calendar WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, next.TeamID, next.Start, next.End).Scan(&nextStart, &nextEnd); err != nil || !nextStart.Equal(invoiceEnd) || !nextEnd.Equal(invoiceEnd.AddDate(0, 1, 0)) {
+					t.Fatalf("next mapping=%v %v err=%v", nextStart, nextEnd, err)
+				}
 			}
 			if tc.fault == "replacement" {
 				if worked, err := newHandler().InvoiceEnrollmentTickForTest(t.Context()); !worked || err != nil {

@@ -13,10 +13,11 @@ import (
 )
 
 type invoiceSubscription struct {
-	ID              string `json:"id"`
-	Customer        string `json:"customer"`
-	Status          string `json:"status"`
-	PauseCollection *struct {
+	BillingCycleAnchor int64  `json:"billing_cycle_anchor"`
+	ID                 string `json:"id"`
+	Customer           string `json:"customer"`
+	Status             string `json:"status"`
+	PauseCollection    *struct {
 		Behavior  string `json:"behavior"`
 		ResumesAt int64  `json:"resumes_at"`
 	} `json:"pause_collection"`
