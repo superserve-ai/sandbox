@@ -61,6 +61,73 @@ WITH objects AS (
 HISTORY_GUARD = "SELECT md5(COALESCE(jsonb_agg(jsonb_build_array(version,name,statements) ORDER BY version),'[]'::jsonb)::text) FROM supabase_migrations.schema_migrations"
 RECEIPT_GUARD = "SELECT md5(COALESCE(jsonb_object_agg(name,jsonb_build_array(state,evidence)),'{}'::jsonb)::text) FROM migration_recovery.preparation"
 HISTORY_SQL = "SELECT version,name,statements FROM supabase_migrations.schema_migrations ORDER BY version"
+AUTHORIZATION_BODY = f"""
+DECLARE permit migration_recovery.authorization%ROWTYPE;
+        plan migration_recovery.plan%ROWTYPE;
+BEGIN
+ SELECT * INTO STRICT plan FROM migration_recovery.plan;
+ SELECT * INTO STRICT permit FROM migration_recovery.authorization;
+ IF plan.complete IS DISTINCT FROM false
+  OR plan.plan_hash IS DISTINCT FROM permit.plan_hash
+  OR requested_version IS DISTINCT FROM permit.version
+  OR pg_backend_pid() IS DISTINCT FROM permit.backend_pid
+  OR (SELECT backend_start FROM pg_stat_activity WHERE pid=pg_backend_pid())
+     IS DISTINCT FROM permit.backend_start
+  OR permit.expires_at IS NULL
+  OR clock_timestamp() >= permit.expires_at
+  OR transaction_timestamp() + interval '2 seconds' > permit.expires_at
+  OR NOT EXISTS(SELECT FROM pg_settings WHERE name='transaction_timeout'
+                AND setting='2000' AND reset_val='2000')
+  OR NOT EXISTS(SELECT FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid()
+                AND classid={MUTEX >> 32} AND objid={MUTEX & 0xffffffff} AND objsubid=1
+                AND mode='ExclusiveLock' AND granted)
+  OR ({HISTORY_GUARD}) IS DISTINCT FROM permit.history_hash
+  OR ({RECEIPT_GUARD}) IS DISTINCT FROM permit.receipts_hash
+ THEN RAISE EXCEPTION 'recovery migration authorization expired or mismatched'; END IF;
+END;
+"""
+HISTORY_AUTHORIZATION_BODY = f"""
+DECLARE completed boolean;
+BEGIN
+ SELECT complete INTO STRICT completed FROM migration_recovery.plan;
+ IF completed AND NEW.version > '{LAST}' THEN RETURN NEW; END IF;
+ PERFORM migration_recovery.check_authorization(NEW.version);
+ RETURN NEW;
+END;
+"""
+
+
+def authorization_check():
+    functions = []
+    for name, body, result in (("check_authorization(text)", AUTHORIZATION_BODY, "void"),
+                               ("authorize_history()", HISTORY_AUTHORIZATION_BODY, "trigger")):
+        functions.append(f"""EXISTS(SELECT FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang
+         WHERE p.oid=to_regprocedure('migration_recovery.{name}')
+          AND p.prosrc={Literal(body).as_string()} AND NOT p.prosecdef AND NOT p.proretset
+          AND p.provolatile='v' AND p.prorettype='{result}'::regtype AND l.lanname='plpgsql'
+          AND p.proconfig=ARRAY['search_path=pg_catalog']::text[])""")
+    return " AND ".join(functions) + """ AND EXISTS(
+      SELECT FROM pg_trigger t WHERE t.tgrelid='supabase_migrations.schema_migrations'::regclass
+       AND t.tgname='retained_recovery_authorization' AND t.tgenabled='O'
+       AND t.tgtype=7 AND t.tgnargs=0 AND t.tgqual IS NULL AND NOT t.tgisinternal
+       AND t.tgfoid=to_regprocedure('migration_recovery.authorize_history()'))
+      AND (SELECT array_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod) ORDER BY a.attnum)
+           FROM pg_attribute a WHERE a.attrelid=to_regclass('migration_recovery.authorization')
+           AND a.attnum>0 AND NOT a.attisdropped) = ARRAY[
+        'singleton:boolean','version:text','backend_pid:integer',
+        'backend_start:timestamp with time zone','expires_at:timestamp with time zone',
+        'plan_hash:text','history_hash:text','receipts_hash:text']::text[]
+      AND (SELECT count(*)=3 AND bool_and(c.relkind='r' AND NOT c.relrowsecurity
+           AND NOT c.relforcerowsecurity) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+           WHERE n.nspname='migration_recovery' AND c.relname IN('plan','preparation','authorization'))
+      AND NOT EXISTS(SELECT FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+           JOIN pg_namespace n ON n.oid=c.relnamespace
+           WHERE n.nspname='migration_recovery' AND NOT t.tgisinternal)
+      AND NOT EXISTS(SELECT FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class
+           JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='migration_recovery')
+    """
+
+
 JOURNAL_SQL = """
 CREATE SCHEMA migration_recovery;
 REVOKE ALL ON SCHEMA migration_recovery FROM PUBLIC;
@@ -73,7 +140,22 @@ CREATE TABLE migration_recovery.preparation (
  name text PRIMARY KEY, state text NOT NULL CHECK(state IN('intent','dropping','ready')),
  evidence jsonb NOT NULL
 );
+CREATE TABLE migration_recovery.authorization (
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ version text NOT NULL, backend_pid integer NOT NULL,
+ backend_start timestamptz NOT NULL, expires_at timestamptz NOT NULL,
+ plan_hash text NOT NULL, history_hash text NOT NULL, receipts_hash text NOT NULL
+);
 REVOKE ALL ON ALL TABLES IN SCHEMA migration_recovery FROM PUBLIC;
+""" + "CREATE FUNCTION migration_recovery.check_authorization(requested_version text) RETURNS void LANGUAGE plpgsql " \
+      "SET search_path=pg_catalog AS $authorization$" + AUTHORIZATION_BODY + "$authorization$;\n" + \
+      "CREATE FUNCTION migration_recovery.authorize_history() RETURNS trigger LANGUAGE plpgsql " \
+      "SET search_path=pg_catalog AS $authorization$" + HISTORY_AUTHORIZATION_BODY + "$authorization$;\n" + """
+REVOKE ALL ON FUNCTION migration_recovery.check_authorization(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION migration_recovery.authorize_history() FROM PUBLIC;
+CREATE TRIGGER retained_recovery_authorization
+ BEFORE INSERT ON supabase_migrations.schema_migrations
+ FOR EACH ROW EXECUTE FUNCTION migration_recovery.authorize_history();
 """
 
 
@@ -114,6 +196,8 @@ def render(sources):
     # migration. The receipt and its truthful SQL are committed with CLI history.
     for version in (FIRST, third, "20261003010014"):
         output[version] += "\nUPDATE migration_recovery.plan SET complete=false WHERE singleton;\n"
+    for version in output:
+        output[version] = f"SELECT migration_recovery.check_authorization('{version}');\n" + output[version]
     return output, host + "\n" + stamp
 
 
@@ -206,6 +290,8 @@ class Recovery:
         journal, receipts = None, {}
         if present:
             require(self.target == "usw2", "Recovery journal on an ineligible target")
+            require(conn.execute("SELECT " + authorization_check()).fetchone()[0],
+                    "Recovery transaction authorization guard changed")
             rows = conn.execute("SELECT plan_hash,predecessor_hash,complete FROM migration_recovery.plan").fetchall()
             require(len(rows) == 1, "Recovery journal is missing or ambiguous")
             journal = list(rows[0])
@@ -277,12 +363,26 @@ class Recovery:
                 "guard_receipts": conn.execute(RECEIPT_GUARD).fetchone()[0] if journal else None}
 
     def guard_mutation(self, conn):
+        now = time.time()
         remaining = min(self.deadline, self.overall_deadline) - time.monotonic()
+        expires = now + remaining
         if self.target == "usw2":
-            remaining = min(remaining, float(self.observation.valid_until) - time.time())
-        milliseconds = min(2000, int(remaining * 1000))
-        require(milliseconds > 0, "Recovery deadline or evidence expired before mutation")
-        conn.execute("SELECT set_config('statement_timeout', %s, false)", (str(milliseconds),))
+            expires = min(expires, float(self.observation.valid_until))
+        # Reserve one 2s budget each for this guard, a delayed client, and the
+        # immediately following mutation. A suspended client loses its backend
+        # before it can start a new concurrent-index statement after expiry.
+        require(expires - time.time() >= 6, "Recovery deadline or evidence expired before mutation")
+        conn.execute(f"""DO $admission$ BEGIN
+          PERFORM set_config('idle_session_timeout','2s',false);
+          -- PostgreSQL ignores a statement timer >= transaction_timeout.
+          PERFORM set_config('statement_timeout','1900ms',false);
+          IF clock_timestamp() + interval '6 seconds' > to_timestamp({expires})
+           OR NOT EXISTS(SELECT FROM pg_settings WHERE name='transaction_timeout'
+                         AND setting='2000' AND reset_val='2000')
+           OR NOT EXISTS(SELECT FROM pg_settings WHERE name='lock_timeout'
+                         AND setting='250' AND reset_val='250')
+          THEN RAISE EXCEPTION 'recovery mutation admission expired'; END IF;
+        END $admission$;""")
 
     def initialize(self, conn, state):
         require(self.target == "usw2" and state["prefix"] == 0, "Only an eligible West database can initialize recovery")
@@ -363,6 +463,7 @@ DO $$ BEGIN
  IF NOT pg_try_advisory_lock({MUTEX}) THEN RAISE EXCEPTION 'migration mutex busy'; END IF;
  IF clock_timestamp() >= to_timestamp({float(self.observation.valid_until)})
  THEN RAISE EXCEPTION 'recovery evidence expired'; END IF;
+ IF ({authorization_check()}) IS NOT TRUE THEN RAISE EXCEPTION 'recovery authorization guard changed'; END IF;
  IF ({HISTORY_GUARD}) <> '{state["guard_history"]}'
  OR NOT EXISTS(SELECT FROM migration_recovery.plan WHERE plan_hash='{self.plan_hash}' AND NOT complete)
  OR (SELECT md5(value::text) FROM ({self.catalog_query()}) q(value)) <> '{state["guard_catalog"]}'
@@ -381,6 +482,13 @@ DO $writers$ DECLARE relation_name text; populated boolean; BEGIN
  OR EXISTS(SELECT FROM legacy_host_storage_report WHERE payload @? '$[*].retained')
  THEN RAISE EXCEPTION 'retained reports prevent recovery'; END IF;
 END $writers$;
+INSERT INTO migration_recovery.authorization(version,backend_pid,backend_start,expires_at,plan_hash,history_hash,receipts_hash)
+ SELECT '{version}',pg_backend_pid(),backend_start,to_timestamp({float(self.observation.valid_until)}),
+ '{self.plan_hash}','{state["guard_history"]}','{state["guard_receipts"]}'
+ FROM pg_stat_activity WHERE pid=pg_backend_pid()
+ ON CONFLICT(singleton) DO UPDATE SET version=excluded.version,backend_pid=excluded.backend_pid,
+ backend_start=excluded.backend_start,expires_at=excluded.expires_at,
+ plan_hash=excluded.plan_hash,history_hash=excluded.history_hash,receipts_hash=excluded.receipts_hash;
 """
         (project / "supabase/roles.sql").write_text(guard)
         migration.cli_run(self.cli, self.url, project, ["db", "push", "--yes", "--include-roles"], self.deadline)

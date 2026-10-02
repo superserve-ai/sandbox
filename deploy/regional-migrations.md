@@ -51,8 +51,10 @@ substitute for the gates.
 The fixed `retained-storage-v1` plan handles West before retained migration 01
 or at a prefix produced by this recovery. Staging and East must already have
 all 24 canonical entries and remain read-only. Source files and applied history
-are never rewritten. West's new 01/03/14 entries truthfully contain the recovery
-SQL executed by the CLI; the other 21 retain their canonical statements.
+are never rewritten. All 24 new West entries truthfully record a stable
+authorization prelude followed by the executed migration body. Bodies 01/03/14
+also contain the bounded recovery substitutions below. Earlier intermediate
+histories without this prelude are not admitted or rewritten.
 
 The runner first installs nullable host attribution and its stamping trigger
 without backfilling old intervals. It builds three indexes concurrently outside
@@ -78,9 +80,24 @@ state requires a new preflight and release decision.
 Execution retains the 250ms lock acquisition, 2s transaction and 60s command
 limits. The complete recovery has a separate 180s deadline, chosen as roughly
 three times the 59s disposable full-path regression duration. Evidence still
-expires after 120s and is checked under the mutation mutex; the total deadline
-does not extend evidence validity or authorize retries. Standalone concurrent index create/drop operations also have a 2s
-statement limit. These reduce exposure; they do not guarantee zero customer
+expires after 120s. The roles hook binds one version, plan, expected phase and
+expiry to its backend PID and start time while holding the mutation mutex.
+The first statement of the actual migration transaction validates that
+authorization, mutex ownership and a full 2s transaction budget before the
+migration body. A history-insert trigger repeats the check before committing
+SQL and history together. This survives the CLI's intervening session reset;
+a reconnect must obtain a new authorization. The checks read private journal
+and catalog relations and can themselves acquire locks under the 250ms/2s caps.
+Server timeout handling and rollback are subject to scheduling latency; these
+are bounded execution controls, not a real-time promise of zero locks or zero
+latency. The total deadline does not extend evidence validity or authorize
+retries. Standalone concurrent index create/drop operations have a 1.9s
+statement limit, strictly below the 2s transaction limit so PostgreSQL keeps
+the whole-statement timer active across their internal transactions. Each Python preparation reserves 6s of remaining validity
+for its admission command, an idle client gap and the next mutation. The
+server arms a 2s idle-session timeout in the admission command, preventing a
+suspended client from later starting concurrent index work with stale evidence.
+Every mutation requires a new admission. These reduce exposure; they do not guarantee zero customer
 latency. Stop on failure. There is no automatic retry or timeout increase.
 After a separately authorized new preflight, a recorded invalid concurrent
 index may be removed only if its name, definition and table identity match the

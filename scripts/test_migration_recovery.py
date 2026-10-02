@@ -246,6 +246,170 @@ class RecoveryTest(fixture.MigrationCLITest):
             self.runner.push_one(self.inspect(), self.project)
         self.assertEqual(self.history(), before)
 
+    def test_cli_expiry_after_roles_rejects_before_migration_ddl(self):
+        self.initialize()
+        while self.prepare_next():
+            pass
+        before = self.history()
+        # Sequence increments survive rollback, proving migration DDL was never
+        # reached rather than merely proving its eventual atomic rollback.
+        self.sql("CREATE SEQUENCE fixture_ddl_attempt; "
+                 "CREATE FUNCTION fixture_observe_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ "
+                 "BEGIN IF current_query() LIKE '%CREATE TABLE retained_storage_cutover%' THEN "
+                 "PERFORM nextval('fixture_ddl_attempt'); END IF; END $$; "
+                 "CREATE EVENT TRIGGER fixture_observe_ddl ON ddl_command_start "
+                 "WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION fixture_observe_ddl()")
+        original = migration.cli_run
+        def delayed_cli(*args):
+            self.runner.observation.valid_until = time.time() + 1
+            roles = self.project / "supabase/roles.sql"
+            text = roles.read_text().replace(str(expiry), str(self.runner.observation.valid_until))
+            roles.write_text(text + "\nSELECT pg_sleep(1.2);\n")
+            return original(*args)
+        expiry = self.runner.observation.valid_until
+        with patch.object(migration, "cli_run", delayed_cli), self.assertRaisesRegex(
+                migration.MigrationError, "SQLSTATE P0001"):
+            self.runner.push_one(self.inspect(), self.project)
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.sql("SELECT is_called FROM fixture_ddl_attempt"), "f")
+        self.assertEqual(self.sql("SELECT to_regclass('retained_storage_cutover') IS NULL"), "t")
+        self.assertEqual(self.sql("SELECT expires_at < clock_timestamp() FROM migration_recovery.authorization"), "t")
+
+    def test_authorization_binds_backend_version_phase_and_mutex(self):
+        self.initialize()
+        while self.prepare_next():
+            pass
+        with patch.object(migration, "cli_run"):
+            self.runner.push_one(self.inspect(), self.project)
+        roles = (self.project / "supabase/roles.sql").read_text()
+        before = self.history()
+        with psycopg.connect(self.runner.url, autocommit=True) as conn:
+            for mutation in (
+                "UPDATE migration_recovery.authorization SET version='wrong'",
+                "UPDATE migration_recovery.authorization SET backend_start=backend_start-interval '1 second'",
+                "UPDATE migration_recovery.authorization SET plan_hash='wrong'",
+                "UPDATE migration_recovery.authorization SET history_hash='wrong'",
+                "UPDATE migration_recovery.authorization SET receipts_hash='wrong'",
+                "UPDATE migration_recovery.authorization SET expires_at=clock_timestamp()+interval '1 second'",
+                "SELECT pg_advisory_unlock_all()",
+            ):
+                with self.subTest(mutation=mutation):
+                    conn.execute(roles)
+                    conn.execute(mutation)
+                    with self.assertRaisesRegex(psycopg.Error, "authorization expired or mismatched"):
+                        conn.execute(f"SELECT migration_recovery.check_authorization('{recovery.FIRST}'); "
+                                     "CREATE TABLE fixture_forbidden(id integer)")
+            conn.execute(roles)
+        # Reacquiring the lock on a replacement connection cannot reuse the
+        # previous backend's authorization, even after RESET ALL.
+        with self.runner.connection() as replacement:
+            replacement.execute("RESET ALL")
+            with self.assertRaisesRegex(psycopg.Error, "authorization expired or mismatched"):
+                replacement.execute(f"SELECT migration_recovery.check_authorization('{recovery.FIRST}')")
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.sql("SELECT to_regclass('fixture_forbidden') IS NULL"), "t")
+
+    def test_client_suspension_after_prelude_terminates_transaction(self):
+        self.initialize()
+        while self.prepare_next():
+            pass
+        with patch.object(migration, "cli_run"):
+            self.runner.push_one(self.inspect(), self.project)
+        before = self.history()
+        with psycopg.connect(self.runner.url, autocommit=True) as conn:
+            conn.execute((self.project / "supabase/roles.sql").read_text())
+            conn.execute("RESET ALL")
+            with self.assertRaises(psycopg.errors.TransactionTimeout), conn.transaction():
+                conn.execute(f"SELECT migration_recovery.check_authorization('{recovery.FIRST}')")
+                time.sleep(2.2)
+                conn.execute("CREATE TABLE fixture_forbidden(id integer)")
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.sql("SELECT to_regclass('fixture_forbidden') IS NULL"), "t")
+
+    def test_client_suspension_after_reset_refuses_before_ddl(self):
+        self.initialize()
+        while self.prepare_next():
+            pass
+        self.runner.observation.valid_until = time.time() + 3.5
+        with patch.object(migration, "cli_run"):
+            self.runner.push_one(self.inspect(), self.project)
+        before = self.history()
+        with psycopg.connect(self.runner.url, autocommit=True) as conn:
+            conn.execute((self.project / "supabase/roles.sql").read_text())
+            conn.execute("RESET ALL")
+            time.sleep(max(0, self.runner.observation.valid_until - time.time()) + 0.1)
+            with self.assertRaisesRegex(psycopg.Error, "authorization expired or mismatched"):
+                conn.execute(f"SELECT migration_recovery.check_authorization('{recovery.FIRST}'); "
+                             "CREATE TABLE fixture_forbidden(id integer)")
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.sql("SELECT to_regclass('fixture_forbidden') IS NULL"), "t")
+
+    def test_history_guard_rolls_back_changed_transaction_authorization(self):
+        self.initialize()
+        while self.prepare_next():
+            pass
+        with patch.object(migration, "cli_run"):
+            self.runner.push_one(self.inspect(), self.project)
+        before = self.history()
+        with psycopg.connect(self.runner.url, autocommit=True) as conn:
+            conn.execute((self.project / "supabase/roles.sql").read_text())
+            conn.execute("RESET ALL")
+            with self.assertRaisesRegex(psycopg.Error, "authorization expired or mismatched"), conn.transaction():
+                conn.execute(f"SELECT migration_recovery.check_authorization('{recovery.FIRST}')")
+                conn.execute("CREATE TABLE fixture_forbidden(id integer)")
+                conn.execute("UPDATE migration_recovery.authorization SET version='wrong'")
+                conn.execute("INSERT INTO supabase_migrations.schema_migrations(version,name,statements) "
+                             "VALUES(%s,'fixture',ARRAY['CREATE TABLE fixture_forbidden(id integer)'])", (recovery.FIRST,))
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.sql("SELECT to_regclass('fixture_forbidden') IS NULL"), "t")
+
+    def test_authorization_guard_tampering_is_refused(self):
+        self.initialize()
+        self.sql("ALTER TABLE supabase_migrations.schema_migrations DISABLE TRIGGER retained_recovery_authorization")
+        with self.assertRaisesRegex(migration.MigrationError, "authorization guard changed"):
+            self.inspect()
+        self.sql("ALTER TABLE supabase_migrations.schema_migrations ENABLE TRIGGER retained_recovery_authorization")
+        state = self.inspect()
+        self.sql("ALTER FUNCTION migration_recovery.check_authorization(text) SECURITY DEFINER")
+        with self.assertRaisesRegex(migration.MigrationError, "SQLSTATE P0001"):
+            self.runner.push_one(state, self.project)
+
+    def test_suspended_preparation_client_cannot_start_concurrent_index(self):
+        self.initialize()
+        self.assertEqual(self.prepare_next(), "host")
+        guard = self.runner.guard_mutation
+        admissions = 0
+        def suspend_after_guard(conn):
+            nonlocal admissions
+            guard(conn)
+            admissions += 1
+            # This is the admission immediately before the index, after the
+            # intent has committed. No new statement resets the idle timer.
+            if admissions == 2:
+                time.sleep(2.2)
+        with patch.object(self.runner, "guard_mutation", suspend_after_guard):
+            with self.assertRaises(psycopg.errors.IdleSessionTimeout):
+                self.prepare_next()
+        self.assertEqual(self.sql("SELECT to_regclass('sandbox_storage_interval_host_window') IS NULL"), "t")
+        self.assertEqual(self.inspect()["receipts"]["storage_index"][0], "intent")
+
+    def test_concurrent_index_statement_timer_spans_internal_transactions(self):
+        self.sql("CREATE TABLE fixture_slow_index(id integer); "
+                 "INSERT INTO fixture_slow_index VALUES(1),(2); "
+                 "CREATE FUNCTION fixture_slow_key(value integer) RETURNS integer IMMUTABLE LANGUAGE plpgsql AS $$ "
+                 "BEGIN PERFORM pg_sleep(0.6); RETURN value; END $$; "
+                 "CREATE FUNCTION fixture_delay_index() RETURNS event_trigger LANGUAGE plpgsql AS $$ "
+                 "BEGIN PERFORM pg_sleep(1); END $$; "
+                 "CREATE EVENT TRIGGER fixture_delay_index ON ddl_command_start "
+                 "WHEN TAG IN ('CREATE INDEX') EXECUTE FUNCTION fixture_delay_index()")
+        # The initial catalog transaction and later index scan each fit within
+        # 2s. Only the strictly shorter whole-statement timer spans both phases.
+        with self.runner.connection() as conn:
+            self.runner.guard_mutation(conn)
+            with self.assertRaisesRegex(psycopg.errors.QueryCanceled, "statement timeout"):
+                conn.execute("CREATE INDEX CONCURRENTLY fixture_slow_index_key "
+                             "ON fixture_slow_index(fixture_slow_key(id))")
+
     def test_mutex_and_stale_cli_state_refuse_mutation(self):
         self.initialize()
         while self.prepare_next():
@@ -297,7 +461,7 @@ class RecoveryTest(fixture.MigrationCLITest):
         with self.assertRaisesRegex(migration.MigrationError, "provenance"):
             self.inspect()
         self.sql("UPDATE migration_recovery.plan SET predecessor_hash='" + state["predecessor_hash"] + "'")
-        self.sql("INSERT INTO supabase_migrations.schema_migrations(version,name,statements) VALUES('20261003010002','wrong',ARRAY['SELECT 1'])")
+        self.sql("SET session_replication_role=replica; INSERT INTO supabase_migrations.schema_migrations(version,name,statements) VALUES('20261003010002','wrong',ARRAY['SELECT 1'])")
         with self.assertRaisesRegex(migration.MigrationError, "contiguous"):
             self.inspect()
 
