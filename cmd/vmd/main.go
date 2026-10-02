@@ -1202,9 +1202,13 @@ func main() {
 		if workers < 1 {
 			workers = 1
 		}
+		store := backup.NewGCSStore(gcsClient, bucket)
+		// The journal's scoped records (a generation found unvouchable)
+		// belong to the store the uploader writes to.
+		journal.SetScope(store.Identity())
 		uploader := &backup.Uploader{
 			Journal:     journal,
-			Store:       backup.NewGCSStore(gcsClient, bucket),
+			Store:       store,
 			Limiter:     rate.NewLimiter(bytesPerSec, 32<<20),
 			Concurrency: workers,
 			Log:         log.With().Str("component", "backup").Logger(),

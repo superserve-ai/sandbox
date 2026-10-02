@@ -1148,3 +1148,129 @@ func TestMergeAllocationsKeepsARealZero(t *testing.T) {
 		t.Fatalf("the missing measurement = %d, want the incoming one", queued[1].AllocatedBytes)
 	}
 }
+
+// A verification record is the only proof a write-only host has that an
+// object already in the bucket holds the bytes a manifest claims. Expire
+// one whose generation is still queued and that generation can never be
+// completed: every retry meets its own objects as a dedupe nothing can
+// vouch for, and abandons.
+func TestPruneKeepsProofWhileItsGenerationIsQueued(t *testing.T) {
+	j, _ := testJournal(t)
+	stale := time.Now().Add(-15 * 24 * time.Hour)
+
+	// Still queued, and deliberately less urgent so the ack below does not
+	// claim it out of the queue.
+	waiting := Task{
+		SandboxID: "sb-waiting", Generation: "gen-waiting", EnqueuedAt: stale,
+		Priority: PriorityCheckpoint,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 1}},
+	}
+	if err := j.Enqueue(waiting); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		queuedProof  = "test-bucket\x00sandboxes/sb-waiting/gen-waiting/rootfs.ext4.p0000"
+		settledProof = "test-bucket\x00sandboxes/sb-settled/gen-settled/rootfs.ext4.p0000"
+		sharedProof  = "test-bucket\x00bases/" + "0000000000000000000000000000000000000000000000000000000000000000" + ".p0000"
+	)
+	for _, object := range []string{queuedProof, settledProof, sharedProof} {
+		if err := j.RecordVerification(waiting, object, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Any ack runs the bounded prune; this one is more urgent, so Next
+	// takes it rather than the record under test.
+	driver := Task{
+		SandboxID: "sb-driver", Generation: "gen-driver", EnqueuedAt: time.Now(),
+		Priority: PriorityPause,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d2", Size: 1}},
+	}
+	if err := j.Enqueue(driver); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(time.Now())
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	if claimed.SandboxID != driver.SandboxID {
+		t.Fatalf("claimed %s, want the driver so the queued record stays queued", claimed.SandboxID)
+	}
+	if _, err := j.Ack(claimed, "test-bucket", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Asked as of the moment it was recorded, so the answer is presence
+	// rather than freshness.
+	for _, tc := range []struct {
+		name   string
+		object string
+		want   bool
+	}{
+		{"a queued generation keeps its proof", queuedProof, true},
+		{"a settled generation's proof expires", settledProof, false},
+		{"a shared base's history is only a shortcut", sharedProof, false},
+	} {
+		got, err := j.WasVerified(tc.object, stale)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: present = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// An unvouchable generation cannot be completed by any later attempt, so
+// it must stop being offered: otherwise every sweep re-enqueues work that
+// abandons, which is what left a host retrying 25 template generations
+// every five minutes indefinitely.
+func TestEnqueueDeclinesAnUnvouchableGeneration(t *testing.T) {
+	j, _ := testJournal(t)
+	j.SetScope("test-bucket")
+	now := time.Unix(4000, 0)
+	stuck := Task{
+		TemplateID: "tpl-a", BuildID: "build-a", Generation: "gen-stuck", EnqueuedAt: now,
+		Priority: PriorityCheckpoint,
+		Files:    []TaskFile{{Name: "mem.snap", Path: "/mem", SHA256: "m", Size: 1}},
+	}
+
+	if err := j.MarkUnvouchable("test-bucket", stuck, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Enqueue(stuck); err != nil {
+		t.Fatal(err)
+	}
+	if counts, err := j.Pending(); err != nil {
+		t.Fatal(err)
+	} else if counts[PriorityCheckpoint] != 0 {
+		t.Fatalf("pending = %v, want the unvouchable generation declined", counts)
+	}
+
+	// A rebuild changes the artifacts, so it is a different generation and
+	// must be accepted.
+	rebuilt := stuck
+	rebuilt.Generation = "gen-rebuilt"
+	rebuilt.Files = []TaskFile{{Name: "mem.snap", Path: "/mem", SHA256: "m2", Size: 1}}
+	if err := j.Enqueue(rebuilt); err != nil {
+		t.Fatal(err)
+	}
+	if counts, err := j.Pending(); err != nil {
+		t.Fatal(err)
+	} else if counts[PriorityCheckpoint] != 1 {
+		t.Fatalf("pending = %v, want the rebuilt generation queued", counts)
+	}
+
+	// Another bucket has not met those objects, so the mark does not carry.
+	other, _ := testJournal(t)
+	other.SetScope("other-bucket")
+	if err := other.Enqueue(stuck); err != nil {
+		t.Fatal(err)
+	}
+	if counts, err := other.Pending(); err != nil {
+		t.Fatal(err)
+	} else if counts[PriorityCheckpoint] != 1 {
+		t.Fatalf("other bucket pending = %v, want the generation attempted there", counts)
+	}
+}
