@@ -58,12 +58,12 @@ opened_measurement_obligation AS (
   WHERE feature_enabled('billing_metrics_write', a.team_id)
     AND EXISTS (
       SELECT 1 FROM retained_storage_cutover c
-      WHERE c.team_id = a.team_id AND c.host_id = a.host_id AND c.started_at <= clock_timestamp()
+      WHERE c.team_id=a.team_id AND c.host_id=a.host_id AND c.started_at <= clock_timestamp()
     )
     AND NOT EXISTS (
       SELECT 1 FROM retained_storage_interval i
-      WHERE i.team_id = a.team_id AND i.host_id = a.host_id
-        AND i.owner_kind = 'sandbox' AND i.owner_id = a.id
+      WHERE i.team_id=a.team_id AND i.host_id=a.host_id
+        AND i.owner_kind='sandbox' AND i.owner_id=a.id
         AND i.started_at <= clock_timestamp()
         AND (i.ended_at IS NULL OR i.ended_at > clock_timestamp())
     )
@@ -75,6 +75,9 @@ SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
 CROSS JOIN (SELECT count(*) FROM opened_measurement_obligation) obligation_fence
 WHERE feature_enabled('billing_metrics_write', a.team_id)
+  -- After retained physical reporting has cut over, activation.disk_mib is
+  -- provisioned capacity rather than a trusted measurement. The next durable
+  -- host report owns the quantity; do not charge the template baseline here.
   AND NOT EXISTS (
     SELECT 1 FROM retained_storage_cutover c
     WHERE c.team_id = a.team_id AND c.host_id = a.host_id AND c.started_at <= now()

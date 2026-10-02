@@ -365,7 +365,7 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 		t.Fatalf("seed artifact warning template: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `
-		UPDATE sandbox SET template_id = $2 WHERE id = $1`, sandboxID, templateID); err != nil {
+		UPDATE sandbox SET template_id = $2, base_path = $3 WHERE id = $1`, sandboxID, templateID, artifactPath); err != nil {
 		t.Fatalf("seed artifact warning sandbox template: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `
@@ -380,7 +380,7 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 	}
 	sharedSandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "trial-warning-artifact-shared")
 	if _, err := testPool.Exec(ctx, `
-		UPDATE sandbox SET template_id = $2 WHERE id = $1`, sharedSandboxID, templateID); err != nil {
+		UPDATE sandbox SET template_id = $2, base_path = $3 WHERE id = $1`, sharedSandboxID, templateID, artifactPath); err != nil {
 		t.Fatalf("seed shared artifact warning sandbox template: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `

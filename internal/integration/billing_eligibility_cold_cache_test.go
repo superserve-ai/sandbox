@@ -42,8 +42,8 @@ func TestIntegration_BillingEligibilityColdCacheDoesNotReadUsageHistory(t *testi
 				FROM generate_series(1,$2::int) n`, team.ID, fleet)
 			storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
 				SELECT id,'base.ext4',rootfs_path,1073741824,1073741824,repeat('0',64) FROM template WHERE team_id=$1`, team.ID)
-			storageExec(t, `INSERT INTO sandbox(team_id,name,status,vcpu_count,memory_mib,host_id,template_id,created_at)
-				SELECT $1,name,'paused',1,1024,'default',id,$2 FROM template WHERE team_id=$1`, team.ID, start)
+			storageExec(t, `INSERT INTO sandbox(team_id,name,status,vcpu_count,memory_mib,host_id,template_id,base_path,created_at)
+				SELECT $1,name,'paused',1,1024,'default',id,rootfs_path,$2 FROM template WHERE team_id=$1`, team.ID, start)
 			storageExec(t, `INSERT INTO sandbox_compute_billing_interval(sandbox_id,team_id,vcpu_count,memory_mib,started_at,ended_at,end_reason)
 				SELECT s.id,$1,1,1024,$2::timestamptz+n*interval '1 minute',$2::timestamptz+(n+1)*interval '1 minute','paused'
 				FROM sandbox s CROSS JOIN generate_series(0,9) n WHERE s.team_id=$1`, team.ID, start)

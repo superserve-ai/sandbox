@@ -76,7 +76,10 @@ WITH bounds AS MATERIALIZED (
  FROM sandbox_storage_interval i JOIN sandbox s ON s.id=i.sandbox_id
  CROSS JOIN bounds b LEFT JOIN retained_storage_cutover c ON c.host_id=i.host_id AND c.team_id=i.team_id
  WHERE i.team_id=p_team AND p_start<b.period_end AND i.started_at<b.period_end
-   AND COALESCE(i.ended_at,b.period_end)>p_start
+   -- An overlay interval can close while its referenced artifacts remain
+   -- retained. Keep that reference until the sandbox's retention ends.
+   AND (COALESCE(i.ended_at,b.period_end)>p_start
+        OR COALESCE(s.destroyed_at,b.period_end)>p_start)
 ), legacy_intervals AS MATERIALIZED (
  SELECT i.sandbox_id,i.team_id,i.host_id,i.disk_mib,i.started_at,
   LEAST(COALESCE(i.ended_at,i.period_end),boundary.started_at) ended_at,
@@ -195,7 +198,7 @@ WITH bounds AS MATERIALIZED (
 SELECT CASE WHEN p_start>=(SELECT period_end FROM bounds) THEN 0::numeric ELSE amount END FROM final_value
 $$;
 
-CREATE FUNCTION storage_mib_seconds(p_team uuid,p_start timestamptz,p_end timestamptz,p_floor_legacy_artifacts boolean DEFAULT true)
+CREATE OR REPLACE FUNCTION storage_mib_seconds(p_team uuid,p_start timestamptz,p_end timestamptz,p_floor_legacy_artifacts boolean DEFAULT true)
 RETURNS numeric LANGUAGE sql STABLE AS $$
  SELECT CASE WHEN EXISTS (
    SELECT 1 FROM retained_storage_measurement_obligation o

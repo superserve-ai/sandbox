@@ -1560,6 +1560,7 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse sandbox id: %v", err)
 	}
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
@@ -2197,6 +2198,7 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse sandbox id: %v", err)
 	}
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
@@ -3745,6 +3747,7 @@ func TestIntegration_HourlyRollupBoundsOpenIntervalsAtNow(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	hourStart := fixedNow.Truncate(time.Hour)
 	hourEnd := hourStart.Add(time.Hour)
@@ -3869,6 +3872,7 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	periodStart := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 	periodEnd := periodStart.Add(100 * time.Second)
@@ -3947,9 +3951,9 @@ func TestIntegration_GetTeamBillingUsageDeduplicatesSharedArtifact(t *testing.T)
 	for i, sandboxID := range sandboxIDs {
 		if _, err := testPool.Exec(ctx, `
 			UPDATE sandbox
-			SET created_at = $2, base_path = NULL, delta_path = NULL
+			SET created_at = $2, base_path = $4, delta_path = NULL
 			WHERE id = $1 AND team_id = $3
-		`, sandboxID, periodStart, teamID); err != nil {
+		`, sandboxID, periodStart, teamID, artifactPath); err != nil {
 			t.Fatalf("prepare sandbox %d: %v", i, err)
 		}
 		var snapshotID uuid.UUID
@@ -4018,9 +4022,9 @@ func TestIntegration_GetTeamBillingUsageStartsArtifactRetentionAtStorageBoundary
 	const artifactBytes = int64(8 * 1024 * 1024)
 	if _, err := testPool.Exec(ctx, `
 		UPDATE sandbox
-		SET created_at = $2, base_path = NULL, delta_path = NULL
+		SET created_at = $2, base_path = $4, delta_path = NULL
 		WHERE id = $1 AND team_id = $3
-	`, sandboxID, periodStart, teamID); err != nil {
+	`, sandboxID, periodStart, teamID, artifactPath); err != nil {
 		t.Fatalf("prepare sandbox: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `
@@ -4069,7 +4073,7 @@ func TestIntegration_GetTeamBillingUsageStartsArtifactRetentionAtStorageBoundary
 	}
 }
 
-func TestIntegration_GetTeamBillingUsageExcludesUnmeasuredArtifact(t *testing.T) {
+func TestIntegration_GetTeamBillingUsagePreservesUnmeasuredArtifact(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
@@ -4086,9 +4090,9 @@ func TestIntegration_GetTeamBillingUsageExcludesUnmeasuredArtifact(t *testing.T)
 	const logicalArtifactBytes = int64(64 * 1024 * 1024)
 	if _, err := testPool.Exec(ctx, `
 		UPDATE sandbox
-		SET created_at = $2, base_path = NULL, delta_path = NULL
+		SET created_at = $2, base_path = $4, delta_path = NULL
 		WHERE id = $1 AND team_id = $3
-	`, sandboxID, periodStart, teamID); err != nil {
+	`, sandboxID, periodStart, teamID, artifactPath); err != nil {
 		t.Fatalf("prepare sandbox: %v", err)
 	}
 	var snapshotID uuid.UUID
@@ -4124,6 +4128,19 @@ func TestIntegration_GetTeamBillingUsageExcludesUnmeasuredArtifact(t *testing.T)
 	})
 	if err != nil {
 		t.Fatalf("get team billing usage: %v", err)
+	}
+	if usage.StorageGibSeconds.Valid {
+		t.Fatalf("unmeasured artifact returned numeric storage: %v", usage.StorageGibSeconds)
+	}
+	// A measured zero permits overlay billing; a missing allocation does not.
+	if _, err := testPool.Exec(ctx, `UPDATE artifact_manifest SET allocated_bytes=0 WHERE snapshot_id=$1 AND path=$2`, snapshotID, artifactPath); err != nil {
+		t.Fatalf("record explicit zero artifact allocation: %v", err)
+	}
+	usage, err = testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get measured-zero billing usage: %v", err)
 	}
 	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(2*10)/1024; got != want {
 		t.Fatalf("storage GiB seconds = %v, want %v; logical artifact size must not be used", got, want)

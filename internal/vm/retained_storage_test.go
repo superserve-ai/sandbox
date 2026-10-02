@@ -182,6 +182,70 @@ func TestRetainedInventoryCancelledEmptyStoreRemainsUnknown(t *testing.T) {
 	}
 }
 
+func TestRetainedInventoryCancelledDuringMeasurementRemainsUnknown(t *testing.T) {
+	root := t.TempDir()
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	disk := filepath.Join(root, "overlay.ext4")
+	if err := os.WriteFile(disk, []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{ID: uuid.NewString(), SourceSnapshotID: uuid.NewString(), Status: StatusRunning, DiskPath: disk}
+	if err := state.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: filepath.Join(root, "snapshots")}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	measured := false
+	if _, err := m.retainedStorageInventory(ctx, func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+		measured = true
+		cancel()
+		return []retainedstorage.Extent{{Device: "fixture", Start: 0, Length: 4096}}, "generation", nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled measurement error = %v, want context.Canceled", err)
+	}
+	if !measured {
+		t.Fatal("inventory did not reach allocation measurement")
+	}
+}
+
+func TestRetainedSamplerDoesNotPublishCancelledInventory(t *testing.T) {
+	cache := newHeartbeatStorageCache(t.TempDir(), zerolog.Nop(), uuid.NewString())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	accepted := &retainedstorage.Inventory{
+		Version: retainedstorage.Version,
+		Owners:  []retainedstorage.Owner{},
+	}
+	if err := cache.store([]heartbeatStorageMeasurement{{Retained: accepted}}); err != nil {
+		t.Fatal(err)
+	}
+	before := cache.pendingSnapshot()
+	replacement := &retainedstorage.Inventory{
+		Version: retainedstorage.Version,
+		Owners: []retainedstorage.Owner{{
+			Kind:       "sandbox",
+			ID:         uuid.NewString(),
+			Generation: strings.Repeat("a", 64),
+			Extents:    []retainedstorage.Extent{{Device: "fixture", Start: 0, Length: 4096}},
+		}},
+	}
+	runRetainedStorageSampler(ctx, HeartbeatConfig{
+		LifecycleReady: func() bool { return true },
+		RetainedStorage: func(context.Context) (*retainedstorage.Inventory, error) {
+			cancel()
+			return replacement, nil
+		},
+	}, cache, zerolog.Nop())
+	if !reflect.DeepEqual(before, cache.pendingSnapshot()) {
+		t.Fatal("cancelled retained inventory replaced the accepted report")
+	}
+}
+
 func TestRetainedBaselineProvenance(t *testing.T) {
 	root := t.TempDir()
 	statePath := filepath.Join(root, "state.db")

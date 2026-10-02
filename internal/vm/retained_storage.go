@@ -118,6 +118,9 @@ func (s *StateStore) retainedLiveRecordsWithBudget(ctx context.Context, budget *
 			return nil
 		})
 	})
+	if err == nil {
+		err = ctx.Err()
+	}
 	return records, err
 }
 
@@ -136,8 +139,14 @@ func (s *StateStore) retainedRecordsContext(ctx context.Context) ([]VMRecord, er
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	archived, err := s.retainedArchivedRecordsWithBudget(ctx, &budget)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	seen := make(map[string]struct{}, len(live)+len(archived))
@@ -152,6 +161,9 @@ func (s *StateStore) retainedRecordsContext(ctx context.Context) ([]VMRecord, er
 			continue
 		}
 		live = append(live, rec)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return live, nil
 }
@@ -742,7 +754,15 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 		return nil, err
 	}
 	sort.Slice(inv.Owners, func(i, j int) bool { return inv.Owners[i].Kind+inv.Owners[i].ID < inv.Owners[j].Kind+inv.Owners[j].ID })
-	return inv, inv.Validate()
+	if err := inv.Validate(); err != nil {
+		return nil, err
+	}
+	// Validation can walk a bounded but non-empty inventory. Recheck the
+	// sampling boundary before handing the result to the publisher.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return inv, nil
 }
 
 func runRetainedStorageSampler(ctx context.Context, cfg HeartbeatConfig, cache *heartbeatStorageCache, log zerolog.Logger) {
@@ -753,6 +773,12 @@ func runRetainedStorageSampler(ctx context.Context, cfg HeartbeatConfig, cache *
 		scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		inv, err := cfg.RetainedStorage(scanCtx)
+		// A provider may finish its final filesystem operation just as the
+		// sampler context is cancelled.  Do not publish that apparently complete
+		// inventory after the sampling boundary has expired.
+		if err == nil {
+			err = scanCtx.Err()
+		}
 		if err == nil && inv == nil {
 			err = fmt.Errorf("retained inventory is unknown")
 		}

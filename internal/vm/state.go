@@ -805,6 +805,9 @@ func (s *StateStore) retainedArchivedRecordsWithBudget(ctx context.Context, budg
 			return nil
 		})
 	})
+	if err == nil {
+		err = ctx.Err()
+	}
 	return records, err
 }
 

@@ -853,15 +853,31 @@ type RetainedStorageCutover struct {
 }
 
 type RetainedStorageInterval struct {
-	ID         int64              `json:"id"`
-	HostID     string             `json:"host_id"`
-	TeamID     uuid.UUID          `json:"team_id"`
-	OwnerKind  string             `json:"owner_kind"`
-	OwnerID    uuid.UUID          `json:"owner_id"`
-	Generation string             `json:"generation"`
-	Extents    []byte             `json:"extents"`
-	StartedAt  time.Time          `json:"started_at"`
-	EndedAt    pgtype.Timestamptz `json:"ended_at"`
+	ID                     int64              `json:"id"`
+	HostID                 string             `json:"host_id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	OwnerKind              string             `json:"owner_kind"`
+	OwnerID                uuid.UUID          `json:"owner_id"`
+	Generation             string             `json:"generation"`
+	Extents                []byte             `json:"extents"`
+	StartedAt              time.Time          `json:"started_at"`
+	EndedAt                pgtype.Timestamptz `json:"ended_at"`
+	BaselinePath           *string            `json:"baseline_path"`
+	BaselineGeneration     *string            `json:"baseline_generation"`
+	BaselineAllocatedBytes *int64             `json:"baseline_allocated_bytes"`
+}
+
+type RetainedStorageMeasurementObligation struct {
+	ID                 int64              `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	OwnerKind          string             `json:"owner_kind"`
+	OwnerID            uuid.UUID          `json:"owner_id"`
+	HostID             string             `json:"host_id"`
+	EffectiveAt        time.Time          `json:"effective_at"`
+	EndedAt            pgtype.Timestamptz `json:"ended_at"`
+	ResolvedAt         pgtype.Timestamptz `json:"resolved_at"`
+	ResolutionReportID pgtype.UUID        `json:"resolution_report_id"`
+	MigrationIdentity  uuid.UUID          `json:"migration_identity"`
 }
 
 type RevokedProxyToken struct {
@@ -1053,6 +1069,21 @@ type SandboxSnapshot struct {
 	// When the sweep next asks the host about a row creating or deleting; pushed out on every attempt, NULL once the host has confirmed.
 	SweepAfter       pgtype.Timestamptz `json:"sweep_after"`
 	RetentionEndedAt pgtype.Timestamptz `json:"retention_ended_at"`
+}
+
+type SandboxStorageBaseline struct {
+	ID             int64              `json:"id"`
+	SandboxID      uuid.UUID          `json:"sandbox_id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	HostID         string             `json:"host_id"`
+	Path           string             `json:"path"`
+	Generation     string             `json:"generation"`
+	AllocatedBytes int64              `json:"allocated_bytes"`
+	ObservedAt     time.Time          `json:"observed_at"`
+	StartedAt      time.Time          `json:"started_at"`
+	EndedAt        pgtype.Timestamptz `json:"ended_at"`
+	EffectiveAt    time.Time          `json:"effective_at"`
+	ReceiptID      uuid.UUID          `json:"receipt_id"`
 }
 
 type SandboxStorageInterval struct {
