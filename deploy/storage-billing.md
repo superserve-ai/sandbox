@@ -7,6 +7,9 @@ binary that reads the storage flag without the durable cutoff.
 
 ## Preload
 
+Use the [repeatable Stripe catalog setup](storage-stripe-catalog.md) to preview,
+create, and verify the shared storage definitions in staging and production.
+
 Use the existing Stripe account and environment. Create or verify one active
 Billing Meter with event name `storage_gib_hours`, `sum` aggregation,
 `customer_mapping[type]=by_id`, `customer_mapping[event_payload_key]=stripe_customer_id`,
