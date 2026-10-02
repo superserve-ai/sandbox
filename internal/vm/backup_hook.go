@@ -183,6 +183,12 @@ func (m *Manager) SetBackupCovered(fn func(backup.Task) (bool, error)) {
 	m.backupCovered = fn
 }
 
+// SetBackupUnvouchable installs the probe for a generation whose objects
+// are in the bucket with no proof this host can offer for them.
+func (m *Manager) SetBackupUnvouchable(fn func(backup.Task) (bool, error)) {
+	m.backupUnvouchable = fn
+}
+
 // retryWithBackoff runs attempt with doubling delays until it succeeds
 // or enqueueRetryAttempts are exhausted, reporting whether it succeeded.
 // The first attempt is already behind the caller; this helper owns only
@@ -1569,6 +1575,17 @@ func (m *Manager) enqueueTemplateBackup(templateID, buildID, snapshotDir string,
 		Generation: backup.GenerationKey(files),
 		Files:      files,
 		Priority:   backup.PriorityCheckpoint,
+	}
+	// A generation whose objects cannot be vouched for abandons on every
+	// attempt, and this sweep is what keeps offering it: checked here
+	// rather than in Enqueue, because a declined write is indistinguishable
+	// from a done one and the pause path clears its durable marker on a
+	// nil error. Paced rather than foreclosed, so a relaid artifact or a
+	// repaired bucket is picked up on its own.
+	if m.backupUnvouchable != nil {
+		if unvouchable, err := m.backupUnvouchable(task); err == nil && unvouchable {
+			return true
+		}
 	}
 	// Already pending or already completed means nothing to do: recovery
 	// sweeps and repeated status-poll adoptions funnel through here, and

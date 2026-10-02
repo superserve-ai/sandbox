@@ -1222,14 +1222,13 @@ func TestPruneKeepsProofWhileItsGenerationIsQueued(t *testing.T) {
 	}
 }
 
-// An unvouchable generation cannot be completed by any later attempt, so
-// it must stop being offered: otherwise every sweep re-enqueues work that
-// abandons, which is what left a host retrying 25 template generations
-// every five minutes indefinitely.
-func TestEnqueueDeclinesAnUnvouchableGeneration(t *testing.T) {
+// A generation whose objects nothing here can vouch for is recorded so
+// its re-offerer can stop handing out work that always abandons. Paced
+// rather than foreclosed: the object name carries a packing fingerprint
+// the generation key does not, so a relaid artifact may upload cleanly
+// under a name that does not exist yet.
+func TestUnvouchableMarkIsPacedAndScoped(t *testing.T) {
 	j, _ := testJournal(t)
-	j.SetScope("test-bucket")
-	// Enqueue reads the real clock, so the mark is anchored to it.
 	now := time.Now()
 	stuck := Task{
 		TemplateID: "tpl-a", BuildID: "build-a", Generation: "gen-stuck", EnqueuedAt: now,
@@ -1237,107 +1236,38 @@ func TestEnqueueDeclinesAnUnvouchableGeneration(t *testing.T) {
 		Files:    []TaskFile{{Name: "mem.snap", Path: "/mem", SHA256: "m", Size: 1}},
 	}
 
+	if marked, err := j.Unvouchable("test-bucket", stuck, now); err != nil || marked {
+		t.Fatalf("unmarked generation = %v (%v)", marked, err)
+	}
 	if err := j.MarkUnvouchable("test-bucket", stuck, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Enqueue(stuck); err != nil {
-		t.Fatal(err)
-	}
-	if counts, err := j.Pending(); err != nil {
-		t.Fatal(err)
-	} else if counts[PriorityCheckpoint] != 0 {
-		t.Fatalf("pending = %v, want the unvouchable generation declined", counts)
+
+	for _, tc := range []struct {
+		name  string
+		scope string
+		at    time.Time
+		want  bool
+	}{
+		{"within the cooldown", "test-bucket", now.Add(time.Hour), true},
+		{"past the cooldown", "test-bucket", now.Add(unvouchableCooldown + time.Minute), false},
+		{"another bucket has met nothing", "other-bucket", now.Add(time.Hour), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marked, err := j.Unvouchable(tc.scope, stuck, tc.at)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if marked != tc.want {
+				t.Fatalf("marked = %v, want %v", marked, tc.want)
+			}
+		})
 	}
 
-	// A rebuild changes the artifacts, so it is a different generation and
-	// must be accepted.
+	// A rebuild keys differently and is never held.
 	rebuilt := stuck
 	rebuilt.Generation = "gen-rebuilt"
-	rebuilt.Files = []TaskFile{{Name: "mem.snap", Path: "/mem", SHA256: "m2", Size: 1}}
-	if err := j.Enqueue(rebuilt); err != nil {
-		t.Fatal(err)
-	}
-	if counts, err := j.Pending(); err != nil {
-		t.Fatal(err)
-	} else if counts[PriorityCheckpoint] != 1 {
-		t.Fatalf("pending = %v, want the rebuilt generation queued", counts)
-	}
-
-	// Past the cooldown the generation is offered again: an artifact
-	// relaid on disk maps to a different object name, which may upload
-	// cleanly, and the name's packing fingerprint is not in the key.
-	stale := stuck
-	stale.Generation = "gen-cooled"
-	stale.Files = []TaskFile{{Name: "mem.snap", Path: "/mem", SHA256: "m3", Size: 1}}
-	if err := j.MarkUnvouchable("test-bucket", stale, now.Add(-unvouchableCooldown-time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if err := j.Enqueue(stale); err != nil {
-		t.Fatal(err)
-	}
-	if counts, err := j.Pending(); err != nil {
-		t.Fatal(err)
-	} else if counts[PriorityCheckpoint] != 2 {
-		t.Fatalf("pending = %v, want the cooled generation offered again", counts)
-	}
-
-	// Another bucket has not met those objects, so the mark does not carry.
-	other, _ := testJournal(t)
-	other.SetScope("other-bucket")
-	if err := other.Enqueue(stuck); err != nil {
-		t.Fatal(err)
-	}
-	if counts, err := other.Pending(); err != nil {
-		t.Fatal(err)
-	} else if counts[PriorityCheckpoint] != 1 {
-		t.Fatalf("other bucket pending = %v, want the generation attempted there", counts)
-	}
-}
-
-// An unvouchable mark must never cost a queued row its upgrade. A live
-// pause re-enqueueing the same generation promotes the row to staged
-// paths and pause priority; suppressed instead, the pause reads success,
-// clears its marker, and the in-flight attempt then acks away a row that
-// was never upgraded — leaving the pause with no row and no marker.
-func TestEnqueueStillUpgradesAQueuedRowMarkedUnvouchable(t *testing.T) {
-	j, _ := testJournal(t)
-	j.SetScope("test-bucket")
-	now := time.Now()
-
-	// In flight from the unstaged path, at best-effort priority.
-	queued := Task{
-		SandboxID: "sb-live", Generation: "gen-live", EnqueuedAt: now,
-		Priority: PriorityBestEffort,
-		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/live/disk", SHA256: "d", Size: 1}},
-	}
-	if err := j.Enqueue(queued); err != nil {
-		t.Fatal(err)
-	}
-	// That attempt finds its objects unvouchable and records it.
-	if err := j.MarkUnvouchable("test-bucket", queued, now); err != nil {
-		t.Fatal(err)
-	}
-
-	// The live pause re-enqueues the same generation from staged copies.
-	staged := queued
-	staged.Priority = PriorityPause
-	staged.Staged = true
-	staged.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/staged/disk", SHA256: "d", Size: 1}}
-	if err := j.Enqueue(staged); err != nil {
-		t.Fatal(err)
-	}
-
-	got, ok, err := j.Next(now.Add(time.Minute))
-	if err != nil || !ok {
-		t.Fatalf("claim = %v (%v)", ok, err)
-	}
-	if !got.Staged {
-		t.Fatal("the row was not promoted to staged: the pause has cleared its marker against it")
-	}
-	if got.Priority != PriorityPause {
-		t.Fatalf("priority = %v, want the live pause's", got.Priority)
-	}
-	if got.Files[0].Path != "/staged/disk" {
-		t.Fatalf("path = %s, want the staged copy that survives teardown", got.Files[0].Path)
+	if marked, err := j.Unvouchable("test-bucket", rebuilt, now.Add(time.Hour)); err != nil || marked {
+		t.Fatalf("rebuilt generation = %v (%v)", marked, err)
 	}
 }

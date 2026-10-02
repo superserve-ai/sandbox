@@ -169,12 +169,6 @@ func (t *Task) HasVerified(object string) bool {
 type Journal struct {
 	db *bolt.DB
 
-	// scope names the store this journal's records are about, so a
-	// generation found unvouchable against one bucket is retried against
-	// another. Empty until SetScope, and Enqueue declines nothing while it
-	// is: a journal with no store has met no objects.
-	scope string
-
 	// mu guards claims AND spans every claim-coupled row mutation: Next's
 	// whole scan-and-claim, and the ownership check plus bolt write in
 	// Ack/Nack. Holding it across the writes is what makes the fencing
@@ -295,9 +289,6 @@ const claimTTL = time.Hour
 
 // NewJournal opens (creating if needed) the journal bucket in db. The
 // caller owns the bolt DB; sharing vmd's state DB keeps one fsync domain.
-// SetScope names the store the journal's scoped records belong to.
-func (j *Journal) SetScope(scope string) { j.scope = scope }
-
 func NewJournal(db *bolt.DB) (*Journal, error) {
 	err := db.Update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{journalBucket, indexBucket, verifiedBucket, outboxBucket, completionsBucket, seededBucket, stagingRootBucket, unvouchableBucket} {
@@ -435,23 +426,6 @@ func (j *Journal) Enqueue(task Task) error {
 		idx := tx.Bucket(indexBucket)
 		// One point lookup; a stale index entry (its queue key gone, e.g.
 		// the entry was dropped as corrupt) self-heals by overwriting.
-		// Declined like a duplicate rather than reported, and only where
-		// there is no row to carry: a generation found unvouchable
-		// completes for nobody, so starting it again is work that always
-		// abandons. An EXISTING row is left to the dedupe below — it may
-		// be mid-upload, and a live pause re-enqueueing the same
-		// generation must still promote it to staged paths and pause
-		// priority, or the pause clears its marker against an un-upgraded
-		// row the attempt then acks away.
-		if idx.Get(task.indexKey()) == nil && j.scope != "" {
-			if v := tx.Bucket(unvouchableBucket).Get(completionKey(j.scope, task)); v != nil {
-				var ns int64
-				if _, err := fmt.Sscanf(string(v), "%d", &ns); err == nil &&
-					time.Since(time.Unix(0, ns)) < unvouchableCooldown {
-					return nil
-				}
-			}
-		}
 		if qk := idx.Get(task.indexKey()); qk != nil {
 			if existing := queue.Get(qk); existing != nil {
 				// Dedupe, with a path upgrade: a first enqueue can carry
