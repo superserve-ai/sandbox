@@ -2058,8 +2058,12 @@ func TestEnqueueCarriesAllocatedBytes(t *testing.T) {
 
 	manifest := []ManifestEntry{
 		{FileName: "rootfs.ext4", Path: "/disk", SizeBytes: 1 << 30, AllocatedBytes: 4 << 20, SHA256: "d"},
-		{FileName: "vmstate.snap", Path: "/snap", SizeBytes: 4096, AllocatedBytes: 4096, SHA256: "s"},
+		// The manifest's sentinel for an allocation it could not measure.
+		{FileName: "vmstate.snap", Path: "/snap", SizeBytes: 4096, AllocatedBytes: -1, SHA256: "s"},
 	}
+	// Unknown, not negative: the control plane stores this verbatim and
+	// sums it, so a sentinel would make the generation shrink the totals.
+	want := []int64{4 << 20, 0}
 	if ok, _, _ := m.enqueueBackup("vm-1", manifest, backup.PriorityPause, ""); !ok {
 		t.Fatal("enqueue refused a complete manifest")
 	}
@@ -2068,8 +2072,8 @@ func TestEnqueueCarriesAllocatedBytes(t *testing.T) {
 		t.Fatalf("files = %d, want %d", len(got.Files), len(manifest))
 	}
 	for i, f := range got.Files {
-		if f.AllocatedBytes != manifest[i].AllocatedBytes {
-			t.Fatalf("%s allocated = %d, want %d", f.Name, f.AllocatedBytes, manifest[i].AllocatedBytes)
+		if f.AllocatedBytes != want[i] {
+			t.Fatalf("%s allocated = %d, want %d", f.Name, f.AllocatedBytes, want[i])
 		}
 	}
 }

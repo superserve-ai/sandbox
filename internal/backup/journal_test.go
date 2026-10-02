@@ -945,3 +945,36 @@ func soleClaimUntil(t *testing.T, j *Journal) time.Time {
 	}
 	return time.Time{}
 }
+
+// A generation already queued keeps its paths on a re-enqueue, but not
+// its blanks: a row written before allocation sizes were carried would
+// otherwise report a generation of unknown size for as long as it waits.
+func TestEnqueueAdoptsAllocationsOnDedupe(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(100, 0)
+	queued := func(alloc int64) Task {
+		return Task{
+			SandboxID: "sb-a", Generation: "gen", EnqueuedAt: now,
+			Files: []TaskFile{{
+				Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
+				AllocatedBytes: alloc,
+			}},
+		}
+	}
+	if err := j.Enqueue(queued(0)); err != nil {
+		t.Fatal(err)
+	}
+	// An unchanged re-pause of the same generation, same staging state,
+	// this time measuring what the artifact occupies.
+	if err := j.Enqueue(queued(4096)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	if got.Files[0].AllocatedBytes != 4096 {
+		t.Fatalf("allocated = %d, want the measurement the re-enqueue carried", got.Files[0].AllocatedBytes)
+	}
+}

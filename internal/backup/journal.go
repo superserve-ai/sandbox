@@ -441,6 +441,12 @@ func (j *Journal) Enqueue(task Task) error {
 					cur.Files = task.Files
 					cur.Staged = true
 					changed = true
+				} else if mergeAllocations(cur.Files, task.Files) {
+					// Same staging state, so the queued paths stand; the
+					// sizes this enqueue measured still belong on them,
+					// or a row queued before they were carried reports a
+					// generation of unknown size forever.
+					changed = true
 				}
 				// Priority promotion, one-way toward more urgent: a live
 				// pause re-enqueueing a generation the backfill queued at
@@ -622,6 +628,28 @@ func (j *Journal) RenewClaim(task Task, now time.Time) bool {
 		return nil
 	})
 	return renewed
+}
+
+// mergeAllocations adopts allocation sizes from an incoming task for the
+// files a queued one names, reporting whether anything was adopted. Only
+// a size the queued row lacks is filled in: the enqueue is a dedupe of
+// the same generation, so the digests already match and the incoming
+// measurement describes the same bytes.
+func mergeAllocations(queued, incoming []TaskFile) bool {
+	adopted := false
+	for i := range queued {
+		if queued[i].AllocatedBytes > 0 {
+			continue
+		}
+		for _, in := range incoming {
+			if in.Name == queued[i].Name && in.AllocatedBytes > 0 {
+				queued[i].AllocatedBytes = in.AllocatedBytes
+				adopted = true
+				break
+			}
+		}
+	}
+	return adopted
 }
 
 // errClaimStolen reports a resolution refused because the caller's lease
