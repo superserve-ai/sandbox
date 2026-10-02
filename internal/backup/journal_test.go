@@ -1037,3 +1037,61 @@ func TestAckAdoptsAllocationsMeasuredDuringTheUpload(t *testing.T) {
 		t.Fatalf("notified object = %q, want the object the upload wrote", got)
 	}
 }
+
+// A pathless re-completion keeps the richer manifest already waiting in
+// the outbox, but a size that only the later pass measured belongs on it:
+// the paths and the measurement come from different passes.
+func TestPreservedOutboxManifestAdoptsNewerAllocations(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(900, 0)
+	queued := func(alloc int64) Task {
+		return Task{
+			SandboxID: "sb-keep", Generation: "gen", EnqueuedAt: now,
+			Files: []TaskFile{{
+				Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
+				AllocatedBytes: alloc,
+			}},
+		}
+	}
+	const object = "sandboxes/sb-keep/gen/rootfs.p0000"
+
+	// A first completion banks the objects, with nothing measured.
+	if err := j.Enqueue(queued(0)); err != nil {
+		t.Fatal(err)
+	}
+	first, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	first.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10, Object: object}}
+	if _, err := j.Ack(first, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// An unchanged re-pause measures the artifact, and its manifest create
+	// dedupes, so its own completion carries no paths.
+	if err := j.Enqueue(queued(4096)); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := j.Next(now.Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("second claim = %v (%v)", ok, err)
+	}
+	if _, err := j.Ack(second, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || len(pending[0].Files) != 1 {
+		t.Fatalf("notifications = %+v", pending)
+	}
+	if got := pending[0].Files[0].Object; got != object {
+		t.Fatalf("object = %q, want the path the first completion banked", got)
+	}
+	if got := pending[0].Files[0].AllocatedBytes; got != 4096 {
+		t.Fatalf("allocated = %d, want the size the later pass measured", got)
+	}
+}

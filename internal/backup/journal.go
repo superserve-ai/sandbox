@@ -995,6 +995,10 @@ func (j *Journal) Ack(task Task, completedScope string, notify bool) (bool, erro
 				var cur Task
 				if json.Unmarshal(prevOutbox, &cur) == nil &&
 					filesCarryObjects(cur.Files) && !filesCarryObjects(nt.Files) {
+					// The kept entry owns the paths, this completion owns
+					// the sizes: a measurement only this pass made must
+					// not be demoted along with the pathless manifest.
+					mergeAllocations(cur.Files, nt.Files)
 					nt.Files = cur.Files
 					nt.FilesFinal = cur.FilesFinal
 				}
