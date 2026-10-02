@@ -99,6 +99,8 @@ class Stripe:
             cursor = None
             for _ in range(100):
                 params = {"limit": 100, **filters_for_state}
+                if kind == "price":
+                    params["expand[]"] = "data.currency_options"
                 if cursor:
                     params["starting_after"] = cursor
                 page = self.request("GET", PATHS[kind], params)
@@ -164,7 +166,10 @@ def inspect(stripe, spec):
         require(price, {"active": True, "currency": "usd", "billing_scheme": "per_unit",
                         "type": "recurring", "product": product["id"], "transform_quantity": None,
                         "custom_unit_amount": None, "tax_behavior": spec["tax_behavior"]}, "price")
-        if price.get("currency_options"):
+        currencies = price.get("currency_options")
+        if not isinstance(currencies, dict) or not currencies:
+            raise ProvisionError("Storage price currency options were not expanded; no writes attempted")
+        if set(currencies) != {"usd"}:
             raise ProvisionError("Storage price has additional currency options; reconcile them manually")
         require(price.get("recurring") or {}, {"meter": meter["id"], "interval": "month",
                 "interval_count": 1, "usage_type": "metered", "trial_period_days": None}, "price recurring settings")
