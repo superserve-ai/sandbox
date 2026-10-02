@@ -74,8 +74,11 @@ jobs:
         with:
           version: '2.119.0'
       - name: Run approved staging action
-        run: python3 scripts/migrate_database.py staging "$MIGRATION_ACTION"
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py staging "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
           MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
 
@@ -91,12 +94,18 @@ jobs:
         with:
           version: '2.119.0'
       - name: Run approved primary production action
-        run: python3 scripts/migrate_database.py use4 "$MIGRATION_ACTION"
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py use4 "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
           MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
       - name: Run approved west production action
-        run: python3 scripts/migrate_database.py usw2 "$MIGRATION_ACTION"
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py usw2 "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
           MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}

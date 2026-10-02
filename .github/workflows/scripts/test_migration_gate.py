@@ -1,4 +1,9 @@
+import os
+import re
+import shlex
 import subprocess
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -103,6 +108,55 @@ class MigrationGateTest(unittest.TestCase):
         with patch.object(gate, "api", side_effect=[{"object": {"sha": SHA}}, {"object": {"sha": BEFORE}}]):
             with self.assertRaises(gate.GateError):
                 gate.select_action(self.env)
+
+    def test_environment_approval_cannot_release_stale_revision(self):
+        with patch.object(gate, "api", side_effect=self.api):
+            self.assertEqual(gate.select_action(self.env), ("preflight", True))
+            gate.verify_revision(self.env)
+        with patch.object(gate, "api", return_value={"object": {"sha": BEFORE}}):
+            with self.assertRaises(gate.GateError):
+                gate.verify_revision(self.env)
+        with patch.object(gate, "api", side_effect=gate.GateError("Unavailable")):
+            with self.assertRaises(gate.GateError):
+                gate.verify_revision(self.env)
+        # Every regional action must recheck after its environment approval,
+        # including West after East has finished in the same production job.
+        workflow = Path(__file__).parents[1].joinpath("cd.yml").read_text()
+        for target in ("staging", "use4", "usw2"):
+            self.assertIn("python3 .github/workflows/scripts/migration_gate.py --verify-revision\n"
+                          f"          python3 scripts/migrate_database.py {target} ", workflow)
+
+    def test_actual_regional_shell_refuses_database_after_main_advances(self):
+        root = Path(__file__).resolve().parents[3]
+        workflow = (root / ".github/workflows/cd.yml").read_text()
+        blocks = re.findall(r"        run: \|\n((?:          .+\n)+)", workflow)
+        self.assertEqual(len(blocks), 3)
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            gh = directory / "gh"
+            gh.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                          "if os.environ.get('GH_FAIL'): sys.exit(1)\n"
+                          "print(json.dumps({'object': {'sha': os.environ['CURRENT_MAIN']}}))\n")
+            gh.chmod(0o755)
+            marker = directory / "database-invoked"
+            recorder = directory / "record.py"
+            recorder.write_text("import os\nfrom pathlib import Path\nPath(os.environ['MARKER']).touch()\n")
+            env = {**os.environ, **self.env, "PATH": temp + os.pathsep + os.environ["PATH"],
+                   "MARKER": str(marker), "CURRENT_MAIN": SHA}
+            for target, block in zip(("staging", "use4", "usw2"), blocks):
+                shell = block.replace("python3 scripts/migrate_database.py", "python3 " + shlex.quote(str(recorder)))
+                with self.subTest(target=target):
+                    result = subprocess.run(["bash", "-e", "-c", shell], cwd=root, env=env, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(marker.exists())
+                    marker.unlink()
+                    # Main changes after the initial gate, during either
+                    # environment wait, or after the preceding region finishes.
+                    for changed in ({"CURRENT_MAIN": BEFORE}, {"GH_FAIL": "1"}):
+                        result = subprocess.run(["bash", "-e", "-c", shell], cwd=root,
+                                                env={**env, **changed}, capture_output=True)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(marker.exists(), "stale/unverified action reached the database runner")
 
 
 if __name__ == "__main__":

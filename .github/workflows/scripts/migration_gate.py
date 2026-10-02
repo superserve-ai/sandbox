@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Select an explicit migration action only after revision and CI checks."""
 
+import argparse
 import importlib.util
 import json
 import os
@@ -32,6 +33,14 @@ def api(repository, path):
     if result.returncode:
         raise GateError("Could not verify migration release prerequisites")
     return json.loads(result.stdout)
+
+
+def verify_revision(env):
+    revision = env["GITHUB_SHA"]
+    if not re.fullmatch(r"[0-9a-f]{40}", revision) or env.get("GITHUB_REF") != "refs/heads/main":
+        raise GateError("Migration execution requires an exact main revision")
+    if api(env["GITHUB_REPOSITORY"], "git/ref/heads/main")["object"]["sha"] != revision:
+        raise GateError("Main advanced; migration release must be re-evaluated")
 
 
 def select_action(env):
@@ -78,7 +87,13 @@ def select_action(env):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verify-revision", action="store_true")
+    args = parser.parse_args()
     try:
+        if args.verify_revision:
+            verify_revision(os.environ)
+            return 0
         action, production = select_action(os.environ)
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write(f"action={action}\nproduction={str(production).lower()}\n")
