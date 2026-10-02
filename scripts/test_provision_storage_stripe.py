@@ -25,6 +25,7 @@ def catalog():
         "price": [{"id": "price_example", "livemode": False, "active": True, "product": PRODUCT_ID,
                    "currency": "usd", "billing_scheme": "per_unit", "type": "recurring", "lookup_key": LOOKUP,
                    "unit_amount_decimal": "0.010800000000", "tax_behavior": "exclusive",
+                   "currency_options": {"usd": {"unit_amount_decimal": "0.0108", "tax_behavior": "exclusive"}},
                    "recurring": {"meter": "mtr_example", "interval": "month", "interval_count": 1,
                                  "usage_type": "metered"}}],
     }
@@ -48,6 +49,8 @@ class FakeStripe(Stripe):
             if kind == "price":
                 active = (params or {}).get("active", "true") == "true"
                 rows = [row for row in rows if row["active"] is active]
+                if (params or {}).get("expand[]") != "data.currency_options":
+                    rows = [{k: v for k, v in row.items() if k != "currency_options"} for row in rows]
             return {"data": copy.deepcopy(rows), "has_more": False}
         if not self.apply:
             raise AssertionError("Write attempted in preview")
@@ -163,12 +166,27 @@ class ProvisionTests(unittest.TestCase):
             page("price_archived_1", True), page("price_archived_2", False),
         ]) as request:
             self.assertEqual(len(stripe.inventory("price")), 4)
-            self.assertEqual([call.args[2] for call in request.call_args_list], [
+            self.assertTrue(all(call.args[2].get("expand[]") == "data.currency_options"
+                                for call in request.call_args_list))
+            self.assertEqual([{k: v for k, v in call.args[2].items() if k != "expand[]"}
+                              for call in request.call_args_list], [
                 {"limit": 100, "active": "true"},
                 {"limit": 100, "active": "true", "starting_after": "price_active_1"},
                 {"limit": 100, "active": "false"},
                 {"limit": 100, "active": "false", "starting_after": "price_archived_1"},
             ])
+
+    def test_currency_options_must_be_expanded_and_usd_only(self):
+        for apply in (False, True):
+            stripe = FakeStripe(catalog(), apply=apply)
+            self.assertEqual(self.run_quiet(stripe)["actions"], dict.fromkeys(PATHS, "reuse"))
+            for currencies in (None, {}, {"usd": {}, "eur": {"unit_amount": 1}}):
+                with self.subTest(apply=apply, currencies=currencies):
+                    stripe = FakeStripe(catalog(), apply=apply)
+                    stripe.data["price"][0]["currency_options"] = currencies
+                    with self.assertRaises(ProvisionError):
+                        self.run_quiet(stripe)
+                    self.assertTrue(all(method == "GET" for method, _, _ in stripe.calls))
 
     def test_paginated_inventory_and_incomplete_response(self):
         stripe = Stripe("rk_test_fixture", False, "acct_example")
