@@ -19,6 +19,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// (unauthenticated flood protection), logging, panic recovery.
 	r.Use(
 		SecurityHeaders(),
+		TeamCreationReadDeadline(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),
 		ErrorHandler(),
@@ -48,6 +49,13 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/preview-ports/:port/token/rotate", h.RotateSandboxPreviewToken)
 		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
 		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
+
+		// Saved snapshots: captures a new sandbox can be created from.
+		api.POST("/sandboxes/:sandbox_id/snapshot", h.CreateSandboxSnapshot)
+		api.GET("/sandboxes/:sandbox_id/snapshots", h.ListSandboxSnapshots)
+		api.GET("/snapshots/:snapshot_id", h.GetSnapshot)
+		api.PATCH("/snapshots/:snapshot_id", h.PatchSnapshot)
+		api.DELETE("/snapshots/:snapshot_id", h.DeleteSnapshot)
 
 		// Directory listing (metadata) flows through the control plane via
 		// boxd's FilesystemService.ListDir, so it works on every sandbox
@@ -85,7 +93,15 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/sandboxes/:sandbox_id/network", h.GetSandboxNetwork)
 
 		api.GET("/billing/summary", h.GetBillingSummary)
+		api.GET("/billing/usage-series", h.GetBillingUsageSeries)
 		api.GET("/billing/pricing", h.GetBillingPricing)
+		api.GET("/teams/:team_id/billing/usage", h.GetTeamBillingUsage)
+		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
+		api.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetTeamBillingExportPreview)
+		api.POST("/stripe/checkout-session", h.CreateStripeCheckoutSession)
+		api.POST("/stripe/checkout-session/publication-decision", PromotionAccountAuth(), h.CreateStripeCheckoutSession)
+		api.POST("/stripe/checkout-session/recover", h.RecoverStripeCheckoutSession)
+		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
 
 		// RBAC Phase 2b customer-facing team management.
 		api.GET("/teams/:team_id/management", h.GetTeamManagement)
@@ -100,6 +116,56 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.GET("/health", h.Health)
 	// Public pricing is intentionally unauthenticated so the marketing site can render current PAYG rates from the same source as billing.
 	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
+	r.POST("/stripe/webhook", h.HandleStripeWebhook)
+	r.POST("/internal/teams", TeamCreationPrivacy(), TeamCreationInternalAuth(), h.CreateInternalTeam)
+
+	promotionCapture := r.Group("/internal/promotion/signup")
+	promotionCapture.Use(PromotionProducerAuth("PROMOTION_CAPTURE_TOKEN"))
+	promotionCapture.POST("/attempts", h.CreatePromotionSignupAttempt)
+	promotionCapture.POST("/attempts/verify", h.VerifyPromotionSignupAttempt)
+
+	promotionAccount := r.Group("/internal/promotion/account")
+	promotionAccount.Use(PromotionProducerAuth("PROMOTION_ACCOUNT_TOKEN"), PromotionAccountAuth())
+	promotionAccount.POST("/bind", h.BindPromotionSignupAccount)
+	promotionAccount.POST("/evidence", h.GetPromotionSignupAccountEvidence)
+	promotionAccount.POST("/register", h.RegisterPromotionSignupDevice)
+	promotionAccount.POST("/register-signup", h.RegisterPromotionSignupAccount)
+	promotionAccount.POST("/signup-eligibility", h.EvaluateSignupPromotion)
+	promotionAccount.POST("/create-team", h.CreateTeamWithPromotionAttempt)
+	promotionAccount.POST("/prepare-team", h.PrepareTeamPromotionCreation)
+	promotionAccount.POST("/recover-team", h.RecoverTeamPromotionCreation)
+	promotionAccount.POST("/complete-team", h.CompleteTeamPromotionCreation)
+	promotionAccount.POST("/discover-team-creations", h.DiscoverTeamPromotionCreations)
+
+	// Operator endpoints — authenticated via OPERATOR_API_TOKEN, a separate
+	// credential from the infra-internal token that every vmd host holds
+	// for heartbeats. Host lifecycle approval must not be reachable with a
+	// credential the hosts themselves possess.
+	operator := r.Group("/internal")
+	operator.Use(OperatorAuth(), InternalActorFromHeader())
+	{
+		// Billing recovery requires a credential unavailable to VMD hosts.
+		operator.POST("/teams/:team_id/billing/storage", h.ReconcileStorageBilling)
+		operator.POST("/teams/:team_id/billing/invoice-reconciliation", h.EnrollInvoiceReconciliation)
+		operator.POST("/teams/:team_id/billing/periods/:period_id/adopt-exports", h.AdoptBillingExports)
+		operator.POST("/billing/export-events/:event_id/recover", h.RecoverBillingExport)
+		operator.POST("/teams/:team_id/billing/periods/:period_id/measure-correction", h.MeasureBillingCorrection)
+		operator.POST("/billing/export-corrections/:correction_id/apply", h.ApplyBillingCorrection)
+		operator.GET("/hosts", h.HostList)
+		operator.POST("/hosts/:host_id/status", h.HostUpdateStatus)
+		operator.POST("/hosts/:host_id/incarnation", h.HostRebindIncarnation)
+		// Abuse controls require the operator credential; the host-shared
+		// internal token must not be sufficient to grant or remove trust.
+		operator.GET("/abuse/teams/:team_id/trust", h.GetPlatformAbuseTeamTrust)
+		operator.PUT("/abuse/teams/:team_id/trust", h.SetPlatformAbuseTeamTrust)
+		operator.GET("/abuse/restrictions", h.ListPlatformAbuseRestrictions)
+		operator.POST("/abuse/restrictions", h.CreatePlatformAbuseRestriction)
+		operator.POST("/abuse/restrictions/:restriction_id/release", h.ReleasePlatformAbuseRestriction)
+		operator.POST("/abuse/refresh", h.RecordPlatformAbuseRefresh)
+		operator.GET("/abuse/trusted-identities", h.ListPlatformAbuseTrustedIdentities)
+		operator.POST("/abuse/trusted-identities", h.AddPlatformAbuseTrustedIdentity)
+		operator.POST("/abuse/trusted-identities/:identity_id/revoke", h.RevokePlatformAbuseTrustedIdentity)
+	}
 
 	// Internal endpoints — authenticated via a shared token (not per-team
 	// API keys). Called by infrastructure components (VMD heartbeat) and
@@ -109,7 +175,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	internal := r.Group("/internal")
 	internal.Use(InternalAuth(), InternalActorFromHeader())
 	{
+		internal.POST("/signup/evaluate", h.EvaluateSignup)
 		internal.POST("/hosts/:host_id/heartbeat", h.HostHeartbeat)
+		internal.POST("/hosts/:host_id/storage-reports", h.HostStorageReport)
+		internal.PUT("/hosts/:host_id/pressure", h.HostReportPressure)
+		internal.POST("/hosts/:host_id/backups", h.ReportHostBackup)
+		internal.POST("/hosts/:host_id/template-attempts/admit", h.AdmitTemplateAttempt)
 		internal.POST("/secrets/decrypt", h.DecryptSecret)
 		internal.GET("/jwks", h.JWKS)
 		internal.GET("/sandbox_revocations", h.ListSandboxRevocations)
@@ -117,6 +188,14 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/teams/:team_id/sandboxes", h.ListPlatformTeamSandboxes)
 		internal.GET("/teams/:team_id/sandboxes/:sandbox_id", h.GetPlatformTeamSandbox)
 		internal.GET("/billing", h.ListPlatformBilling)
+		internal.GET("/teams/:team_id/billing/usage", h.GetPlatformTeamBillingUsage)
+		internal.GET("/teams/:team_id/billing/periods", h.ListPlatformTeamBillingPeriods)
+		internal.POST("/billing/cutover", h.EstablishBillingCutover)
+		internal.POST("/teams/:team_id/billing/anchor", h.EstablishCommercialBillingAnchor)
+		internal.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetPlatformTeamBillingExportPreview)
+		internal.POST("/teams/:team_id/billing/periods/:period_id/approve", h.ApproveTeamBillingPeriod)
+		internal.POST("/teams/:team_id/billing/periods/:period_id/export", h.ExportTeamBillingPeriod)
+		internal.GET("/teams/:team_id/billing/periods/:period_id/export-accounting", h.GetBillingExportAccounting)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

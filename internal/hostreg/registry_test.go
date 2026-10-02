@@ -1,0 +1,1488 @@
+package hostreg
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
+)
+
+// hostDB serves GetHost with a switchable vmd_addr, optional read failure,
+// and an optional gate that holds reads open while a test interleaves.
+type hostDB struct {
+	mu       sync.Mutex
+	addr     string
+	failRead bool
+	gate     chan struct{} // non-nil: QueryRow waits until closed (after capturing the address)
+	delay    chan struct{} // non-nil: QueryRow waits until closed BEFORE capturing the address
+	reads    atomic.Int64
+}
+
+func (h *hostDB) setAddr(a string) { h.mu.Lock(); h.addr = a; h.mu.Unlock() }
+func (h *hostDB) setFailRead(v bool) {
+	h.mu.Lock()
+	h.failRead = v
+	h.mu.Unlock()
+}
+func (h *hostDB) setGate(c chan struct{})  { h.mu.Lock(); h.gate = c; h.mu.Unlock() }
+func (h *hostDB) setDelay(c chan struct{}) { h.mu.Lock(); h.delay = c; h.mu.Unlock() }
+
+type errRow struct{ err error }
+
+func (r errRow) Scan(...any) error { return r.err }
+
+func (h *hostDB) readCount() int64 { return h.reads.Load() }
+
+func (h *hostDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec")
+}
+func (h *hostDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, fmt.Errorf("unexpected Query")
+}
+func (h *hostDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	h.reads.Add(1)
+	h.mu.Lock()
+	delay := h.delay
+	h.mu.Unlock()
+	if delay != nil {
+		<-delay // a query that started early but executes late
+	}
+	h.mu.Lock()
+	addr, fail, gate := h.addr, h.failRead, h.gate
+	h.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	if fail {
+		return errRow{err: fmt.Errorf("connection reset")}
+	}
+	id := args[0].(string)
+	return hostScanRow(func(dest ...any) error {
+		*dest[0].(*string) = id
+		*dest[1].(*string) = addr
+		*dest[2].(*string) = "proxy:5007"
+		*dest[3].(*string) = "region-a"
+		*dest[4].(*string) = "active"
+		*dest[5].(*int32) = 1024
+		*dest[6].(*int32) = 8
+		*dest[7].(*pgtype.Timestamptz) = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+		*dest[8].(*time.Time) = time.Now()
+		*dest[9].(*time.Time) = time.Now()
+		*dest[10].(*bool) = false
+		return nil
+	})
+}
+
+type hostScanRow func(...any) error
+
+func (r hostScanRow) Scan(dest ...any) error { return r(dest...) }
+
+// A client whose host row changed address must be re-dialed BEFORE the next
+// dispatch once its recheck is due — never returned pointing at the old
+// machine. The address change lands on whichever control-plane replica
+// served the heartbeat; every other replica converges through this check.
+func TestClientForRedialsBeforeDispatchWhenAddressChanges(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	var lastAddr atomic.Value
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		lastAddr.Store(addr)
+		return nil, nil // client value is irrelevant to the registry's bookkeeping
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("first ClientFor: %v", err)
+	}
+	if dials.Load() != 1 || lastAddr.Load().(string) != "10.0.0.1:50051" {
+		t.Fatalf("first dial = %d/%v", dials.Load(), lastAddr.Load())
+	}
+
+	store.setAddr("10.0.0.2:50051")
+	time.Sleep(5 * time.Millisecond) // entry is now due for verification
+
+	// Blocking semantics: this single call must verify and re-dial.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after address change: %v", err)
+	}
+	if dials.Load() != 2 || lastAddr.Load().(string) != "10.0.0.2:50051" {
+		t.Fatalf("after change: dials = %d addr = %v, want 2 dials at the new address",
+			dials.Load(), lastAddr.Load())
+	}
+}
+
+// An unchanged address must refresh the recheck clock without re-dialing:
+// steady state stays at one dial no matter how many verifications run.
+func TestClientForKeepsClientWhenAddressUnchanged(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+
+	for i := 0; i < 20; i++ {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+			t.Fatalf("ClientFor %d: %v", i, err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1 (verification must not re-dial an unchanged address)", dials.Load())
+	}
+}
+
+// A COLD dial (no cached entry) raced by an invalidation must also discard
+// its result: the row was read before the reclaim committed, so the dialed
+// client points at the old machine. The resolution re-reads and returns a
+// client for the newest address — the caller never receives the old one.
+func TestClientForColdDialRacedByInvalidateReturnsNewestAddress(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		if addr == "10.0.0.1:50051" {
+			close(dialStarted)
+			<-dialRelease // hold the cold dial open while the reclaim lands
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		done <- err
+	}()
+
+	<-dialStarted // resolution read .1 and is dialing it
+	store.setAddr("10.0.0.2:50051")
+	r.Invalidate("host-a") // the reclaim to .2 commits mid-dial
+	close(dialRelease)
+
+	if err := <-done; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "10.0.0.1:50051" || got[1] != "10.0.0.2:50051" {
+		t.Fatalf("dial sequence = %v, want [.1 discarded, .2 returned]", got)
+	}
+	// The settled entry serves the newest address without another dial.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-race ClientFor: %v", err)
+	}
+	mu.Lock()
+	n := len(dialed)
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("dials after settle = %d, want 2", n)
+	}
+}
+
+// A transient read failure with NO invalidation keeps the availability
+// softness while the last successful verification is within the lease: the
+// still-cached client is returned rather than failing the op.
+func TestClientForServesCachedOnReadBlipWithinLease(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = 100 * time.Millisecond // lease = 200ms
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Verification due now, but the last successful verification is
+	// recent: within the lease.
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now()
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("read blip within lease must serve the cached client, got error: %v", err)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}
+
+// Past the unverified lease, a failing row read fails CLOSED: "we could not
+// check" must not keep dispatching forever to a machine that may have lost
+// the identity. Recovery is immediate once reads succeed again.
+func TestClientForFailsClosedPastUnverifiedLease(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = 100 * time.Millisecond // lease = 200ms
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now()
+	e.verifiedAt = time.Now().Add(-300 * time.Millisecond)
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("read failure past the lease must fail closed, got a client")
+	}
+	store.setFailRead(false)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("recovery after reads resume: %v", err)
+	}
+}
+
+// Inside the last fifth of the verification window, a fresh call triggers a
+// background refresh so the blocking due-verification read almost never
+// lands on a request.
+func TestClientForRefreshesAheadOfExpiry(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = 300 * time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	reads := store.readCount()
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now().Add(50 * time.Millisecond) // inside the last fifth, still fresh
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("fresh call in refresh-ahead window: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < reads+1 {
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh never read the row")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// The refresh renewed the entry: an immediate call neither reads nor dials.
+	after := store.readCount()
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-refresh call: %v", err)
+	}
+	if store.readCount() != after || dials.Load() != 1 {
+		t.Fatalf("post-refresh reads/dials = %d/%d, want %d/1", store.readCount(), dials.Load(), after)
+	}
+}
+
+// Sustained read failure must not become a read (and a warning) per call:
+// the failed verification backs off, serving the cached client without
+// touching the DB until the backoff lapses.
+func TestClientForBacksOffFailedVerification(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	r.recheck = 100 * time.Millisecond // backoff = min(5s, ttl) = 100ms
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Expire the entry and break the DB.
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now().Add(-time.Second)
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("degraded ClientFor: %v", err)
+	}
+	after := store.readCount() // seed read + 1 failed verification
+
+	// Immediate repeat calls stay inside the backoff: zero further reads.
+	for i := 0; i < 10; i++ {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+			t.Fatalf("backoff ClientFor %d: %v", i, err)
+		}
+	}
+	if got := store.readCount(); got != after {
+		t.Fatalf("reads during backoff = %d, want %d (no per-call reads)", got, after)
+	}
+
+	// Past the backoff, verification is retried again.
+	time.Sleep(120 * time.Millisecond)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-backoff ClientFor: %v", err)
+	}
+	if got := store.readCount(); got != after+1 {
+		t.Fatalf("reads after backoff = %d, want %d (one paced retry)", got, after+1)
+	}
+}
+
+// A read failure AFTER the entry was invalidated must fail closed: the
+// invalidation had a reason (an address reclaim), and dispatching the
+// pre-invalidation client past it risks the machine that lost the identity.
+func TestClientForFailsClosedWhenInvalidatedAndRowUnreadable(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	gate := make(chan struct{})
+	store.setGate(gate)
+	store.setFailRead(true)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		done <- err
+	}()
+	// The verification read is in flight (or about to be); land the
+	// invalidation, then let the read fail.
+	time.Sleep(2 * time.Millisecond)
+	r.Invalidate("host-a")
+	close(gate)
+
+	if err := <-done; err == nil {
+		t.Fatal("invalidated entry with unreadable row must fail closed, got a client")
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1 (nothing new may be dialed through a failed verification)", dials.Load())
+	}
+}
+
+// An Invalidate landing while a verification dial is in flight must not be
+// undone by that verification's store: the result is discarded and the row
+// re-read, so the entry lands on the newest address, never the one that was
+// current when the verification began.
+func TestClientForDiscardsVerificationRacedByInvalidate(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		if addr == "10.0.0.2:50051" {
+			close(dialStarted)
+			<-dialRelease // hold the dial open while the invalidation lands
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed ClientFor: %v", err)
+	}
+	store.setAddr("10.0.0.2:50051")
+	time.Sleep(5 * time.Millisecond) // entry due for verification
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		done <- err
+	}()
+
+	<-dialStarted // verification has read .2 and is dialing it
+	store.setAddr("10.0.0.3:50051")
+	r.Invalidate("host-a") // the reclaim to .3 lands mid-dial
+	close(dialRelease)
+
+	if err := <-done; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	want := []string{"10.0.0.1:50051", "10.0.0.2:50051", "10.0.0.3:50051"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("dial sequence = %v, want %v (raced dial discarded, row re-read)", got, want)
+	}
+
+	// The cache must hold the newest address as verified — an immediate call
+	// dials nothing new.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-race ClientFor: %v", err)
+	}
+	mu.Lock()
+	n := len(dialed)
+	mu.Unlock()
+	if n != 3 {
+		t.Fatalf("dials after settle = %d, want 3 (entry must be cached at the newest address)", n)
+	}
+}
+
+// When the address changed but the new machine cannot be dialed, ClientFor
+// must fail loudly — never quietly hand back the old-address client, which
+// would execute the operation on the machine that lost this identity.
+func TestClientForFailsClosedWhenNewAddressUndialable(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	var failDial atomic.Bool
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		if failDial.Load() {
+			return nil, fmt.Errorf("connection refused")
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("first ClientFor: %v", err)
+	}
+
+	store.setAddr("10.0.0.2:50051")
+	failDial.Store(true)
+	time.Sleep(5 * time.Millisecond)
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("ClientFor returned a client while the new address is undialable")
+	}
+
+	// Recovery: once the new machine is reachable, the next call succeeds.
+	failDial.Store(false)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after recovery: %v", err)
+	}
+	if got := dials.Load(); got != 3 {
+		t.Fatalf("dials = %d, want 3 (initial, failed re-dial, recovery)", got)
+	}
+}
+
+// A caller whose request is canceled must stop waiting for a slow
+// resolution immediately; the shared resolution finishes on its detached
+// context and still fills the cache for the callers that follow.
+func TestClientForCanceledCallerStopsWaiting(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	gate := make(chan struct{})
+	store.setGate(gate) // hold the row read open: resolution is slow
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(ctx, "host-a")
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("canceled caller got a client, want context error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled caller still waiting on the shared resolution")
+	}
+
+	// The abandoned resolution completes and caches; the next caller is
+	// served without a new resolution.
+	store.setGate(nil)
+	close(gate)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resolution never completed after the caller abandoned it")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// With the production ratio (backoff ≪ TTL), a failed verification must NOT
+// re-fire through refresh-ahead: after a failure, the entry sits inside what
+// would be the refresh-ahead window, and only the backoff may schedule the
+// next read. Repeated calls during the backoff do zero reads.
+func TestClientForFailureSuppressesRefreshAhead(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	r.recheck = 300 * time.Millisecond
+	r.failBackoff = 50 * time.Millisecond // production shape: backoff ≪ TTL
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now()
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("degraded ClientFor: %v", err)
+	}
+	after := store.readCount()
+	// nextCheckAt = now+50ms, which is deep inside the 60ms refresh-ahead
+	// margin — the old clock arithmetic would fire a read per call here.
+	for i := 0; i < 10; i++ {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+			t.Fatalf("backoff ClientFor %d: %v", i, err)
+		}
+	}
+	// Give any (wrong) async refresh a moment to land before asserting.
+	time.Sleep(20 * time.Millisecond)
+	if got := store.readCount(); got != after {
+		t.Fatalf("reads during backoff = %d, want %d (refresh-ahead must stay suppressed while degraded)", got, after)
+	}
+}
+
+// The fast path itself enforces the lease: a failure backoff that outlives
+// the lease must not keep serving — the next call goes to resolution and
+// fails closed while reads are still failing.
+func TestClientForFastPathHonorsLeaseDuringBackoff(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	r.recheck = 100 * time.Millisecond // lease = 200ms
+	r.failBackoff = 80 * time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Verification due; lease nearly exhausted (30ms left of 200ms).
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now()
+	e.verifiedAt = time.Now().Add(-170 * time.Millisecond)
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+	store.setFailRead(true)
+
+	// Within lease: served, and an 80ms backoff window opens.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("within-lease ClientFor: %v", err)
+	}
+	// 40ms later the backoff is still open but the lease has expired: the
+	// fast path must refuse and resolution must fail closed.
+	time.Sleep(40 * time.Millisecond)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("lease expired mid-backoff: dispatch must fail closed, got a client")
+	}
+}
+
+// Refresh-ahead launches ONE background goroutine per host, no matter how
+// many warm calls land in the refresh window while the read is slow —
+// singleflight dedupes the read, but only this guard bounds the goroutines
+// parked behind it.
+func TestClientForRefreshAheadLaunchesOneGoroutine(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	r.recheck = 300 * time.Millisecond
+
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	r.mu.Lock()
+	e := r.clients["host-a"]
+	e.nextCheckAt = time.Now().Add(30 * time.Millisecond) // inside the refresh window, still fresh
+	r.clients["host-a"] = e
+	r.mu.Unlock()
+
+	gate := make(chan struct{})
+	store.setGate(gate) // the background read parks until released
+	before := runtime.NumGoroutine()
+	for i := 0; i < 50; i++ {
+		if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+			t.Fatalf("warm ClientFor %d: %v", i, err)
+		}
+	}
+	after := runtime.NumGoroutine()
+	if after-before > 5 {
+		t.Fatalf("goroutines grew by %d during a slow refresh, want ≤ 5 (one refresh per host)", after-before)
+	}
+	store.setGate(nil)
+	close(gate)
+	// Let the refresh finish so it doesn't leak into other tests.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, loaded := r.refreshing.Load("host-a"); !loaded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refresh goroutine never finished")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// Observe fires once per EXECUTED resolution — never per waiter. A burst of
+// callers sharing one gated flight contributes exactly one sample, and a
+// caller that cancels its wait records nothing: the sample belongs to the
+// resolution (which succeeds behind the canceled waiter), not the waiters.
+func TestObserveRecordsPerResolutionNotPerWaiter(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	gate := make(chan struct{})
+	store.setGate(gate) // hold the flight's row read open
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+
+	var mu sync.Mutex
+	type sample struct {
+		kind string
+		err  error
+	}
+	var samples []sample
+	r.Observe = func(kind string, _ time.Duration, err error) {
+		mu.Lock()
+		samples = append(samples, sample{kind, err})
+		mu.Unlock()
+	}
+
+	// Ten cold waiters share one flight; one of them cancels mid-wait.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		ctx := context.Background()
+		if i == 0 {
+			ctx = cancelCtx
+		}
+		wg.Add(1)
+		go func(ctx context.Context) {
+			defer wg.Done()
+			_, _ = r.ClientFor(ctx, "host-a")
+		}(ctx)
+	}
+	time.Sleep(20 * time.Millisecond) // let the waiters pile onto the flight
+	cancel()
+	close(gate)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(samples) != 1 {
+		t.Fatalf("samples = %d (%v), want exactly 1 per executed resolution", len(samples), samples)
+	}
+	if samples[0].kind != "cold" || samples[0].err != nil {
+		t.Fatalf("sample = %+v, want cold/success (the canceled waiter must not record an error)", samples[0])
+	}
+}
+
+// A caller that has just read the host row hands the address to the
+// registry: a cached client at that address has its lease renewed without a
+// row read of its own, so the dispatch that follows never blocks on one.
+func TestMarkVerifiedRenewsLeaseWithoutRead(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // cold: read + dial
+		t.Fatalf("prime: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond) // lease due; ClientFor alone would read again
+
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a"))
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after MarkVerified: %v", err)
+	}
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1 (MarkVerified must renew the lease without a read)", n)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}
+
+// With no client yet, MarkVerified resolves up front — one row read, since a
+// reported address is never dialed unread — so the first dispatch finds a
+// verified client without reading again.
+func TestMarkVerifiedColdResolvesOnce(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a"))
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1 (the registry's own read; the report is not dialed unread)", n)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}
+
+// A report that disagrees with the cached client is itself in doubt — the
+// cached address came from a read too, and the two cannot be ordered — so
+// the old client is dropped and the row is read before either address is
+// dialed. With the row unreadable, dispatch fails closed; once it reads,
+// the registry lands on the row's answer.
+func TestMarkVerifiedMovedAddressReadsBeforeDialing(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dialed = append(dialed, addr)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	store.setFailRead(true)
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a"))
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("ClientFor dispatched while the moved address was unconfirmed and unreadable")
+	}
+	if len(dialed) != 1 {
+		t.Fatalf("dialed = %v, want only the priming dial until the row confirms", dialed)
+	}
+
+	store.setFailRead(false)
+	store.setAddr("10.0.0.2:50051")
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor once readable: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2", settled)
+	}
+}
+
+// A moved address re-resolves: one read, one fresh dial, and the next
+// dispatch goes to the new machine without a further read.
+func TestMarkVerifiedMovedAddressRedials(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dialed = append(dialed, addr)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	store.setAddr("10.0.0.2:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a"))
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor after move: %v", err)
+	}
+	if want := []string{"10.0.0.1:50051", "10.0.0.2:50051"}; fmt.Sprint(dialed) != fmt.Sprint(want) {
+		t.Fatalf("dialed = %v, want %v", dialed, want)
+	}
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads = %d, want 2 (prime, and the move read before dialing)", n)
+	}
+}
+
+// A cold lookup that read the row before the host moved must not publish
+// that older address over a report that observed the move while the lookup
+// was still dialing: the newer report contradicts what the lookup read, so
+// the lookup re-reads and the newest address is what settles.
+func TestMarkVerifiedNewerReportSupersedesColdLookup(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		if addr == "10.0.0.1:50051" {
+			close(dialStarted)
+			<-dialRelease // hold the cold dial open while the move is observed
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	<-dialStarted // the lookup read .1 and is dialing it
+	store.setAddr("10.0.0.2:50051")
+
+	verified := make(chan struct{})
+	go func() {
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // joins the lookup in flight
+		close(verified)
+	}()
+	waitForObserved(t, r, "host-a", "10.0.0.2:50051")
+	close(dialRelease)
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	<-verified
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "10.0.0.1:50051" || got[1] != "10.0.0.2:50051" {
+		t.Fatalf("dial sequence = %v, want [.1 discarded, .2 published]", got)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want the newer .2", settled)
+	}
+}
+
+// Concurrent reports of the same, unchanged address must cost a cold lookup
+// nothing: equal addresses never conflict, so the lookup publishes on its
+// first attempt and the registry never re-reads or re-dials for them.
+func TestConcurrentSameAddressReportsDoNotDisturbColdLookup(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dials atomic.Int64
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	var once sync.Once
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dials.Add(1)
+		once.Do(func() {
+			close(dialStarted)
+			<-dialRelease // hold the first dial open while the reports land
+		})
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	<-dialStarted
+
+	var verified sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		verified.Add(1)
+		go func() {
+			defer verified.Done()
+			r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a"))
+		}()
+	}
+	for i := 0; i < 100; i++ {
+		runtime.Gosched() // let the reports reach the registry before the dial returns
+	}
+	close(dialRelease)
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v (equivalent reports must not disturb the lookup)", err)
+	}
+	verified.Wait()
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("dials = %d, want 1 (no report contradicted the lookup's read)", n)
+	}
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads = %d, want 1", n)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.1:50051" {
+		t.Fatalf("settled address = %q", settled)
+	}
+}
+
+// An address the registry has held before is not an already-handled report:
+// the cached client moved to .2 through an ordinary refresh, an older lookup
+// has read .2 and not yet acted on it, and a newer read reports the host
+// back at .1. The report must win, whatever the registry has seen
+// historically: the older lookup re-reads instead of publishing .2 again.
+func TestMarkVerifiedReusedAddressStillSupersedesOlderLookup(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	store.setAddr("10.0.0.2:50051")
+	time.Sleep(2 * time.Millisecond)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // refresh adopts .2
+		t.Fatalf("refresh: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("after refresh settled = %q, want .2", settled)
+	}
+
+	// Lease due again: the next lookup reads .2 and is held inside that read
+	// (the store captured .2 before it blocked), so it has not acted on it.
+	time.Sleep(2 * time.Millisecond)
+	gate := make(chan struct{})
+	store.setGate(gate)
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("older lookup never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.setAddr("10.0.0.1:50051") // the host returns to .1 while that read is held
+	verified := make(chan struct{})
+	go func() {
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a"))
+		close(verified)
+	}()
+	waitForObserved(t, r, "host-a", "10.0.0.1:50051")
+	store.setGate(nil)
+	close(gate) // the older read returns .2, which is now contradicted
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	<-verified
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.1:50051" {
+		t.Fatalf("settled address = %q, want the newer .1 (an older lookup of .2 must not win)", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 3 || got[2] != "10.0.0.1:50051" {
+		t.Fatalf("dial sequence = %v, want [.1, .2, .1 re-read and published]", got)
+	}
+}
+
+// The renew-in-place shortcut is not exempt: the cached client is at .1, an
+// older lookup read the host at .2 and is dialing, and a newer read reports
+// .1 again. Renewing .1 is right, but the older lookup must not then publish
+// .2 over it.
+func TestMarkVerifiedSameAddressStillSupersedesOlderConflictingLookup(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dialStarted := make(chan struct{})
+	dialRelease := make(chan struct{})
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		if addr == "10.0.0.2:50051" {
+			close(dialStarted)
+			<-dialRelease
+		}
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	store.setAddr("10.0.0.2:50051")
+	time.Sleep(2 * time.Millisecond)
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a") // reads .2, dials it
+		lookup <- err
+	}()
+	<-dialStarted
+	store.setAddr("10.0.0.1:50051")
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // matches the cached client: renews
+	close(dialRelease)
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.1:50051" {
+		t.Fatalf("settled address = %q, want .1 (the older .2 lookup must re-read, not publish)", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	// The conflict dropped the cached .1 (it was in doubt), so the confirming
+	// re-read dials .1 afresh rather than renewing it: .2 is never published.
+	if len(got) != 3 || got[1] != "10.0.0.2:50051" || got[2] != "10.0.0.1:50051" {
+		t.Fatalf("dial sequence = %v, want [.1, .2 discarded, .1 re-dialed after confirmation]", got)
+	}
+}
+
+func settledAddr(r *Registry, hostID string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.clients[hostID].addr
+}
+
+// waitForObserved blocks until the registry's last report for hostID is
+// addr, i.e. the report under test has been recorded.
+func waitForObserved(t *testing.T, r *Registry, hostID, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r.mu.RLock()
+		got := r.reported[hostID]
+		r.mu.RUnlock()
+		if got == addr {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("report of %s never recorded (latest is %q)", addr, got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Start time says nothing about snapshot order: a row read that started
+// first can execute last. Here the registry's due recheck is delayed before
+// it reads, a capability read executed in the meantime reports the old
+// address, the host moves, and the delayed read then sees the NEW address.
+// That read is the newer snapshot and must be kept — nothing may discard it
+// on the grounds that another read "started later".
+func TestDelayedLookupThatReadsTheNewerAddressIsKept(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond) // lease due: the next ClientFor re-reads
+
+	delay := make(chan struct{})
+	store.setDelay(delay)
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 2 { // the recheck has started its read and is held before it
+		if time.Now().After(deadline) {
+			t.Fatal("recheck never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // executed first: still .1
+	store.setAddr("10.0.0.2:50051")                                                          // the host moves
+	store.setDelay(nil)
+	close(delay) // the delayed read now executes and sees .2
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2 (the later-executed read is the newer snapshot)", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 2 || got[1] != "10.0.0.2:50051" {
+		t.Fatalf("dial sequence = %v, want [.1, .2]", got)
+	}
+	// The report landed inside the read's window and disagreed with what the
+	// read returned, so the resolution read once more before publishing:
+	// prime, the delayed read, and that confirming read. The next dispatch
+	// then goes to .2 with no further read.
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("post-settle ClientFor: %v", err)
+	}
+	if n := store.readCount(); n != 3 {
+		t.Fatalf("reads = %d, want 3 (prime, delayed read, confirming re-read)", n)
+	}
+}
+
+// A report that arrives while a cold read is in flight is ambiguous: the
+// read may have captured an older snapshot. The registry must not publish
+// what the read saw when the report disagrees with it; it reads again, and
+// the address the read discarded is never dialed.
+func TestReportDuringColdReadForcesReRead(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	gate := make(chan struct{})
+	store.setGate(gate) // the read captures .1 and is held before it returns
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("cold lookup never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.setAddr("10.0.0.2:50051")
+	verified := make(chan struct{})
+	go func() {
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // joins the lookup in flight
+		close(verified)
+	}()
+	waitForObserved(t, r, "host-a", "10.0.0.2:50051")
+	store.setGate(nil)
+	close(gate) // the held read now returns the stale .1
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	<-verified
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "10.0.0.2:50051" {
+		t.Fatalf("dialed = %v, want only .2 (the stale read must not be dialed)", got)
+	}
+}
+
+// The renew-in-place path is not exempt from that window: the cached client
+// is at .1, a due read has captured .2 and is held, the host returns to .1,
+// and a report of .1 arrives. The read must not publish .2 over the
+// verified .1; it re-reads and lands on .1 with no new dial.
+func TestReportDuringReadAfterAddressReturns(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond) // lease due
+	store.setAddr("10.0.0.2:50051")
+	gate := make(chan struct{})
+	store.setGate(gate) // the recheck captures .2 and is held before it returns
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("recheck never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.setAddr("10.0.0.1:50051")                                                          // the host returns to .1
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // matches the cached client: renews
+	store.setGate(nil)
+	close(gate) // the held read now returns .2
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.1:50051" {
+		t.Fatalf("settled address = %q, want the verified .1", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	// The conflict dropped the cached .1 (in doubt until confirmed), so the
+	// re-read dials .1 again; .2 is never dialed.
+	if len(got) != 2 || got[1] != "10.0.0.1:50051" {
+		t.Fatalf("dialed = %v, want [.1, .1 re-dialed after confirmation] and never .2", got)
+	}
+}
+
+// A conflict must not leave the doubted client behind as a fallback. The
+// cached client is at .1, a due read captures .2 and is held, a report of .1
+// renews the client, the held read returns .2 — a conflict — and the
+// confirming re-read then fails. Nothing may dispatch through .1: not this
+// resolution via its within-lease fallback, and not a concurrent request.
+// Once reads work again the registry lands on the row's answer.
+func TestConflictDropsCachedClientSoFailedConfirmationFailsClosed(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	r.recheck = time.Millisecond
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil { // .1
+		t.Fatalf("prime: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond) // lease due
+	store.setAddr("10.0.0.2:50051")
+	gate := make(chan struct{})
+	store.setGate(gate) // the recheck captures .2 and is held
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("recheck never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // renews .1
+	store.setFailRead(true)                                                                  // the confirming re-read will fail
+	store.setGate(nil)
+	close(gate) // the held read returns .2: a conflict
+
+	if err := <-lookup; err == nil {
+		t.Fatal("resolution returned a client after its confirming read failed; want fail closed")
+	}
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("a concurrent ClientFor was served the doubted client; want fail closed")
+	}
+	mu.Lock()
+	n := len(dialed)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("dials = %d, want only the priming dial while the address is in doubt", n)
+	}
+
+	store.setFailRead(false)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor once reads work: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2 (the row's answer)", settled)
+	}
+}
+
+// Two reports that disagree with each other inside a read's window leave the
+// address in doubt even when the later one happens to echo the read. A cold
+// read captures .1 and is held; the host moves to .2 and a report says so;
+// a stale report of .1 arrives after it; the held read returns .1. The
+// registry must confirm rather than trust the echo, and lands on .2.
+func TestConflictingReportsDoNotHideEachOther(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var mu sync.Mutex
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	gate := make(chan struct{})
+	store.setGate(gate) // the cold read captures .1 and is held
+	lookup := make(chan error, 1)
+	go func() {
+		_, err := r.ClientFor(context.Background(), "host-a")
+		lookup <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.readCount() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("cold lookup never reached its read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	store.setAddr("10.0.0.2:50051")
+	var reports sync.WaitGroup
+	reports.Add(2)
+	go func() {
+		defer reports.Done()
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // current
+	}()
+	waitForObserved(t, r, "host-a", "10.0.0.2:50051")
+	go func() {
+		defer reports.Done()
+		r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // stale, delivered late
+	}()
+	waitForObserved(t, r, "host-a", "10.0.0.1:50051")
+	store.setGate(nil)
+	close(gate) // the held read returns .1, matching the stale report
+
+	if err := <-lookup; err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	reports.Wait()
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2 (a stale echo must not hide the conflicting report)", settled)
+	}
+	mu.Lock()
+	got := append([]string(nil), dialed...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "10.0.0.2:50051" {
+		t.Fatalf("dialed = %v, want only .2", got)
+	}
+}
+
+// Reports from unlocked reads can finish out of order across a move: a
+// report of .2 dials .2 cold, then a stale report of .1 arrives. The stale
+// report disagrees with the previous one, so it must not be dialed unread:
+// the row is read, still says .2, and .2 stays. A second stale .1 report
+// disagrees with the cached .2 and is likewise confirmed by a read, never
+// dialed.
+func TestSequentialConflictingReportsAreConfirmedByARead(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.2:50051"}
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dialed = append(dialed, addr)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.2:50051", r.Generation("host-a")) // cold: read, then dialed
+	if n := store.readCount(); n != 1 {
+		t.Fatalf("reads after the cold report = %d, want 1", n)
+	}
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // stale, out of order
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("after the stale report settled = %q, want .2 confirmed by the row", settled)
+	}
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads after the stale report = %d, want 2 (the confirmation)", n)
+	}
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")) // stale again
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("after the second stale report settled = %q, want .2", settled)
+	}
+	for _, d := range dialed {
+		if d == "10.0.0.1:50051" {
+			t.Fatalf("dialed = %v; the stale address must never be dialed", dialed)
+		}
+	}
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+}
+
+// An ordinary resolution against a failing row read costs two reads and no
+// more; the third attempt exists for a seeded dial or a conflict re-read.
+func TestOrdinaryLookupFailureUsesTwoReads(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051", failRead: true}
+	dial := func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil }
+	r := New(db.New(store), dial)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err == nil {
+		t.Fatal("ClientFor succeeded against a failing row read")
+	}
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads = %d, want 2", n)
+	}
+}
+
+// A report from before an invalidation is stale by construction: the
+// reclaim that bumped the generation is newer than whatever it read. The
+// caller captured the generation before its read, so the registry discards
+// the report and the next dispatch resolves from the row.
+func TestMarkVerifiedFromBeforeInvalidateIsDiscarded(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051"}
+	var dialed []string
+	dial := func(_, addr string, _ func()) (vmdclient.Client, error) {
+		dialed = append(dialed, addr)
+		return nil, nil
+	}
+	r := New(db.New(store), dial)
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	gen := r.Generation("host-a") // captured before a read that saw .1
+	store.setAddr("10.0.0.2:50051")
+	r.Invalidate("host-a")                                                // the reclaim to .2 commits
+	r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", gen) // that read, delivered late
+	if _, ok := func() (entry, bool) { r.mu.RLock(); defer r.mu.RUnlock(); e, ok := r.clients["host-a"]; return e, ok }(); ok {
+		t.Fatal("a report from before the invalidation repopulated the client")
+	}
+	if _, err := r.ClientFor(context.Background(), "host-a"); err != nil {
+		t.Fatalf("ClientFor: %v", err)
+	}
+	if settled := settledAddr(r, "host-a"); settled != "10.0.0.2:50051" {
+		t.Fatalf("settled address = %q, want .2 from the row", settled)
+	}
+	if want := []string{"10.0.0.1:50051", "10.0.0.2:50051"}; fmt.Sprint(dialed) != fmt.Sprint(want) {
+		t.Fatalf("dialed = %v, want %v (the stale .1 must not be dialed again)", dialed, want)
+	}
+}
+
+// A cold host whose row cannot be read fails MarkVerified with the
+// resolution's own read budget, and the error is returned so the caller
+// does not run the same resolution again at dispatch.
+func TestMarkVerifiedColdFailureIsReturned(t *testing.T) {
+	store := &hostDB{addr: "10.0.0.1:50051", failRead: true}
+	r := New(db.New(store), func(_, _ string, _ func()) (vmdclient.Client, error) { return nil, nil })
+
+	if err := r.MarkVerified(context.Background(), "host-a", "10.0.0.1:50051", r.Generation("host-a")); err == nil {
+		t.Fatal("MarkVerified returned nil for an unreadable row")
+	}
+	if n := store.readCount(); n != 2 {
+		t.Fatalf("reads = %d, want 2 (one resolution's failure budget)", n)
+	}
+}

@@ -15,6 +15,10 @@ WHERE team_id = $1 AND name = $2 AND deleted_at IS NULL;
 SELECT * FROM secret
 WHERE team_id = $1 AND name = ANY($2::text[]) AND deleted_at IS NULL;
 
+-- name: GetSecretsByIDs :many
+SELECT * FROM secret
+WHERE team_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL;
+
 -- name: GetSecretByID :one
 SELECT * FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
@@ -63,9 +67,28 @@ RETURNING *;
 -- check and insert serialize across API instances, not just the in-process lock.
 SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
 
--- name: AddSandboxSecret :exec
+-- name: HoldSandboxSecretWrites :exec
+-- The same lock, held by the session until released: an attach keeps it
+-- through its guest update, which no transaction should stay open across.
+SELECT pg_advisory_lock(hashtext($1)::bigint);
+
+-- name: ReleaseSandboxSecretWrites :one
+SELECT pg_advisory_unlock(hashtext($1)::bigint);
+
+-- name: AddSandboxSecret :execrows
+-- FOR UPDATE on the sandbox row, taken before the insert because the insert
+-- depends on it, serializes this against every destroy path. A destroy that
+-- already committed leaves `live` empty, so nothing is bound and 0 rows come
+-- back — the caller must not mint a JWT for a sandbox that no longer exists. A
+-- destroy that has not started blocks until this commits, by which point the
+-- had_secret_bindings trigger has fired, so it still writes the revocation.
+WITH live AS (
+  SELECT s.id AS sandbox_id FROM sandbox s
+  WHERE s.id = sqlc.arg(sandbox_id) AND s.destroyed_at IS NULL
+  FOR UPDATE
+)
 INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-VALUES ($1, $2, $3, $4);
+SELECT live.sandbox_id, sqlc.arg(secret_id), sqlc.arg(env_key), sqlc.narg(proxy_token) FROM live;
 
 -- name: ClaimSandboxSecretProxyToken :one
 -- Persist a proxy token minted on the fly for a legacy (NULL-token) binding.
@@ -103,13 +126,20 @@ ORDER BY ss.env_key;
 
 -- name: ListSandboxSecretBindingMeta :many
 -- Per-binding auth shape, hosts, and proxy token for a sandbox; excludes
--- soft-deleted secrets.
+-- soft-deleted secrets. Keys detached and not bound again follow, marked
+-- detached and with nothing else: the guest may still hold them.
 SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
-       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
+       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts, false AS detached
 FROM sandbox_secret ss
 JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
-ORDER BY ss.env_key;
+UNION ALL
+SELECT '00000000-0000-0000-0000-000000000000'::uuid, d.env_key, NULL::text,
+       ''::text, '{}'::jsonb, NULL::text, NULL::text[], true
+FROM sandbox_secret_detached d
+WHERE d.sandbox_id = $1
+  AND NOT EXISTS (SELECT 1 FROM sandbox_secret x WHERE x.sandbox_id = $1 AND x.env_key = d.env_key)
+ORDER BY env_key;
 
 -- name: ListSandboxesForSecret :many
 -- Returns (sandbox_id, host_id) for non-destroyed sandboxes bound to this secret.
@@ -162,3 +192,24 @@ WHERE pa.secret_id = sqlc.arg('secret_id')
   AND pa.status <= sqlc.arg('status_max')::int
 ORDER BY pa.id DESC
 LIMIT sqlc.arg('row_limit');
+
+-- name: RecordDetachedSecretKey :exec
+INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, $2)
+ON CONFLICT (sandbox_id, env_key) DO UPDATE SET detached_at = now();
+
+-- name: PruneDetachedSecretKeys :exec
+-- Keeps the most recent detached keys only, so what a snapshot records
+-- stays bounded however many keys a sandbox churns through.
+DELETE FROM sandbox_secret_detached d
+WHERE d.sandbox_id = sqlc.arg('sandbox_id')::uuid AND d.env_key IN (
+  SELECT k.env_key FROM sandbox_secret_detached k
+  WHERE k.sandbox_id = sqlc.arg('sandbox_id')::uuid
+  ORDER BY k.detached_at DESC, k.env_key
+  OFFSET sqlc.arg('keep')::int
+);
+
+-- name: ForgetDetachedSecretKey :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2;
+
+-- name: ForgetDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY(@env_keys::text[]);

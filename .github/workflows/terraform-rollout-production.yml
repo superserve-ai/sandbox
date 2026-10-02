@@ -1,5 +1,12 @@
 name: Terraform Rollout Production
 
+# Serialize manual infrastructure applies with API deployments and the
+# staged control-plane identity migration.
+concurrency:
+  group: control-plane-deploy
+  queue: max
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +23,9 @@ on:
           - central1
           - all
 
+env:
+  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
+
 jobs:
   west2:
     name: Apply production us-west2
@@ -28,6 +38,8 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       API_BASE_URL: https://usw-api.superserve.ai
       API_KEY: ${{ secrets.SS_TEST_API_KEY_USW }}
       SANDBOX_BASE_URL: https://usw-sandbox.superserve.ai
@@ -57,6 +69,17 @@ jobs:
           command -v jq
           command -v curl
 
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Bootstrap credentials key IAM
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra/envs/production/us-central1 init -input=false
+          terraform -chdir=infra/envs/production/us-central1 plan -input=false \
+            -target=google_project_iam_member.cd_credentials_key_iam -out=cd-key.tfplan
+          terraform -chdir=infra/envs/production/us-central1 apply -input=false -auto-approve cd-key.tfplan
+          python3 .github/workflows/scripts/wait_credentials_key_iam.py --project "${{ vars.GCP_PROJECT }}"
+
       - name: Terraform apply production/us-west2
         run: |
           set -euo pipefail
@@ -65,6 +88,8 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-usw2
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform apply -input=false -auto-approve tfplan
 
       - name: Smoke test production/us-west2
@@ -85,6 +110,7 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       API_BASE_URL: https://usc-api.superserve.ai
       API_KEY: ${{ secrets.SS_TEST_API_KEY_USEAST }}
       SANDBOX_BASE_URL: https://usc-sandbox.superserve.ai
@@ -122,6 +148,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-us-central1
           terraform apply -input=false -auto-approve tfplan
 
       - name: Smoke test production/us-central1

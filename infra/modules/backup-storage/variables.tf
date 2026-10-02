@@ -29,6 +29,12 @@ variable "writer_members" {
   type        = list(string)
 }
 
+variable "reader_members" {
+  description = "IAM members (serviceAccount:... form) granted managed-folder template and shared-base object read/list access. Keep this list to same-cell control-plane readers; no write or delete permission is implied."
+  type        = list(string)
+  default     = []
+}
+
 variable "restore_service_account_id" {
   description = "Account ID for the dedicated read-only restore service account. Nothing runs as it; restore tooling impersonates it via out-of-band grants."
   type        = string
@@ -62,7 +68,7 @@ variable "noncurrent_version_retention_days" {
 }
 
 variable "kms_key_name" {
-  description = "Optional CMEK key resource name for bucket default encryption. Must be in the bucket's location; null uses Google-managed encryption. Prerequisite: the project's Cloud Storage service agent must already hold roles/cloudkms.cryptoKeyEncrypterDecrypter on the key, or bucket creation and object writes fail. That grant is managed out-of-band, like the other KMS grants in this repo — the CD Terraform SA cannot set KMS IAM policy."
+  description = "Optional CMEK key resource name for bucket default encryption. Must be in the bucket's location; null uses Google-managed encryption. Prerequisite: the project's Cloud Storage service agent must already hold roles/cloudkms.cryptoKeyEncrypterDecrypter on the key, or bucket creation and object writes fail. That grant is managed out-of-band; the CD permission on credentials-kek does not authorize IAM changes on a separate backup key."
   type        = string
   default     = null
 }

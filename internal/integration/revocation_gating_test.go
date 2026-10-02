@@ -1,0 +1,155 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/superserve-ai/sandbox/internal/db"
+)
+
+func revocationExists(t *testing.T, sandboxID uuid.UUID) bool {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM sandbox_revocation WHERE sandbox_id = $1`, sandboxID,
+	).Scan(&n); err != nil {
+		t.Fatalf("count revocations for %s: %v", sandboxID, err)
+	}
+	return n > 0
+}
+
+func seedSecret(t *testing.T, teamID uuid.UUID) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := testPool.QueryRow(context.Background(),
+		`INSERT INTO secret (team_id, name, auth_type, hosts, ciphertext, encrypted_dek, kek_id)
+		 VALUES ($1, $2, 'bearer', ARRAY['example.com'], '\x00'::bytea, '\x00'::bytea, 'test-kek')
+		 RETURNING id`,
+		teamID, "sec-"+uuid.New().String()[:8],
+	).Scan(&id); err != nil {
+		t.Fatalf("seed secret: %v", err)
+	}
+	return id
+}
+
+func destroy(t *testing.T, teamID, sandboxID uuid.UUID) {
+	t.Helper()
+	if _, err := testQueries.DestroySandbox(context.Background(), db.DestroySandboxParams{
+		ID:                      sandboxID,
+		TeamID:                  teamID,
+		StaleTransitionalBefore: time.Now(),
+		RevocationExpiresAt:     time.Now().Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("destroy %s: %v", sandboxID, err)
+	}
+}
+
+// Destroy writes a revocation only for sandboxes that ever had a secret
+// binding: the proxy consults that set only after a secrets JWT authenticates,
+// and a JWT is minted only for bound sandboxes. Revoking the rest accumulated
+// entries no request could ever match.
+func TestIntegration_DestroyRevokesOnlySecretsSandboxes(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	// false is what the create queries write for a sandbox with no secrets;
+	// insertSandboxAt does not set the column, so set it as a real create would.
+	plain := insertSandboxAt(t, teamID, "plain-"+uuid.New().String()[:8], "active", time.Now())
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET had_secret_bindings = false WHERE id = $1`, plain); err != nil {
+		t.Fatalf("mark unbound: %v", err)
+	}
+	destroy(t, teamID, plain)
+	if revocationExists(t, plain) {
+		t.Error("sandbox that never had a binding was revoked; the set grows with every delete")
+	}
+
+	bound := insertSandboxAt(t, teamID, "bound-"+uuid.New().String()[:8], "active", time.Now())
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET had_secret_bindings = true WHERE id = $1`, bound); err != nil {
+		t.Fatalf("mark bound: %v", err)
+	}
+	destroy(t, teamID, bound)
+	if !revocationExists(t, bound) {
+		t.Error("sandbox that had a binding was NOT revoked; a leaked JWT would stay valid")
+	}
+
+	// NULL is a row predating the column: binding history is unknowable, so it
+	// must still revoke. Guessing "no" would leave a leaked JWT valid.
+	// insertSandboxAt leaves the column unset, which is exactly that state.
+	legacy := insertSandboxAt(t, teamID, "legacy-"+uuid.New().String()[:8], "active", time.Now())
+	destroy(t, teamID, legacy)
+	if !revocationExists(t, legacy) {
+		t.Error("pre-column sandbox was NOT revoked; unknown history must revoke conservatively")
+	}
+}
+
+// Binding a destroyed sandbox must bind nothing and report it. Destroy has
+// already read had_secret_bindings by then, so a JWT minted after it would
+// never be revoked; the caller relies on the row count to stop before minting.
+func TestIntegration_AddSandboxSecretRefusesDestroyedSandbox(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := insertSandboxAt(t, teamID, "gone-"+uuid.New().String()[:8], "active", time.Now())
+	secretID := seedSecret(t, teamID)
+	destroy(t, teamID, sandboxID)
+
+	token := "tok-" + uuid.New().String()[:8]
+	bound, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
+		SandboxID: sandboxID, SecretID: secretID, EnvKey: "API_KEY", ProxyToken: &token,
+	})
+	if err != nil {
+		t.Fatalf("AddSandboxSecret against a destroyed sandbox: %v", err)
+	}
+	if bound != 0 {
+		t.Errorf("rows = %d, want 0 — a destroyed sandbox must not accept a binding", bound)
+	}
+
+	var bindings int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_secret WHERE sandbox_id = $1`, sandboxID).Scan(&bindings); err != nil {
+		t.Fatalf("count bindings: %v", err)
+	}
+	if bindings != 0 {
+		t.Errorf("bindings = %d, want 0", bindings)
+	}
+}
+
+// The marker must survive the binding going away. Detach clears the row, and the
+// mark-failed paths clear all of them, but a JWT may already have been minted
+// and injected — so a live-bindings check would under-revoke exactly there.
+func TestIntegration_SecretsMarkerSurvivesBindingRemoval(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := insertSandboxAt(t, teamID, "detached-"+uuid.New().String()[:8], "active", time.Now())
+	// Start from false, as a secretless create writes: NULL would revoke on its
+	// own and the assertion below could not fail for the right reason.
+	if _, err := testPool.Exec(ctx,
+		`UPDATE sandbox SET had_secret_bindings = false WHERE id = $1`, sandboxID); err != nil {
+		t.Fatalf("mark unbound: %v", err)
+	}
+
+	secretID := seedSecret(t, teamID)
+
+	token := "tok-" + uuid.New().String()[:8]
+	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{
+		SandboxID: sandboxID, SecretID: secretID, EnvKey: "API_KEY", ProxyToken: &token,
+	}); err != nil {
+		t.Fatalf("AddSandboxSecret: %v", err)
+	}
+
+	// Clear every binding, as the mark-failed paths do.
+	if err := testQueries.DeleteSandboxSecrets(ctx, sandboxID); err != nil {
+		t.Fatalf("DeleteSandboxSecrets: %v", err)
+	}
+
+	destroy(t, teamID, sandboxID)
+	if !revocationExists(t, sandboxID) {
+		t.Error("marker did not survive binding removal; a JWT minted earlier would stay valid")
+	}
+}

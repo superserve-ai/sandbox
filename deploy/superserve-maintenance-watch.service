@@ -1,0 +1,7 @@
+[Unit]
+Description=GCE host maintenance notice watcher
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/sandbox/maintenance-watch.env
+ExecStart=/usr/local/bin/maintenance-watch

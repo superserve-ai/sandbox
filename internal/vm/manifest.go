@@ -26,8 +26,10 @@ type ManifestEntry struct {
 	FileName  string
 	Path      string
 	SizeBytes int64
-	SHA256    string
-	BasePath  string
+	// -1 means allocation metadata was unavailable; zero is a valid measurement.
+	AllocatedBytes int64
+	SHA256         string
+	BasePath       string
 	// BaseStagedPath is the staged snapshot to READ the base from when
 	// staging captured one; BasePath remains the recorded identity.
 	BaseStagedPath string
@@ -36,6 +38,18 @@ type ManifestEntry struct {
 	// same path changes the effective filesystem under an unchanged
 	// overlay, and only the content digest makes that a new generation.
 	BaseSHA256 string
+}
+
+func allocatedBytes(path string) (int64, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return st.Blocks * 512, true
 }
 
 const (
@@ -84,6 +98,30 @@ func hashFile(ctx context.Context, path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
+// overlayBlockMapPath is where Firecracker saves an overlay drive's block
+// map beside the snapshot. A cold boot of the disk takes it as the
+// authoritative record of which blocks the overlay holds.
+func overlayBlockMapPath(snapshotPath string) string {
+	return snapshotPath + ".overlay"
+}
+
+// collectVMStateEntry hashes ONLY the vmstate file: tens of KB, sub
+// millisecond, safe on the pause RPC path. Everything size-dependent
+// (overlay, base) is the async worker's job; the control plane treats
+// the resulting manifest as partial, exactly like a budget-exhausted
+// hash always did.
+func collectVMStateEntry(ctx context.Context, snapshotPath string, log zerolog.Logger) []ManifestEntry {
+	if snapshotPath == "" {
+		return nil
+	}
+	sum, size, err := hashFile(ctx, snapshotPath)
+	if err != nil {
+		log.Warn().Err(err).Str("path", snapshotPath).Msg("vmstate hash failed; manifest empty")
+		return nil
+	}
+	return []ManifestEntry{{FileName: "vmstate.snap", Path: snapshotPath, SizeBytes: size, SHA256: sum}}
+}
+
 // collectPauseManifest hashes a pause's durable artifacts: the disk state
 // (what the backup tier uploads) plus vmstate.snap (small, cheap local
 // integrity). Memory files are deliberately absent: they never leave the
@@ -101,7 +139,15 @@ func hashFile(ctx context.Context, path string) (string, int64, error) {
 // budget or fails to hash is likewise skipped with a warning rather than
 // failing the pause; the control plane never publishes a partial total as
 // the snapshot size.
-func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBasePath string, log zerolog.Logger) []ManifestEntry {
+//
+// diskBasePath is what actually gets read for the base digest: the
+// pause-time pin when the staged flow has one, the shared original
+// otherwise. diskBaseKeyPath is what the digest cache and coalescing
+// group key on, always the shared original regardless of which one
+// diskBasePath is — a batch of overlay pauses against the same template
+// each mint their own unique pin, and keying on that would make every
+// one of them pay its own full-base hash instead of sharing one.
+func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBasePath, diskBaseKeyPath string, log zerolog.Logger) []ManifestEntry {
 	budget, ok := hashBudget(ctx)
 	if !ok {
 		log.Warn().Msg("pause manifest: no hashing budget left before RPC deadline, skipping")
@@ -111,38 +157,50 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 	defer cancel()
 
 	start := time.Now()
-	entries := make([]ManifestEntry, 0, 2)
-	add := func(name, path, basePath string) {
+	entries := make([]ManifestEntry, 0, 3)
+	add := func(name, path, basePath, baseKeyPath string) bool {
 		if path == "" {
-			return
+			return false
 		}
-		sum, size, err := hashFile(hctx, path)
+		sum, size, err := backup.HashFileApparent(hctx, path)
 		if err != nil {
 			log.Warn().Err(err).Str("path", path).Msg("pause manifest: hash failed, entry skipped")
-			return
+			return false
+		}
+		allocated := int64(-1)
+		if value, ok := allocatedBytes(path); ok {
+			allocated = value
 		}
 		var baseSum string
 		if basePath != "" {
-			baseSum, err = baseDigest(hctx, basePath)
+			baseSum, err = baseDigest(hctx, basePath, baseKeyPath)
 			if err != nil {
 				log.Warn().Err(err).Str("path", basePath).
 					Msg("pause manifest: base digest failed, entry skipped")
-				return
+				return false
 			}
 		}
 		entries = append(entries, ManifestEntry{
-			FileName:   name,
-			Path:       path,
-			SizeBytes:  size,
-			SHA256:     sum,
-			BasePath:   basePath,
-			BaseSHA256: baseSum,
+			FileName:       name,
+			Path:           path,
+			SizeBytes:      size,
+			AllocatedBytes: allocated,
+			SHA256:         sum,
+			BasePath:       basePath,
+			BaseSHA256:     baseSum,
 		})
+		return true
 	}
 	// vmstate first: tiny and guaranteed inside any budget, so even a
 	// budget-exhausted pause records something verifiable.
-	add("vmstate.snap", snapshotPath, "")
-	add("rootfs.ext4", diskPath, diskBasePath)
+	add("vmstate.snap", snapshotPath, "", "")
+	// A saved map that cannot be hashed leaves the manifest incomplete, so
+	// the pause stays pending rather than publishing a generation without
+	// the map its disk was saved with.
+	if p := overlayBlockMapPath(snapshotPath); snapshotPath != "" && diskBasePath != "" && statRegularFile(p) && !add(backup.BlockMapName, p, "", "") {
+		return entries
+	}
+	add("rootfs.ext4", diskPath, diskBasePath, diskBaseKeyPath)
 	log.Info().
 		Int("files", len(entries)).
 		Int64("manifest_hash_ms", time.Since(start).Milliseconds()).
@@ -180,17 +238,65 @@ var baseDigestCache sync.Map
 // base must produce one hash, not one per pause.
 var baseDigestGroup singleflight.Group
 
-// baseDigest returns the content digest of a base image, cached. The
-// identity is re-checked after hashing: a base swapped mid-hash yields
-// an error (and an incomplete manifest, which the retry path owns)
-// rather than a digest describing bytes of two different files.
-func baseDigest(ctx context.Context, path string) (string, error) {
-	key, err := baseIdentity(path)
+// baseDigest returns the content digest of a base image, cached and
+// coalesced by keyPath while the bytes are actually read from readPath.
+// These differ for a staged pause: readPath is the pause-time pin (a
+// hard link, unique per pause and immutable), keyPath is the shared
+// template original every pause of that template has in common. Keying
+// the cache on readPath instead would make each pin its own cache entry
+// and defeat coalescing entirely — a batch of overlay pauses against one
+// cold base would each pay their own full hash instead of sharing one.
+//
+// The identity is re-checked against keyPath after hashing only when
+// readPath == keyPath (no pin): that guards against the shared original
+// mutating mid-hash, a race a hard-linked pin cannot have, since its
+// bytes cannot change out from under it. Skipping the recheck when
+// pinned also means a keyPath deleted after the read (template GC) is
+// not treated as an error — the bytes this call already has came from
+// the pin, not the now-gone original.
+func baseDigest(ctx context.Context, readPath, keyPath string) (string, error) {
+	key, err := baseIdentity(keyPath)
 	if err != nil {
-		return "", err
+		if readPath == keyPath {
+			return "", err
+		}
+		// The shared original can be gone (template GC after a destroy)
+		// even though the pause-time pin at readPath still holds valid,
+		// unchanged bytes: key on the pin instead. This hash then isn't
+		// shared with sibling pauses of the same template, but it must
+		// still succeed — surviving exactly this is the whole reason a
+		// pin exists.
+		key, err = baseIdentity(readPath)
+		if err != nil {
+			return "", err
+		}
 	}
 	if v, ok := baseDigestCache.Load(key); ok {
 		return v.(string), nil
+	}
+	if readPath != keyPath {
+		// Cache miss under keyPath's identity, about to hash readPath and
+		// store under key. keyPath may have been replaced (new content
+		// at the same shared path) after this pause pinned the old
+		// inode but before this worker got around to hashing it;
+		// baseIdentity's string always differs between readPath and
+		// keyPath (it embeds the path itself), so it can't be compared
+		// directly — stat both and check they're still the same
+		// underlying file instead. Trusting keyPath's identity as the
+		// cache key without this would cache readPath's (old) bytes
+		// under the replacement base's key, silently poisoning every
+		// future pause of the new base. Only worth doing on a miss: a
+		// cache hit under keyPath's current identity is trustworthy on
+		// its own and needs no comparison against readPath at all.
+		if same, serr := sameFile(readPath, keyPath); serr != nil || !same {
+			key, err = baseIdentity(readPath)
+			if err != nil {
+				return "", err
+			}
+			if v, ok := baseDigestCache.Load(key); ok {
+				return v.(string), nil
+			}
+		}
 	}
 	// DoChan rather than Do: a joiner must honor its own hash budget. A
 	// synchronous pause joining a hash started under the async rehash's
@@ -204,16 +310,18 @@ func baseDigest(ctx context.Context, path string) (string, error) {
 		}
 		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseRehashBudget)
 		defer cancel()
-		sum, _, err := hashFile(hctx, path)
+		sum, _, err := backup.HashFileApparent(hctx, readPath)
 		if err != nil {
 			return "", err
 		}
-		after, err := baseIdentity(path)
-		if err != nil {
-			return "", err
-		}
-		if after != key {
-			return "", fmt.Errorf("base image %s changed while hashing", path)
+		if readPath == keyPath {
+			after, err := baseIdentity(keyPath)
+			if err != nil {
+				return "", err
+			}
+			if after != key {
+				return "", fmt.Errorf("base image %s changed while hashing", keyPath)
+			}
 		}
 		baseDigestCache.Store(key, sum)
 		return sum, nil
@@ -244,6 +352,22 @@ func baseIdentity(path string) (string, error) {
 	// change is visible there.
 	return fmt.Sprintf("%s|%d|%d|%d|%d|%d",
 		path, st.Dev, st.Ino, fi.Size(), fi.ModTime().UnixNano(), st.Ctim.Nano()), nil
+}
+
+// sameFile reports whether a and b currently identify the same inode
+// (os.SameFile is dev+ino based, so it's a definitive answer, unlike
+// comparing two baseIdentity strings which always differ on the
+// embedded path even for hard links to one file).
+func sameFile(a, b string) (bool, error) {
+	fa, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(fa, fb), nil
 }
 
 // collectBuildManifest hashes every artifact file in a completed build's
@@ -287,17 +411,22 @@ func collectBuildManifest(ctx context.Context, snapshotDir string, extraPaths []
 			return
 		}
 		seen[name] = path
-		sum, size, err := hashFile(hctx, path)
+		sum, size, err := backup.HashFileApparent(hctx, path)
 		if err != nil {
 			log.Warn().Err(err).Str("path", path).Msg("build manifest: hash failed")
 			complete = false
 			return
 		}
+		allocated := int64(-1)
+		if value, ok := allocatedBytes(path); ok {
+			allocated = value
+		}
 		entries = append(entries, ManifestEntry{
-			FileName:  name,
-			Path:      path,
-			SizeBytes: size,
-			SHA256:    sum,
+			FileName:       name,
+			Path:           path,
+			SizeBytes:      size,
+			AllocatedBytes: allocated,
+			SHA256:         sum,
 		})
 	}
 	for _, de := range dirEntries {

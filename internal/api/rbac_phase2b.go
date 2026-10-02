@@ -118,6 +118,10 @@ func customerTeamID(c *gin.Context) (uuid.UUID, error) {
 	return pathTeamID, nil
 }
 
+func customerContextTeamID(c *gin.Context) (uuid.UUID, error) {
+	return teamIDFromContext(c)
+}
+
 func internalTeamID(c *gin.Context) (uuid.UUID, error) {
 	return parseUUIDParam(c, "team_id")
 }

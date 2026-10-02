@@ -20,6 +20,10 @@ resource "google_monitoring_alert_policy" "compute_instance_cpu" {
 
   lifecycle {
     precondition {
+      condition     = contains(keys(var.runbook_urls), "host_cpu")
+      error_message = "Missing required runbook URL for compute_instance_cpu."
+    }
+    precondition {
       condition     = length(var.notification_channel_ids) > 0
       error_message = "notification_channel_ids must contain an existing monitored channel when CPU alerts are configured"
     }
@@ -63,33 +67,117 @@ resource "google_monitoring_alert_policy" "compute_instance_cpu" {
   }
 
   documentation {
-    content = coalesce(each.value.documentation, <<-EOT
+    content = format("%s\n\nRunbook: %s", replace(coalesce(each.value.documentation, <<-EOT
       Sustained CPU utilization above ${format("%.0f", each.value.threshold * 100)}% was observed on ${each.value.instance_name} for ${each.value.evaluation_duration}.
 
       Owner: Infrastructure Operations. Response: confirm host saturation in Cloud Monitoring, inspect running sandbox workload and host services, and scale or drain the host when capacity remains constrained. Record the incident and link the remediation before closing the alert.
     EOT
-    )
+    ), "/(?m)^ *Runbook:[^\\n]*(\\n|$)/", ""), lookup(var.runbook_urls, "host_cpu", ""))
+
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type    = "compute_cpu_saturation"
-    instance_name = each.value.instance_name
-    managed_by    = "terraform"
+    superserve_family         = "host"
+    superserve_component      = "host"
+    superserve_failure_family = "capacity"
+    alert_type                = "compute_cpu_saturation"
+    instance_name             = each.value.instance_name
+    managed_by                = "terraform"
+  })
+}
+
+resource "google_monitoring_alert_policy" "host_maintenance_events" {
+  for_each = var.host_maintenance_event_alerts
+
+  project               = var.project_id
+  display_name          = each.value.display_name
+  combiner              = "OR"
+  enabled               = true
+  notification_channels = var.notification_channel_ids
+
+  lifecycle {
+    precondition {
+      condition     = contains(keys(var.runbook_urls), "host_maintenance")
+      error_message = "Missing required runbook URL for host_maintenance_events."
+    }
+    precondition {
+      condition     = length(var.notification_channel_ids) > 0
+      error_message = "notification_channel_ids must contain an existing monitored channel when host maintenance alerts are configured"
+    }
+    precondition {
+      condition = alltrue([
+        for channel_id in var.notification_channel_ids : can(regex(
+          "^projects/${var.project_id}/notificationChannels/[0-9]+$",
+          channel_id
+        ))
+      ])
+      error_message = "notification_channel_ids must reference monitored channels in the configured project using full resource names"
+    }
+  }
+
+  conditions {
+    display_name = "${each.value.instance_name} host maintenance system event"
+
+    condition_matched_log {
+      filter = <<-EOT
+        logName="projects/${var.project_id}/logs/cloudaudit.googleapis.com%2Fsystem_event"
+        resource.type="gce_instance"
+        resource.labels.instance_id="${each.value.instance_id}"
+        protoPayload.methodName=~"(upcomingMaintenance|terminateOnHostMaintenance|hostError|automaticRestart)"
+      EOT
+    }
+  }
+
+  alert_strategy {
+    # Required on log-based policies; 5 min absorbs the notice/terminate/
+    # restart burst a single maintenance event produces.
+    notification_rate_limit {
+      period = "300s"
+    }
+    auto_close = "86400s"
+  }
+
+  documentation {
+    content = format("%s\n\nRunbook: %s", replace(coalesce(each.value.documentation, <<-EOT
+      Compute Engine logged a host system event for ${each.value.instance_name}: an upcoming maintenance notice, a maintenance termination, a host error, or an automatic restart.
+
+      This instance is bare metal — host maintenance terminates and restarts it, taking every workload on it down. On an upcoming-maintenance notice, check `gcloud compute instances describe ${each.value.instance_name} --format="yaml(resourceStatus.upcomingMaintenance)"` for the window and whether it can be triggered early, and drain the host before the window starts. On a termination/restart event, verify the host and its services recovered.
+
+      Owner: Infrastructure Operations.
+    EOT
+    ), "/(?m)^ *Runbook:[^\\n]*(\\n|$)/", ""), lookup(var.runbook_urls, "host_maintenance", ""))
+
+    mime_type = "text/markdown"
+  }
+
+  user_labels = merge(var.labels, {
+    superserve_family         = "host"
+    superserve_component      = "host"
+    superserve_failure_family = "maintenance"
+    alert_type                = "host_maintenance_event"
+    instance_name             = each.value.instance_name
+    managed_by                = "terraform"
   })
 }
 
 locals {
   observability_contract = {
-    project_id                  = var.project_id
-    environment                 = var.environment
-    notification_email          = var.notification_email
-    notification_channel_ids    = var.notification_channel_ids
-    compute_instance_cpu_alerts = var.compute_instance_cpu_alerts
-    log_buckets                 = var.log_buckets
-    uptime_checks               = var.uptime_checks
-    alert_policies              = var.alert_policies
-    dashboards                  = var.dashboards
-    labels                      = var.labels
+    project_id                    = var.project_id
+    environment                   = var.environment
+    notification_email            = var.notification_email
+    notification_channel_ids      = var.notification_channel_ids
+    compute_instance_cpu_alerts   = var.compute_instance_cpu_alerts
+    host_maintenance_event_alerts = var.host_maintenance_event_alerts
+    backup_alerts                 = var.backup_alerts
+    backup_coverage_alerts        = var.backup_coverage_alerts
+    lifecycle_latency_alerts      = var.lifecycle_latency_alerts
+    failed_sandbox_alert_enabled  = var.failed_sandbox_alert_enabled
+    host_disk_alerts              = var.host_disk_alerts
+    log_buckets                   = var.log_buckets
+    uptime_checks                 = var.uptime_checks
+    alert_policies                = var.alert_policies
+    dashboards                    = var.dashboards
+    labels                        = var.labels
   }
 }

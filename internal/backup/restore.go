@@ -159,23 +159,50 @@ type ProgressFunc func(format string, args ...any)
 // directory as restored. Artifact entries named manifest.json are
 // rejected up front so the marker can never collide.
 func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, progress ProgressFunc) (*GenerationManifest, error) {
+	return restoreGeneration(ctx, r, sandboxID, generation, destDir, nil, nil, progress)
+}
+
+// restoreGeneration is RestoreGeneration with entries skip reports as
+// already satisfied. skip is handed the pinned destination root: an entry
+// it satisfies by materializing something must write it there, through
+// the same handle every other artifact goes through, or a destination
+// swapped for a symlink mid-restore would take that write outside.
+// A manifest the caller has already read and validated is used as given,
+// so a restore costs one manifest request and cannot fail on a second
+// identical one.
+func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, manifest *GenerationManifest, skip func(ManifestFile, *os.Root) bool, progress ProgressFunc) (*GenerationManifest, error) {
 	report := func(format string, args ...any) {
 		if progress != nil {
 			progress(format, args...)
 		}
 	}
-	manifest, err := fetchManifest(ctx, r, sandboxID, generation, report)
-	if err != nil {
-		return nil, err
+	if manifest == nil {
+		fetched, err := fetchManifest(ctx, r, owner, generation, report)
+		if err != nil {
+			return nil, err
+		}
+		manifest = fetched
 	}
-	report("manifest %s/%s: %d files", sandboxID, generation, len(manifest.Files))
+	report("manifest %s/%s: %d files", owner, generation, len(manifest.Files))
 	root, err := openFreshDir(destDir)
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
 	var created []string
+	// publishers holds, per shared base materialized into this destination,
+	// the reader's callback awaiting that file's verdict. Every entry is
+	// consumed exactly once: with the file's own verification result, or
+	// with false when the restore fails for any reason first, so nothing
+	// this restore materialized from can outlive it unverified.
+	publishers := map[string]func(bool) error{}
 	fail := func(err error) (*GenerationManifest, error) {
+		for name, publish := range publishers {
+			if perr := publish(false); perr != nil {
+				report("shared base for %s not discarded: %v", name, perr)
+			}
+			delete(publishers, name)
+		}
 		var cleanupErrs []string
 		for _, name := range created {
 			if rerr := root.Remove(name); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
@@ -193,20 +220,40 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		if err := validSegment(mf.Name); err != nil {
 			return fail(fmt.Errorf("manifest file name: %w", err))
 		}
+		if skip != nil && skip(mf, root) {
+			report("skipping %s: satisfied on the host", mf.Name)
+			continue
+		}
 		report("restoring %s (%d bytes packed, %d apparent)", mf.Name, mf.PackedSize, mf.Size)
-		madeFile, err := restoreFile(ctx, r, sandboxID, generation, mf, root)
+		madeFile, publish, err := restoreFile(ctx, r, owner, generation, mf, root)
 		if madeFile {
 			created = append(created, mf.Name)
 		}
 		if err != nil {
 			return fail(fmt.Errorf("restore %s: %w", mf.Name, err))
 		}
+		if publish != nil {
+			publishers[mf.Name] = publish
+		}
 	}
 	// Verify after every file has materialized so an error part way through
 	// verification cannot leave earlier files implicitly blessed: either
 	// the whole set passes or the whole set is gone.
 	for _, mf := range manifest.Files {
-		if err := verifyFile(ctx, root, mf); err != nil {
+		if skip != nil && skip(mf, root) {
+			continue
+		}
+		err := verifyFile(ctx, root, mf)
+		if publish := publishers[mf.Name]; publish != nil {
+			// This verification is the one that blesses the copy the
+			// reader materialized from; a failure here must also stop it
+			// being reused.
+			delete(publishers, mf.Name)
+			if perr := publish(err == nil); perr != nil {
+				report("shared base %s not cached: %v", mf.SHA256, perr)
+			}
+		}
+		if err != nil {
 			return fail(fmt.Errorf("verify %s: %w", mf.Name, err))
 		}
 		report("verified %s sha256 %s", mf.Name, mf.SHA256)
@@ -345,15 +392,33 @@ func makeDirPortable(dir string) error {
 	return nil
 }
 
-func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation string, report ProgressFunc) (*GenerationManifest, error) {
-	object, err := SandboxObject(sandboxID, generation, ManifestObject)
+// SnapshotOwner names a saved snapshot's backup where a sandbox id would
+// otherwise name the owner.
+func SnapshotOwner(snapshotID string) string { return snapshotOwnerPrefix + snapshotID }
+
+func manifestOwner(m *GenerationManifest) string {
+	if m.SnapshotID != "" {
+		return SnapshotOwner(m.SnapshotID)
+	}
+	return m.SandboxID
+}
+
+func ownerObject(owner, generation, fileName string) (string, error) {
+	if id, ok := strings.CutPrefix(owner, snapshotOwnerPrefix); ok {
+		return SnapshotObject(id, generation, fileName)
+	}
+	return SandboxObject(owner, generation, fileName)
+}
+
+func fetchManifest(ctx context.Context, r BlobReader, owner, generation string, report ProgressFunc) (*GenerationManifest, error) {
+	object, err := ownerObject(owner, generation, ManifestObject)
 	if err != nil {
 		return nil, err
 	}
 	rc, err := r.NewReader(ctx, object)
 	if err != nil {
 		if errors.Is(err, ErrObjectNotFound) {
-			return nil, fmt.Errorf("%s/%s: %w", sandboxID, generation, ErrGenerationIncomplete)
+			return nil, fmt.Errorf("%s/%s: %w", owner, generation, ErrGenerationIncomplete)
 		}
 		return nil, err
 	}
@@ -367,9 +432,10 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 	// The manifest records its own identity; a manifest copied or misplaced
 	// under another prefix could otherwise restore a different sandbox's
 	// generation with every digest passing.
-	if manifest.SandboxID != sandboxID || manifest.Generation != generation {
+	recorded := manifestOwner(&manifest)
+	if recorded != owner || manifest.Generation != generation {
 		return nil, fmt.Errorf("manifest identity mismatch: %s records %s/%s, requested %s/%s",
-			object, manifest.SandboxID, manifest.Generation, sandboxID, generation)
+			object, recorded, manifest.Generation, owner, generation)
 	}
 	// The manifest must also be self-authenticating: the generation prefix
 	// is the content address GenerationKey derives from the enqueued file
@@ -447,6 +513,40 @@ const maxManifestBytes = 64 << 20
 // maxApparentSize bounds a single restored artifact; see validExtents.
 const maxApparentSize = int64(16) << 40
 
+// BaseMaterializer is an optional BlobReader capability: produce the
+// unpacked bytes of a shared base object into dst, typically by cloning a
+// copy the reader already holds. The caller verifies dst afterwards, so an
+// implementation only has to be byte-exact, not trusted. The returned
+// publish callback, when non-nil, is bound to the exact copy dst was
+// materialized from: the restorer calls it with its verification result
+// so the reader may keep that copy for reuse or must discard it. The
+// reader never hashes a base itself.
+type BaseMaterializer interface {
+	MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) (publish func(verified bool) error, err error)
+}
+
+// unpackExtents writes a packed object's extents into dst at their apparent
+// offsets and truncates to the apparent size; the streaming core of
+// restoreFile, shared with base materialization.
+func unpackExtents(ctx context.Context, rc io.Reader, mf ManifestFile, dst *os.File) error {
+	for _, e := range mf.Extents {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(io.NewOffsetWriter(dst, e.Offset), rc, e.Length); err != nil {
+			return fmt.Errorf("extent at %d: %w", e.Offset, err)
+		}
+	}
+	switch n, err := io.CopyN(io.Discard, rc, 1); {
+	case n != 0:
+		extra, _ := io.Copy(io.Discard, rc)
+		return fmt.Errorf("packed object is %d bytes, extent table describes %d", PackedSize(mf.Extents)+1+extra, PackedSize(mf.Extents))
+	case err != nil && !errors.Is(err, io.EOF):
+		return fmt.Errorf("read past extents: %w", err)
+	}
+	return dst.Truncate(mf.Size)
+}
+
 // isSharedEntry reports whether a manifest entry points at a bucket-wide
 // shared object rather than one inside the generation prefix: shared
 // entries record the full object path, generation-local entries a single
@@ -471,12 +571,12 @@ func isSharedEntry(mf ManifestFile) bool {
 // (or a symlink planted in between) is never opened, truncated, or
 // followed. madeFile reports whether this call created the file, and only
 // then may the caller's failure cleanup remove it.
-func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, root *os.Root) (madeFile bool, _ error) {
+func restoreFile(ctx context.Context, r BlobReader, owner, generation string, mf ManifestFile, root *os.Root) (madeFile bool, publish func(bool) error, _ error) {
 	if mf.Object == "" {
-		return false, fmt.Errorf("manifest entry records no object name")
+		return false, nil, fmt.Errorf("manifest entry records no object name")
 	}
 	if err := validExtents(mf); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	var object string
 	if isSharedEntry(mf) {
@@ -487,36 +587,58 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 		// arbitrary bucket object.
 		fp, ok := strings.CutPrefix(mf.Object, SharedBaseObject(mf.SHA256, ""))
 		if !ok || fp == "" || strings.ContainsAny(fp, "/\\") {
-			return false, fmt.Errorf("shared object name %q is not bound to digest %s", mf.Object, mf.SHA256)
+			return false, nil, fmt.Errorf("shared object name %q is not bound to digest %s", mf.Object, mf.SHA256)
 		}
 		object = mf.Object
 	} else {
 		if err := validSegment(mf.Object); err != nil {
-			return false, fmt.Errorf("manifest object name: %w", err)
+			return false, nil, fmt.Errorf("manifest object name: %w", err)
 		}
 		var err error
-		object, err = SandboxObject(sandboxID, generation, mf.Object)
+		object, err = ownerObject(owner, generation, mf.Object)
 		if err != nil {
-			return false, err
+			return false, nil, err
 		}
+	}
+	// A shared base is the same bytes for every sandbox that layers on it.
+	// When the reader can hand out a materialized copy, clone that into
+	// place instead of unpacking the object again: on a reflink filesystem
+	// the clone shares blocks, so a fleet's worth of restores costs one
+	// base on disk rather than one per sandbox. The clone is still verified
+	// below like any other file.
+	if bm, ok := r.(BaseMaterializer); ok && isSharedEntry(mf) {
+		f, err := root.OpenFile(mf.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return false, nil, err
+		}
+		madeFile = true
+		defer f.Close()
+		publish, err := bm.MaterializeBase(ctx, object, mf, f)
+		if err != nil {
+			return madeFile, nil, err
+		}
+		if err := f.Sync(); err != nil {
+			return madeFile, nil, err
+		}
+		return madeFile, publish, f.Close()
 	}
 	rc, err := r.NewReader(ctx, object)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer rc.Close()
 	f, err := root.OpenFile(mf.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	madeFile = true
 	defer f.Close()
 	for _, e := range mf.Extents {
 		if err := ctx.Err(); err != nil {
-			return madeFile, err
+			return madeFile, nil, err
 		}
 		if _, err := io.CopyN(io.NewOffsetWriter(f, e.Offset), rc, e.Length); err != nil {
-			return madeFile, fmt.Errorf("extent at %d: %w", e.Offset, err)
+			return madeFile, nil, fmt.Errorf("extent at %d: %w", e.Offset, err)
 		}
 	}
 	// The packed object must hold exactly the extent table's bytes;
@@ -525,20 +647,20 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 	switch n, err := io.CopyN(io.Discard, rc, 1); {
 	case n != 0:
 		extra, _ := io.Copy(io.Discard, rc)
-		return madeFile, fmt.Errorf("packed object is %d bytes, extent table describes %d", PackedSize(mf.Extents)+1+extra, PackedSize(mf.Extents))
+		return madeFile, nil, fmt.Errorf("packed object is %d bytes, extent table describes %d", PackedSize(mf.Extents)+1+extra, PackedSize(mf.Extents))
 	case err != nil && !errors.Is(err, io.EOF):
-		return madeFile, fmt.Errorf("read past extents: %w", err)
+		return madeFile, nil, fmt.Errorf("read past extents: %w", err)
 	}
 	if err := f.Truncate(mf.Size); err != nil {
-		return madeFile, err
+		return madeFile, nil, err
 	}
 	// Contents must be on disk before the caller can report a verified
 	// restore; page-cache-only bytes would vanish in a power loss behind a
 	// complete-looking directory.
 	if err := f.Sync(); err != nil {
-		return madeFile, err
+		return madeFile, nil, err
 	}
-	return madeFile, f.Close()
+	return madeFile, nil, f.Close()
 }
 
 // validExtents rejects extent tables that could not have come from the
@@ -607,12 +729,18 @@ func verifyFile(ctx context.Context, root *os.Root, mf ManifestFile) error {
 	if apparent != mf.Size {
 		return fmt.Errorf("apparent size %d, manifest records %d", apparent, mf.Size)
 	}
+	return verifyDigest(ctx, f, extents, apparent, mf.SHA256)
+}
+
+// verifyDigest hashes a file's apparent content and compares it with the
+// digest recorded for those bytes.
+func verifyDigest(ctx context.Context, f *os.File, extents []Extent, apparent int64, sha string) error {
 	sum, err := hashApparent(ctx, f, extents, apparent)
 	if err != nil {
 		return err
 	}
-	if sum != mf.SHA256 {
-		return fmt.Errorf("sha256 mismatch: got %s, manifest records %s", sum, mf.SHA256)
+	if sum != sha {
+		return fmt.Errorf("sha256 mismatch: got %s, manifest records %s", sum, sha)
 	}
 	return nil
 }

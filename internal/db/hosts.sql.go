@@ -9,13 +9,42 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const bindHostIdentity = `-- name: BindHostIdentity :exec
+UPDATE host
+SET identity_bound = true, updated_at = now()
+WHERE id = $1
+`
+
+// Opt-in: an existing (legacy) row whose holder sent a complete
+// self-description at its current address enters identity-bound mode.
+func (q *Queries) BindHostIdentity(ctx context.Context, id string) error {
+	_, err := q.db.Exec(ctx, bindHostIdentity, id)
+	return err
+}
+
+const bindHostIncarnation = `-- name: BindHostIncarnation :exec
+UPDATE host SET incarnation_id = $1::uuid
+WHERE id = $2 AND incarnation_id IS NULL
+`
+
+type BindHostIncarnationParams struct {
+	IncarnationID uuid.UUID `json:"incarnation_id"`
+	HostID        string    `json:"host_id"`
+}
+
+func (q *Queries) BindHostIncarnation(ctx context.Context, arg BindHostIncarnationParams) error {
+	_, err := q.db.Exec(ctx, bindHostIncarnation, arg.IncarnationID, arg.HostID)
+	return err
+}
 
 const createHost = `-- name: CreateHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation
 `
 
 type CreateHostParams struct {
@@ -48,21 +77,27 @@ func (q *Queries) CreateHost(ctx context.Context, arg CreateHostParams) (Host, e
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 	)
 	return i, err
 }
 
-const deleteHostCapabilities = `-- name: DeleteHostCapabilities :exec
-DELETE FROM host_capability WHERE host_id = $1
+const deleteHostPressure = `-- name: DeleteHostPressure :exec
+DELETE FROM host_pressure WHERE host_id = $1
 `
 
-func (q *Queries) DeleteHostCapabilities(ctx context.Context, hostID string) error {
-	_, err := q.db.Exec(ctx, deleteHostCapabilities, hostID)
+// Clears stored pressure when a host identity is reclaimed by a new
+// machine: the old machine's numbers are meaningless for the new
+// holder, and stale pressure must not survive into its tenure.
+func (q *Queries) DeleteHostPressure(ctx context.Context, hostID string) error {
+	_, err := q.db.Exec(ctx, deleteHostPressure, hostID)
 	return err
 }
 
 const getHost = `-- name: GetHost :one
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host WHERE id = $1
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host WHERE id = $1
 `
 
 func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
@@ -79,6 +114,110 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
+	)
+	return i, err
+}
+
+const getHostCapabilityDiagnostics = `-- name: GetHostCapabilityDiagnostics :many
+WITH host_snapshot AS (
+  SELECT h.id,
+         h.status,
+         h.last_heartbeat_at,
+         (
+           h.status = 'active'
+           AND h.last_heartbeat_at IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM unnest($1::text[]) AS required(capability)
+             WHERE NOT EXISTS (
+               SELECT 1
+               FROM host_capability required_hc
+               WHERE required_hc.host_id = h.id
+                 AND required_hc.capability = required.capability
+                 AND required_hc.heartbeat_at = h.last_heartbeat_at
+             )
+           )
+         ) AS capabilities_match
+  FROM host h
+  WHERE h.id = $2
+)
+SELECT hs.last_heartbeat_at,
+       hs.status,
+       hs.capabilities_match,
+       hc.capability,
+       hc.heartbeat_at
+FROM host_snapshot hs
+LEFT JOIN host_capability hc ON hc.host_id = hs.id
+ORDER BY hc.capability ASC
+`
+
+type GetHostCapabilityDiagnosticsParams struct {
+	RequiredCapabilities []string `json:"required_capabilities"`
+	HostID               string   `json:"host_id"`
+}
+
+type GetHostCapabilityDiagnosticsRow struct {
+	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
+	Status            string             `json:"status"`
+	CapabilitiesMatch *bool              `json:"capabilities_match"`
+	Capability        *string            `json:"capability"`
+	HeartbeatAt       pgtype.Timestamptz `json:"heartbeat_at"`
+}
+
+// Snapshot the host heartbeat generation and every capability attestation for
+// best-effort diagnostics when capability enforcement rejects a request.
+func (q *Queries) GetHostCapabilityDiagnostics(ctx context.Context, arg GetHostCapabilityDiagnosticsParams) ([]GetHostCapabilityDiagnosticsRow, error) {
+	rows, err := q.db.Query(ctx, getHostCapabilityDiagnostics, arg.RequiredCapabilities, arg.HostID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetHostCapabilityDiagnosticsRow{}
+	for rows.Next() {
+		var i GetHostCapabilityDiagnosticsRow
+		if err := rows.Scan(
+			&i.LastHeartbeatAt,
+			&i.Status,
+			&i.CapabilitiesMatch,
+			&i.Capability,
+			&i.HeartbeatAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const getHostForUpdate = `-- name: GetHostForUpdate :one
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host WHERE id = $1 FOR UPDATE
+`
+
+// Row-locked read for the heartbeat's identity check, so the guard and the
+// heartbeat update see the same row version inside one transaction.
+func (q *Queries) GetHostForUpdate(ctx context.Context, id string) (Host, error) {
+	row := q.db.QueryRow(ctx, getHostForUpdate, id)
+	var i Host
+	err := row.Scan(
+		&i.ID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.Region,
+		&i.Status,
+		&i.CapacityMemoryMib,
+		&i.CapacityVcpus,
+		&i.LastHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 	)
 	return i, err
 }
@@ -88,9 +227,10 @@ WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = $2
-    AND status = 'active'
+    AND status = ANY($3::text[])
     AND last_heartbeat_at IS NOT NULL
-  FOR SHARE
+    AND ($4::timestamptz IS NULL
+         OR last_heartbeat_at > $4)
 )
 SELECT EXISTS (
   SELECT 1
@@ -110,16 +250,22 @@ SELECT EXISTS (
 `
 
 type HostHasCapabilitiesParams struct {
-	RequiredCapabilities []string `json:"required_capabilities"`
-	HostID               string   `json:"host_id"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	HostID               string             `json:"host_id"`
+	AllowedStatuses      []string           `json:"allowed_statuses"`
+	HeartbeatAfter       pgtype.Timestamptz `json:"heartbeat_after"`
 }
 
-// Lock the one active host row whose heartbeat anchors this capability set.
-// Callers that run this in a mutation transaction keep the host stable until
-// VMD delivery and commit, while the relational division below proves that
-// every requested capability belongs to that exact heartbeat.
+// Evaluate in a new READ COMMITTED statement after LockHostForCapabilities,
+// in the same transaction, to avoid mixing pre-wait capability rows with a
+// post-wait host row. Lifecycle callers use LockedHostHasCapabilities.
 func (q *Queries) HostHasCapabilities(ctx context.Context, arg HostHasCapabilitiesParams) (bool, error) {
-	row := q.db.QueryRow(ctx, hostHasCapabilities, arg.RequiredCapabilities, arg.HostID)
+	row := q.db.QueryRow(ctx, hostHasCapabilities,
+		arg.RequiredCapabilities,
+		arg.HostID,
+		arg.AllowedStatuses,
+		arg.HeartbeatAfter,
+	)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -127,66 +273,66 @@ func (q *Queries) HostHasCapabilities(ctx context.Context, arg HostHasCapabiliti
 
 const hostHasCapabilitiesUnlocked = `-- name: HostHasCapabilitiesUnlocked :one
 WITH target_host AS MATERIALIZED (
-  SELECT id, last_heartbeat_at
+  SELECT id, vmd_addr, last_heartbeat_at
   FROM host
   WHERE id = $2
-    AND status = 'active'
+    AND status = ANY($3::text[])
     AND last_heartbeat_at IS NOT NULL
+    AND ($4::timestamptz IS NULL
+         OR last_heartbeat_at > $4)
 )
-SELECT EXISTS (
-  SELECT 1
-  FROM target_host h
-  WHERE NOT EXISTS (
+SELECT
+  EXISTS (
     SELECT 1
-    FROM unnest($1::text[]) AS required(capability)
+    FROM target_host h
     WHERE NOT EXISTS (
       SELECT 1
-      FROM host_capability hc
-      WHERE hc.host_id = h.id
-        AND hc.capability = required.capability
-        AND hc.heartbeat_at = h.last_heartbeat_at
+      FROM unnest($1::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
     )
-  )
-)
+  ) AS has_capabilities,
+  COALESCE((SELECT vmd_addr FROM target_host), '')::text AS vmd_addr
 `
 
 type HostHasCapabilitiesUnlockedParams struct {
-	RequiredCapabilities []string `json:"required_capabilities"`
-	HostID               string   `json:"host_id"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	HostID               string             `json:"host_id"`
+	AllowedStatuses      []string           `json:"allowed_statuses"`
+	HeartbeatAfter       pgtype.Timestamptz `json:"heartbeat_after"`
+}
+
+type HostHasCapabilitiesUnlockedRow struct {
+	HasCapabilities bool   `json:"has_capabilities"`
+	VmdAddr         string `json:"vmd_addr"`
 }
 
 // HostHasCapabilities without the row lock, for standalone pre-flight reads
 // outside a mutation transaction: omitting the lock keeps concurrent checks
 // from serializing behind the host's heartbeat writer. Transactional callers
-// that must pin the host across a commit use HostHasCapabilities.
-func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (bool, error) {
-	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
-	var exists bool
-	err := row.Scan(&exists)
-	return exists, err
-}
-
-const insertHostCapability = `-- name: InsertHostCapability :exec
-INSERT INTO host_capability (host_id, capability, heartbeat_at)
-SELECT id, $1, last_heartbeat_at
-FROM host
-WHERE id = $2 AND last_heartbeat_at IS NOT NULL
-ON CONFLICT (host_id, capability)
-DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at
-`
-
-type InsertHostCapabilityParams struct {
-	Capability string `json:"capability"`
-	HostID     string `json:"host_id"`
-}
-
-func (q *Queries) InsertHostCapability(ctx context.Context, arg InsertHostCapabilityParams) error {
-	_, err := q.db.Exec(ctx, insertHostCapability, arg.Capability, arg.HostID)
-	return err
+// that must pin the host across a commit use LockedHostHasCapabilities.
+//
+// Also returns the host's VMD address (empty when the host is ineligible),
+// so the caller can record this read as the registry's address verification.
+func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (HostHasCapabilitiesUnlockedRow, error) {
+	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked,
+		arg.RequiredCapabilities,
+		arg.HostID,
+		arg.AllowedStatuses,
+		arg.HeartbeatAfter,
+	)
+	var i HostHasCapabilitiesUnlockedRow
+	err := row.Scan(&i.HasCapabilities, &i.VmdAddr)
+	return i, err
 }
 
 const listActiveHosts = `-- name: ListActiveHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host
 WHERE status = 'active'
 ORDER BY created_at ASC
 `
@@ -211,6 +357,9 @@ func (q *Queries) ListActiveHosts(ctx context.Context) ([]Host, error) {
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.IdentityBound,
+			&i.IncarnationID,
+			&i.PeerGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -260,6 +409,9 @@ type ListActiveHostsByLoadRow struct {
 	ActiveSandboxCount int32              `json:"active_sandbox_count"`
 }
 
+// 'migrating' rows (an operator's boots being put back to paused) are not
+// counted: they are bounded and short-lived, and the partial index behind
+// this JOIN is keyed to exactly this predicate.
 // Returns active hosts sorted by current sandbox count (ascending).
 // The scheduler picks the first row (least loaded host). One query
 // replaces N per-host lookups.
@@ -295,8 +447,142 @@ func (q *Queries) ListActiveHostsByLoad(ctx context.Context, requiredCapabilitie
 	return items, nil
 }
 
+const listCapacityCandidates = `-- name: ListCapacityCandidates :many
+SELECT h.id, h.region, h.capacity_memory_mib, h.capacity_vcpus,
+       EXISTS (
+         SELECT 1 FROM host_capability hc
+         WHERE hc.host_id = h.id
+           AND hc.capability = $1::text
+           AND hc.heartbeat_at = h.last_heartbeat_at
+       ) AS pressure_capable,
+       hp.reported_at,
+       -- Report AGE, computed by the database against its own clock.
+       --
+       -- reported_at is stamped by the database, so comparing it to a
+       -- control-plane time.Now() mixes two clocks: a control plane
+       -- ahead of Postgres would call every current report stale, and
+       -- one behind would keep ranking expired ones. Handing back an
+       -- age instead means only DURATIONS cross the boundary — the
+       -- caller adds its own locally-measured elapsed time since the
+       -- fetch, which needs no agreement about what time it is.
+       --
+       -- Hosts that never reported get an age no freshness window can
+       -- accept.
+       COALESCE(EXTRACT(EPOCH FROM (now() - hp.reported_at)), 1e9)::float8 AS report_age_seconds,
+       COALESCE(hp.running_sandboxes, 0)::int AS running_sandboxes,
+       COALESCE(hp.provisioning_sandboxes, 0)::int AS provisioning_sandboxes,
+       COALESCE(hp.paused_sandboxes, 0)::int AS paused_sandboxes,
+       COALESCE(hp.allocated_memory_mib, 0)::bigint AS allocated_memory_mib,
+       COALESCE(hp.allocated_vcpus, 0)::bigint AS allocated_vcpus,
+       COALESCE(hp.used_net_slots, 0)::int AS used_net_slots,
+       COALESCE(hp.provisioning_net_slots, 0)::int AS provisioning_net_slots,
+       COALESCE(hp.warm_net_slots, 0)::int AS warm_net_slots,
+       COALESCE(hp.net_slot_ceiling, 0)::int AS net_slot_ceiling,
+       COALESCE(hp.max_network_slots, 0)::int AS max_network_slots,
+       COALESCE(hp.max_sandboxes, 0)::int AS max_sandboxes,
+       -- Live VMs the host could not size. Non-zero means the allocation
+       -- columns are a known undercount, so ranking must not read the
+       -- shortfall as free memory.
+       COALESCE(hp.unknown_allocation_vms, 0)::int AS unknown_allocation_vms
+FROM host h
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
+WHERE h.status = 'active'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest($2::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+`
+
+type ListCapacityCandidatesParams struct {
+	PressureCapability   string   `json:"pressure_capability"`
+	RequiredCapabilities []string `json:"required_capabilities"`
+}
+
+type ListCapacityCandidatesRow struct {
+	ID                    string             `json:"id"`
+	Region                string             `json:"region"`
+	CapacityMemoryMib     int32              `json:"capacity_memory_mib"`
+	CapacityVcpus         int32              `json:"capacity_vcpus"`
+	PressureCapable       bool               `json:"pressure_capable"`
+	ReportedAt            pgtype.Timestamptz `json:"reported_at"`
+	ReportAgeSeconds      float64            `json:"report_age_seconds"`
+	RunningSandboxes      int32              `json:"running_sandboxes"`
+	ProvisioningSandboxes int32              `json:"provisioning_sandboxes"`
+	PausedSandboxes       int32              `json:"paused_sandboxes"`
+	AllocatedMemoryMib    int64              `json:"allocated_memory_mib"`
+	AllocatedVcpus        int64              `json:"allocated_vcpus"`
+	UsedNetSlots          int32              `json:"used_net_slots"`
+	ProvisioningNetSlots  int32              `json:"provisioning_net_slots"`
+	WarmNetSlots          int32              `json:"warm_net_slots"`
+	NetSlotCeiling        int32              `json:"net_slot_ceiling"`
+	MaxNetworkSlots       int32              `json:"max_network_slots"`
+	MaxSandboxes          int32              `json:"max_sandboxes"`
+	UnknownAllocationVms  int32              `json:"unknown_allocation_vms"`
+}
+
+// Candidate hosts for capacity ranking, cached control-plane-side: every
+// active host passing the capability filter, with its newest pressure
+// report and the legacy sandbox count.
+//
+// Read ONLY by the background shadow evaluator, never by a request. The
+// create path does no query of its own; ranking works from whatever this
+// last returned.
+//
+// Freshness and eligibility policy live in the ranker; this query only
+// distinguishes "capable" (advertised capacity_pressure_v1 on the
+// CURRENT heartbeat, so a capability from a previous boot cannot vouch
+// for this one) and reports raw timestamps.
+//
+// A scalar subquery, not a second join, for the sandbox count: joining
+// two child tables would cross-multiply the per-host rows.
+func (q *Queries) ListCapacityCandidates(ctx context.Context, arg ListCapacityCandidatesParams) ([]ListCapacityCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listCapacityCandidates, arg.PressureCapability, arg.RequiredCapabilities)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCapacityCandidatesRow{}
+	for rows.Next() {
+		var i ListCapacityCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Region,
+			&i.CapacityMemoryMib,
+			&i.CapacityVcpus,
+			&i.PressureCapable,
+			&i.ReportedAt,
+			&i.ReportAgeSeconds,
+			&i.RunningSandboxes,
+			&i.ProvisioningSandboxes,
+			&i.PausedSandboxes,
+			&i.AllocatedMemoryMib,
+			&i.AllocatedVcpus,
+			&i.UsedNetSlots,
+			&i.ProvisioningNetSlots,
+			&i.WarmNetSlots,
+			&i.NetSlotCeiling,
+			&i.MaxNetworkSlots,
+			&i.MaxSandboxes,
+			&i.UnknownAllocationVms,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listHosts = `-- name: ListHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host
 ORDER BY created_at ASC
 `
 
@@ -320,6 +606,161 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.IdentityBound,
+			&i.IncarnationID,
+			&i.PeerGeneration,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listHostsAdmin = `-- name: ListHostsAdmin :many
+SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
+       h.capacity_memory_mib, h.capacity_vcpus,
+       h.last_heartbeat_at, h.created_at, h.updated_at,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('active', 'starting')
+                                      AND s.destroyed_at IS NULL), 0)::int AS running_count,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming', 'migrating')
+                                      AND s.destroyed_at IS NULL), 0)::int AS transitional_count,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
+                                      AND s.destroyed_at IS NULL), 0)::int AS paused_count,
+       -- Scalar subquery, not a second LEFT JOIN: joining two child tables
+       -- would cross-multiply the per-host rows and corrupt the counts.
+       COALESCE((SELECT COUNT(*) FROM template_build tb
+                 WHERE tb.vmd_host_id = h.id
+                   AND tb.status IN ('building', 'snapshotting')
+                   AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=tb.id)), 0)::int
+       + (SELECT count(*)::int FROM template_build_attempt a WHERE a.host_id=h.id AND a.incarnation_id=h.incarnation_id
+          AND (a.state IN ('claimed','admitted','uploading') OR a.cleanup_pending)) AS building_count,
+       -- Paused sandboxes whose CURRENT pause has no durable backup: the
+       -- ones whose only up-to-date copy lives on this host's local disk.
+       -- Retiring the machine destroys them outright; even
+       -- paused-with-coverage stays pinned here until cross-host restore
+       -- exists, but unbacked is the irrecoverable class an operator must
+       -- never retire past.
+       --
+       -- "Covers the current pause" reads the PERSISTED identity link the
+       -- report handler writes (MarkSandboxBackupCovered): a generation
+       -- counts only if its verified manifest matched the head snapshot's
+       -- recorded digests at report time, under the same row lock the
+       -- pause finalize takes — and the link names both the snapshot row
+       -- and its per-pause generation counter, so a re-pause (which
+       -- advances the counter even when the legacy finalize reuses the
+       -- row id) unlinks every earlier generation. Nothing here infers
+       -- identity from timestamps or manifest containment at read time:
+       -- both misidentify a previous pause's generation under delayed
+       -- outbox delivery. Errs conservative: a generation recorded before
+       -- this linkage existed (or whose report predates the current
+       -- pause) reads as unbacked until its next redelivery re-verifies
+       -- it against the current manifest.
+       COALESCE((SELECT COUNT(*) FROM sandbox s2
+                 WHERE s2.host_id = h.id
+                   AND s2.status = 'paused'
+                   AND s2.destroyed_at IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM backup_generation bg
+                     JOIN snapshot snap ON snap.id = s2.snapshot_id
+                     WHERE bg.sandbox_id = s2.id
+                       AND bg.covered_snapshot_id = snap.id
+                       AND bg.covered_snapshot_generation = snap.generation)), 0)::int AS paused_unbacked_count,
+       -- Live pressure, when the host publishes it (NULL otherwise): the
+       -- vmd-reported allocation view, alongside the DB-derived counts
+       -- above. hp is 1:1 by primary key, so it cannot multiply the
+       -- sandbox join's count rows.
+       hp.allocated_memory_mib AS pressure_allocated_memory_mib,
+       hp.allocated_vcpus AS pressure_allocated_vcpus,
+       hp.running_sandboxes AS pressure_running_sandboxes,
+       hp.provisioning_sandboxes AS pressure_provisioning_sandboxes,
+       hp.used_net_slots AS pressure_used_net_slots,
+       hp.warm_net_slots AS pressure_warm_net_slots,
+       -- Non-zero means the allocation columns above are a known
+       -- undercount, so an operator can tell an idle host from one that
+       -- cannot yet describe itself.
+       hp.unknown_allocation_vms AS pressure_unknown_allocation_vms,
+       hp.reported_at AS pressure_reported_at
+FROM host h
+LEFT JOIN sandbox s ON s.host_id = h.id
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
+WHERE $1::text IS NULL OR h.id = $1
+GROUP BY h.id, hp.host_id
+ORDER BY h.created_at ASC
+`
+
+type ListHostsAdminRow struct {
+	ID                            string             `json:"id"`
+	VmdAddr                       string             `json:"vmd_addr"`
+	ProxyAddr                     string             `json:"proxy_addr"`
+	Region                        string             `json:"region"`
+	Status                        string             `json:"status"`
+	CapacityMemoryMib             int32              `json:"capacity_memory_mib"`
+	CapacityVcpus                 int32              `json:"capacity_vcpus"`
+	LastHeartbeatAt               pgtype.Timestamptz `json:"last_heartbeat_at"`
+	CreatedAt                     time.Time          `json:"created_at"`
+	UpdatedAt                     time.Time          `json:"updated_at"`
+	RunningCount                  int32              `json:"running_count"`
+	TransitionalCount             int32              `json:"transitional_count"`
+	PausedCount                   int32              `json:"paused_count"`
+	BuildingCount                 int32              `json:"building_count"`
+	PausedUnbackedCount           int32              `json:"paused_unbacked_count"`
+	PressureAllocatedMemoryMib    *int64             `json:"pressure_allocated_memory_mib"`
+	PressureAllocatedVcpus        *int64             `json:"pressure_allocated_vcpus"`
+	PressureRunningSandboxes      *int32             `json:"pressure_running_sandboxes"`
+	PressureProvisioningSandboxes *int32             `json:"pressure_provisioning_sandboxes"`
+	PressureUsedNetSlots          *int32             `json:"pressure_used_net_slots"`
+	PressureWarmNetSlots          *int32             `json:"pressure_warm_net_slots"`
+	PressureUnknownAllocationVms  *int32             `json:"pressure_unknown_allocation_vms"`
+	PressureReportedAt            pgtype.Timestamptz `json:"pressure_reported_at"`
+}
+
+// Operator view (hostctl): every host regardless of status, with live
+// sandbox counts for drain progress. transitional counts pausing/resuming
+// sandboxes whose lifecycle RPC is still using the host, and migrating
+// ones an operator has claimed here — a host is not drained while any
+// exist, even when running and paused both read zero.
+// The optional id filter exists for drain polling: `hostctl drain --wait`
+// re-reads one host every few seconds, and the per-host counts (the
+// backup-coverage probe especially) must not be recomputed for the whole
+// fleet on every poll.
+func (q *Queries) ListHostsAdmin(ctx context.Context, id *string) ([]ListHostsAdminRow, error) {
+	rows, err := q.db.Query(ctx, listHostsAdmin, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListHostsAdminRow{}
+	for rows.Next() {
+		var i ListHostsAdminRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.VmdAddr,
+			&i.ProxyAddr,
+			&i.Region,
+			&i.Status,
+			&i.CapacityMemoryMib,
+			&i.CapacityVcpus,
+			&i.LastHeartbeatAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.RunningCount,
+			&i.TransitionalCount,
+			&i.PausedCount,
+			&i.BuildingCount,
+			&i.PausedUnbackedCount,
+			&i.PressureAllocatedMemoryMib,
+			&i.PressureAllocatedVcpus,
+			&i.PressureRunningSandboxes,
+			&i.PressureProvisioningSandboxes,
+			&i.PressureUsedNetSlots,
+			&i.PressureWarmNetSlots,
+			&i.PressureUnknownAllocationVms,
+			&i.PressureReportedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -332,7 +773,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 }
 
 const listStaleHosts = `-- name: ListStaleHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host
 WHERE status = 'active'
   AND last_heartbeat_at IS NOT NULL
   AND last_heartbeat_at < $1
@@ -361,6 +802,9 @@ func (q *Queries) ListStaleHosts(ctx context.Context, lastHeartbeatAt pgtype.Tim
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.IdentityBound,
+			&i.IncarnationID,
+			&i.PeerGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -370,6 +814,18 @@ func (q *Queries) ListStaleHosts(ctx context.Context, lastHeartbeatAt pgtype.Tim
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockHostForCapabilities = `-- name: LockHostForCapabilities :execrows
+SELECT id FROM host WHERE id = $1 FOR SHARE
+`
+
+func (q *Queries) LockHostForCapabilities(ctx context.Context, hostID string) (int64, error) {
+	result, err := q.db.Exec(ctx, lockHostForCapabilities, hostID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markHostUnhealthy = `-- name: MarkHostUnhealthy :exec
@@ -383,6 +839,155 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 	return err
 }
 
+const prepareHostHeartbeat = `-- name: PrepareHostHeartbeat :exec
+SELECT prepare_host_heartbeat($1::text, $2::text)
+`
+
+type PrepareHostHeartbeatParams struct {
+	HostID        string `json:"host_id"`
+	IncarnationID string `json:"incarnation_id"`
+}
+
+func (q *Queries) PrepareHostHeartbeat(ctx context.Context, arg PrepareHostHeartbeatParams) error {
+	_, err := q.db.Exec(ctx, prepareHostHeartbeat, arg.HostID, arg.IncarnationID)
+	return err
+}
+
+const rebindHostIncarnation = `-- name: RebindHostIncarnation :one
+SELECT rebind_host_incarnation($1::text,
+    $2::uuid, $3::uuid)::bigint AS peer_generation
+`
+
+type RebindHostIncarnationParams struct {
+	HostID              string    `json:"host_id"`
+	ExpectedIncarnation uuid.UUID `json:"expected_incarnation"`
+	NewIncarnation      uuid.UUID `json:"new_incarnation"`
+}
+
+func (q *Queries) RebindHostIncarnation(ctx context.Context, arg RebindHostIncarnationParams) (int64, error) {
+	row := q.db.QueryRow(ctx, rebindHostIncarnation, arg.HostID, arg.ExpectedIncarnation, arg.NewIncarnation)
+	var peer_generation int64
+	err := row.Scan(&peer_generation)
+	return peer_generation, err
+}
+
+const registerHost = `-- name: RegisterHost :one
+INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
+                  capacity_memory_mib, capacity_vcpus, last_heartbeat_at,
+                  identity_bound)
+VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now(), true)
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation
+`
+
+type RegisterHostParams struct {
+	ID                string `json:"id"`
+	VmdAddr           string `json:"vmd_addr"`
+	ProxyAddr         string `json:"proxy_addr"`
+	Region            string `json:"region"`
+	CapacityMemoryMib int32  `json:"capacity_memory_mib"`
+	CapacityVcpus     int32  `json:"capacity_vcpus"`
+}
+
+// Self-registration from a first heartbeat. Starts in 'provisioning' so the
+// scheduler never sees the host until an operator activates it. Stamps
+// last_heartbeat_at because capability attestation keys on it: without a
+// heartbeat time, InsertHostCapability is a silent no-op.
+func (q *Queries) RegisterHost(ctx context.Context, arg RegisterHostParams) (Host, error) {
+	row := q.db.QueryRow(ctx, registerHost,
+		arg.ID,
+		arg.VmdAddr,
+		arg.ProxyAddr,
+		arg.Region,
+		arg.CapacityMemoryMib,
+		arg.CapacityVcpus,
+	)
+	var i Host
+	err := row.Scan(
+		&i.ID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.Region,
+		&i.Status,
+		&i.CapacityMemoryMib,
+		&i.CapacityVcpus,
+		&i.LastHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
+	)
+	return i, err
+}
+
+const syncHostCapabilities = `-- name: SyncHostCapabilities :exec
+WITH current_host AS (
+    SELECT id, last_heartbeat_at
+    FROM host
+    WHERE id = $1 AND last_heartbeat_at IS NOT NULL
+), advertised AS (
+    SELECT DISTINCT unnest(COALESCE($2::text[], ARRAY[]::text[])) AS capability
+), upserted AS (
+    INSERT INTO host_capability (host_id, capability, heartbeat_at)
+    SELECT h.id, a.capability, h.last_heartbeat_at
+    FROM current_host h
+    CROSS JOIN advertised a
+    ON CONFLICT (host_id, capability)
+    DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at
+    RETURNING capability
+)
+DELETE FROM host_capability hc
+WHERE hc.host_id = $1
+  AND NOT (hc.capability = ANY(COALESCE($2::text[], ARRAY[]::text[])))
+`
+
+type SyncHostCapabilitiesParams struct {
+	HostID       string   `json:"host_id"`
+	Capabilities []string `json:"capabilities"`
+}
+
+// Refresh the advertised set in place and prune only capabilities omitted by
+// this heartbeat. Empty capabilities intentionally remove the entire set.
+func (q *Queries) SyncHostCapabilities(ctx context.Context, arg SyncHostCapabilitiesParams) error {
+	_, err := q.db.Exec(ctx, syncHostCapabilities, arg.HostID, arg.Capabilities)
+	return err
+}
+
+const updateHostAddresses = `-- name: UpdateHostAddresses :exec
+UPDATE host
+SET vmd_addr = $2, proxy_addr = $3, region = $4,
+    capacity_memory_mib = $5, capacity_vcpus = $6,
+    status = 'provisioning', identity_bound = true, updated_at = now()
+WHERE id = $1
+`
+
+type UpdateHostAddressesParams struct {
+	ID                string `json:"id"`
+	VmdAddr           string `json:"vmd_addr"`
+	ProxyAddr         string `json:"proxy_addr"`
+	Region            string `json:"region"`
+	CapacityMemoryMib int32  `json:"capacity_memory_mib"`
+	CapacityVcpus     int32  `json:"capacity_vcpus"`
+}
+
+// Re-provision path: the identity is reclaiming its row from a new address
+// after the old holder went silent. Guarded by the handler's staleness check.
+// The reclaim DEMOTES the row to provisioning in the same statement: an
+// address change is a re-registration, and every holder of the vmd-internal
+// token can trigger one after two minutes of silence — it must never leave
+// (or make) a host schedulable without the operator credential re-approving.
+func (q *Queries) UpdateHostAddresses(ctx context.Context, arg UpdateHostAddressesParams) error {
+	_, err := q.db.Exec(ctx, updateHostAddresses,
+		arg.ID,
+		arg.VmdAddr,
+		arg.ProxyAddr,
+		arg.Region,
+		arg.CapacityMemoryMib,
+		arg.CapacityVcpus,
+	)
+	return err
+}
+
 const updateHostHeartbeat = `-- name: UpdateHostHeartbeat :one
 WITH prev AS (
     SELECT h.id, h.status FROM host h WHERE h.id = $1 FOR UPDATE
@@ -393,7 +998,7 @@ SET last_heartbeat_at = now(),
     updated_at = now()
 FROM prev
 WHERE host.id = prev.id
-RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, prev.status AS prev_status
+RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, host.identity_bound, host.incarnation_id, host.peer_generation, prev.status AS prev_status
 `
 
 type UpdateHostHeartbeatRow struct {
@@ -407,6 +1012,9 @@ type UpdateHostHeartbeatRow struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+	IdentityBound     bool               `json:"identity_bound"`
+	IncarnationID     pgtype.UUID        `json:"incarnation_id"`
+	PeerGeneration    *int64             `json:"peer_generation"`
 	PrevStatus        string             `json:"prev_status"`
 }
 
@@ -432,23 +1040,168 @@ func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (UpdateHos
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 		&i.PrevStatus,
 	)
 	return i, err
 }
 
-const updateHostStatus = `-- name: UpdateHostStatus :exec
+const updateHostProxyAddress = `-- name: UpdateHostProxyAddress :exec
 UPDATE host
-SET status = $2, updated_at = now()
+SET proxy_addr = $2, updated_at = now()
 WHERE id = $1
 `
 
-type UpdateHostStatusParams struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
+type UpdateHostProxyAddressParams struct {
+	ID        string `json:"id"`
+	ProxyAddr string `json:"proxy_addr"`
 }
 
-func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusParams) error {
-	_, err := q.db.Exec(ctx, updateHostStatus, arg.ID, arg.Status)
+// Endpoint advertisement changes for the current holder must not alter
+// lifecycle status; unlike address reclamation, this is not re-provisioning.
+func (q *Queries) UpdateHostProxyAddress(ctx context.Context, arg UpdateHostProxyAddressParams) error {
+	_, err := q.db.Exec(ctx, updateHostProxyAddress, arg.ID, arg.ProxyAddr)
 	return err
+}
+
+const updateHostStatus = `-- name: UpdateHostStatus :one
+UPDATE host
+SET status = $2, updated_at = now()
+WHERE id = $1
+  AND ($2 <> 'active'
+       OR (last_heartbeat_at IS NOT NULL
+           AND last_heartbeat_at > $3))
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation
+`
+
+type UpdateHostStatusParams struct {
+	ID                   string             `json:"id"`
+	Status               string             `json:"status"`
+	ActiveHeartbeatAfter pgtype.Timestamptz `json:"active_heartbeat_after"`
+}
+
+// Activation requires a live heartbeat: a provisioning host that died
+// before the operator activated it must not become schedulable — the
+// unhealthy detector only watches active rows, so it would sit exposed to
+// placement until the detector's next pass. Non-active targets carry no
+// freshness requirement; draining a dead host is legitimate.
+func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusParams) (Host, error) {
+	row := q.db.QueryRow(ctx, updateHostStatus, arg.ID, arg.Status, arg.ActiveHeartbeatAfter)
+	var i Host
+	err := row.Scan(
+		&i.ID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.Region,
+		&i.Status,
+		&i.CapacityMemoryMib,
+		&i.CapacityVcpus,
+		&i.LastHeartbeatAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
+	)
+	return i, err
+}
+
+const upsertHostPressure = `-- name: UpsertHostPressure :execrows
+INSERT INTO host_pressure (
+    host_id, running_sandboxes, provisioning_sandboxes, paused_sandboxes,
+    allocated_memory_mib, allocated_vcpus,
+    used_net_slots, provisioning_net_slots, warm_net_slots,
+    net_slot_ceiling, max_network_slots, max_sandboxes, unknown_allocation_vms,
+    included_build_vm_ids, included_build_slot_vm_ids,
+    reported_at
+)
+SELECT h.id, $1, $2, $3,
+       $4, $5,
+       $6, $7, $8,
+       $9, $10, $11, $12,
+       COALESCE($13::text[], '{}'::text[]),
+       COALESCE($14::text[], '{}'::text[]),
+       now()
+FROM host h
+WHERE h.id = $15 AND h.vmd_addr = $16
+  AND (h.incarnation_id IS NULL OR h.incarnation_id::text = $17::text)
+FOR SHARE
+ON CONFLICT (host_id) DO UPDATE SET
+    running_sandboxes = EXCLUDED.running_sandboxes,
+    provisioning_sandboxes = EXCLUDED.provisioning_sandboxes,
+    paused_sandboxes = EXCLUDED.paused_sandboxes,
+    allocated_memory_mib = EXCLUDED.allocated_memory_mib,
+    allocated_vcpus = EXCLUDED.allocated_vcpus,
+    used_net_slots = EXCLUDED.used_net_slots,
+    provisioning_net_slots = EXCLUDED.provisioning_net_slots,
+    warm_net_slots = EXCLUDED.warm_net_slots,
+    net_slot_ceiling = EXCLUDED.net_slot_ceiling,
+    max_network_slots = EXCLUDED.max_network_slots,
+    max_sandboxes = EXCLUDED.max_sandboxes,
+    unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
+    included_build_vm_ids = EXCLUDED.included_build_vm_ids,
+    included_build_slot_vm_ids = EXCLUDED.included_build_slot_vm_ids,
+    reported_at = EXCLUDED.reported_at
+`
+
+type UpsertHostPressureParams struct {
+	RunningSandboxes       int32    `json:"running_sandboxes"`
+	ProvisioningSandboxes  int32    `json:"provisioning_sandboxes"`
+	PausedSandboxes        int32    `json:"paused_sandboxes"`
+	AllocatedMemoryMib     int64    `json:"allocated_memory_mib"`
+	AllocatedVcpus         int64    `json:"allocated_vcpus"`
+	UsedNetSlots           int32    `json:"used_net_slots"`
+	ProvisioningNetSlots   int32    `json:"provisioning_net_slots"`
+	WarmNetSlots           int32    `json:"warm_net_slots"`
+	NetSlotCeiling         int32    `json:"net_slot_ceiling"`
+	MaxNetworkSlots        int32    `json:"max_network_slots"`
+	MaxSandboxes           int32    `json:"max_sandboxes"`
+	UnknownAllocationVms   int32    `json:"unknown_allocation_vms"`
+	IncludedBuildVmIds     []string `json:"included_build_vm_ids"`
+	IncludedBuildSlotVmIds []string `json:"included_build_slot_vm_ids"`
+	HostID                 string   `json:"host_id"`
+	VmdAddr                string   `json:"vmd_addr"`
+	IncarnationID          string   `json:"incarnation_id"`
+}
+
+// Records a host's live pressure report, identity-fenced: the write
+// lands only while the report's vmd_addr matches the host row, so a
+// daemon whose identity was reclaimed cannot overwrite the new
+// holder's numbers (mirrors the heartbeat's reclaim semantics). 0 rows
+// = unknown host or address mismatch; the handler disambiguates.
+// Last-write-wins wholesale, reported_at from the DATABASE clock: this
+// pair is the reconciliation contract (see the host_pressure table
+// comment).
+// FOR SHARE serializes the address check against an identity reclaim
+// (which takes the row FOR UPDATE): without it this statement could
+// evaluate the old address from its snapshot and insert stale pressure
+// AFTER the reclaim committed its delete. Locked, either the reclaim
+// waits for this write (then deletes it), or this write waits and
+// re-evaluates against the new address (then matches nothing).
+func (q *Queries) UpsertHostPressure(ctx context.Context, arg UpsertHostPressureParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertHostPressure,
+		arg.RunningSandboxes,
+		arg.ProvisioningSandboxes,
+		arg.PausedSandboxes,
+		arg.AllocatedMemoryMib,
+		arg.AllocatedVcpus,
+		arg.UsedNetSlots,
+		arg.ProvisioningNetSlots,
+		arg.WarmNetSlots,
+		arg.NetSlotCeiling,
+		arg.MaxNetworkSlots,
+		arg.MaxSandboxes,
+		arg.UnknownAllocationVms,
+		arg.IncludedBuildVmIds,
+		arg.IncludedBuildSlotVmIds,
+		arg.HostID,
+		arg.VmdAddr,
+		arg.IncarnationID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

@@ -29,8 +29,68 @@ var ErrTornSnapshot = errors.New("torn snapshot (overlay side-car empty)")
 // at runtime.
 const tornSnapshotMarker = "(torn snapshot save)"
 
+// A Firecracker that predates the clock option rejects the whole request rather
+// than ignoring the field, because it deserializes these params with
+// deny_unknown_fields. The deploy swaps the binary in place without restarting
+// vmd, so a rollback can put an older Firecracker under a running daemon — this
+// is how that is recognised and degraded to legacy instead of failing restores.
+// Lower-case; matching is case-insensitive so a casing drift cannot silently
+// disable the fallback.
+const unknownClockFieldMarker = "unknown field `clock_realtime`"
+
+func isUnknownClockFieldErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), unknownClockFieldMarker)
+}
+
+// The guarded-session fields carry the same rollback hazard, on both
+// endpoints: load takes tracking_session_id, create takes expected_session_id
+// and expected_generation. The refusal names only the FIRST unknown field in
+// the body, and the generated client serializes the generation before the
+// id, so an older binary reports expected_generation.
+const (
+	unknownTrackingSessionFieldMarker    = "unknown field `tracking_session_id`"
+	unknownExpectedSessionFieldMarker    = "unknown field `expected_session_id`"
+	unknownExpectedGenerationFieldMarker = "unknown field `expected_generation`"
+)
+
+func isUnknownSessionFieldErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, unknownTrackingSessionFieldMarker) ||
+		strings.Contains(msg, unknownExpectedSessionFieldMarker) ||
+		strings.Contains(msg, unknownExpectedGenerationFieldMarker)
+}
+
 func isTornSnapshotErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), tornSnapshotMarker)
+}
+
+// ErrDirtyTrackingMismatch is the firecracker fork's rejection of a guarded
+// Diff snapshot whose expected session token no longer matches the live dirty
+// bitmap (something consumed it since tracking was armed — an ad-hoc snapshot,
+// or the token belongs to an earlier FC run). The rejection happens before the
+// bitmap or any output file is touched, so falling back to a Full snapshot of
+// the same paused VM is always safe.
+var ErrDirtyTrackingMismatch = errors.New("dirty-tracking session mismatch")
+
+// dirtyTrackingMismatchKind is the stable error_kind discriminator the fork
+// returns for a rejected guarded snapshot; the free-form fault message is not
+// a contract. See the Error definition in the fork's swagger spec.
+const dirtyTrackingMismatchKind = "DirtyTrackingSessionMismatch"
+
+func isDirtyTrackingMismatchErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var badReq *operations.CreateSnapshotBadRequest
+	if errors.As(err, &badReq) {
+		return badReq.Payload != nil && badReq.Payload.ErrorKind == dirtyTrackingMismatchKind
+	}
+	// The generated client can surface an unparsed body (e.g. a default
+	// response); the serialized payload still carries the discriminator.
+	return strings.Contains(err.Error(), dirtyTrackingMismatchKind)
 }
 
 // ErrLayeredInvalidSnapshot is the firecracker fork's sentinel for a structurally
@@ -98,9 +158,14 @@ type FirecrackerConfig struct {
 // ---------------------------------------------------------------------------
 
 // newFCClient creates a Firecracker API client that talks over the given Unix socket.
-func newFCClient(socketPath string) *fcclient.Firecracker {
+// newFCClient returns a client for one logical operation and the close the
+// caller owes it when done. The connection is reused across the operation's
+// calls and released at its end: Firecracker's API admits ten connections
+// per VM, and one held open by each operation would have a VM's later calls
+// refused.
+func newFCClient(socketPath string) (*fcclient.Firecracker, func()) {
 	transport := httptransport.New(fcclient.DefaultHost, fcclient.DefaultBasePath, fcclient.DefaultSchemes)
-	transport.Transport = &http.Transport{
+	tr := &http.Transport{
 		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 			addr, err := net.ResolveUnixAddr("unix", socketPath)
 			if err != nil {
@@ -109,13 +174,24 @@ func newFCClient(socketPath string) *fcclient.Firecracker {
 			return net.DialUnix("unix", nil, addr)
 		},
 	}
+	transport.Transport = tr
 	c := fcclient.NewHTTPClient(strfmt.NewFormats())
 	c.SetTransport(transport)
-	return c
+	return c, tr.CloseIdleConnections
 }
 
 func strPtr(s string) *string { return &s }
 func boolPtr(b bool) *bool    { return &b }
+
+// omitFalse returns nil for false so the field is left out of the request body.
+// These params are deserialized with deny_unknown_fields, so a Firecracker
+// binary predating the field rejects the whole request instead of ignoring it.
+func omitFalse(b bool) *bool {
+	if !b {
+		return nil
+	}
+	return &b
+}
 func int64Ptr(i int64) *int64 { return &i }
 
 // vmHostname returns a short hostname for a VM.
@@ -138,7 +214,8 @@ func shortID(s string) string {
 // ---------------------------------------------------------------------------
 
 func ConfigureMachine(socketPath string, cfg FirecrackerConfig) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	ctx := context.Background()
 
 	bootArgs := cfg.KernelArgs
@@ -253,7 +330,8 @@ func ConfigureMachine(socketPath string, cfg FirecrackerConfig) error {
 // ---------------------------------------------------------------------------
 
 func StartInstance(socketPath string) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	actionType := models.InstanceActionInfoActionTypeInstanceStart
 	if _, err := fc.Operations.CreateSyncAction(&operations.CreateSyncActionParams{
 		Context: context.Background(),
@@ -288,11 +366,17 @@ const (
 // containing dirty blocks — required to create sandboxes from this template.
 // mode=SnapshotFlatten bakes those deltas into base.ext4 (see SnapshotMode).
 func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mode SnapshotMode) error {
+	return CreateSnapshotContext(context.Background(), socketPath, snapshotPath, memPath, blockDeltaDir, mode)
+}
+
+// CreateSnapshotContext is CreateSnapshot bounded by ctx: a Firecracker that
+// stops answering cannot hold the caller past its deadline.
+func CreateSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath, blockDeltaDir string, mode SnapshotMode) error {
 	if mode == SnapshotFlatten && blockDeltaDir == "" {
 		return fmt.Errorf("SnapshotFlatten requires non-empty blockDeltaDir")
 	}
-	fc := newFCClient(socketPath)
-	ctx := context.Background()
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 
 	// Pause the VM.
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
@@ -310,7 +394,7 @@ func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mod
 			MemFilePath:   &memPath,
 			SnapshotType:  models.SnapshotCreateParamsSnapshotTypeFull,
 			BlockDeltaDir: blockDeltaDir,
-			Flatten:       mode == SnapshotFlatten,
+			Flatten:       omitFalse(mode == SnapshotFlatten),
 		},
 	}); err != nil {
 		return fmt.Errorf("create snapshot: %w", err)
@@ -374,9 +458,14 @@ func VMState(ctx context.Context, socketPath string) (string, error) {
 	return info.State, nil
 }
 
-func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
-	fc := newFCClient(socketPath)
-	ctx := context.Background()
+func CreateDiffSnapshot(socketPath, snapshotPath, memPath, expectedSessionID string, expectedGeneration int64) error {
+	return CreateDiffSnapshotContext(context.Background(), socketPath, snapshotPath, memPath, expectedSessionID, expectedGeneration)
+}
+
+// CreateDiffSnapshotContext is CreateDiffSnapshot bounded by ctx.
+func CreateDiffSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath, expectedSessionID string, expectedGeneration int64) error {
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
 		Context: ctx,
@@ -385,14 +474,29 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 		return fmt.Errorf("pause VM: %w", err)
 	}
 
+	body := &models.SnapshotCreateParams{
+		SnapshotPath: &snapshotPath,
+		MemFilePath:  &memPath,
+		SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
+	}
+	// Guarded diff: Firecracker compares the token against the session it
+	// installed at load time, and the generation against the snapshots it has
+	// taken since, and rejects — before consuming the bitmap or touching
+	// memPath — unless both match. A capture of the running source takes a
+	// snapshot and advances the generation the record carries; anything else
+	// that consumed the bitmap shows up as a mismatch and a clean rejection.
+	if expectedSessionID != "" {
+		gen := expectedGeneration
+		body.ExpectedSessionID = expectedSessionID
+		body.ExpectedGeneration = &gen
+	}
 	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
 		Context: ctx,
-		Body: &models.SnapshotCreateParams{
-			SnapshotPath: &snapshotPath,
-			MemFilePath:  &memPath,
-			SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
-		},
+		Body:    body,
 	}); err != nil {
+		if isDirtyTrackingMismatchErr(err) {
+			return fmt.Errorf("create diff snapshot: %w: %v", ErrDirtyTrackingMismatch, err)
+		}
 		return fmt.Errorf("create diff snapshot: %w", err)
 	}
 	return nil
@@ -401,12 +505,43 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath string) error {
 // UnpauseVM resumes a paused VM's vCPUs. Used after CreateSnapshot to make
 // snapshot creation non-destructive.
 func UnpauseVM(socketPath string) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
 		Context: context.Background(),
 		Body:    &models.VM{State: strPtr(models.VMStateResumed)},
 	}); err != nil {
 		return fmt.Errorf("unpause VM: %w", err)
+	}
+	return nil
+}
+
+// UnpauseVMContext resumes a paused VM's vCPUs within ctx. A bare request over
+// a context-honouring dial, as VMState: it runs on failure and recovery paths,
+// where a stuck API must not hang the caller. A VM that is not paused refuses
+// it, which callers treat as nothing to do.
+func UnpauseVMContext(ctx context.Context, socketPath string) error {
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socketPath)
+		},
+		DisableKeepAlives: true,
+	}
+	defer tr.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, "http://localhost/vm", strings.NewReader(`{"state":"Resumed"}`))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		return fmt.Errorf("unpause VM: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("unpause VM: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
@@ -421,7 +556,8 @@ func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice,
 	if tapDevice != "" {
 		overrides = []*models.NetworkOverride{{IfaceID: &ifaceID, HostDevName: &tapDevice}}
 	}
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
 		Body: &models.SnapshotLoadParams{
@@ -446,7 +582,8 @@ func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice,
 // SnapshotPausedVM creates a Full snapshot of an already-paused VM (e.g. one
 // loaded via LoadSnapshotNoResume), issuing no pause first as CreateSnapshot does.
 func SnapshotPausedVM(socketPath, snapshotPath, memPath string) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
 		Context: context.Background(),
 		Body: &models.SnapshotCreateParams{
@@ -463,8 +600,9 @@ func SnapshotPausedVM(socketPath, snapshotPath, memPath string) error {
 // RestoreSnapshot loads a snapshot and resumes the VM. Non-empty blockDeltaDir
 // hydrates a fresh per-VM overlay from <dir>/<drive_id>.delta — pass empty
 // for in-place resume (existing overlay already carries state).
-func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) error {
-	fc := newFCClient(socketPath)
+func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, clockRealtime *bool) error {
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
 		Body: &models.SnapshotLoadParams{
@@ -476,6 +614,8 @@ func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) er
 			ResumeVM:         true,
 			NetworkOverrides: []*models.NetworkOverride{}, // Empty, not nil — Firecracker rejects null.
 			BlockDeltaDir:    blockDeltaDir,
+			// nil ⇒ omitted ⇒ Firecracker restores the flags the snapshot carries.
+			ClockRealtime: clockRealtime,
 		},
 	}); err != nil {
 		if isTornSnapshotErr(err) {
@@ -488,8 +628,9 @@ func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string) er
 
 // RestoreSnapshotWithOverrides loads a snapshot, overrides the network TAP
 // device, and resumes the VM. See RestoreSnapshot for blockDeltaDir semantics.
-func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir string) error {
-	fc := newFCClient(socketPath)
+func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir string, clockRealtime *bool) error {
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
 		Body: &models.SnapshotLoadParams{
@@ -503,6 +644,8 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},
 			BlockDeltaDir: blockDeltaDir,
+			// nil ⇒ omitted ⇒ Firecracker restores the flags the snapshot carries.
+			ClockRealtime: clockRealtime,
 		},
 	}); err != nil {
 		if isTornSnapshotErr(err) {
@@ -524,12 +667,15 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // suppressed on the Firecracker side regardless of accessLogPath.
 func RestoreSnapshotUffdInternalWithOverrides(
 	socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
-	trackDirty, abortOnHandlerDeath bool,
+	trackDirty, abortOnHandlerDeath, eagerOverlay bool,
+	trackingSessionID string,
+	clockRealtime *bool,
 ) error {
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: ctx,
 		Body: &models.SnapshotLoadParams{
@@ -542,16 +688,22 @@ func RestoreSnapshotUffdInternalWithOverrides(
 				BasePath:            basePath,
 				AccessLogPath:       accessLogPath,
 				RecordTo:            recordToPath,
-				AbortOnHandlerDeath: abortOnHandlerDeath,
+				AbortOnHandlerDeath: omitFalse(abortOnHandlerDeath),
+				EagerOverlay:        omitFalse(eagerOverlay),
 			},
 			// Arms dirty-page tracking so the next pause can write an incremental
-			// (Diff) snapshot instead of a Full one.
-			TrackDirtyPages: trackDirty,
-			ResumeVM:        true,
+			// (Diff) snapshot instead of a Full one. The session id (guarded
+			// pause flag on) makes the armed bitmap provable: the pause's Diff
+			// request carries it back and Firecracker rejects a stale baseline.
+			TrackDirtyPages:   trackDirty,
+			TrackingSessionID: trackingSessionID,
+			ResumeVM:          true,
 			NetworkOverrides: []*models.NetworkOverride{
 				{IfaceID: &ifaceID, HostDevName: &tapDevice},
 			},
 			BlockDeltaDir: blockDeltaDir,
+			// nil ⇒ omitted ⇒ Firecracker restores the flags the snapshot carries.
+			ClockRealtime: clockRealtime,
 		},
 	}); err != nil {
 		if isTornSnapshotErr(err) {

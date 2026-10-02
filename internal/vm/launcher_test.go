@@ -4,10 +4,14 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/shellquote"
 )
@@ -33,6 +37,91 @@ func TestBuildLauncherNamespace_Integration(t *testing.T) {
 	// A rebuild over an existing pin must also succeed (stale-pin path).
 	if err := buildLauncherNamespace(ctx, pin); err != nil {
 		t.Fatalf("rebuild over existing pin: %v", err)
+	}
+}
+
+func TestFCStartScript_ExecStamp(t *testing.T) {
+	got := fcStartScript("ns-7", "", "SETUP",
+		"/usr/bin/firecracker", "/run/x/fc.sock", "vm-abc")
+	// The stamp path rides inside the doubly-quoted inner script, so assert on
+	// the stable fragments rather than the escaped quoting.
+	if !strings.Contains(got, "date +%s%N >") || !strings.Contains(got, "/run/x/fcexec.ts") {
+		t.Fatalf("script missing pre-exec stamp; got:\n%s", got)
+	}
+	// The stamp must precede the firecracker exec and follow the setup: a
+	// failed setup must not stamp, and the stamp must not run after exec.
+	idx := strings.Index(got, "fcexec.ts")
+	if execIdx := strings.Index(got, "/usr/bin/firecracker"); execIdx < idx {
+		t.Errorf("stamp must come before the firecracker exec; got:\n%s", got)
+	}
+	if setupIdx := strings.Index(got, "SETUP"); setupIdx > idx {
+		t.Errorf("stamp must come after setup commands; got:\n%s", got)
+	}
+	// A best-effort stamp: date failure must not break the && chain to exec.
+	if !strings.Contains(got, "|| true") {
+		t.Errorf("stamp must be best-effort (|| true); got:\n%s", got)
+	}
+}
+
+func TestReadFCExecStamp(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "fc.sock")
+	write := func(s string) {
+		if err := os.WriteFile(fcExecStampPath(socketPath), []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := time.Now().Add(-time.Second)
+	after := time.Now().Add(time.Second)
+
+	if _, ok := readFCExecStamp(socketPath, before, after); ok {
+		t.Error("missing stamp file must read as absent")
+	}
+	write("garbage%N\n")
+	if _, ok := readFCExecStamp(socketPath, before, after); ok {
+		t.Error("unparsable stamp must read as absent")
+	}
+	// A stale stamp from a prior launch sits outside the window.
+	write(strconv.FormatInt(before.Add(-time.Hour).UnixNano(), 10))
+	if _, ok := readFCExecStamp(socketPath, before, after); ok {
+		t.Error("stale stamp outside the window must read as absent")
+	}
+	now := time.Now()
+	write(strconv.FormatInt(now.UnixNano(), 10) + "\n")
+	ts, ok := readFCExecStamp(socketPath, before, after)
+	if !ok || !ts.Equal(time.Unix(0, now.UnixNano())) {
+		t.Errorf("valid stamp: got (%v, %v), want (%v, true)", ts, ok, now)
+	}
+}
+
+// The two launch sites — vmd's start script and template-builder's build VM —
+// share LaunchNamespaceEntry so they cannot diverge on the entry mode or on
+// the sysfs remount it obliges. Skipping the remount under nsenter is silent:
+// the VM boots and /sys/class/net just shows the host's interfaces.
+func TestLaunchNamespaceEntry(t *testing.T) {
+	legacy := LaunchNamespaceEntry("ns-7", "")
+	if got := strings.Join(legacy.Argv, " "); got != "ip netns exec ns-7" {
+		t.Errorf("legacy argv = %q, want `ip netns exec ns-7`", got)
+	}
+	if legacy.SysfsSetup != "" {
+		t.Errorf("legacy entry must not remount /sys (ip netns exec already does); got %q", legacy.SysfsSetup)
+	}
+
+	pinned := LaunchNamespaceEntry("ns-7", "/run/vmd/launcher.mntns")
+	if got := strings.Join(pinned.Argv, " "); got != "nsenter --net=/run/netns/ns-7 --mount=/run/vmd/launcher.mntns --" {
+		t.Errorf("launcher argv = %q", got)
+	}
+	if !strings.Contains(pinned.SysfsSetup, "mount -t sysfs sysfs /sys") {
+		t.Errorf("launcher entry must remount /sys; got %q", pinned.SysfsSetup)
+	}
+	// The exec and shell renderings must describe the same entry, or the two
+	// launch sites take different paths from identical inputs. Compared with
+	// the shell quoting stripped, since only the shell form quotes the pin.
+	unquoted := strings.ReplaceAll(pinned.Shell, "'", "")
+	for _, a := range pinned.Argv {
+		if !strings.Contains(unquoted, a) {
+			t.Errorf("shell rendering %q missing argv element %q", pinned.Shell, a)
+		}
 	}
 }
 
@@ -220,5 +309,78 @@ malformed
 		if got[i] != want[i] {
 			t.Errorf("prunePaths[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// TestEnsureLauncherNamespace_SingleFlight pins the guard that keeps the boot
+// build and a sampler-driven retry from pruning the same pin concurrently. The
+// boot build runs async, so a retry scheduled by the first sampler tick can
+// land while it is still running.
+func TestEnsureLauncherNamespace_SingleFlight(t *testing.T) {
+	m := &Manager{cfg: ManagerConfig{
+		LaunchViaLauncherNS: true,
+		LauncherNSPath:      filepath.Join(t.TempDir(), "launcher.mntns"),
+	}}
+	// Stand in for a build already in flight.
+	m.launcherBuilding.Store(true)
+
+	if err := m.EnsureLauncherNamespace(context.Background()); err != nil {
+		t.Fatalf("EnsureLauncherNamespace with a build in flight = %v, want nil", err)
+	}
+	if m.launcherBuilt.Load() || m.launcherReady.Load() {
+		t.Fatal("a skipped build must not claim the pin is built or ready")
+	}
+	if !m.launcherBuilding.Load() {
+		t.Fatal("a skipped build must leave the in-flight guard held by its owner")
+	}
+}
+
+// TestRetryLauncherBuild_RateLimited pins the spacing between failed rebuild
+// attempts: without it a host whose build keeps failing pays a full prune on
+// every sampler tick.
+func TestRetryLauncherBuild_RateLimited(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{
+		LaunchViaLauncherNS: true,
+		LauncherNSPath:      filepath.Join(t.TempDir(), "launcher.mntns"),
+	}}
+	// Held so the spawned attempt returns at the single-flight guard instead of
+	// running a real unshare/prune from a unit test.
+	m.launcherBuilding.Store(true)
+
+	m.retryLauncherBuild(context.Background())
+	first := m.launcherNextRetry.Load()
+	if first == 0 {
+		t.Fatal("first retry did not arm the interval")
+	}
+	if got := time.Until(time.Unix(0, first)); got > launcherRetryInterval {
+		t.Fatalf("next retry armed %v out, want <= %v", got, launcherRetryInterval)
+	}
+
+	m.retryLauncherBuild(context.Background())
+	if m.launcherNextRetry.Load() != first {
+		t.Fatal("a retry inside the interval must not re-arm the timer")
+	}
+}
+
+// TestRetryLauncherBuild_CoversPostBuildInvalidation pins the second way a
+// process ends up stuck on the legacy path: a pin that built successfully and
+// later went invalid clears launcherReady but leaves launcherBuilt set, so a
+// rebuild gated on launcherBuilt alone would never fire.
+func TestRetryLauncherBuild_CoversPostBuildInvalidation(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{
+		LaunchViaLauncherNS: true,
+		LauncherNSPath:      filepath.Join(t.TempDir(), "launcher.mntns"),
+	}}
+	// Built this boot, then invalidated: exactly the state revalidateLauncher
+	// leaves behind when a live pin stops being valid.
+	m.launcherBuilt.Store(true)
+	m.launcherReady.Store(false)
+	// Held so the scheduled attempt stops at the single-flight guard rather
+	// than running a real unshare/prune from a unit test.
+	m.launcherBuilding.Store(true)
+
+	m.retryLauncherBuild(context.Background())
+	if m.launcherNextRetry.Load() == 0 {
+		t.Fatal("an invalidated pin must schedule a rebuild, not wait for a restart")
 	}
 }

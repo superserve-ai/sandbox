@@ -1,3 +1,10 @@
+variable "promotion_evidence_enabled" {
+  description = "Attach promotion evidence secrets only after operators publish all four versions and prepare shared Auth. Does not enable device policy."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
 variable "project_id" {
   description = "GCP project ID."
   type        = string
@@ -8,6 +15,12 @@ variable "environment" {
   description = "Logical environment name."
   type        = string
   default     = "production"
+}
+
+variable "team_creation_public_keys" {
+  description = "JSON map of dedicated Console assertion key IDs to base64 Ed25519 public keys. Empty disables team creation."
+  type        = string
+  default     = "{}"
 }
 
 variable "region" {
@@ -46,26 +59,14 @@ variable "connector_subnet_cidr" {
   default     = "10.2.0.0/24"
 }
 
-variable "host_internal_ip" {
-  description = "Reserved internal IP for the vmd host."
-  type        = string
-  default     = "10.2.0.2"
-}
-
-variable "machine_type" {
-  description = "Sandbox/VMD host machine type."
-  type        = string
-  default     = "c4-highmem-288-lssd-metal"
-}
-
 variable "boot_disk_type" {
   description = "Boot disk type. C4 metal has no Persistent Disk support, so this must be a Hyperdisk type."
   type        = string
   default     = "hyperdisk-balanced"
 }
 
-variable "reservation_name" {
-  description = "Name of a reservation to specifically target — only valid if that reservation has specificReservationRequired=true. Null uses default affinity, which automatically consumes a matching (non-specific) reservation in the zone. The us-east4 c4-metal reservation was created without specificReservationRequired, so it must be consumed this way rather than targeted by name."
+variable "host_c_reservation_name" {
+  description = "z3 reservation the sandbox host targets; null uses default affinity."
   type        = string
   default     = null
 }
@@ -129,4 +130,61 @@ variable "notification_channel_ids" {
   description = "Existing monitored Cloud Monitoring notification channel resource names for infrastructure alerts."
   type        = list(string)
   default     = []
+}
+
+variable "cloud_ids_runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.cloud_ids_runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
+  }
+}
+
+variable "host_c_host_id" {
+  description = "The serving host's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it."
+  type        = string
+}
+
+variable "boot_disk_image" {
+  default     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
+  description = "Regional creation-time image default; existing boot disks remain unchanged."
+  type        = string
+  nullable    = false
+}
+
+variable "host_image_overrides" {
+  description = "Creation-time image overrides keyed by configured host module name."
+  type        = map(string)
+  default     = {}
+}
+
+variable "provisioning_hosts" {
+  description = "Host module names held outside scheduling and runtime deployment during maintenance. Remove only after readiness and explicit admission."
+  type        = set(string)
+  default     = []
+}
+
+variable "compute_restrictions_secret_name" {
+  description = "Existing operator-managed compute restriction secret ID, supplied through deployment configuration."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]+$", var.compute_restrictions_secret_name))
+    error_message = "Set compute_restrictions_secret_name to an existing Secret Manager secret ID."
+  }
+}
+
+variable "alert_runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.alert_runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
+  }
 }

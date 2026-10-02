@@ -15,3 +15,4 @@ internal_api_token_secret_name        = "internal-api-token"
 sandbox_access_token_seed_secret_name = "sandbox-access-token-seed"
 secrets_signing_key_secret_name       = "secretsproxy-signing-key"
 system_team_id_secret_name            = "system-team-id-production"
+notification_channel_ids              = ["projects/rayai-prod/notificationChannels/7690949645937454026"]

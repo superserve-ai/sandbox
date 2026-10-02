@@ -70,6 +70,33 @@ func (q *Queries) GetTeamNotifyEmail(ctx context.Context, teamID uuid.UUID) (str
 	return email, err
 }
 
+const isTrialCreditWarningRecipientCurrent = `-- name: IsTrialCreditWarningRecipientCurrent :one
+SELECT EXISTS (
+    SELECT 1
+    FROM team_memberships m
+    JOIN profile p ON p.id = m.user_id
+    JOIN user_role_assignments a ON a.user_id = m.user_id AND a.team_id = m.team_id
+    JOIN roles r ON r.id = a.role_id AND r.scope_type = 'team'
+    JOIN role_permissions rp ON rp.role_id = r.id
+    JOIN permissions perm ON perm.id = rp.permission_id AND perm.name = 'billing:write'
+    WHERE m.team_id = $1
+      AND m.status = 'active' AND a.scope_type = 'team' AND a.revoked_at IS NULL
+      AND lower(btrim(p.email)) = $2::text
+)::boolean AS current
+`
+
+type IsTrialCreditWarningRecipientCurrentParams struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	Recipient string    `json:"recipient"`
+}
+
+func (q *Queries) IsTrialCreditWarningRecipientCurrent(ctx context.Context, arg IsTrialCreditWarningRecipientCurrentParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isTrialCreditWarningRecipientCurrent, arg.TeamID, arg.Recipient)
+	var current bool
+	err := row.Scan(&current)
+	return current, err
+}
+
 const listQuotaAlertState = `-- name: ListQuotaAlertState :many
 SELECT team_id, quota_type, channel, created_at FROM quota_alert_state
 `
@@ -211,6 +238,41 @@ func (q *Queries) ListTeamQuotaUsage(ctx context.Context) ([]ListTeamQuotaUsageR
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTrialCreditWarningRecipients = `-- name: ListTrialCreditWarningRecipients :many
+SELECT DISTINCT p.email
+FROM team_memberships m
+JOIN profile p ON p.id = m.user_id
+JOIN user_role_assignments a ON a.user_id = m.user_id AND a.team_id = m.team_id
+JOIN roles r ON r.id = a.role_id AND r.scope_type = 'team'
+JOIN role_permissions rp ON rp.role_id = r.id
+JOIN permissions perm ON perm.id = rp.permission_id AND perm.name = 'billing:write'
+WHERE m.team_id = $1
+  AND m.status = 'active' AND a.scope_type = 'team' AND a.revoked_at IS NULL
+  AND p.email IS NOT NULL AND p.email <> ''
+`
+
+// Active members with an active team-scoped assignment granting billing:write.
+// DISTINCT prevents duplicate sends when a user has multiple matching roles.
+func (q *Queries) ListTrialCreditWarningRecipients(ctx context.Context, teamID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listTrialCreditWarningRecipients, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var email string
+		if err := rows.Scan(&email); err != nil {
+			return nil, err
+		}
+		items = append(items, email)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

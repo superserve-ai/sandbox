@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,10 +37,13 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/promotiontest"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 const testDefaultHostID = "default"
+
+const integrationSchemaLockKey int64 = 0x5355504552534552
 
 var (
 	testPool         *pgxpool.Pool
@@ -70,33 +74,61 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "cannot ping test database: %v\n", err)
 		os.Exit(1)
 	}
+	lockCtx, stopLockWait := context.WithTimeout(context.Background(), 5*time.Minute)
+	lockConn, err := pgx.Connect(lockCtx, dbURL)
+	if err == nil {
+		_, err = lockConn.Exec(lockCtx, `SELECT pg_advisory_lock($1)`, integrationSchemaLockKey)
+	}
+	stopLockWait()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lock integration test database: %v\n", err)
+		os.Exit(1)
+	}
+	setupCtx, stopSetup := context.WithTimeout(context.Background(), 30*time.Second)
 
-	if err := resetTestSchema(ctx, testPool); err != nil {
+	if err := resetTestSchema(setupCtx, testPool); err != nil {
 		fmt.Fprintf(os.Stderr, "reset test schema: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := applyMigrations(ctx, testPool); err != nil {
+	if err := applyMigrations(setupCtx, testPool); err != nil {
 		fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err := promotiontest.Install(setupCtx, testPool); err != nil {
+		fmt.Fprintf(os.Stderr, "install trusted identity fixture: %v\n", err)
 		os.Exit(1)
 	}
 
 	testQueries = db.New(testPool)
 
-	if err := seedSystemTemplate(ctx, testQueries); err != nil {
+	if err := seedSystemTemplate(setupCtx, testQueries); err != nil {
 		fmt.Fprintf(os.Stderr, "seed system template: %v\n", err)
 		os.Exit(1)
 	}
-	if err := seedPreviewCapableHost(ctx, testQueries); err != nil {
+	if err := seedPreviewCapableHost(setupCtx, testQueries); err != nil {
 		fmt.Fprintf(os.Stderr, "seed preview-capable host: %v\n", err)
 		os.Exit(1)
 	}
+	stopSetup()
 
-	os.Exit(m.Run())
+	workerCtx, stopStorageWorker := context.WithCancel(context.Background())
+	api.StartStorageReportWorker(workerCtx, testPool)
+	code := m.Run()
+	stopStorageWorker()
+	if _, err := lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, integrationSchemaLockKey); err != nil {
+		fmt.Fprintf(os.Stderr, "unlock integration test database: %v\n", err)
+		code = 1
+	}
+	if err := lockConn.Close(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "close integration test database lock: %v\n", err)
+		code = 1
+	}
+	os.Exit(code)
 }
 
 func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
+	_, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS promotion_auth CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
 	return err
 }
 
@@ -156,21 +188,21 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 	if _, err := q.UpdateHostHeartbeat(ctx, testDefaultHostID); err != nil {
 		return fmt.Errorf("heartbeat default host: %w", err)
 	}
-	for _, capability := range []string{
+	capabilities := []string{
 		preview.HostCapabilityPorts,
 		preview.HostCapabilityPortAccess,
 		preview.HostCapabilityPortTokens,
 		preview.HostCapabilityPortBrowserAuth,
-	} {
-		if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
-			HostID: testDefaultHostID, Capability: capability,
-		}); err != nil {
-			return fmt.Errorf("advertise %s: %w", capability, err)
-		}
+	}
+	if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: testDefaultHostID, Capabilities: capabilities,
+	}); err != nil {
+		return fmt.Errorf("advertise capabilities: %w", err)
 	}
 
 	capable, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
+		AllowedStatuses: []string{"active"},
+		HostID:          testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 	})
 	if err != nil {
 		return fmt.Errorf("verify preview capability: %w", err)
@@ -184,7 +216,8 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
 	ctx := context.Background()
 	missing, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: "missing-host-" + uuid.New().String()[:8],
+		AllowedStatuses: []string{"active"},
+		HostID:          "missing-host-" + uuid.New().String()[:8],
 		RequiredCapabilities: []string{
 			preview.HostCapabilityPorts,
 		},
@@ -209,13 +242,15 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
 		t.Fatalf("heartbeat host: %v", err)
 	}
-	params := db.InsertHostCapabilityParams{HostID: hostID, Capability: preview.HostCapabilityPorts}
-	if err := testQueries.InsertHostCapability(ctx, params); err != nil {
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: []string{preview.HostCapabilityPorts},
+	}); err != nil {
 		t.Fatalf("advertise capability: %v", err)
 	}
 	hasCapability := func() bool {
 		got, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-			HostID: hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
+			AllowedStatuses: []string{"active"},
+			HostID:          hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 		})
 		if err != nil {
 			t.Fatalf("check capability: %v", err)
@@ -226,7 +261,8 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 		t.Fatal("current capability on active host was not recognized")
 	}
 	batch, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: hostID,
+		AllowedStatuses: []string{"active"},
+		HostID:          hostID,
 		RequiredCapabilities: []string{
 			preview.HostCapabilityPorts,
 			preview.HostCapabilityPortAccess,
@@ -252,24 +288,32 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 	}
 }
 
+func findMigrationsDir() (string, error) {
+	// Walk up from the test file to the repo root (contains supabase/).
+	dir, _ := os.Getwd()
+	for {
+		migrationsDir := filepath.Join(dir, "supabase", "migrations")
+		if _, err := os.Stat(migrationsDir); err == nil {
+			return migrationsDir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("could not find supabase/migrations from %s", dir)
+		}
+		dir = parent
+	}
+}
+
 // applyMigrations reads SQL files from supabase/migrations/ and executes them
 // in order against the test database. Uses IF NOT EXISTS / OR REPLACE so it is
 // safe to run repeatedly against the same database.
 func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	// Walk up from the test file to the repo root (contains supabase/).
-	dir, _ := os.Getwd()
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "supabase", "migrations")); err == nil {
-			break
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return fmt.Errorf("could not find supabase/migrations from %s", dir)
-		}
-		dir = parent
+	migrationsDir, err := findMigrationsDir()
+	if err != nil {
+		return err
 	}
 
-	entries, err := os.ReadDir(filepath.Join(dir, "supabase", "migrations"))
+	entries, err := os.ReadDir(migrationsDir)
 	if err != nil {
 		return fmt.Errorf("read migrations dir: %w", err)
 	}
@@ -280,7 +324,7 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		if !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, "supabase", "migrations", e.Name()))
+		data, err := os.ReadFile(filepath.Join(migrationsDir, e.Name()))
 		if err != nil {
 			return fmt.Errorf("read %s: %w", e.Name(), err)
 		}
@@ -294,18 +338,38 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct {
-	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+	resumeFn          func()
+	resumeAttestation vmdclient.ResumeAttestation
+	pauseCalls        atomic.Int32
+	resumeCalls       atomic.Int32
+	restoreCalls      atomic.Int32
+	updatePreviewFn   func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+	updateNetworkFn   func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	pauseErr          error // when set, every PauseInstance fails with it
+	pauseFn           func(ctx context.Context, id, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error)
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
-func (s *stubVMD) PauseInstance(_ context.Context, _, _ string) (string, string, []vmdclient.ManifestEntry, error) {
-	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, nil
+func (s *stubVMD) PauseInstance(ctx context.Context, id, _, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
+	s.pauseCalls.Add(1)
+	if s.pauseFn != nil {
+		return s.pauseFn(ctx, id, pauseToken)
+	}
+	if s.pauseErr != nil {
+		return "", "", nil, "", s.pauseErr
+	}
+	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string) (string, uint32, uint32, error) {
-	return "10.0.0.1", 1, 1024, nil
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+	s.resumeCalls.Add(1)
+	if s.resumeFn != nil {
+		s.resumeFn()
+	}
+	return "10.0.0.1", 1, 1024, s.resumeAttestation, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string) (string, uint32, uint32, string, error) {
-	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, nil
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
+	s.restoreCalls.Add(1)
+	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, limits.Egress != nil, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
 	return nil
@@ -313,7 +377,10 @@ func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]str
 func (s *stubVMD) ListDir(_ context.Context, _, _ string) ([]vmdclient.DirEntry, error) {
 	return nil, nil
 }
-func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {
+	if s.updateNetworkFn != nil {
+		return s.updateNetworkFn(ctx, instanceID, allowedCIDRs, deniedCIDRs, allowedDomains)
+	}
 	return nil
 }
 
@@ -323,11 +390,15 @@ func (s *stubVMD) UpdateSandboxPreviewPolicy(ctx context.Context, id, access str
 	}
 	return nil
 }
-func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error        { return nil }
-func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error           { return nil }
-func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error  { return nil }
-func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error    { return nil }
-func (s *stubVMD) DeleteSandboxSnapshots(_ context.Context, _ string) error  { return nil }
+func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error       { return nil }
+func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error          { return nil }
+func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error   { return nil }
+func (s *stubVMD) DeleteSandboxSnapshots(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) CreateSavedSnapshot(_ context.Context, _, snapshotID, kind string) (vmdclient.SavedSnapshot, error) {
+	return vmdclient.SavedSnapshot{Kind: kind, DiskPath: "/saved/" + snapshotID + "/overlay.ext4", VCPU: 1, MemoryMiB: 1024, DiskSizeMiB: 4096}, nil
+}
+func (s *stubVMD) DeleteSavedSnapshot(_ context.Context, _ string) error     { return nil }
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
 func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {
@@ -669,12 +740,10 @@ func seedActivePreviewHost(t *testing.T, capabilities ...string) string {
 	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
 		t.Fatalf("heartbeat preview host: %v", err)
 	}
-	for _, capability := range capabilities {
-		if err := testQueries.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
-			HostID: hostID, Capability: capability,
-		}); err != nil {
-			t.Fatalf("advertise preview host %s: %v", capability, err)
-		}
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: capabilities,
+	}); err != nil {
+		t.Fatalf("advertise preview host capabilities: %v", err)
 	}
 	return hostID
 }
@@ -702,6 +771,97 @@ func readPreviewCredentialState(t *testing.T, sandboxID uuid.UUID) (version, rev
 		t.Fatalf("read preview credential state: %v", err)
 	}
 	return version, revision
+}
+
+func TestIntegration_SyncHostCapabilitiesRefreshesCompleteSet(t *testing.T) {
+	ctx := context.Background()
+	hostID := "sync-capability-host-" + uuid.New().String()[:8]
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "localhost:0", ProxyAddr: "localhost:0", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
+		t.Fatalf("initial heartbeat: %v", err)
+	}
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: []string{"cap-a", "cap-b"},
+	}); err != nil {
+		t.Fatalf("initial capability sync: %v", err)
+	}
+	var initialHeartbeat, initialCapabilityCreatedAt time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT h.last_heartbeat_at, hc.created_at
+		FROM host h
+		JOIN host_capability hc ON hc.host_id = h.id AND hc.capability = 'cap-a'
+		WHERE h.id = $1`, hostID).Scan(&initialHeartbeat, &initialCapabilityCreatedAt); err != nil {
+		t.Fatalf("read initial heartbeat: %v", err)
+	}
+
+	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
+		t.Fatalf("refresh heartbeat: %v", err)
+	}
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: []string{"cap-a", "cap-c"},
+	}); err != nil {
+		t.Fatalf("refresh capability sync: %v", err)
+	}
+
+	rows, err := testPool.Query(ctx, `
+		SELECT hc.capability, hc.heartbeat_at, hc.created_at, h.last_heartbeat_at
+		FROM host_capability hc
+		JOIN host h ON h.id = hc.host_id
+		WHERE hc.host_id = $1
+		ORDER BY hc.capability`, hostID)
+	if err != nil {
+		t.Fatalf("read synchronized capabilities: %v", err)
+	}
+	defer rows.Close()
+	got := make(map[string]time.Time)
+	for rows.Next() {
+		var capability string
+		var capabilityHeartbeat, capabilityCreatedAt, hostHeartbeat time.Time
+		if err := rows.Scan(&capability, &capabilityHeartbeat, &capabilityCreatedAt, &hostHeartbeat); err != nil {
+			t.Fatalf("scan synchronized capability: %v", err)
+		}
+		if !capabilityHeartbeat.Equal(hostHeartbeat) {
+			t.Fatalf("capability %q heartbeat = %v, host heartbeat = %v", capability, capabilityHeartbeat, hostHeartbeat)
+		}
+		got[capability] = capabilityHeartbeat
+		if capability == "cap-a" && !capabilityCreatedAt.Equal(initialCapabilityCreatedAt) {
+			t.Fatalf("unchanged capability created_at = %v, initial = %v; want row identity preserved", capabilityCreatedAt, initialCapabilityCreatedAt)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate synchronized capabilities: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("synchronized capabilities = %#v, want cap-a and cap-c", got)
+	}
+	if _, ok := got["cap-a"]; !ok {
+		t.Fatal("unchanged capability cap-a was not refreshed")
+	}
+	if !got["cap-a"].After(initialHeartbeat) {
+		t.Fatalf("unchanged capability heartbeat = %v, initial heartbeat = %v; want refresh", got["cap-a"], initialHeartbeat)
+	}
+	if _, ok := got["cap-c"]; !ok {
+		t.Fatal("new capability cap-c was not inserted")
+	}
+	if _, ok := got["cap-b"]; ok {
+		t.Fatal("omitted capability cap-b was not pruned")
+	}
+
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{HostID: hostID}); err != nil {
+		t.Fatalf("empty capability sync: %v", err)
+	}
+	var remaining int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM host_capability WHERE host_id = $1`, hostID).Scan(&remaining); err != nil {
+		t.Fatalf("count cleared capabilities: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("capabilities after empty sync = %d, want 0", remaining)
+	}
 }
 
 func TestIntegration_MintDeliveryFailureRollsBackRevisionAndReturnsNoCredential(t *testing.T) {
@@ -983,6 +1143,13 @@ func seedTeamAndKeyWithRole(t *testing.T, roleName string) (uuid.UUID, string, u
 	if err != nil {
 		t.Fatalf("seedTeamAndKeyWithRole: create team: %v", err)
 	}
+	seedHistoricalTeam(t, team.ID)
+	if _, err := testPool.Exec(ctx, `
+		DELETE FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, team.ID); err != nil {
+		t.Fatalf("seedTeamAndKeyWithRole: clear default trial grant: %v", err)
+	}
 
 	profileID := uuid.New()
 	if _, err := testPool.Exec(ctx,
@@ -1092,6 +1259,7 @@ func seedTeamAndKeyNoCreator(t *testing.T) (uuid.UUID, string) {
 	if err != nil {
 		t.Fatalf("seedTeamAndKeyNoCreator: create team: %v", err)
 	}
+	seedHistoricalTeam(t, team.ID)
 
 	rawKey := "sk-test-" + uuid.New().String()
 	hash := sha256.Sum256([]byte(rawKey))
@@ -1145,6 +1313,7 @@ func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
 	if err != nil {
 		t.Fatalf("seedTeamKeyAndProfile: create team: %v", err)
 	}
+	seedHistoricalTeam(t, team.ID)
 
 	profileID := uuid.New()
 	if _, err := testPool.Exec(ctx,
@@ -1189,6 +1358,15 @@ func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
 	}
 
 	return team.ID, rawKey, profileID
+}
+
+// Generic endpoint fixtures model existing teams, not unfinished Console signups.
+// Signup tests exercise the pending marker through the actual owner chain.
+func seedHistoricalTeam(t *testing.T, teamID uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(), `DELETE FROM team_signup_trial_provenance WHERE team_id = $1`, teamID); err != nil {
+		t.Fatalf("seed historical team: %v", err)
+	}
 }
 
 func roleIDByName(ctx context.Context, roleName string) (uuid.UUID, error) {
@@ -1287,7 +1465,12 @@ func assertFloatNear(t *testing.T, got, want float64) {
 
 func assertFloatBetween(t *testing.T, got, min, max float64) {
 	t.Helper()
-	const epsilon = 0.000000000001
+	// Billing usage is measured by PostgreSQL while the bounds use the
+	// application clock; allow a small cross-process clock/scheduling skew.
+	// CI can run the database and application on hosts whose clocks differ by
+	// a few tens of milliseconds; at the rates used here that is still only a
+	// fraction of a micro-dollar.
+	const epsilon = 0.000001
 	if got < min-epsilon || got > max+epsilon {
 		t.Fatalf("got %v, want between %v and %v", got, min, max)
 	}
@@ -1359,6 +1542,15 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	teamID, ownerKey := seedTeamAndKey(t)
 	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
 	r := newRouter(t)
+	// This test exercises the shadow-mode response explicitly. Billing export
+	// is live by default, so do not rely on the global default here.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable billing export for shadow-mode test: %v", err)
+	}
 
 	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"billing-summary-box"}`)
 	if cw.Code != http.StatusCreated {
@@ -1368,6 +1560,7 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse sandbox id: %v", err)
 	}
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
@@ -1391,6 +1584,18 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 		t.Fatalf("test clock is too close to the billing period start: start=%s end=%s", start, end)
 	}
 	seconds := end.Sub(start).Seconds()
+	// Billable usage is clamped to the current period, so the seeded window
+	// collapses to minutes just after a period rolls over. Size the credit
+	// from the closed intervals rather than hardcoding an amount: a fixed
+	// credit only stays below the charges for most of the month, and exceeds
+	// them at the start of one, leaving credit unspent and flipping every
+	// assertion that expects it fully consumed.
+	closedCompute := 2 * seconds * 0.000014
+	closedMemory := 2 * seconds * 0.0000045
+	creditUSD := math.Round((closedCompute+closedMemory)/2*1e6) / 1e6
+	if creditUSD <= 0 {
+		t.Fatalf("seeded window is too short to bill against: seconds=%v", seconds)
+	}
 	openStart := now.Add(-15 * time.Minute)
 	if openStart.Before(periodStart) {
 		openStart = periodStart
@@ -1433,14 +1638,20 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
-		VALUES ($1, 0.100000, 0.100000, 'integration test credit')
-	`, teamID); err != nil {
+		VALUES ($1, $2, $2, 'integration test credit')
+	`, teamID, creditUSD); err != nil {
 		t.Fatalf("seed billing credit: %v", err)
 	}
 
-	requestStarted := time.Now().UTC()
+	// Open usage uses PostgreSQL's clock, which can differ from the test process.
+	var requestStarted, requestFinished time.Time
+	if err := testPool.QueryRow(ctx, `SELECT now()`).Scan(&requestStarted); err != nil {
+		t.Fatalf("read database time before summary: %v", err)
+	}
 	w := do(r, "GET", "/billing/summary", viewerKey, "")
-	requestFinished := time.Now().UTC()
+	if err := testPool.QueryRow(ctx, `SELECT now()`).Scan(&requestFinished); err != nil {
+		t.Fatalf("read database time after summary: %v", err)
+	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -1452,13 +1663,59 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 
 	body := mustJSON(t, w)
+	if got := body["mode"].(string); got != "shadow" {
+		t.Fatalf("mode = %q, want shadow", got)
+	}
+	trial, ok := body["trial"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("trial = %v, want object", body["trial"])
+	}
+	for _, key := range []string{"grant_usd", "consumed_usd", "remaining_usd", "state", "eligible"} {
+		if _, present := trial[key]; !present {
+			t.Fatalf("trial missing %q: %v", key, trial)
+		}
+	}
+	state, ok := trial["state"].(string)
+	if !ok || (state != "no_grant" && state != "active" && state != "exhausted" && state != "expired" && state != "ended_by_billing_activation") {
+		t.Fatalf("trial state = %v, want a recognized lifecycle state", trial["state"])
+	}
+	if state == "no_grant" && (trial["grant_usd"] != float64(0) || trial["consumed_usd"] != float64(0) || trial["remaining_usd"] != float64(0)) {
+		t.Fatalf("no-grant trial = %v, want zero monetary values", trial)
+	}
+	// An expired signup grant is terminal and ineligible, distinct from a team
+	// that never received a signup grant.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at)
+		VALUES ($1, 1, 1, 'signup trial credit', now() + interval '1 hour')
+	`, teamID); err != nil {
+		t.Fatalf("seed signup trial grant for expiry: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_credit_grant
+		SET expires_at = now() - interval '1 second'
+		WHERE team_id = $1 AND reason = 'signup trial credit' AND expires_at IS NOT NULL
+	`, teamID); err != nil {
+		t.Fatalf("expire signup trial grant: %v", err)
+	}
+	expired := do(r, "GET", "/billing/summary", viewerKey, "")
+	if expired.Code != http.StatusOK {
+		t.Fatalf("expired trial summary: expected 200, got %d: %s", expired.Code, expired.Body.String())
+	}
+	expiredTrial, ok := mustJSON(t, expired)["trial"].(map[string]interface{})
+	if !ok || expiredTrial["state"] != "expired" || expiredTrial["eligible"] != false || expiredTrial["remaining_usd"] != float64(0) {
+		t.Fatalf("expired trial = %v, want expired, ineligible, and zero remaining", expiredTrial)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_credit_grant
+		SET expires_at = NULL, remaining_usd = 0
+		WHERE team_id = $1 AND reason = 'signup trial credit' AND expires_at IS NOT NULL
+	`, teamID); err != nil {
+		t.Fatalf("restore signup trial grant expiry: %v", err)
+	}
 	breakdown, ok := body["cost_breakdown_usd"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("cost_breakdown_usd not an object: %v", body["cost_breakdown_usd"])
 	}
-	closedCompute := 2 * seconds * 0.000014
-	closedMemory := 2 * seconds * 0.0000045
-	closedStorage := 10 * seconds * 0.00000003
 	minOpenSeconds := requestStarted.Sub(openStart).Seconds()
 	maxOpenSeconds := requestFinished.Sub(openStart).Seconds()
 	if minOpenSeconds < 0 {
@@ -1472,14 +1729,81 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	storage := breakdown["storage"].(float64)
 	assertFloatBetween(t, compute, closedCompute+minOpenSeconds*0.000014, closedCompute+maxOpenSeconds*0.000014)
 	assertFloatBetween(t, memory, closedMemory+0.5*minOpenSeconds*0.0000045, closedMemory+0.5*maxOpenSeconds*0.0000045)
-	assertFloatBetween(t, storage, closedStorage+5*minOpenSeconds*0.00000003, closedStorage+5*maxOpenSeconds*0.00000003)
+	assertFloatNear(t, storage, 0)
 
 	currentCharges := body["current_charges_usd"].(float64)
-	creditsApplied := math.Min(currentCharges, 0.1)
-	assertFloatNear(t, currentCharges, compute+memory+storage)
+	// Everything below assumes the credit is fully consumed — including the
+	// later payment_setup_required check, which only holds once no credit
+	// remains. Fail here with the reason rather than there with a bare false.
+	if currentCharges <= creditUSD {
+		t.Fatalf("charges %v do not exceed the seeded credit %v, so it cannot be fully consumed", currentCharges, creditUSD)
+	}
+	creditsApplied := math.Min(currentCharges, creditUSD)
+	assertFloatNear(t, currentCharges, compute+memory)
 	assertFloatNear(t, body["credits_applied_usd"].(float64), creditsApplied)
-	assertFloatNear(t, body["credits_remaining_usd"].(float64), 0.1-creditsApplied)
+	assertFloatNear(t, body["credits_remaining_usd"].(float64), creditUSD-creditsApplied)
 	assertFloatNear(t, body["expected_invoice_amount_usd"].(float64), currentCharges-creditsApplied)
+
+	resources, ok := body["resources"].([]interface{})
+	if !ok || len(resources) != 3 {
+		t.Fatalf("resources = %v, want 3 entries", body["resources"])
+	}
+	storageResource := resources[2].(map[string]interface{})
+	if storageResource["resource"] != "storage_gib" || storageResource["billable"].(bool) {
+		t.Fatalf("storage resource should be tracked-only in shadow mode: %+v", storageResource)
+	}
+	if got := body["payment_setup_required"].(bool); got {
+		t.Fatal("payment_setup_required should be false in shadow mode")
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable live billing mode: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+		ON CONFLICT (team_id) DO UPDATE
+		SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+		    stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+		    stripe_subscription_status = EXCLUDED.stripe_subscription_status
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatalf("seed incomplete billing account: %v", err)
+	}
+
+	liveRouter := newBillingRouter(t, &fakeStripeClient{})
+	live := do(liveRouter, "GET", "/billing/summary", ownerKey, "")
+	if live.Code != http.StatusOK {
+		t.Fatalf("live billing summary: expected 200, got %d: %s", live.Code, live.Body.String())
+	}
+	liveBody := mustJSON(t, live)
+	if got := liveBody["payment_setup_required"].(bool); !got {
+		t.Fatal("payment_setup_required should be true before subscription is established")
+	}
+	if got := liveBody["checkout_available"].(bool); !got {
+		t.Fatal("checkout_available should be true before subscription is established")
+	}
+	if got := liveBody["portal_available"].(bool); got {
+		t.Fatal("portal_available should be false before subscription is established")
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_billing_account
+		SET trial_ended_at = now(), stripe_subscription_status = 'active'
+		WHERE team_id = $1
+	`, teamID); err != nil {
+		t.Fatalf("mark subscription active: %v", err)
+	}
+	activated := do(liveRouter, "GET", "/billing/summary", ownerKey, "")
+	if activated.Code != http.StatusOK {
+		t.Fatalf("activated billing summary: expected 200, got %d: %s", activated.Code, activated.Body.String())
+	}
+	activatedTrial, ok := mustJSON(t, activated)["trial"].(map[string]interface{})
+	if !ok || activatedTrial["state"] != "ended_by_billing_activation" || activatedTrial["eligible"] != true || activatedTrial["remaining_usd"] != float64(0) {
+		t.Fatalf("activated trial = %v, want ended_by_billing_activation, eligible, and zero remaining", activatedTrial)
+	}
 
 	period, ok := body["billing_period"].(map[string]interface{})
 	if !ok {
@@ -1503,6 +1827,363 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 }
 
+func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO profile (id, email)
+		VALUES ($1, $2)
+	`, userID, "trial-credit-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	// A prior $95 redemption must not consume the user's separate $5 claim.
+	stripeTeam, err := testQueries.CreateTeam(ctx, "trial-credit-stripe-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create Stripe redemption team: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO user_promotion_entitlement (user_id, stripe_redemption_at, stripe_redemption_team_id)
+		VALUES ($1, now(), $2)
+	`, userID, stripeTeam.ID); err != nil {
+		t.Fatalf("seed Stripe redemption: %v", err)
+	}
+	// Membership in an existing team (including an invited-team flow) must not
+	// consume the creator's personal signup trial.
+	joinedTeam, err := testQueries.CreateTeam(ctx, "trial-credit-joined-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create joined team: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status)
+		VALUES ($1, $2, 'active')
+	`, joinedTeam.ID, userID); err != nil {
+		t.Fatalf("create membership: %v", err)
+	}
+	teamID, err := provisionTeamForUser(ctx, userID, "trial-credit-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create team: %v", err)
+	}
+	var amount, remaining float64
+	if err := testPool.QueryRow(ctx, `
+		SELECT amount_usd, remaining_usd
+		FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, teamID).Scan(&amount, &remaining); err != nil {
+		t.Fatalf("load signup trial credit: %v", err)
+	}
+	if amount != 5 || remaining != 5 {
+		t.Fatalf("signup trial credit = (%v, %v), want (5, 5)", amount, remaining)
+	}
+	var ownerMemberships, ownerAssignments int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM team_member legacy
+		JOIN team_memberships membership
+		  ON membership.team_id = legacy.team_id
+		 AND membership.user_id = legacy.profile_id
+		WHERE legacy.team_id = $1 AND legacy.profile_id = $2
+		  AND legacy.role = 'owner' AND membership.status = 'active'
+	`, teamID, userID).Scan(&ownerMemberships); err != nil {
+		t.Fatalf("check creator provisioning chain: %v", err)
+	}
+	if ownerMemberships != 1 {
+		t.Fatalf("creator provisioning chain rows = %d, want 1", ownerMemberships)
+	}
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM user_role_assignments assignment
+		JOIN roles role ON role.id = assignment.role_id
+		WHERE assignment.team_id = $1 AND assignment.user_id = $2
+		  AND assignment.scope_type = 'team' AND assignment.revoked_at IS NULL
+		  AND role.name = 'team_owner'
+	`, teamID, userID).Scan(&ownerAssignments); err != nil {
+		t.Fatalf("check creator role assignment: %v", err)
+	}
+	if ownerAssignments != 1 {
+		t.Fatalf("creator role assignments = %d, want 1", ownerAssignments)
+	}
+	var claimedTeamID, redeemedTeamID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		SELECT c.team_id, e.stripe_redemption_team_id
+		FROM user_signup_trial_claim c
+		JOIN user_promotion_entitlement e ON e.user_id = c.user_id
+		WHERE c.user_id = $1
+	`, userID).Scan(&claimedTeamID, &redeemedTeamID); err != nil {
+		t.Fatalf("load independent promotion claims: %v", err)
+	}
+	if claimedTeamID != teamID || redeemedTeamID != stripeTeam.ID {
+		t.Fatalf("promotion claims = (%s, %s), want (%s, %s)", claimedTeamID, redeemedTeamID, teamID, stripeTeam.ID)
+	}
+	var joinedGrantCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, joinedTeam.ID).Scan(&joinedGrantCount); err != nil {
+		t.Fatalf("count joined-team signup trial grants: %v", err)
+	}
+	if joinedGrantCount != 0 {
+		t.Fatalf("joined-team signup trial grant count = %d, want 0", joinedGrantCount)
+	}
+
+	// A second team for the same user must not receive another grant.
+	secondTeamID, err := provisionTeamForUser(ctx, userID, "trial-credit-second-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create second team: %v", err)
+	}
+	var grantCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM team_credit_grant
+		WHERE team_id IN ($1, $2) AND reason = 'signup trial credit'
+	`, teamID, secondTeamID).Scan(&grantCount); err != nil {
+		t.Fatalf("count signup trial grants: %v", err)
+	}
+	if grantCount != 1 {
+		t.Fatalf("signup trial grant count = %d, want 1", grantCount)
+	}
+	var secondTeamEligible bool
+	if err := testPool.QueryRow(ctx, `SELECT team_sandbox_billing_eligible($1)`, secondTeamID).Scan(&secondTeamEligible); err != nil {
+		t.Fatalf("check repeat-team eligibility: %v", err)
+	}
+	if secondTeamEligible {
+		t.Fatal("repeat-created team remains eligible without a signup grant")
+	}
+
+	// A failed claim (the profile FK is invalid) must roll back the team row.
+	failedName := "trial-credit-rollback-" + uuid.NewString()[:8]
+	if _, err := provisionTeamForUser(ctx, uuid.New(), failedName); err == nil {
+		t.Fatal("create with invalid profile: expected error")
+	}
+	var rolledBackCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE name = $1`, failedName).Scan(&rolledBackCount); err != nil {
+		t.Fatalf("check rolled-back team: %v", err)
+	}
+	if rolledBackCount != 0 {
+		t.Fatalf("rolled-back team count = %d, want 0", rolledBackCount)
+	}
+
+	// A failure after the claim RPC, while the provisioning chain is still in
+	// flight, must roll back both the team and the user's entitlement.
+	rollbackUser := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, rollbackUser, "trial-credit-chain-rollback-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create rollback profile: %v", err)
+	}
+	failedChainName := "trial-credit-chain-rollback-" + uuid.NewString()[:8]
+	if _, err := provisionTeamForUserAfterClaimFailure(ctx, rollbackUser, failedChainName); err == nil {
+		t.Fatal("failed provisioning chain: expected error")
+	}
+	var chainRollbackCount, chainClaimCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE name = $1`, failedChainName).Scan(&chainRollbackCount); err != nil {
+		t.Fatalf("check chain-rolled-back team: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM user_signup_trial_claim WHERE user_id = $1`, rollbackUser).Scan(&chainClaimCount); err != nil {
+		t.Fatalf("check preserved signup claim: %v", err)
+	}
+	if chainRollbackCount != 0 || chainClaimCount != 0 {
+		t.Fatalf("post-claim rollback state = (team %d, claims %d), want (0, 0)", chainRollbackCount, chainClaimCount)
+	}
+
+	// Concurrent provisioning for a fresh user must still produce one claim
+	// and one grant, even though every team insert succeeds.
+	concurrentUser := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, concurrentUser, "trial-credit-concurrent-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create concurrent profile: %v", err)
+	}
+	const concurrentCreates = 4
+	errs := make(chan error, concurrentCreates)
+	for i := 0; i < concurrentCreates; i++ {
+		go func() {
+			_, err := provisionTeamForUser(context.Background(), concurrentUser, "trial-credit-concurrent-owned-"+uuid.NewString()[:8])
+			errs <- err
+		}()
+	}
+	for i := 0; i < concurrentCreates; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent team creation: %v", err)
+		}
+	}
+	var entitlementCount, concurrentGrantCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM user_signup_trial_claim WHERE user_id = $1`, concurrentUser).Scan(&entitlementCount); err != nil {
+		t.Fatalf("count concurrent entitlement: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team_credit_grant g JOIN user_signup_trial_claim c ON c.team_id = g.team_id WHERE c.user_id = $1 AND g.reason = 'signup trial credit'`, concurrentUser).Scan(&concurrentGrantCount); err != nil {
+		t.Fatalf("count concurrent grants: %v", err)
+	}
+	if entitlementCount != 1 || concurrentGrantCount != 1 {
+		t.Fatalf("concurrent entitlement/grant counts = (%d, %d), want (1, 1)", entitlementCount, concurrentGrantCount)
+	}
+}
+
+// The control-plane provisioning boundary keeps the team, claim, and owner
+// chain in one transaction after authenticating the actor.
+func provisionTeamForUser(ctx context.Context, userID uuid.UUID, name string) (uuid.UUID, error) {
+	return provisionTeamForUserWithFailure(ctx, userID, name, false)
+}
+
+func provisionTeamForUserWithFailure(ctx context.Context, userID uuid.UUID, name string, failAfterMembership bool) (uuid.UUID, error) {
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer tx.Rollback(ctx)
+	team, err := testQueries.WithTx(tx).CreateTeamForUser(ctx, db.CreateTeamForUserParams{
+		Name:   name,
+		UserID: userID,
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO team_member (team_id, profile_id, role)
+		VALUES ($1, $2, 'owner')
+	`, team.ID, userID); err != nil {
+		return uuid.Nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status)
+		VALUES ($1, $2, 'active')
+	`, team.ID, userID); err != nil {
+		return uuid.Nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id)
+		SELECT $1, id, 'team', $2
+		FROM roles
+		WHERE name = 'team_owner'
+	`, userID, team.ID); err != nil {
+		return uuid.Nil, err
+	}
+	if failAfterMembership {
+		return team.ID, fmt.Errorf("simulated provisioning chain failure")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return uuid.Nil, err
+	}
+	return team.ID, nil
+}
+
+func provisionTeamForUserAfterClaimFailure(ctx context.Context, userID uuid.UUID, name string) (uuid.UUID, error) {
+	return provisionTeamForUserWithFailure(ctx, userID, name, true)
+}
+
+func TestIntegration_ExpiredSignupTrialIsBillingIneligible(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at)
+		VALUES ($1, 5.000000, 5.000000, 'signup trial credit', now() - interval '1 second')
+	`, teamID); err != nil {
+		t.Fatalf("seed expired signup trial credit: %v", err)
+	}
+	eligible, err := testQueries.IsTeamSandboxBillingEligible(ctx, teamID)
+	if err != nil {
+		t.Fatalf("check expired signup trial eligibility: %v", err)
+	}
+	if eligible {
+		t.Fatal("expired signup trial should be billing-ineligible")
+	}
+}
+
+func TestIntegration_IncompleteStripeSubscriptionIsNotTrialEligible(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatalf("seed incomplete subscription: %v", err)
+	}
+	balance, err := testQueries.GetTeamTrialBalance(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load trial balance: %v", err)
+	}
+	if balance.Eligible {
+		t.Fatal("incomplete Stripe subscription should not be trial-eligible")
+	}
+}
+
+func TestIntegration_CreateSandboxBlockedWhenTrialCreditIsExhausted(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 5.000000, 0, 'signup trial credit')
+	`, teamID); err != nil {
+		t.Fatalf("exhaust signup trial credit: %v", err)
+	}
+
+	w := do(newRouter(t), "POST", "/sandboxes", ownerKey, `{"name":"trial-exhausted"}`)
+	if w.Code != http.StatusPaymentRequired {
+		t.Fatalf("create with exhausted trial: expected 402, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_GetBillingSummaryDefersPaymentSetupWhileCreditsRemain(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"billing-credit-trial"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	periodStart, periodEnd := billing.CurrentBillingPeriod(time.Now().UTC())
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable live billing mode: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+		ON CONFLICT (team_id) DO UPDATE
+		SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+		    stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+		    stripe_subscription_status = EXCLUDED.stripe_subscription_status
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatalf("seed incomplete billing account: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+		VALUES ($1, 10.000000, 10.000000, 'integration test trial credit')
+	`, teamID); err != nil {
+		t.Fatalf("seed billing trial credit: %v", err)
+	}
+
+	liveRouter := newBillingRouter(t, &fakeStripeClient{})
+	live := do(liveRouter, "GET", "/billing/summary", ownerKey, "")
+	if live.Code != http.StatusOK {
+		t.Fatalf("live billing summary with trial credit: expected 200, got %d: %s", live.Code, live.Body.String())
+	}
+	liveBody := mustJSON(t, live)
+	if got := liveBody["payment_setup_required"].(bool); got {
+		t.Fatal("payment_setup_required should be false while trial credit remains")
+	}
+	period, ok := liveBody["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", liveBody["billing_period"])
+	}
+	if got := period["start"].(string); got != periodStart.Format(time.RFC3339) {
+		t.Fatalf("period start = %q, want %q", got, periodStart.Format(time.RFC3339))
+	}
+	if got := period["end"].(string); got != periodEnd.Format(time.RFC3339) {
+		t.Fatalf("period end = %q, want %q", got, periodEnd.Format(time.RFC3339))
+	}
+}
+
 func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 	ctx := context.Background()
 	teamID, ownerKey := seedTeamAndKey(t)
@@ -1517,6 +2198,7 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse sandbox id: %v", err)
 	}
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
@@ -1579,6 +2261,190 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 	}
 	if !gotEnd.Equal(periodEnd) {
 		t.Fatalf("period end = %s, want %s", gotEnd, periodEnd)
+	}
+}
+
+func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	routerNow := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	r := newRouterWithNow(t, func() time.Time { return routerNow })
+
+	anchor := routerNow.Add(-24 * time.Hour).Truncate(time.Second)
+	reportingStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	reportingEnd := reportingStart.AddDate(0, 1, 0)
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	}); err != nil {
+		t.Fatalf("claim commercial billing anchor: %v", err)
+	}
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: reportingStart,
+		PeriodEnd:   reportingEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("upsert reporting billing period: %v", err)
+	}
+	wantStart, wantEnd, ok := billing.AnniversaryPeriod(anchor, time.Now().UTC())
+	if !ok {
+		t.Fatal("commercial billing anchor should define a current period")
+	}
+
+	w := do(r, "GET", "/billing/summary", ownerKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("billing summary with commercial anchor: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	body := mustJSON(t, w)
+	period, ok := body["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", body["billing_period"])
+	}
+	// The summary reports the anniversary period containing the router's
+	// clock, which rolls forward a month at a time from the anchor.
+	wantStart, wantEnd, anchored := billing.AnniversaryPeriod(anchor, routerNow)
+	if !anchored {
+		t.Fatalf("anchor %s is not yet in effect", anchor)
+	}
+	gotStart, err := time.Parse(time.RFC3339, period["start"].(string))
+	if err != nil {
+		t.Fatalf("parse billing period start: %v", err)
+	}
+	if !gotStart.Equal(wantStart) {
+		t.Fatalf("billing summary period start = %s, want %s", gotStart, wantStart)
+	}
+	gotEnd, err := time.Parse(time.RFC3339, period["end"].(string))
+	if err != nil {
+		t.Fatalf("parse billing period end: %v", err)
+	}
+	if !gotEnd.Equal(wantEnd) {
+		t.Fatalf("billing summary period end = %s, want %s", gotEnd, wantEnd)
+	}
+}
+
+func TestIntegration_ClaimTeamCommercialBillingAnchorIsIdempotentAndConflictSafe(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+
+	got, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	})
+	if err != nil {
+		t.Fatalf("first commercial billing anchor claim: %v", err)
+	}
+	if !got.Equal(anchor) {
+		t.Fatalf("first commercial billing anchor claim = %s, want %s", got, anchor)
+	}
+
+	retry, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	})
+	if err != nil {
+		t.Fatalf("idempotent commercial billing anchor claim: %v", err)
+	}
+	if !retry.Equal(anchor) {
+		t.Fatalf("idempotent commercial billing anchor claim = %s, want %s", retry, anchor)
+	}
+
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor.Add(time.Hour),
+	}); err == nil {
+		t.Fatal("conflicting commercial billing anchor claim succeeded, want failure")
+	}
+
+	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load team billing account: %v", err)
+	}
+	if !account.CommercialBillingAnchor.Valid {
+		t.Fatal("commercial billing anchor was not persisted")
+	}
+	if !account.CommercialBillingAnchor.Time.Equal(anchor) {
+		t.Fatalf("commercial billing anchor = %s, want %s", account.CommercialBillingAnchor.Time, anchor)
+	}
+}
+
+func TestIntegration_ClaimTeamCommercialBillingAnchorPreservesLegacyPeriod(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	legacyStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	legacyEnd := legacyStart.AddDate(0, 1, 0)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: legacyStart,
+		PeriodEnd:   legacyEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("seed legacy billing period: %v", err)
+	}
+
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	}); err != nil {
+		t.Fatalf("claim commercial billing anchor: %v", err)
+	}
+
+	var status string
+	var finalizedAt *time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, finalized_at
+		FROM team_billing_period
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, legacyStart, legacyEnd).Scan(&status, &finalizedAt); err != nil {
+		t.Fatalf("load reconciled legacy billing period: %v", err)
+	}
+	if status != "open" || finalizedAt != nil {
+		t.Fatalf("legacy billing period status/finalized_at = %q/%v, want open/null", status, finalizedAt)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: anchor,
+		PeriodEnd:   anchor.AddDate(0, 1, 0),
+		Status:      "open",
+	}); err == nil {
+		t.Fatal("overlapping anniversary billing period insert succeeded, want failure")
+	}
+}
+
+func TestIntegration_UpsertTeamBillingPeriodRejectsOverlap(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	firstStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	firstEnd := firstStart.AddDate(0, 1, 0)
+	secondStart := firstStart.Add(20 * 24 * time.Hour)
+	secondEnd := secondStart.AddDate(0, 1, 0)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: firstStart,
+		PeriodEnd:   firstEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("seed first billing period: %v", err)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: secondStart,
+		PeriodEnd:   secondEnd,
+		Status:      "open",
+	}); err == nil {
+		t.Fatal("overlapping billing period insert succeeded, want failure")
+	} else {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23P01" {
+			t.Fatalf("overlapping billing period error = %v, want PostgreSQL 23P01", err)
+		}
 	}
 }
 
@@ -1677,9 +2543,12 @@ func TestIntegration_GetBillingPricingUsesNewestEffectiveRate(t *testing.T) {
 	}
 	rates := billingRatesByResource(t, body)
 	assertFloatNear(t, rates["vcpu"].PriceUSD, 0.000022)
+	if got := rates["storage_gib"].Billable; got {
+		t.Fatal("storage_gib pricing should be tracked-only in public pricing")
+	}
 }
 
-func TestIntegration_GetBillingPricingMissingRequiredRateReturns503(t *testing.T) {
+func TestIntegration_GetBillingPricingMissingRequiredComputeRateReturns503(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "viewer")
 	planKey := "missing-rate-plan-" + uuid.New().String()
@@ -1693,9 +2562,7 @@ func TestIntegration_GetBillingPricingMissingRequiredRateReturns503(t *testing.T
 	}
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
-		VALUES
-			($1, 'vcpu', 'second', 0.000011, $2),
-			($1, 'memory_gib', 'second', 0.0000045, $2)
+		VALUES ($1, 'vcpu', 'second', 0.000011, $2)
 	`, planKey, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("insert incomplete pricing rates: %v", err)
 	}
@@ -1775,6 +2642,8 @@ type billingPricingTestResponse struct {
 		Unit           string  `json:"unit"`
 		PriceUSD       float64 `json:"price_usd"`
 		PriceUSDHourly float64 `json:"price_usd_hourly"`
+		Tracked        bool    `json:"tracked"`
+		Billable       bool    `json:"billable"`
 	} `json:"rates"`
 }
 
@@ -1821,6 +2690,9 @@ func assertPaygPricingResponse(t *testing.T, body billingPricingTestResponse) {
 		assertFloatNear(t, got.PriceUSD, want.price)
 		assertFloatNear(t, got.PriceUSDHourly, want.hourlyRate)
 	}
+	if got := rates["storage_gib"].Billable; got {
+		t.Fatal("storage_gib should be tracked-only in public pricing")
+	}
 }
 
 func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[string]struct {
@@ -1828,6 +2700,8 @@ func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[s
 	Unit           string
 	PriceUSD       float64
 	PriceUSDHourly float64
+	Tracked        bool
+	Billable       bool
 } {
 	t.Helper()
 	rates := make(map[string]struct {
@@ -1835,6 +2709,8 @@ func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[s
 		Unit           string
 		PriceUSD       float64
 		PriceUSDHourly float64
+		Tracked        bool
+		Billable       bool
 	}, len(body.Rates))
 	for _, rate := range body.Rates {
 		if _, exists := rates[rate.Resource]; exists {
@@ -1845,11 +2721,15 @@ func billingRatesByResource(t *testing.T, body billingPricingTestResponse) map[s
 			Unit           string
 			PriceUSD       float64
 			PriceUSDHourly float64
+			Tracked        bool
+			Billable       bool
 		}{
 			Resource:       rate.Resource,
 			Unit:           rate.Unit,
 			PriceUSD:       rate.PriceUSD,
 			PriceUSDHourly: rate.PriceUSDHourly,
+			Tracked:        rate.Tracked,
+			Billable:       rate.Billable,
 		}
 	}
 	return rates
@@ -2195,6 +3075,67 @@ func TestIntegration_PauseRevertExemptFromQuota(t *testing.T) {
 
 	if count := activeCount(t, teamID); count != 2 {
 		t.Errorf("active_sandbox_count = %d, want 2 (transient overcommit recorded, not blocked)", count)
+	}
+}
+
+// RevertPauseToActive is the single-statement compensation for a pause that
+// failed after BeginPause: status back to 'active' and the interval reopened
+// commit together, and only for a row still in 'pausing' — a sandbox some
+// other transition already moved on must not be touched.
+func TestIntegration_RevertPauseToActive(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"revert-atomic"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	if _, err := testQueries.BeginPause(ctx, db.BeginPauseParams{ID: sandboxID, TeamID: teamID}); err != nil {
+		t.Fatalf("BeginPause: %v", err)
+	}
+
+	n, err := testQueries.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	})
+	if err != nil {
+		t.Fatalf("RevertPauseToActive: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("reverted %d rows, want 1", n)
+	}
+
+	sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sb.Status != db.SandboxStatusActive {
+		t.Errorf("status = %q, want active", sb.Status)
+	}
+	var open int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM sandbox_active_interval WHERE sandbox_id = $1 AND ended_at IS NULL`,
+		sandboxID).Scan(&open); err != nil {
+		t.Fatalf("count open intervals: %v", err)
+	}
+	if open != 1 {
+		t.Errorf("open intervals = %d, want 1 (revert must reopen exactly one)", open)
+	}
+
+	// Already active: the status gate makes a second revert a 0-row no-op —
+	// no error, no duplicate interval.
+	n, err = testQueries.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
+		SandboxID: sandboxID,
+		TeamID:    teamID,
+	})
+	if err != nil {
+		t.Fatalf("second RevertPauseToActive: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("revert of non-pausing sandbox = %d rows, want 0", n)
 	}
 }
 
@@ -2626,6 +3567,17 @@ func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
 	periodStart := time.Now().UTC().Truncate(time.Hour)
 	periodEnd := periodStart.Add(24 * time.Hour)
 
+	enabled, err := testQueries.IsFeatureEnabledForTeam(ctx, db.IsFeatureEnabledForTeamParams{
+		Key:    "billing_export_enabled",
+		TeamID: pgtype.UUID{Bytes: teamID, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("check billing export default: %v", err)
+	}
+	if !enabled {
+		t.Fatal("billing export disabled for newly created team")
+	}
+
 	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
@@ -2643,12 +3595,20 @@ func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
 		t.Fatalf("upsert billing usage before export: %v", err)
 	}
 
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable billing_export_enabled: %v", err)
+	}
+
 	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
 	}); err == nil {
-		t.Fatal("expected billing export to be gated off by default")
+		t.Fatal("expected explicit billing export opt-out to gate export")
 	}
 
 	if _, err := testPool.Exec(ctx, `
@@ -2665,6 +3625,90 @@ func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
 		PeriodEnd:   periodEnd,
 	}); err != nil {
 		t.Fatalf("expected billing export after enabling flag: %v", err)
+	}
+}
+
+func TestIntegration_BillingExportDefaultMigrationBackfillsExistingTeams(t *testing.T) {
+	ctx := context.Background()
+	missingTeam, _ := seedTeamAndKey(t)
+	optedOutTeam, _ := seedTeamAndKey(t)
+	alreadyEnabledTeam, _ := seedTeamAndKey(t)
+
+	migrationsDir, err := findMigrationsDir()
+	if err != nil {
+		t.Fatalf("find migrations directory: %v", err)
+	}
+	migration, err := os.ReadFile(filepath.Join(migrationsDir, "20260921190000_billing_export_enabled_by_default.sql"))
+	if err != nil {
+		t.Fatalf("read billing export default migration: %v", err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin migration test transaction: %v", err)
+	}
+	defer tx.Rollback(ctx) // The migration test must not alter shared fixtures.
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE feature_flag
+		SET enabled = false
+		WHERE key = 'billing_export_enabled'
+	`); err != nil {
+		t.Fatalf("seed pre-migration global default: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', false),
+		       ($2, 'billing_export_enabled', true)
+	`, optedOutTeam, alreadyEnabledTeam); err != nil {
+		t.Fatalf("seed existing team overrides: %v", err)
+	}
+
+	if _, err := tx.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("apply billing export default migration: %v", err)
+	}
+	if _, err := tx.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("reapply billing export default migration: %v", err)
+	}
+
+	checkTeamFlag := func(teamID uuid.UUID, want bool) {
+		t.Helper()
+		var got bool
+		if err := tx.QueryRow(ctx, `
+			SELECT enabled
+			FROM team_feature_flag
+			WHERE team_id = $1 AND key = 'billing_export_enabled'
+		`, teamID).Scan(&got); err != nil {
+			t.Fatalf("read billing export flag for %s: %v", teamID, err)
+		}
+		if got != want {
+			t.Fatalf("billing export flag for %s = %v, want %v", teamID, got, want)
+		}
+	}
+	checkTeamFlag(missingTeam, true)
+	checkTeamFlag(optedOutTeam, false)
+	checkTeamFlag(alreadyEnabledTeam, true)
+
+	var globalEnabled bool
+	if err := tx.QueryRow(ctx, `
+		SELECT enabled FROM feature_flag WHERE key = 'billing_export_enabled'
+	`).Scan(&globalEnabled); err != nil {
+		t.Fatalf("read migrated global default: %v", err)
+	}
+	if !globalEnabled {
+		t.Fatal("billing export global default remains disabled after migration")
+	}
+
+	var missingTeamRows int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM team_feature_flag
+		WHERE team_id = $1 AND key = 'billing_export_enabled'
+	`, missingTeam).Scan(&missingTeamRows); err != nil {
+		t.Fatalf("count backfilled team flags: %v", err)
+	}
+	if missingTeamRows != 1 {
+		t.Fatalf("backfilled team flag rows = %d, want 1 after rerun", missingTeamRows)
 	}
 }
 
@@ -2703,6 +3747,7 @@ func TestIntegration_HourlyRollupBoundsOpenIntervalsAtNow(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	hourStart := fixedNow.Truncate(time.Hour)
 	hourEnd := hourStart.Add(time.Hour)
@@ -2827,6 +3872,7 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	periodStart := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 	periodEnd := periodStart.Add(100 * time.Second)
@@ -2864,6 +3910,7 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 			vcpuSeconds, memoryGibSeconds, storageGibSeconds)
 	}
 
+	seedStorageActivation(t, teamID, periodStart)
 	rollup, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
 		TeamID:      teamID,
 		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
@@ -2880,6 +3927,223 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 	}
 	if got := numericFloat64(t, rollup.StorageMibSeconds); got != 245_760 {
 		t.Fatalf("rollup storage MiB seconds = %v, want 245760", got)
+	}
+}
+
+func TestIntegration_GetTeamBillingUsageDeduplicatesSharedArtifact(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	var sandboxIDs []uuid.UUID
+	for _, name := range []string{"shared-artifact-a", "shared-artifact-b"} {
+		cw := do(r, "POST", "/sandboxes", apiKey, fmt.Sprintf(`{"name":%q}`, name))
+		if cw.Code != http.StatusCreated {
+			t.Fatalf("create %s: %d %s", name, cw.Code, cw.Body.String())
+		}
+		sandboxIDs = append(sandboxIDs, uuid.MustParse(mustJSON(t, cw)["id"].(string)))
+	}
+
+	periodStart := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	periodEnd := periodStart.Add(time.Minute)
+	const artifactPath = "/tmp/test/shared-rootfs.ext4"
+	const artifactBytes = int64(8 * 1024 * 1024)
+	for i, sandboxID := range sandboxIDs {
+		if _, err := testPool.Exec(ctx, `
+			UPDATE sandbox
+			SET created_at = $2, base_path = $4, delta_path = NULL
+			WHERE id = $1 AND team_id = $3
+		`, sandboxID, periodStart, teamID, artifactPath); err != nil {
+			t.Fatalf("prepare sandbox %d: %v", i, err)
+		}
+		var snapshotID uuid.UUID
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
+			VALUES ($1, $2, $3, 'pause')
+			RETURNING id
+		`, sandboxID, teamID, fmt.Sprintf("/tmp/test/snapshot-%d", i)).Scan(&snapshotID); err != nil {
+			t.Fatalf("seed snapshot %d: %v", i, err)
+		}
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
+			t.Fatalf("link snapshot %d: %v", i, err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, snapshotID, fmt.Sprintf("rootfs-%d.ext4", i), artifactPath, artifactBytes, artifactBytes, strings.Repeat("0", 64)); err != nil {
+			t.Fatalf("seed artifact manifest %d: %v", i, err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			UPDATE sandbox_storage_interval
+			SET started_at = $2, ended_at = $3, end_reason = 'deleted', disk_mib = 1
+			WHERE sandbox_id = $1 AND ended_at IS NULL
+		`, sandboxID, periodStart.Add(10*time.Second), periodStart.Add(20*time.Second)); err != nil {
+			t.Fatalf("set overlay interval %d: %v", i, err)
+		}
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, artifactPath, artifactBytes); err != nil {
+		t.Fatalf("set shared template artifact: %v", err)
+	}
+
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get team billing usage: %v", err)
+	}
+	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(artifactBytes/1024/1024*50+20)/1024; got != want {
+		t.Fatalf("storage GiB seconds = %v, want %v", got, want)
+	}
+	seedStorageActivation(t, teamID, periodStart.Add(35*time.Second))
+	eligible, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := numericFloat64(t, eligible.BillableStorageGibSeconds), float64(artifactBytes/1024/1024*25)/1024; got != want {
+		t.Fatalf("shared artifact after cutoff=%v want=%v", got, want)
+	}
+
+}
+
+func TestIntegration_GetTeamBillingUsageStartsArtifactRetentionAtStorageBoundary(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-artifact-boundary"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	periodStart := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	periodEnd := periodStart.Add(time.Minute)
+	const artifactPath = "/tmp/test/boundary-rootfs.ext4"
+	const artifactBytes = int64(8 * 1024 * 1024)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox
+		SET created_at = $2, base_path = $4, delta_path = NULL
+		WHERE id = $1 AND team_id = $3
+	`, sandboxID, periodStart, teamID, artifactPath); err != nil {
+		t.Fatalf("prepare sandbox: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("set storage boundary: %v", err)
+	}
+	var snapshotID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
+		VALUES ($1, $2, $3, 'pause')
+		RETURNING id
+	`, sandboxID, teamID, "/tmp/test/boundary-snapshot").Scan(&snapshotID); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
+		t.Fatalf("link snapshot: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+		VALUES ($1, 'boundary-rootfs.ext4', $2, $3, $4, $5)
+	`, snapshotID, artifactPath, artifactBytes, artifactBytes, strings.Repeat("0", 64)); err != nil {
+		t.Fatalf("seed artifact manifest: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, artifactPath, artifactBytes); err != nil {
+		t.Fatalf("set template artifact: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $2, end_reason = 'deleted', disk_mib = 1
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(30*time.Second)); err != nil {
+		t.Fatalf("close overlay interval at boundary: %v", err)
+	}
+
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get team billing usage: %v", err)
+	}
+	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(artifactBytes/1024/1024*30)/1024; got != want {
+		t.Fatalf("storage GiB seconds = %v, want %v", got, want)
+	}
+}
+
+func TestIntegration_GetTeamBillingUsagePreservesUnmeasuredArtifact(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"billing-unmeasured-artifact"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+
+	periodStart := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	periodEnd := periodStart.Add(time.Minute)
+	const artifactPath = "/tmp/test/unmeasured-rootfs.ext4"
+	const logicalArtifactBytes = int64(64 * 1024 * 1024)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox
+		SET created_at = $2, base_path = $4, delta_path = NULL
+		WHERE id = $1 AND team_id = $3
+	`, sandboxID, periodStart, teamID, artifactPath); err != nil {
+		t.Fatalf("prepare sandbox: %v", err)
+	}
+	var snapshotID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO snapshot (sandbox_id, team_id, path, trigger)
+		VALUES ($1, $2, $3, 'pause')
+		RETURNING id
+	`, sandboxID, teamID, "/tmp/test/unmeasured-snapshot").Scan(&snapshotID); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
+		t.Fatalf("link snapshot: %v", err)
+	}
+	// Without a measured manifest, the template's logical size is not a
+	// physical allocation. Omitting allocated_bytes on an inserted manifest
+	// would instead use the schema's explicit-zero default.
+	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, artifactPath, logicalArtifactBytes); err != nil {
+		t.Fatalf("set template artifact: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox_storage_interval
+		SET started_at = $2, ended_at = $3, end_reason = 'deleted', disk_mib = 2
+		WHERE sandbox_id = $1 AND ended_at IS NULL
+	`, sandboxID, periodStart.Add(10*time.Second), periodStart.Add(20*time.Second)); err != nil {
+		t.Fatalf("set overlay interval: %v", err)
+	}
+
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get team billing usage: %v", err)
+	}
+	if usage.StorageGibSeconds.Valid {
+		t.Fatalf("unmeasured artifact returned numeric storage: %v", usage.StorageGibSeconds)
+	}
+	// A measured zero permits overlay billing; a missing allocation does not.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+		VALUES ($1, 'unmeasured-rootfs.ext4', $2, $3, 0, $4)
+	`, snapshotID, artifactPath, logicalArtifactBytes, strings.Repeat("0", 64)); err != nil {
+		t.Fatalf("record explicit zero artifact allocation: %v", err)
+	}
+	usage, err = testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get measured-zero billing usage: %v", err)
+	}
+	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(2*10)/1024; got != want {
+		t.Fatalf("storage GiB seconds = %v, want %v; logical artifact size must not be used", got, want)
 	}
 }
 
@@ -3512,6 +4776,7 @@ func setupBillingFinalizationScenarioAt(
 		0,
 		0,
 		0,
+		false,
 	)
 
 	return billingFinalizationScenario{
@@ -3955,6 +5220,13 @@ func TestIntegration_BillingPeriodFinalizationUsesPeriodPricingAndUsageUnits(t *
 	`, teamID, planAKey, periodStart.Add(-time.Hour), planBKey, currentPlanAt); err != nil {
 		t.Fatalf("assign pricing plans: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_storage_billing_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable storage billing: %v", err)
+	}
 
 	result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, periodStart, periodEnd)
 	if err != nil {
@@ -3972,6 +5244,7 @@ func TestIntegration_BillingPeriodFinalizationUsesPeriodPricingAndUsageUnits(t *
 		0.000004,
 		0.00000002,
 		0,
+		true,
 	)
 	wantCurrent := math.Round(want.CurrentChargesUSD*1e6) / 1e6
 	assertFloatNear(t, result.Charges.CurrentChargesUSD, wantCurrent)
@@ -4078,6 +5351,75 @@ func TestIntegration_BillingPeriodFinalizationRoundsFinancialValuesAtMicroBounda
 	assertFloatNear(t, numericFloat64(t, result.Period.CreditsAppliedUsd), 0.123456)
 	assertFloatNear(t, numericFloat64(t, result.Period.NetInvoiceAmountUsd), 0.000001)
 	assertFloatNear(t, numericFloat64(t, result.Period.GrossChargesUsd)-numericFloat64(t, result.Period.CreditsAppliedUsd), numericFloat64(t, result.Period.NetInvoiceAmountUsd))
+}
+
+func TestIntegration_BillingPeriodFinalizationUsesExportedStorageMode(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+
+	planKey := "storage-mode-finalization-" + uuid.New().String()
+	periodStart := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	periodEnd := periodStart.Add(24 * time.Hour)
+	rateEffectiveFrom := periodStart.Add(-time.Hour)
+
+	insertPricingPlanForTest(t, ctx, planKey, true)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES
+			($1, 'vcpu', 'second', 0.000011, $2),
+			($1, 'memory_gib', 'second', 0.0000045, $2),
+			($1, 'storage_gib', 'second', 0.00000003, $2)
+	`, planKey, rateEffectiveFrom); err != nil {
+		t.Fatalf("insert storage-mode pricing rates: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)
+	`, teamID, planKey, rateEffectiveFrom); err != nil {
+		t.Fatalf("assign storage-mode pricing plan: %v", err)
+	}
+
+	scenario := setupBillingFinalizationScenarioAt(t, ctx, teamID, periodStart, periodEnd, 120, nil)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_billing_usage
+		SET memory_mib_seconds = 0,
+		    storage_mib_seconds = 4096
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, scenario.periodStart, scenario.periodEnd); err != nil {
+		t.Fatalf("seed storage usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO billing_usage_export (
+			team_id, period_start, period_end, resource_type,
+			stripe_customer_id, stripe_meter_event_identifier, stripe_event_name,
+			value, status
+		)
+		VALUES ($1, $2, $3, 'storage', NULL, $4, 'storage_gib_hours', 4.000000, 'sent')
+	`, teamID, scenario.periodStart, scenario.periodEnd, "team-storage-mode-"+uuid.New().String()); err != nil {
+		t.Fatalf("seed storage export attempt: %v", err)
+	}
+
+	result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, teamID, scenario.periodStart, scenario.periodEnd)
+	if err != nil {
+		t.Fatalf("finalize billing period: %v", err)
+	}
+	want := billing.CalculateSummaryCharges(
+		120,
+		0,
+		4,
+		0.000011,
+		0.0000045,
+		0.00000003,
+		0,
+		true,
+	)
+	wantCurrent := math.Round(want.CurrentChargesUSD*1e6) / 1e6
+	wantStorage := math.Round(want.Breakdown.StorageUSD*1e6) / 1e6
+	assertFloatNear(t, result.Charges.CurrentChargesUSD, wantCurrent)
+	assertFloatNear(t, result.Charges.Breakdown.StorageUSD, wantStorage)
+	if got := numericFloat64(t, result.Period.GrossChargesUsd); math.Abs(got-wantCurrent) > 1e-9 {
+		t.Fatalf("gross charges = %v, want %v", got, wantCurrent)
+	}
 }
 
 func TestIntegration_BillingPeriodFinalizationCreditEligibilityUsesPeriodEnd(t *testing.T) {
@@ -4257,6 +5599,11 @@ func TestIntegration_BillingEndpointsRespectTenantUsageDashboardFlag(t *testing.
 		if errBody["code"] != "not_found" {
 			t.Fatalf("%s: error code = %v, want not_found", path, errBody["code"])
 		}
+	}
+
+	w := do(r, "GET", "/teams/"+teamID.String()+"/billing/usage", apiKey, "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("/teams/%s/billing/usage: expected 404, got %d: %s", teamID, w.Code, w.Body.String())
 	}
 }
 
@@ -4456,13 +5803,15 @@ func TestIntegration_DeleteSandbox_Success(t *testing.T) {
 		t.Fatal("expected sandbox to be gone after delete")
 	}
 
-	// The revocation row is written in the same statement as the soft-delete.
+	// This sandbox never had a secret binding, so no JWT was minted and destroy
+	// writes no revocation — see TestIntegration_DestroyRevokesOnlySecretsSandboxes
+	// for both directions of that gate.
 	var revoked int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_revocation WHERE sandbox_id = $1`, sandboxID).Scan(&revoked); err != nil {
 		t.Fatalf("revocation query: %v", err)
 	}
-	if revoked != 1 {
-		t.Errorf("sandbox_revocation rows = %d, want 1", revoked)
+	if revoked != 0 {
+		t.Errorf("sandbox_revocation rows = %d, want 0 for a sandbox that never had secrets", revoked)
 	}
 }
 
@@ -5310,6 +6659,50 @@ func TestIntegration_FinalizePause_StaleFinalizeCannotOverwriteManifest(t *testi
 	}
 }
 
+func TestIntegration_FinalizePause_UnavailableAllocationKeepsPriorMeasurement(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"manifest-allocation-retention"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+	mem := "/snapshots/" + sid + "/mem.snap"
+	finalize := func(allocatedBytes int64) uuid.UUID {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+			t.Fatalf("force pausing: %v", err)
+		}
+		snapID, err := testQueries.FinalizePause(ctx, db.FinalizePauseParams{
+			ID: sandboxID, TeamID: teamID, Path: "/snapshots/" + sid + "/vmstate.snap",
+			MemPath: &mem, Trigger: "pause", ManifestFileNames: []string{"rootfs.ext4"},
+			ManifestPaths: []string{"/snapshots/" + sid + "/rootfs.ext4"}, ManifestSizes: []int64{4096},
+			ManifestAllocatedBytes: []int64{allocatedBytes}, ManifestDigests: []string{strings.Repeat("a", 64)},
+			ManifestBasePaths: []string{""},
+		})
+		if err != nil {
+			t.Fatalf("finalize: %v", err)
+		}
+		return snapID
+	}
+
+	snapID := finalize(8192)
+	updatedSnapID := finalize(-1)
+	if updatedSnapID != snapID {
+		t.Fatalf("finalize allocated a new snapshot %s; want conflict update of %s", updatedSnapID, snapID)
+	}
+	manifest, err := testQueries.ListSnapshotManifest(ctx, pgtype.UUID{Bytes: snapID, Valid: true})
+	if err != nil {
+		t.Fatalf("list manifest: %v", err)
+	}
+	if len(manifest) != 1 || manifest[0].AllocatedBytes != 8192 {
+		t.Fatalf("allocated_bytes = %+v, want retained 8192", manifest)
+	}
+}
+
 // The generations expand ships with the legacy unique index retained:
 // finalizes upsert in place (generation advancing) until the contract phase
 // drops the index, at which point the same binary starts inserting real
@@ -5424,6 +6817,83 @@ func TestIntegration_FinalizePause_GenerationModes(t *testing.T) {
 	}
 	if lastSize != 4096 {
 		t.Fatalf("partial-manifest generation size = %d, want prior size 4096 carried forward", lastSize)
+	}
+	// A failed host allocation sample on a new generation carries the prior
+	// head's allocation forward.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	allocationPath := "/snapshots/" + sid + "/overlay.ext4"
+	if _, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p7", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+		ManifestFileNames: []string{"overlay.ext4"}, ManifestPaths: []string{allocationPath},
+		ManifestSizes: []int64{4096}, ManifestAllocatedBytes: []int64{8192},
+		ManifestDigests: []string{strings.Repeat("c", 64)}, ManifestBasePaths: []string{""},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	failedAllocationHead, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p8", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+		ManifestFileNames: []string{"overlay.ext4"}, ManifestPaths: []string{allocationPath},
+		ManifestSizes: []int64{4096}, ManifestAllocatedBytes: []int64{-1},
+		ManifestDigests: []string{strings.Repeat("d", 64)}, ManifestBasePaths: []string{""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retainedAllocation int64
+	if err := testPool.QueryRow(ctx,
+		`SELECT allocated_bytes FROM artifact_manifest WHERE snapshot_id = $1 AND file_name = 'overlay.ext4'`, failedAllocationHead).
+		Scan(&retainedAllocation); err != nil {
+		t.Fatal(err)
+	}
+	if retainedAllocation != 8192 {
+		t.Fatalf("failed allocation = %d, want prior 8192", retainedAllocation)
+	}
+	// An omitted allocation sample is also unavailable and must retain the
+	// prior generation's physical allocation rather than becoming zero.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	nilAllocationHead, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p8b", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+		ManifestFileNames: []string{"overlay.ext4"}, ManifestPaths: []string{allocationPath},
+		ManifestSizes:   []int64{4096},
+		ManifestDigests: []string{strings.Repeat("d", 64)}, ManifestBasePaths: []string{""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT allocated_bytes FROM artifact_manifest WHERE snapshot_id = $1 AND file_name = 'overlay.ext4'`, nilAllocationHead).
+		Scan(&retainedAllocation); err != nil {
+		t.Fatal(err)
+	}
+	if retainedAllocation != 8192 {
+		t.Fatalf("omitted allocation = %d, want prior 8192", retainedAllocation)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	zeroAllocationHead, err := testQueries.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
+		ID: sandboxID, TeamID: teamID, Path: "p9", MemPath: &memPath, SizeBytes: 4096, Trigger: "pause",
+		ManifestFileNames: []string{"overlay.ext4"}, ManifestPaths: []string{allocationPath},
+		ManifestSizes: []int64{4096}, ManifestAllocatedBytes: []int64{0},
+		ManifestDigests: []string{strings.Repeat("e", 64)}, ManifestBasePaths: []string{""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(ctx,
+		`SELECT allocated_bytes FROM artifact_manifest WHERE snapshot_id = $1 AND file_name = 'overlay.ext4'`, zeroAllocationHead).
+		Scan(&retainedAllocation); err != nil {
+		t.Fatal(err)
+	}
+	if retainedAllocation != 0 {
+		t.Fatalf("successful zero allocation = %d, want 0", retainedAllocation)
 	}
 	// A stale finalize is still rejected whole in generations mode.
 	mem := "/snapshots/" + sid + "/mem.snap"
@@ -5585,4 +7055,341 @@ func routedFinalize(ctx context.Context, t *testing.T, params db.FinalizePausePa
 		ManifestDigests:   params.ManifestDigests,
 		ManifestBasePaths: params.ManifestBasePaths,
 	})
+}
+
+// A delete records the host-side reclaim it owes, owned by the deleting
+// request first. The sweeper then claims one record per host at a time
+// fleet-wide, taking the host's lease with the record; every settle is
+// fenced on the attempt; holding a host leaves the reclaim in flight on it
+// alone.
+func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hostA := "teardown-a-" + uuid.NewString()
+	hostB := "teardown-b-" + uuid.NewString()
+	for _, hostID := range []string{hostA, hostB} {
+		if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+			ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+			CapacityMemoryMib: 1024, CapacityVcpus: 1,
+		}); err != nil {
+			t.Fatalf("create host: %v", err)
+		}
+	}
+	destroy := func(hostID string, leaseSeconds int32) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
+			id, teamID, "teardown", hostID,
+		); err != nil {
+			t.Fatalf("insert sandbox: %v", err)
+		}
+		row, err := testQueries.DestroySandbox(ctx, db.DestroySandboxParams{
+			ID: id, TeamID: teamID, LeaseSeconds: leaseSeconds,
+			StaleTransitionalBefore: time.Now().Add(-time.Hour), RevocationExpiresAt: time.Now().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("destroy sandbox: %v", err)
+		}
+		if row.HostID != hostID {
+			t.Fatalf("destroyed host = %q, want %q", row.HostID, hostID)
+		}
+		return id
+	}
+	// The birth lease ending, without the wait.
+	expireBirthLease := func(id uuid.UUID) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox_teardown SET lease_until = now() WHERE sandbox_id = $1`, id); err != nil {
+			t.Fatalf("expire birth lease: %v", err)
+		}
+	}
+	claim := func() (db.ClaimNextTeardownRow, bool) {
+		t.Helper()
+		row, err := testQueries.ClaimNextTeardown(ctx, 60)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return row, false
+		}
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		return row, true
+	}
+	releaseHost := func(hostID string, id uuid.UUID, attempt int32) {
+		t.Helper()
+		if err := testQueries.ReleaseTeardownHost(ctx, db.ReleaseTeardownHostParams{HostID: hostID, SandboxID: id, Attempt: attempt}); err != nil {
+			t.Fatalf("release host: %v", err)
+		}
+	}
+	// Other tests' deletes leave records too; clear them so only this
+	// test's records are claimable in the assertions below.
+	for _, table := range []string{"sandbox_teardown", "sandbox_teardown_host"} {
+		if _, err := testPool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+
+	// Born owned by the deleting request for its inline budget, so the
+	// sweeper does not take it.
+	a1 := destroy(hostA, 60)
+	var owned bool
+	var attempts int32
+	if err := testPool.QueryRow(ctx, `SELECT lease_until > now(), attempts FROM sandbox_teardown WHERE sandbox_id = $1`, a1).Scan(&owned, &attempts); err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	if !owned || attempts != 1 {
+		t.Fatalf("born owned = %v, attempts = %d; want true, 1", owned, attempts)
+	}
+	if _, ok := claim(); ok {
+		t.Fatal("the sweeper claimed a record the deleting request still owns")
+	}
+	// Once the birth lease ends it is the sweeper's, and the claim takes
+	// host A with it.
+	expireBirthLease(a1)
+	rec, ok := claim()
+	// The inline attempt was attempt 1; the sweeper's is attempt 2.
+	if !ok || rec.SandboxID != a1 || rec.HostID != hostA || rec.Attempts != 2 {
+		t.Fatalf("claim after the birth lease = %+v (%v), want %s on %s at attempt 2", rec, ok, a1, hostA)
+	}
+
+	// One attempt per host: with host A held, the next claim skips A's other
+	// record for B's, then finds nothing.
+	a2, b1 := destroy(hostA, 0), destroy(hostB, 0)
+	if rec, ok = claim(); !ok || rec.SandboxID != b1 {
+		t.Fatalf("claim with host A held = %+v (%v), want %s", rec, ok, b1)
+	}
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim with both hosts held = %+v, want none", rec)
+	}
+
+	// Settles are fenced on the attempt, and the host stays held until the
+	// worker releases it, fenced on the record and attempt it was working.
+	if n, err := testQueries.CompleteTeardown(ctx, db.CompleteTeardownParams{SandboxID: a1, Attempts: 99}); err != nil || n != 0 {
+		t.Fatalf("complete under a stale attempt: rows = %d, err = %v; want 0", n, err)
+	}
+	if n, err := testQueries.CompleteTeardown(ctx, db.CompleteTeardownParams{SandboxID: a1, Attempts: 2}); err != nil || n != 1 {
+		t.Fatalf("complete: rows = %d, err = %v; want 1", n, err)
+	}
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim with host A still held = %+v, want none", rec)
+	}
+	releaseHost(hostA, a2, 2)
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim after a release fenced on the wrong record = %+v, want none", rec)
+	}
+	releaseHost(hostA, a1, 5)
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim after a release fenced on a stale attempt = %+v, want none", rec)
+	}
+	releaseHost(hostA, a1, 2)
+	if rec, ok = claim(); !ok || rec.SandboxID != a2 {
+		t.Fatalf("claim once host A is released = %+v (%v), want %s", rec, ok, a2)
+	}
+
+	// A deferred record waits out its backoff; holding a host leaves its
+	// record in flight alone and never shortens a longer backoff.
+	msg := "host unreachable"
+	if n, err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: 3600, LastError: &msg, SandboxID: a2, Attempts: 2}); err != nil || n != 1 {
+		t.Fatalf("defer: rows = %d, err = %v", n, err)
+	}
+	releaseHost(hostA, a2, 2)
+	if n, err := testQueries.DeferHostTeardowns(ctx, db.DeferHostTeardownsParams{RetryAfterSeconds: 30, LastError: &msg, HostID: hostA}); err != nil || n != 1 {
+		t.Fatalf("hold host A: rows = %d, err = %v; want 1", n, err)
+	}
+	var keptLongerBackoff bool
+	if err := testPool.QueryRow(ctx, `SELECT retry_at > now() + interval '30 minutes' FROM sandbox_teardown WHERE sandbox_id = $1`, a2).Scan(&keptLongerBackoff); err != nil || !keptLongerBackoff {
+		t.Fatalf("a shorter host hold cut a2's backoff (kept = %v, err = %v)", keptLongerBackoff, err)
+	}
+	if n, err := testQueries.DeferHostTeardowns(ctx, db.DeferHostTeardownsParams{RetryAfterSeconds: 3600, LastError: &msg, HostID: hostB}); err != nil || n != 0 {
+		t.Fatalf("hold host with its record in flight: rows = %d, err = %v; want 0", n, err)
+	}
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim with a2 waiting and b1 in flight = %+v, want none", rec)
+	}
+	if n, err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: -1, LastError: &msg, SandboxID: b1, Attempts: 2}); err != nil || n != 1 {
+		t.Fatalf("defer with the backoff passed: rows = %d, err = %v", n, err)
+	}
+	releaseHost(hostB, b1, 2)
+	if rec, ok = claim(); !ok || rec.SandboxID != b1 || rec.Attempts != 3 {
+		t.Fatalf("claim after the backoff = %+v (%v), want %s at attempt 3", rec, ok, b1)
+	}
+
+	backlog, err := testQueries.TeardownBacklog(ctx)
+	if err != nil || backlog.Total != 2 || backlog.Retrying != 2 || backlog.OldestAgeSeconds < 0 {
+		t.Fatalf("backlog = %+v, err = %v; want 2 total, 2 retrying", backlog, err)
+	}
+}
+
+// Claims racing for one host from many connections at once, as replicas
+// do: exactly one takes the host, the rest get nothing.
+func TestIntegration_TeardownClaimsForOneHostSerializeAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hostID := "teardown-race-" + uuid.NewString()
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	for _, table := range []string{"sandbox_teardown", "sandbox_teardown_host"} {
+		if _, err := testPool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	const records = 8
+	for i := 0; i < records; i++ {
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
+			id, teamID, "teardown-race", hostID,
+		); err != nil {
+			t.Fatalf("insert sandbox: %v", err)
+		}
+		if _, err := testQueries.DestroySandbox(ctx, db.DestroySandboxParams{
+			ID: id, TeamID: teamID, LeaseSeconds: 0,
+			StaleTransitionalBefore: time.Now().Add(-time.Hour), RevocationExpiresAt: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("destroy sandbox: %v", err)
+		}
+	}
+
+	var won int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < records; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := testQueries.ClaimNextTeardown(ctx, 60)
+			switch {
+			case err == nil:
+				atomic.AddInt32(&won, 1)
+			case errors.Is(err, pgx.ErrNoRows):
+			default:
+				t.Errorf("claim: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if won != 1 {
+		t.Fatalf("%d concurrent claims took host %s, want exactly 1", won, hostID)
+	}
+}
+
+// An auto-deleted sandbox makes no inline attempt, so its record starts at
+// zero and the sweeper's first claim is attempt 1.
+func TestIntegration_AutoDeleteTeardownStartsAtAttemptZero(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hostID := "teardown-auto-" + uuid.NewString()
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	for _, table := range []string{"sandbox_teardown", "sandbox_teardown_host"} {
+		if _, err := testPool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	id := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox (id, team_id, name, status, host_id, auto_delete_at) VALUES ($1,$2,'teardown-auto','paused',$3, now() - interval '1 minute')`,
+		id, teamID, hostID,
+	); err != nil {
+		t.Fatalf("insert sandbox: %v", err)
+	}
+	if _, err := testQueries.ClaimAutoDeleteSandboxes(ctx, db.ClaimAutoDeleteSandboxesParams{
+		BatchSize: 100, RevocationExpiresAt: time.Now().Add(time.Hour), LeaseSeconds: 0,
+	}); err != nil {
+		t.Fatalf("claim auto-delete: %v", err)
+	}
+	var attempts int32
+	if err := testPool.QueryRow(ctx, `SELECT attempts FROM sandbox_teardown WHERE sandbox_id = $1`, id).Scan(&attempts); err != nil {
+		t.Fatalf("teardown row: %v", err)
+	}
+	if attempts != 0 {
+		t.Fatalf("born attempts = %d, want 0", attempts)
+	}
+	row, err := testQueries.ClaimNextTeardown(ctx, 60)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if row.SandboxID != id || row.Attempts != 1 {
+		t.Fatalf("first claim = %s attempt %d, want %s attempt 1", row.SandboxID, row.Attempts, id)
+	}
+	// A first attempt that fails is already a retry in waiting.
+	msg := "host unreachable"
+	if n, err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: 30, LastError: &msg, SandboxID: id, Attempts: 1}); err != nil || n != 1 {
+		t.Fatalf("defer: rows = %d, err = %v", n, err)
+	}
+	if b, err := testQueries.TeardownBacklog(ctx); err != nil || b.Retrying != 1 {
+		t.Fatalf("backlog after a failed first attempt = %+v, err = %v; want 1 retrying", b, err)
+	}
+}
+
+// A claim still in flight on one host does not draw the next worker onto
+// that host's other records: it takes another host's instead of waiting.
+func TestIntegration_TeardownClaimsSpreadAcrossHostsWhileOneIsInFlight(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hostA := "teardown-spread-a-" + uuid.NewString()
+	hostB := "teardown-spread-b-" + uuid.NewString()
+	for _, hostID := range []string{hostA, hostB} {
+		if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+			ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+			CapacityMemoryMib: 1024, CapacityVcpus: 1,
+		}); err != nil {
+			t.Fatalf("create host: %v", err)
+		}
+	}
+	for _, table := range []string{"sandbox_teardown", "sandbox_teardown_host"} {
+		if _, err := testPool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	destroy := func(hostID string) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,'teardown-spread','active',$3)`,
+			id, teamID, hostID,
+		); err != nil {
+			t.Fatalf("insert sandbox: %v", err)
+		}
+		if _, err := testQueries.DestroySandbox(ctx, db.DestroySandboxParams{
+			ID: id, TeamID: teamID, LeaseSeconds: 0,
+			StaleTransitionalBefore: time.Now().Add(-time.Hour), RevocationExpiresAt: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("destroy sandbox: %v", err)
+		}
+		return id
+	}
+	a1 := destroy(hostA)
+	destroy(hostA)
+	b1 := destroy(hostB)
+
+	// Host A's claim stays uncommitted: its row lock and host lease are in flight.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	rec, err := db.New(tx).ClaimNextTeardown(ctx, 60)
+	if err != nil || rec.SandboxID != a1 {
+		t.Fatalf("in-flight claim = %+v (%v), want %s", rec, err, a1)
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rec, err = testQueries.ClaimNextTeardown(cctx, 60)
+	if err != nil {
+		t.Fatalf("claim while host A's is in flight: %v (waited on host A instead of taking host B)", err)
+	}
+	if rec.SandboxID != b1 || rec.HostID != hostB {
+		t.Fatalf("claim while host A's is in flight = %+v, want %s on %s", rec, b1, hostB)
+	}
 }

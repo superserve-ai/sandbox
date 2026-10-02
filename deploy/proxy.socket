@@ -1,0 +1,15 @@
+[Unit]
+Description=Superserve Edge Proxy listeners
+
+# systemd owns the public listeners, so a proxy restart queues connections
+# in the accept backlog instead of refusing them. Stopping this unit stops
+# the proxy too.
+
+[Socket]
+ListenStream=5007
+ListenStream=5008
+Accept=no
+Backlog=4096
+
+[Install]
+WantedBy=sockets.target

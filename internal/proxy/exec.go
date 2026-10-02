@@ -5,6 +5,8 @@ import (
 	"net/http/httputil"
 	"strconv"
 	"time"
+
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 const (
@@ -45,12 +47,42 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		return
 	}
 	tStart := time.Now()
+	// mode splits the series: buffered ttfb includes the whole command run
+	// (boxd writes headers at completion), streaming ttfb is setup only
+	// (headers before the process starts). Mixed, the percentiles would
+	// track transport mix instead of either latency.
+	mode := "buffered"
+	if streaming {
+		mode = "stream"
+	}
+	var tAuthDone time.Time
+	phasesEmitted := false
+	// Early returns — missing token, failed authorization (including a
+	// resolver lookup that burns its whole timeout) — must still sample;
+	// the slowest auth failures are exactly the tail worth seeing. The
+	// proxied path emits its fuller phase set below instead.
+	defer func() {
+		if phasesEmitted || h.recorder == nil {
+			return
+		}
+		phases := map[string]time.Duration{"total": time.Since(tStart)}
+		if !tAuthDone.IsZero() {
+			phases["auth"] = tAuthDone.Sub(tStart)
+		}
+		for phase, d := range phases {
+			h.recorder.RecordLatencyPhase(r.Context(), telemetry.LatencyPhase{
+				Plane: "dataplane", Op: "exec", Phase: phase, Mode: mode, Duration: d,
+			})
+		}
+	}()
 
 	info, ok := h.authorizeBoxdRequest(w, r, instanceID, "exec")
+	// Stamped on every outcome: the 401 and the auth failure must land in
+	// the auth series too, not just the proxied path.
+	tAuthDone = time.Now()
 	if !ok {
 		return
 	}
-	tAuthDone := time.Now()
 	h.captureUsage(instanceID, "command_run", info)
 
 	transport := h.transports.get(instanceID, info)
@@ -63,9 +95,10 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	// are what split it further.
 	var (
 		upstreamStatus int
-		ttfbMs         int64 = -1
-		boxdSpawnMs    int64 = -1
-		boxdRunMs      int64 = -1
+		ttfb           time.Duration = -1
+		ttfbMs         int64         = -1
+		boxdSpawnMs    int64         = -1
+		boxdRunMs      int64         = -1
 		tProxy         time.Time
 	)
 
@@ -75,7 +108,9 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		// -1: stream each chunk as it arrives — required for SSE.
 		FlushInterval: -1,
 		ModifyResponse: func(resp *http.Response) error {
-			ttfbMs = time.Since(tProxy).Milliseconds()
+			// Raw duration for the histogram (sub-ms buckets); ms for the log.
+			ttfb = time.Since(tProxy)
+			ttfbMs = ttfb.Milliseconds()
 			upstreamStatus = resp.StatusCode
 			boxdSpawnMs = headerMs(resp, "X-Boxd-Spawn-Ms")
 			boxdRunMs = headerMs(resp, "X-Boxd-Run-Ms")
@@ -108,6 +143,23 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		Int64("boxd_spawn_ms", boxdSpawnMs).
 		Int64("boxd_run_ms", boxdRunMs).
 		Msg("exec phases")
+	if h.recorder != nil {
+		phasesEmitted = true
+		for phase, d := range map[string]time.Duration{
+			"auth":       tAuthDone.Sub(tStart),
+			"boxd_spawn": time.Duration(boxdSpawnMs) * time.Millisecond,
+			"run":        time.Duration(boxdRunMs) * time.Millisecond,
+			"ttfb":       ttfb,
+			"total":      time.Since(tStart),
+		} {
+			if d < 0 {
+				continue
+			}
+			h.recorder.RecordLatencyPhase(r.Context(), telemetry.LatencyPhase{
+				Plane: "dataplane", Op: "exec", Phase: phase, Mode: mode, Duration: d,
+			})
+		}
+	}
 }
 
 // headerMs parses a millisecond timing header; -1 means absent or unparseable

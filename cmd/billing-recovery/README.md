@@ -1,0 +1,100 @@
+# Billing activation recovery
+
+`billing-recovery` is a read-only audit by default. It looks up the current
+Stripe subscription and credit grants, then reports candidates, exclusions,
+and unresolved evidence. A processed webhook row is not replayed and normal
+webhook deduplication is unchanged.
+
+Audit all incomplete active accounts:
+
+```sh
+go run ./cmd/billing-recovery
+```
+
+Audit one team without mutating it:
+
+```sh
+go run ./cmd/billing-recovery -team <team-uuid>
+```
+
+Apply one explicitly targeted repair only after reviewing its dry-run result:
+
+```sh
+go run ./cmd/billing-recovery -team <team-uuid> -apply
+```
+
+In the default activation-recovery mode, `-apply` rechecks Stripe ownership,
+current activating status (`active`, `trialing`, or `past_due`), and grant
+ownership, then re-locks and revalidates the local association before writing.
+The repair records a subscription-event watermark while holding that lock, so
+older delayed webhook deliveries cannot overwrite the recovered projection.
+Canceled, replaced, excluded, or uncertain accounts are reported and skipped.
+The command is repeatable: an existing verified grant is reconciled
+locally when no user promotion or checkout actor is associated with the team.
+It does not create missing grants. An active subscription can legitimately
+have no grant when its activating user is ineligible or unknown. Missing grants
+and user promotion state are reported unresolved and require the normal
+webhook reconciliation workflow, which owns the user and team reservations.
+Grant evidence must also declare metered applicability. When the local grant ID
+is absent, recovery requires the team-scoped activation identity marker; a
+category/amount-only grant is reported unresolved rather than guessed.
+Production execution remains an operational decision; this command does not
+resume sandboxes.
+
+When a subscription-created webhook arrives before its checkout association is
+known, the webhook remains unprocessed and returns a retryable error. A
+matching checkout completion then reconciles that retained delivery; normal
+event-ID deduplication is unchanged.
+
+Recovery requires an existing local customer/subscription association; it does
+not import a missing subscription association from Checkout.
+
+A retained checkout reservation is recoverable only when Stripe confirms the
+exact session is complete for the current team, customer, and subscription.
+Recovery rechecks that proof under the billing-account lock and clears the
+reservation in the same transaction as activation. Open, expired, mismatched,
+and unproven pending sessions remain skipped. An expired session ID retained
+after its reservation was cleared does not block recovery of the existing
+subscription and is preserved. Stripe lookup failures are reported as unresolved.
+
+To reconcile an existing custom credit, use `-team <team-uuid>
+-activation-credit-cents <positive-usd-cents>` for both dry-run and apply.
+The default remains 9500 cents. A custom amount cannot be used for a fleet scan.
+Existing grants must match the requested amount and established identity;
+unverified promotional USD grants leave recovery unresolved.
+
+## Revoke activation credit after cancellation
+
+Use `-revoke-activation` to audit canceled subscriptions, including cancellation
+scheduled for the end of the billing period. This mode is separate from the
+activation repair above and never creates credits or activates an account.
+Set `DATABASE_URL`, `STRIPE_SECRET_KEY`, and `STRIPE_API_VERSION` for the target
+environment, then run the read-only audit:
+
+```sh
+go run ./cmd/billing-recovery -revoke-activation
+```
+
+Review each candidate's team and grant identity. Audit one team and apply its
+verified revocation with:
+
+```sh
+go run ./cmd/billing-recovery -revoke-activation -team <team-uuid>
+go run ./cmd/billing-recovery -revoke-activation -team <team-uuid> -apply
+```
+
+Revocation supports only the standard $95 activation grant. It verifies the
+persisted grant ID or a unique team activation identity across Stripe's grant
+list; unrelated grants are untouched. Unused grants are voided, and grants
+already applied to invoices are expired so remaining or reinstated credit cannot
+be spent. Existing redemption history is preserved, including after reversal or
+resubscription. A proven unattempted reservation is released without creating a
+grant, while the team's cancellation marker prevents later redemption.
+
+An `unresolved` outcome requires investigating the reported ownership or Stripe
+error before retrying. Do not substitute an amount-only grant match. A
+`reconciled` outcome confirms completion; rerunning the same targeted command is
+safe. `-exclude-team <team-uuid>` skips the selected team. Apply both activation
+revocation migrations before using this mode. Historical revocation is an
+explicit operational action; deploying the webhook change alone does not scan
+previously canceled accounts.

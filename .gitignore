@@ -67,6 +67,7 @@ docs/
 *:Zone.Identifier
 
 # Terraform local state/cache
+*.local.auto.tfvars.json
 **/.terraform/
 *.tfstate
 *.tfstate.*
@@ -83,3 +84,9 @@ override.tf.json
 .terraformrc
 terraform.rc
 .envrc
+
+# Merge-tool backups
+*.orig
+
+# Local peer issuance policy and public request/certificate artifacts
+.peer-credentials/

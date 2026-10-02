@@ -153,9 +153,8 @@ func newBridgeTestEnv(t *testing.T) *bridgeTestEnv {
 	path, handler := boxdpbconnect.NewProcessServiceHandler(fake)
 	boxdMux := http.NewServeMux()
 	boxdMux.Handle(path, handler)
-	boxdSrv := httptest.NewUnstartedServer(h2c.NewHandler(boxdMux, &http2.Server{}))
+	boxdSrv := newIPv4TestServer(t, h2c.NewHandler(boxdMux, &http2.Server{}))
 	boxdSrv.EnableHTTP2 = true
-	boxdSrv.Start()
 
 	// A connect-rpc client pointing at the fake. Uses an explicit
 	// http.Client with HTTP/2 transport so streaming flows correctly.
@@ -170,7 +169,7 @@ func newBridgeTestEnv(t *testing.T) *bridgeTestEnv {
 		log:        zerolog.Nop(),
 	}
 
-	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	proxySrv := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
 			CompressionMode:    websocket.CompressionDisabled,
@@ -390,9 +389,7 @@ func TestBridge_StartErrorClosesWSImmediately(t *testing.T) {
 	path, handler := boxdpbconnect.NewProcessServiceHandler(fake)
 	boxdMux := http.NewServeMux()
 	boxdMux.Handle(path, handler)
-	boxdSrv := httptest.NewUnstartedServer(h2c.NewHandler(boxdMux, &http2.Server{}))
-	boxdSrv.EnableHTTP2 = true
-	boxdSrv.Start()
+	boxdSrv := newIPv4TestServer(t, h2c.NewHandler(boxdMux, &http2.Server{}))
 	defer boxdSrv.Close()
 
 	procClient := boxdpbconnect.NewProcessServiceClient(boxdSrv.Client(), boxdSrv.URL)
@@ -517,9 +514,7 @@ func TestServeTerminal_AllowedOriginAccepted(t *testing.T) {
 	path, handler := boxdpbconnect.NewProcessServiceHandler(fake)
 	boxdMux := http.NewServeMux()
 	boxdMux.Handle(path, handler)
-	boxdSrv := httptest.NewUnstartedServer(h2c.NewHandler(boxdMux, &http2.Server{}))
-	boxdSrv.EnableHTTP2 = true
-	boxdSrv.Start()
+	boxdSrv := newIPv4TestServer(t, h2c.NewHandler(boxdMux, &http2.Server{}))
 	defer boxdSrv.Close()
 
 	seedKey := []byte("test-seed-key-that-is-at-least-32-bytes-long!!")

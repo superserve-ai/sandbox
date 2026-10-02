@@ -44,6 +44,24 @@ const (
 	// depends on, HostCapabilityPortTokens.
 	HostCapabilityPortBrowserAuth = "preview_port_browser_auth_v1"
 
+	// Host operational capabilities describe technical host abilities and are
+	// published independently from control-plane status and capacity.
+	HostCapabilityCanCreate       = "can_create"
+	HostCapabilityCanResume       = "can_resume"
+	HostCapabilityCanPause        = "can_pause"
+	HostCapabilityCanDestroy      = "can_destroy"
+	HostCapabilityCanProxyTraffic = "can_proxy_traffic"
+	HostCapabilityCanReadFiles    = "can_read_files"
+	HostCapabilityCanWriteFiles   = "can_write_files"
+	// HostCapabilitySavedSnapshots is advertised by a vmd that captures and
+	// deletes saved snapshots and refuses a capture for an id it has deleted,
+	// so the control plane never asks an older daemon for one.
+	HostCapabilitySavedSnapshots = "saved_snapshots_v1"
+	// HostCapabilitySnapshotForks is advertised by a vmd that installs a
+	// fork's egress rules before its guest runs; an older one would resume
+	// the captured workload unrestricted.
+	HostCapabilitySnapshotForks = "snapshot_forks_v1"
+
 	// Published preview ports exclude privileged ports and boxd's reserved
 	// service port. Keeping this vocabulary shared prevents the API, VMD,
 	// and durable schema from disagreeing about what can be published.

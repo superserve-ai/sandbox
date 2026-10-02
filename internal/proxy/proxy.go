@@ -15,6 +15,8 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/superserve-ai/sandbox/internal/telemetry"
+
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -61,12 +63,16 @@ type Handler struct {
 	// are equivalent for validation — the proxy only checks whether a
 	// Host ends in one of them and echoes the Host back, it never picks
 	// one to construct a URL from.
-	domains      []string
-	resolver     Resolver
-	transports   *transportCache
-	sandboxConns *connLimiter
-	ipConns      *connLimiter
-	log          zerolog.Logger
+	domains            []string
+	resolver           Resolver
+	transports         *transportCache
+	sandboxConns       *connLimiter
+	ipConns            *connLimiter
+	authenticatedConns *connLimiter
+	log                zerolog.Logger
+	// recorder receives per-exec latency phases; nil (the default) records
+	// nothing. Set via WithTelemetry.
+	recorder telemetry.Recorder
 
 	// seedKey is the HMAC seed shared with the control plane. Both
 	// sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
@@ -130,14 +136,22 @@ func (h *Handler) originAllowed(origin string) bool {
 
 // NewHandler creates a proxy Handler that only accepts requests whose Host
 // header ends in ".{domain}" for one of the given domains.
+// WithTelemetry attaches the operational metrics recorder; per-exec latency
+// phases are emitted through it.
+func (h *Handler) WithTelemetry(r telemetry.Recorder) *Handler {
+	h.recorder = r
+	return h
+}
+
 func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handler {
 	h := &Handler{
-		domains:      domains,
-		resolver:     resolver,
-		transports:   newTransportCache(),
-		sandboxConns: newConnLimiter(maxConnsPerSandbox),
-		ipConns:      newConnLimiter(maxConnsPerIP),
-		log:          log,
+		domains:            domains,
+		resolver:           resolver,
+		transports:         newTransportCache(),
+		sandboxConns:       newConnLimiter(maxConnsPerSandbox),
+		ipConns:            newConnLimiter(maxConnsPerIP),
+		authenticatedConns: newConnLimiter(1024),
+		log:                log,
 	}
 	return h
 }
@@ -167,6 +181,19 @@ func (h *Handler) PreviewCapabilities() []string {
 		)
 	}
 	return capabilities
+}
+
+// FilesEnabled reports whether the authenticated /files bridge is enabled.
+// It is a read-only snapshot used by the local health endpoint; it performs
+// no sandbox I/O.
+func (h *Handler) FilesEnabled() bool {
+	return h.filesEnabled
+}
+
+// ResolverReady verifies the configured resolver endpoint without touching a sandbox.
+func (h *Handler) ResolverReady(ctx context.Context) bool {
+	resolver, ok := h.resolver.(interface{ Ready(context.Context) error })
+	return ok && resolver.Ready(ctx) == nil
 }
 
 // WithAnalytics enables data-plane usage events (exec/files).
@@ -513,14 +540,31 @@ func NewServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-// ListenAndServe starts the proxy and blocks until ctx is cancelled.
+// shutdownGrace is how long in-flight requests get once the listener is
+// closed; new connections wait in the backlog for the whole of it.
+const shutdownGrace = 5 * time.Second
+
+// ListenAndServe starts the proxy on addr and blocks until ctx is cancelled.
 func ListenAndServe(ctx context.Context, addr string, handler http.Handler, log zerolog.Logger) error {
+	return Serve(ctx, nil, addr, handler, log)
+}
+
+// Serve is ListenAndServe on a listener the caller already holds; nil binds
+// addr. Requests outliving the grace are cut, which is not an error.
+func Serve(ctx context.Context, ln net.Listener, addr string, handler http.Handler, log zerolog.Logger) error {
 	srv := NewServer(addr, handler)
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info().Str("addr", addr).Msg("proxy listening")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if ln != nil {
+			log.Info().Str("addr", ln.Addr().String()).Msg("proxy listening on inherited socket")
+			err = srv.Serve(ln)
+		} else {
+			log.Info().Str("addr", addr).Msg("proxy listening")
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 		close(errCh)
@@ -530,12 +574,16 @@ func ListenAndServe(ctx context.Context, addr string, handler http.Handler, log 
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
 		log.Info().Msg("proxy shutting down")
 		err := srv.Shutdown(shutdownCtx)
 		// Drain in case Shutdown races with a serve error.
 		<-errCh
+		if errors.Is(err, context.DeadlineExceeded) {
+			log.Warn().Dur("grace", shutdownGrace).Msg("proxy shut down with requests still in flight")
+			return nil
+		}
 		return err
 	}
 }

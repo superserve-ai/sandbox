@@ -17,13 +17,14 @@ import (
 type SandboxStatus string
 
 const (
-	SandboxStatusStarting SandboxStatus = "starting"
-	SandboxStatusActive   SandboxStatus = "active"
-	SandboxStatusPausing  SandboxStatus = "pausing"
-	SandboxStatusPaused   SandboxStatus = "paused"
-	SandboxStatusDeleted  SandboxStatus = "deleted"
-	SandboxStatusFailed   SandboxStatus = "failed"
-	SandboxStatusResuming SandboxStatus = "resuming"
+	SandboxStatusStarting  SandboxStatus = "starting"
+	SandboxStatusActive    SandboxStatus = "active"
+	SandboxStatusPausing   SandboxStatus = "pausing"
+	SandboxStatusPaused    SandboxStatus = "paused"
+	SandboxStatusDeleted   SandboxStatus = "deleted"
+	SandboxStatusFailed    SandboxStatus = "failed"
+	SandboxStatusResuming  SandboxStatus = "resuming"
+	SandboxStatusMigrating SandboxStatus = "migrating"
 )
 
 func (e *SandboxStatus) Scan(src interface{}) error {
@@ -151,6 +152,54 @@ func (ns NullTemplateStatus) Value() (driver.Value, error) {
 	return string(ns.TemplateStatus), nil
 }
 
+type AbuseRestriction struct {
+	ID            uuid.UUID          `json:"id"`
+	SubjectType   string             `json:"subject_type"`
+	SubjectValue  string             `json:"subject_value"`
+	SubjectUserID pgtype.UUID        `json:"subject_user_id"`
+	SubjectTeamID pgtype.UUID        `json:"subject_team_id"`
+	Action        string             `json:"action"`
+	Source        string             `json:"source"`
+	Reason        string             `json:"reason"`
+	Evidence      []byte             `json:"evidence"`
+	CreatedBy     pgtype.UUID        `json:"created_by"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+	ReleasedAt    pgtype.Timestamptz `json:"released_at"`
+	ReleasedBy    pgtype.UUID        `json:"released_by"`
+}
+
+type AbuseStateChange struct {
+	ID         int64       `json:"id"`
+	TeamID     pgtype.UUID `json:"team_id"`
+	Generation int64       `json:"generation"`
+	Reason     string      `json:"reason"`
+	CreatedAt  time.Time   `json:"created_at"`
+}
+
+type AbuseTeamTrust struct {
+	TeamID    uuid.UUID          `json:"team_id"`
+	Verified  bool               `json:"verified"`
+	Source    string             `json:"source"`
+	Reason    *string            `json:"reason"`
+	Evidence  []byte             `json:"evidence"`
+	CreatedAt time.Time          `json:"created_at"`
+	UpdatedAt time.Time          `json:"updated_at"`
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type AbuseTrustedIdentity struct {
+	ID           uuid.UUID          `json:"id"`
+	AuthProvider string             `json:"auth_provider"`
+	Domain       string             `json:"domain"`
+	Source       string             `json:"source"`
+	Evidence     []byte             `json:"evidence"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type Activity struct {
 	ID           uuid.UUID   `json:"id"`
 	SandboxID    pgtype.UUID `json:"sandbox_id"`
@@ -174,9 +223,19 @@ type AnalyticsActiveSandboxCount struct {
 	ActiveSandboxes int64 `json:"active_sandboxes"`
 }
 
+type AnalyticsDailySandboxFailure struct {
+	Day      pgtype.Date `json:"day"`
+	Failures int64       `json:"failures"`
+}
+
 type AnalyticsDailySandboxStart struct {
 	Day    pgtype.Date `json:"day"`
 	Starts int64       `json:"starts"`
+}
+
+type AnalyticsSandboxActiveInterval struct {
+	StartedAt time.Time          `json:"started_at"`
+	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 }
 
 type AnalyticsTeamHourlySpend struct {
@@ -217,17 +276,18 @@ type ApiKey struct {
 }
 
 type ArtifactManifest struct {
-	ID          uuid.UUID   `json:"id"`
-	SnapshotID  pgtype.UUID `json:"snapshot_id"`
-	TemplateID  pgtype.UUID `json:"template_id"`
-	FileName    string      `json:"file_name"`
-	Path        string      `json:"path"`
-	SizeBytes   int64       `json:"size_bytes"`
-	Sha256      string      `json:"sha256"`
-	BasePath    *string     `json:"base_path"`
-	GuestKernel *string     `json:"guest_kernel"`
-	VmdVersion  *string     `json:"vmd_version"`
-	CreatedAt   time.Time   `json:"created_at"`
+	ID             uuid.UUID   `json:"id"`
+	SnapshotID     pgtype.UUID `json:"snapshot_id"`
+	TemplateID     pgtype.UUID `json:"template_id"`
+	FileName       string      `json:"file_name"`
+	Path           string      `json:"path"`
+	SizeBytes      int64       `json:"size_bytes"`
+	Sha256         string      `json:"sha256"`
+	BasePath       *string     `json:"base_path"`
+	GuestKernel    *string     `json:"guest_kernel"`
+	VmdVersion     *string     `json:"vmd_version"`
+	CreatedAt      time.Time   `json:"created_at"`
+	AllocatedBytes int64       `json:"allocated_bytes"`
 }
 
 type AuditLog struct {
@@ -240,6 +300,234 @@ type AuditLog struct {
 	NewValue     []byte      `json:"new_value"`
 	Metadata     []byte      `json:"metadata"`
 	CreatedAt    time.Time   `json:"created_at"`
+}
+
+type BackupGeneration struct {
+	ID                        uuid.UUID          `json:"id"`
+	SandboxID                 pgtype.UUID        `json:"sandbox_id"`
+	TemplateID                pgtype.UUID        `json:"template_id"`
+	BuildID                   *string            `json:"build_id"`
+	Generation                string             `json:"generation"`
+	Bucket                    string             `json:"bucket"`
+	CompletedAt               time.Time          `json:"completed_at"`
+	ReportedAt                time.Time          `json:"reported_at"`
+	Files                     []byte             `json:"files"`
+	CoveredSnapshotID         pgtype.UUID        `json:"covered_snapshot_id"`
+	CoveredSnapshotGeneration *int64             `json:"covered_snapshot_generation"`
+	PurgeClaimedAt            pgtype.Timestamptz `json:"purge_claimed_at"`
+	PurgedAt                  pgtype.Timestamptz `json:"purged_at"`
+	SnapshotID                pgtype.UUID        `json:"snapshot_id"`
+}
+
+type BackupWalk struct {
+	Bucket    string    `json:"bucket"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+type BillingExportAllocation struct {
+	ID              uuid.UUID      `json:"id"`
+	TeamID          uuid.UUID      `json:"team_id"`
+	PeriodStart     time.Time      `json:"period_start"`
+	PeriodEnd       time.Time      `json:"period_end"`
+	ResourceType    string         `json:"resource_type"`
+	CoverageStart   pgtype.Numeric `json:"coverage_start"`
+	CoverageEnd     pgtype.Numeric `json:"coverage_end"`
+	MeasuredThrough time.Time      `json:"measured_through"`
+	CreatedAt       time.Time      `json:"created_at"`
+	CorrectionID    pgtype.UUID    `json:"correction_id"`
+}
+
+type BillingExportCorrection struct {
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	PeriodStart         time.Time          `json:"period_start"`
+	PeriodEnd           time.Time          `json:"period_end"`
+	ResourceType        string             `json:"resource_type"`
+	Frozen              bool               `json:"frozen"`
+	Version             int64              `json:"version"`
+	MeasuredQuantity    pgtype.Numeric     `json:"measured_quantity"`
+	BaselineQuantity    pgtype.Numeric     `json:"baseline_quantity"`
+	ReservedQuantity    pgtype.Numeric     `json:"reserved_quantity"`
+	TargetQuantity      pgtype.Numeric     `json:"target_quantity"`
+	PreviousID          pgtype.UUID        `json:"previous_id"`
+	MeasurementSnapshot string             `json:"measurement_snapshot"`
+	CreatedAt           time.Time          `json:"created_at"`
+	AppliedAt           pgtype.Timestamptz `json:"applied_at"`
+	AppliedBy           pgtype.UUID        `json:"applied_by"`
+	ApprovalSnapshot    *string            `json:"approval_snapshot"`
+	Action              *string            `json:"action"`
+	Evidence            *string            `json:"evidence"`
+	AccountingSequence  int64              `json:"accounting_sequence"`
+}
+
+type BillingExportDiscovery struct {
+	Singleton     bool        `json:"singleton"`
+	AfterTeam     pgtype.UUID `json:"after_team"`
+	ResetExisting bool        `json:"reset_existing"`
+	NextRunAt     time.Time   `json:"next_run_at"`
+}
+
+type BillingExportEvent struct {
+	ID                 uuid.UUID          `json:"id"`
+	AllocationID       uuid.UUID          `json:"allocation_id"`
+	Identifier         string             `json:"identifier"`
+	IdempotencyKey     string             `json:"idempotency_key"`
+	EventName          string             `json:"event_name"`
+	CustomerID         string             `json:"customer_id"`
+	Quantity           pgtype.Numeric     `json:"quantity"`
+	QuantityPayload    string             `json:"quantity_payload"`
+	EventTimestamp     int64              `json:"event_timestamp"`
+	Source             string             `json:"source"`
+	Evidence           *string            `json:"evidence"`
+	RecoveryOutcome    *string            `json:"recovery_outcome"`
+	RecoveryEvidence   *string            `json:"recovery_evidence"`
+	Replaces           pgtype.UUID        `json:"replaces"`
+	Active             bool               `json:"active"`
+	Status             string             `json:"status"`
+	FirstAttemptAt     pgtype.Timestamptz `json:"first_attempt_at"`
+	SubmittedAt        pgtype.Timestamptz `json:"submitted_at"`
+	NextAttemptAt      time.Time          `json:"next_attempt_at"`
+	LeaseToken         pgtype.UUID        `json:"lease_token"`
+	LeaseUntil         pgtype.Timestamptz `json:"lease_until"`
+	AttemptCount       int32              `json:"attempt_count"`
+	LastError          *string            `json:"last_error"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+	AccountingSequence int64              `json:"accounting_sequence"`
+}
+
+type BillingExportMeasurement struct {
+	TeamID            uuid.UUID      `json:"team_id"`
+	PeriodStart       time.Time      `json:"period_start"`
+	PeriodEnd         time.Time      `json:"period_end"`
+	HourStart         time.Time      `json:"hour_start"`
+	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
+}
+
+type BillingExportMeasurementQueue struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	HourStart         time.Time          `json:"hour_start"`
+	Pending           bool               `json:"pending"`
+	HourEnd           pgtype.Timestamptz `json:"hour_end"`
+	VcpuSeconds       pgtype.Numeric     `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric     `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric     `json:"storage_mib_seconds"`
+}
+
+type BillingExportObservation struct {
+	TeamID            uuid.UUID      `json:"team_id"`
+	PeriodStart       time.Time      `json:"period_start"`
+	PeriodEnd         time.Time      `json:"period_end"`
+	ResourceType      string         `json:"resource_type"`
+	LocalQuantity     pgtype.Numeric `json:"local_quantity"`
+	SubmittedQuantity pgtype.Numeric `json:"submitted_quantity"`
+	ReservedQuantity  pgtype.Numeric `json:"reserved_quantity"`
+	CountedQuantity   pgtype.Numeric `json:"counted_quantity"`
+	ObservedAt        time.Time      `json:"observed_at"`
+	QueryStart        time.Time      `json:"query_start"`
+	QueryEnd          time.Time      `json:"query_end"`
+	LastError         *string        `json:"last_error"`
+	MeterID           *string        `json:"meter_id"`
+}
+
+type BillingExportUsage struct {
+	TeamID              uuid.UUID          `json:"team_id"`
+	PeriodStart         time.Time          `json:"period_start"`
+	PeriodEnd           time.Time          `json:"period_end"`
+	VcpuSeconds         pgtype.Numeric     `json:"vcpu_seconds"`
+	MemoryMibSeconds    pgtype.Numeric     `json:"memory_mib_seconds"`
+	StorageMibSeconds   pgtype.Numeric     `json:"storage_mib_seconds"`
+	UpdatedAt           time.Time          `json:"updated_at"`
+	LastExportAttemptAt pgtype.Timestamptz `json:"last_export_attempt_at"`
+}
+
+type BillingExportWork struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	NextRunAt         time.Time          `json:"next_run_at"`
+	LeaseToken        pgtype.UUID        `json:"lease_token"`
+	LeaseUntil        pgtype.Timestamptz `json:"lease_until"`
+	SeedAfter         pgtype.Timestamptz `json:"seed_after"`
+	SeedComplete      bool               `json:"seed_complete"`
+	LastError         *string            `json:"last_error"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	NextReconcileAt   time.Time          `json:"next_reconcile_at"`
+	ReconcileError    *string            `json:"reconcile_error"`
+	CorrectionAfter   pgtype.Timestamptz `json:"correction_after"`
+	CorrectionThrough pgtype.Timestamptz `json:"correction_through"`
+	NextCorrectionAt  time.Time          `json:"next_correction_at"`
+}
+
+type BillingIncrementalPeriod struct {
+	TeamID                 uuid.UUID          `json:"team_id"`
+	PeriodStart            time.Time          `json:"period_start"`
+	PeriodEnd              time.Time          `json:"period_end"`
+	CreatedAt              time.Time          `json:"created_at"`
+	CorrectionVersion      int64              `json:"correction_version"`
+	LastReconcileAttemptAt pgtype.Timestamptz `json:"last_reconcile_attempt_at"`
+}
+
+type BillingInvoiceAccount struct {
+	TeamID              uuid.UUID          `json:"team_id"`
+	CustomerID          string             `json:"customer_id"`
+	SubscriptionID      string             `json:"subscription_id"`
+	AdjustmentPriceID   string             `json:"adjustment_price_id"`
+	AdjustmentEventName string             `json:"adjustment_event_name"`
+	AdjustmentMeterID   string             `json:"adjustment_meter_id"`
+	EnrolledAt          time.Time          `json:"enrolled_at"`
+	LastAttemptAt       pgtype.Timestamptz `json:"last_attempt_at"`
+	LastError           *string            `json:"last_error"`
+}
+
+type BillingInvoiceClose struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	PeriodStart       time.Time          `json:"period_start"`
+	PeriodEnd         time.Time          `json:"period_end"`
+	InvoiceID         string             `json:"invoice_id"`
+	Plan              []byte             `json:"plan"`
+	State             string             `json:"state"`
+	FirstAdjustmentAt pgtype.Timestamptz `json:"first_adjustment_at"`
+	FirstFinalizeAt   pgtype.Timestamptz `json:"first_finalize_at"`
+	VerifiedAt        pgtype.Timestamptz `json:"verified_at"`
+	FinalizedEvidence []byte             `json:"finalized_evidence"`
+	LastError         *string            `json:"last_error"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
+type BillingInvoiceEnrollment struct {
+	TeamID         uuid.UUID          `json:"team_id"`
+	CustomerID     string             `json:"customer_id"`
+	SubscriptionID string             `json:"subscription_id"`
+	RequestedAt    time.Time          `json:"requested_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	NextAttemptAt  time.Time          `json:"next_attempt_at"`
+	AttemptCount   int32              `json:"attempt_count"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	LastError      *string            `json:"last_error"`
+}
+
+type BillingMeterReconciliation struct {
+	ID                 uuid.UUID      `json:"id"`
+	TeamID             uuid.UUID      `json:"team_id"`
+	PeriodStart        time.Time      `json:"period_start"`
+	PeriodEnd          time.Time      `json:"period_end"`
+	ResourceType       string         `json:"resource_type"`
+	EventName          string         `json:"event_name"`
+	CustomerID         string         `json:"customer_id"`
+	MeterID            string         `json:"meter_id"`
+	LocalQuantity      pgtype.Numeric `json:"local_quantity"`
+	ReservedQuantity   pgtype.Numeric `json:"reserved_quantity"`
+	SubmittedQuantity  pgtype.Numeric `json:"submitted_quantity"`
+	ProviderQuantity   pgtype.Numeric `json:"provider_quantity"`
+	Difference         pgtype.Numeric `json:"difference"`
+	QueryStart         time.Time      `json:"query_start"`
+	QueryEnd           time.Time      `json:"query_end"`
+	ObservedAt         time.Time      `json:"observed_at"`
+	CollectedAt        time.Time      `json:"collected_at"`
+	Policy             string         `json:"policy"`
+	AccountingSnapshot []byte         `json:"accounting_snapshot"`
+	BucketPasses       []byte         `json:"bucket_passes"`
 }
 
 type BillingPeriodAnomaly struct {
@@ -291,6 +579,24 @@ type BillingRollupTeamBackfillState struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+type BillingUsageExport struct {
+	ID                         uuid.UUID          `json:"id"`
+	TeamID                     uuid.UUID          `json:"team_id"`
+	PeriodStart                time.Time          `json:"period_start"`
+	PeriodEnd                  time.Time          `json:"period_end"`
+	ResourceType               string             `json:"resource_type"`
+	StripeCustomerID           *string            `json:"stripe_customer_id"`
+	StripeMeterEventIdentifier string             `json:"stripe_meter_event_identifier"`
+	StripeEventName            string             `json:"stripe_event_name"`
+	Value                      pgtype.Numeric     `json:"value"`
+	Status                     string             `json:"status"`
+	Error                      *string            `json:"error"`
+	CreatedAt                  time.Time          `json:"created_at"`
+	SentAt                     pgtype.Timestamptz `json:"sent_at"`
+	UpdatedAt                  time.Time          `json:"updated_at"`
+	StripeIdempotencyKey       *string            `json:"stripe_idempotency_key"`
+}
+
 type DeviceCode struct {
 	ID         uuid.UUID   `json:"id"`
 	DeviceCode string      `json:"device_code"`
@@ -329,6 +635,9 @@ type Host struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+	IdentityBound     bool               `json:"identity_bound"`
+	IncarnationID     pgtype.UUID        `json:"incarnation_id"`
+	PeerGeneration    *int64             `json:"peer_generation"`
 }
 
 // Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.
@@ -337,6 +646,70 @@ type HostCapability struct {
 	Capability  string    `json:"capability"`
 	HeartbeatAt time.Time `json:"heartbeat_at"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type HostIdentityRegistry struct {
+	HostID  string `json:"host_id"`
+	Retired bool   `json:"retired"`
+}
+
+type HostPressure struct {
+	HostID                 string    `json:"host_id"`
+	RunningSandboxes       int32     `json:"running_sandboxes"`
+	ProvisioningSandboxes  int32     `json:"provisioning_sandboxes"`
+	PausedSandboxes        int32     `json:"paused_sandboxes"`
+	AllocatedMemoryMib     int64     `json:"allocated_memory_mib"`
+	AllocatedVcpus         int64     `json:"allocated_vcpus"`
+	UsedNetSlots           int32     `json:"used_net_slots"`
+	ProvisioningNetSlots   int32     `json:"provisioning_net_slots"`
+	WarmNetSlots           int32     `json:"warm_net_slots"`
+	NetSlotCeiling         int32     `json:"net_slot_ceiling"`
+	MaxNetworkSlots        int32     `json:"max_network_slots"`
+	MaxSandboxes           int32     `json:"max_sandboxes"`
+	UnknownAllocationVms   int32     `json:"unknown_allocation_vms"`
+	ReportedAt             time.Time `json:"reported_at"`
+	IncludedBuildVmIds     []string  `json:"included_build_vm_ids"`
+	IncludedBuildSlotVmIds []string  `json:"included_build_slot_vm_ids"`
+}
+
+type HostRetiredAddress struct {
+	HostID        string    `json:"host_id"`
+	IncarnationID uuid.UUID `json:"incarnation_id"`
+	VmdAddr       string    `json:"vmd_addr"`
+}
+
+type HostRetiredIncarnation struct {
+	HostID                 string    `json:"host_id"`
+	IncarnationID          uuid.UUID `json:"incarnation_id"`
+	SuccessorIncarnationID uuid.UUID `json:"successor_incarnation_id"`
+}
+
+type HostStorageReport struct {
+	HostID               string             `json:"host_id"`
+	IncarnationID        uuid.UUID          `json:"incarnation_id"`
+	ReportID             uuid.UUID          `json:"report_id"`
+	IngestSeq            int64              `json:"ingest_seq"`
+	ReceivedAt           time.Time          `json:"received_at"`
+	Payload              []byte             `json:"payload"`
+	State                string             `json:"state"`
+	Attempts             int32              `json:"attempts"`
+	NextMeasurementIndex int32              `json:"next_measurement_index"`
+	NextAttemptAt        time.Time          `json:"next_attempt_at"`
+	LastError            *string            `json:"last_error"`
+	ProcessedAt          pgtype.Timestamptz `json:"processed_at"`
+	PayloadHash          string             `json:"payload_hash"`
+	ProcessingGeneration int64              `json:"processing_generation"`
+}
+
+type LegacyHostStorageReport struct {
+	HostID                 string      `json:"host_id"`
+	RequestedIncarnationID pgtype.UUID `json:"requested_incarnation_id"`
+	ReportID               uuid.UUID   `json:"report_id"`
+	ReceivedAt             time.Time   `json:"received_at"`
+	Payload                []byte      `json:"payload"`
+	Attempts               int32       `json:"attempts"`
+	NextAttemptAt          time.Time   `json:"next_attempt_at"`
+	LastError              *string     `json:"last_error"`
 }
 
 type NetFlow struct {
@@ -396,6 +769,90 @@ type Profile struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+type PromotionDeviceGrant struct {
+	Promotion   string    `json:"promotion"`
+	UserID      uuid.UUID `json:"user_id"`
+	TeamID      uuid.UUID `json:"team_id"`
+	Fingerprint *string   `json:"fingerprint"`
+	GrantedAt   time.Time `json:"granted_at"`
+}
+
+type PromotionDeviceOwner struct {
+	Fingerprint  string    `json:"fingerprint"`
+	UserID       uuid.UUID `json:"user_id"`
+	RegisteredAt time.Time `json:"registered_at"`
+}
+
+type PromotionDevicePolicy struct {
+	Singleton        bool      `json:"singleton"`
+	DeviceEnforced   bool      `json:"device_enforced"`
+	EvidenceRequired bool      `json:"evidence_required"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type PromotionIdentity struct {
+	IdentityKey          string             `json:"identity_key"`
+	SignupClaimedAt      pgtype.Timestamptz `json:"signup_claimed_at"`
+	StripeRedemptionAt   pgtype.Timestamptz `json:"stripe_redemption_at"`
+	StripeReservedTeamID pgtype.UUID        `json:"stripe_reserved_team_id"`
+	StripeReservedUserID pgtype.UUID        `json:"stripe_reserved_user_id"`
+	CreatedAt            time.Time          `json:"created_at"`
+}
+
+type PromotionIdentityBinding struct {
+	UserID      uuid.UUID `json:"user_id"`
+	IdentityKey string    `json:"identity_key"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type PromotionIdentityCurrent struct {
+	UserID          uuid.UUID `json:"user_id"`
+	EvidenceVersion uuid.UUID `json:"evidence_version"`
+}
+
+type PromotionIdentityEnforcement struct {
+	Singleton          bool               `json:"singleton"`
+	Enabled            bool               `json:"enabled"`
+	EnabledAt          pgtype.Timestamptz `json:"enabled_at"`
+	ReadinessReference *string            `json:"readiness_reference"`
+}
+
+type PromotionIdentityEvidence struct {
+	EvidenceVersion uuid.UUID `json:"evidence_version"`
+	UserID          uuid.UUID `json:"user_id"`
+	Email           *string   `json:"email"`
+	EmailVerified   bool      `json:"email_verified"`
+	AuthUpdatedAt   time.Time `json:"auth_updated_at"`
+	ObservedAt      time.Time `json:"observed_at"`
+}
+
+type PromotionIdentityHistory struct {
+	HistoryKey        string             `json:"history_key"`
+	Promotion         string             `json:"promotion"`
+	UserID            pgtype.UUID        `json:"user_id"`
+	TeamID            pgtype.UUID        `json:"team_id"`
+	ClaimedAt         time.Time          `json:"claimed_at"`
+	GrantState        string             `json:"grant_state"`
+	Status            string             `json:"status"`
+	IdentityKeys      []string           `json:"identity_keys"`
+	EvidenceReference *string            `json:"evidence_reference"`
+	ReconciledAt      pgtype.Timestamptz `json:"reconciled_at"`
+	EvidenceVersion   pgtype.UUID        `json:"evidence_version"`
+}
+
+type PromotionSignupDeviceEvidence struct {
+	UserID          uuid.UUID `json:"user_id"`
+	SourceAttemptID uuid.UUID `json:"source_attempt_id"`
+	SourceEventID   string    `json:"source_event_id"`
+	Fingerprint     string    `json:"fingerprint"`
+	RegisteredAt    time.Time `json:"registered_at"`
+}
+
+type PromotionStripeActorRedemption struct {
+	UserID     uuid.UUID `json:"user_id"`
+	RedeemedAt time.Time `json:"redeemed_at"`
+}
+
 type ProxyAudit struct {
 	ID             int64       `json:"id"`
 	Ts             time.Time   `json:"ts"`
@@ -426,6 +883,40 @@ type ReconcilerLog struct {
 	Reason    string      `json:"reason"`
 	DriftKind *string     `json:"drift_kind"`
 	CreatedAt time.Time   `json:"created_at"`
+}
+
+type RetainedStorageCutover struct {
+	HostID    string    `json:"host_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+type RetainedStorageInterval struct {
+	ID                     int64              `json:"id"`
+	HostID                 string             `json:"host_id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	OwnerKind              string             `json:"owner_kind"`
+	OwnerID                uuid.UUID          `json:"owner_id"`
+	Generation             string             `json:"generation"`
+	Extents                []byte             `json:"extents"`
+	StartedAt              time.Time          `json:"started_at"`
+	EndedAt                pgtype.Timestamptz `json:"ended_at"`
+	BaselinePath           *string            `json:"baseline_path"`
+	BaselineGeneration     *string            `json:"baseline_generation"`
+	BaselineAllocatedBytes *int64             `json:"baseline_allocated_bytes"`
+}
+
+type RetainedStorageMeasurementObligation struct {
+	ID                 int64              `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	OwnerKind          string             `json:"owner_kind"`
+	OwnerID            uuid.UUID          `json:"owner_id"`
+	HostID             string             `json:"host_id"`
+	EffectiveAt        time.Time          `json:"effective_at"`
+	EndedAt            pgtype.Timestamptz `json:"ended_at"`
+	ResolvedAt         pgtype.Timestamptz `json:"resolved_at"`
+	ResolutionReportID pgtype.UUID        `json:"resolution_report_id"`
+	MigrationIdentity  uuid.UUID          `json:"migration_identity"`
 }
 
 type RevokedProxyToken struct {
@@ -477,6 +968,32 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt          pgtype.Timestamptz `json:"failed_at"`
+	// True once any secret binding has existed for this sandbox; false when the sandbox was created without one; NULL for rows predating the column. Never cleared — a detached or failure-cleared binding may still have had a JWT minted against it. Destroy revokes unless this is false.
+	HadSecretBindings *bool `json:"had_secret_bindings"`
+	// Digest of the binding set last injected into the guest; a resume re-injects when the current set differs.
+	SecretEnvFingerprint *string `json:"secret_env_fingerprint"`
+	// Guest IP the injected proxy JWT is bound to; a resume re-injects when the guest comes back on another.
+	SecretEnvIp *string `json:"secret_env_ip"`
+	// When the last injection landed; only a snapshot taken after it holds the injected environment.
+	SecretEnvInjectedAt pgtype.Timestamptz `json:"secret_env_injected_at"`
+	// Expiry of the injected proxy JWT; a resume re-injects when it is near.
+	SecretEnvExpiresAt pgtype.Timestamptz `json:"secret_env_expires_at"`
+	// Identity of the pause in flight, reused as the pause token across every attempt; NULL when no pause is pending.
+	PauseOpID        pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt pgtype.Timestamptz `json:"pause_op_started_at"`
+	// Until when the worker holding pause_op_lease_version may act on the pause; expired or NULL means claimable.
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	// When a pause pending past its age threshold was flagged for an operator; set once.
+	PauseOpAttentionAt pgtype.Timestamptz `json:"pause_op_attention_at"`
+	// Why the pause in flight was started (pause, timeout, billing_ineligible); kept so a reconciled pause records its original cause.
+	PauseOpTrigger *string `json:"pause_op_trigger"`
+	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
+	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
+	RoutingVersion int64       `json:"routing_version"`
+	// Snapshot this sandbox was created from; NULL when created from a template.
+	SourceSnapshotID pgtype.UUID `json:"source_snapshot_id"`
 }
 
 type SandboxActiveInterval struct {
@@ -541,11 +1058,78 @@ type SandboxRevocation struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+type SandboxRoutingRevocation struct {
+	SandboxID      uuid.UUID          `json:"sandbox_id"`
+	RoutingVersion int64              `json:"routing_version"`
+	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+}
+
 type SandboxSecret struct {
 	SandboxID  uuid.UUID `json:"sandbox_id"`
 	SecretID   uuid.UUID `json:"secret_id"`
 	EnvKey     string    `json:"env_key"`
 	ProxyToken *string   `json:"proxy_token"`
+}
+
+type SandboxSecretDetached struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	EnvKey     string    `json:"env_key"`
+	DetachedAt time.Time `json:"detached_at"`
+}
+
+type SandboxSnapshot struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+	// Sandbox the snapshot was captured from. Kept after that sandbox is destroyed.
+	SandboxID      uuid.UUID   `json:"sandbox_id"`
+	TemplateID     pgtype.UUID `json:"template_id"`
+	Kind           string      `json:"kind"`
+	Status         string      `json:"status"`
+	Name           *string     `json:"name"`
+	IdempotencyKey *string     `json:"idempotency_key"`
+	// Host holding the artifacts; forks run there.
+	HostID    string `json:"host_id"`
+	VcpuCount int32  `json:"vcpu_count"`
+	MemoryMib int32  `json:"memory_mib"`
+	DiskMib   int32  `json:"disk_mib"`
+	// Template base image the overlay sits on. Pins the template build while the snapshot exists.
+	BasePath string `json:"base_path"`
+	// Template memory image the memory diff layers on; NULL for a full image or an fs snapshot.
+	BaseMemPath  *string `json:"base_mem_path"`
+	SnapshotPath *string `json:"snapshot_path"`
+	MemPath      *string `json:"mem_path"`
+	OverlayPath  *string `json:"overlay_path"`
+	// Bytes the snapshot uniquely holds on disk, for metering; 0 until ready.
+	SizeBytes      int64  `json:"size_bytes"`
+	TimeoutSeconds *int32 `json:"timeout_seconds"`
+	NetworkConfig  []byte `json:"network_config"`
+	// Array of {env_key, secret_id} the source had at capture; a fork re-binds by secret_id with fresh tokens.
+	SecretBindings []byte  `json:"secret_bindings"`
+	FcBuildSha     *string `json:"fc_build_sha"`
+	GuestKernel    *string `json:"guest_kernel"`
+	// Firecracker snapshot format version the memory image was written with; NULL for an fs snapshot.
+	SnapshotFormat *string            `json:"snapshot_format"`
+	CreatedAt      time.Time          `json:"created_at"`
+	ReadyAt        pgtype.Timestamptz `json:"ready_at"`
+	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+	// When the sweep next asks the host about a row creating or deleting; pushed out on every attempt, NULL once the host has confirmed.
+	SweepAfter       pgtype.Timestamptz `json:"sweep_after"`
+	RetentionEndedAt pgtype.Timestamptz `json:"retention_ended_at"`
+}
+
+type SandboxStorageBaseline struct {
+	ID             int64              `json:"id"`
+	SandboxID      uuid.UUID          `json:"sandbox_id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	HostID         string             `json:"host_id"`
+	Path           string             `json:"path"`
+	Generation     string             `json:"generation"`
+	AllocatedBytes int64              `json:"allocated_bytes"`
+	ObservedAt     time.Time          `json:"observed_at"`
+	StartedAt      time.Time          `json:"started_at"`
+	EndedAt        pgtype.Timestamptz `json:"ended_at"`
+	EffectiveAt    time.Time          `json:"effective_at"`
+	ReceiptID      uuid.UUID          `json:"receipt_id"`
 }
 
 type SandboxStorageInterval struct {
@@ -556,6 +1140,30 @@ type SandboxStorageInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+	HostID    *string            `json:"host_id"`
+}
+
+// Host-side reclaim still owed for a deleted sandbox; removed when the VM and its artifacts are gone.
+type SandboxTeardown struct {
+	SandboxID  uuid.UUID   `json:"sandbox_id"`
+	HostID     string      `json:"host_id"`
+	BasePath   *string     `json:"base_path"`
+	TemplateID pgtype.UUID `json:"template_id"`
+	CreatedAt  time.Time   `json:"created_at"`
+	// Until when the worker on this reclaim owns it; passed means no one is working on it.
+	LeaseUntil time.Time `json:"lease_until"`
+	// Not attempted again before this; the backoff after a failed attempt.
+	RetryAt   time.Time `json:"retry_at"`
+	Attempts  int32     `json:"attempts"`
+	Permanent bool      `json:"permanent"`
+	LastError *string   `json:"last_error"`
+}
+
+type SandboxTeardownHost struct {
+	HostID     string    `json:"host_id"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	Attempt    int32     `json:"attempt"`
+	LeaseUntil time.Time `json:"lease_until"`
 }
 
 type Secret struct {
@@ -586,6 +1194,84 @@ type Snapshot struct {
 	MemPath    *string   `json:"mem_path"`
 	Generation int64     `json:"generation"`
 	Name       *string   `json:"name"`
+	PauseToken *string   `json:"pause_token"`
+}
+
+type StripeActivationCreditRevocation struct {
+	TeamID           uuid.UUID          `json:"team_id"`
+	StripeCustomerID string             `json:"stripe_customer_id"`
+	RequestedAt      time.Time          `json:"requested_at"`
+	CompletedAt      pgtype.Timestamptz `json:"completed_at"`
+	StripeGrantID    *string            `json:"stripe_grant_id"`
+}
+
+type StripeCheckoutAssociationAlert struct {
+	EventID     string             `json:"event_id"`
+	LeaseUntil  pgtype.Timestamptz `json:"lease_until"`
+	NextCheckAt time.Time          `json:"next_check_at"`
+	LastAlertAt pgtype.Timestamptz `json:"last_alert_at"`
+	RetiredAt   pgtype.Timestamptz `json:"retired_at"`
+}
+
+type StripeCheckoutExpirationEvidence struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	StripeCustomerID   string    `json:"stripe_customer_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
+	CheckoutSessionID  string    `json:"checkout_session_id"`
+	ExpiredAt          time.Time `json:"expired_at"`
+}
+
+type StripeCheckoutGenerationAuthority struct {
+	TeamID                  uuid.UUID   `json:"team_id"`
+	CheckoutGeneration      time.Time   `json:"checkout_generation"`
+	UserID                  uuid.UUID   `json:"user_id"`
+	IdentityEvidenceVersion pgtype.UUID `json:"identity_evidence_version"`
+}
+
+type StripeCheckoutPublicationDecision struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
+	UserID             uuid.UUID `json:"user_id"`
+	OperationID        uuid.UUID `json:"operation_id"`
+	HomeRegion         string    `json:"home_region"`
+	RequestKey         string    `json:"request_key"`
+	Decision           string    `json:"decision"`
+}
+
+type StripeCheckoutPublicationSubscription struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	SubscriptionID     string    `json:"subscription_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
+}
+
+type StripePromotionMigrationFence struct {
+	TeamID   uuid.UUID `json:"team_id"`
+	FencedAt time.Time `json:"fenced_at"`
+}
+
+type StripePromotionOutcome struct {
+	EventID   string    `json:"event_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	Outcome   string    `json:"outcome"`
+	Reason    string    `json:"reason"`
+	DecidedAt time.Time `json:"decided_at"`
+}
+
+type StripeWebhookEvent struct {
+	EventID     string             `json:"event_id"`
+	EventType   string             `json:"event_type"`
+	Payload     []byte             `json:"payload"`
+	ReceivedAt  time.Time          `json:"received_at"`
+	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
+	LastError   *string            `json:"last_error"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+}
+
+type StripeWebhookProcessingLease struct {
+	CustomerID string    `json:"customer_id"`
+	Token      uuid.UUID `json:"token"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 type Team struct {
@@ -600,16 +1286,54 @@ type Team struct {
 	MaxTemplates         *int32    `json:"max_templates"`
 	MaxSandboxes         int32     `json:"max_sandboxes"`
 	// Frozen at the sharded-counter migration; read team_active_sandbox_counts instead.
-	ActiveSandboxCount    int32  `json:"active_sandbox_count"`
-	CredentialStoreKind   string `json:"credential_store_kind"`
-	CredentialStoreConfig []byte `json:"credential_store_config"`
-	UnmatchedHostPolicy   string `json:"unmatched_host_policy"`
-	HomeRegion            string `json:"home_region"`
+	ActiveSandboxCount     int32  `json:"active_sandbox_count"`
+	CredentialStoreKind    string `json:"credential_store_kind"`
+	CredentialStoreConfig  []byte `json:"credential_store_config"`
+	UnmatchedHostPolicy    string `json:"unmatched_host_policy"`
+	HomeRegion             string `json:"home_region"`
+	MaxSnapshots           int32  `json:"max_snapshots"`
+	MaxSnapshotsPerSandbox int32  `json:"max_snapshots_per_sandbox"`
+	MaxSnapshotsInFlight   int32  `json:"max_snapshots_in_flight"`
 }
 
 type TeamActiveSandboxCount struct {
 	TeamID             uuid.UUID `json:"team_id"`
 	ActiveSandboxCount int32     `json:"active_sandbox_count"`
+}
+
+type TeamBillingAccount struct {
+	TeamID                          uuid.UUID          `json:"team_id"`
+	StripeCustomerID                *string            `json:"stripe_customer_id"`
+	StripeSubscriptionID            *string            `json:"stripe_subscription_id"`
+	StripeSubscriptionStatus        *string            `json:"stripe_subscription_status"`
+	CurrentPeriodStart              pgtype.Timestamptz `json:"current_period_start"`
+	CurrentPeriodEnd                pgtype.Timestamptz `json:"current_period_end"`
+	CancelAtPeriodEnd               bool               `json:"cancel_at_period_end"`
+	CreatedAt                       time.Time          `json:"created_at"`
+	UpdatedAt                       time.Time          `json:"updated_at"`
+	StripeInvoiceStatus             *string            `json:"stripe_invoice_status"`
+	StripeSubscriptionEventAt       pgtype.Timestamptz `json:"stripe_subscription_event_at"`
+	TrialEndedAt                    pgtype.Timestamptz `json:"trial_ended_at"`
+	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
+	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
+	// Authoritative Superserve commercial billing start. May predate Stripe subscription creation and must not be overwritten by Checkout time.
+	CommercialBillingAnchor                  pgtype.Timestamptz `json:"commercial_billing_anchor"`
+	CheckoutInitializingAt                   pgtype.Timestamptz `json:"checkout_initializing_at"`
+	CheckoutAnchorSnapshot                   pgtype.Timestamptz `json:"checkout_anchor_snapshot"`
+	CheckoutSessionID                        *string            `json:"checkout_session_id"`
+	CheckoutSubscriptionID                   *string            `json:"checkout_subscription_id"`
+	CheckoutCompletedAt                      pgtype.Timestamptz `json:"checkout_completed_at"`
+	CheckoutRequestKey                       *string            `json:"checkout_request_key"`
+	CheckoutPendingAttemptIds                []uuid.UUID        `json:"checkout_pending_attempt_ids"`
+	CheckoutMayExist                         bool               `json:"checkout_may_exist"`
+	StripeActivationUserID                   pgtype.UUID        `json:"stripe_activation_user_id"`
+	StripeActivationCreditReservedAt         pgtype.Timestamptz `json:"stripe_activation_credit_reserved_at"`
+	StripeActivationCreditReservationEventID *string            `json:"stripe_activation_credit_reservation_event_id"`
+	StripeCheckoutActorID                    pgtype.UUID        `json:"stripe_checkout_actor_id"`
+	StripeCheckoutActorClaimedAt             pgtype.Timestamptz `json:"stripe_checkout_actor_claimed_at"`
+	StripeActivationIdentityKey              *string            `json:"stripe_activation_identity_key"`
+	StripeCheckoutIdentityEvidenceVersion    pgtype.UUID        `json:"stripe_checkout_identity_evidence_version"`
+	StripeActivationIdentityEvidenceVersion  pgtype.UUID        `json:"stripe_activation_identity_evidence_version"`
 }
 
 type TeamBillingPeriod struct {
@@ -650,6 +1374,17 @@ type TeamBillingUsageHourly struct {
 	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
 	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
 	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+type TeamCreationRequest struct {
+	ActorID   uuid.UUID          `json:"actor_id"`
+	Cell      string             `json:"cell"`
+	RequestID string             `json:"request_id"`
+	Name      string             `json:"name"`
+	Region    string             `json:"region"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	CreatedAt time.Time          `json:"created_at"`
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
 }
 
 type TeamCreditGrant struct {
@@ -710,10 +1445,75 @@ type TeamPricingPlan struct {
 	CreatedAt     time.Time          `json:"created_at"`
 }
 
+type TeamPromotionCreationAttempt struct {
+	AttemptID            uuid.UUID   `json:"attempt_id"`
+	TeamID               uuid.UUID   `json:"team_id"`
+	UserID               uuid.UUID   `json:"user_id"`
+	Name                 string      `json:"name"`
+	HomeRegion           string      `json:"home_region"`
+	AuthorityUnavailable bool        `json:"authority_unavailable"`
+	Outcome              *string     `json:"outcome"`
+	Reason               *string     `json:"reason"`
+	CreatedAt            time.Time   `json:"created_at"`
+	OperationID          pgtype.UUID `json:"operation_id"`
+}
+
 type TeamSandboxCounter struct {
 	TeamID uuid.UUID `json:"team_id"`
 	Shard  int16     `json:"shard"`
 	Cnt    int32     `json:"cnt"`
+}
+
+type TeamSignupPromotionOutcome struct {
+	TeamID      uuid.UUID `json:"team_id"`
+	UserID      uuid.UUID `json:"user_id"`
+	IdentityKey *string   `json:"identity_key"`
+	Outcome     string    `json:"outcome"`
+	Reason      string    `json:"reason"`
+	DecidedAt   time.Time `json:"decided_at"`
+}
+
+type TeamSignupTrialDenial struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type TeamSignupTrialProvenance struct {
+	TeamID         uuid.UUID          `json:"team_id"`
+	CreatorUserID  pgtype.UUID        `json:"creator_user_id"`
+	CreatorBoundAt pgtype.Timestamptz `json:"creator_bound_at"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	LegacyGrantID  pgtype.UUID        `json:"legacy_grant_id"`
+	CreatedAt      time.Time          `json:"created_at"`
+}
+
+type TeamStorageBillingActivation struct {
+	TeamID                 uuid.UUID `json:"team_id"`
+	EffectiveAt            time.Time `json:"effective_at"`
+	ApprovedCutoff         time.Time `json:"approved_cutoff"`
+	VerifiedSubscriptionID *string   `json:"verified_subscription_id"`
+	VerifiedPriceID        *string   `json:"verified_price_id"`
+	CreatedAt              time.Time `json:"created_at"`
+}
+
+type TeamTrialEligibilityCache struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	Eligible  bool      `json:"eligible"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type TeamTrialRunway struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	LifecycleKey string    `json:"lifecycle_key"`
+	State        string    `json:"state"`
+	ObservedAt   time.Time `json:"observed_at"`
+}
+
+type TelemetrySamplerLease struct {
+	Name        string    `json:"name"`
+	LockedBy    string    `json:"locked_by"`
+	LockedUntil time.Time `json:"locked_until"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Template struct {
@@ -753,6 +1553,92 @@ type TemplateBuild struct {
 	UpdatedAt     time.Time           `json:"updated_at"`
 }
 
+type TemplateBuildAttempt struct {
+	ID               uuid.UUID          `json:"id"`
+	BuildID          uuid.UUID          `json:"build_id"`
+	HostID           string             `json:"host_id"`
+	IncarnationID    uuid.UUID          `json:"incarnation_id"`
+	VmID             string             `json:"vm_id"`
+	State            string             `json:"state"`
+	ClaimedAt        time.Time          `json:"claimed_at"`
+	AdmittedAt       pgtype.Timestamptz `json:"admitted_at"`
+	Reason           string             `json:"reason"`
+	CleanupCheckedAt pgtype.Timestamptz `json:"cleanup_checked_at"`
+	CleanupPending   bool               `json:"cleanup_pending"`
+}
+
+type TemplateBuildExecution struct {
+	BuildID            uuid.UUID          `json:"build_id"`
+	Revision           int64              `json:"revision"`
+	Cell               *string            `json:"cell"`
+	CurrentAttempt     pgtype.UUID        `json:"current_attempt"`
+	FirstStartedAt     pgtype.Timestamptz `json:"first_started_at"`
+	ReconcileCheckedAt pgtype.Timestamptz `json:"reconcile_checked_at"`
+	Reason             string             `json:"reason"`
+}
+
+type TemplateBuildIdentity struct {
+	BuildID    uuid.UUID `json:"build_id"`
+	TemplateID uuid.UUID `json:"template_id"`
+	InputKey   string    `json:"input_key"`
+}
+
+type TemplateBuildInput struct {
+	BuildID   uuid.UUID `json:"build_id"`
+	BuildSpec []byte    `json:"build_spec"`
+	Vcpu      int32     `json:"vcpu"`
+	MemoryMib int32     `json:"memory_mib"`
+	DiskMib   int32     `json:"disk_mib"`
+}
+
+type TemplateBuildPublication struct {
+	BuildID        uuid.UUID          `json:"build_id"`
+	AttemptID      uuid.UUID          `json:"attempt_id"`
+	TemplateID     uuid.UUID          `json:"template_id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	Cell           string             `json:"cell"`
+	Revision       int64              `json:"revision"`
+	Bucket         string             `json:"bucket"`
+	Generation     string             `json:"generation"`
+	ManifestObject string             `json:"manifest_object"`
+	Files          []byte             `json:"files"`
+	Runtime        []byte             `json:"runtime"`
+	VerifiedAt     time.Time          `json:"verified_at"`
+	AcceptedAt     pgtype.Timestamptz `json:"accepted_at"`
+}
+
+type TrialCreditWarningDelivery struct {
+	TeamID       uuid.UUID          `json:"team_id"`
+	Recipient    string             `json:"recipient"`
+	SentAt       pgtype.Timestamptz `json:"sent_at"`
+	RejectedAt   pgtype.Timestamptz `json:"rejected_at"`
+	LifecycleKey string             `json:"lifecycle_key"`
+}
+
+type TrialCreditWarningState struct {
+	TeamID       uuid.UUID          `json:"team_id"`
+	Status       string             `json:"status"`
+	ClaimToken   pgtype.UUID        `json:"claim_token"`
+	ClaimedAt    pgtype.Timestamptz `json:"claimed_at"`
+	SentAt       pgtype.Timestamptz `json:"sent_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	LifecycleKey string             `json:"lifecycle_key"`
+}
+
+type UserPromotionEntitlement struct {
+	UserID                         uuid.UUID          `json:"user_id"`
+	SignupTrialClaimedAt           pgtype.Timestamptz `json:"signup_trial_claimed_at"`
+	SignupTrialTeamID              pgtype.UUID        `json:"signup_trial_team_id"`
+	StripeRedemptionAt             pgtype.Timestamptz `json:"stripe_redemption_at"`
+	StripeRedemptionTeamID         pgtype.UUID        `json:"stripe_redemption_team_id"`
+	StripeRedemptionReservedTeamID pgtype.UUID        `json:"stripe_redemption_reserved_team_id"`
+	StripeRedemptionReservedAt     pgtype.Timestamptz `json:"stripe_redemption_reserved_at"`
+	StripeRedemptionAttemptedAt    pgtype.Timestamptz `json:"stripe_redemption_attempted_at"`
+	CreatedAt                      time.Time          `json:"created_at"`
+	UpdatedAt                      time.Time          `json:"updated_at"`
+	StripeDeviceFingerprint        *string            `json:"stripe_device_fingerprint"`
+}
+
 type UserRoleAssignment struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`
@@ -764,4 +1650,11 @@ type UserRoleAssignment struct {
 	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
 	CreatedAt time.Time          `json:"created_at"`
 	UpdatedAt time.Time          `json:"updated_at"`
+}
+
+type UserSignupTrialClaim struct {
+	UserID    uuid.UUID   `json:"user_id"`
+	ClaimedAt time.Time   `json:"claimed_at"`
+	TeamID    pgtype.UUID `json:"team_id"`
+	CreatedAt time.Time   `json:"created_at"`
 }

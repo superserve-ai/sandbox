@@ -15,6 +15,7 @@ import (
 
 // GRPCAdapter wraps a Manager to implement vmdpb.VMDaemonServer.
 type GRPCAdapter struct {
+	buildAdmission BuildAdmission
 	vmdpb.UnimplementedVMDaemonServer
 	mgr             *Manager
 	secrets         *SecretsBrokerClient
@@ -46,25 +47,30 @@ func (a *GRPCAdapter) DestroyVM(ctx context.Context, req *vmdpb.DestroyVMRequest
 }
 
 func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*vmdpb.PauseVMResponse, error) {
-	snapshotPath, memPath, manifest, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir())
+	snapshotPath, memPath, manifest, err := a.mgr.PauseVM(ctx, req.GetVmId(), req.GetSnapshotDir(), req.GetPauseToken())
 	if err != nil {
 		return nil, err
 	}
 	entries := make([]*vmdpb.ArtifactManifestEntry, 0, len(manifest))
 	for _, e := range manifest {
-		entries = append(entries, &vmdpb.ArtifactManifestEntry{
-			FileName:  e.FileName,
-			Path:      e.Path,
-			SizeBytes: e.SizeBytes,
-			Sha256:    e.SHA256,
-			BasePath:  e.BasePath,
-		})
+		entry := &vmdpb.ArtifactManifestEntry{
+			FileName:       e.FileName,
+			Path:           e.Path,
+			SizeBytes:      e.SizeBytes,
+			Sha256:         e.SHA256,
+			BasePath:       e.BasePath,
+			AllocatedBytes: e.AllocatedBytes,
+		}
+		entries = append(entries, entry)
 	}
 	return &vmdpb.PauseVMResponse{
 		VmId:         req.GetVmId(),
 		SnapshotPath: snapshotPath,
 		MemFilePath:  memPath,
 		Manifest:     entries,
+		// Echo: this daemon threaded the token into the backup pipeline,
+		// so the caller may store it and require it of reports.
+		PauseToken: req.GetPauseToken(),
 	}, nil
 }
 
@@ -79,7 +85,68 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	}
 	defer unlockOp()
 
-	inst, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath())
+	var resumeNetworkRules *sandboxNetworkRules
+	if netCfg := req.GetSandboxNetwork(); netCfg != nil {
+		egress := netCfg.GetEgress()
+		if egress != nil {
+			resumeNetworkRules = &sandboxNetworkRules{
+				allowedCIDRs:   egress.GetAllowedCidrs(),
+				deniedCIDRs:    egress.GetDeniedCidrs(),
+				allowedDomains: egress.GetAllowedDomains(),
+			}
+		}
+	}
+	// The preview policy rides the request (see vmd.proto). Stamped before the
+	// guest runs, through the same monotonic check a policy push takes, so a
+	// revision behind the record leaves the newer policy in place.
+	previewAccess := req.GetPreviewAccess()
+	if previewAccess != "" {
+		if previewAccess != preview.AccessLegacyPublic && previewAccess != preview.AccessPublic && previewAccess != preview.AccessPrivate {
+			return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, %q, %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, preview.AccessPrivate, previewAccess)
+		}
+		previewPorts, perr := previewPortsFromProto(req.GetPreviewPorts())
+		if perr != nil {
+			return nil, perr
+		}
+		if previewPortsContainTokenizedAccess(previewPorts) && req.GetPreviewPolicyRevision() <= 0 {
+			return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
+		}
+		if err := a.mgr.UpdateSandboxPreviewPolicy(req.GetVmId(), previewAccess, previewPorts, req.GetPreviewPolicyRevision()); err != nil {
+			if status.Code(err) != codes.FailedPrecondition {
+				return nil, err
+			}
+			// Same revision, different content: the record keeps what it
+			// enforces at that revision, as a restore would. Not fatal, since
+			// a resume refused here would be refused the same way on every
+			// retry; the attestation reports the record's revision.
+			a.mgr.log.Warn().Err(err).Str("vm_id", req.GetVmId()).
+				Msg("resume: preview policy differs from the record's at the same revision; keeping the record's")
+		}
+	}
+
+	var inst *VMInstance
+	var rulesApplied bool
+	// A VM this host already booted from a backup is recognized from its
+	// record alone; only starting a new fetch depends on the switch.
+	revived, needsGeneration := a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration())
+	switch {
+	case needsGeneration:
+		return nil, pauseArtifactsMissingErr(req.GetVmId())
+	case revived != nil:
+		// Rules live in this process; after a restart the adopted VM has
+		// none until they are applied again.
+		inst, rulesApplied = revived, a.mgr.applyAdoptedNetworkRules(req.GetVmId(), resumeNetworkRules)
+	case !a.mgr.BackupRestoreEnabled():
+		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	case a.mgr.pauseArtifactsMissing(req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath()):
+		if req.GetBackupGeneration() == "" {
+			return nil, pauseArtifactsMissingErr(req.GetVmId())
+		}
+		inst, err = a.mgr.resumeFromBackupLocked(ctx, req.GetVmId(), req.GetBackupGeneration(), resumeNetworkRules)
+		rulesApplied = resumeNetworkRules != nil
+	default:
+		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +173,10 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
-	return &vmdpb.ResumeVMResponse{
+	inst.mu.RLock()
+	coldBoot := inst.BackupGeneration != ""
+	inst.mu.RUnlock()
+	resp := &vmdpb.ResumeVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
 		IpAddress:  inst.IP,
@@ -115,7 +185,18 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			VcpuCount: inst.Config.VCPU,
 			MemoryMib: inst.Config.MemoryMiB,
 		},
-	}, nil
+		NetworkRulesApplied: rulesApplied,
+		ColdBoot:            coldBoot,
+	}
+	if previewAccess != "" {
+		// Attests the request's policy fields were applied, and which
+		// revision the record holds now (see vmd.proto).
+		resp.PreviewProtocol = preview.HostCapabilityPorts
+		inst.mu.RLock()
+		resp.PreviewPolicyRevision = inst.PreviewPolicyRevision
+		inst.mu.RUnlock()
+	}
+	return resp, nil
 }
 
 func (a *GRPCAdapter) CreateSnapshot(ctx context.Context, req *vmdpb.CreateSnapshotRequest) (*vmdpb.CreateSnapshotResponse, error) {
@@ -142,6 +223,14 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	}
 	vmCfg.BasePath = req.GetBasePath()
 	vmCfg.DeltaDir = req.GetDeltaDir()
+	vmCfg.SavedSnapshotID = req.GetSavedSnapshotId()
+	if egress := req.GetSandboxNetwork().GetEgress(); egress != nil {
+		vmCfg.EgressRules = &sandboxNetworkRules{
+			allowedCIDRs:   egress.GetAllowedCidrs(),
+			deniedCIDRs:    egress.GetDeniedCidrs(),
+			allowedDomains: egress.GetAllowedDomains(),
+		}
+	}
 
 	var netCfg *network.Config
 	if nc := req.GetNetworkConfig(); nc != nil {
@@ -164,10 +253,21 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
 	}
 
-	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
+	var inst *VMInstance
+	id := vmCfg.SavedSnapshotID
+	// The ordinary restore finds a missing snapshot as it reads it; only a
+	// retry naming the backup comes here.
+	if id != "" && req.GetBackupGeneration() != "" {
+		inst, err = a.mgr.forkFromBackup(ctx, req.GetVmId(), req.GetBackupGeneration(), vmCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
+	} else {
+		inst, err = a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
+	}
 	if err != nil {
 		return nil, err
 	}
+	// A restore that succeeds has its rules in place: installed before the
+	// launch, or again on a VM it adopted.
+	rulesApplied := vmCfg.EgressRules != nil
 
 	// Env vars are pushed in a separate InjectSandboxEnv call so the control
 	// plane can mint a JWT against the now-known source IP before injection.
@@ -181,7 +281,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 			MemoryMib: inst.Config.MemoryMiB,
 		},
 		// Attests the request's policy fields were applied (see vmd.proto).
-		PreviewProtocol: preview.HostCapabilityPorts,
+		PreviewProtocol:     preview.HostCapabilityPorts,
+		NetworkRulesApplied: rulesApplied,
 	}, nil
 }
 
@@ -250,6 +351,35 @@ func (a *GRPCAdapter) DeleteSnapshot(ctx context.Context, req *vmdpb.DeleteSnaps
 	return &vmdpb.DeleteSnapshotResponse{Deleted: true}, nil
 }
 
+func (a *GRPCAdapter) CreateSavedSnapshot(ctx context.Context, req *vmdpb.CreateSavedSnapshotRequest) (*vmdpb.CreateSavedSnapshotResponse, error) {
+	man, err := a.mgr.CreateSavedSnapshot(ctx, req.GetVmId(), req.GetSnapshotId(), SavedSnapshotKind(req.GetKind()))
+	if err != nil {
+		return nil, err
+	}
+	return &vmdpb.CreateSavedSnapshotResponse{
+		SnapshotId:        man.SnapshotID,
+		Kind:              string(man.Kind),
+		BasePath:          man.BasePath,
+		DiskPath:          man.DiskPath,
+		SnapshotPath:      man.SnapshotPath,
+		MemPath:           man.MemPath,
+		BaseMemPath:       man.BaseMemPath,
+		VcpuCount:         man.VCPU,
+		MemoryMib:         man.MemoryMiB,
+		DiskSizeMib:       man.DiskSizeMiB,
+		SizeBytes:         man.SizeBytes,
+		FirecrackerSha256: man.FirecrackerSHA256,
+		CreatedAtUnix:     man.CreatedAt.Unix(),
+	}, nil
+}
+
+func (a *GRPCAdapter) DeleteSavedSnapshot(ctx context.Context, req *vmdpb.DeleteSavedSnapshotRequest) (*vmdpb.DeleteSavedSnapshotResponse, error) {
+	if err := a.mgr.DeleteSavedSnapshot(ctx, req.GetSnapshotId()); err != nil {
+		return nil, err
+	}
+	return &vmdpb.DeleteSavedSnapshotResponse{Deleted: true}, nil
+}
+
 // DeleteSandboxSnapshots removes a sandbox's entire snapshot directory.
 // Idempotent; scoped to <SnapshotDir>/<vm_id>/ at the Manager layer.
 func (a *GRPCAdapter) DeleteSandboxSnapshots(ctx context.Context, req *vmdpb.DeleteSandboxSnapshotsRequest) (*vmdpb.DeleteSandboxSnapshotsResponse, error) {
@@ -315,11 +445,19 @@ func (a *GRPCAdapter) ListDir(ctx context.Context, req *vmdpb.ListDirRequest) (*
 
 // DeleteBuildArtifacts removes a single build's subdir under a template.
 func (a *GRPCAdapter) DeleteBuildArtifacts(ctx context.Context, req *vmdpb.DeleteBuildArtifactsRequest) (*vmdpb.DeleteBuildArtifactsResponse, error) {
+	if err := a.checkBuildIncarnation(ctx); err != nil {
+		return nil, err
+	}
 	tplID := req.GetTemplateId()
 	buildID := req.GetBuildId()
 	if tplID == "" || buildID == "" {
 		return nil, status.Error(codes.InvalidArgument, "template_id and build_id must be set")
 	}
+	unlock, err := a.mgr.lockVMOp(ctx, buildID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if err := a.mgr.DeleteBuildArtifacts(tplID, buildID); err != nil {
 		return nil, err
 	}
@@ -394,22 +532,13 @@ func (a *GRPCAdapter) UpdateSandboxNetwork(ctx context.Context, req *vmdpb.Updat
 		return nil, err
 	}
 
-	// Update nftables rules (non-TCP traffic).
-	if err := a.mgr.netMgr.UpdateFirewallRules(vmID, egress.GetAllowedCidrs(), egress.GetDeniedCidrs()); err != nil {
-		return nil, status.Errorf(codes.Internal, "update firewall rules: %v", err)
-	}
-
-	// Update egress proxy rules (TCP traffic — domain + CIDR filtering).
-	if a.mgr.egressProxy != nil {
-		netInfo := a.mgr.netMgr.GetVMNetInfo(vmID)
-		if netInfo != nil {
-			a.mgr.egressProxy.SetRules(netInfo.HostIP, &network.EgressRules{
-				AllowedCIDRs:   egress.GetAllowedCidrs(),
-				DeniedCIDRs:    egress.GetDeniedCidrs(),
-				AllowedDomains: egress.GetAllowedDomains(),
-				SandboxID:      vmID,
-			})
-		}
+	netInfo := a.mgr.netMgr.GetVMNetInfo(vmID)
+	if err := a.mgr.applySandboxNetworkRules(vmID, netInfo, &sandboxNetworkRules{
+		allowedCIDRs:   egress.GetAllowedCidrs(),
+		deniedCIDRs:    egress.GetDeniedCidrs(),
+		allowedDomains: egress.GetAllowedDomains(),
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 
 	return &vmdpb.UpdateSandboxNetworkResponse{VmId: vmID}, nil
@@ -518,6 +647,20 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		return nil, status.Error(codes.InvalidArgument, "from is required")
 	}
 
+	unlock, err := a.mgr.lockVMOp(ctx, req.GetBuildVmId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	admit, err := a.buildAdmissionCallback(ctx, req.GetBuildVmId())
+	if err != nil {
+		return nil, err
+	}
+	if admit != nil {
+		if _, exists := a.mgr.GetBuildStatus(req.GetBuildVmId()); exists {
+			return &vmdpb.BuildTemplateResponse{BuildVmId: req.GetBuildVmId()}, nil
+		}
+	}
 	spec := builder.BuildSpec{
 		From:     req.GetFrom(),
 		StartCmd: req.GetStartCmd(),
@@ -533,6 +676,7 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 
 	buildVMID, err := a.mgr.BuildTemplate(ctx, BuildTemplateRequest{
 		TemplateID: req.GetTemplateId(),
+		admit:      admit,
 		Spec:       spec,
 		VCPU:       req.GetVcpu(),
 		MemoryMiB:  req.GetMemoryMib(),
@@ -540,6 +684,9 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		BuildVMID:  req.GetBuildVmId(),
 	})
 	if err != nil {
+		if status.Code(err) != codes.Unknown {
+			return nil, err
+		}
 		return nil, status.Errorf(codes.Internal, "build template: %v", err)
 	}
 
@@ -547,6 +694,9 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 }
 
 func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildStatusRequest) (*vmdpb.GetBuildStatusResponse, error) {
+	if err := a.checkBuildIncarnation(ctx); err != nil {
+		return nil, err
+	}
 	if req.GetBuildVmId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "build_vm_id is required")
 	}
@@ -570,16 +720,33 @@ func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildSta
 		resp.DeltaPath = snap.Result.DeltaPath
 		resp.ResolvedDigest = snap.Result.ResolvedDigest
 		resp.SizeBytes = snap.Result.SizeBytes
+		resp.AllocatedBytesSupported = true
+		resp.RootfsAllocatedBytes = snap.Result.RootfsAllocatedBytes
+		resp.BaseAllocatedBytes = snap.Result.BaseAllocatedBytes
+		resp.DeltaAllocatedBytes = snap.Result.DeltaAllocatedBytes
 	}
 	return resp, nil
 }
 
 func (a *GRPCAdapter) CancelBuild(ctx context.Context, req *vmdpb.CancelBuildRequest) (*vmdpb.CancelBuildResponse, error) {
+	if err := a.checkBuildIncarnation(ctx); err != nil {
+		return nil, err
+	}
 	if req.GetBuildVmId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "build_vm_id is required")
 	}
+	unlock, err := a.mgr.lockVMOp(ctx, req.GetBuildVmId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if err := a.mgr.CancelBuild(ctx, req.GetBuildVmId()); err != nil {
 		return nil, status.Errorf(codes.Internal, "cancel build: %v", err)
+	}
+	if a.buildAdmission.IncarnationID != "" {
+		if err := a.mgr.waitBuildStopped(ctx, req.GetBuildVmId()); err != nil {
+			return nil, err
+		}
 	}
 	return &vmdpb.CancelBuildResponse{}, nil
 }
@@ -590,6 +757,9 @@ func (a *GRPCAdapter) CancelBuild(ctx context.Context, req *vmdpb.CancelBuildReq
 // Returns NotFound when the build is unknown — the client maps that to a
 // 404 on its SSE endpoint.
 func (a *GRPCAdapter) StreamBuildLogs(req *vmdpb.StreamBuildLogsRequest, stream vmdpb.VMDaemon_StreamBuildLogsServer) error {
+	if err := a.checkBuildIncarnation(stream.Context()); err != nil {
+		return err
+	}
 	if req.GetBuildVmId() == "" {
 		return status.Error(codes.InvalidArgument, "build_vm_id is required")
 	}
@@ -611,6 +781,7 @@ func (a *GRPCAdapter) StreamBuildLogs(req *vmdpb.StreamBuildLogsRequest, stream 
 				return nil
 			}
 			pbEv := &vmdpb.BuildLogEvent{
+				Sequence:           ev.Sequence,
 				TimestampUnix:      ev.Timestamp.Unix(),
 				TimestampUnixNanos: ev.Timestamp.UnixNano(),
 				Stream:             string(ev.Stream),
@@ -673,4 +844,44 @@ func vmStatusToProto(s VMStatus) vmdpb.VMStatus {
 	default:
 		return vmdpb.VMStatus_VM_STATUS_UNSPECIFIED
 	}
+}
+
+// ReviveVM cold-boots a dead sandbox from a salvaged copy of its own
+// disk; see Manager.ReviveVM for the liveness and residue semantics.
+func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) (*vmdpb.ReviveVMResponse, error) {
+	var rules *sandboxNetworkRules
+	if len(req.GetAllowedCidrs()) > 0 || len(req.GetDeniedCidrs()) > 0 || len(req.GetAllowedDomains()) > 0 {
+		rules = &sandboxNetworkRules{
+			allowedCIDRs:   req.GetAllowedCidrs(),
+			deniedCIDRs:    req.GetDeniedCidrs(),
+			allowedDomains: req.GetAllowedDomains(),
+		}
+	}
+	inst, err := a.mgr.ReviveVM(ctx, req.GetVmId(), req.GetDiskPath(), req.GetBasePath(), req.GetBlockMapPath(), req.GetStandaloneDisk(), req.GetAllowRecordless(), req.GetTeamId(), req.GetOwnerId(), req.GetVcpu(), req.GetMemMib(), rules)
+	if err != nil {
+		return nil, err
+	}
+	inst.mu.RLock()
+	diskPath, hostIP := inst.DiskPath, inst.IP
+	inst.mu.RUnlock()
+	// A cold boot starts boxd with an empty context: unlike snapshot
+	// resume, no in-memory init state survives, so env and secret
+	// bindings re-inject here when the caller supplied them, reusing the
+	// standalone injection path verbatim (lock, proxy gate, retries).
+	// Empty config leaves re-injection to the caller before activation.
+	if len(req.GetEnvVars()) > 0 || req.GetSecretsJwt() != "" {
+		if _, err := a.InjectSandboxEnv(ctx, &vmdpb.InjectSandboxEnvRequest{
+			VmId:       req.GetVmId(),
+			EnvVars:    req.GetEnvVars(),
+			SecretsJwt: req.GetSecretsJwt(),
+		}); err != nil {
+			// The boot succeeded; the config did not land. Fail the RPC
+			// so the operator retries injection rather than activating a
+			// sandbox missing its env, but leave the VM up: re-running
+			// revive is guarded off by the liveness probe, and the
+			// standalone InjectSandboxEnv RPC is the retry path.
+			return nil, status.Errorf(codes.Internal, "revived but configuration injection failed; retry via InjectSandboxEnv: %v", err)
+		}
+	}
+	return &vmdpb.ReviveVMResponse{DiskPath: diskPath, HostIp: hostIP}, nil
 }

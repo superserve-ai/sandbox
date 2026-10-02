@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -17,6 +18,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -354,12 +358,130 @@ func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/preview-ports", strings.NewReader(`{"port":3000}`))
 	setupPreviewRouter(h, teamID.String()).ServeHTTP(w, req)
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
 	}
 	if mutated || vmdCalled {
 		t.Fatalf("incapable host reached mutation=%v vmd=%v", mutated, vmdCalled)
+	}
+}
+
+func TestRequireHostPreviewCapabilitiesDiagnosticFailurePreservesConflict(t *testing.T) {
+	var diagnosticCalls int
+	var logOutput bytes.Buffer
+	oldLogger := log.Logger
+	log.Logger = zerolog.New(&logOutput).Level(zerolog.DebugLevel)
+	defer func() { log.Logger = oldLogger }()
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "HostHasCapabilitiesUnlocked") {
+				return scalarBoolRow(false)
+			}
+			return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "GetHostCapabilityDiagnostics") {
+				diagnosticCalls++
+				return nil, fmt.Errorf("diagnostic read unavailable")
+			}
+			return nil, fmt.Errorf("unexpected Query: %s", sql)
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/sandboxes/example/preview-ports", nil)
+
+	if h.requireHostPreviewCapabilities(c, "example-host", preview.HostCapabilityPorts) {
+		t.Fatal("capability rejection unexpectedly succeeded")
+	}
+	h.WaitAsyncBookkeeping()
+	assertPreviewCapabilityConflictResponse(t, w)
+	if diagnosticCalls != 1 {
+		t.Fatalf("diagnostic query calls=%d, want 1", diagnosticCalls)
+	}
+	if !strings.Contains(logOutput.String(), `"host_id":"example-host"`) ||
+		!strings.Contains(logOutput.String(), `"required_capabilities":["preview_ports_v1"]`) {
+		t.Fatalf("diagnostic failure log=%s, want host and required capabilities", logOutput.String())
+	}
+}
+
+func TestRequireHostPreviewCapabilitiesLogsDiagnosticSnapshot(t *testing.T) {
+	var diagnosticCalls int
+	var logOutput bytes.Buffer
+	oldLogger := log.Logger
+	log.Logger = zerolog.New(&logOutput).Level(zerolog.DebugLevel)
+	defer func() { log.Logger = oldLogger }()
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "HostHasCapabilitiesUnlocked") {
+				return scalarBoolRow(false)
+			}
+			return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "GetHostCapabilityDiagnostics") {
+				diagnosticCalls++
+				capability := "preview_ports_v1"
+				matched := true
+				heartbeatAt := pgtype.Timestamptz{Time: time.Date(2026, 8, 19, 12, 34, 56, 0, time.UTC), Valid: true}
+				return &scanRows{rows: []func(dest ...any) error{func(dest ...any) error {
+					*dest[0].(*pgtype.Timestamptz) = heartbeatAt
+					*dest[1].(*string) = "active"
+					*dest[2].(**bool) = &matched
+					*dest[3].(**string) = &capability
+					*dest[4].(*pgtype.Timestamptz) = heartbeatAt
+					return nil
+				}}}, nil
+			}
+			return nil, fmt.Errorf("unexpected Query: %s", sql)
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "sandbox_id", Value: "example-sandbox"}}
+	c.Request = httptest.NewRequest(http.MethodGet, "/sandboxes/example-sandbox/preview-ports", nil)
+
+	if h.requireHostPreviewCapabilities(c, "example-host", preview.HostCapabilityPorts) {
+		t.Fatal("capability rejection unexpectedly succeeded")
+	}
+	h.WaitAsyncBookkeeping()
+	assertPreviewCapabilityConflictResponse(t, w)
+	if diagnosticCalls != 1 {
+		t.Fatalf("diagnostic query calls=%d, want 1", diagnosticCalls)
+	}
+	if !strings.Contains(logOutput.String(), `"message":"preview capability enforcement rejected request"`) ||
+		!strings.Contains(logOutput.String(), `"host_capabilities":[{"capability":"preview_ports_v1"`) ||
+		!strings.Contains(logOutput.String(), `"heartbeat_at":"2026-08-19T12:34:56Z"`) ||
+		!strings.Contains(logOutput.String(), `"last_heartbeat_at":"2026-08-19T12:34:56Z"`) ||
+		!strings.Contains(logOutput.String(), `"sandbox_id":"example-sandbox"`) {
+		t.Fatalf("diagnostic snapshot log=%s, want rejection fields", logOutput.String())
+	}
+}
+
+func assertPreviewCapabilityConflictResponse(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	var response struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, w.Body.String())
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status=%d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	if response.Error.Code != "conflict" {
+		t.Fatalf("error.code=%q, want %q; body=%s", response.Error.Code, "conflict", w.Body.String())
+	}
+	wantMessage := "The sandbox's host does not enforce all required capabilities (preview_ports_v1); retry after the fleet is upgraded"
+	if response.Error.Message != wantMessage {
+		t.Fatalf("error.message=%q, want %q", response.Error.Message, wantMessage)
 	}
 }
 
@@ -398,6 +520,9 @@ func TestPublishPrivatePreviewPathsRequireBrowserCapabilityBeforeMutation(t *tes
 				queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 					if strings.Contains(sql, "-- name: ListPublishedPorts :many") {
 						return previewPortPolicyRows(tt.existingRows...), nil
+					}
+					if strings.Contains(sql, "-- name: GetHostCapabilityDiagnostics :many") {
+						return emptyRows{}, nil
 					}
 					mutated = true
 					return nil, fmt.Errorf("unexpected mutation Query: %s", sql)

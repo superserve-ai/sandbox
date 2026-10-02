@@ -10,15 +10,15 @@
 -- can observe a new sandbox through the rolling-deploy legacy fallback, and
 -- quota admission remains statement-sized.
 WITH ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, false)
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, sqlc.arg(preview_access)::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.* FROM ins
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxFromTemplate :one
@@ -33,15 +33,15 @@ WITH tpl AS (
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, sqlc.arg(preview_access)::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.* FROM ins
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxWithSecrets :one
@@ -51,8 +51,8 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- concurrent quota checks until it commits, and a multi-statement transaction
 -- would stretch that window across client round trips.
 WITH ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-  VALUES (@id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, @template_id, @snapshot_path, @mem_path, @base_path, @delta_path, @auto_delete_seconds)
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
+  VALUES (@id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, @template_id, @snapshot_path, @mem_path, @base_path, @delta_path, @auto_delete_seconds, true)
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -63,7 +63,7 @@ WITH ins AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.* FROM ins
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxFromTemplateWithSecrets :one
@@ -78,8 +78,8 @@ WITH tpl AS (
     AND (t.team_id = @team_id OR t.team_id = @system_team_id)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
+  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds, true FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -90,8 +90,42 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at
 FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
+
+-- name: CreateSandboxFromSnapshot :one
+-- The sandbox created from a saved snapshot: shape, artifact paths and
+-- template pin are the snapshot's, read here so the row never disagrees
+-- with the image it boots. The bindings are the snapshot's re-bound plus the
+-- request's, as arrays that may be empty. Returns 0 rows if the snapshot is
+-- not ready, deleted, or not the caller's. The egress rules are written with
+-- the row: the fork's guest runs under them from its first instruction, and
+-- a resume reapplies what the row says. The snapshot is held shared until
+-- the new row commits, so a delete lands before it or after, and never
+-- while nothing visible references the build both share; forks of one
+-- snapshot share the lock.
+WITH src AS (
+  SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.vcpu_count, s.memory_mib, s.disk_mib,
+         s.base_path, s.snapshot_path, s.mem_path
+  FROM sandbox_snapshot s
+  WHERE s.id = @snapshot_id AND s.team_id = @team_id
+    AND s.status = 'ready' AND s.deleted_at IS NULL
+  FOR SHARE
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config)
+  SELECT @id, @team_id, @name, @status, vcpu_count, memory_mib, host_id, @timeout_seconds, @metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, @auto_delete_seconds, cardinality(@secret_ids::uuid[]) > 0, source_snapshot_id, sqlc.narg('network_config')::jsonb FROM src
+  RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, @preview_access::text, 0 FROM ins
+  RETURNING sandbox_id
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
+  FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
+)
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: GetSandbox :one
@@ -99,19 +133,77 @@ SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
 -- name: CountActiveSandboxesAtBasePath :one
--- Count of non-destroyed sandboxes still referencing this base_path. Used at
--- destroy time to decide whether the per-build artifact dir is safe to GC.
-SELECT COUNT(*)::bigint FROM sandbox
-WHERE base_path = $1 AND destroyed_at IS NULL;
+-- Count of non-destroyed sandboxes and live snapshots still referencing this
+-- base_path. Used at destroy time to decide whether the per-build artifact
+-- dir is safe to GC.
+SELECT (
+  (SELECT COUNT(*)::bigint FROM sandbox
+   WHERE sandbox.base_path = $1 AND sandbox.destroyed_at IS NULL)
+  + (SELECT COUNT(*)::bigint FROM sandbox_snapshot
+     WHERE sandbox_snapshot.base_path = $1
+       AND sandbox_snapshot.deleted_at IS NULL
+       AND sandbox_snapshot.status IN ('creating', 'ready'))
+)::bigint;
 
 -- name: ListPinnedBuildPaths :many
 -- Reconciler input: distinct base_path values held by non-destroyed
--- sandboxes. Their builds must survive even if the template moved on.
-SELECT DISTINCT base_path FROM sandbox
-WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
+-- sandboxes and live snapshots. Their builds must survive even if the
+-- template moved on.
+SELECT DISTINCT sandbox.base_path FROM sandbox
+WHERE sandbox.base_path IS NOT NULL AND sandbox.destroyed_at IS NULL
+UNION
+SELECT sandbox_snapshot.base_path FROM sandbox_snapshot
+WHERE sandbox_snapshot.deleted_at IS NULL AND sandbox_snapshot.status IN ('creating', 'ready');
+
+-- Static created_at variants of ListSandboxesByTeamPaged. The plain ORDER BY
+-- lets the planner walk idx_sandbox_team_created_active (forward for DESC,
+-- backward for ASC) and stop at LIMIT, where the guarded-CASE ORDER BY in
+-- ListSandboxesByTeamPaged is opaque to it and forces a sort of the entire
+-- filtered set on every call. created_at is the default sort and the only one
+-- unpaginated SDK/MCP callers ever use, so these two cover the hot path;
+-- name/status sorts stay on the flexible query below. Filters and pagination
+-- are identical to the flexible query, including the NULL @row_limit "return
+-- everything" contract.
+--
+-- All three carry the effective preview access, so the list decorates its page
+-- from one round trip. The join is 1:1 on sandbox_preview_policy's primary key,
+-- so it cannot multiply rows and leaves the LIMIT pushdown intact.
+
+-- name: ListSandboxesByTeamCreatedDesc :many
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY s.created_at DESC
+LIMIT sqlc.narg('row_limit')::bigint
+OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
+
+-- name: ListSandboxesByTeamCreatedAsc :many
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY s.created_at ASC
+LIMIT sqlc.narg('row_limit')::bigint
+OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
 -- name: ListSandboxesByTeamPaged :many
--- Paginated, sortable, filterable team sandbox list backing the console.
+-- Paginated, sortable, filterable team sandbox list backing the console. Only
+-- serves the non-default sorts (name/status); the default created_at sort is
+-- handled by the static ListSandboxesByTeamCreated{Desc,Asc} queries above,
+-- which the planner can satisfy from an index.
 --
 -- Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
 -- to match everything), status equality, and a case-insensitive name
@@ -121,20 +213,23 @@ WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
 -- no-op), with created_at DESC as the stable tiebreaker and default. A NULL
 -- @row_limit returns all rows, preserving the pre-pagination "return
 -- everything" default so unpaginated SDK/MCP callers are unaffected.
-SELECT * FROM sandbox
-WHERE team_id = @team_id
-  AND destroyed_at IS NULL
-  AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
   AND (sqlc.narg('name_search')::text IS NULL
-       OR name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY
-  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'asc'  THEN name END ASC,
-  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'desc' THEN name END DESC,
-  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc'  THEN status::text END ASC,
-  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN status::text END DESC,
-  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN created_at END ASC,
-  created_at DESC
+  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'asc'  THEN s.name END ASC,
+  CASE WHEN @sort_by::text = 'name'   AND @sort_dir::text = 'desc' THEN s.name END DESC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc'  THEN s.status::text END ASC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
@@ -156,7 +251,7 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
 -- name: UpdateSandboxHost :exec
 UPDATE sandbox
-SET host_id = $2, ip_address = $3, pid = $4, updated_at = now()
+SET host_id = $2, ip_address = $3, pid = COALESCE($4, pid), updated_at = now()
 WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 
 -- name: ActivateSandbox :exec
@@ -172,12 +267,19 @@ WHERE id = $1 AND team_id = $5 AND destroyed_at IS NULL;
 WITH activated AS (
   UPDATE sandbox
   SET status = 'active',
+      -- The claim left the paused deadline on the row; it ends here.
+      auto_delete_at = NULL,
       vcpu_count = $2,
       memory_mib = $3,
       ip_address = $4,
       updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
-  RETURNING id, team_id, vcpu_count, memory_mib, disk_mib
+  RETURNING id, team_id, host_id, vcpu_count, memory_mib, disk_mib
+),
+retained_fence AS (
+  SELECT pg_try_advisory_xact_lock_shared(hashtextextended(a.host_id, 0)) AS host_lock,
+         pg_try_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || a.host_id, 0)) AS pending_lock
+  FROM activated a
 ),
 opened_compute AS (
   INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
@@ -195,16 +297,49 @@ opened_billing_compute AS (
   WHERE feature_enabled('billing_metrics_write', a.team_id)
   ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
   RETURNING sandbox_id
-)
+),
+opened_measurement_obligation AS (
+  INSERT INTO retained_storage_measurement_obligation (
+    team_id, owner_kind, owner_id, host_id, effective_at
+  )
+  SELECT a.team_id, 'sandbox', a.id, a.host_id, clock_timestamp()
+  FROM activated a
+  WHERE feature_enabled('billing_metrics_write', a.team_id)
+    AND EXISTS (
+      SELECT 1 FROM retained_storage_cutover c
+      WHERE c.team_id=a.team_id AND c.host_id=a.host_id AND c.started_at <= clock_timestamp()
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM retained_storage_interval i
+      WHERE i.team_id=a.team_id AND i.host_id=a.host_id
+        AND i.owner_kind='sandbox' AND i.owner_id=a.id
+        AND i.started_at <= clock_timestamp()
+        AND (i.ended_at IS NULL OR i.ended_at > clock_timestamp())
+    )
+  ON CONFLICT (owner_kind, owner_id) WHERE resolved_at IS NULL AND ended_at IS NULL DO NOTHING
+  RETURNING owner_id
+),
+opened_storage AS (
 INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
+CROSS JOIN (SELECT count(*) FROM retained_fence) retained_fence_guard
 WHERE feature_enabled('billing_metrics_write', a.team_id)
-ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
+  -- After retained physical reporting has cut over, activation.disk_mib is
+  -- provisioned capacity rather than a trusted measurement. The next durable
+  -- host report owns the quantity; do not charge the template baseline here.
+  AND NOT EXISTS (
+    SELECT 1 FROM retained_storage_cutover c
+    WHERE c.team_id = a.team_id AND c.host_id = a.host_id AND c.started_at <= now()
+  )
+ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+)
+-- Evaluate the fence even when cutover suppresses the legacy interval insert.
+SELECT COALESCE(bool_and(host_lock AND pending_lock), true) FROM retained_fence;
 
 -- name: DestroySandbox :one
 -- Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
--- (active/paused/failed) or from a transitional state (starting/resuming/pausing)
+-- (active/paused/failed) or from a transitional state (starting/resuming/pausing/migrating)
 -- whose owning worker is provably gone — updated_at older than
 -- stale_transitional_before. It never claims a live transition, so it serializes
 -- against a concurrent resume/pause (this CAS and BeginResume target the same row,
@@ -223,14 +358,27 @@ WITH destroyed AS (
     AND sandbox.destroyed_at IS NULL
     AND (
       sandbox.status IN ('active', 'paused', 'failed')
-      OR (sandbox.status IN ('starting', 'resuming', 'pausing')
+      OR (sandbox.status IN ('starting', 'resuming', 'pausing', 'migrating')
           AND sandbox.updated_at < sqlc.arg(stale_transitional_before))
     )
-  RETURNING id
+  RETURNING id, had_secret_bindings, host_id, base_path, template_id
 ),
 revoked AS (
+  -- Only sandboxes that ever had a binding: the proxy consults this set only
+  -- after a secrets JWT authenticates, and a JWT is minted only for those.
+  -- IS NOT FALSE, so rows predating the column (NULL, history unknown) still
+  -- revoke.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed
+  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings IS NOT FALSE
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
+owed AS (
+  -- The host-side reclaim is recorded with the delete, so neither a slow
+  -- host nor a control-plane restart can lose it (see sandbox_teardown).
+  -- Owned by the caller for its inline attempt; the sweeper takes it after.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => sqlc.arg(lease_seconds)::int)
+  FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -254,18 +402,27 @@ closed_storage AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT id FROM destroyed;
+SELECT id, host_id, base_path, template_id FROM destroyed;
 
 -- name: SandboxExists :one
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
 
 -- name: ListSandboxesByHost :many
--- Used by the VMD reconciler. snapshot_path is joined so the paused-sandbox
--- drift check can stat the file without a per-row snapshot lookup.
-SELECT sqlc.embed(s), snap.path AS snapshot_path
+-- Used by the VMD reconciler's per-host drift pass. Returns only the fields
+-- the drift checks read (status + snapshot linkage) so the scan stays
+-- index-only via idx_sandbox_host_reconcile even on hosts with very large
+-- live-sandbox counts. Snapshot paths are fetched separately, in one batch,
+-- for just the paused candidates that need them (see GetSnapshotPathsByIDs) —
+-- avoiding a LEFT JOIN across the entire host inventory every pass.
+SELECT s.id, s.status, s.snapshot_id
 FROM sandbox s
-LEFT JOIN snapshot snap ON snap.id = s.snapshot_id
 WHERE s.host_id = $1 AND s.destroyed_at IS NULL;
+
+-- name: GetSnapshotPathsByIDs :many
+-- Batched snapshot-path lookup for the reconciler's paused-snapshot drift
+-- check. Replaces the old per-inventory join with a PK lookup over just the
+-- snapshot IDs of paused sandboxes.
+SELECT id, path FROM snapshot WHERE id = ANY(@ids::uuid[]);
 
 -- name: ListRecentlyDestroyedSandboxIDsByHost :many
 -- Used by the VMD disk reconciler so a sandbox destroyed within the grace
@@ -300,9 +457,16 @@ WITH failed AS (
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
   -- and a stale one would resurface (or instantly fire) if the sandbox is
   -- ever returned to 'paused' by a recovery path.
-  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now(),
+      pause_op_id = NULL, pause_op_started_at = NULL,
+      pause_op_lease_until = NULL, pause_op_attention_at = NULL,
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
     AND sandbox.status = sqlc.arg(observed_status)
+    -- A pause worker may only fail the operation it holds the lease on.
+    AND (sqlc.narg(pause_op_id)::uuid IS NULL
+         OR (sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
+             AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
   RETURNING id
 ),
 closed_active AS (
@@ -356,9 +520,18 @@ WHERE sandbox_id IN (SELECT id FROM failed)
 -- GetSandbox in the rare error path.
 WITH paused AS (
   UPDATE sandbox
-  SET status = 'pausing', updated_at = now()
-  WHERE sandbox.id = $1
-    AND sandbox.team_id = $2
+  SET status = 'pausing', updated_at = now(),
+      -- The pause's identity and the caller's lease on it, which keeps the
+      -- reconciler off the row until the caller has given up.
+      pause_op_id = sqlc.arg(pause_op_id),
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+      pause_op_lease_version = pause_op_lease_version + 1,
+      pause_op_attention_at = NULL,
+      pause_op_trigger = COALESCE(sqlc.narg(trigger)::text, 'pause'),
+      pause_op_actor_id = sqlc.narg(actor_id)::uuid
+  WHERE sandbox.id = sqlc.arg(id)
+    AND sandbox.team_id = sqlc.arg(team_id)
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
   RETURNING *
@@ -381,6 +554,62 @@ SELECT p.*
 FROM paused p
 LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id;
 
+-- name: RevertPauseToActive :one
+-- BeginPause's mirror for the failed-pause compensation path: status back to
+-- 'active' AND the interval reopened in one statement, so an error between
+-- two separate writes cannot leave an active sandbox unbilled, and the reopen
+-- applies only to the row THIS statement moved out of 'pausing' — a
+-- concurrent transition cannot interleave between the two facts. Gated on
+-- status = 'pausing': if another actor already moved the sandbox on
+-- (delete, reaper failover), their transition wins and this returns 0.
+WITH reverted AS (
+  UPDATE sandbox
+  -- A migration pause goes back to 'migrating': that boot is not the
+  -- owner's session and must not become reachable or billed.
+  SET status = (CASE WHEN sandbox.pause_op_trigger = 'migration' THEN 'migrating' ELSE 'active' END)::sandbox_status,
+      updated_at = now(),
+      -- The pause is over: drop its identity so a result that arrives late
+      -- for it can no longer match this row.
+      pause_op_id = NULL, pause_op_started_at = NULL,
+      pause_op_lease_until = NULL, pause_op_attention_at = NULL,
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
+  WHERE sandbox.id = sqlc.arg(sandbox_id)
+    AND sandbox.team_id = sqlc.arg(team_id)
+    AND sandbox.destroyed_at IS NULL
+    AND sandbox.status = 'pausing'
+    AND (sqlc.narg(pause_op_id)::uuid IS NULL
+         OR (sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
+             AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
+  RETURNING id, team_id, vcpu_count, memory_mib, status
+),
+opened_active AS (
+  -- The reopened interval keeps the actor of the one the pause closed when
+  -- the revert has none of its own (an automatic pause): actor-level
+  -- activity reporting skips NULL actors.
+  INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
+  SELECT r.id, r.team_id,
+         COALESCE(sqlc.narg(actor_id)::uuid,
+                  (SELECT i.actor_id FROM sandbox_active_interval i
+                   WHERE i.sandbox_id = r.id AND i.ended_at IS NOT NULL
+                   ORDER BY i.ended_at DESC LIMIT 1)),
+         now()
+  FROM reverted r
+  WHERE r.status = 'active'
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+  RETURNING sandbox_id
+),
+opened_billing AS (
+  INSERT INTO sandbox_compute_billing_interval (
+    sandbox_id, team_id, vcpu_count, memory_mib, started_at
+  )
+  SELECT r.id, r.team_id, r.vcpu_count, r.memory_mib, now()
+  FROM opened_active oa
+  JOIN reverted r ON r.id = oa.sandbox_id
+  WHERE feature_enabled('billing_metrics_write', r.team_id)
+  ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+)
+SELECT count(*) FROM reverted;
+
 -- name: BeginResume :one
 -- Atomic claim for resume: transitions 'paused' to 'resuming' in one
 -- statement. A 0-row result means another resume (explicit or auto) has
@@ -391,15 +620,120 @@ SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
 RETURNING *;
 
+-- name: ClaimResume :one
+-- The paused→resuming claim plus the boot inputs in one round trip:
+-- snapshot paths, preview policy with published ports, template base path.
+-- The advisory lock is the one attach/detach take before re-reading
+-- status; held to statement end, so the returned row already reflects a
+-- binding mutation that beat the claim. It rides a FROM item joined on
+-- the row key: the planner keeps a volatile target there, whereas an
+-- EXISTS subquery has its target list dropped and never takes the lock.
+-- LEFT joins keep the row when the snapshot or policy row is missing.
+-- The auto-delete deadline stays on the row: the reaper acts on paused rows
+-- only, a failed resume returns the row to paused with the deadline it had,
+-- and activation clears it.
+-- 0 rows: not paused, or another resume claimed it.
+UPDATE sandbox
+SET status = 'resuming', updated_at = now()
+FROM (
+  SELECT @id::uuid AS id
+  FROM (SELECT pg_advisory_xact_lock(hashtext(@lock_key::text)::bigint)) locked
+) lk, (
+  SELECT sb.id,
+         s.path AS snap_path,
+         s.mem_path AS snap_mem_path,
+         s.created_at AS snap_created_at,
+         COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+         COALESCE(p.access, 'legacy_public')::text AS wire_access,
+         COALESCE(p.revision, 0)::bigint AS revision,
+         COALESCE(pp.ports, '{}')::int[] AS port_numbers,
+         COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
+         COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
+         t.base_path AS template_base_path
+  FROM sandbox sb
+  LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
+  LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
+  LEFT JOIN template t ON t.id = sb.template_id
+  LEFT JOIN LATERAL (
+    SELECT array_agg(pp.port ORDER BY pp.port) AS ports,
+           array_agg(pp.access ORDER BY pp.port) AS accesses,
+           array_agg(g.token_version ORDER BY pp.port) AS token_versions
+    FROM sandbox_published_port pp
+    JOIN sandbox_preview_port_token_generation g
+      ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+    WHERE pp.sandbox_id = sb.id AND g.token_version > 0
+  ) pp ON true
+  WHERE sb.id = @id AND sb.team_id = @team_id
+) x
+WHERE sandbox.id = lk.id AND sandbox.id = x.id
+  AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+RETURNING sqlc.embed(sandbox),
+          x.snap_path, x.snap_mem_path, x.snap_created_at,
+          x.access, x.wire_access, x.revision,
+          x.port_numbers, x.port_accesses, x.port_token_versions,
+          x.template_base_path, statement_timestamp()::timestamptz AS routing_observed_at;
+
+-- name: ResumePostBootCheck :one
+-- The two reads a resume makes after the boot, in one statement: the
+-- sandbox's current preview policy (its revision proves whether a mutation
+-- landed during the boot) and whether the host still meets the claim
+-- policy's capability requirement. When that requirement is non-empty,
+-- evaluate it after LockHostForCapabilities in the same transaction, as
+-- HostHasCapabilities is (LockedResumePostBootCheck); host_eligible is
+-- meaningful only then, and the caller ignores it for a legacy policy.
+WITH target_host AS MATERIALIZED (
+  SELECT host.id, host.last_heartbeat_at
+  FROM host
+  WHERE host.id = sqlc.arg('host_id')
+    AND host.status = ANY(sqlc.arg('allowed_statuses')::text[])
+    AND host.last_heartbeat_at IS NOT NULL
+    AND host.last_heartbeat_at > sqlc.arg('heartbeat_after')::timestamptz
+)
+SELECT
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+  COALESCE(p.access, 'legacy_public')::text AS wire_access,
+  COALESCE(p.revision, 0)::bigint AS revision,
+  EXISTS (
+    SELECT 1
+    FROM target_host h
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
+    )
+  ) AS host_eligible
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.id = sqlc.arg('id') AND s.team_id = sqlc.arg('team_id') AND s.destroyed_at IS NULL;
+
+-- name: RecordSandboxSecretEnv :exec
+-- Bookkeeping after a successful secrets injection: what the guest now
+-- holds, for the resume-time reuse check. Off the hot path; a lost write
+-- only costs one re-injection.
+UPDATE sandbox
+SET secret_env_fingerprint = $2,
+    secret_env_ip = $3,
+    secret_env_injected_at = now(),
+    secret_env_expires_at = $4
+WHERE id = $1 AND destroyed_at IS NULL;
+
 -- name: RevertResumeToPaused :exec
 -- Compensate a failed resume attempt by flipping status back to 'paused'.
 -- Guarded on status = 'resuming' so we never clobber a concurrent transition
 -- (e.g., ActivateSandbox has already flipped to 'active').
 UPDATE sandbox
 SET status = 'paused',
-    -- Re-arm the auto-delete deadline cleared by BeginResume; the sandbox is
-    -- paused again, so it gets a fresh window.
-    auto_delete_at = now() + make_interval(secs => auto_delete_seconds),
+    -- The claim leaves the deadline in place, so a failed resume returns the
+    -- row to paused with the deadline it had and retrying cannot postpone
+    -- deletion. An auto-delete patch made while resuming leaves the deadline
+    -- NULL for the return to paused, so it is armed from the window here.
+    auto_delete_at = COALESCE(auto_delete_at, now() + make_interval(secs => auto_delete_seconds)),
     updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'resuming';
 
@@ -421,15 +755,25 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+    -- Fenced to the named operation's current lease; a reclaimed or stale
+    -- worker matches nothing. Callers without an operation keep the broad guard.
+    AND (sqlc.narg(pause_op_id)::uuid IS NULL
+         OR (status = 'pausing'
+             AND pause_op_id = sqlc.narg(pause_op_id)::uuid
+             AND pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
   FOR UPDATE
 ),
 upserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
-  SELECT target.id, target.team_id, @path, @mem_path, @size_bytes, @trigger FROM target
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, pause_token)
+  SELECT target.id, target.team_id, @path, @mem_path, @size_bytes, @trigger,
+         NULLIF(@pause_token::text, '') FROM target
   ON CONFLICT (sandbox_id)
   DO UPDATE SET
     path = EXCLUDED.path,
     mem_path = EXCLUDED.mem_path,
+    -- The token names THIS pause; it replaces unconditionally, like the
+    -- artifacts it identifies.
+    pause_token = EXCLUDED.pause_token,
     -- Compatibility mode while snapshot_sandbox_unique exists: history is
     -- still one row, but the generation counter advances so consumers see
     -- monotonic generations before and after the contract-phase index drop.
@@ -458,17 +802,26 @@ fresh AS (
   SELECT unnest(@manifest_file_names::text[]) AS file_name,
          unnest(@manifest_paths::text[])      AS path,
          unnest(@manifest_sizes::bigint[])    AS size_bytes,
+         unnest(@manifest_allocated_bytes::bigint[]) AS allocated_bytes,
          unnest(@manifest_digests::text[])    AS sha256,
          unnest(@manifest_base_paths::text[]) AS base_path
 ),
 kept AS (
-  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
-  SELECT u.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256, base_path)
+  SELECT u.snap_id, f.file_name, f.path, f.size_bytes,
+         CASE WHEN f.allocated_bytes IS NULL OR f.allocated_bytes < 0 THEN
+                COALESCE((SELECT am.allocated_bytes
+                          FROM artifact_manifest am
+                          WHERE am.snapshot_id = u.snap_id
+                            AND am.file_name = f.file_name), 0)
+              ELSE COALESCE(f.allocated_bytes, 0) END,
+         f.sha256, NULLIF(f.base_path, '')
   FROM upserted u CROSS JOIN fresh f
   ON CONFLICT (snapshot_id, file_name) WHERE snapshot_id IS NOT NULL
   DO UPDATE SET
       path = EXCLUDED.path,
       size_bytes = EXCLUDED.size_bytes,
+      allocated_bytes = EXCLUDED.allocated_bytes,
       sha256 = EXCLUDED.sha256,
       base_path = EXCLUDED.base_path,
       created_at = now()
@@ -486,10 +839,19 @@ SET snapshot_id = (SELECT snap_id FROM upserted),
     -- make_interval(NULL) propagates NULL, so an unset auto_delete_seconds
     -- leaves the deadline NULL (never deleted).
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
-    updated_at = now()
+    updated_at = now(),
+    -- The operation is complete: clear it so nothing can claim this row
+    -- under its identity later. Its token lives on with the snapshot.
+    pause_op_id = NULL, pause_op_started_at = NULL,
+    pause_op_lease_until = NULL, pause_op_attention_at = NULL,
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
 FROM upserted
 WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
+  AND (sqlc.narg(pause_op_id)::uuid IS NULL
+       OR (sandbox.status = 'pausing'
+           AND sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
+           AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
 RETURNING upserted.snap_id::uuid AS snapshot_id;
 
 -- name: HasLegacySnapshotUnique :one
@@ -517,10 +879,16 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = @id AND team_id = @team_id AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+    -- Fenced to the named operation's current lease; a reclaimed or stale
+    -- worker matches nothing. Callers without an operation keep the broad guard.
+    AND (sqlc.narg(pause_op_id)::uuid IS NULL
+         OR (status = 'pausing'
+             AND pause_op_id = sqlc.narg(pause_op_id)::uuid
+             AND pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
   FOR UPDATE
 ),
 inserted AS (
-  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation)
+  INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation, pause_token)
   SELECT target.id, target.team_id, @path, @mem_path,
          -- A non-positive total means the manifest was partial (hash budget
          -- exhausted or a file failed to hash): carry the prior head's
@@ -532,7 +900,8 @@ inserted AS (
                              WHERE s.sandbox_id = target.id
                              ORDER BY s.generation DESC LIMIT 1), 0) END,
          @trigger,
-         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1
+         COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1,
+         NULLIF(@pause_token::text, '')
   FROM target
   RETURNING snapshot.id AS snap_id
 ),
@@ -540,12 +909,21 @@ fresh AS (
   SELECT unnest(@manifest_file_names::text[]) AS file_name,
          unnest(@manifest_paths::text[])      AS path,
          unnest(@manifest_sizes::bigint[])    AS size_bytes,
+         unnest(@manifest_allocated_bytes::bigint[]) AS allocated_bytes,
          unnest(@manifest_digests::text[])    AS sha256,
          unnest(@manifest_base_paths::text[]) AS base_path
 ),
 manifested AS (
-  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256, base_path)
-  SELECT i.snap_id, f.file_name, f.path, f.size_bytes, f.sha256, NULLIF(f.base_path, '')
+  INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256, base_path)
+  SELECT i.snap_id, f.file_name, f.path, f.size_bytes,
+         CASE WHEN f.allocated_bytes IS NULL OR f.allocated_bytes < 0 THEN
+                COALESCE((SELECT am.allocated_bytes
+                          FROM artifact_manifest am
+                          JOIN sandbox sb ON sb.snapshot_id = am.snapshot_id
+                          WHERE sb.id = @id
+                            AND am.file_name = f.file_name), 0)
+              ELSE COALESCE(f.allocated_bytes, 0) END,
+         f.sha256, NULLIF(f.base_path, '')
   FROM inserted i CROSS JOIN fresh f
   RETURNING id
 )
@@ -553,10 +931,19 @@ UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM inserted),
     status = 'paused',
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
-    updated_at = now()
+    updated_at = now(),
+    -- The operation is complete: clear it so nothing can claim this row
+    -- under its identity later. Its token lives on with the snapshot.
+    pause_op_id = NULL, pause_op_started_at = NULL,
+    pause_op_lease_until = NULL, pause_op_attention_at = NULL,
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
 FROM inserted
 WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
+  AND (sqlc.narg(pause_op_id)::uuid IS NULL
+       OR (sandbox.status = 'pausing'
+           AND sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
+           AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
 RETURNING inserted.snap_id::uuid AS snapshot_id;
 
 -- name: UpdateSandboxNetworkConfig :exec
@@ -589,21 +976,14 @@ FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
 
--- name: ListSandboxPreviewPoliciesByTeam :many
-SELECT
-  s.id AS sandbox_id,
-  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
-  COALESCE(p.revision, 0)::bigint AS revision
-FROM sandbox s
-LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
-WHERE s.team_id = $1 AND s.destroyed_at IS NULL;
-
 -- name: LockSandboxForPreviewMutation :one
 -- The sandbox row exists for both legacy (no policy row) and strict sandboxes,
 -- so it is the stable per-sandbox serialization point across the transition.
+-- Allow storage-interval foreign-key checks while a heartbeat holds the host
+-- lock: preview validation acquires that host lock after this sandbox lock.
 SELECT id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-FOR UPDATE;
+FOR NO KEY UPDATE;
 
 -- name: GetSandboxStatusForPreviewMutation :one
 -- Read after LockSandboxForPreviewMutation in the same transaction when host
@@ -711,47 +1091,74 @@ FROM sandbox s
 JOIN team t ON s.team_id = t.id
 WHERE s.id = $1 AND s.destroyed_at IS NULL;
 
--- name: ClaimExpiredSandboxes :many
--- Atomically claims active sandboxes past their timeout and marks them 'pausing'.
--- FOR UPDATE OF s SKIP LOCKED lets concurrent reaper replicas skip in-flight rows.
+-- name: ListExpiredSandboxes :many
+-- The expired candidates in age order, unlocked and unleased: one scan per
+-- tick feeds every worker, and a candidate holds nothing while it waits.
+-- ClaimExpiredSandbox re-checks each one under lock at dispatch time.
 --
--- timeout_seconds bounds an active session, not total lifetime, so the window is
--- anchored on the current session start (the open sandbox_active_interval row,
--- reopened on resume) — each resume re-arms it. Anchoring on created_at would
--- instead keep a sandbox that ever exceeded its timeout permanently eligible.
---
--- COALESCE falls back to created_at when interval bookkeeping (best-effort) leaves
--- an active sandbox with no open interval; otherwise the NULL comparison would
--- silently exempt it from the timeout.
---
--- Only 'active' rows are eligible; the 60s grace floor spares freshly started or
--- resumed sandboxes with very short timeouts.
+-- timeout_seconds bounds the current session (its open interval, reopened on
+-- resume), falling back to created_at when no interval is open; the 60s grace
+-- floor spares freshly started or resumed sandboxes with very short timeouts.
+-- 'migrating' rows are an operator's boot on another host that must be
+-- paused again without ever being exposed as active; they carry a short
+-- timeout for exactly this scan.
 WITH open_sessions AS (
-  -- Current session start per sandbox: the open interval, computed once.
   SELECT sandbox_id, max(started_at) AS session_start
   FROM sandbox_active_interval
   WHERE ended_at IS NULL
   GROUP BY sandbox_id
+)
+SELECT s.id
+FROM sandbox s
+LEFT JOIN open_sessions os ON os.sandbox_id = s.id
+WHERE s.destroyed_at IS NULL
+  AND s.timeout_seconds IS NOT NULL
+  AND s.status IN ('active', 'migrating')
+  AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
+  AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
+ORDER BY s.created_at ASC
+LIMIT $1;
+
+-- name: ClaimExpiredSandbox :one
+-- Claims one listed candidate: its timeout is re-evaluated for this sandbox
+-- alone under FOR UPDATE SKIP LOCKED, so a row another replica holds, or one
+-- that resumed since the scan, comes back as no rows. Marks it 'pausing' with
+-- a fresh pause operation and closes its intervals in the same statement.
+WITH open_session AS (
+  SELECT max(i.started_at) AS session_start
+  FROM sandbox_active_interval i
+  WHERE i.sandbox_id = sqlc.arg(id)::uuid AND i.ended_at IS NULL
 ),
 expired AS (
-  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
-  FROM sandbox s
-  LEFT JOIN open_sessions os ON os.sandbox_id = s.id
-  WHERE s.destroyed_at IS NULL
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id, s.status
+  FROM sandbox s, open_session os
+  WHERE s.id = sqlc.arg(id)::uuid
+    AND s.destroyed_at IS NULL
     AND s.timeout_seconds IS NOT NULL
-    AND s.status = 'active'
+    AND s.status IN ('active', 'migrating')
     AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
     AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
-  ORDER BY s.created_at ASC
-  LIMIT $1
   FOR UPDATE OF s SKIP LOCKED
 ),
 paused AS (
   UPDATE sandbox
-  SET status = 'pausing', updated_at = now()
+  SET status = 'pausing', updated_at = now(),
+      -- Same pause identity and lease as BeginPause; minted here since the
+      -- rows are chosen inside the statement.
+      pause_op_id = gen_random_uuid(),
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+      pause_op_lease_version = sandbox.pause_op_lease_version + 1,
+      pause_op_attention_at = NULL,
+      -- A migrating row is an operator's boot being put back to paused;
+      -- the trigger remembers that so a failed attempt reverts to
+      -- migrating, never to active.
+      pause_op_trigger = CASE WHEN expired.status = 'migrating' THEN 'migration' ELSE 'timeout' END,
+      pause_op_actor_id = NULL
   FROM expired
   WHERE sandbox.id = expired.id
-  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config,
+            sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until
 ),
 closed_intervals AS (
   -- Same atomicity story as BeginPause: bundle the active-interval close
@@ -772,7 +1179,64 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
+       p.pause_op_id, p.pause_op_lease_version, p.pause_op_lease_until
+FROM paused p
+LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
+
+-- name: ListBillingIneligibleSandboxes :many
+-- Active sandboxes of a team whose billing eligibility was lost, oldest
+-- first, unlocked; ClaimBillingIneligibleSandbox takes them one at a time.
+SELECT s.id
+FROM sandbox s
+WHERE s.team_id = $1
+  AND s.destroyed_at IS NULL
+  AND s.status = 'active'
+  AND NOT team_sandbox_billing_eligible(s.team_id)
+ORDER BY s.created_at ASC
+LIMIT $2;
+
+-- name: ClaimBillingIneligibleSandbox :one
+-- Claims one listed candidate under FOR UPDATE SKIP LOCKED, re-checking
+-- eligibility; no rows means another replica has it or it no longer applies.
+WITH candidates AS (
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  FROM sandbox s
+  WHERE s.id = sqlc.arg(id)::uuid
+    AND s.team_id = sqlc.arg(team_id)::uuid
+    AND s.destroyed_at IS NULL
+    AND s.status = 'active'
+    AND NOT team_sandbox_billing_eligible(s.team_id)
+  FOR UPDATE OF s SKIP LOCKED
+), paused AS (
+  UPDATE sandbox
+  SET status = 'pausing', updated_at = now(),
+      pause_op_id = gen_random_uuid(),
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+      pause_op_lease_version = sandbox.pause_op_lease_version + 1,
+      pause_op_attention_at = NULL,
+      pause_op_trigger = 'billing_ineligible',
+      pause_op_actor_id = NULL
+  FROM candidates
+  WHERE sandbox.id = candidates.id
+  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config,
+            sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until
+), closed_intervals AS (
+  UPDATE sandbox_active_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+), closed_billing_compute AS (
+  UPDATE sandbox_compute_billing_interval
+  SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
+  WHERE sandbox_id IN (SELECT id FROM paused)
+    AND ended_at IS NULL
+  RETURNING sandbox_id
+)
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
+       p.pause_op_id, p.pause_op_lease_version, p.pause_op_lease_until
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 
@@ -798,11 +1262,13 @@ WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL;
 -- next tick: the window is evaluated against the current active session
 -- start, so lowering it below already-elapsed session time pauses the
 -- sandbox on the next sweep. On a paused sandbox it applies to the next
--- active session after resume.
+-- active session after resume. Not while migrating: the timeout is the
+-- operator's arm on that boot, and the owner's value is put back with the
+-- row; the caller reports the conflict and the owner retries in a minute.
 UPDATE sandbox
 SET timeout_seconds = sqlc.narg(timeout_seconds),
     updated_at = now()
-WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL;
+WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL AND status <> 'migrating';
 
 -- name: ClaimAutoDeleteSandboxes :many
 -- Atomically soft-deletes paused sandboxes whose auto-delete deadline has
@@ -833,11 +1299,19 @@ destroyed AS (
   FROM due
   WHERE sandbox.id = due.id
   RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
-            sandbox.base_path, sandbox.template_id
+            sandbox.base_path, sandbox.template_id, sandbox.had_secret_bindings
 ),
 revoked AS (
+  -- Gated as in DestroySandbox; see the note there.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
-  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed
+  SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings IS NOT FALSE
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
+owed AS (
+  -- No inline attempt here: born at zero so the sweeper's first claim is attempt 1.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until, attempts)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => sqlc.arg(lease_seconds)::int), 0
+  FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -863,3 +1337,160 @@ closed_storage AS (
 )
 SELECT d.id, d.team_id, d.name, d.host_id, d.base_path, d.template_id
 FROM destroyed d;
+
+-- name: ListPendingPauses :many
+-- Pauses whose caller has given up: still 'pausing' with an expired lease.
+-- Every holder's attempt ends before its lease does, and a holder that stops
+-- early releases the lease, so an expired lease is claimable at once. A row
+-- with no lease recorded falls back to an age gate. Longest-eligible first so
+-- a row that keeps failing cannot cycle ahead of newer ones. Unlocked; rows
+-- without an operation predate this contract and are skipped.
+SELECT id FROM sandbox
+WHERE status = 'pausing' AND destroyed_at IS NULL
+  AND pause_op_id IS NOT NULL
+  AND (pause_op_lease_until < now()
+       OR (pause_op_lease_until IS NULL
+           AND pause_op_started_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)))
+ORDER BY pause_op_lease_until ASC NULLS FIRST, pause_op_started_at ASC
+LIMIT sqlc.arg(max_rows);
+
+-- name: ClaimPendingPause :one
+-- Leases one listed pause, re-checked under FOR UPDATE SKIP LOCKED. Only
+-- the lease moves; updated_at is left alone so a renewal never reads as
+-- activity.
+WITH due AS (
+  SELECT s.id FROM sandbox s
+  WHERE s.id = sqlc.arg(id)::uuid
+    AND s.status = 'pausing' AND s.destroyed_at IS NULL
+    AND s.pause_op_id IS NOT NULL
+    AND (s.pause_op_lease_until < now()
+         OR (s.pause_op_lease_until IS NULL
+             AND s.pause_op_started_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)))
+  FOR UPDATE OF s SKIP LOCKED
+)
+UPDATE sandbox
+SET pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+    pause_op_lease_version = sandbox.pause_op_lease_version + 1
+FROM due
+WHERE sandbox.id = due.id
+RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
+          sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until,
+          sandbox.pause_op_started_at, sandbox.pause_op_attention_at, sandbox.pause_op_trigger,
+          sandbox.pause_op_actor_id;
+-- name: ReleasePauseLease :execrows
+-- A worker gives its lease back, undecided, and says when the next attempt
+-- may start. Fenced on the lease it holds: a reclaimed lease releases
+-- nothing.
+UPDATE sandbox
+SET pause_op_lease_until = now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int)
+WHERE id = sqlc.arg(id) AND destroyed_at IS NULL AND status = 'pausing'
+  AND pause_op_id = sqlc.arg(pause_op_id)
+  AND pause_op_lease_version = sqlc.arg(pause_op_lease_version);
+
+-- name: MarkPauseAttention :execrows
+-- Flags a pause pending past its age threshold for an operator, once. The
+-- operation itself is left exactly as it is: age is not evidence of the VM's
+-- state.
+UPDATE sandbox
+SET pause_op_attention_at = now()
+WHERE id = sqlc.arg(id) AND destroyed_at IS NULL AND status = 'pausing'
+  AND pause_op_id = sqlc.arg(pause_op_id)
+  AND pause_op_lease_version = sqlc.arg(pause_op_lease_version)
+  AND pause_op_attention_at IS NULL;
+
+-- name: GetSandboxPeerEndpoint :one
+-- A missing owner or unbound host remains distinguishable from a valid route.
+SELECT s.host_id, h.vmd_addr, h.proxy_addr, h.incarnation_id, h.peer_generation
+FROM sandbox s LEFT JOIN host h ON h.id = s.host_id AND h.last_heartbeat_at IS NOT NULL
+WHERE s.id = $1 AND s.destroyed_at IS NULL;
+
+-- name: ClaimNextTeardown :one
+-- The sweeper's claim: the oldest reclaim nobody owns whose backoff has
+-- passed, on a host no sweeper is working, taking the host's lease in the
+-- same statement. Two claims racing for one host serialize on its row in
+-- sandbox_teardown_host; the one that finds the lease already taken claims
+-- nothing. So a host that does not answer occupies one worker fleet-wide.
+WITH candidate AS (
+  SELECT t.sandbox_id, t.host_id, t.attempts + 1 AS attempt
+  FROM sandbox_teardown t
+  WHERE t.sandbox_id IN (
+    -- One row per host, so racing workers lock rows of different hosts
+    -- rather than piling onto the oldest host and losing its lease.
+    SELECT DISTINCT ON (host_id) sandbox_id
+    FROM sandbox_teardown
+    WHERE lease_until <= now()
+      AND retry_at <= now()
+      AND NOT EXISTS (
+        SELECT 1 FROM sandbox_teardown_host h
+        WHERE h.host_id = sandbox_teardown.host_id AND h.lease_until > now()
+      )
+    ORDER BY host_id, created_at
+  )
+    AND t.lease_until <= now()
+    AND t.retry_at <= now()
+  ORDER BY t.created_at
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+),
+host_lease AS (
+  INSERT INTO sandbox_teardown_host (host_id, sandbox_id, attempt, lease_until)
+  SELECT host_id, sandbox_id, attempt, now() + make_interval(secs => sqlc.arg(lease_seconds)::int)
+  FROM candidate
+  ON CONFLICT (host_id) DO UPDATE
+    SET sandbox_id = EXCLUDED.sandbox_id, attempt = EXCLUDED.attempt, lease_until = EXCLUDED.lease_until
+    WHERE sandbox_teardown_host.lease_until <= now()
+  RETURNING host_id
+)
+UPDATE sandbox_teardown t
+SET lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+    attempts = c.attempt
+FROM candidate c
+JOIN host_lease h ON h.host_id = c.host_id
+WHERE t.sandbox_id = c.sandbox_id
+RETURNING t.sandbox_id, t.host_id, t.base_path, t.template_id, t.attempts;
+
+-- name: ReleaseTeardownHost :exec
+-- The sweeper's attempt on this host is over; fenced on the reclaim attempt
+-- it was working so a worker whose lease ran out cannot release a newer
+-- holder, even one working the same reclaim.
+UPDATE sandbox_teardown_host
+SET lease_until = now()
+WHERE host_id = sqlc.arg(host_id) AND sandbox_id = sqlc.arg(sandbox_id) AND attempt = sqlc.arg(attempt);
+
+-- name: CompleteTeardown :execrows
+-- Fenced on the attempt: a worker whose lease ran out cannot remove a
+-- reclaim a newer attempt is still working on.
+DELETE FROM sandbox_teardown
+WHERE sandbox_id = sqlc.arg(sandbox_id) AND attempts = sqlc.arg(attempts);
+
+-- name: DeferTeardown :execrows
+-- The attempt did not finish: release the lease, hold the reclaim for the
+-- backoff, keep why. Fenced on the attempt like CompleteTeardown.
+UPDATE sandbox_teardown
+SET lease_until = now(),
+    retry_at = now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int),
+    permanent = sqlc.arg(permanent),
+    last_error = sqlc.narg(last_error)
+WHERE sandbox_id = sqlc.arg(sandbox_id) AND attempts = sqlc.arg(attempts);
+
+-- name: DeferHostTeardowns :execrows
+-- The host did not answer: hold every reclaim on it that nobody is working
+-- on, so the sweeper does not try them one by one. Reclaims in flight are
+-- left to their workers, and a reclaim already waiting longer keeps its
+-- own backoff.
+UPDATE sandbox_teardown
+SET retry_at = GREATEST(retry_at, now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int)),
+    last_error = sqlc.narg(last_error)
+WHERE host_id = sqlc.arg(host_id) AND lease_until <= now();
+
+-- name: TeardownBacklog :one
+SELECT count(*)::bigint AS total,
+       count(*) FILTER (WHERE permanent)::bigint AS permanent,
+       count(*) FILTER (WHERE last_error IS NOT NULL AND NOT permanent)::bigint AS retrying,
+       coalesce(extract(epoch FROM now() - min(created_at)), 0)::float8 AS oldest_age_seconds
+FROM sandbox_teardown;
+
+-- name: DeletedSandboxIDs :many
+-- The subset of ids whose sandbox row says deleted; an id the database does
+-- not know is not one of them.
+SELECT id FROM sandbox WHERE id = ANY(@ids::uuid[]) AND status = 'deleted';

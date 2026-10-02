@@ -55,9 +55,9 @@ func TestReconcileDecision(t *testing.T) {
 		{
 			name: "mixed: live + orphan + newer",
 			onDisk: []vmdclient.BuildArtifactEntry{
-				{TemplateID: tplA, BuildID: bldX, MTimeUnix: old},     // live
-				{TemplateID: tplA, BuildID: bldY, MTimeUnix: old},     // orphan
-				{TemplateID: tplB, BuildID: bldZ, MTimeUnix: newer},   // grace
+				{TemplateID: tplA, BuildID: bldX, MTimeUnix: old},   // live
+				{TemplateID: tplA, BuildID: bldY, MTimeUnix: old},   // orphan
+				{TemplateID: tplB, BuildID: bldZ, MTimeUnix: newer}, // grace
 			},
 			live:      []string{tplA + "/" + bldX},
 			wantDelta: []string{tplA + "/" + bldY},

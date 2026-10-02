@@ -1,0 +1,321 @@
+"""Operator credentials must never be deployed under a host runtime identity."""
+from copy import deepcopy
+import importlib.util
+import io
+import json
+from pathlib import Path
+import re
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[3]
+spec = importlib.util.spec_from_file_location(
+    'identity_check', Path(__file__).with_name('check_controlplane_identity.py'))
+identity = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(identity)
+
+
+class ControlplaneIdentityTest(unittest.TestCase):
+    def test_promotion_evidence_secrets_require_explicit_enablement_in_every_cell(self):
+        for environment, region, secret_file in (
+            ('production', 'us-east4', 'controlplane-identity.tf'),
+            ('production', 'us-west2', 'controlplane-identity.tf'),
+            ('staging', 'us-central1', 'control-plane-identity.tf'),
+        ):
+            root = ROOT / 'infra/envs' / environment / region
+            secrets = (root / secret_file).read_text()
+            main = (root / 'main.tf').read_text()
+            with self.subTest(environment=environment, region=region):
+                variables = (root / 'variables.tf').read_text()
+                gate = re.search(r'variable "promotion_evidence_enabled" \{(.*?)\n\}', variables, re.S)
+                self.assertIsNotNone(gate)
+                self.assertRegex(gate[1], r'type\s*=\s*bool')
+                self.assertRegex(gate[1], r'default\s*=\s*false')
+                self.assertRegex(gate[1], r'nullable\s*=\s*false')
+                if environment == 'staging':
+                    for tfvars in root.glob('*.tfvars'):
+                        self.assertNotRegex(tfvars.read_text(), r'(?m)^\s*promotion_evidence_enabled\s*=\s*true')
+                gated = re.search(
+                    r'promotion_evidence_secrets\s*=\s*var\.promotion_evidence_enabled\s*\?\s*\{(.*?)\n  \}\s*:\s*\{\}',
+                    secrets, re.S)
+                self.assertIsNotNone(gated)
+                for name, resource in (
+                    ('PROMOTION_AUTH_DATABASE_URL', 'promotion_auth_database_url'),
+                    ('PROMOTION_CAPTURE_TOKEN', 'promotion_capture_token'),
+                    ('PROMOTION_ACCOUNT_TOKEN', 'promotion_account_token'),
+                    ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion_account_public_key'),
+                ):
+                    self.assertIn(f'resource "google_secret_manager_secret" "{resource}"', secrets)
+                    self.assertRegex(gated[1], rf'{name}\s*=\s*\{{\s*secret\s*=\s*google_secret_manager_secret\.{resource}\.secret_id')
+                    self.assertNotIn(name, secrets[:gated.start()] + secrets[gated.end():] + main)
+                if environment == 'production':
+                    api = main.split('module "api" {', 1)[1].split('\n}', 1)[0]
+                    self.assertRegex(api, r'PROMOTION_EVIDENCE_ENABLED\s*=\s*tostring\(var\.promotion_evidence_enabled\)')
+                    self.assertRegex(secrets, r'controlplane_secrets\s*=\s*merge\(local\.promotion_evidence_secrets,')
+                    self.assertRegex(main, r'secrets\s*=\s*local\.controlplane_secrets')
+                    self.assertIn('for_each = toset([for config in values(local.controlplane_secrets) : config.secret])', secrets)
+                else:
+                    self.assertRegex(main, r'secrets\s*=\s*merge\(local\.promotion_evidence_secrets,')
+                    self.assertRegex(secrets, r'controlplane_secret_ids\s*=\s*toset\(concat\(\s*\[for config in values\(local\.promotion_evidence_secrets\) : config\.secret\],')
+                    self.assertIn('for_each = local.controlplane_secret_ids', secrets)
+                self.assertIn('roles/secretmanager.secretAccessor', secrets)
+                self.assertIn('controlplane_runtime.email', secrets)
+
+    def test_shared_auth_proxy_role_has_only_rpc_privileges(self):
+        migration = (ROOT / 'supabase/shared-auth-migrations/20260925190000_promotion_evidence_proxy_role.sql').read_text()
+        self.assertIn('LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION', migration)
+        self.assertIn('REVOKE ALL ON public.signup_device_attempt, public.signup_device_account_evidence', migration)
+        for function in ('create_signup_device_attempt()',
+                         'verify_signup_device_attempt(uuid,uuid,text,text,timestamptz)',
+                         'bind_signup_device_account(uuid,uuid)',
+                         'get_signup_device_account_evidence(uuid)'):
+            self.assertIn(function, migration)
+        self.assertNotRegex(migration, r'GRANT\s+(?:SELECT|INSERT|UPDATE|DELETE|ALL)\s+ON\s+(?:TABLE\s+)?public\.signup_device_')
+
+    def service(self, cell, enabled=True):
+        secrets = [('OPERATOR_API_TOKEN', 'operator-api-token'),
+                   ('PROMOTION_AUTH_DATABASE_URL', 'promotion-auth-database-url'),
+                   ('PROMOTION_CAPTURE_TOKEN', 'promotion-capture-token'),
+                   ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token'),
+                   ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion-account-public-key')]
+        if not enabled:
+            secrets = secrets[:1]
+        return {'spec': {'template': {'spec': {
+            'serviceAccountName': f'superserve-controlplane-{cell}@example-project.iam.gserviceaccount.com',
+            'containers': [{'env': [{'name': name, 'valueFrom': {
+                'secretKeyRef': {'name': f'{secret}-{cell}', 'key': 'latest'}}}
+                for name, secret in secrets] + [
+                    {'name': 'PROMOTION_EVIDENCE_ENABLED', 'value': str(enabled).lower()}]}],
+        }}}}
+
+    def test_accepts_both_cell_identities(self):
+        for cell in ('use4', 'usw2'):
+            for enabled in (False, True):
+                with self.subTest(cell=cell, enabled=enabled):
+                    identity.check(self.service(cell, enabled), 'example-project', cell)
+
+    def test_rejects_partial_promotion_configuration(self):
+        for cell in ('use4', 'usw2'):
+            for enabled in (False, True):
+                for mask in range(1, 15):
+                    service = self.service(cell)
+                    container = service['spec']['template']['spec']['containers'][0]
+                    env = container['env']
+                    env[-1]['value'] = str(enabled).lower()
+                    container['env'] = env[:1] + [
+                        mapping for i, mapping in enumerate(env[1:5]) if mask & (1 << i)] + env[5:]
+                    with self.subTest(cell=cell, enabled=enabled, mask=mask), self.assertRaises(ValueError):
+                        identity.check(service, 'example-project', cell)
+
+    def test_rejects_malformed_promotion_secret_mappings(self):
+        for cell in ('use4', 'usw2'):
+            for index in range(1, 5):
+                for fault in ('duplicate', 'literal', 'wrong_cell', 'missing_version'):
+                    service = self.service(cell)
+                    env = service['spec']['template']['spec']['containers'][0]['env']
+                    mapping = env[index]
+                    if fault == 'duplicate':
+                        env.append(deepcopy(mapping))
+                    elif fault == 'literal':
+                        mapping.update(value='example-value', valueFrom={})
+                    elif fault == 'wrong_cell':
+                        ref = mapping['valueFrom']['secretKeyRef']
+                        other = 'usw2' if cell == 'use4' else 'use4'
+                        ref['name'] = ref['name'].replace(cell, other)
+                    else:
+                        del mapping['valueFrom']['secretKeyRef']['key']
+                    with self.subTest(cell=cell, index=index, fault=fault), self.assertRaises(ValueError):
+                        identity.check(service, 'example-project', cell)
+
+    def test_cli_resolves_the_deployed_rollout_state(self):
+        for cell in ('use4', 'usw2'):
+            for enabled in (False, True):
+                service = self.service(cell, enabled)
+                for missing_secrets in (False, True):
+                    candidate = deepcopy(service)
+                    if missing_secrets:
+                        env = candidate['spec']['template']['spec']['containers'][0]['env']
+                        env[:] = [item for item in env if item['name'] in (
+                            'OPERATOR_API_TOKEN', 'PROMOTION_EVIDENCE_ENABLED')]
+                    with self.subTest(cell=cell, enabled=enabled, missing_secrets=missing_secrets), \
+                            patch('sys.argv', ['check_controlplane_identity.py', '--project',
+                                               'example-project', '--cell', cell]), \
+                            patch('sys.stdin', io.StringIO(json.dumps(candidate))), \
+                            patch('sys.stderr', io.StringIO()):
+                        self.assertEqual(identity.main(), int(enabled and missing_secrets))
+
+    def test_rollout_state_must_be_explicit_even_with_valid_secrets(self):
+        for enabled in (False, True):
+            for value in (None, '', 'False', '0', False, True):
+                service = self.service('use4', enabled)
+                env = service['spec']['template']['spec']['containers'][0]['env']
+                env[-1]['value'] = value
+                with self.subTest(enabled=enabled, value=value), self.assertRaises(ValueError):
+                    identity.check(service, 'example-project', 'use4')
+            for mutation in ('missing', 'duplicate', 'secret'):
+                service = self.service('use4', enabled)
+                env = service['spec']['template']['spec']['containers'][0]['env']
+                if mutation == 'missing':
+                    env.pop()
+                elif mutation == 'duplicate':
+                    env.append(deepcopy(env[-1]))
+                else:
+                    env[-1]['valueFrom'] = {'secretKeyRef': {'name': 'example', 'key': 'latest'}}
+                with self.subTest(enabled=enabled, mutation=mutation), self.assertRaises(ValueError):
+                    identity.check(service, 'example-project', 'use4')
+
+    def test_every_promotion_mapping_is_required_and_cell_scoped_when_enabled(self):
+        for cell in ('use4', 'usw2'):
+            other = 'usw2' if cell == 'use4' else 'use4'
+            for index in range(1, 5):
+                for mutation in ('missing', 'duplicate', 'literal', 'wrong_cell', 'no_version'):
+                    service = self.service(cell)
+                    env = service['spec']['template']['spec']['containers'][0]['env']
+                    if mutation == 'missing':
+                        env.pop(index)
+                    elif mutation == 'duplicate':
+                        env.append(deepcopy(env[index]))
+                    elif mutation == 'literal':
+                        env[index]['value'] = 'example-value'
+                    elif mutation == 'wrong_cell':
+                        ref = env[index]['valueFrom']['secretKeyRef']
+                        ref['name'] = ref['name'].removesuffix(cell) + other
+                    else:
+                        del env[index]['valueFrom']['secretKeyRef']['key']
+                    with self.subTest(cell=cell, index=index, mutation=mutation), self.assertRaises(ValueError):
+                        identity.check(service, 'example-project', cell)
+
+    def test_disabled_rollout_still_checks_present_promotion_mappings(self):
+        service = self.service('use4')
+        env = service['spec']['template']['spec']['containers'][0]['env']
+        env[-1]['value'] = 'false'
+        identity.check(service, 'example-project', 'use4')
+        env[1]['valueFrom']['secretKeyRef']['name'] = 'promotion-auth-database-url-usw2'
+        with self.assertRaises(ValueError):
+            identity.check(service, 'example-project', 'use4')
+
+    def test_rejects_shared_host_identity_and_missing_or_wrong_credentials(self):
+        mutations = [
+            lambda s: s.update(serviceAccountName='superserve-api-runner@example-project.iam.gserviceaccount.com'),
+            lambda s: s.update(containers=[]),
+            lambda s: s['containers'][0].update(env=[]),
+            lambda s: s['containers'][0]['env'][0].update(value='example-token', valueFrom={}),
+            lambda s: s['containers'][0]['env'][0]['valueFrom']['secretKeyRef'].update(name='internal-api-token'),
+            lambda s: s['containers'][0]['env'][0]['valueFrom']['secretKeyRef'].update(name='operator-api-token-usw2'),
+            lambda s: s['containers'][0]['env'][0]['valueFrom']['secretKeyRef'].update(key=''),
+            lambda s: s['containers'][0]['env'].append(deepcopy(s['containers'][0]['env'][0])),
+        ]
+        promotion_mutations = [
+            lambda s: s['containers'][0]['env'].pop(1),
+            lambda s: s['containers'][0]['env'][1].update(value='example-url', valueFrom={}),
+            lambda s: s['containers'][0]['env'][2]['valueFrom']['secretKeyRef'].update(name='promotion-capture-token-usw2'),
+            lambda s: s['containers'][0]['env'][3]['valueFrom']['secretKeyRef'].update(key=''),
+            lambda s: s['containers'][0]['env'].pop(4),
+            lambda s: s['containers'][0]['env'][4]['valueFrom']['secretKeyRef'].update(name='promotion-account-public-key-usw2'),
+        ]
+        for enabled in (False, True):
+            for mutate in mutations + (promotion_mutations if enabled else []):
+                candidate = self.service('use4', enabled)
+                mutate(candidate['spec']['template']['spec'])
+                with self.subTest(promotion_enabled=enabled), self.assertRaises(ValueError):
+                    identity.check(candidate, 'example-project', 'use4')
+
+    def test_production_deploys_check_identity_before_image_update(self):
+        for workflow in ('deploy-api.yml', 'terraform-cd.yml'):
+            source = (ROOT / '.github/workflows' / workflow).read_text()
+            for cell, suffix in (('USE4', 'use4'), ('USW', 'usw2')):
+                command = 'gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_' + cell + ' }}'
+                prefix = source.split(command, 1)[0].rsplit('run: |', 1)[1]
+                self.assertIn('check_controlplane_identity.py', prefix)
+                self.assertIn('--cell ' + suffix, prefix)
+                self.assertIn('gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_' + cell + ' }}', prefix)
+                self.assertIn('--format=json |', prefix)
+
+    def test_terraform_limits_operator_access_to_controlplane(self):
+        for region in ('us-east4', 'us-west2'):
+            root = ROOT / 'infra/envs/production' / region
+            source = (root / 'main.tf').read_text()
+            api = source.split('module "api" {', 1)[1].split('\n}', 1)[0]
+            self.assertIn('service_account_email = google_service_account.controlplane_runtime.email', api)
+            self.assertRegex(api, r'(?m)^\s*secrets\s*=\s*local\.controlplane_secrets\s*$')
+            self.assertRegex(api, r'(?m)^\s*secret_volumes\s*=\s*local\.controlplane_secret_volumes\s*$')
+            self.assertIn('COMPUTE_RESTRICTIONS_FILE = "${local.controlplane_secret_volumes.compute-restrictions.mount_path}/${local.controlplane_secret_volumes.compute-restrictions.path}"', api)
+            self.assertIn('google_secret_manager_secret_iam_member.controlplane_runtime_secret_volumes', api)
+            self.assertIn('google_secret_manager_secret_iam_member.controlplane_runtime_secrets', api)
+            self.assertIn('google_kms_crypto_key_iam_member.controlplane_credentials', api)
+            self.assertIn('google_service_account_iam_member.controlplane_deploy_act_as', api)
+            grants = (root / 'controlplane-identity.tf').read_text()
+            self.assertIn('for config in values(local.controlplane_secrets) : config.secret', grants)
+            self.assertRegex(grants, r'secret\s*=\s*var\.compute_restrictions_secret_name')
+            self.assertRegex(grants, r'mount_path\s*=\s*"/etc/superserve"')
+            self.assertRegex(grants, r'path\s*=\s*"abuse-restrictions.json"')
+            self.assertIn('OPERATOR_API_TOKEN = {', grants)
+            self.assertIn('roles/secretmanager.secretAccessor', grants)
+            self.assertIn('roles/cloudkms.cryptoKeyEncrypterDecrypter', grants)
+            self.assertIn('roles/iam.serviceAccountUser', grants)
+            self.assertIn('data.google_service_account.github_actions.email', grants)
+            self.assertNotIn('api_runner.email', grants)
+            self.assertNotIn('vmd_runtime.email', grants)
+            for module in ('sandbox_host', 'sandbox_host_b', 'sandbox_host_2'):
+                marker = f'module "{module}" {{'
+                if marker in source:
+                    host = source.split(marker, 1)[1].split('\n}', 1)[0]
+                    self.assertNotIn('controlplane_runtime', host)
+                    self.assertNotIn('OPERATOR_API_TOKEN', host)
+
+    def test_production_permission_probes_include_cell_operator_secret(self):
+        for workflow in ('deploy-api.yml', 'terraform-cd.yml'):
+            source = (ROOT / '.github/workflows' / workflow).read_text()
+            probes = source.split('bash scripts/verify-control-plane-kms.sh')[1:]
+            self.assertEqual(len(probes), 2, workflow)
+            for probe in probes:
+                command = probe.split('\n\n', 1)[0]
+                cell = re.search(r'control-plane-kms/(use4|usw2)"', command).group(1)
+                with self.subTest(workflow=workflow, cell=cell):
+                    self.assertIn('--secret "${TF_VAR_compute_restrictions_secret_name:?Set COMPUTE_RESTRICTIONS_SECRET_NAME}"', command)
+                    self.assertIn(f'--secret operator-api-token-{cell} ', command)
+                    other = 'usw2' if cell == 'use4' else 'use4'
+                    self.assertNotIn(f'--secret operator-api-token-{other} ', command)
+
+    def test_cd_policy_management_is_scoped_to_credentials_key(self):
+        source = (ROOT / 'infra/envs/production/us-central1/cd-credentials-key-iam.tf').read_text()
+        binding = re.search(r'resource "google_project_iam_member" "cd_credentials_key_iam" \{(.*?)\n\}', source, re.S)
+        self.assertIsNotNone(binding)
+        source = binding.group(1)
+        condition = re.search(r'condition \{(.*?)\n  \}', source, re.S)
+        self.assertIsNotNone(condition)
+        self.assertIn('role    = "roles/iam.securityAdmin"', source)
+        self.assertIn('serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com', source)
+        self.assertIn("resource.type == 'cloudkms.googleapis.com/CryptoKey' && resource.name == 'projects/${local.project_id}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek'", condition.group(1))
+        self.assertNotIn('roles/cloudkms.admin', source)
+        self.assertNotIn('resource.name.startsWith', source)
+
+    def test_key_policy_permission_bootstraps_before_both_regions(self):
+        workflow = (ROOT / '.github/workflows/terraform-cd.yml').read_text()
+        self.assertIn("'.github/workflows/scripts/wait_credentials_key_iam.py'", workflow.split('jobs:', 1)[0])
+        bootstrap = workflow.split('  production-us-central1-bootstrap:', 1)[1].split('\n  production-us-west2-infra:', 1)[0]
+        self.assertIn('-target=google_project_iam_member.cd_credentials_key_iam', bootstrap)
+        self.assertIn('wait_credentials_key_iam.py', bootstrap)
+        self.assertLess(bootstrap.index('terraform apply'), bootstrap.index('wait_credentials_key_iam.py'))
+        manual = (ROOT / '.github/workflows/terraform-rollout-production.yml').read_text().split('  central1:', 1)[0]
+        self.assertIn('-target=google_project_iam_member.cd_credentials_key_iam', manual)
+        self.assertLess(manual.index('apply -input=false -auto-approve cd-key.tfplan'), manual.index('wait_credentials_key_iam.py'))
+        self.assertLess(manual.index('wait_credentials_key_iam.py'), manual.index('- name: Terraform apply production/us-west2'))
+        for region in ('us-east4', 'us-west2'):
+            job = workflow.split(f'  production-{region}-infra:', 1)[1].split('\n    steps:', 1)[0]
+            self.assertIn('production-us-central1-bootstrap', job)
+
+    def test_controlplane_key_grants_exclude_deployment_identity(self):
+        for region in ('us-east4', 'us-west2'):
+            source = (ROOT / 'infra/envs/production' / region / 'controlplane-identity.tf').read_text()
+            grants = re.findall(r'resource "google_kms_crypto_key_iam_member" "[^"]+" \{(.*?)\n\}', source, re.S)
+            self.assertTrue(grants, region)
+            for grant in grants:
+                self.assertRegex(grant, r'role\s*=\s*"roles/cloudkms.cryptoKeyEncrypterDecrypter"')
+                self.assertRegex(grant, r'member\s*=\s*"serviceAccount:\$\{google_service_account.controlplane_runtime.email\}"')
+                self.assertNotIn('github_actions', grant)
+            self.assertNotIn('controlplane_deploy_kms_admin', source)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // launcherPruneArg is the hidden argv[1] under which vmd re-execs itself to
@@ -63,6 +64,14 @@ func (m *Manager) EnsureLauncherNamespace(ctx context.Context) error {
 	if pinPath == "" {
 		return nil // launcher mode disabled
 	}
+	// One build at a time. The boot build runs async and can still be in flight
+	// when the first sampler tick schedules a retry; two concurrent prunes would
+	// race over the same pin path. Reporting nil is right — the in-flight build
+	// owns the outcome and logs it.
+	if !m.launcherBuilding.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer m.launcherBuilding.Store(false)
 	ctx, cancel := context.WithTimeout(ctx, launcherBuildTimeout)
 	defer cancel()
 	// The launch path needs nsenter; without it, fail here (launcherReady stays
@@ -112,6 +121,15 @@ const nsfsMagic = 0x6e736673
 // deleted one errors). One syscall, no fork — cheap and non-flaky enough for the
 // per-launch hot path, unlike launcherNSValid's nsenter exec, which stays the
 // deep check for boot and the sampler.
+// LauncherPinUsable reports whether pinPath still carries a live
+// mount-namespace pin. Exported for callers that resolve a pin path well
+// before they use it — a template build can spend minutes pulling an image
+// between vmd handing it the path and the launch that enters it, and in that
+// window the daemon can restart, rebuild, or detach the pin. Entering a path
+// that is no longer a pin fails the launch; re-checking here lets the caller
+// fall back to the legacy entry instead.
+func LauncherPinUsable(pinPath string) bool { return pinIsMounted(pinPath) }
+
 func pinIsMounted(pinPath string) bool {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(pinPath, &st); err != nil {
@@ -273,12 +291,30 @@ func (m *Manager) startSampler(ctx context.Context, name string, every time.Dura
 // the per-launch warns carry the vm_id detail but make a poor time series.
 // One /proc/mounts read per tick.
 func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+	// One immediate sample so the startup window has a mount count (a
+	// fleet-size correlate for the startup phase timings); async so the scan
+	// stays off the readiness path. Gauge-only, NOT the full tick body:
+	// revalidation during the in-flight boot-time launcher build would burn
+	// the rebuild cooldown on a single-flight no-op.
+	go func() {
+		defer sentrylog.Recover("mount-count first sample")
+		total, nsfs := hostMountCounts()
+		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
+			Bool("launcher_ready", m.launcherReady.Load()).
+			Msg("host mount table")
+	}()
 	m.startSampler(ctx, "mount-count sampler", every, func() {
 		total, nsfs := hostMountCounts()
 		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
 			Bool("launcher_ready", m.launcherReady.Load()).
 			Msg("host mount table")
 		m.revalidateLauncher(ctx)
+		// After revalidation, so the sample reflects the tick's verdict rather
+		// than the previous one. Emitted here rather than from the reclaim
+		// controller: the launch path degrades whether or not that is enabled.
+		if m.recorder != nil {
+			m.recorder.RecordLauncherState(ctx, telemetry.LauncherState{Ready: m.launcherReady.Load()})
+		}
 	})
 }
 
@@ -286,12 +322,19 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 // netns_orphaned (namespaces with no owning slot) is the leak signal: sustained
 // growth means teardown is leaking. One /run/netns readdir per tick.
 func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
-	m.startSampler(ctx, "netns-leak sampler", every, func() {
+	sample := func() {
 		netnsTotal, ownedSlots, orphaned := m.netMgr.NetnsStats()
 		m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
 			Int("netns_orphaned", orphaned).
 			Msg("netns leak gauge")
-	})
+	}
+	// Immediate first sample (same rationale as StartMountCountSampler); async
+	// because NetnsStats readdirs /run/netns under the allocator lock.
+	go func() {
+		defer sentrylog.Recover("netns-leak first sample")
+		sample()
+	}()
+	m.startSampler(ctx, "netns-leak sampler", every, sample)
 }
 
 // revalidateLauncher re-syncs launcherReady with the live pin each tick: drop to
@@ -313,6 +356,49 @@ func (m *Manager) revalidateLauncher(ctx context.Context) {
 		m.launcherReady.Store(true)
 		m.log.Info().Str("path", pin).Msg("launcher pin valid again — resuming launcher launch path")
 	}
+
+	// Rebuild whenever we are not on the launcher path, whatever put us there.
+	// launcherReady is the right predicate because it is true only for a pin
+	// that is both valid AND built this boot, so this covers both ways of
+	// ending up on the legacy path for the life of the process:
+	//
+	//   - the boot build failed, so launcherBuilt never became true and the
+	//     re-enable arm above can never fire;
+	//   - the pin built fine and later went invalid (unmounted, or otherwise
+	//     no longer pruned), which clears launcherReady but leaves
+	//     launcherBuilt set, so a check on launcherBuilt alone would skip it.
+	//
+	// Either way every launch pays the full host mount table until something
+	// rebuilds. Rebuilding is safe where resurrecting an old pin is not: a
+	// fresh build snapshots the CURRENT mount table, which is exactly what the
+	// boot-time build does, so it cannot be missing a launch-critical mount
+	// added since. The single-flight guard inside EnsureLauncherNamespace makes
+	// this a no-op while the boot build is still running.
+	if !m.launcherReady.Load() {
+		m.retryLauncherBuild(ctx)
+	}
+}
+
+// launcherRetryInterval spaces failed pin rebuilds. A working build takes
+// seconds, so this only paces hosts where it keeps failing — there is no point
+// paying a full prune attempt on every sampler tick.
+const launcherRetryInterval = 5 * time.Minute
+
+// retryLauncherBuild re-attempts the pruned-namespace build after a failure.
+// Async by design: a wedged mount syscall can hold a build for
+// launcherBuildTimeout, and the sampler tick must not block on it.
+func (m *Manager) retryLauncherBuild(ctx context.Context) {
+	now := time.Now()
+	if next := m.launcherNextRetry.Load(); next != 0 && now.UnixNano() < next {
+		return
+	}
+	m.launcherNextRetry.Store(now.Add(launcherRetryInterval).UnixNano())
+	go func() {
+		defer sentrylog.Recover("launcher namespace rebuild")
+		if err := m.EnsureLauncherNamespace(ctx); err != nil {
+			m.log.Warn().Err(err).Msg("launcher pin rebuild failed — still on the legacy launch path")
+		}
+	}()
 }
 
 // hostMountCounts returns the total mount count and the nsfs subset (the

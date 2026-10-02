@@ -2,13 +2,19 @@ package vm
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +36,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/shellquote"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
+	"github.com/superserve-ai/sandbox/internal/vm/fc/client/operations"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
@@ -87,25 +95,63 @@ func (s VMStatus) String() string {
 
 // VMInstance holds the runtime state of a single microVM.
 type VMInstance struct {
-	ID           string
-	PID          int
-	SocketPath   string
-	VsockPath    string
-	IP           string
-	TAPDevice    string
-	MACAddress   string
-	Status       VMStatus
-	Unverified   bool // Running persisted before boxd readiness (see VMRecord)
-	Config       VMConfig
-	RunDirID     string // Directory name under RunDir for this VM's files.
-	Namespace    string // Network namespace name.
-	DiskPath     string
-	SnapshotPath string
-	MemFilePath  string
-	CreatedAt    time.Time
-	Metadata     map[string]string
-	TeamID       string // owning team; carried for data-plane usage attribution
-	OwnerID      string // creating user; empty when unknown
+	ID  string
+	PID int
+	// launchGen fences PID publication to the attempt that started it. A
+	// retry reuses this instance, and the previous attempt's asynchronous
+	// MainPID resolver can still be in flight — writing a stopped unit's PID
+	// into the new attempt's record. Bumped under mu at each attempt start;
+	// a resolver whose captured generation no longer matches drops its write.
+	launchGen        uint64
+	SocketPath       string
+	VsockPath        string
+	IP               string
+	TAPDevice        string
+	MACAddress       string
+	Status           VMStatus
+	Unverified       bool   // Running persisted before boxd readiness (see VMRecord)
+	RevivalPending   bool   // revival attempt in flight (see VMRecord)
+	RevivedDisk      string // resolved salvage path of a completed revival (see VMRecord)
+	BackupGeneration string // backup a backup-backed resume booted from (see VMRecord)
+	Config           VMConfig
+	RunDirID         string // Directory name under RunDir for this VM's files.
+	Namespace        string // Network namespace name.
+	DiskPath         string
+	SnapshotPath     string
+	MemFilePath      string
+	// SourceSnapshotID names the saved snapshot this VM was created from, so
+	// a retried create recognizes it without the snapshot, which may be gone.
+	SourceSnapshotID string
+	// CorrectsWallClock records whether this guest fixes its own wall clock on
+	// wake, resolved once when it was restored. Cached so pause never has to go
+	// to the filesystem to find out. Nil means unresolved — a record written by a
+	// binary that predates the field drops it on round-trip, and treating that
+	// silence as "no" would strip a marker that is still valid.
+	CorrectsWallClock *bool
+	// ArtifactID names the manifest beside the image this VM was last paused
+	// into, so a pause intent left beside it can be told from an interrupted one.
+	ArtifactID string
+	// SnapshotWorkloadFrozen: see VMRecord.
+	SnapshotWorkloadFrozen *bool
+	// WakePending / ClockFrozen / WakeOwedFromPaused: see VMRecord.
+	WakePending        bool
+	ClockFrozen        bool
+	WakeOwedFromPaused bool
+	// FreezeToken is the token the image's freeze carries; a wake must present it.
+	FreezeToken string
+	// WakeToken, WakeSnapshotPath, WakeMemPath: see VMRecord.
+	WakeToken        string
+	WakeSnapshotPath string
+	WakeMemPath      string
+	CreatedAt        time.Time
+	Metadata         map[string]string
+	TeamID           string // owning team; carried for data-plane usage attribution
+	OwnerID          string // creating user; empty when unknown
+	// PausedAt records when this VM last entered the paused state. It drives
+	// oldest-first pressure reclamation. Zero means the field is unset on a
+	// legacy record; callers fall back to CreatedAt and then place any fully
+	// timestampless records last.
+	PausedAt time.Time
 
 	// PreviewAccess and PreviewPorts are the data-plane publication policy.
 	// Empty/legacy_public preserves historical all-port routing; strict modes
@@ -125,11 +171,39 @@ type VMInstance struct {
 	// (overlay + base). Cleared when a pause falls back to a standalone Full.
 	BaseMemPath string
 
+	// StrandedOverlays are overlays a Full fallback left unreferenced while
+	// the process serving them could not be confirmed stopped; persisted,
+	// and each reclaimed by the first later step that proves the VM at rest.
+	StrandedOverlays []string
+
 	// DirtyTracked is true when the current Firecracker run was loaded with
 	// dirty-page tracking armed (set on incremental UFFD resume). Gates whether
 	// the next pause may write a Diff snapshot. Not persisted: it describes the
 	// live FC process, which a fresh resume re-establishes.
 	DirtyTracked bool
+
+	// DirtyTrackingSessionID is the random token this run's dirty tracking was
+	// armed with (guarded-pause flag on). Persisted, unlike DirtyTracked: it is
+	// safe to trust after a vmd restart because the pause's Diff request carries
+	// it back to Firecracker, which rejects it — before touching the bitmap or
+	// the overlay — unless it still names the live, unconsumed baseline. That
+	// pause-time check, not this field, is the correctness boundary; the field
+	// is only the claim being checked.
+	DirtyTrackingSessionID string
+
+	// DirtyTrackingGeneration counts the snapshots Firecracker has taken of
+	// this session's bitmap: a capture of the running source takes one and
+	// advances it, and the next guarded diff must name it or is rejected.
+	// Persisted with the session it belongs to.
+	DirtyTrackingGeneration int64
+
+	// TeardownPending, when non-empty, records that a failed lifecycle op
+	// deliberately RETAINED this VM's resources (rundir, network slot)
+	// because its process could not be proven dead — and names the owner of
+	// the residual teardown. Persisted, so the parked state explains itself
+	// after a restart; cleared by a successful relaunch, and retired with
+	// the record when the reconciler completes the release.
+	TeardownPending string
 
 	// Supervision records how the current Firecracker run is supervised —
 	// SupervisionUnit (systemd service, the empty string so legacy records
@@ -138,9 +212,44 @@ type VMInstance struct {
 	// dispatch on it, and it must survive a vmd restart. A resume decides
 	// the mode for the NEW run and must set it before the post-launch
 	// persist.
-	Supervision string
+	Supervision Supervision
 
 	mu sync.RWMutex
+}
+
+// vmNetworkManager captures the network operations the VM manager uses.
+// Keeping this narrow lets tests stub teardown/rebuild behavior without
+// running real namespace commands.
+type vmNetworkManager interface {
+	CleanupVM(vmID string)
+	CleanupVMOrNamespace(vmID, fallbackNamespace string)
+	ClaimFreshSlot(owner string) (int, error)
+	EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, macAddress string) (*network.VMNetInfo, error)
+	Forget(vmID string)
+	GetVMNetInfo(vmID string) *network.VMNetInfo
+	NetnsStats() (netnsTotal, ownedSlots, orphaned int)
+	NamespaceForPID(pid int) string
+	ReattachVM(vmID, namespace, hostIP, macAddress string) error
+	ReclaimUnusedSlots() int
+	ReleaseSlot(owner string, idx int)
+	ReserveSlotsAbove(reservations map[string]string)
+	SetupVM(ctx context.Context, vmID string, cfg *network.Config) (*network.VMNetInfo, error)
+	PoolStats() (fresh, recycled int, enabled bool)
+	SlotPressure() network.SlotPressureStats
+	DrainWarmPool(max int) int
+	SweepOrphanNamespaces(keep map[string]bool) int
+	UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []string) error
+	TeardownVMOrNamespace(vmID, fallbackNamespace string)
+	TeardownVM(vmID string)
+	// UsesNetlinkSlotOps lets the build path hand the same backend to
+	// template-builder, which creates its own slot in its own process.
+	UsesNetlinkSlotOps() bool
+}
+
+type sandboxNetworkRules struct {
+	allowedCIDRs   []string
+	deniedCIDRs    []string
+	allowedDomains []string
 }
 
 // PreviewPortPolicy is the VMD representation of one published port. Access
@@ -165,6 +274,11 @@ type VMConfig struct {
 	// DeltaDir hydrates a fresh per-VM overlay from <dir>/rootfs.delta on
 	// restore. Empty for in-place resume of an already-populated overlay.
 	DeltaDir string
+	// SavedSnapshotID names a saved snapshot to create this VM from; every
+	// file it owns becomes the VM's own before use. See materializeFork.
+	SavedSnapshotID string
+	// EgressRules are installed on a restore before the guest runs.
+	EgressRules *sandboxNetworkRules
 }
 
 // ManagerConfig holds paths and settings for the VM manager.
@@ -182,6 +296,45 @@ type ManagerConfig struct {
 	// prevent a spike of concurrent sandbox creates from saturating host
 	// file I/O, netns setup, and Firecracker boots. 0 → default 500.
 	MaxConcurrentRestores int
+
+	// PausedNetworkSlotHeadroomPercent is the percentage-based free-slot
+	// cushion the controller tries to maintain. Zero disables the percentage
+	// component and relies on the absolute reserve.
+	PausedNetworkSlotHeadroomPercent int
+	// PausedNetworkSlotHeadroomReserve is the absolute free-slot cushion the
+	// controller tries to maintain. The controller uses the larger of the
+	// reserve and the percentage-derived target.
+	PausedNetworkSlotHeadroomReserve int
+	// PausedNetworkSlotHeadroomHysteresis is the extra free-slot margin used
+	// to stop reclaiming only after healthy headroom is restored.
+	PausedNetworkSlotHeadroomHysteresis int
+	// PausedNetworkNetnsThreshold is the maximum number of netns entries the
+	// host should tolerate before the controller switches into inventory-shrink
+	// mode.
+	PausedNetworkNetnsThreshold int
+	// PausedNetworkNetnsHysteresis is the stop margin below the netns pressure
+	// threshold.
+	PausedNetworkNetnsHysteresis int
+	// PausedNetworkMountThreshold is the maximum number of host mount entries
+	// the controller should tolerate before it switches into inventory-shrink
+	// mode.
+	PausedNetworkMountThreshold int
+	// PausedNetworkMountHysteresis is the stop margin below the mount pressure
+	// threshold.
+	PausedNetworkMountHysteresis int
+	// PausedNetworkMinWarmAge keeps freshly paused VMs out of pressure-driven
+	// reclamation so they can remain warm briefly.
+	PausedNetworkMinWarmAge time.Duration
+	// PausedNetworkReclaimEnabled gates the pressure controller.
+	PausedNetworkReclaimEnabled bool
+	// PausedNetworkMaxReclaims bounds how many paused sandboxes one controller
+	// pass may reclaim.
+	PausedNetworkMaxReclaims int
+	// PausedNetworkReclaimCooldown adds hysteresis between reclamation passes.
+	PausedNetworkReclaimCooldown time.Duration
+	// TelemetryRecorder receives bounded host metrics for paused-network
+	// pressure and reclaim activity. Nil disables export.
+	TelemetryRecorder telemetry.Recorder
 
 	// UffdEnabled gates the UFFD lazy-restore path. false → fresh
 	// restores fall back to the File memory backend (synchronous CRC64),
@@ -215,11 +368,42 @@ type ManagerConfig struct {
 	// ResumeUffdEnabled. Default false.
 	IncrementalSnapshotEnabled bool
 
+	// DirtyTrackingSessionEnabled arms dirty tracking with a session token and
+	// sends the token back on the pause's Diff request, letting a reattached
+	// (post-vmd-restart) VM keep its incremental pause: Firecracker validates
+	// the token atomically and a stale baseline degrades to one Full pause.
+	// Sessions are armed only when the binary also advertises the capability,
+	// so this is safe to enable ahead of the Firecracker rollout. Default false.
+	DirtyTrackingSessionEnabled bool
+
 	// HandlerDeathAbortEnabled tells the in-process UFFD handler to abort Firecracker
 	// on an unexpected handler death (instead of letting the guest freeze on its next
 	// page fault). The dead VM then surfaces via the unit-inactive → reconciler path
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
+
+	// GuestFreezeBudget bounds the pause-side wait for a guest to stop its
+	// workload before a frozen-clock snapshot. Zero means the default.
+	GuestFreezeBudget time.Duration
+
+	// SavedSnapshotConcurrency caps concurrent saved-snapshot captures per
+	// host. Zero means the default.
+	SavedSnapshotConcurrency int
+
+	// GuestClockFreezeEnabled lets a restore ask Firecracker to freeze the guest's
+	// monotonic clock across the snapshot instead of advancing it by the time the
+	// snapshot sat unused. Only takes effect for a snapshot whose guest can correct
+	// its own wall clock on wake; everything else stays on legacy behaviour whatever
+	// this says. Default false.
+	GuestClockFreezeEnabled bool
+
+	// TemplateFreezeWorkload has the template builder freeze a guest's
+	// workload for its snapshot when the guest proves it corrects its own
+	// wall clock, and mark the image so. Every sandbox created from such a
+	// template owes a wake, which only a supervisor with the wake protocol
+	// gives: the floor is raised before the image is published. Default
+	// false; the switch to turn on first, and the one to turn off first.
+	TemplateFreezeWorkload bool
 
 	// RequirePresenceSidecar controls refusing a layered UFFD restore whose
 	// overlay has no .presence side-car next to it. Without the side-car,
@@ -244,6 +428,22 @@ type ManagerConfig struct {
 	// via `unshare --mount`). Only used when LaunchViaLauncherNS is true.
 	// Empty → defaultLauncherNSPath.
 	LauncherNSPath string
+
+	// DirectSpawn requests the cgroup-supervised launch path for new VMs:
+	// vmd forks Firecracker into a per-VM cgroup instead of starting a
+	// systemd unit, removing PID 1's serial per-unit dispatch from launch.
+	// Arming additionally requires ArmDirectSpawn to succeed (delegated
+	// subtree present, unit configured KillMode=process) — a request
+	// without the preconditions degrades to the unit path with a loud
+	// error, never to a fleet that dies on the next vmd deploy.
+	DirectSpawn bool
+
+	// PressureAccounting declares that this daemon publishes capacity
+	// pressure (set from the same condition that configures publication).
+	// Startup work that exists only to make a future report accurate is
+	// skipped when false, so a host that never publishes runs the
+	// startup path it ran before the feature existed.
+	PressureAccounting bool
 }
 
 // ---------------------------------------------------------------------------
@@ -252,23 +452,70 @@ type ManagerConfig struct {
 
 // Manager orchestrates the lifecycle of Firecracker microVMs.
 type Manager struct {
+	storageEpoch     atomic.Uint64
+	storageMutations atomic.Int64
+	buildIncarnation string // immutable daemon identity for durable build reports
+
 	cfg         ManagerConfig
-	netMgr      *network.Manager
+	netMgr      vmNetworkManager
 	egressProxy *network.EgressProxy
 	log         zerolog.Logger
 	state       *StateStore // persistent local state (BoltDB); nil = no persistence
+	recorder    telemetry.Recorder
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
-	// backupStaging is the uploader's hard-link staging tree; empty
-	// means artifacts upload from their original paths.
+	// backupLoad reads back the journal row a generation ended up with,
+	// which is the only authority on whose staged copy the uploader
+	// will read; nil means no row is ever assumed.
+	backupLoad func(backup.Task) (backup.Task, bool, error)
+	// backupReader and backupLister bring a lost pause back from the bucket
+	// so a resume can revive the sandbox from its disk.
+	backupRestoreOn   atomic.Bool
+	backupReader      backup.BlobReader
+	backupLister      backup.BlobLister
+	backupRestoreRoot string
+	backupRestore     BackupRestoreOptions
+	backupBaseReader  backup.BlobReader
+	backupFetchSem    chan struct{}
+	backupFlightsMu   sync.Mutex
+	backupFlights     map[string]*backupFlight
+	backupCacheMu     sync.RWMutex
+	// backupStaging is the uploader-visible staging tree: where a
+	// finished generation ends up for the uploader to hash and stream
+	// from, and where the at-rest/backfill worker path (StageTask)
+	// snapshots mutable originals directly, since that path never runs
+	// on the pause RPC path. Empty means artifacts upload from their
+	// original paths. See SetBackupStaging.
 	backupStaging string
+	// pauseStagingRoot is the pause RPC path's own inline staging tree
+	// (see backupPause / StagePending): always on the same filesystem as
+	// SnapshotDir, regardless of where backupStaging points, so the
+	// synchronous pause path's reflink attempts and its base-pin hard
+	// link never have to cross filesystems. A finished generation is
+	// promoted from here into backupStaging off the RPC path (see
+	// enqueueStagedPending) before it is enqueued. Empty disables inline
+	// pause-time staging. See SetPauseStagingRoot.
+	pauseStagingRoot string
 	// unitDead overrides the systemd unit-dead probe in tests; nil means
-	// the real probe. See unitConfirmedDead.
+	// the real probe. See vmConfirmedAtRest.
 	unitDead func(ctx context.Context, vmID string) bool
+	// rehashDone, when set, is called as the detached pending-backup worker
+	// returns. The worker deliberately outlives backupPause, so a test whose
+	// staging tree is a t.TempDir() otherwise races its own cleanup against
+	// the worker's writes. Nil in production.
+	rehashDone func()
 	// pendingInFlight guards one pending-backup worker per VM across the
 	// startup recovery and the periodic sweep.
 	pendingInFlight sync.Map
+	// pendingSweepCursor is the last record a sweep pass offered a turn,
+	// so the next pass resumes after it instead of re-offering the head
+	// of a key-ordered listing. Sweep-goroutine only, and deliberately
+	// not persisted: a restart may re-offer the head once.
+	pendingSweepCursor string
+	// pendingSweepBudget overrides how long one pending-backup sweep pass
+	// keeps dispatching in tests; zero means pendingSweepPassBudget.
+	pendingSweepBudget time.Duration
 	// pendingSweepInterval overrides the pending-backup sweep pace in
 	// tests; 0 means pendingBackupSweepInterval.
 	pendingSweepInterval time.Duration
@@ -281,6 +528,35 @@ type Manager struct {
 	// already pending or completed; nil means never covered. See
 	// SetBackupCovered.
 	backupCovered func(backup.Task) (bool, error)
+	// lastSandboxEnqueue records the generation of each sandbox's most
+	// recent successful backup enqueue, captured ONLY while a backfill
+	// pass runs (backfillCapturing): the pass is the map's only reader,
+	// it clears the map when it ends, and gating the writes keeps a
+	// long-lived host's churn from growing the map with sandboxes no
+	// pass will ever read.
+	lastSandboxEnqueue sync.Map
+	backfillCapturing  atomic.Bool
+	// backupMetrics optionally observes backup hook timings; nil (metrics
+	// disabled) is safe at every call site. See SetBackupMetrics.
+	backupMetrics *telemetry.BackupRecorder
+	// launchFirecrackerHook is a test seam. When set, launchFirecracker
+	// delegates to it instead of the platform-specific implementation.
+	launchFirecrackerHook func(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error)
+	// stopVMHook is the same kind of seam for stopVM.
+	stopVMHook func(ctx context.Context, vmID string, supervision Supervision) error
+	// restoreForResumeHook is a test seam for the snapshot restore step.
+	restoreForResumeHook func(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, trackingSessionID string, err error)
+	// restoreSnapshotHook is the restore path's.
+	restoreSnapshotHook func(socketPath, snapshotPath, memPath string, clockRealtime *bool) error
+	// These hooks are test seams for the retained-dependency lock-order
+	// regression; nil in production.
+	retainedDependencyLockHook      func(string)
+	handleVMErrorPreManagerLockHook func(string)
+	handleVMErrorManagerLockHook    func(string)
+	// pausedNetworkControllerState bounds pause-network reclamation cadence.
+	pausedNetworkControllerMu      sync.Mutex
+	pausedNetworkControllerLastRun time.Time
+	pausedNetworkControllerActive  bool
 	// adoptedBuildBackups guards backup reconciliation of completed
 	// builds adopted from disk: one IN-FLIGHT reconcile per build id.
 	// Cross-process and cross-attempt dedupe is the journal's job (owner
@@ -297,7 +573,34 @@ type Manager struct {
 	// revalidateLauncher's re-enable so a stale previous-boot pin can't resurrect
 	// the launcher path.
 	launcherBuilt atomic.Bool
+	// launcherBuilding admits one pin build at a time, so the boot build and a
+	// sampler-driven retry can't run concurrently and prune the same paths.
+	launcherBuilding atomic.Bool
+	// launcherNextRetry is the earliest wall-clock (unix nanos) at which a failed
+	// pin build may be retried. Zero means retry immediately.
+	launcherNextRetry atomic.Int64
 
+	// cgroups is the delegated subtree for direct-spawned VMs; nil until
+	// ArmDirectSpawn succeeds. directSpawnArmed gates NEW launches onto the
+	// cgroup path — existing VMs always follow their record's Supervision
+	// regardless of the flag, so both modes coexist through the migration.
+	// launchPathValidated reports the launch validations passed this boot;
+	// every cgroup launch (fresh or relaunch) requires it — see
+	// validateDirectLaunchPath.
+	cgroups             *cgroupTree
+	directSpawnArmed    atomic.Bool
+	launchPathValidated atomic.Bool
+	// reapers holds the per-VM exit channel for direct-spawned children this
+	// process owns (vmID → chan directSpawnResult, buffered 1). Kill paths
+	// wait on the channel, never on kill(0) polls — zombies answer polls.
+	reapers sync.Map
+	// survivorNS preserves vmID → netns for a protected recordless survivor
+	// whose startup kill could not be confirmed. Once that process exits on
+	// its own, its pid — the only other route to the namespace — is gone, so
+	// the empty-group reap must spend this mapping to release the reserved
+	// slot and veth. In-memory only: a restart rebuilds reservations from
+	// scratch and the startup sweep reclaims unprotected namespaces.
+	survivorNS sync.Map
 	// orphanScanDone gates the fresh-unit linger skip: it is set only after
 	// startup reattach successfully listed active units and registered the
 	// BoltDB-missing ones as unconfirmed stops. Until then (or forever, if
@@ -329,10 +632,88 @@ type Manager struct {
 	tplLastRestore map[string]time.Time
 
 	// builds tracks in-flight and completed template builds. Keyed by
-	// build VM id (which is also "build-" + templateID). Entries survive
+	// build VM id. Entries survive
 	// until process exit so late pollers can read terminal outcomes.
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
+	// Build workflow count releases only at worker exit. Memory/vCPU
+	// allocations release when the last build VM exits, independently of
+	// terminal status, so cancellation cannot hide a surviving process.
+	buildPressureCount atomic.Int64
+	buildPressureMem   atomic.Int64
+	buildPressureVcpus atomic.Int64
+	// survivingBuilderPIDs are template-builder subprocesses observed at
+	// startup that outlived the previous daemon (deploy restarts kill only
+	// the main process): their build VMs hold real memory and CPU, but the
+	// registry that knew their sizes died with the old process, so their
+	// allocation is unrecoverable. Publication stays gated until they
+	// exit; builderAlive is a seam over the pid-liveness probe.
+	survivingBuilders []builderProc
+	builderAlive      func(p builderProc) bool
+	// pendingBuildCgroups and pendingBuildUnits are predecessor builds'
+	// leftovers found at startup — cgroup-mode groups and unit-mode
+	// firecracker@build-* units respectively: publication waits until
+	// each resolves (the orphaned builder tears its own VM down on exit,
+	// and the reconciler deliberately skips build-prefixed ids, so
+	// nothing else re-evaluates them). Unlike a generic orphan this
+	// state is self-resolving, so it gates dynamically — PressureReady
+	// polls the remaining sets, and the lists only shrink. Guarded by
+	// m.mu.
+	pendingBuildCgroups []string
+	pendingBuildUnits   []string
+	// pressureIndex mirrors m.vms membership for CapacityPressure: the
+	// beat ranges this sync.Map instead of copying the instance map under
+	// m.mu, so per-heartbeat telemetry never contends the lifecycle mutex
+	// cold boot and restore need to publish instances (an O(fleet) copy
+	// under that lock would stall them, scaled by the host's population).
+	// Maintained ONLY by indexVM/unindexVM, called adjacent to every
+	// m.vms insert/delete inside the same locked sections.
+	pressureIndex sync.Map // vmID -> *VMInstance
+
+	// pressureAccounting reports whether this daemon publishes capacity
+	// pressure. Startup work that exists ONLY to make a future report
+	// accurate — the residue-marker reconstruction, the surviving-builder
+	// scan — is skipped entirely when it is false, so a host that never
+	// publishes runs exactly the startup path it ran before the feature
+	// existed. Set once before ReattachAll; never mutated after.
+	pressureAccounting bool
+
+	// recovery probes allocations for VMs nobody declared a size for.
+	// Fixed worker set; see machineConfigRecovery.
+	recovery machineConfigRecovery
+
+	// vmStopUnconfirmed marks VMs whose stop could not be confirmed
+	// dead, in EITHER supervision mode and from EITHER origin — a pause
+	// whose stop failed, or a failed spawn whose cleanup could not prove
+	// the cgroup empty (errSpawnedStopUnconfirmed): the record reads
+	// Paused/Error while Firecracker may still hold its memory, and the
+	// cgroup mode has no unit-oracle entry to remember that by.
+	// CapacityPressure counts the allocation while the marker stands.
+	// Cleared when the VM is provably resolved (confirmed pause stop,
+	// destroy teardown, or a pause retry that confirms rest); a
+	// reconciler reap that bypasses those paths leaves the marker to
+	// over-count until the sandbox next resumes or is destroyed — the
+	// conservative direction.
+	vmStopUnconfirmed sync.Map // vmID -> struct{}
+
+	// builderScanPending holds the gate closed from the moment survivor
+	// discovery is REQUESTED until the async scan lands its result: the
+	// first heartbeat can fire before the scan finishes, and an unscanned
+	// host must not publish as though no survivors exist. Set
+	// synchronously by ScanSurvivingBuildersAsync, cleared by its
+	// goroutine after survivingBuilderPIDs is written (the atomic
+	// store/load pair orders the write for the heartbeat's reader).
+	builderScanPending atomic.Bool
+	// builderScan is a test seam over findSurvivingBuilders.
+	builderScan func(builderBin string) ([]builderProc, error)
+
+	// reattachComplete gates pressure publication: until the background
+	// reattach has rebuilt the instance map, CapacityPressure would
+	// report a near-zero allocation for a possibly-full host, and one
+	// such report after every vmd restart would briefly invite
+	// over-placement. The control plane keeps the previous report while
+	// publication is suppressed; its age is the staleness signal.
+	reattachComplete atomic.Bool
 
 	// vmOpLocks serializes lifecycle operations (restore, resume, pause) for
 	// a single vmID, so a retry or a concurrent actor can't stomp an
@@ -347,6 +728,26 @@ type Manager struct {
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
 
+	// Saved-snapshot captures in flight, bounded per host; see acquireSavedCapture.
+	savedCaptures     chan struct{}
+	savedReserved     atomic.Int64 // bytes admitted captures still expect to write
+	savedCapturesOnce sync.Once
+	savedIDMu         sync.Mutex
+	savedIDLocks      map[string]*savedIDLock // see lockSavedSnapshot
+	// reflinkFile stands in for the exact file clone in tests.
+	reflinkFile func(ctx context.Context, src, dst string) error
+
+	// launchGenSeq issues launch generations. It is manager-global and
+	// monotonic on purpose: a per-instance counter restarts at zero whenever
+	// restoreVMSnapshot installs a fresh VMInstance for the same VM id, so
+	// two different attempts would both hold generation 1 and a delayed
+	// resolver from the first could publish its dead PID into the second.
+	launchGenSeq atomic.Uint64
+
+	// forensicsOK gates console quarantine: false when the root-only
+	// forensics directory could not be created or secured at startup.
+	forensicsOK bool
+
 	// destroying holds the vmIDs currently inside DestroyVM, from just before
 	// the slot is freed until teardown completes. A lazy getInstance skips
 	// reattaching a listed VM: without this, a request that misses m.vms
@@ -354,6 +755,66 @@ type Manager struct {
 	// the freed slot, and hand a live pointer to an IP the pool is recycling.
 	// Keyed vmID → struct{}{}; entries are always removed when destroy returns.
 	destroying sync.Map
+	// destroyEpochs counts completed DestroyVM calls per vmID (bumped on
+	// every exit, before the tombstone clears). A rollback that must
+	// distinguish its own teardowns from an external destroy that
+	// completed in between compares this against its expected count: the
+	// tombstone alone only spans an in-flight destroy, not a finished
+	// one.
+	destroyEpochs sync.Map // vmID -> *uint64
+	// recordOwnerMus serializes DestroyVM against revival's rollback:
+	// DestroyVM holds vmID's mutex from before the tombstone through the
+	// epoch bump and tombstone clear, so a rollback that acquires it and
+	// then checks the epoch cannot interleave with a destroy completing
+	// between its check and its restore write.
+	recordOwnerMus sync.Map // vmID -> *sync.Mutex
+	// preserveRecordOnDestroy converts record deletion into an overwrite
+	// with the stored pending anchor while a revival is in flight:
+	// revival refuses unknown sandboxes, so any delete-then-rewrite gap
+	// (its own residue clear most of all) would brick the retry if vmd
+	// crashed inside it. Revival's destroy-wins paths bypass it with
+	// deleteStateForce once an external destroy is detected.
+	preserveRecordOnDestroy sync.Map // vmID -> VMRecord
+	// reattachStopDeadline bounds the aggregate time the eager reattach
+	// pass may spend stopping interrupted-revival residue: the pass is
+	// serial, and per-record stop budgets would otherwise stack into
+	// minutes of postponed reconciliation.
+	reattachStopDeadline atomic.Value // time.Time
+
+	// clockRealtimeCapable records whether the Firecracker binary this manager
+	// launches understands the per-restore clock flag. Probed once in the
+	// background at startup — the probe execs a process, which belongs neither on
+	// the restore path nor on the restart path. Atomic and demotable: the deploy
+	// swaps the binary in place without restarting vmd, so a rollback can put an
+	// older Firecracker under a running daemon, and the first restore it refuses
+	// clears this for good.
+	clockRealtimeCapable atomic.Bool
+	// guestClockUnready latches once a guest reported it cannot correct its
+	// clock: every later restore takes the unfrozen path until vmd restarts.
+	guestClockUnready atomic.Bool
+	// pendingWakes are reattached records that owe a wake, held back from
+	// m.vms until the pool completes it. See queuePendingWake.
+	pendingWakeMu sync.Mutex
+	pendingWakes  map[string]*pendingWake
+	// wakeDrainStarted closes when the pool begins serving queued wakes; a
+	// request waiting on a queued wake counts its bound from then.
+	wakeDrainStarted chan struct{}
+	wakeDrainBegun   bool
+	// The pool: started by the startup pass before its scan, so a wake
+	// queued early is served while later records are still being read. A
+	// wake queued before the pool exists waits for it.
+	wakePoolCtx context.Context
+	wakeSem     chan struct{}
+	wakeWG      sync.WaitGroup
+	wakeWoken   atomic.Int32
+	// reattachDeferred marks ids whose startup reattach was left to the
+	// request holding their lifecycle lock; see reattachByID.
+	reattachDeferred sync.Map
+	// dirtyTrackingSessionCapable is the same probe for the guarded-session
+	// fields, demoted on the first refusal exactly like the clock flag.
+	dirtyTrackingSessionCapable atomic.Bool
+	// eagerOverlayCapable is the same probe for mem_backend.eager_overlay.
+	eagerOverlayCapable atomic.Bool
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -440,7 +901,8 @@ func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
 			<-ch
 			return nil, err
 		}
-		return func() { <-ch }, nil
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-ch }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -452,7 +914,8 @@ func (m *Manager) tryLockVMOp(vmID string) (unlock func(), ok bool) {
 	ch := m.vmOpCh(vmID)
 	select {
 	case ch <- struct{}{}:
-		return func() { <-ch }, true
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-ch }, true
 	default:
 		return nil, false
 	}
@@ -467,18 +930,39 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 	// Magic mount target — every per-VM start script mounts tmpfs over it.
 	// Missing → "mount: failed" → opaque "wait for socket" timeout. Create
 	// at startup so an aggressive ops cleanup can't break sandbox/build paths.
+	forensicsQuarantineOK := false
 	if cfg.RunDir != "" {
 		if err := os.MkdirAll(filepath.Join(cfg.RunDir, templateDirName), 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir template magic dir: %w", err)
 		}
+		// Pre-created so the readiness-timeout verdict path only renames
+		// into it — even first-stall metadata I/O must not spend the
+		// reserve. Best-effort: if an ops cleanup removes it, the rename
+		// fails and forensics degrade to the journald summary.
+		forensicsDir := filepath.Join(cfg.RunDir, stallForensicsDirName)
+		// MkdirAll leaves a PRE-EXISTING directory's mode alone, and
+		// consoles land in it as 0644 before the deferred file chmod — the
+		// directory mode is what actually fences other accounts, so an
+		// unsecurable directory disables file quarantine entirely (the
+		// content-free summary and journald fallback still work).
+		if err := os.MkdirAll(forensicsDir, 0o700); err != nil {
+			log.Warn().Err(err).Msg("stall-forensics dir unavailable; console quarantine disabled")
+		} else if err := os.Chmod(forensicsDir, 0o700); err != nil {
+			log.Warn().Err(err).Msg("stall-forensics dir not securable; console quarantine disabled")
+		} else {
+			forensicsQuarantineOK = true
+		}
 	}
 	m := &Manager{
-		cfg:            cfg,
-		netMgr:         netMgr,
-		log:            log.With().Str("component", "vm_manager").Logger(),
-		vms:            make(map[string]*VMInstance),
-		restoreSem:     make(chan struct{}, maxRestores),
-		tplLastRestore: make(map[string]time.Time),
+		forensicsOK:        forensicsQuarantineOK,
+		cfg:                cfg,
+		netMgr:             netMgr,
+		recorder:           cfg.TelemetryRecorder,
+		log:                log.With().Str("component", "vm_manager").Logger(),
+		vms:                make(map[string]*VMInstance),
+		restoreSem:         make(chan struct{}, maxRestores),
+		tplLastRestore:     make(map[string]time.Time),
+		pressureAccounting: cfg.PressureAccounting,
 	}
 	m.loadPresenceConverged()
 	return m, nil
@@ -486,6 +970,24 @@ func NewManager(cfg ManagerConfig, netMgr *network.Manager, log zerolog.Logger) 
 
 // SetStateStore attaches a BoltDB state store for durable persistence.
 // Must be called before any VM operations.
+
+// recordPhases emits one latency histogram sample per named phase (plane
+// "vmd"); the host label comes from the recorder's construction. Nil-safe
+// and negative durations are dropped, so call sites stay one-liners.
+func (m *Manager) recordPhases(op, mode string, phases map[string]time.Duration) {
+	if m.recorder == nil {
+		return
+	}
+	for phase, d := range phases {
+		if d < 0 {
+			continue
+		}
+		m.recorder.RecordLatencyPhase(context.Background(), telemetry.LatencyPhase{
+			Plane: "vmd", Op: op, Phase: phase, Mode: mode, Duration: d,
+		})
+	}
+}
+
 func (m *Manager) SetStateStore(s *StateStore) {
 	m.state = s
 }
@@ -494,6 +996,45 @@ func (m *Manager) SetStateStore(s *StateStore) {
 // Must be called before any VMs are created.
 func (m *Manager) SetEgressProxy(proxy *network.EgressProxy) {
 	m.egressProxy = proxy
+}
+
+// applyAdoptedNetworkRules re-applies the request's egress rules to a VM a
+// retried resume adopts. The earlier attempt applied them before launch,
+// but the proxy's per-sandbox rules live in memory and a daemon restart
+// drops them, so the adopting resume applies them again. Reports whether
+// they are fully in place; otherwise the caller pushes them itself.
+func (m *Manager) applyAdoptedNetworkRules(vmID string, rules *sandboxNetworkRules) bool {
+	if rules == nil {
+		return true
+	}
+	if m.netMgr == nil {
+		return false
+	}
+	netInfo := m.netMgr.GetVMNetInfo(vmID)
+	if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
+		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("resume: egress rules not applied on adoption")
+		return false
+	}
+	// The proxy half needs the slot; without it only the firewall landed.
+	return netInfo != nil
+}
+
+func (m *Manager) applySandboxNetworkRules(vmID string, netInfo *network.VMNetInfo, rules *sandboxNetworkRules) error {
+	if rules == nil {
+		return nil
+	}
+	if err := m.netMgr.UpdateFirewallRules(vmID, rules.allowedCIDRs, rules.deniedCIDRs); err != nil {
+		return fmt.Errorf("update firewall rules: %w", err)
+	}
+	if m.egressProxy != nil && netInfo != nil {
+		m.egressProxy.SetRules(netInfo.HostIP, &network.EgressRules{
+			AllowedCIDRs:   rules.allowedCIDRs,
+			DeniedCIDRs:    rules.deniedCIDRs,
+			AllowedDomains: rules.allowedDomains,
+			SandboxID:      vmID,
+		})
+	}
+	return nil
 }
 
 // templateRunDir returns the fixed path where every template's rootfs lives
@@ -531,9 +1072,10 @@ func TemplateMagicOverlayPath(runDir string) string {
 type restoreDiskAction int
 
 const (
-	restoreCreateOverlay restoreDiskAction = iota // overlay clone of a template
-	restoreReuseOverlay                           // existing per-VM overlay (resume)
-	restoreLegacyResolve                          // legacy non-overlay path
+	restoreCreateOverlay   restoreDiskAction = iota // overlay clone of a template
+	restoreReuseOverlay                             // existing per-VM overlay (resume)
+	restoreLegacyResolve                            // legacy non-overlay path
+	restoreMaterializeFork                          // the VM's own copies of a saved snapshot's files
 )
 
 // restorePlan is planRestore's output — pure decision, no I/O.
@@ -545,15 +1087,21 @@ type restorePlan struct {
 // planRestore picks the disk action + delta_dir for a restore. createOverlay
 // requires ALL of {basePath, deltaDir, !inPlace} — anything missing means
 // we'd be cloning over an existing per-VM file, so fall back to reuse.
-func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
+func planRestore(basePath, deltaDir string, fork, reuse bool) restorePlan {
 	p := restorePlan{deltaDir: deltaDir}
-	if inPlace {
+	if reuse {
 		// fc's delta-apply truncates the overlay; force empty to stop a
-		// caller mistake from clobbering per-VM state.
+		// caller mistake from clobbering per-VM state. A same-ID retry after
+		// a cleaned-up failure has no rundir, so the overlay is built again.
 		p.deltaDir = ""
 	}
 	switch {
-	case basePath != "" && deltaDir != "" && !inPlace:
+	case fork:
+		// Fresh copies on every attempt: the snapshot is the truth, not what
+		// a prior attempt left behind.
+		p.deltaDir = ""
+		p.action = restoreMaterializeFork
+	case basePath != "" && p.deltaDir != "":
 		p.action = restoreCreateOverlay
 	case basePath != "":
 		p.action = restoreReuseOverlay
@@ -574,38 +1122,40 @@ func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
 //
 // Anything else is an error: silently falling back to BaseRootfsPath would
 // put the wrong disk under the snapshot's memory view.
-func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (string, error) {
+func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (diskPath, rootfsPath string, err error) {
 	if src, srcErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath); srcErr == nil {
 		dst, err := m.copyRootfs(ctx, vmID, src)
 		if err != nil {
-			return "", fmt.Errorf("copy rootfs for restore: %w", err)
+			return "", "", fmt.Errorf("copy rootfs for restore: %w", err)
 		}
-		return dst, nil
+		return dst, src, nil
 	} else {
 		existing := filepath.Join(m.cfg.RunDir, vmID, "rootfs.ext4")
 		if _, statErr := os.Stat(existing); statErr != nil {
-			return "", fmt.Errorf(
+			return "", "", fmt.Errorf(
 				"resolve rootfs for vm %s: snapshot %q is not a template snapshot (%v) and per-VM rootfs %q is missing (%v)",
 				vmID, snapshotPath, srcErr, existing, statErr,
 			)
 		}
-		return existing, nil
+		return existing, "", nil
 	}
 }
 
-// templateRootfsForSnapshot maps .../templates/<id>/<file>.snap →
-// <runDir>/templates/<id>/rootfs.ext4. Lets vmd find the template's rootfs
-// without needing controlplane to pass it.
+// templateRootfsForSnapshot preserves the template/build path beneath templates
+// when mapping a snapshot to its rootfs in runDir. Flat legacy templates omit
+// the build directory.
 func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
-	parent := filepath.Dir(snapshotPath) // .../templates/<templateID>
-	templateID := filepath.Base(parent)  // <templateID>
-	if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
-		return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
+	parent := filepath.Dir(snapshotPath)
+	relative := filepath.Base(parent)
+	templatesDir := filepath.Dir(parent)
+	if filepath.Base(templatesDir) != TemplatesDirName {
+		relative = filepath.Join(filepath.Base(templatesDir), relative)
+		templatesDir = filepath.Dir(templatesDir)
 	}
-	if templateID == "" || templateID == "." || templateID == string(filepath.Separator) {
-		return "", fmt.Errorf("snapshot path %q has an empty template id segment", snapshotPath)
+	if filepath.Base(templatesDir) != TemplatesDirName {
+		return "", fmt.Errorf("snapshot path %q is not a template or build snapshot", snapshotPath)
 	}
-	return filepath.Join(runDir, TemplatesDirName, templateID, "rootfs.ext4"), nil
+	return filepath.Join(runDir, TemplatesDirName, relative, "rootfs.ext4"), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -662,7 +1212,22 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // coldBootFromRootfs is the parameterized form: boot a VM from a specific
 // rootfs at the requested vcpu/memory. Used by BuildTemplate to boot the
 // build VM from a freshly-produced rootfs at the template's target shape.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath string, vcpu, memMiB uint32) (*VMInstance, error) {
+// basePath, when non-empty, boots the rootfs as a sparse overlay backed
+// by that shared read-only base (the fork's overlay drive mode); the
+// per-VM copy must then be hole-exact, so it reflinks strictly rather
+// than falling back to a heuristic sparse copy that could turn
+// guest-written zeros into holes exposing base content.
+// blockMap, when non-empty, is the snapshot's saved block map for that
+// overlay: placed beside the copy, Firecracker takes it as the record of
+// which blocks the overlay holds instead of reading the file's allocation.
+// supervised spawns the VM under the fleet's real lifecycle supervision
+// (systemd unit or validated cgroup, seeded by `supervision`) through
+// the same dispatcher resume uses, so auto-pause's mode-directed stop
+// and every at-rest oracle see the VM the way they see any sandbox.
+// The flag is explicit because SupervisionUnit is the zero value: a
+// sentinel on the mode alone cannot distinguish "unit mode" from the
+// legacy unsupervised spawn kept for throwaway template-build VMs.
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath, blockMap string, rules *sandboxNetworkRules, seed func(*VMInstance), preLaunch func() error, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -692,20 +1257,46 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 			MemoryMiB:  memMiB,
 			KernelPath: m.cfg.KernelPath,
 			RootfsPath: rootfsPath,
+			BasePath:   basePath,
 		},
 	}
+	// The seed runs before the instance is visible or persisted, so
+	// every intermediate durable write during the boot (each setStatus
+	// persists synchronously) already carries the caller's metadata; a
+	// crash mid-boot must not leave a record with empty ownership or
+	// preview policy, or one that claims a verified guest.
+	if seed != nil {
+		seed(inst)
+	}
 	m.vms[vmID] = inst
+	m.indexVM(vmID, inst)
 	m.mu.Unlock()
 
 	log := m.log.With().Str("vm_id", vmID).Logger()
-	log.Info().Str("rootfs", rootfsPath).Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).Msg("cold-booting VM")
+	log.Info().Str("rootfs", rootfsPath).Str("base", basePath).Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).Msg("cold-booting VM")
 
-	// 1. Copy the rootfs for this VM.
-	diskPath, err := m.copyRootfs(ctx, vmID, rootfsPath)
+	// 1. Copy the rootfs for this VM. Overlay sources demand a
+	// hole-exact copy (reflink, no heuristic fallback): every hole is a
+	// window to the base, and a guest-written zero run misdetected as a
+	// hole would silently resurface base content.
+	var diskPath string
+	var err error
+	if basePath != "" {
+		diskPath, err = m.copyRootfsExact(ctx, vmID, rootfsPath)
+	} else {
+		diskPath, err = m.copyRootfs(ctx, vmID, rootfsPath)
+	}
 	if err != nil {
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("copy rootfs: %w", err)
+	}
+	if blockMap != "" {
+		if err := placeBlockMap(blockMap, diskPath); err != nil {
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("place block map: %w", err)
+		}
 	}
 
 	// 2. Set up networking.
@@ -728,6 +1319,32 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 	mac := inst.MACAddress
 	inst.mu.Unlock()
 
+	// Egress policy installs before the guest can execute a single
+	// instruction: resume's discipline (rules land before
+	// launchFirecracker), because a policied workload's startup services
+	// must never see the fresh slot's permissive defaults.
+	if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
+		m.netMgr.CleanupVM(vmID)
+		m.cleanupRunDir(vmID)
+		m.setStatus(vmID, StatusError)
+		return nil, fmt.Errorf("apply network rules: %w", err)
+	}
+
+	// A caller-supplied gate right before Firecracker starts: revival's
+	// last chance to notice an external destroy that completed after
+	// network setup began (network setup blocks, so the epoch check at
+	// prep time is already stale by the time execution reaches here).
+	// Without this, revival could launch onto a slot/TAP a destroy
+	// already handed back to the pool.
+	if preLaunch != nil {
+		if perr := preLaunch(); perr != nil {
+			m.netMgr.CleanupVM(vmID)
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, perr
+		}
+	}
+
 	// 3. Build Firecracker machine configuration.
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
@@ -737,6 +1354,7 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 		KernelPath: m.cfg.KernelPath,
 		KernelArgs: "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=0 random.trust_cpu=on",
 		RootfsPath: diskPath,
+		BasePath:   basePath,
 		VCPUCount:  int(vcpu),
 		MemSizeMiB: int(memMiB),
 		TAPDevice:  network.TAPName,
@@ -747,12 +1365,91 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 	}
 
 	// 4. Start Firecracker inside the network namespace, configure, and boot.
-	pid, err := m.startFirecrackerColdBoot(ctx, vmID, socketPath, fcCfg, netInfo.Namespace)
-	if err != nil {
-		m.netMgr.CleanupVM(vmID)
-		m.cleanupRunDir(vmID)
-		m.setStatus(vmID, StatusError)
-		return nil, fmt.Errorf("start firecracker: %w", err)
+	var pid int
+	if supervised {
+		spawnedPID, actual, lerr := m.launchFirecracker(ctx, vmID, socketPath, diskPath, basePath, netInfo.Namespace, supervision, true, false)
+		// Stamp before the error branch too: a cgroup launch that forked
+		// Firecracker but failed confirmation leaves a live process, so
+		// the instance must say cgroup for stops to target it rather
+		// than no-op a unit.
+		inst.mu.Lock()
+		inst.Supervision = actual
+		inst.mu.Unlock()
+		// The mandatory stop must not run under the RPC's possibly-
+		// expired context: a canceled stop leaves a live supervised
+		// Firecracker, and freeing its slot and run directory
+		// underneath it is the wedge the stop exists to prevent.
+		stopFailed := false
+		stopSpawned := func() {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldBootStopBudget)
+			defer cancel()
+			if serr := m.stopVM(sctx, vmID, actual); serr != nil {
+				stopFailed = true
+				log.Error().Err(serr).Msg("stop spawned VM after failed cold boot; residue left for forced teardown")
+				return
+			}
+			// A nil stop can still mean a deactivating unit (the expired
+			// stop wait settles those as complete while the process may
+			// hold its socket): release requires the terminal claim,
+			// exactly as every stale-cleanup path holds it.
+			var down bool
+			if cgroupSupervised(actual) {
+				down = m.cgroupDefinitelyDead(vmID) && vmUnitFullyDown(vmID)
+			} else {
+				down = vmUnitFullyDown(vmID)
+			}
+			if !down {
+				stopFailed = true
+				log.Error().Msg("spawned VM not terminally down after stop; residue left for forced teardown")
+			}
+		}
+		if lerr != nil {
+			// A failed launch can itself leave a live process (a cgroup
+			// spawn whose internal kill was unconfirmed), so the
+			// confirmed stop runs here too before anything is freed.
+			stopSpawned()
+		} else if lerr = waitForSocket(socketPath, 10*time.Second); lerr != nil {
+			stopSpawned()
+		} else if lerr = ConfigureMachine(socketPath, fcCfg); lerr != nil {
+			stopSpawned()
+		} else if lerr = StartInstance(socketPath); lerr != nil {
+			stopSpawned()
+		}
+		if lerr == nil {
+			pid = spawnedPID
+		}
+		if lerr != nil {
+			// A failed stop forbids freeing resources: the slot and run
+			// directory may still be under a live Firecracker, so leave
+			// the residue for a forced DestroyVM to clear.
+			if !stopFailed {
+				m.netMgr.CleanupVM(vmID)
+				m.cleanupRunDir(vmID)
+			}
+			m.setStatus(vmID, StatusError)
+			if stopFailed {
+				// Supervision-independent marker: the unit oracle cannot
+				// see a cgroup-mode residue, and once the settle window
+				// expires pressure would otherwise stop charging memory
+				// this Firecracker may still hold. removeVM (the forced
+				// teardown) clears it.
+				m.vmStopUnconfirmed.Store(vmID, struct{}{})
+				// Callers that roll back durable state must know the
+				// spawned VM may still be alive: the StatusError record
+				// above is the truthful one to keep.
+				return nil, fmt.Errorf("start firecracker (supervised): %w: %w", lerr, errSpawnedStopUnconfirmed)
+			}
+			return nil, fmt.Errorf("start firecracker (supervised): %w", lerr)
+		}
+	} else {
+		var serr error
+		pid, serr = m.startFirecrackerColdBoot(ctx, vmID, socketPath, fcCfg, netInfo.Namespace)
+		if serr != nil {
+			m.netMgr.CleanupVM(vmID)
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("start firecracker: %w", serr)
+		}
 	}
 
 	inst.mu.Lock()
@@ -770,7 +1467,7 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath strin
 // ---------------------------------------------------------------------------
 
 // DestroyVM terminates a VM and cleans up all its resources.
-func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error {
+func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Bool("force", force).Msg("destroying VM")
 
@@ -785,8 +1482,28 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// field). A tracked VM still resolves from m.vms below — this gates only
 	// reattach; an untracked one takes the record fallback, which carries all
 	// teardown needs.
+	unlockOwner := m.lockRecordOwner(vmID)
+	defer unlockOwner() // registered first: releases after the epoch bump and tombstone clear
+	// An external destroy retires any revival anchor: its success must
+	// mean the record is durably gone, not preserved until an in-flight
+	// revival's cleanup happens to run. Revival's own teardowns mark
+	// their context and keep the preserve (their record deletion is the
+	// crash gap the preserve exists to close).
+	if v := ctx.Value(reviveTeardownCtxKey{}); v == nil {
+		m.preserveRecordOnDestroy.Delete(vmID)
+	}
 	m.destroying.Store(vmID, struct{}{})
 	defer m.destroying.Delete(vmID)
+	// Only a SUCCESSFUL destroy advances the epoch (LIFO: before the
+	// tombstone clears): revival treats an epoch step as an
+	// authoritative deletion and force-deletes the anchor, but a failed
+	// destroy deliberately left residue and record for a forced retry,
+	// and counting it would destroy the only durable record.
+	defer func() {
+		if err == nil {
+			m.bumpDestroyEpoch(vmID)
+		}
+	}()
 
 	// A paused or post-restart VM may be absent from m.vms. Don't early-return on
 	// that: unit stop and rundir removal are derivable from vmID and must run, or
@@ -794,10 +1511,53 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 	// the instance, so it's gated below. Destroy is idempotent.
 	inst, instErr := m.getInstance(vmID)
 
-	// Stop the systemd unit if one exists — this is the path for sandbox
-	// VMs launched via startFirecrackerViaSystemd.
-	if err := stopUnit(ctx, systemdUnitName(vmID)); err != nil {
-		log.Warn().Err(err).Msg("systemctl stop failed (unit may not exist — trying PID-based kill)")
+	// Stop by supervision mode: cgroup kill+rmdir for direct-spawned VMs, the
+	// systemd stop for unit VMs. Derived from instance-or-record so a paused
+	// or post-restart VM (absent from m.vms) still stops correctly.
+	destroySupervision := SupervisionUnit
+	if instErr == nil {
+		inst.mu.RLock()
+		destroySupervision = inst.Supervision
+		inst.mu.RUnlock()
+	} else {
+		destroySupervision = m.supervisionForVM(vmID)
+	}
+	if err := m.stopVM(ctx, vmID, destroySupervision); err != nil {
+		log.Warn().Err(err).Msg("stop failed (VM may not exist — trying PID-based kill)")
+	}
+	// Mode-agnostic safety gate, BEFORE any destructive cleanup. Neither the stop
+	// error nor destroySupervision can be trusted to prove death here: the record's
+	// supervision can be stale (a verify throwaway can leak a cgroup FC onto a unit
+	// record), and a no-op unit stop returns nil — so a stale unit record would
+	// sail past a mode-conditioned check and free the tap under a live FC, handing
+	// it to the next tenant. Consult the cgroup directly instead: if this vmID's
+	// group is still live (populated, or unreadable == inconclusive == alive),
+	// keep the record+slot and let the reconciler reclaim once it empties; a retry
+	// then completes. cgroup.kill for a wedged FC (uninterruptible I/O) is exactly
+	// this case, but so is any record/reality drift.
+	if m.cgroupStillLive(vmID) {
+		// Stop what the probe found: the record's mode can be stale (a
+		// verify throwaway's failed cleanup leaves a cgroup FC on a
+		// unit-mode record), destroy's intent is death in either mode, and
+		// in BoltDB-only mode no drift rule reclaims a live group behind an
+		// existing record. stopVM's cgroup arm kills, reaps, and removes on
+		// its own detached budget; only a group that still won't die
+		// refuses.
+		_ = m.stopVM(ctx, vmID, SupervisionCgroup)
+		if m.cgroupStillLive(vmID) {
+			return status.Errorf(codes.Unavailable, "vm %s stop unconfirmed (cgroup process still live); retry after it exits", vmID)
+		}
+	}
+	// The mirror ambiguity: a scope-gone fallback can leave a cgroup record
+	// over a live firecracker@ unit (crash before the mode persisted), and
+	// the recorded-mode stop above never touched it. Stop the unit too and
+	// require it terminal before any cleanup — a no-op round trip when no
+	// unit exists.
+	if cgroupSupervised(destroySupervision) {
+		_ = stopUnit(ctx, systemdUnitName(vmID))
+		if !unitFullyDown(ctx, systemdUnitName(vmID)) {
+			return status.Errorf(codes.Unavailable, "vm %s stop unconfirmed (fallback unit still active); retry after it exits", vmID)
+		}
 	}
 	removeUnitDropIn(vmID)
 
@@ -840,6 +1600,11 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 		rundirKey = inst.RunDirID
 	}
 	m.cleanupRunDir(rundirKey)
+	// Revival tears the zombie down through here on its way to booting
+	// from the staged disk; only a real destroy drops that staging.
+	if ctx.Value(reviveTeardownCtxKey{}) == nil {
+		m.cleanupRestoreStaging(vmID)
+	}
 	m.removeVM(vmID)
 
 	log.Info().Msg("VM destroyed")
@@ -854,7 +1619,42 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) error 
 // manifest carries integrity metadata (sha256 + size) for the pause's
 // durable artifacts (disk state + vmstate); see collectPauseManifest for
 // what is included and why memory files are not.
-func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error) {
+func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []ManifestEntry, err error) {
+	// Timed from BEFORE the op lock so pause_ms includes lock queueing —
+	// a duplicate-pause pile-up shows here rather than hiding.
+	tPause := time.Now()
+	var snapshotType string
+	var tSnapshot time.Time
+	var snapshotDur, stopDur time.Duration
+	// Deferred, gated on freeze or snapshot work having begun: a failed
+	// freeze or a slow failed snapshot must land in the pause distributions.
+	// The already-paused retry guard still emits nothing.
+	var freezeDur, manifestDur time.Duration
+	var tFreeze time.Time
+	defer func() {
+		if tSnapshot.IsZero() && tFreeze.IsZero() {
+			return
+		}
+		phases := map[string]time.Duration{"total": time.Since(tPause)}
+		if freezeDur == 0 && !tFreeze.IsZero() {
+			freezeDur = time.Since(tFreeze) // died inside the freeze
+		}
+		if freezeDur > 0 {
+			phases["freeze"] = freezeDur
+		}
+		if manifestDur > 0 {
+			phases["manifest"] = manifestDur
+		}
+		if snapshotDur > 0 {
+			phases["snapshot"] = snapshotDur
+		} else if !tSnapshot.IsZero() {
+			phases["snapshot"] = time.Since(tSnapshot)
+		}
+		if stopDur > 0 {
+			phases["stop"] = stopDur
+		}
+		m.recordPhases("pause", snapshotType, phases)
+	}()
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate pause
 	// waits, then hits the already-paused guard.
 	unlockOp, err := m.lockVMOp(ctx, vmID)
@@ -883,6 +1683,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		if !fileExists(snapshotPath) || !fileExists(memPath) {
 			return "", "", nil, status.Errorf(codes.FailedPrecondition, "paused VM artifacts missing on host: %s", memPath)
 		}
+		atRest := m.vmConfirmedAtRest(ctx, vmID)
 		// The paused status may only exist in memory: the original pause sets it
 		// before persisting, so a failed write leaves the durable record reading
 		// Running behind a stopped unit — which the next reattach cleans up as
@@ -901,8 +1702,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// that skip through a status the at-rest checks trust, so it
 		// backs up only once the unit is confirmed dead.
 		var manifest []ManifestEntry
-		if m.unitConfirmedDead(ctx, vmID) {
-			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, log)
+		if atRest {
+			// Rest is now proven: the earlier unconfirmed stop resolved. Any
+			// overlay the original pause deferred is reclaimed only now,
+			// after the re-record above made the replacement image durable.
+			m.vmStopUnconfirmed.Delete(vmID)
+			m.reclaimStrandedOverlays(inst, log)
+			manifest = m.backupPause(ctx, vmID, snapshotPath, retryDiskPath, retryDiskBase, pauseToken, log)
 		} else {
 			log.Warn().Msg("pause backup skipped on retry: unit not confirmed dead")
 		}
@@ -920,19 +1726,32 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
 	}
+	// One spelling: the checks below compare it to the VM's own directory.
+	snapshotDir = filepath.Clean(snapshotDir)
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		return "", "", nil, fmt.Errorf("create snapshot dir: %w", err)
 	}
 
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
+	// Firecracker rewrites the overlay block map with every snapshot it
+	// saves; one an earlier pause left at this fixed path must not stand
+	// in for this pause's if the save leaves none.
+	if err := os.Remove(overlayBlockMapPath(snapshotPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", "", nil, fmt.Errorf("drop previous block map: %w", err)
+	}
 
 	// Read the fields that select Full vs in-place-diff vs layered together under the
 	// lock, so the decision can't see a torn mix written by a concurrent resume.
 	inst.mu.RLock()
 	socketPath := inst.SocketPath
 	dirtyTracked := inst.DirtyTracked
+	trackingSessionID := inst.DirtyTrackingSessionID
+	trackingGeneration := inst.DirtyTrackingGeneration
 	instBaseMem := inst.BaseMemPath
 	instMemFile := inst.MemFilePath
+	recordedCorrects := inst.CorrectsWallClock
+	recordedArtifact := inst.ArtifactID
+	instIP := inst.IP
 	diskPath := inst.DiskPath
 	diskBasePath := inst.Config.BasePath
 	inst.mu.RUnlock()
@@ -949,9 +1768,109 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// drop the prior overlay's pages, so fall back to a Full (complete) image.
 	overlayPath := filepath.Join(snapshotDir, "mem.diff")
 	fullPath := filepath.Join(snapshotDir, "mem.snap")
+
+	// Clear any wall-clock marker before the image exists, and refuse the pause if
+	// it cannot be cleared. vmd reuses memory paths, so a marker left beside a
+	// replaced image would let this guest be restored with a frozen clock without
+	// ever having shown it can correct one — a guest running on a stale clock,
+	// which is worse than a failed pause the caller can retry. Both candidate
+	// paths are cleared because the layered branch can still fall back to Full.
+	//
+	// An unresolved record (nil) means the answer was lost, not that it is no —
+	// go and look, or this pause would delete a marker that is still valid.
+	correctsWallClock := recordedCorrects != nil && *recordedCorrects
+	if recordedCorrects == nil {
+		correctsWallClock = guestCorrectsWallClock(instMemFile, instBaseMem)
+	}
+	// Recovery after a crash looks for a pause's intent in this VM's own
+	// snapshot directory and nowhere else, so a pause into a caller-supplied
+	// directory freezes nothing and writes no manifest: the older path, correct.
+	if correctsWallClock && snapshotDir != filepath.Join(m.cfg.SnapshotDir, vmID) {
+		log.Info().Str("dir", snapshotDir).Msg("pause: custom snapshot directory; pausing unfrozen")
+		correctsWallClock = false
+	}
+	// The token this freeze carries; the guest keeps it across the snapshot and
+	// the wake must present it. The artifact id names the manifest this pause
+	// will write, in the intent and in the record alike.
+	freezeToken, artifactID := "", ""
+	if correctsWallClock {
+		freezeToken, artifactID = NewFreezeToken(), NewArtifactID()
+	}
+	// Only a pause that will freeze records its intent (see pause_intent.go),
+	// and only once the floor is up: recovery looks for intents there alone.
+	// Durable before the freeze, or a crash leaves a guest nobody can release.
+	willFreeze := correctsWallClock && m.cfg.GuestClockFreezeEnabled && m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load()
+	if willFreeze {
+		tFreeze = time.Now()
+		if err := m.ensureWakeFloorTimed("pause"); err != nil {
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record the rollback floor before freezing: %w", err))
+		}
+	}
+	// Whatever this pause plans, a freeze an earlier pause left is resolved
+	// first: a custom directory or a host that cannot freeze must not publish
+	// a frozen workload as unfrozen. A refusal keeps that intent for the retry.
+	if err := m.resolveOutstandingFreeze(ctx, vmID, socketPath, instIP, recordedArtifact, log); err != nil {
+		return "", "", nil, m.handleVMError(vmID, err)
+	}
+	if willFreeze {
+		// Durable BEFORE the freeze: a crash after it must find the token,
+		// or the guest stays frozen with nobody able to release it.
+		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, FreezeToken: freezeToken, ArtifactID: artifactID}); err != nil {
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
+		}
+	} else if wakeProtocolFloorRaised() && snapshotDir == filepath.Join(m.cfg.SnapshotDir, vmID) && m.mayBeFrozenAt(overlayPath, fullPath) {
+		// An unfrozen pause overwriting an image whose manifest says frozen,
+		// or cannot be read:
+		// the image is rewritten before the manifest is replaced, so the
+		// rewrite is recorded and a restore refuses the image until recovery
+		// removes the stale manifest. Only a host with frozen images holds one.
+		if artifactID == "" {
+			artifactID = NewArtifactID()
+		}
+		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, ArtifactID: artifactID}); err != nil {
+			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
+		}
+	}
+	// Freeze the workload before the image exists — only when the restore would
+	// freeze the clock; otherwise the freeze buys nothing.
+	guestFrozen := false
+	if willFreeze {
+		var ferr error
+		guestFrozen, ferr = m.freezeGuestForPause(ctx, instIP, freezeToken, log)
+		freezeDur = time.Since(tFreeze)
+		if ferr != nil {
+			// The guest may be frozen and could not be shown released: it
+			// must not be served as running. The intent keeps its token.
+			m.markUnservable(inst, ferr, log)
+			return "", "", nil, m.handleVMError(vmID, ferr)
+		}
+	}
+	// The manifest says what this image holds: an unfrozen one restores the
+	// unfrozen way. What the guest can do is not rewritten by what this pause did.
+	snapshotOK := false
+	if guestFrozen {
+		// A failed snapshot leaves the VM running; do not leave it frozen.
+		defer func() {
+			if snapshotOK {
+				return
+			}
+			if terr := m.releaseOrConfirmRunning(ctx, socketPath, instIP, freezeToken); terr != nil {
+				m.markUnservable(inst, fmt.Errorf("snapshot failed and the guest could not be released: %w", terr), log)
+			}
+		}()
+	}
 	layered := m.cfg.IncrementalSnapshotEnabled && dirtyTracked && instBaseMem != "" &&
 		(instMemFile == instBaseMem || overlayPath == instMemFile)
 	baseMemPath := ""
+	// Which memory image this pause writes — the field that makes a slow
+	// full-snapshot pause visible at a glance. Bounded: layered|diff|full.
+	snapshotType = "full"
+	tSnapshot = time.Now()
+	// orphanedOverlay is the accumulated mem.diff a layered→Full fallback
+	// strands: the record's artifact becomes mem.snap, so DeleteSnapshotFiles
+	// would never reclaim the overlay. It still backs the running VM via UFFD
+	// until the stop below, so removal is deferred to after a confirmed stop.
+	orphanedOverlay := ""
 	// CreateDiffSnapshot merges in place: an interrupted diff has no surviving copy
 	// of the file it overwrites (for layered, only the session delta — the template
 	// base is untouched; for in-place, the VM's own mem.snap). Crash-atomicity of the
@@ -985,48 +1904,197 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 				usable = false
 			}
 		}
+		// A presence map that cannot be marked cannot be proven this save's
+		// afterwards, and an unproven map is one a restore may trust wrongly:
+		// a Full instead.
+		var sidecarMark time.Time
 		if usable {
-			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
-			saveStart := time.Now()
-			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
-				// A failed diff may have left a partial overlay. Drop the .base sidecar
-				// so a later restore can't treat that partial data as a valid layered
-				// overlay — without the sidecar it's refused (overlay-without-base),
-				// failing loud instead of loading corrupt memory. The overlay file
-				// itself is left in place: handleVMError keeps a still-running VM, which
-				// may still have it mmap'd. (True crash-atomicity is out of scope.)
-				// The presence side-car goes too — it describes the pre-failure
-				// overlay. Racing a still-running Firecracker is benign: a side-car it
-				// rewrites after this remove matches the completed dump, and with
-				// .base gone the restore is refused regardless.
-				_ = os.Remove(layeredBaseSidecarPath(memPath))
-				_ = os.Remove(presence.SidecarPath(memPath))
-				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
+			var markErr error
+			if sidecarMark, markErr = markPresenceForSave(memPath); markErr != nil {
+				log.Warn().Err(markErr).Msg("pause: presence side-car could not be marked; falling back to Full")
+				usable = false
 			}
-			m.verifyPresenceRefreshed(memPath, saveStart, log)
+		}
+		if usable {
+			snapshotType = "layered"
+			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
+			// One Full pause is the safe degradation from a layered one
+			// (the vCPUs are already paused; CreateSnapshot's pause PATCH is
+			// idempotent). Nothing is removed until that Full has landed: if
+			// it fails the VM keeps running and the overlay with its
+			// sidecars is still the valid artifact.
+			fullInstead := func(why string, err error) error {
+				log.Warn().Err(err).Str("vm_id", vmID).Msg("pause: " + why + "; falling back to full snapshot")
+				snapshotType = "full"
+				memPath, baseMemPath = fullPath, ""
+				if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+					snapshotDur = time.Since(tSnapshot)
+					return m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+				}
+				if instMemFile == overlayPath {
+					// The accumulating overlay is now stranded; reclaimed
+					// with its sidecars after the stop.
+					orphanedOverlay = overlayPath
+				} else {
+					// First pass: whatever of the overlay exists, from the
+					// .base sidecar written above to a diff that was not
+					// proven whole, is for an image that never followed.
+					_ = os.Remove(layeredBaseSidecarPath(overlayPath))
+					_ = freshenFirstPassOverlay(overlayPath)
+				}
+				return nil
+			}
+			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, trackingSessionID, trackingGeneration); err != nil {
+				if errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err) {
+					// Rejected before Firecracker touched the bitmap or the
+					// overlay.
+					if ferr := fullInstead("guarded diff rejected", err); ferr != nil {
+						return "", "", nil, ferr
+					}
+				} else {
+					snapshotDur = time.Since(tSnapshot)
+					// A failed diff may have left a partial overlay. Drop the .base sidecar
+					// so a later restore can't treat that partial data as a valid layered
+					// overlay — without the sidecar it's refused (overlay-without-base),
+					// failing loud instead of loading corrupt memory. The overlay file
+					// itself is left in place: handleVMError keeps a still-running VM, which
+					// may still have it mmap'd. (True crash-atomicity is out of scope.)
+					// The presence side-car goes too — it describes the pre-failure
+					// overlay. Racing a still-running Firecracker is benign: a side-car it
+					// rewrites after this remove matches the completed dump, and with
+					// .base gone the restore is refused regardless.
+					_ = os.Remove(layeredBaseSidecarPath(memPath))
+					_ = os.Remove(presence.SidecarPath(memPath))
+					_ = os.Remove(clockFreezeMarkerPath(memPath))
+					return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
+				}
+			} else if verr := m.verifyPresenceRefreshed(memPath, sidecarMark); verr != nil {
+				// The diff landed, but its map was not proven this save's:
+				// absent, a strict host refuses the image; stale, a restore
+				// trusts it wrongly. The image is not published; the Full
+				// that replaces it holds everything, and the overlay is
+				// stranded or removed with it.
+				if ferr := fullInstead("presence side-car not proven this save's", verr); ferr != nil {
+					return "", "", nil, ferr
+				}
+			}
 		} else {
+			// Same stranding as the mismatch fallback: an accumulating
+			// overlay this Full pause abandons is reclaimed after the stop.
+			if instMemFile == overlayPath {
+				orphanedOverlay = overlayPath
+			}
 			memPath, baseMemPath = fullPath, ""
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+				snapshotDur = time.Since(tSnapshot)
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
 		}
 	default:
 		memPath = fullPath
+		// A source on its overlay whose tracking was spent, by a capture
+		// that fell back to a full image, pauses Full here: the overlay it
+		// leaves is reclaimed after the stop, as the layered fallback's is.
+		if instMemFile == overlayPath {
+			orphanedOverlay = overlayPath
+		}
 		// In-place diff (no template base): merge dirtied pages into the VM's own
 		// mem.snap when tracking was armed this run and mem.snap is the resume base —
 		// dirtied offsets are resident/never re-faulted, disjoint from clean reads.
 		if shouldWriteDiff(m.cfg.IncrementalSnapshotEnabled, dirtyTracked, memPath, instMemFile, fileExists(memPath)) {
+			snapshotType = "diff"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating diff snapshot")
-			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath); err != nil {
-				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
+			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, trackingSessionID, trackingGeneration); err != nil {
+				if errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err) {
+					// Rejected before the bitmap or mem.snap was touched; a
+					// Full dump to the same path is the safe degradation.
+					log.Warn().Err(err).Str("vm_id", vmID).
+						Msg("pause: guarded diff rejected; falling back to full snapshot")
+					snapshotType = "full"
+					if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+						snapshotDur = time.Since(tSnapshot)
+						return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+					}
+				} else {
+					snapshotDur = time.Since(tSnapshot)
+					return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create diff snapshot: %w", err))
+				}
 			}
 		} else {
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating snapshot")
 			if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+				snapshotDur = time.Since(tSnapshot)
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
 			}
 		}
 	}
+
+	// The manifest lands after the image, beside the image this pause wrote
+	// only: an untouched image keeps its own, still the last good one if this
+	// pause dies here. Frozen: mandatory and durable, or an overlay would read
+	// as legacy elsewhere and never be woken; the deferred thaw releases the
+	// guest on failure.
+	if correctsWallClock {
+		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifactID, WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
+		if guestFrozen {
+			man.FreezeToken = freezeToken
+			// A file and a directory sync while the guest is stopped: timed
+			// as its own phase, so a storage stall here has a name.
+			tManifest := time.Now()
+			merr := WriteWallClockManifest(memPath, man)
+			manifestDur = time.Since(tManifest)
+			if merr != nil {
+				// The deferred thaw resumes and releases the guest; the
+				// consumed baseline is dropped here so the retry is Full.
+				m.abandonDirtyBaseline(inst)
+				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("write wall-clock manifest: %w", merr))
+			}
+		} else {
+			// Unfrozen: lazy where no manifest exists, since losing it costs
+			// only a slower resume; replaced durably where one exists, since
+			// it may say frozen under a token this guest already answered.
+			_, serr := os.Stat(clockFreezeMarkerPath(memPath))
+			replacing := serr == nil
+			var merr error
+			if replacing {
+				tManifest := time.Now()
+				merr = WriteWallClockManifest(memPath, man)
+				manifestDur = time.Since(tManifest)
+			} else {
+				merr = writeWallClockManifestLazy(memPath, man)
+			}
+			if merr != nil {
+				// No manifest is safe for an unfrozen image; a stale frozen
+				// one is not. The stale one goes, durably, or the pause
+				// fails; a marker that was not a frozen manifest and will not
+				// go is harmless and only logged.
+				if blocking, rerr := removeWallClockManifest(memPath); rerr != nil && blocking {
+					return "", "", nil, m.failAfterSnapshot(inst, socketPath, fmt.Errorf("wall-clock manifest write failed (%v) and the stale one could not be cleared: %w", merr, rerr))
+				} else if rerr != nil {
+					log.Warn().Err(rerr).Str("path", WallClockMarkerPath(memPath)).Msg("pause: a stale marker could not be removed")
+				}
+				log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).
+					Msg("pause: wall-clock manifest write failed; resume falls back to legacy clock behaviour")
+			}
+		}
+	} else {
+		// No manifest for a guest that cannot correct its clock; a stale one
+		// goes, durably. A marker that will not go fails the pause unless it
+		// is known harmless. The vCPUs are paused from the snapshot on: a
+		// failure here must not strand them.
+		tManifest := time.Now()
+		blocking, merr := removeWallClockManifest(memPath)
+		if d := time.Since(tManifest); d > time.Millisecond {
+			manifestDur = d
+		}
+		if merr != nil && blocking {
+			return "", "", nil, m.failAfterSnapshot(inst, socketPath, fmt.Errorf("clear stale wall-clock manifest for %q: %w", memPath, merr))
+		} else if merr != nil {
+			log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).Msg("pause: a stale marker could not be removed")
+		}
+	}
+
+	snapshotOK = true
 
 	// Stop the Firecracker process — snapshot is already on disk. A stop
 	// that fails must NOT fail the pause: the artifacts are valid and the
@@ -1038,25 +2106,77 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// deadline, and inheriting it would kill the stop before it starts. The
 	// snapshot is durable and the record reaches Paused either way; the
 	// budget only bounds how long this handler lingers past the RPC, and a
-	// straggler unit is still reclaimed by the reconciler.
-	unit := systemdUnitName(vmID)
+	// straggler VM is still reclaimed by the reconciler.
+	snapshotDur = time.Since(tSnapshot)
+	inst.mu.RLock()
+	pauseSupervision := inst.Supervision
+	inst.mu.RUnlock()
 	stopConfirmed := true
+	tStop := time.Now()
 	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(ctx), stopUnitBudget)
-	if err := stopUnit(stopCtx, unit); err != nil {
-		log.Warn().Err(err).Msg("systemctl stop failed during pause; retrying")
-		if serr := stopUnit(stopCtx, unit); serr != nil && !unitDefinitelyDead(stopCtx, unit) {
+	stopErr := m.stopVM(stopCtx, vmID, pauseSupervision)
+	if stopErr != nil {
+		log.Warn().Err(stopErr).Msg("stop failed during pause")
+		// Retry only the unit path (a transient systemctl failure). The cgroup
+		// kill already SIGKILLs and waits the group empty on its own detached
+		// budget, so a second call is a redundant kill that spends a second
+		// full budget past the RPC without reviving a wedged FC.
+		if !cgroupSupervised(pauseSupervision) {
+			stopErr = m.stopVM(stopCtx, vmID, pauseSupervision)
+		}
+		if stopErr != nil && !m.vmDefinitelyDead(stopCtx, vmID, pauseSupervision) {
 			stopConfirmed = false
-			log.Error().Err(serr).Msg("unit still running after pause; reconciler will reclaim it")
+			// Pressure must keep counting this VM's allocation while the
+			// process may be live behind a Paused record (the unit oracle
+			// only covers unit mode; this marker covers both).
+			m.vmStopUnconfirmed.Store(vmID, struct{}{})
+			log.Error().Err(stopErr).Msg("VM still running after pause; reconciler will reclaim it")
 		}
 	}
 	stopCancel()
+	stopDur = time.Since(tStop)
+	if stopConfirmed {
+		// A confirmed stop resolves any unconfirmed marker from an
+		// earlier pause of this VM (resume relaunched it in between).
+		m.vmStopUnconfirmed.Delete(vmID)
+	}
+
+	// An overlay a layered→Full fallback stranded is never removed here, only
+	// recorded as a deferral: the durable record still names it as the live
+	// image until the paused record below lands, and a crash between an
+	// early unlink and that write would leave a Running record pointing at
+	// nothing. The reclaim runs after the write, and only once the VM is
+	// proven at rest — stopConfirmed is the RPC's notion of a finished stop,
+	// which deliberately includes a still-deactivating unit whose UFFD
+	// handler may still serve pages from the file. The same fully-down probe
+	// gates the backup below, on a detached ctx since the caller's may be
+	// spent.
+	atRest := stopConfirmed && m.vmConfirmedAtRest(probeCtx(), vmID)
+	if orphanedOverlay != "" {
+		log.Warn().Str("path", orphanedOverlay).Bool("at_rest", atRest).
+			Msg("pause: overlay stranded by the Full fallback; reclaimed once the paused record is durable and the VM is at rest")
+	}
 
 	inst.mu.Lock()
+	if orphanedOverlay != "" && !hasStrandedOverlay(inst, orphanedOverlay) {
+		// Appended, never replaced: an earlier deferral this run's resume
+		// displaced is still owed its reclaim.
+		inst.StrandedOverlays = append(inst.StrandedOverlays, orphanedOverlay)
+	}
 	inst.Status = StatusPaused
 	inst.SnapshotPath = snapshotPath
 	inst.MemFilePath = memPath
-	inst.BaseMemPath = baseMemPath // template base for a layered overlay; "" when standalone
-	inst.DirtyTracked = false      // FC process is stopping; a fresh resume re-arms tracking.
+	inst.BaseMemPath = baseMemPath   // template base for a layered overlay; "" when standalone
+	inst.DirtyTracked = false        // FC process is stopping; a fresh resume re-arms tracking.
+	inst.DirtyTrackingSessionID = "" // the session dies with the FC run
+	inst.DirtyTrackingGeneration = 0
+	inst.SnapshotWorkloadFrozen = &guestFrozen
+	inst.FreezeToken = ""
+	if guestFrozen {
+		inst.FreezeToken = freezeToken
+	}
+	inst.ArtifactID = artifactID
+	inst.PausedAt = time.Now()
 	// The crash-window marker describes a RUNNING record persisted before
 	// readiness was proven; a successful pause proves the guest was live and
 	// snapshots fresh artifacts, and its resume relaunches from them anyway.
@@ -1078,6 +2198,22 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		log.Warn().Msg("record deleted during pause stop — destroy owns the teardown")
 		return "", "", nil, status.Errorf(codes.NotFound, "vm %s destroyed during pause", vmID)
 	}
+	// The image, its manifest and the record are all durable: the rewrite is
+	// complete. An intent that cannot be removed now names the artifact the
+	// record does, which is how the next resume tells it from an interrupted
+	// one and clears it itself.
+	if willFreeze {
+		if err := clearPauseIntent(snapshotDir); err != nil {
+			log.Warn().Err(err).Str("dir", snapshotDir).Msg("pause: intent marker could not be cleared; the next resume clears it")
+		}
+	}
+
+	// Every deferral — this pause's and any earlier one — resolves now that
+	// the record naming the replacement image is durable, if the VM is at
+	// rest. The guard against the live artifact sees the image just written.
+	if atRest {
+		m.reclaimStrandedOverlays(inst, log)
+	}
 
 	// Hash the durable artifacts once the unit is stopped and the files are
 	// at rest. Runs under its own budget derived from the RPC deadline (see
@@ -1091,13 +2227,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// Firecracker keeps writing the overlay, and the recorded StatusPaused
 	// would satisfy the rehash's at-rest proof while the bytes are live. A
 	// later retry pause backs the artifacts up once the unit is truly dead.
-	// stopConfirmed alone is the RPC's notion of a finished stop, which
-	// deliberately includes a still-deactivating unit; hashing needs the
-	// stronger fully-down claim, so the gate reconfirms with the same
-	// probe the at-rest proof uses — on a detached probe ctx, since the
-	// caller's may be spent (the stop above detached for exactly that).
-	if stopConfirmed && m.unitConfirmedDead(probeCtx(), vmID) {
-		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, log)
+	// Gated on the fully-down claim probed above, not on stopConfirmed alone.
+	if atRest {
+		manifest = m.backupPause(ctx, vmID, snapshotPath, diskPath, diskBasePath, pauseToken, log)
 	} else if m.backupEnqueue != nil {
 		log.Warn().Msg("pause backup deferred: unit not confirmed fully down, bytes may still be changing")
 		// The pause still owes its backup. Leave a pending marker AND a
@@ -1105,12 +2237,19 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 		// a transiently failed write here), its at-rest proof holds the
 		// backup off until the unit is truly down, and the periodic
 		// sweep keeps retrying after the worker gives up.
-		pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath)
-		m.persistPendingBackup(pb, log)
+		pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath, pauseToken)
+		pb.unwritten = !m.persistPendingBackup(pb, log)
 		go m.rehashPendingBackup(ctx, pb, log)
 	}
 
-	log.Info().Msg("VM paused")
+	log.Info().
+		Str("snapshot_type", snapshotType).
+		Bool("guest_frozen", guestFrozen).
+		Int64("freeze_ms", freezeDur.Milliseconds()).
+		Int64("snapshot_ms", snapshotDur.Milliseconds()).
+		Int64("stop_ms", stopDur.Milliseconds()).
+		Int64("pause_ms", time.Since(tPause).Milliseconds()).
+		Msg("VM paused")
 	return snapshotPath, memPath, manifest, nil
 }
 
@@ -1177,6 +2316,11 @@ func freshenFirstPassOverlay(overlayPath string) error {
 	if err := os.Remove(presence.SidecarPath(overlayPath)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	// Same reasoning for the wall-clock marker: the fresh overlay has not been
+	// shown to come from a guest that corrects its own clock.
+	if err := os.Remove(clockFreezeMarkerPath(overlayPath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return nil
 }
 
@@ -1227,13 +2371,72 @@ func fileExists(path string) bool {
 // this returning and those steps acting on it. The gRPC adapter is the sole
 // caller and owns that lock scope; there is deliberately no self-locking
 // wrapper, which would release the lock before those steps and reopen the race.
-func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
+func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules) (*VMInstance, bool, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
+	var tSlot, tVerify, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
+	var verifyDur time.Duration
+	needsNetworkCleanup := false
+	defer func() {
+		if needsNetworkCleanup {
+			m.netMgr.TeardownVM(vmID)
+		}
+	}()
+	// Deferred, gated on real resume work having begun (tSlot): failed
+	// resumes must land in the phase distributions with whichever stages
+	// they reached — success-only emission hides the slowest failures.
+	// Precondition rejections before the slot claim emit nothing.
+	// Registered after the network-cleanup defer so it runs BEFORE
+	// TeardownVM: the elapsed-time fallbacks must not absorb teardown.
+	defer func() {
+		if !tVerify.IsZero() {
+			// Died mid-probe; count the elapsed verification time.
+			verifyDur += time.Since(tVerify)
+		}
+		if tSlot.IsZero() && verifyDur == 0 {
+			return
+		}
+		phases := map[string]time.Duration{
+			"total": time.Since(tEntry),
+		}
+		// Synchronous readiness verification — the pre-slot adoption gate
+		// and the post-restore gate for relaunched unverified records — is
+		// real resume work (each a bounded multi-second wait); a slow probe
+		// must not vanish from the distributions.
+		if verifyDur > 0 {
+			phases["verify"] = verifyDur
+		}
+		if tSlot.IsZero() {
+			m.recordPhases("resume", "", phases)
+			return
+		}
+		phases["prep"] = tSlot.Sub(tEntry)
+		switch {
+		case !tFcDone.IsZero():
+			phases["fc_start"] = tFcDone.Sub(tFcStart)
+		case !tFcStart.IsZero():
+			phases["fc_start"] = time.Since(tFcStart)
+		}
+		if !tFcStart.IsZero() {
+			phases["ensure_slot"] = tFcStart.Sub(tSlot)
+		} else {
+			// Slot/network preparation died mid-stage — report its elapsed
+			// time, or slow failed preparation stays invisible in the phase
+			// meant to identify it.
+			phases["ensure_slot"] = time.Since(tSlot)
+		}
+		switch {
+		case !tRestoreDone.IsZero():
+			phases["restore"] = tRestoreDone.Sub(tRestore)
+		case !tRestore.IsZero():
+			phases["restore"] = time.Since(tRestore)
+		}
+		m.recordPhases("resume", "", phases)
+	}()
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if snapshotPath == "" {
@@ -1243,7 +2446,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		memPath = inst.MemFilePath
 	}
 	if snapshotPath == "" || memPath == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
+		return nil, false, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
 	}
 
 	// Retried resume (response lost mid-RPC): the VM may already be up from
@@ -1256,13 +2459,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			// detached telemetry), so adoption matches: record + live unit
 			// suffice.
 			log.Info().Msg("resume: VM already running and healthy, returning it")
-			return existing, nil
+			return existing, m.applyAdoptedNetworkRules(vmID, networkRules), nil
 		}
 		// An unverified target is the one case where blindness is unsafe in
 		// BOTH directions: blind adoption hands back a corpse, blind refusal
 		// relaunches over a possibly-live guest. Evidence decides, with the
 		// gate restore adoption uses; success heals the marker durably.
-		if verr := m.verifyBoxdReady(ctx, existing.IP); verr != nil {
+		tVerify = time.Now()
+		verr := m.verifyBoxdReady(ctx, existing.IP, existing)
+		verifyDur += time.Since(tVerify)
+		tVerify = time.Time{}
+		if verr != nil {
 			// A genuine verdict (see verifyBoxdReady): the record is a corpse.
 			// Record it before relaunching: the relaunch can still fail a
 			// precondition, and those paths return without touching status
@@ -1278,17 +2485,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			// instead — the next attempt re-derives the verdict.
 			switch wrote, perr := m.persistStateIfPresent(existing); {
 			case perr != nil:
-				return nil, fmt.Errorf("record readiness verdict for vm %s: %w", vmID, perr)
+				return nil, false, fmt.Errorf("record readiness verdict for vm %s: %w", vmID, perr)
 			case !wrote:
-				return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during resume", vmID)
+				return nil, false, status.Errorf(codes.NotFound, "vm %s was destroyed during resume", vmID)
 			}
 			log.Warn().Err(verr).Msg("resume: unverified VM failed readiness — relaunching")
 		} else {
 			if cerr := m.commitVerifiedAdoption(existing); cerr != nil {
-				return nil, cerr
+				return nil, false, cerr
 			}
 			log.Info().Msg("resume: unverified VM verified and adopted")
-			return existing, nil
+			return existing, m.applyAdoptedNetworkRules(vmID, networkRules), nil
 		}
 	}
 
@@ -1305,15 +2512,46 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// pause-sourced restore.
 	if _, err := os.Stat(snapshotPath); err != nil {
 		if os.IsNotExist(err) {
-			return nil, status.Errorf(codes.FailedPrecondition, "snapshot file missing on host: %s", snapshotPath)
+			return nil, false, status.Errorf(codes.FailedPrecondition, "snapshot file missing on host: %s", snapshotPath)
 		}
-		return nil, status.Errorf(codes.FailedPrecondition, "stat snapshot %s: %v", snapshotPath, err)
+		return nil, false, status.Errorf(codes.FailedPrecondition, "stat snapshot %s: %v", snapshotPath, err)
 	}
 	if _, err := os.Stat(memPath); err != nil {
 		if os.IsNotExist(err) {
-			return nil, status.Errorf(codes.FailedPrecondition, "memory file missing on host: %s", memPath)
+			return nil, false, status.Errorf(codes.FailedPrecondition, "memory file missing on host: %s", memPath)
 		}
-		return nil, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
+		return nil, false, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
+	}
+	// What the image says about its guest, read before anything is launched.
+	// An ordinary resume reloads the exact image this VM was paused into, and
+	// the record already holds the answer; only an override, or a record that
+	// lost it, goes to disk. An intent left beside the image by a pause that was
+	// interrupted, or a manifest this binary cannot trust, refuses the resume
+	// here; a frozen workload owes a wake before the resume commits. An intent
+	// exists only on a host whose floor is up; elsewhere nothing is looked for.
+	inst.mu.RLock()
+	recordedCorrects, recordedFrozen, recordedToken := inst.CorrectsWallClock, inst.SnapshotWorkloadFrozen, inst.FreezeToken
+	pausedMemPath, recordedArtifact, entryUnverified := inst.MemFilePath, inst.ArtifactID, inst.Unverified
+	// The identity the record carried in: a frozen resume stamps this run's
+	// slot before the launch and hands it back if it does not commit. The
+	// loaded image's token rides WakeToken until the commit.
+	entrySocket, entryIP, entryTAP, entryMAC, entryNS := inst.SocketPath, inst.IP, inst.TAPDevice, inst.MACAddress, inst.Namespace
+	inst.mu.RUnlock()
+	if wakeProtocolFloorRaised() {
+		if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), recordedArtifact); blocked {
+			return nil, false, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing resume until it is inspected", memPath, why)
+		}
+	}
+	resumeCorrectsWallClock, resumeWorkloadFrozen, resumeToken, merr := resumeImageFacts(memPath, pausedMemPath, recordedCorrects, recordedFrozen, recordedToken)
+	if merr != nil {
+		return nil, false, status.Errorf(codes.FailedPrecondition, "%v", merr)
+	}
+	if resumeWorkloadFrozen {
+		// The floor rises before this host acts on an image that owes a wake,
+		// or a rollback could later meet the image with nothing to witness it.
+		if err := m.ensureWakeFloorTimed("resume"); err != nil {
+			return nil, false, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", memPath, err)
+		}
 	}
 	// Presence gate for layered overlays. Deterministic from a stat, so it
 	// belongs here with the other precondition checks — a post-boot refusal
@@ -1321,7 +2559,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// auto-resume retry of a sandbox whose side-car was lost in transfer.
 	if isOverlayMemFile(memPath) {
 		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
-			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
+			return nil, false, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
 
@@ -1345,24 +2583,28 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
-	tSlot := time.Now()
+	tSlot = time.Now()
 	var netInfo *network.VMNetInfo
-	if inst.Namespace != "" {
+	nsName := inst.Namespace
+	if nsName != "" {
 		var nsErr error
-		netInfo, nsErr = m.netMgr.EnsureVMSlot(ctx, vmID, inst.Namespace, inst.IP, inst.MACAddress)
+		netInfo, nsErr = m.netMgr.EnsureVMSlot(ctx, vmID, nsName, inst.IP, inst.MACAddress)
 		if nsErr != nil {
-			return nil, fmt.Errorf("ensure network slot for resume: %w", nsErr)
+			return nil, false, fmt.Errorf("ensure network slot for resume: %w", nsErr)
 		}
+	} else {
+		var netErr error
+		netInfo, netErr = m.netMgr.SetupVM(ctx, vmID, nil)
+		if netErr != nil {
+			return nil, false, fmt.Errorf("setup network for resume: %w", netErr)
+		}
+		nsName = netInfo.Namespace
+		needsNetworkCleanup = true
+	}
+	if err := m.applySandboxNetworkRules(vmID, netInfo, networkRules); err != nil {
+		return nil, false, err
 	}
 
-	tFcStart := time.Now()
-	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, false)
-	if err != nil {
-		return nil, fmt.Errorf("start firecracker for restore: %w", err)
-	}
-	tFcDone := time.Now()
-
-	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
 	// (not the cached BaseMemPath) means a standalone/override resume clears any
 	// stale base, so the next pause won't wrongly diff against the old template.
@@ -1379,37 +2621,190 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			basePath = inst.BaseMemPath
 		}
 		if basePath == "" {
-			m.stopUnitDuringRestoreError(vmID)
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, false, status.Errorf(codes.FailedPrecondition,
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
 		}
 	}
-	tRestore := time.Now()
-	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
-	tRestoreDone := time.Now()
-	if err != nil {
-		// Firecracker is already running; stop the unit before returning or it leaks.
-		m.stopUnitDuringRestoreError(vmID)
-		if errors.Is(err, ErrTornSnapshot) {
-			return nil, status.Errorf(codes.DataLoss,
-				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
-				snapshotPath, err)
+
+	var (
+		pid               int
+		dirtyTracked      bool
+		trackingSessionID string
+		restoreErr        error
+		resumeClockFrozen bool
+		syncWake          time.Duration
+	)
+	// A frozen image publishes Running with a wake owed before each launch (see
+	// persistWakeOwed). A resume that then fails leaves that record claiming a
+	// guest that never came back: put the sandbox back to Paused, unless a
+	// failure path already gave a more specific verdict.
+	published, committed := false, false
+	defer func() {
+		if !published || committed {
+			return
 		}
-		if errors.Is(err, ErrLayeredInvalidSnapshot) {
-			// Permanent: the overlay/base pairing is structurally invalid, so retrying
-			// the layered restore can't succeed. FailedPrecondition tells the caller not
-			// to retry (vs the generic Internal below, which it may).
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
-				snapshotPath, err)
+		inst.mu.Lock()
+		revert := inst.Status == StatusRunning && inst.Unverified
+		if revert {
+			inst.Status = StatusPaused
+			inst.Unverified = entryUnverified
+			inst.WakePending = false
+			inst.ClockFrozen = false
+			inst.WakeOwedFromPaused = false
 		}
-		return nil, fmt.Errorf("restore snapshot: %w", err)
+		// Whatever verdict the record got, it must not keep this run's
+		// identity: the slot goes back to the pool once this returns, and a
+		// retry that found it here would claim whatever sandbox holds it
+		// next. The in-flight token goes with it.
+		restamped := inst.IP != entryIP || inst.Namespace != entryNS || inst.WakeToken != ""
+		inst.SocketPath, inst.IP, inst.TAPDevice, inst.MACAddress, inst.Namespace = entrySocket, entryIP, entryTAP, entryMAC, entryNS
+		inst.dropWakeImage()
+		inst.mu.Unlock()
+		if !revert && !restamped {
+			return
+		}
+		// Durable before the deferred teardown releases the slot. If the
+		// write fails the durable record still names the slot, so the slot
+		// stays this sandbox's until a write succeeds: leaked for now, never
+		// claimed from another sandbox after a restart.
+		if _, perr := m.persistStateIfPresent(inst); perr != nil {
+			needsNetworkCleanup = false
+			log.Error().Err(perr).Msg("resume rollback could not be made durable; keeping the network slot reserved for this sandbox")
+		}
+	}()
+	// If this Firecracker refuses the clock option, the record must say the
+	// clock ran before the legacy retry can run the vCPUs.
+	demote := func() error {
+		inst.mu.Lock()
+		inst.ClockFrozen = false
+		inst.mu.Unlock()
+		// Fenced like the wake-owed write: a destroy landing here must not
+		// be resurrected, and a VM that is gone gets no legacy load.
+		if !m.persistWhileTracked(inst) {
+			return fmt.Errorf("vm %s: clock policy could not be made durable before the legacy restore", vmID)
+		}
+		return nil
+	}
+	// Two passes at most: a frozen-clock restore whose guest cannot correct its
+	// clock is relaunched unfrozen. Only Firecracker is torn down between
+	// passes; the slot, the network, and this frame's cleanup are kept.
+	for pass := 0; ; pass++ {
+		tFcStart = time.Now()
+		inst.mu.RLock()
+		resumeExisting := inst.Supervision
+		inst.mu.RUnlock()
+		resumePolicy := m.clockPolicyFor(resumeWorkloadFrozen)
+		var joinWakeOwed func(Supervision) bool
+		if resumeWorkloadFrozen {
+			predicted := SupervisionUnit
+			if m.cgroupLaunch(resumeExisting) {
+				predicted = SupervisionCgroup
+			}
+			// The record recovery would act on must name this launch's guest:
+			// the slot this resume took and the token the image resolved to,
+			// stamped before the write that owes the wake, not after it.
+			inst.mu.Lock()
+			inst.SocketPath = socketPath
+			inst.IP = netInfo.HostIP
+			inst.TAPDevice = netInfo.TAPDevice
+			inst.MACAddress = netInfo.MACAddress
+			inst.Namespace = nsName
+			inst.WakeToken = resumeToken
+			inst.WakeSnapshotPath, inst.WakeMemPath = snapshotPath, memPath
+			inst.mu.Unlock()
+			joinWakeOwed = m.persistWakeOwed(inst, predicted, resumePolicy != nil, true)
+			published = true
+		}
+		// freshUnit=false: a resume replaces a paused VM's slot, never a brand-new
+		// unit, so it must always run the linger query.
+		var resumeSupervision = resumeExisting
+		var err error
+		pid, resumeSupervision, err = m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, nsName, resumeExisting, true, false)
+		// Stamp before the error branch too: a cgroup launch that forked FC but
+		// failed socket-readiness (kill unconfirmed) leaves a live process, so the
+		// instance must say cgroup for a later destroy to kill it, not no-op a unit.
+		inst.mu.Lock()
+		inst.Supervision = resumeSupervision
+		inst.mu.Unlock()
+		durable := true
+		if joinWakeOwed != nil {
+			durable = joinWakeOwed(resumeSupervision)
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("start firecracker for restore: %w", err)
+		}
+		if !durable && !m.persistWhileTracked(inst) {
+			// Fail closed: the vCPUs must not run ahead of the record that
+			// owes their wake.
+			m.stopUnitDuringRestoreError(vmID)
+			return nil, false, fmt.Errorf("vm %s: wake record could not be made durable before the load", vmID)
+		}
+		tFcDone = time.Now()
+
+		log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
+		tRestore = time.Now()
+		resumeClockFrozen = false
+		if m.restoreForResumeHook != nil {
+			dirtyTracked, trackingSessionID, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
+		} else {
+			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, resumePolicy, demote)
+		}
+		tRestoreDone = time.Now()
+		if restoreErr != nil {
+			// Firecracker is already running; stop the unit before returning or it leaks.
+			m.stopUnitDuringRestoreError(vmID)
+			if errors.Is(restoreErr, ErrTornSnapshot) {
+				return nil, false, status.Errorf(codes.DataLoss,
+					"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
+					snapshotPath, restoreErr)
+			}
+			if errors.Is(restoreErr, ErrLayeredInvalidSnapshot) {
+				// Permanent: the overlay/base pairing is structurally invalid, so retrying
+				// the layered restore can't succeed. FailedPrecondition tells the caller not
+				// to retry (vs the generic Internal below, which it may).
+				return nil, false, status.Errorf(codes.FailedPrecondition,
+					"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
+					snapshotPath, restoreErr)
+			}
+			return nil, false, fmt.Errorf("restore snapshot: %w", restoreErr)
+		}
+
+		// An image with a frozen workload is not resumed until the guest has
+		// released it, correcting its clock first if that was frozen too. If it
+		// cannot, the second pass relaunches with the clock running — the host is
+		// latched, so the policy resolves to legacy — and still owes the release.
+		if resumeWorkloadFrozen {
+			tWake := time.Now()
+			werr := boxdWakeGuest(context.WithoutCancel(ctx), netInfo.HostIP, boxdResumeReadyBudget, resumeClockFrozen, resumeToken)
+			syncWake = time.Since(tWake)
+			if werr != nil {
+				m.stopUnitDuringRestoreError(vmID)
+				if errors.Is(werr, ErrGuestClockUnready) && pass == 0 {
+					m.noteGuestClockUnready(log, werr)
+					continue
+				}
+				if errors.Is(werr, ErrGuestTokenMismatch) {
+					// This image and its record describe different snapshots.
+					// Durably Error, never retried: the artifacts are retained,
+					// and nothing is owed, so recovery cannot return it to Paused.
+					inst.mu.Lock()
+					inst.WakePending, inst.WakeOwedFromPaused = false, false
+					inst.dropWakeImage()
+					inst.mu.Unlock()
+					m.setStatus(vmID, StatusError)
+					return nil, false, status.Errorf(codes.FailedPrecondition, "image %q: %v", memPath, werr)
+				}
+				return nil, false, status.Errorf(codes.Unavailable, "guest did not wake after restore: %v", werr)
+			}
+			inst.mu.Lock()
+			inst.WakePending = false
+			inst.WakeOwedFromPaused = false
+			inst.mu.Unlock()
+		}
+		break
 	}
 
-	inst.mu.RLock()
-	wasUnverified := inst.Unverified
-	inst.mu.RUnlock()
-	if wasUnverified {
+	if entryUnverified {
 		// The relaunch of an unverified crash-window record verifies readiness
 		// synchronously (as its adoption above does): clearing the marker
 		// blind would let a same-artifact restore retry adopt an unready VM without
@@ -1418,19 +2813,34 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// (detached probe below). The guest was just relaunched from its
 		// snapshot, so this teardown discards nothing of value — but only a
 		// GENUINE verdict may reach it; see verifyBoxdReady.
-		if verr := m.verifyBoxdReady(ctx, inst.IP); verr != nil {
+		tVerify = time.Now()
+		verr := m.verifyBoxdReady(ctx, netInfo.HostIP, inst)
+		verifyDur += time.Since(tVerify)
+		tVerify = time.Time{}
+		if verr != nil {
 			m.stopUnitDuringRestoreError(vmID)
 			m.setStatus(vmID, StatusError)
-			return nil, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
+			return nil, false, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
 		}
 	}
 
 	inst.mu.Lock()
 	inst.PID = pid
 	inst.SocketPath = socketPath
+	inst.IP = netInfo.HostIP
+	inst.TAPDevice = netInfo.TAPDevice
+	inst.MACAddress = netInfo.MACAddress
+	inst.Namespace = nsName
 	inst.Status = StatusRunning
 	inst.Unverified = false
 	inst.DirtyTracked = dirtyTracked
+	inst.DirtyTrackingSessionID = trackingSessionID
+	inst.DirtyTrackingGeneration = 0
+	inst.CorrectsWallClock = &resumeCorrectsWallClock
+	inst.SnapshotWorkloadFrozen = &resumeWorkloadFrozen
+	inst.FreezeToken = resumeToken
+	inst.dropWakeImage()
+	inst.PausedAt = time.Time{}
 	// Record the file actually resumed from (callers may pass an explicit path
 	// that differs from the cached one) so the next pause's diff baseline matches
 	// what Firecracker's dirty bitmap is relative to.
@@ -1440,8 +2850,19 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.mu.Unlock()
 
 	if cerr := m.commitResumeState(inst); cerr != nil {
-		return nil, cerr
+		return nil, false, cerr
 	}
+	committed = true
+	// A legacy paused record is the one case reattach cannot recover:
+	// it skips paused VMs because a paused VM has no Firecracker to ask.
+	// Resume is when one becomes askable again, so without this such a
+	// VM would stay unsized for the rest of its life and keep its host
+	// permanently under-described. No-op for every VM whose size is
+	// known, which after the declared-allocation contract is all of them.
+	if m.pressureAccounting {
+		m.backfillMachineConfigAsync(inst)
+	}
+	needsNetworkCleanup = false
 	// Resume-side phase parity with the create path's "restoring snapshot"
 	// line; wait_boxd_ms arrives async on the probe log below. prep spans
 	// the op-lock wait plus the precondition gates, so a duplicate-resume
@@ -1452,6 +2873,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		Int64("fc_start_ms", tFcDone.Sub(tFcStart).Milliseconds()).
 		Int64("restore_ms", tRestoreDone.Sub(tRestore).Milliseconds()).
 		Int64("total_ms", time.Since(tEntry).Milliseconds()).
+		Bool("guest_clock_frozen", resumeClockFrozen).
 		Msg("VM resumed from snapshot")
 
 	// Telemetry only: measure how long boxd takes to become reachable after
@@ -1462,21 +2884,35 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// exec-503 incidents.
 	probeStart := time.Now()
 	vmIP := inst.IP
+	probe := boxdHealthProbe
+	if resumeWorkloadFrozen {
+		// Readiness was proven by the wake; the detached probe has nothing to add.
+		log.Info().Int64("wait_boxd_ms", syncWake.Milliseconds()).Msg("guest awake after resume")
+		m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": syncWake})
+	}
 	go func() {
+		if resumeWorkloadFrozen {
+			return
+		}
 		defer sentrylog.Recover("resume-boxd-probe")
 		probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := m.waitForBoxd(probeCtx, vmIP, 30*time.Second); err != nil {
+		if err := probe(probeCtx, vmIP, 30*time.Second); err != nil {
 			log.Warn().Err(err).
 				Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 				Msg("boxd not reachable after resume")
+			// Emit the timeout sample too: dropping it would censor exactly
+			// the exec-unavailable incidents this series exists to reveal —
+			// they'd appear as missing observations instead of a ~30s mode.
+			m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": time.Since(probeStart)})
 			return
 		}
 		log.Info().
 			Int64("wait_boxd_ms", time.Since(probeStart).Milliseconds()).
 			Msg("boxd reachable after resume")
+		m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": time.Since(probeStart)})
 	}()
-	return inst, nil
+	return inst, true, nil
 }
 
 // restoreForResume picks the resume memory backend: UFFD (reusing the existing tap
@@ -1484,7 +2920,10 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 // tap is present, else File. A layered overlay (basePath set) requires UFFD. Reports
 // whether dirty-page tracking was armed so the caller can decide if the next pause
 // may write a Diff.
-func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, err error) {
+// clockPolicy is resolved by the caller so the resume log can report what was
+// asked for without stat-ing the marker a second time; beforeLegacy runs
+// before the legacy retry if this Firecracker refuses the option.
+func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo, clockPolicy *bool, beforeLegacy func() error) (dirtyTracked bool, trackingSessionID string, clockFrozen bool, err error) {
 	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
 	if !useUffd {
 		// A layered overlay can only be served by the UFFD layered backend. If this
@@ -1492,19 +2931,51 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		// than load the sparse overlay via the File backend, which would read the
 		// base's pages as zero holes.
 		if basePath != "" {
-			return false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
+			return false, "", false, fmt.Errorf("layered overlay %q requires UFFD resume (resume-uffd + uffd + tap); refusing File-backend restore", memPath)
 		}
-		return false, RestoreSnapshot(socketPath, snapshotPath, memPath, "")
+		used, rerr := m.restoreWithClockFallback(clockPolicy, beforeLegacy, func(clock *bool) error {
+			return RestoreSnapshot(socketPath, snapshotPath, memPath, "", clock)
+		})
+		return false, "", used, rerr
 	}
 
 	// No prefetch access log: only template builds record one (next to the template
 	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
 	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
-	return trackDirty, RestoreSnapshotUffdInternalWithOverrides(
-		socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
-		m.cfg.HandlerDeathAbortEnabled,
-	)
+	sessionID := ""
+	if trackDirty && m.sessionArmingEnabled() {
+		sessionID = newTrackingSessionID()
+	}
+	armed, used, rerr := m.restoreWithSessionFallback(sessionID, func(sid string) (bool, error) {
+		return m.restoreWithClockFallback(clockPolicy, beforeLegacy, func(clock *bool) error {
+			return RestoreSnapshotUffdInternalWithOverrides(
+				socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+				m.cfg.HandlerDeathAbortEnabled, false, sid, clock,
+			)
+		})
+	})
+	return trackDirty, armed, used, rerr
+}
+
+// newTrackingSessionID mints the random token a dirty-tracking session is
+// armed with. Uniqueness per arming event is all that matters — vmd is the
+// only API client — so 16 random bytes are ample.
+//
+// Deliberately synchronous on the restore path: on Linux crypto/rand is
+// getrandom(2), which blocks only until the kernel entropy pool initializes
+// once at early boot — a state a host running vmd left long ago. After that
+// it is a microsecond-scale call against the multi-millisecond LoadSnapshot
+// RPC it precedes, so a precomputed-token pool would add plumbing to shave
+// nothing measurable.
+func newTrackingSessionID() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		// Out of entropy is effectively unreachable; an empty id just means
+		// this run's pause is unguarded, which degrades to today's behavior.
+		return ""
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // VerifySnapshot loads vmID's snapshot without resuming, re-snapshots the frozen
@@ -1560,23 +3031,63 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	}
 	socketPath := filepath.Join(m.cfg.RunDir, rundirKey, "firecracker.sock")
 
-	var tapDevice string
+	var (
+		tapDevice string
+		nsName    string
+	)
 	if inst.Namespace != "" {
 		netInfo, nsErr := m.netMgr.EnsureVMSlot(ctx, vmID, inst.Namespace, inst.IP, inst.MACAddress)
 		if nsErr != nil {
 			return "", fmt.Errorf("ensure network slot for verify: %w", nsErr)
 		}
 		tapDevice = netInfo.TAPDevice
+		nsName = netInfo.Namespace
+	} else {
+		netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, nil)
+		if netErr != nil {
+			return "", fmt.Errorf("setup network for verify: %w", netErr)
+		}
+		tapDevice = netInfo.TAPDevice
+		nsName = netInfo.Namespace
+		defer m.netMgr.TeardownVM(vmID)
 	}
 
-	// Throwaway Firecracker in the sandbox's existing unit/rundir, stopped on the
+	// Throwaway Firecracker in the sandbox's existing rundir, stopped on the
 	// way out. Safe because the VM is paused (no live FC to disrupt), but it must
 	// not run concurrently with a resume of the same sandbox — fine for the
-	// debug/staging use this endpoint is gated to.
-	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace, false); err != nil {
+	// debug/staging use this endpoint is gated to. The deferred stop uses the
+	// mode this launch ACTUALLY chose (arming can put a legacy VM's throwaway
+	// on the cgroup path), or the FC and its cgroup outlive the verify.
+	// freshUnit=false: a verify throwaway reuses the VM's id, so the linger
+	// query must run.
+	inst.mu.RLock()
+	verifyExisting := inst.Supervision
+	inst.mu.RUnlock()
+	_, verifySupervision, err := m.launchFirecracker(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, nsName, verifyExisting, true, false)
+	// Register the mode-aware stop BEFORE the error branch: a cgroup launch that
+	// forked FC but failed socket-readiness (kill unconfirmed) returns cgroup
+	// mode with an error and leaves a live throwaway, so the deferred stop must
+	// run to kill it — or the FC and its tap outlive the verify. A no-op when
+	// nothing spawned (stopVM is idempotent on a missing group or unit).
+	defer func() {
+		sctx, scancel := context.WithTimeout(context.Background(), stopUnitBudget)
+		stopErr := m.stopVM(sctx, vmID, verifySupervision)
+		scancel()
+		// Same verdict rule as pause and restore-error cleanup: the
+		// throwaway FC's memory is real until its death is proven, and
+		// the instance reads Paused — invisible to pressure without the
+		// marker. Resolution (including empty-group-with-failed-rmdir)
+		// clears any stale marker instead.
+		if stopErr == nil ||
+			(cgroupSupervised(verifySupervision) && m.cgroupDefinitelyDead(vmID)) {
+			m.vmStopUnconfirmed.Delete(vmID)
+		} else {
+			m.vmStopUnconfirmed.Store(vmID, struct{}{})
+		}
+	}()
+	if err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
-	defer func() { _ = stopUnitWithBudget(context.Background(), systemdUnitName(vmID)) }()
 
 	if err := LoadSnapshotNoResume(socketPath, snapshotPath, memPath, "eth0", tapDevice, ""); err != nil {
 		return "", err
@@ -1601,6 +3112,15 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 
 // CreateVMSnapshot captures a point-in-time snapshot of a running VM.
 func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string) (snapshotPath, memPath string, err error) {
+	// Under the VM's lifecycle lock, like a pause: the intent read below must
+	// not take a pause in flight for an abandoned one and release the guest
+	// that pause is freezing, and the image is of a guest no concurrent
+	// lifecycle op is moving. Unrelated sandboxes are not serialized.
+	unlockOp, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return "", "", err
+	}
+	defer unlockOp()
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return "", "", err
@@ -1609,6 +3129,19 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID, fmt.Sprintf("snap-%d", time.Now().Unix()))
 	}
+	// An ad-hoc image is never marked, so it restores without a wake: only a
+	// running guest no earlier pause left frozen may be captured. A paused
+	// record's Firecracker may have outlived a failed stop, workload frozen.
+	inst.mu.RLock()
+	adHocStatus := inst.Status
+	adHocSocket, adHocIP, adHocArtifact := inst.SocketPath, inst.IP, inst.ArtifactID
+	inst.mu.RUnlock()
+	if adHocStatus != StatusRunning {
+		return "", "", status.Errorf(codes.FailedPrecondition, "vm %s is %v; an ad-hoc snapshot needs a running VM", vmID, adHocStatus)
+	}
+	if err := m.resolveOutstandingFreeze(ctx, vmID, adHocSocket, adHocIP, adHocArtifact, m.log.With().Str("vm_id", vmID).Logger()); err != nil {
+		return "", "", err
+	}
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		return "", "", fmt.Errorf("create snapshot dir: %w", err)
 	}
@@ -1616,6 +3149,25 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
 	memPath = filepath.Join(snapshotDir, "mem.snap")
 
+	// A directory reused over a frozen image: the image is replaced before
+	// its manifest goes, and a crash or a failed resume in between would leave
+	// the old frozen manifest governing the new unfrozen image. The rewrite is
+	// journalled first, so a restore refuses the image until the manifest is
+	// gone; the journal is cleared with it. Only a host with frozen images
+	// can hold such a manifest.
+	journalled := false
+	if wakeProtocolFloorRaised() && m.mayBeFrozenAt(memPath) {
+		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, ArtifactID: NewArtifactID()}); err != nil {
+			return "", "", fmt.Errorf("record the ad-hoc rewrite of %q: %w", memPath, err)
+		}
+		journalled = true
+	}
+
+	// Before the snapshot, not after: CreateSnapshot consumes Firecracker's dirty
+	// bitmap and leaves the VM paused, so returning past that point would skip
+	// clearing DirtyTracked and the unpause below. Failing here has done nothing
+	// yet.
+	//
 	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
@@ -1627,15 +3179,41 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	// ad-hoc snapshot. Forces the next pause back to Full.
 	//
 	// Not persisted, deliberately: DirtyTracked is not in VMRecord, so a write
-	// here would duplicate the durable record while clobbering fields a
-	// concurrent lifecycle op just changed — this path holds no vm-op lock.
-	// Persisting from here needs that lock; see TestToRecordIgnoresDirtyTracked.
+	// here would only duplicate the durable record; see
+	// TestToRecordIgnoresDirtyTracked.
+	// The session id gets the same in-memory-only clear: skipping the guarded
+	// Diff it would fail saves one rejected RPC, and a stale PERSISTED session
+	// (this clear not landing durably before a vmd restart) is exactly what the
+	// pause-time token check exists to catch — Firecracker bumped its
+	// generation for this snapshot, so a later guarded Diff mismatches and the
+	// pause degrades to Full.
 	inst.mu.Lock()
 	inst.DirtyTracked = false
+	inst.DirtyTrackingSessionID = ""
+	inst.DirtyTrackingGeneration = 0
 	inst.mu.Unlock()
 
 	if err := UnpauseVM(inst.SocketPath); err != nil {
 		return snapshotPath, memPath, fmt.Errorf("resume after snapshot: %w", err)
+	}
+
+	// An ad-hoc image is never marked: restores from it take legacy behaviour,
+	// slower and always correct. A manifest an earlier image left at this path
+	// goes only now, after the image is replaced: a snapshot that failed left
+	// the earlier image, and its manifest must stay with it. One that will
+	// not go and is not known harmless would send a wake nothing answers, so
+	// the image is withdrawn rather than published beside it.
+	if blocking, merr := removeWallClockManifest(memPath); merr != nil && blocking {
+		_ = os.Remove(memPath)
+		_ = os.Remove(snapshotPath)
+		return "", "", fmt.Errorf("clear wall-clock manifest for ad-hoc snapshot %q: %w", memPath, merr)
+	} else if merr != nil {
+		m.log.Warn().Err(merr).Str("vm_id", vmID).Msg("ad-hoc snapshot: a stale marker could not be removed")
+	}
+	if journalled {
+		if err := clearPauseIntent(snapshotDir); err != nil {
+			return "", "", fmt.Errorf("clear the ad-hoc rewrite journal for %q: %w", memPath, err)
+		}
 	}
 
 	return snapshotPath, memPath, nil
@@ -1693,7 +3271,14 @@ func (m *Manager) DeleteSnapshotFiles(vmID, snapshotPath, memPath string) error 
 		// .base: VMD reuses mem paths, and a stale bitmap next to a future
 		// same-size overlay passes Firecracker's geometry checks and silently
 		// resolves pages against the wrong layer.
-		for _, sidecar := range []string{layeredBaseSidecarPath(memPath), presence.SidecarPath(memPath)} {
+		// The wall-clock marker goes with them: left behind, it would let a future
+		// image at this reused path be restored with a frozen clock on a guest that
+		// never proved it can correct one.
+		for _, sidecar := range []string{
+			layeredBaseSidecarPath(memPath),
+			presence.SidecarPath(memPath),
+			clockFreezeMarkerPath(memPath),
+		} {
 			if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
 				m.log.Warn().Err(err).Str("path", sidecar).Msg("remove mem side-car")
 			}
@@ -1836,6 +3421,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
+	// A caller-supplied vmID becomes a filesystem path component (rundir and,
+	// under direct spawn, the per-VM cgroup dir). Reject a non-leaf or
+	// reserved name before it can escape those trees — e.g. "../daemon" would
+	// resolve a cgroup onto vmd's own group and a later kill would take the
+	// daemon down with the VM.
+	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
+		return nil, status.Errorf(codes.InvalidArgument, "vm_id %q must be a valid per-VM identifier", vmID)
+	}
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
 	// waits for the in-flight attempt, then retriedLaunchTarget recognizes
@@ -1861,7 +3454,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// restore slot (or fails on the semaphore when all slots are busy).
 	// lazyReattach loads a paused VM the background reattach hasn't reached.
 	m.lazyReattach(vmID)
-	if existing, needsVerify := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+	var existing *VMInstance
+	var needsVerify bool
+	if resourceLimits.SavedSnapshotID != "" {
+		existing, needsVerify = m.retriedForkTarget(vmID, resourceLimits.SavedSnapshotID)
+	} else {
+		existing, needsVerify = m.retriedLaunchTarget(vmID, snapshotPath, memPath)
+	}
+	if existing != nil {
 		// The adopted VM keeps its stamped policy without re-validation, and
 		// the response still attests it: sound only while every vmd generation
 		// that could have served the prior attempt stamps the request's policy
@@ -1873,7 +3473,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// adopting — a bounded WAIT, not a single probe, so a warming VM
 			// passes. Verified records adopt without this gate: readiness was
 			// proven once, and a wedged boxd here must not demote a live VM.
-			if err := m.verifyBoxdReady(ctx, existing.IP); err != nil {
+			tVerify := time.Now()
+			err := m.verifyBoxdReady(ctx, existing.IP, existing)
+			// Emitted here, success and failure alike: this branch returns
+			// before the phase defer below is registered, and a crash-window
+			// adoption can wait out the whole probe budget.
+			m.recordPhases("restore", "", map[string]time.Duration{"verify": time.Since(tVerify)})
+			if err != nil {
 				// A destroy racing the wait is the one thing that says nothing
 				// about the VM; match the sibling destroyed-paths.
 				m.mu.RLock()
@@ -1904,8 +3510,24 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				return nil, cerr
 			}
 		}
+		// The earlier attempt installed the rules before its launch, but the
+		// proxy's half lives in memory and a daemon restart drops it.
+		if resourceLimits.EgressRules != nil && !m.applyAdoptedNetworkRules(vmID, resourceLimits.EgressRules) {
+			return nil, status.Errorf(codes.Unavailable, "restore adopted vm %s but could not reinstall its egress rules", vmID)
+		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
+	}
+	// Only now does a create from a snapshot need the snapshot itself: a
+	// retry of one that completed was answered above, whether or not the
+	// snapshot still exists.
+	var fork *SavedSnapshotManifest
+	if resourceLimits.SavedSnapshotID != "" {
+		var err error
+		fork, snapshotPath, memPath, err = m.forkSource(vmID, &resourceLimits, snapshotPath, memPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// A control plane from before preview publication sends the zero-value
@@ -1928,9 +3550,88 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	case m.restoreSem <- struct{}{}:
 		defer func() { <-m.restoreSem }()
 	case <-ctx.Done():
+		// The full-deadline queue wait is the worst restore-queue latency —
+		// emit it, or saturation incidents vanish from entry_to_sem.
+		m.recordPhases("restore", "", map[string]time.Duration{"entry_to_sem": time.Since(tEntry)})
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
+	// A fork reads what the image says from the snapshot itself, under the
+	// snapshot's lock. The lock is released once the reads are done and taken
+	// again for the copies, which check the snapshot is still the same one,
+	// so neither a prior life's stop nor a second fork of the same snapshot
+	// waits behind this one for longer than its reads.
+	metaSnapshot, metaMem := snapshotPath, memPath
+	var unlockFork func()
+	if fork != nil {
+		unlock, err := m.lockSavedSnapshot(ctx, fork.SnapshotID)
+		if err != nil {
+			return nil, err
+		}
+		unlockFork = unlock
+		defer func() {
+			if unlockFork != nil {
+				unlockFork()
+			}
+		}()
+		if err := savedSnapshotCommitted(fork); err != nil {
+			return nil, err
+		}
+		metaSnapshot, metaMem = fork.SnapshotPath, fork.MemPath
+	}
+	// Do not infer a template rootfs on the restore path. Overlay/build
+	// snapshots do not create the legacy path, and a synchronous filesystem
+	// probe here would both invent a dependency and add latency to resume.
+	// Reconciliation resolves legacy full-copy dependencies from build metadata
+	// before retained accounting accepts the generation.
+	// Failed restores return before the first-attempt success block below
+	// records the setup phases; emit whichever stages completed (elapsed for
+	// the in-flight one) so failed attempts — which can consume most of the
+	// restore deadline — form the phase tails instead of vanishing.
+	restorePhasesRecorded := false
+	// Phases of a frozen image's restore are labelled so the two kinds can be
+	// compared side by side; set once the manifest is read, before any phase
+	// that follows it, and seen by the failure recorder below.
+	restoreMode := ""
+	var attempt int
+	var tDiskReady, tNetReady, tFcReady, tAttemptStart, tFailBoundary time.Time
+	defer func() {
+		if restorePhasesRecorded {
+			return
+		}
+		// The failure branches stamp tFailBoundary before their cleanup so
+		// the in-flight stage's elapsed time excludes teardown/persistence.
+		end := time.Now()
+		if !tFailBoundary.IsZero() {
+			end = tFailBoundary
+		}
+		phases := map[string]time.Duration{}
+		if attempt <= 1 {
+			phases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
+			switch {
+			case tDiskReady.IsZero():
+				phases["sem_to_disk"] = end.Sub(tSemAcquired)
+			case tNetReady.IsZero():
+				phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
+				phases["disk_to_net"] = end.Sub(tDiskReady)
+			default:
+				phases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
+				phases["disk_to_net"] = tNetReady.Sub(tDiskReady)
+				phases["net_to_fc"] = end.Sub(tNetReady)
+			}
+		} else {
+			// Retry attempt died mid-setup: the pre-loop phases went out with
+			// attempt 1, so measure this attempt's setup from its own start.
+			switch {
+			case tNetReady.IsZero():
+				phases["disk_to_net"] = end.Sub(tAttemptStart)
+			default:
+				phases["disk_to_net"] = tNetReady.Sub(tAttemptStart)
+				phases["net_to_fc"] = end.Sub(tNetReady)
+			}
+		}
+		m.recordPhases("restore", restoreMode, phases)
+	}()
 	// Cold/hot segmentation tags for the phase log, sampled once (not per
 	// attempt): concurrency, template-cache age, and host CPU/mem pressure.
 	// warmthPath is the file that actually drives fault-in — for a layered
@@ -1940,13 +3641,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// inflight = other restores in flight (we already hold a slot, so subtract
 	// it); an uncontended restore reads 0. len >= 1 here, so no underflow.
 	inflight := len(m.restoreSem) - 1
-	warmthPath := memPath
-	if base, ok := readLayeredBase(memPath); ok {
+	warmthPath := metaMem
+	if base, ok := readLayeredBase(metaMem); ok {
 		warmthPath = base
 	}
 	tplAgeSecs := m.templateRestoreAge(warmthPath)
-	cpuPSI := psiSomeAvg10("/proc/pressure/cpu")
-	memPSI := psiSomeAvg10("/proc/pressure/memory")
+	cpuPSI, memPSI, ioPSI := cachedPSI()
 
 	// Deterministic artifact/config preconditions, checked before ANY state
 	// changes: no provisional instance published (a refusal must not leave a
@@ -1955,18 +3655,75 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	//
 	// Side-car == overlay-mode marker. Fail clean if BasePath is missing
 	// rather than fall through and risk opening an unrelated rootfs.
-	if resourceLimits.BasePath == "" && snapshotPath != "" {
-		if _, err := os.Stat(snapshotPath + ".overlay"); err == nil {
+	if resourceLimits.BasePath == "" && metaSnapshot != "" {
+		if _, err := os.Stat(metaSnapshot + ".overlay"); err == nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"snapshot %q is overlay-mode but no base_path was provided to restore", snapshotPath)
+				"snapshot %q is overlay-mode but no base_path was provided to restore", metaSnapshot)
 		}
 	}
 	// Presence gate for layered overlays (same predicate the layered backend
 	// selection uses below).
-	if _, hasBase := readLayeredBase(memPath); hasBase || isOverlayMemFile(memPath) {
-		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
+	if _, hasBase := readLayeredBase(metaMem); hasBase || isOverlayMemFile(metaMem) {
+		if gerr := m.gateOverlayPresence(metaMem, log); gerr != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
+	}
+	// An in-place restore of a VM this daemon knows may meet the leftover of a
+	// pause that completed; any other intent means an interrupted rewrite.
+	// An image restored under a new id checks with no known artifact, so an
+	// intent beside it can never be cleared as completed. No host whose floor
+	// is down holds an intent, so today a create looks for nothing; on a host
+	// whose floor is up it pays one lookup that a template never answers.
+	m.mu.RLock()
+	prev := m.vms[vmID]
+	m.mu.RUnlock()
+	restoreFromPaused := false
+	var prevPausedAt time.Time
+	if prev != nil {
+		prev.mu.RLock()
+		restoreFromPaused = prev.Status == StatusPaused
+		prevPausedAt = prev.PausedAt
+		prev.mu.RUnlock()
+	}
+	if wakeProtocolFloorRaised() {
+		knownArtifact := ""
+		if prev != nil {
+			prev.mu.RLock()
+			knownArtifact = prev.ArtifactID
+			prev.mu.RUnlock()
+		}
+		if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), knownArtifact); blocked {
+			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing restore until it is inspected", memPath, why)
+		}
+	}
+	// What the image says about its guest, read once per restore: whether its
+	// workload is frozen and whether the guest corrects its clock. Read from
+	// disk every time, never cached by path: a cache would turn any exception
+	// into a frozen image restored the old way. One small open beside the
+	// sidecar read here; an untrusted manifest refuses before any launch.
+	manifest, merr := imageManifest(metaMem)
+	if merr != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
+	}
+	restoreWorkloadFrozen := manifest != nil && manifest.WorkloadFrozen
+	restoreGuestCorrects := manifest != nil && manifest.GuestCorrectsClock
+	if restoreWorkloadFrozen {
+		restoreMode = "frozen"
+	}
+	if restoreWorkloadFrozen {
+		// The floor rises before this host acts on an image that owes a wake,
+		// or a rollback could later meet the image with nothing to witness it.
+		if err := m.ensureWakeFloorTimed("restore"); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", metaMem, err)
+		}
+	}
+	restoreToken, restoreArtifactID := "", ""
+	if manifest != nil {
+		restoreToken, restoreArtifactID = manifest.FreezeToken, manifest.ArtifactID
+	}
+	if unlockFork != nil {
+		unlockFork()
+		unlockFork = nil
 	}
 
 	// Sampled before this attempt creates the rundir: a pre-existing rundir
@@ -1978,24 +3735,57 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	priorRunDir := !errors.Is(rdErr, os.ErrNotExist)
 
 	m.mu.Lock()
-	_, inPlace := m.vms[vmID]
+	prevInst, inPlace := m.vms[vmID]
+	prevSupervision := SupervisionUnit
+	var stopErr error
 	if inPlace {
+		prevInst.mu.RLock()
+		prevSupervision = prevInst.Supervision
+		prevInst.mu.RUnlock()
 		delete(m.vms, vmID)
+		// Deliberately NOT unindexed: the old Firecracker is live until
+		// the stop below completes (and stays live if it doesn't), and a
+		// heartbeat during that window must keep counting its memory.
+		// The replacement's indexVM a few lines down overwrites the same
+		// key, so the old entry's lifetime ends exactly when the
+		// StatusCreating instance takes over the id — no window in which
+		// this VM's resources are invisible to pressure.
 		m.mu.Unlock()
-		_ = stopUnit(ctx, systemdUnitName(vmID))
+		stopErr = m.stopVM(ctx, vmID, prevSupervision)
+		m.mu.Lock()
+	}
+	// A fork replaces the files here, so every life that may own them is
+	// stopped first: the recorded one above and, whatever the record says,
+	// anything under either supervision. A run dir with no record is a fork
+	// this daemon lost before persisting, and a life parked as error after an
+	// unconfirmed stop may run under a supervision its record never had.
+	if fork != nil && (inPlace || priorRunDir) && stopErr == nil {
+		m.mu.Unlock()
+		stopErr = m.stopLeftoverLife(ctx, vmID)
 		m.mu.Lock()
 	}
 
 	inst := &VMInstance{
-		ID:           vmID,
-		Status:       StatusCreating,
-		CreatedAt:    time.Now(),
-		RunDirID:     vmID,
-		Config:       resourceLimits,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-		TeamID:       teamID,
-		OwnerID:      ownerID,
+		ID:        vmID,
+		Status:    StatusCreating,
+		CreatedAt: time.Now(),
+		RunDirID:  vmID,
+		Config:    resourceLimits,
+		// Carry the replaced VM's supervision so the launch relaunches in the
+		// same mode and its preamble clears the stale process — an in-place
+		// replace whose stop above failed/timed out must not start a new
+		// process in a different mode alongside the surviving old one (same
+		// ID, disk, netns, tap). Fresh (non-inPlace) creates keep "" and the
+		// launch chooses by the armed flag.
+		Supervision:      prevSupervision,
+		SnapshotPath:     snapshotPath,
+		SourceSnapshotID: resourceLimits.SavedSnapshotID,
+		MemFilePath:      memPath,
+		// Kept through the launch: a failure returns a restore from a paused
+		// record to Paused in its place in the reclaim order; the commit clears it.
+		PausedAt: prevPausedAt,
+		TeamID:   teamID,
+		OwnerID:  ownerID,
 
 		PreviewAccess:              previewAccess,
 		PreviewPorts:               clonePreviewPorts(previewPorts),
@@ -2003,6 +3793,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		PreviewTokenPolicyRevision: inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision),
 	}
 	m.vms[vmID] = inst
+	m.indexVM(vmID, inst)
 	m.mu.Unlock()
 
 	// A provably-fresh unit name — no known instance (lazyReattach already
@@ -2017,21 +3808,30 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// active units, a predecessor-era orphan may exist with no bookkeeping.
 	// Only the first attempt qualifies: any retry follows a start of the
 	// same unit name.
+	// In place only when the prior life left its disk, slot and supervisor
+	// behind; a retry after cleanup keeps the stop but takes fresh resources.
+	reuse := inPlace && priorRunDir
+
 	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
 		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
-	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
+	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, fork != nil, reuse)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
 	// see cleanupRunDirKeepOverlay.
 	cleanupAfterRestoreFailure := func() {
-		if plan.action == restoreReuseOverlay {
+		switch plan.action {
+		case restoreReuseOverlay:
 			m.cleanupRunDirKeepOverlay(vmID)
-		} else {
+		case restoreMaterializeFork:
+			m.cleanupRunDir(vmID)
+			m.cleanupForkCopies(vmID)
+		default:
 			m.cleanupRunDir(vmID)
 		}
 	}
-	var diskPath string
+	var diskPath, templateRootfs string
 	var diskErr error
+	diskUntouched := false
 	switch plan.action {
 	case restoreCreateOverlay:
 		diskPath, diskErr = m.createOverlay(vmID, resourceLimits.BasePath)
@@ -2043,37 +3843,86 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			diskPath = existing
 		}
 	case restoreLegacyResolve:
-		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+		diskPath, templateRootfs, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+	case restoreMaterializeFork:
+		if (inPlace || priorRunDir) && stopErr != nil {
+			// A stop that did not confirm may leave a Firecracker that still
+			// owns the files here; replacing them would truncate its disk.
+			diskErr = status.Errorf(codes.Unavailable, "vm %s could not be confirmed stopped before being replaced: %v", vmID, stopErr)
+			diskUntouched = true
+		} else {
+			// Every prior life is confirmed stopped; nothing is left to charge.
+			m.vmStopUnconfirmed.Delete(vmID)
+			diskPath, diskErr = m.materializeFork(ctx, vmID, fork)
+		}
 	}
 	if diskErr != nil {
+		tFailBoundary = time.Now()
+		if diskUntouched {
+			// Nothing of the prior life was touched and its process may
+			// live: keep charging it behind the record until a confirmed stop.
+			m.markUnservable(inst, diskErr, log)
+			return nil, diskErr
+		}
+		// A run dir left behind makes the retry plan a reuse of the disk
+		// this attempt never finished.
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, diskErr
 	}
-	tDiskReady := time.Now()
+	tDiskReady = time.Now()
 
 	vmDir := filepath.Join(m.cfg.RunDir, vmID)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
 	// inPlace resume always uses the File backend; UffdEnabled=false is the
 	// ops circuit breaker that forces fresh restores onto File too.
-	useUffd := !inPlace && m.cfg.UffdEnabled
+	useUffd := !reuse && m.cfg.UffdEnabled
 
 	// Loop-carried across restore attempts: only what the post-loop code reads.
 	var (
-		hostIP     string
-		pid        int
-		restoreErr error
+		hostIP, tapDevice, macAddr, nsName string
+		pid                                int
+		restoreErr                         error
 	)
 
 	// A fresh restore that fails with a still-held tap0 (isTapDeviceBusyErr) is
 	// retried on a different slot; the failed slot is torn down. inPlace resumes
 	// reuse a specific VM's own slot and never retry.
 	const maxRestoreAttempts = 3
-	for attempt := 1; ; attempt++ {
-		tAttemptStart := time.Now()
-		var tapDevice, macAddr, nsName string
-		hostIP = ""
-		if inPlace {
+	// A function of memPath alone, which no attempt reassigns, so it is resolved
+	// once here rather than per attempt: a tap-busy retry would otherwise repeat
+	// the sidecar read after Firecracker and networking have started, on
+	// user-visible restore latency.
+	sidecarBase, hasSidecar := readLayeredBase(memPath)
+	// Only a fork pre-copies: its overlay is what it will read, and its per-fork
+	// copy starts cold on every restore. Only the layered UFFD load can carry
+	// the request, so a restore that cannot reach it is not labelled as one.
+	eager := plan.action == restoreMaterializeFork && hasSidecar &&
+		useUffd && m.cfg.ResumeUffdEnabled && m.eagerOverlayEnabled()
+	if eager {
+		restoreMode = strings.TrimPrefix(restoreMode+"+eager", "+")
+	}
+	var (
+		restoreClockFrozen bool
+		clockRetried       bool
+		wakeErr            error
+		tBoxdStart         time.Time
+		optimisticOK       bool
+	)
+	// The Running write that overlaps the readiness wait; joined before the
+	// record is trusted, and by the failure worker before it writes Error.
+	var persistDone chan struct{}
+	// Whether a wake-owed record was published for an attempt: a failure
+	// before the wake then returns a restore from a paused record to Paused.
+	wakeOwedPublished := false
+	for attempt = 1; ; attempt++ {
+		tAttemptStart = time.Now()
+		if attempt > 1 {
+			restorePhasesRecorded = false
+			tNetReady, tFcReady = time.Time{}, time.Time{}
+		}
+		if reuse {
 			existingNet := m.netMgr.GetVMNetInfo(vmID)
 			if existingNet != nil {
 				tapDevice = existingNet.TAPDevice
@@ -2086,6 +3935,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if tapDevice == "" {
 			netInfo, netErr := m.netMgr.SetupVM(ctx, vmID, netCfg)
 			if netErr != nil {
+				tFailBoundary = time.Now()
 				cleanupAfterRestoreFailure()
 				m.setStatus(vmID, StatusError)
 				return nil, fmt.Errorf("setup network: %w", netErr)
@@ -2095,12 +3945,22 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			hostIP = netInfo.HostIP
 			nsName = netInfo.Namespace
 		}
-		tNetReady := time.Now()
+		if err := m.applySandboxNetworkRules(vmID, m.netMgr.GetVMNetInfo(vmID), resourceLimits.EgressRules); err != nil {
+			tFailBoundary = time.Now()
+			m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
+			m.setStatus(vmID, StatusError)
+			return nil, err
+		}
+		tNetReady = time.Now()
 
 		// Publish all the network/disk/socket fields before starting Firecracker
 		// so the in-memory view is consistent for concurrent readers.
 		inst.mu.Lock()
 		inst.DiskPath = diskPath
+		if templateRootfs != "" {
+			// A full pause replaces the memory anchors before inventory may run.
+			inst.Config.RootfsPath = templateRootfs
+		}
 		inst.IP = hostIP
 		inst.TAPDevice = tapDevice
 		inst.MACAddress = macAddr
@@ -2109,19 +3969,89 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		inst.mu.Unlock()
 
 		var startErr error
-		pid, startErr = m.startFirecrackerViaSystemd(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, freshUnit && attempt == 1)
+		var supervision Supervision
+		inst.mu.RLock()
+		existingSupervision := inst.Supervision
+		inst.mu.RUnlock()
+		// hadPriorLife = inPlace || priorRunDir: a leftover rundir means a
+		// crashed prior life whose recordless systemd unit may still be running
+		// (record never persisted, so inPlace is false). The cgroup path must run
+		// its legacy-unit stop before spawning, or an armed retry starts a second
+		// Firecracker over the live unit on the same id/disk/tap. Matches the same
+		// !inPlace && !priorRunDir the freshUnit gate above uses.
+		// freshUnit && attempt == 1: only a first-attempt fresh unit may skip
+		// the linger query; a retry replaces the prior attempt's unit. The
+		// dispatcher threads it to the systemd path (irrelevant to cgroup).
+		// Forget the previous attempt's PID BEFORE this launch can spawn its
+		// own MainPID resolver: a retry reuses `inst`, and a stale PID that
+		// survives into the new attempt points at a stopped (possibly
+		// recycled) process — which stall capture would then inspect and
+		// report as this VM's.
+		// Whether this host can act on the image's fact is decided separately,
+		// so an older binary does not erase it; and per attempt, since a
+		// relaunch after an uncorrectable clock finds the host latched.
+		clockPolicy := m.clockPolicyFor(restoreWorkloadFrozen)
+		predictedSupervision := SupervisionUnit
+		if m.cgroupLaunch(existingSupervision) {
+			predictedSupervision = SupervisionCgroup
+		}
+		// Cached so the next pause knows what this guest and this image are
+		// without going back to the filesystem to ask.
+		inst.mu.Lock()
+		inst.CorrectsWallClock = &restoreGuestCorrects
+		inst.SnapshotWorkloadFrozen = &restoreWorkloadFrozen
+		inst.FreezeToken = restoreToken
+		inst.ArtifactID = restoreArtifactID
+		if restoreWorkloadFrozen {
+			inst.WakeToken = restoreToken
+		}
+		inst.mu.Unlock()
+		// Only a frozen image owes a wake, so only then must the record say so
+		// before the vCPUs can run (see persistWakeOwed). An unfrozen image
+		// keeps the older ordering below, unchanged.
+		var joinWakeOwed func(Supervision) bool
+		if restoreWorkloadFrozen {
+			joinWakeOwed = m.persistWakeOwed(inst, predictedSupervision, clockPolicy != nil, restoreFromPaused)
+			wakeOwedPublished = true
+		}
+		m.beginLaunchAttempt(inst)
+		pid, supervision, startErr = m.launchFirecracker(ctx, vmID, socketPath, diskPath, resourceLimits.BasePath, nsName, existingSupervision, inPlace || priorRunDir, freshUnit && attempt == 1)
+		// Stamp the chosen mode NOW, before the error branch: a launch that
+		// forked a cgroup FC but failed socket-readiness (and whose own kill
+		// couldn't confirm the group empty) leaves a live process. The record
+		// must say cgroup so a later destroy dispatches the cgroup kill/rmdir
+		// instead of a no-op unit stop.
+		inst.mu.Lock()
+		inst.Supervision = supervision
+		inst.mu.Unlock()
+		// Joined before the load: the record must owe the wake before the
+		// vCPUs can run. Normally it landed under the launch.
+		tJoin := time.Now()
+		var persistJoin time.Duration
+		if joinWakeOwed != nil {
+			optimisticOK = joinWakeOwed(supervision)
+			persistJoin = time.Since(tJoin)
+		}
 		if startErr != nil {
-			if !inPlace {
-				m.netMgr.CleanupVM(vmID)
-			}
-			cleanupAfterRestoreFailure()
-			m.setStatus(vmID, StatusError)
+			tFailBoundary = time.Now()
+			m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
+			m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
-		inst.mu.Lock()
-		inst.PID = pid
-		inst.mu.Unlock()
-		tFcReady := time.Now()
+		if joinWakeOwed != nil && !optimisticOK {
+			optimisticOK = m.persistWhileTracked(inst)
+		}
+		if joinWakeOwed != nil && !optimisticOK {
+			// Fail closed: the vCPUs must not run ahead of the record that
+			// owes their wake.
+			tFailBoundary = time.Now()
+			m.stopUnitDuringRestoreError(vmID)
+			m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
+			m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
+			return nil, fmt.Errorf("vm %s: wake record could not be made durable before the load", vmID)
+		}
+		publishLaunchPID(inst, pid, supervision)
+		tFcReady = time.Now()
 
 		// Attempts after the first measure from the attempt start, so a retry's
 		// disk_to_net_ms doesn't absorb the whole failed previous attempt.
@@ -2141,8 +4071,19 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Bool("uffd", useUffd).
 			Float64("cpu_psi_avg10", cpuPSI).
 			Float64("mem_psi_avg10", memPSI).
+			Float64("io_psi_avg10", ioPSI).
 			Int("attempt", attempt).
+			Int64("persist_join_ms", persistJoin.Milliseconds()).
 			Msg("restoring snapshot")
+		restorePhasesRecorded = true
+		attemptPhases := map[string]time.Duration{
+			"disk_to_net": tNetReady.Sub(netBase),
+			"net_to_fc":   tFcReady.Sub(tNetReady),
+		}
+		if attempt == 1 {
+			attemptPhases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
+			attemptPhases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
+		}
 
 		// attemptErr is this attempt's result alone; it lands in restoreErr after
 		// the load log so a stale prior-attempt error can never leak into the
@@ -2153,9 +4094,26 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// disabled / inPlace / resume-UFFD off it fails loud instead of falling to the
 		// File backend, which would load the sparse overlay as a full image (the base's
 		// pages read as zero holes).
-		sidecarBase, hasSidecar := readLayeredBase(memPath)
 		overlayNeedsLayered := isOverlayMemFile(memPath) || hasSidecar
+		// If this Firecracker refuses the option, the record must say the clock
+		// ran before the legacy retry can run the vCPUs.
+		demote := func() error {
+			inst.mu.Lock()
+			inst.ClockFrozen = false
+			inst.mu.Unlock()
+			// Fenced like the wake-owed write: a destroy landing here must
+			// not be resurrected, and a VM that is gone gets no legacy load.
+			if !m.persistWhileTracked(inst) {
+				return fmt.Errorf("vm %s: clock policy could not be made durable before the legacy restore", vmID)
+			}
+			return nil
+		}
+		restoreClockFrozen = false
 		switch {
+		case m.restoreSnapshotHook != nil:
+			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
+				return m.restoreSnapshotHook(socketPath, snapshotPath, memPath, clock)
+			})
 		case overlayNeedsLayered && !(useUffd && m.cfg.ResumeUffdEnabled):
 			attemptErr = fmt.Errorf(
 				"layered overlay %q requires UFFD layered restore (uffd + resume-uffd); refusing File-backend restore",
@@ -2182,50 +4140,173 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			canLayered := m.cfg.UffdEnabled && m.cfg.ResumeUffdEnabled
 			basePath := ""
 			armLayered := false
+			trackingSessionID := ""
 			switch {
 			case hasSidecar:
 				// The outer overlayNeedsLayered guard already required resume-UFFD to reach
 				// here, so canLayered holds — serve the overlay over its recorded base.
 				basePath = sidecarBase
 				armLayered = m.cfg.IncrementalSnapshotEnabled
+				if armLayered && m.sessionArmingEnabled() {
+					trackingSessionID = newTrackingSessionID()
+				}
 				inst.mu.Lock()
 				inst.BaseMemPath = sidecarBase
 				inst.DirtyTracked = armLayered
+				inst.DirtyTrackingSessionID = trackingSessionID
+				inst.DirtyTrackingGeneration = 0
 				inst.mu.Unlock()
 			case isOverlayMemFile(memPath):
 				attemptErr = fmt.Errorf("layered overlay %q has no base sidecar; refusing standalone restore", memPath)
 			case m.cfg.IncrementalSnapshotEnabled && canLayered && recordToPath == "" && isTemplate:
 				armLayered = true
+				if m.sessionArmingEnabled() {
+					trackingSessionID = newTrackingSessionID()
+				}
 				inst.mu.Lock()
 				inst.BaseMemPath = memPath // template mem file = the layered base
 				inst.DirtyTracked = true
+				inst.DirtyTrackingSessionID = trackingSessionID
+				inst.DirtyTrackingGeneration = 0
 				inst.mu.Unlock()
 			}
 			if attemptErr == nil {
-				attemptErr = RestoreSnapshotUffdInternalWithOverrides(
-					socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
-					m.cfg.HandlerDeathAbortEnabled,
-				)
+				var armed string
+				armed, restoreClockFrozen, attemptErr = m.restoreWithSessionFallback(trackingSessionID, func(sid string) (bool, error) {
+					return m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
+						used, err := m.restoreWithEagerOverlayFallback(eager, func(eager bool) error {
+							return RestoreSnapshotUffdInternalWithOverrides(
+								socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+								m.cfg.HandlerDeathAbortEnabled, eager, sid, clock,
+							)
+						})
+						// A refused field fell back without it: measure the
+						// restore as the one that actually ran.
+						if eager && !used {
+							eager = false
+							restoreMode = strings.TrimSuffix(strings.TrimSuffix(restoreMode, "eager"), "+")
+						}
+						return err
+					})
+				})
+				if armed != trackingSessionID {
+					inst.mu.Lock()
+					inst.DirtyTrackingSessionID = armed
+					inst.DirtyTrackingGeneration = 0
+					inst.mu.Unlock()
+				}
 			}
-		case inPlace:
-			attemptErr = RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir)
+		case reuse:
+			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
+				return RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir, clock)
+			})
 		default:
 			// UFFD disabled but fresh restore — File backend with network overrides.
-			attemptErr = RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir)
+			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
+				return RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, "eth0", tapDevice, plan.deltaDir, clock)
+			})
 		}
 		log.Info().
 			Int64("load_snapshot_ms", time.Since(tFcReady).Milliseconds()).
 			Bool("ok", attemptErr == nil).
 			Int("attempt", attempt).
+			// Which clock policy this restore actually asked for. Without it the
+			// only symptom of the gates disagreeing is a readiness number that
+			// looks the same as before, which is indistinguishable from the
+			// feature being off.
+			Bool("guest_clock_frozen", restoreClockFrozen).
+			Bool("eager_overlay", eager).
 			Msg("snapshot loaded")
+		// Failed attempts included: a slow failing load (tap-busy retry,
+		// terminal failure) must appear in the distribution, not vanish. The
+		// setup phases wait for the load too, so a fallback that changed the
+		// mode records the whole attempt under the mode that ran.
+		attemptPhases["load_snapshot"] = time.Since(tFcReady)
+		m.recordPhases("restore", restoreMode, attemptPhases)
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
-			break
+			// An unfrozen image publishes Running after the load, the write
+			// overlapping the readiness wait; a crash here leaves an unverified
+			// record, which adoption re-verifies before trusting.
+			persistDone = nil
+			if !restoreWorkloadFrozen {
+				inst.mu.Lock()
+				inst.Status = StatusRunning
+				inst.Unverified = true
+				inst.PausedAt = time.Time{}
+				inst.mu.Unlock()
+				done := make(chan struct{})
+				persistDone = done
+				go func() {
+					defer sentrylog.Recover("restore-persist")
+					defer close(done)
+					optimisticOK = m.persistState(inst)
+				}()
+			}
+			tBoxdStart = time.Now()
+			// Same window as first boot: a restore that has to fault its memory and
+			// overlay from cold storage (first resume of a migrated VM, page cache
+			// evicted) legitimately needs more than a warm same-host resume, and a
+			// timeout here is destructive — the error path below tears down the VM.
+			//
+			// The window is clamped to the RPC deadline less the WORST-CASE error
+			// path — the verdict returns only after teardown, so the reserve must
+			// cover it: the 10s bounded unit stop, the 2s surviving-unit resolve,
+			// and a reply margin. Then the DEFINITIVE verdict always reaches the
+			// caller in-band even when setup ate into the budget and the stop is
+			// stuck at its bound: an honest early error beats letting the caller's
+			// deadline win the race — a bare DeadlineExceeded reads as transient
+			// and gets retried into this VM's torn-down state.
+			readiness := 30 * time.Second
+			if dl, ok := ctx.Deadline(); ok {
+				if remaining := time.Until(dl) - bootVerdictReserve; remaining < readiness {
+					readiness = remaining
+				}
+			}
+			// Diagnostics fire from inside the readiness window if the guest is still
+			// unready after a few seconds — the teardown capture proved the guest
+			// itself is what stalls, and answering why needs signals that exist only
+			// while it runs. Cancelled on the healthy path, where the whole cost is a
+			// timer that never fires.
+			stopDiag := m.armEarlyStallDiagnostics(vmID, pid)
+			if restoreWorkloadFrozen {
+				wakeErr = boxdWakeGuest(ctx, hostIP, readiness, restoreClockFrozen, restoreToken)
+			} else {
+				wakeErr = boxdHealthProbe(ctx, hostIP, readiness)
+			}
+			stopDiag()
+			// The write overlapping the wait must land before the vCPUs are
+			// trusted or the same instance is relaunched. A failed restore
+			// joins it in its detached worker instead, so a stalled store
+			// delays neither the teardown nor the reply.
+			retryUnfrozen := wakeErr != nil && !clockRetried && restoreClockFrozen && errors.Is(wakeErr, ErrGuestClockUnready)
+			if (wakeErr == nil || retryUnfrozen) && persistDone != nil {
+				<-persistDone
+			}
+			if !retryUnfrozen {
+				break
+			}
+			// The guest could not correct a frozen clock. The host is latched now,
+			// so the same instance relaunches with the clock running — on the slot,
+			// overlay and record it already owns. None of them may be released and
+			// recreated: an in-place overlay recreated from scratch is truncated.
+			clockRetried = true
+			m.noteGuestClockUnready(log, wakeErr)
+			m.recordPhases("restore", restoreMode, map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+			m.stopUnitDuringRestoreError(vmID)
+			if !vmDeadForRetry(m, vmID) {
+				log.Warn().Msg("VM not confirmed dead after stop — not relaunching")
+				break
+			}
+			inst.mu.Lock()
+			inst.DirtyTracked = false
+			inst.mu.Unlock()
+			continue
 		}
 		// Retriable only for a fresh-restore tap0 busy. The overlay and inst are
 		// kept for the next attempt; terminal cleanup lives below the loop.
-		if inPlace || attempt >= maxRestoreAttempts || !isTapDeviceBusyErr(restoreErr) {
+		if reuse || attempt >= maxRestoreAttempts || !isTapDeviceBusyErr(restoreErr) {
 			break
 		}
 		m.stopUnitDuringRestoreError(vmID)
@@ -2234,11 +4315,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// but "not confirmed dead" means systemctl itself is struggling;
 		// kept conservative.
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		dead := unitDefinitelyDead(checkCtx, systemdUnitName(vmID))
+		dead := m.vmDefinitelyDead(checkCtx, vmID, m.supervisionForVM(vmID))
 		checkCancel()
 		if !dead {
 			log.Warn().Int("attempt", attempt).
-				Msg("unit not confirmed dead after stop — not retrying restore")
+				Msg("VM not confirmed dead after stop — not retrying restore")
 			break
 		}
 		log.Warn().Err(restoreErr).Int("attempt", attempt).
@@ -2246,8 +4327,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Full teardown, not recycle: a fast recycle could return this same busy
 		// slot to the pool and the next attempt could re-claim it.
 		m.netMgr.TeardownVM(vmID)
+		tapDevice, macAddr, hostIP, nsName = "", "", "", ""
 		inst.mu.Lock()
 		inst.DirtyTracked = false
+		inst.DirtyTrackingSessionID = ""
+		inst.DirtyTrackingGeneration = 0
 		inst.mu.Unlock()
 	}
 
@@ -2255,23 +4339,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Firecracker is already running; stop the unit before other
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
 		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			// A tap-busy slot is suspect — tear it down rather than recycle it,
-			// so it isn't handed to another create with the same bad tap.
-			if isTapDeviceBusyErr(restoreErr) {
-				m.netMgr.TeardownVM(vmID)
-			} else {
-				m.netMgr.CleanupVM(vmID)
-			}
-		}
-		cleanupAfterRestoreFailure()
-		m.setStatus(vmID, StatusError)
+		m.releaseFailedRestore(vmID, reuse, isTapDeviceBusyErr(restoreErr), cleanupAfterRestoreFailure)
+		m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
 		// armLayered may have set DirtyTracked=true on inst before the restore call;
 		// clear it on failure so a lingering instance can't later take a Diff against a
 		// baseline that never loaded. (The VM is StatusError + unit stopped, so this is
 		// belt-and-suspenders, but it keeps the flag honest.)
 		inst.mu.Lock()
 		inst.DirtyTracked = false
+		inst.DirtyTrackingSessionID = ""
+		inst.DirtyTrackingGeneration = 0
 		inst.mu.Unlock()
 		if errors.Is(restoreErr, ErrTornSnapshot) {
 			return nil, status.Errorf(codes.DataLoss,
@@ -2296,61 +4373,140 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
-	// Running means the vCPUs are live, which is what lets the persist overlap
-	// the wait below; readiness is still verified there and still fails the
-	// restore. This deliberately adopts the resume path's weaker guarantee —
-	// resume has always published Running before readiness (its probe is
-	// detached telemetry) — where restore previously published only after.
-	// The window itself is not routable: the control plane hands out no usable
-	// sandbox until this RPC returns and it activates the row. What the marker
-	// bounds is the durable case — a crash here leaves a Running record whose
-	// readiness was never proven, and both restore and resume adoption
-	// re-verify such records before adopting them.
-	// The status is set directly — setStatus would
-	// persist synchronously, serializing the very fsync the goroutine
-	// overlaps with the boxd wait.
-	inst.mu.Lock()
-	inst.Status = StatusRunning
-	inst.Unverified = true
-	inst.mu.Unlock()
-	persistDone := make(chan struct{})
-	optimisticOK := false
-	go func() {
-		defer sentrylog.Recover("restore-persist")
-		defer close(persistDone)
-		optimisticOK = m.persistState(inst)
-	}()
+	// Callers declare the allocation, so this normally does nothing at
+	// all — backfillMachineConfigAsync returns immediately once the size
+	// is known, spawning nothing. It covers the rollout window where a
+	// NEW daemon takes restores from a control plane that predates the
+	// declared-allocation contract: without it those VMs would stay
+	// unsized until the daemon next restarts. Gated on publication so a
+	// host doing no accounting never pays for it, and detached either
+	// way — it must not join the readiness wait below.
+	if m.pressureAccounting {
+		m.backfillMachineConfigAsync(inst)
+	}
 
-	tBoxdStart := time.Now()
-	// Same window as first boot: a restore that has to fault its memory and
-	// overlay from cold storage (first resume of a migrated VM, page cache
-	// evicted) legitimately needs more than a warm same-host resume, and a
-	// timeout here is destructive — the error path below tears down the VM.
-	if err := m.waitForBoxd(ctx, hostIP, 30*time.Second); err != nil {
+	if wakeErr != nil {
+		err := wakeErr
+		// The verdict this failure leaves. A wake refused as another freeze's
+		// is terminal: Error, owing nothing. A wake that merely did not happen
+		// on the image the record was paused into returns it to Paused, as a
+		// resume's failure does, not to an Error a restart would reap.
+		verdict := StatusError
+		if errors.Is(err, ErrGuestTokenMismatch) {
+			inst.mu.Lock()
+			inst.WakePending, inst.WakeOwedFromPaused = false, false
+			inst.dropWakeImage()
+			inst.mu.Unlock()
+		} else if restoreFromPaused {
+			verdict = StatusPaused
+			inst.mu.Lock()
+			inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
+			inst.dropWakeImage()
+			inst.mu.Unlock()
+		}
+		// Emit the exhausted readiness wait immediately, before teardown, so
+		// the sample measures the probe (not unit stop + resource release +
+		// persist join) and the concurrent-destroy return below can't skip it.
+		m.recordPhases("restore", restoreMode, map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+		// The console (FC log + guest serial) is the only witness to where
+		// the guest stalled between vCPU resume and first output; the
+		// teardown below deletes it, so capture it now. Only for a genuine
+		// readiness timeout: a caller disconnect also lands here via ctx,
+		// and that aborting restore should neither pay the file read nor
+		// pollute the stall signal.
+		if ctx.Err() == nil {
+			m.captureStallForensics(vmID, m.resolveFCPID(vmID, pid), time.Since(tBoxdStart), tAttemptStart)
+		}
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
 		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanupAfterRestoreFailure()
-		// Join before the durable writes, or the goroutine's Running write
-		// could land after the Error write. Mirror the success path's
-		// post-join check: a concurrent destroy erased the record, and the
-		// joined write must not resurrect it — setStatus alone can't fix
-		// this (it no-ops on an untracked VM).
-		<-persistDone
+		m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
+		// Durable-state convergence is unbounded fsync work (the persist
+		// join, then another synchronous Put) and BoltDB is slow under
+		// exactly the host pressure that stalls readiness — it must not
+		// spend the verdict reserve. The ordering the join protects
+		// (Running must not land after Error; a destroyed record must not
+		// be resurrected) moves intact into a detached worker: join, then
+		// re-check tracking, then write. The reply needs only a map read
+		// to pick its error; a destroy that lands during the persist join
+		// now returns the generic error instead of NotFound in that narrow
+		// race — the worker still converges the durable state either way.
 		m.mu.RLock()
 		_, stillTracked := m.vms[vmID]
 		m.mu.RUnlock()
+		if stillTracked {
+			// Mark the failure in-memory BEFORE returning: only the durable
+			// write may be deferred. A same-ID retry that wins the lifecycle
+			// lock right after this RPC returns must see the verdict — a
+			// lingering Running/Unverified corpse would route it into
+			// re-verifying a stopped VM instead of relaunching.
+			inst.mu.Lock()
+			inst.Status = verdict
+			inst.mu.Unlock()
+		}
+		go func() {
+			defer sentrylog.Recover("restore-error-persist")
+			// The optimistic Running write may still be in flight; it lands
+			// before the Error write below so it cannot overwrite it.
+			if persistDone != nil {
+				<-persistDone
+			}
+			// The identity check and the Error write must be atomic against
+			// a same-ID retry, which serializes on the lifecycle lock: held
+			// here, the map entry cannot be replaced between check and
+			// write (only DestroyVM bypasses the lock, and its record
+			// delete makes setStatus a no-op — the safe direction).
+			unlock, lockErr := m.lockVMOp(context.Background(), vmID)
+			if lockErr != nil {
+				return
+			}
+			defer unlock()
+			m.mu.RLock()
+			cur, tracked := m.vms[vmID]
+			m.mu.RUnlock()
+			if !tracked {
+				m.deleteState(vmID)
+				return
+			}
+			if cur != inst {
+				// A same-ID retry replaced the entry while the persist was
+				// blocked. The stale optimistic write joined above may have
+				// landed AFTER the replacement's own durable write, leaving
+				// this torn-down instance as the last BoltDB value — a vmd
+				// restart would reattach stale PID/network state. Repair by
+				// re-persisting the replacement: it is stable under the
+				// lifecycle lock held here (a live retry would still hold
+				// it), and this write lands after the stale one by
+				// construction.
+				m.persistState(cur)
+			} else {
+				m.setStatus(vmID, verdict)
+			}
+			// DestroyVM bypasses the lifecycle lock, so its record delete
+			// can interleave anywhere around EITHER write above and be
+			// resurrected by it. Converge by compensation: if the VM is
+			// gone now, delete what we may have just written; a destroy
+			// landing after this check deletes it itself. Every
+			// interleaving ends with the record absent. (Under the held
+			// lifecycle lock a destroy is the only possible map mutation,
+			// so an untracked entry here can mean nothing else.)
+			m.mu.RLock()
+			_, still := m.vms[vmID]
+			m.mu.RUnlock()
+			if !still {
+				m.deleteState(vmID)
+			}
+		}()
 		if !stillTracked {
 			// The destroy owns the teardown; report it as such, like every
 			// sibling destroy-race path. A generic error here reads as
 			// transient and the control plane retries a destroyed sandbox.
-			m.deleteState(vmID)
 			return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 		}
-		m.setStatus(vmID, StatusError)
+		if errors.Is(err, ErrGuestTokenMismatch) {
+			// The artifacts are retained for inspection; nothing retries this.
+			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %v", memPath, err)
+		}
 		return nil, fmt.Errorf("boxd not ready after restore: %w", err)
 	}
 	tBoxdReady := time.Now()
@@ -2362,22 +4518,24 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// secs_since_template_restore reflects real warmth for either backend.
 	m.markTemplateRestored(warmthPath)
 
-	<-persistDone
 	if !optimisticOK && !m.persistState(inst) {
 		// The record could not be made durable, so the VM would be invisible
 		// to the next reattach — a zombie unit after any vmd restart. Fail
 		// the restore; the retry only costs latency when the store is
 		// already broken.
 		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanupAfterRestoreFailure()
+		m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("vm %s restored but its state could not be persisted", vmID)
 	}
 	inst.mu.Lock()
 	inst.Unverified = false
+	inst.WakePending = false
+	inst.WakeOwedFromPaused = false
+	inst.dropWakeImage()
+	// A frozen image kept its pause timestamp through the launch, so a
+	// failure could return it to Paused in its place in the reclaim order.
+	inst.PausedAt = time.Time{}
 	inst.mu.Unlock()
 	// Persist-then-verify: checking AFTER the write leaves no window — a
 	// concurrent DestroyVM either erased the record itself or is caught here,
@@ -2389,10 +4547,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if !stillTracked {
 		m.deleteState(vmID)
 		m.stopUnitDuringRestoreError(vmID)
-		if !inPlace {
-			m.netMgr.CleanupVM(vmID)
-		}
-		cleanupAfterRestoreFailure()
+		m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
 		return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 	}
 	tPersisted := time.Now()
@@ -2419,6 +4574,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Int64("wait_boxd_ms", tBoxdReady.Sub(tBoxdStart).Milliseconds()).
 		Int64("persist_state_ms", tPersisted.Sub(tBoxdReady).Milliseconds()).
 		Msg("VM restored from snapshot")
+	m.recordPhases("restore", restoreMode, map[string]time.Duration{
+		"wait_boxd": tBoxdReady.Sub(tBoxdStart),
+		"persist":   tPersisted.Sub(tBoxdReady),
+	})
 	return inst, nil
 }
 
@@ -2451,16 +4610,500 @@ func (m *Manager) ShutdownAll() {
 // For each VM in BoltDB that systemd confirms is alive AND whose Firecracker
 // API socket is reachable, VMD reattaches. Stale BoltDB entries (dead process)
 // are cleaned up. Orphan systemd units (running but not in BoltDB) are logged
-// so the Phase 3 reconciler can handle them.
+// so the reconciler can handle them.
+// recordRepresentedOrGone reports whether a startup record has settled
+// into one of the two states the pressure gate accepts: an instance in
+// the map, or no record in the store. The observation is RETRIED on a
+// short budget because it races teardown, which removes the instance
+// from the map BEFORE deleting the record (destroy, handleVMError):
+// reading that middle state once and closing the gate permanently would
+// let a successfully destroyed VM suppress every report until the next
+// restart. A teardown in flight is re-observed (the destroying marker
+// when present, otherwise the retry itself); a genuinely stuck state —
+// a retained record with no instance and no teardown — is stable across
+// the whole budget and still closes the gate. Runs only in the
+// background reattach goroutine, so the bounded sleeps cost no request.
+func (m *Manager) recordRepresentedOrGone(id string) bool {
+	const attempts = 6
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		m.mu.RLock()
+		_, inMap := m.vms[id]
+		m.mu.RUnlock()
+		if inMap {
+			return true
+		}
+		if _, tearingDown := m.destroying.Load(id); tearingDown {
+			continue // mid-teardown; re-observe after it lands
+		}
+		cur, err := m.state.Get(id)
+		if err == nil && cur == nil {
+			return true // conclusively gone
+		}
+		// Record present (or store unreadable) with no instance: either a
+		// teardown between its map removal and record delete, or the
+		// genuinely stuck case. Re-observe.
+	}
+	return false
+}
+
+// machineConfigProbeTimeout bounds one allocation probe. Generous for a
+// local unix-socket call because nothing waits on it: the only cost of a
+// slow probe is one VM staying uncounted for a beat.
+const machineConfigProbeTimeout = 5 * time.Second
+
+// machineConfigProbeMaxBackoff caps the retry interval. A transient
+// socket failure must not leave a live VM permanently uncounted — the
+// backfill runs once per restore/reattach, so if its only attempt lost,
+// every later sample would keep publishing that VM's memory as free.
+const machineConfigProbeMaxBackoff = 30 * time.Second
+
+// machineConfigProbeBackoff is the first retry interval. A var, not a
+// const, so tests can drive the retry path without sleeping for real
+// seconds — nothing in production reassigns it.
+var machineConfigProbeBackoff = time.Second
+
+// machineConfigRecoveryWorkers bounds how many legacy records recover at
+// once. Reattach can find hundreds of zero-sized records, and one
+// goroutine each would fire hundreds of concurrent Firecracker API calls
+// at the moment the daemon is busiest — exactly when creates are racing
+// the same startup. A small pool converges just as surely, only slower,
+// and the gate that matters (publication) already waits for reattach
+// rather than for these.
+const machineConfigRecoveryWorkers = 4
+
+// machineConfigProbe fetches a running VM's real vCPU/memory allocation
+// from Firecracker. Seam so tests can exercise the backfill without a
+// live microVM.
+var machineConfigProbe = func(ctx context.Context, socketPath string) (vcpu, memoryMiB uint32, err error) {
+	params := operations.NewGetMachineConfigurationParamsWithContext(ctx)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
+	resp, err := fc.Operations.GetMachineConfiguration(params)
+	if err != nil {
+		return 0, 0, err
+	}
+	cfg := resp.GetPayload()
+	if cfg == nil || cfg.VcpuCount == nil || cfg.MemSizeMib == nil {
+		return 0, 0, fmt.Errorf("machine configuration incomplete")
+	}
+	return uint32(*cfg.VcpuCount), uint32(*cfg.MemSizeMib), nil
+}
+
+// machineConfigBackfillDone, when set, fires as each backfill goroutine
+// exits. Test seam only (nil in production), so tests can join the
+// detached work instead of sleeping — same pattern as reattachHook.
+var machineConfigBackfillDone func(vmID string)
+
+// jitterDuration spreads a retry interval across [d, 1.5d). Deliberately
+// one-sided: never shorter than the backoff it was given, so jitter can
+// only relieve a thundering herd, never tighten a retry loop.
+func jitterDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int64N(int64(d/2)+1))
+}
+
+// instanceIsCurrent reports whether id still names THIS exact instance.
+// Pointer identity, never the id alone: an id can be reused by an
+// in-place replace, and work started for the old instance must not act
+// on its successor's behalf.
+func (m *Manager) instanceIsCurrent(inst *VMInstance) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cur, ok := m.vms[inst.ID]
+	return ok && cur == inst
+}
+
+// recoveryItem is one VM awaiting an allocation probe, with the time its
+// next attempt becomes due and the backoff that produced it.
+type recoveryItem struct {
+	inst    *VMInstance
+	dueAt   time.Time
+	backoff time.Duration
+	index   int // heap position, maintained by container/heap
+}
+
+// recoveryHeap orders pending probes by due time, so the dispatcher
+// reaches the next one in O(log n) instead of scanning. A slice scan
+// that deleted from the middle held the recovery lock for O(n) per
+// dispatch — O(n²) to drain a restart's backlog — and that lock is also
+// taken by resume, so draining could delay a lifecycle operation.
+type recoveryHeap []*recoveryItem
+
+func (h recoveryHeap) Len() int           { return len(h) }
+func (h recoveryHeap) Less(i, j int) bool { return h[i].dueAt.Before(h[j].dueAt) }
+func (h recoveryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
+func (h *recoveryHeap) Push(x any)        { it := x.(*recoveryItem); it.index = len(*h); *h = append(*h, it) }
+func (h *recoveryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	it := old[n-1]
+	old[n-1] = nil
+	*h = old[:n-1]
+	return it
+}
+
+// machineConfigRecovery probes VMs whose allocation nobody declared, on
+// a FIXED set of workers rather than a goroutine per VM.
+//
+// The goroutine-per-VM shape it replaces looked bounded — a semaphore
+// capped concurrent probes — but a restart with a large legacy fleet
+// still created one goroutine per unsized VM, each mostly asleep between
+// retries. Bounding the probes is not the same as bounding the workers.
+// Here the cost is constant: machineConfigRecoveryWorkers probing
+// goroutines plus one timer, whatever the fleet size.
+//
+// Retries never sleep on a worker. A failed probe goes back to the heap
+// with a longer, jittered due time and the worker takes the next item,
+// so a handful of permanently unreachable sockets cannot starve the VMs
+// that would answer.
+//
+// tracked is what bounds the queue, rather than a depth limit that
+// would have to drop VMs: one entry per instance, so the pending set
+// cannot exceed the host's own VM count however many times recovery is
+// requested for the same VM. Dropping was the wrong shape — recovered
+// sizes are memory-only by design, so a restart re-queues exactly the
+// population that overflowed and would overflow again, leaving a host
+// permanently under-described.
+type machineConfigRecovery struct {
+	mu      sync.Mutex
+	pending recoveryHeap
+	tracked map[*VMInstance]struct{} // queued or in flight; dedupes re-requests
+	ready   chan recoveryItem
+	wake    chan struct{}
+	probe   func(context.Context, string) (uint32, uint32, error)
+	done    func(string)
+	started bool
+}
+
+// backfillMachineConfigAsync queues a VM for allocation recovery when
+// the caller did not declare one, so capacity accounting describes the
+// real machine rather than an empty request.
+//
+// Restores and resumes declare their allocation, so this is the recovery
+// path for the cases that have none: records written before that
+// contract existed, and lifecycle calls from a control plane that
+// predates it (the mixed-version window during a rollout). A VM sized
+// zero reads as free capacity — a host full of them would publish as
+// idle — and Firecracker knows the real shape, so ask it.
+//
+// Costs nothing in the normal case: the size is already known, and this
+// returns without queueing anything. Gated by callers on publication, so
+// a host doing no capacity accounting never runs it.
+func (m *Manager) backfillMachineConfigAsync(inst *VMInstance) {
+	if inst == nil || !m.recoveryEligible(inst) {
+		return
+	}
+	m.recovery.mu.Lock()
+	if !m.recovery.started {
+		m.recovery.started = true
+		m.recovery.probe = machineConfigProbe
+		m.recovery.done = machineConfigBackfillDone
+		m.recovery.ready = make(chan recoveryItem)
+		m.recovery.wake = make(chan struct{}, 1)
+		m.recovery.tracked = make(map[*VMInstance]struct{})
+		for i := 0; i < machineConfigRecoveryWorkers; i++ {
+			go m.recoveryWorker()
+		}
+		go m.recoveryDispatcher()
+	}
+	if _, dup := m.recovery.tracked[inst]; dup {
+		// Already queued or being probed — a resume of a VM reattach
+		// already picked up, say. One entry per instance is what keeps
+		// the pending set bounded by the fleet.
+		m.recovery.mu.Unlock()
+		return
+	}
+	m.recovery.tracked[inst] = struct{}{}
+	heap.Push(&m.recovery.pending, &recoveryItem{inst: inst, backoff: machineConfigProbeBackoff})
+	m.recovery.mu.Unlock()
+	m.nudgeRecovery()
+}
+
+// recoveryEligible reports whether a VM still needs and can answer a
+// probe. Size unknown, still the instance the id names, and RUNNING:
+// a paused VM has no Firecracker listening, so probing one would retry
+// against a dead socket for the rest of its life.
+func (m *Manager) recoveryEligible(inst *VMInstance) bool {
+	inst.mu.RLock()
+	unsized := inst.Config.VCPU == 0 || inst.Config.MemoryMiB == 0
+	running := inst.Status == StatusRunning || inst.Status == StatusCreating
+	hasSocket := inst.SocketPath != ""
+	inst.mu.RUnlock()
+	return unsized && running && hasSocket && m.instanceIsCurrent(inst)
+}
+
+func (m *Manager) nudgeRecovery() {
+	select {
+	case m.recovery.wake <- struct{}{}:
+	default:
+	}
+}
+
+// recoveryDispatcher moves due items onto the ready channel and sleeps
+// until the next one comes due. One goroutine for the whole fleet.
+func (m *Manager) recoveryDispatcher() {
+	defer sentrylog.Recover("machine-config-recovery-dispatcher")
+	for {
+		var next *recoveryItem
+		var sleep time.Duration
+		m.recovery.mu.Lock()
+		if len(m.recovery.pending) > 0 {
+			if top := m.recovery.pending[0]; !top.dueAt.After(time.Now()) {
+				next = heap.Pop(&m.recovery.pending).(*recoveryItem)
+			} else {
+				sleep = time.Until(top.dueAt)
+			}
+		}
+		idle := len(m.recovery.pending) == 0 && next == nil
+		m.recovery.mu.Unlock()
+
+		if next != nil {
+			// tracked keeps this instance marked while in flight, so a
+			// concurrent request cannot queue a second copy.
+			m.recovery.ready <- *next
+			continue
+		}
+		if idle {
+			<-m.recovery.wake // nothing pending; park until something is queued
+			continue
+		}
+		select {
+		case <-time.After(sleep):
+		case <-m.recovery.wake:
+		}
+	}
+}
+
+// recoveryWorker probes one VM at a time and never sleeps: a failure
+// returns the VM to the pending set with a longer, jittered due time so
+// the worker is free for the next candidate.
+func (m *Manager) recoveryWorker() {
+	defer sentrylog.Recover("machine-config-recovery-worker")
+	for item := range m.recovery.ready {
+		inst := item.inst
+		if !m.recoveryEligible(inst) {
+			// Destroyed, replaced, paused, or a declared size landed
+			// while it waited — all of them end the work.
+			m.recoveryFinished(inst)
+			continue
+		}
+		inst.mu.RLock()
+		socket := inst.SocketPath
+		inst.mu.RUnlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), machineConfigProbeTimeout)
+		vcpu, memoryMiB, err := m.recovery.probe(ctx, socket)
+		cancel()
+		if err == nil && vcpu > 0 && memoryMiB > 0 {
+			m.applyMachineConfig(inst, vcpu, memoryMiB)
+			m.recoveryFinished(inst)
+			continue
+		}
+		// Never invent a size on failure: an under-reported allocation
+		// is visible as a host that looks emptier than it is, while a
+		// guessed one would be wrong in a direction nothing can detect.
+		m.requeueRecovery(item, err)
+	}
+}
+
+// requeueRecovery schedules the next attempt, doubling the backoff to a
+// ceiling and jittering it so a fleet that restarted together does not
+// re-probe in lockstep.
+func (m *Manager) requeueRecovery(item recoveryItem, probeErr error) {
+	backoff := item.backoff
+	if backoff <= 0 {
+		backoff = machineConfigProbeBackoff
+	}
+	if backoff < machineConfigProbeMaxBackoff {
+		backoff *= 2
+		if backoff > machineConfigProbeMaxBackoff {
+			backoff = machineConfigProbeMaxBackoff
+		}
+	}
+	wait := jitterDuration(backoff)
+	m.recovery.mu.Lock()
+	heap.Push(&m.recovery.pending, &recoveryItem{
+		inst: item.inst, dueAt: time.Now().Add(wait), backoff: backoff,
+	})
+	m.recovery.mu.Unlock()
+	m.log.Warn().Err(probeErr).Str("vm_id", item.inst.ID).Dur("retry_in", wait).
+		Msg("could not read machine configuration; allocation stays uncounted until a retry succeeds")
+	m.nudgeRecovery()
+}
+
+// recoveryFinished releases an instance's tracking slot, then re-queues
+// it if it is eligible again.
+//
+// The re-check is not an optimization; it closes a lost-wakeup race.
+// Deciding to discard an item and releasing its tracking entry are
+// separate steps, and a resume landing between them finds the instance
+// still tracked, so its request is deduped away — against an entry this
+// function is about to delete. The VM would be left running, unsized,
+// and queued nowhere until the next daemon restart. Re-checking after
+// the delete means the last writer wins either way: if the resume
+// queued it, this is a no-op against the fresh tracking entry; if the
+// resume was deduped, this queues it.
+//
+// A VM whose probe SUCCEEDED is no longer eligible (its size is known),
+// so the common path stops inside the eligibility check.
+func (m *Manager) recoveryFinished(inst *VMInstance) {
+	m.recovery.mu.Lock()
+	delete(m.recovery.tracked, inst)
+	m.recovery.mu.Unlock()
+	m.backfillMachineConfigAsync(inst)
+	if m.recovery.done != nil {
+		m.recovery.done(inst.ID)
+	}
+}
+
+// applyMachineConfig records a probed allocation in memory, and only
+// while the instance is still the one the id names and still lacks a
+// declared size.
+//
+// Deliberately does NOT persist. A durable write here cannot be made
+// safe against id reuse: PutIfPresent refuses a deleted record, but a
+// REPLACEMENT under the same id has a live record, so a write that
+// passed its identity check a moment earlier would land on the
+// successor and overwrite its pid, socket, ip and tap with the old
+// run's — and the next restart would reattach to that. Closing the
+// window would mean holding the fleet lock across the write, which
+// stalls every concurrent create; a generation counter on the record is
+// more machinery than a shrinking population of legacy records
+// justifies.
+//
+// So the size lives in memory until something with a legitimate reason
+// to write the record carries it (a pause, a status change). If nothing
+// does before a restart, reattach simply probes again — bounded and
+// jittered, and correct either way.
+func (m *Manager) applyMachineConfig(inst *VMInstance, vcpu, memoryMiB uint32) {
+	if !m.instanceIsCurrent(inst) {
+		return
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if inst.Config.VCPU > 0 && inst.Config.MemoryMiB > 0 {
+		// A declared allocation won the race; it outranks a probe of a
+		// socket that may by now belong to a different run.
+		return
+	}
+	inst.Config.VCPU, inst.Config.MemoryMiB = vcpu, memoryMiB
+}
+
+// releaseBuildAlloc returns a build's memory/vCPU pressure counters at
+// the moment its LAST VM is gone (subprocess reaped, recorder destroyed)
+// — never at worker return, which happens only after artifact hashing
+// that can run for minutes with no VM alive. Idempotent under buildsMu.
+// Keyed on the RECORD POINTER, never the build id: a terminal id may be
+// re-registered while the old worker still runs its deferred cleanup,
+// and an id-keyed release would mark the REPLACEMENT's allocation
+// released while subtracting the old sizes — hiding the new build's
+// memory for its whole lifetime. Each worker releases exactly the
+// record whose registration incremented the counters.
+func (m *Manager) releaseBuildAlloc(rec *buildRecord, vcpu, memoryMiB uint32) {
+	if rec == nil {
+		return
+	}
+	m.buildsMu.Lock()
+	if rec.AllocReleased {
+		m.buildsMu.Unlock()
+		return
+	}
+	rec.AllocReleased = true
+	rec.RecorderLive = false
+	m.buildsMu.Unlock()
+	m.buildPressureMem.Add(-int64(memoryMiB))
+	m.buildPressureVcpus.Add(-int64(vcpu))
+}
+
+// buildAllocCovers reports whether a build-prefixed id is currently
+// sized by the build pressure counters: a registry build whose
+// allocation has not yet been released. Coverage keys on AllocReleased
+// ALONE, never on terminal status — a cancel marks the record terminal
+// while the recorder VM may still be tearing down (up to its destroy
+// timeout) with the counters intentionally held, and a terminal check
+// here would count that recorder twice for the whole teardown. What is
+// NOT covered: leftovers from a dead daemon (empty registry), and any
+// build VM still alive AFTER its allocation was returned (a recorder
+// whose teardown failed) — the cgroup orphan gate treats those as
+// unrepresented and the instance loop counts them directly. Both id
+// shapes resolve to the registry: the build VM itself
+// ("build-<build-row-uuid>") and its access-pattern recorder
+// ("build-record-<template>", matched by template id — registry keys are
+// caller-chosen, never reconstructable from the recorder name).
+func (m *Manager) buildAllocCovers(id string) bool {
+	if !isBuildVM(id) {
+		return false
+	}
+	m.buildsMu.RLock()
+	defer m.buildsMu.RUnlock()
+	if tpl, ok := strings.CutPrefix(id, "build-record-"); ok {
+		// Phase-scoped, not template-scoped: only a build whose OWN
+		// recorder is currently expected covers this id. A recorder
+		// leaked by an earlier build (teardown failed, allocation
+		// released) must stay instance-counted even while a LATER build
+		// of the same template runs — that build's counters carry only
+		// its own VMs.
+		for _, rec := range m.builds {
+			if rec.RecorderLive && rec.TemplateID == tpl {
+				return true
+			}
+		}
+		return false
+	}
+	rec, ok := m.builds[id]
+	return ok && !rec.AllocReleased
+}
+
+// indexVM and unindexVM keep pressureIndex in lockstep with m.vms; call
+// adjacent to every membership change, inside the same locked section.
+func (m *Manager) indexVM(id string, inst *VMInstance) { m.pressureIndex.Store(id, inst) }
+func (m *Manager) unindexVM(id string)                 { m.pressureIndex.Delete(id) }
+
+// vmKnownNow reports whether id is represented in the CURRENT instance
+// map or state store — as opposed to ReattachAll's startup-time record
+// snapshot. The orphan scans run in a background pass that concurrent
+// creates and restores can outrun: a VM born after the snapshot shows up
+// in the unit/cgroup scans without being in knownIDs, and must neither
+// be reported to the reconciler as an orphan nor keep the pressure gate
+// closed. An unreadable store answers false — unknown fails closed.
+func (m *Manager) vmKnownNow(id string) bool {
+	m.mu.RLock()
+	_, ok := m.vms[id]
+	m.mu.RUnlock()
+	if ok {
+		return true
+	}
+	if m.state != nil {
+		if rec, err := m.state.Get(id); err == nil && rec != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	if m.state == nil {
+		// No persisted state means nothing to reattach: an empty map IS
+		// this host's truth, so publication may begin.
 		m.log.Warn().Msg("no state store configured — skipping reattach")
+		m.reattachComplete.Store(true)
 		return 0, 0
 	}
 
 	records, err := m.state.All()
 	if err != nil {
-		m.log.Error().Err(err).Msg("failed to read BoltDB state — skipping reattach")
+		// FAIL CLOSED: the map is empty but the host may be full, and a
+		// fresh zero-pressure report would look current and trustworthy —
+		// inviting over-placement — where a suppressed one leaves the
+		// previous report visibly aging (reported_at is the staleness
+		// signal admission must gate on). Publication stays off until a
+		// restart reads the store successfully.
+		m.log.Error().Err(err).Msg("failed to read BoltDB state — skipping reattach; pressure publication stays suppressed")
 		return 0, 0
 	}
 
@@ -2476,15 +5119,30 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		m.log.Info().Int("count", len(records)).Msg("reattaching VMs from BoltDB")
 	}
 
-	// Phase A: reattach from BoltDB. Routed through reattachByID (singleflight)
+	// Reattach from BoltDB, routed through reattachByID (singleflight)
 	// so this eager pass and any concurrent lazy request serialize per VM — a
 	// lazy load can't run reattachRecord for a vmID while the eager pass is mid
 	// stale-cleanup for the same one. reattachByID re-reads the record inside the
 	// flight, so a DestroyVM between the snapshot and here can't resurrect it.
+	// conclusive gates pressure publication, stricter than "the pass
+	// finished": every live VM's resources must be either represented in
+	// the instance map or conclusively gone. A recordless orphan unit, a
+	// failed orphan scan, or a shutdown-interrupted pass all leave
+	// possibly-live Firecrackers outside the map, and a report published
+	// over them would overwrite the previous report with a fresh
+	// undercount — worse than visibly stale data. Inconclusive keeps
+	// publication closed for the process's lifetime; the reconciler owns
+	// the orphans, and the next restart re-evaluates.
+	conclusive := true
+	m.reattachStopDeadline.Store(time.Now().Add(reattachStopPassBudget))
+	// Wakes queued by the scan are served as it runs, not after it: a
+	// recovering sandbox must not wait behind every record on the host.
+	m.startWakePool(ctx)
 	for _, snap := range records {
 		// Stop on shutdown: a cancelled ctx makes liveness checks fail, which
 		// would otherwise misfire the stale-cleanup path against live VMs.
 		if ctx.Err() != nil {
+			conclusive = false
 			break
 		}
 		if m.reattachByID(snap.ID, true) != nil {
@@ -2493,14 +5151,90 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 			stale++
 		}
 	}
+	reattached += m.drainPendingWakes(ctx)
 
-	// Phase B: detect orphan systemd units not in BoltDB.
-	activeIDs, err := listActiveFirecrackerUnits(ctx)
+	// Reconstruct unconfirmed-stop markers the previous process took to
+	// its grave: vmStopUnconfirmed is in-memory, so a restart after a
+	// cgroup-supervised pause or failed spawn whose stop never confirmed
+	// forgets that the record's Paused/Error status may be lying. The
+	// unit mode re-learns through the settle window plus the reconciler's
+	// re-recording of lingering units; the cgroup mode has no such path,
+	// so probe each cgroup-supervised Paused/Error record once here —
+	// startup-only, one file read per such record, off every beat — and
+	// re-mark those whose group is still populated (or unreadable:
+	// unknown fails toward counting). The reconciler's eventual reap
+	// clears the marker through removeVM as usual.
+	//
+	// Ranged over pressureIndex, never m.vms under m.mu: holding the
+	// lifecycle lock across a fleet-sized walk would make every
+	// concurrent create and restore (both need m.mu.Lock to publish
+	// their instance) queue behind this pass — and because the walk
+	// takes each instance's own lock, one instance held by a slow
+	// persistence write would extend that into a fleet-wide stall
+	// rather than a single-VM one. The sync.Map needs no global lock
+	// and each instance lock is taken with none held.
+	if m.pressureAccounting {
+		var residues []string
+		m.pressureIndex.Range(func(k, v any) bool {
+			id, _ := k.(string)
+			inst, _ := v.(*VMInstance)
+			if inst == nil {
+				return true
+			}
+			inst.mu.RLock()
+			supervised := cgroupSupervised(inst.Supervision)
+			parked := inst.Status == StatusPaused || inst.Status == StatusError
+			inst.mu.RUnlock()
+			if supervised && parked {
+				residues = append(residues, id)
+			}
+			return true
+		})
+		for _, id := range residues {
+			if m.cgroupStillLive(id) {
+				m.vmStopUnconfirmed.Store(id, struct{}{})
+				m.log.Warn().Str("vm_id", id).
+					Msg("cgroup still populated behind a paused/error record after restart; allocation stays counted")
+			}
+		}
+	}
+
+	// Detect orphan units not in BoltDB, both supervision modes. The
+	// gate's scan covers every state that can hold a live process
+	// (activating and deactivating included), unlike the reconciler's
+	// active-only sweep: a transitional recordless unit still holds
+	// memory, and missing it would open publication over it.
+	activeIDs, err := listActiveFCUnits(ctx)
 	if err != nil {
+		conclusive = false
 		m.log.Warn().Err(err).Msg("failed to list active firecracker units — orphan detection skipped")
 	} else {
 		for _, id := range activeIDs {
 			if !knownIDs[id] {
+				if m.vmKnownNow(id) {
+					// Born after the startup snapshot (a concurrent
+					// create/restore racing this background pass): fully
+					// represented, not an orphan.
+					continue
+				}
+				if isBuildVM(id) && !m.buildAllocCovers(id) {
+					// A predecessor build's unit (build-* or
+					// build-record-*): self-resolving — the orphaned
+					// builder tears its own VM down on exit — so gate
+					// DYNAMICALLY like the cgroup case below instead of
+					// poisoning conclusive, which never reevaluates and
+					// would suppress publication until the next restart.
+					m.mu.Lock()
+					m.pendingBuildUnits = append(m.pendingBuildUnits, id)
+					m.mu.Unlock()
+					recordUnitStop(systemdUnitName(id))
+					m.log.Warn().Str("vm_id", id).
+						Msg("predecessor build unit detected; pressure publication deferred until it exits")
+					continue
+				}
+				// A live Firecracker with no record: its memory is real
+				// and unrepresentable in pressure.
+				conclusive = false
 				// Registered as an unconfirmed stop so a same-ID launch never
 				// reads this orphan as fresh: without a control-plane DB the
 				// reconciler never stops BoltDB-missing units, so this
@@ -2514,12 +5248,90 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		// unobserved orphan can't be ruled out by anything else.
 		m.orphanScanDone.Store(true)
 	}
+	// Detect orphan per-VM cgroups not in BoltDB — LOG ONLY,
+	// symmetric with the unit path. Killing here would race an in-flight
+	// restore (this runs in a background goroutine; a create past the
+	// startup gate can have its cgroup before its record). The reconciler
+	// owns destruction, with a grace period and the op lock.
+	if m.cgroups != nil {
+		if cgIDs, cerr := m.cgroups.scanVMCgroups(); cerr == nil {
+			for _, id := range cgIDs {
+				if knownIDs[id] || m.vmKnownNow(id) || m.buildAllocCovers(id) {
+					continue
+				}
+				if isBuildVM(id) {
+					// A predecessor build's cgroup: its builder process
+					// (when still running) tears its own VM down on exit,
+					// so this resolves on its own — gate DYNAMICALLY
+					// instead of poisoning conclusive, which never
+					// reevaluates and would suppress publication until
+					// the next restart even after the cgroup empties.
+					// PressureReady polls these until they are gone.
+					m.mu.Lock()
+					m.pendingBuildCgroups = append(m.pendingBuildCgroups, id)
+					m.mu.Unlock()
+					m.log.Warn().Str("vm_id", id).
+						Msg("predecessor build cgroup detected; pressure publication deferred until it empties")
+					continue
+				}
+				if m.cgroupDefinitelyDead(id) {
+					// A provably EMPTY residue directory (startup cleanup
+					// killed the process but rmdir failed) holds no memory
+					// or CPU and nothing will ever repopulate it: harmless
+					// to pressure, so it must not suppress publication
+					// until the next restart. The reconciler still owns
+					// removing the directory.
+					m.log.Warn().Str("vm_id", id).
+						Msg("empty orphan vm cgroup directory (reap residue); ignored for pressure")
+					continue
+				}
+				conclusive = false
+				m.log.Warn().Str("vm_id", id).Msg("orphan vm cgroup detected (not in BoltDB) — will be handled by reconciler")
+			}
+		} else {
+			conclusive = false
+			m.log.Warn().Err(cerr).Msg("failed to scan vm cgroups — cgroup orphan detection skipped")
+		}
+	}
 
 	// No broad re-sweep here. Startup already swept once before StartPool filled
 	// the pool; re-sweeping now would delete the pool's warm netns (which are not
-	// BoltDB records). Stale records deleted in Phase A free their own namespace
+	// BoltDB records). Stale records deleted above free their own namespace
 	// inline (see reattachRecord), so a re-sweep isn't needed.
 
+	// Final invariant, checked over OUTCOMES rather than by classifying
+	// reattach's internal paths (which would rot as reattach evolves):
+	// every startup record must have ended either REPRESENTED (an
+	// instance in the map — running, paused, or parked Error, all of
+	// which pressure can see) or CONCLUSIVELY GONE (its stale cleanup
+	// deleted the record). A record that is neither — retained in the
+	// store with no instance, e.g. a cgroup VM whose socket vanished and
+	// whose stop could not be confirmed — is a possibly-live VM that
+	// pressure cannot count, so publication stays closed.
+	if conclusive {
+		for _, rec := range records {
+			if m.recordRepresentedOrGone(rec.ID) {
+				continue
+			}
+			conclusive = false
+			m.log.Warn().Str("vm_id", rec.ID).
+				Msg("startup record neither represented nor removed; pressure publication stays suppressed")
+			break
+		}
+	}
+
+	// Explicit store at the SUCCESSFUL return, never a defer: a defer runs
+	// during panic unwinding too, and a panic mid-pass would mark a
+	// half-rebuilt map ready — publishing exactly the partial snapshot
+	// this flag exists to suppress. On a panic the flag stays false and
+	// publication stays closed for the process's lifetime. Gated on
+	// conclusive for the same reason: represented-or-conclusively-gone
+	// only.
+	if conclusive {
+		m.reattachComplete.Store(true)
+	} else {
+		m.log.Warn().Msg("reattach inconclusive (orphans or failed scans); pressure publication stays suppressed for this process")
+	}
 	return reattached, stale
 }
 
@@ -2531,7 +5343,7 @@ var reattachHook func(vmID string)
 
 // staleUnitStopConfirmed stops a stale record's still-active unit on a
 // detached budget (the reattach ctx may be nearly spent) and reports whether
-// it is confirmed down; a var for the same test seam vmUnitDead uses. The
+// it is confirmed down; a var for the same test seam vmDeadForRetry uses. The
 // terminal probe decides regardless of the stop's reported outcome: a nil
 // stop can still mean a deactivating unit (the expired-wait settle reports
 // those complete), and the caller releases the record and namespace on
@@ -2549,6 +5361,61 @@ var staleUnitStopConfirmed = func(ctx context.Context, unit string) bool {
 // cleanupStale must be false on the request path: the dead-VM check would SIGKILL
 // and delete a live VM whenever systemctl is merely slow. Only the eager GC pass
 // sets it. Concurrent-safe: the map write is double-checked under the lock.
+// interruptedResume reports a record a resume published, owing a wake, and
+// never completed: its paused image is intact. Error counts too: a reattach
+// parks one behind a stop it could not confirm, still owing its return; a
+// terminal park owes nothing (see parkUnservable).
+func interruptedResume(rec VMRecord) bool {
+	return (rec.Status == StatusRunning || rec.Status == StatusError) && rec.Unverified && rec.WakePending && rec.WakeOwedFromPaused
+}
+
+// returnToPaused rewrites the record Paused with nothing owed and nothing in
+// flight.
+func (rec *VMRecord) returnToPaused() {
+	rec.Status = StatusPaused
+	rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
+	rec.WakeToken, rec.WakeSnapshotPath, rec.WakeMemPath = "", "", ""
+}
+
+// returnInterruptedResumeToPaused rewrites an interrupted resume's record
+// Paused with nothing owed, once its process is known stopped, and reattaches
+// it; the record is never reaped as a failed create.
+func (m *Manager) returnInterruptedResumeToPaused(ctx context.Context, rec VMRecord, cleanupStale bool, log zerolog.Logger) (*VMInstance, bool) {
+	log.Warn().Msg("resume interrupted before its guest ran — record returns to Paused")
+	rec.returnToPaused()
+	if wrote, perr := m.state.PutIfPresent(rec); perr != nil || !wrote {
+		log.Warn().Err(perr).Bool("present", wrote).Msg("interrupted resume's record could not be returned to Paused")
+		return nil, false
+	}
+	return m.reattachRecord(ctx, rec, cleanupStale)
+}
+
+// recoverInterruptedResume returns an interrupted resume's record to Paused,
+// its slot and image kept, once the caller has proven its process gone.
+// Untracked, the record is loaded through the reattach flight, which
+// serializes with lazy loads, so no reattach that read an older record can
+// publish over it; tracked, the instance owns its record and is rewritten
+// in place. Reports whether the record no longer owes its return.
+func (m *Manager) recoverInterruptedResume(vmID string) bool {
+	m.mu.RLock()
+	inst := m.vms[vmID]
+	m.mu.RUnlock()
+	if inst == nil {
+		m.reattachByID(vmID, true)
+		rec, err := m.state.Get(vmID)
+		return err == nil && (rec == nil || !interruptedResume(*rec))
+	}
+	inst.mu.Lock()
+	if interruptedResume(toRecordLocked(inst)) {
+		inst.Status = StatusPaused
+		inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
+		inst.dropWakeImage()
+	}
+	inst.mu.Unlock()
+	_, err := m.persistStateIfPresent(inst)
+	return err == nil
+}
+
 func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale bool) (*VMInstance, bool) {
 	if reattachHook != nil {
 		reattachHook(rec.ID)
@@ -2562,18 +5429,197 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		return inst, true
 	}
 	m.mu.RUnlock()
+	// A request meeting a wake the startup pass still owes waits for the
+	// outcome rather than adopting a frozen guest: as long as a wake can take
+	// behind everything queued ahead of it, since giving up early would
+	// report a live VM as missing.
+	if pw := m.pendingWake(rec.ID); pw != nil && !cleanupStale {
+		published := func() (*VMInstance, bool) {
+			m.mu.RLock()
+			inst, ok := m.vms[rec.ID]
+			m.mu.RUnlock()
+			return inst, ok
+		}
+		// A wake queued before the pool exists waits for it, unbounded by
+		// the queue: wait for the pool to start, then for it to reach this
+		// wake.
+		select {
+		case <-pw.done:
+			return published()
+		case <-m.wakeDrainStartedCh():
+		}
+		wait := time.NewTimer(pendingWakeWaitBoundFor(m.pendingWakeCount()))
+		defer wait.Stop()
+		select {
+		case <-pw.done:
+			return published()
+		case <-wait.C:
+			// The pool may have published the VM and be held only in the
+			// durable write that follows, which no round bounds: a VM in
+			// the map is served.
+			return published()
+		}
+	}
 
 	log := m.log.With().Str("vm_id", rec.ID).Logger()
+
+	// A revival interrupted by a restart must keep its record: it is the
+	// retry's anchor (revive refuses unknown sandboxes), and the stale
+	// cleanup below would delete it as a dead non-paused record. Park it
+	// as Error without adopting; the retry's at-rest probe gates any
+	// residue before a new boot, and the retry clears the mark.
+	// No status exclusion: a pending marker can ride a still-Paused
+	// record (revival of an unresumable paused zombie anchors before the
+	// first status write), and a crash there leaves the same possibly-
+	// live residue as any other interrupted attempt.
+	if rec.RevivalPending {
+		// A revival in flight holds vmID's op lock (ReviveVM's very
+		// first step) and already owns this record's fate; stopping its
+		// newly launched replacement or overwriting its state out from
+		// under it would be exactly the corruption this cleanup exists
+		// to prevent for a CRASHED attempt. The lock is held through the
+		// WHOLE cleanup below (stop and park), not just checked and
+		// released, or a fresh revive could start the instant it
+		// released and race the rest of this block exactly as if the
+		// check had never happened. Non-blocking: this pass must not
+		// stall on a live revival, so a held lock skips cleanup entirely
+		// and leaves that attempt's own commit or rollback to resolve
+		// the record.
+		unlockTry, ok := m.tryLockVMOp(rec.ID)
+		if !ok {
+			log.Info().Msg("revival in flight (op lock held) — leaving pending record for that attempt to resolve")
+			return nil, false
+		}
+		defer unlockTry()
+		log.Warn().Msg("revival interrupted by restart — stopping residue and parking record for retry")
+		// The interrupted attempt may have left a live replacement, and
+		// the retry's at-rest probe would refuse while it runs; without a
+		// stop here (the reaper exempts pending records) recovery would
+		// wedge until a manual destroy. Bounded and best-effort: an
+		// unconfirmed stop still parks, the probe keeps refusing, and
+		// the operator's forced destroy resolves.
+		// Both supervisors stop, not just the recorded mode: a cgroup
+		// launch can fall back to a unit mid-crash (errScopeGone), so the
+		// record's mode may not name the residue's real supervisor. The
+		// budget is the per-record cap clipped to the pass-wide deadline,
+		// so many pending records cannot stack stops into minutes of
+		// postponed reconciliation; past the deadline the stop is
+		// skipped, the record still parks, and the retry's at-rest probe
+		// keeps refusing until the operator resolves.
+		budget := coldBootStopBudget
+		if d, ok := m.reattachStopDeadline.Load().(time.Time); ok && !d.IsZero() {
+			if rem := time.Until(d); rem < budget {
+				budget = rem
+			}
+		}
+		// The pass deadline bounds stop STARTS, not stop internals: some
+		// stop branches strip cancellation and run their own internal
+		// budgets, so the deadline is rechecked between the two stops
+		// and the overshoot is bounded by at most one internal budget.
+		if budget > 0 {
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+			_ = m.stopVM(sctx, rec.ID, SupervisionUnit)
+			remaining := true
+			if d, ok := m.reattachStopDeadline.Load().(time.Time); ok && !d.IsZero() && time.Until(d) <= 0 {
+				remaining = false
+			}
+			if remaining {
+				_ = m.stopVM(sctx, rec.ID, SupervisionCgroup)
+			} else {
+				log.Warn().Msg("reattach stop budget exhausted after unit stop; skipping cgroup stop")
+			}
+			cancel()
+		} else {
+			log.Warn().Msg("reattach stop budget exhausted; parking without residue stop")
+		}
+		rec.Status = StatusError
+		// Presence-conditional parking, deliberately WITHOUT the
+		// record-owner mutex: a concurrent DestroyVM holds that mutex
+		// while joining this very reattach flight through getInstance,
+		// so taking it here would deadlock both. PutIfPresent is a
+		// single Bolt transaction, which is discrimination enough: a
+		// destroy's delete landing first makes this a no-op, and one
+		// landing after deletes the parked record. The destroy wins
+		// both orderings.
+		if wrote, err := m.state.PutIfPresent(rec); err != nil {
+			log.Error().Err(err).Msg("park interrupted-revival record")
+		} else if !wrote {
+			log.Info().Msg("interrupted-revival record deleted by a destroy; leaving it deleted")
+		}
+		return nil, false
+	}
+
+	// A live cgroup is ground truth for supervision, reconciled before we
+	// trust the record's mode or status. Two crash windows produce a
+	// disagreement: a crash mid unit→cgroup flip leaves the record still
+	// saying unit over a live cgroup; a crash mid-resume leaves a Paused
+	// record with a live half-restored FC.
+	supervisionCorrected := false
+	if m.cgroups != nil {
+		// An unreadable cgroup.events reads as populated (fail-closed): falling
+		// through to the stale unit mode would free networking under a live
+		// cgroup FC that the unit liveness check reads as dead.
+		if pop, perr := m.cgroups.vmCgroupPopulated(rec.ID); perr != nil || pop {
+			// Stamp cgroup mode FIRST, unconditionally: even if the kill
+			// below fails (host contention), the published record must never
+			// say unit over a live cgroup, or a later destroy stops a
+			// nonexistent unit and a resume launches a unit alongside it. This
+			// is a no-op when the record already says cgroup (the common clean
+			// reattach), so capture the disagreement before overwriting it —
+			// only an ACTUAL correction is worth a WARN, not every reattach.
+			wasNonCgroup := !cgroupSupervised(rec.Supervision)
+			supervisionCorrected = wasNonCgroup
+			rec.Supervision = SupervisionCgroup
+			if rec.Status == StatusPaused {
+				// A paused VM has no live process — this is a mid-resume
+				// orphan. Kill it and keep the record Paused so a fresh
+				// resume retries cleanly. On kill failure the reconciler
+				// backstops (the record is now cgroup-mode).
+				log.Warn().Msg("live cgroup for a paused record — killing mid-resume orphan")
+				_ = m.stopVM(ctx, rec.ID, SupervisionCgroup)
+			} else if wasNonCgroup {
+				// Only when the record actually disagreed with the live cgroup
+				// (a crash mid unit→cgroup flip), never on a clean reattach.
+				log.Warn().Msg("live cgroup with a non-cgroup record — corrected supervision to cgroup")
+			}
+		}
+	}
+
+	// An unknown supervision mode (store corruption, or a record written by a
+	// NEWER binary) is unmanageable: the dispatchers refuse it, and the stale
+	// cleanup below would probe the wrong oracle — a nonexistent unit reads
+	// vacuously down, releasing record and network under a possibly-live FC.
+	// Park it as Error instead (durable via the publish tail), preserving the
+	// value for the binary that understands it. The live-cgroup correction
+	// above already repaired the one case reality can prove.
+	unmanageableMode := !knownSupervision(rec.Supervision)
+	if unmanageableMode {
+		log.Error().Str("supervision", string(rec.Supervision)).
+			Msg("unknown supervision mode — parking as unmanageable")
+		rec.Status = StatusError
+	}
 
 	// Running VMs must have a live systemd unit and a reachable API socket; a
 	// dead one is a stale record. Paused VMs legitimately have no unit — they
 	// were stopped at pause and wait for a resume — so they skip these checks.
-	// Release requires the TERMINAL unit state, not vmUnitDead: deactivating
+	// Release requires the TERMINAL unit state, not vmDeadForRetry: deactivating
 	// reads dead there while a wedged FC (a parked Error record's unconfirmed
 	// stop, riding out a restart) may still be exiting — a transitional unit
 	// falls through to the socket path below, which parks it instead.
-	if cleanupStale && rec.Status != StatusPaused {
-		if vmUnitFullyDown(rec.ID) {
+	if cleanupStale && !unmanageableMode && rec.Status != StatusPaused {
+		var fullyDown bool
+		if cgroupSupervised(rec.Supervision) {
+			// Both supervisors — the scope-gone fallback window (see
+			// DestroyVM's fallback-unit gate); an empty group is already
+			// terminal, the unit claim must be too.
+			fullyDown = m.cgroupDefinitelyDead(rec.ID) && vmUnitFullyDown(rec.ID)
+		} else {
+			fullyDown = vmUnitFullyDown(rec.ID)
+		}
+		if fullyDown {
+			if interruptedResume(rec) {
+				return m.returnInterruptedResumeToPaused(ctx, rec, cleanupStale, log)
+			}
 			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
 			// Cold-booted VMs (old build path) ran with Setsid and no unit, so
 			// they survive vmd restarts as orphans holding TAP fds — SIGKILL by
@@ -2584,7 +5630,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				sigkillPID(rec.PID, 500*time.Millisecond)
 				log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
 			}
-			m.state.Delete(rec.ID)
+			if err := m.state.ReleaseRetainingStorage(rec.ID); err != nil {
+				log.Error().Err(err).Msg("failed to preserve stale storage metadata")
+				return nil, false
+			}
 			// Free this record's namespace/slot directly instead of a broad
 			// re-sweep (which would also delete the warm pool's netns).
 			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
@@ -2593,44 +5642,66 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		if rec.SocketPath != "" {
 			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
 				log.Warn().Str("socket", rec.SocketPath).Msg("VM unit active but socket missing — stopping and cleaning up")
-				// The unit is still active, so stop Firecracker before we forget
+				// The VM is still live, so stop Firecracker before we forget
 				// the record and tear down its netns — otherwise it keeps running
 				// as an orphan burning CPU/RAM and holding TAP fds in a namespace
-				// we're about to delete out from under it. An unconfirmed stop
-				// keeps the record — deleting it would leave a live unit no
-				// record points to — but flipped to Error: a socket-less VM can
-				// never be managed again, so no retry may adopt it. A
-				// caller-driven relaunch or destroy stops the unit on its own
-				// budget; failing that, the reconciler's error-unit rule reaps
-				// it.
-				confirmed := staleUnitStopConfirmed(ctx, systemdUnitName(rec.ID))
-				if !confirmed {
-					rec.Status = StatusError
-					wrote, perr := m.state.PutIfPresent(rec)
-					if perr == nil && !wrote {
-						// Deleted while we waited on the stop (destroy or
-						// markStale): whoever deleted it owns the teardown, and
-						// recreating the row would resurrect it and rebind a
-						// freed slot.
+				// we're about to delete out from under it.
+				var confirmed bool
+				if cgroupSupervised(rec.Supervision) {
+					// A cgroup FC that survived the stop still holds its tap;
+					// deleting the record and reclaiming the slot now would recycle
+					// it under a live process and discard the only handle to retry.
+					// Keep both intact unless it's confirmed dead — the reconciler
+					// reclaims it once the group empties.
+					if err := m.stopVM(ctx, rec.ID, rec.Supervision); err != nil {
+						log.Warn().Err(err).Msg("stop failed for socket-missing VM")
+					}
+					// Both supervisors — the scope-gone fallback window.
+					_ = stopUnit(ctx, systemdUnitName(rec.ID))
+					confirmed = m.cgroupDefinitelyDead(rec.ID) && vmUnitFullyDown(rec.ID)
+					if !confirmed {
 						return nil, false
 					}
-					if perr != nil {
-						log.Error().Err(perr).Msg("failed to persist error status for unstopped VM")
-						// Without a durable refusal, a restart could re-adopt
-						// the Running row. Escalate instead of retrying the
-						// broken store — kill by verified PID when possible,
-						// then have systemd kill whatever remains — and let
-						// one probe decide: SIGKILL delivery does not prove
-						// exit (a D-state process survives it), and an
-						// unconfirmed kill must not release the record.
-						if pidIsVMFirecracker(rec.PID, rec.ID) {
-							sigkillPID(rec.PID, 500*time.Millisecond)
+				} else {
+					// An unconfirmed stop keeps the record — deleting it would
+					// leave a live unit no record points to — but flipped to
+					// Error: a socket-less VM can never be managed again, so no
+					// retry may adopt it. A caller-driven relaunch or destroy
+					// stops the unit on its own budget; failing that, the
+					// reconciler's error-unit rule reaps it.
+					confirmed = staleUnitStopConfirmed(ctx, systemdUnitName(rec.ID))
+					if !confirmed {
+						rec.Status = StatusError
+						wrote, perr := m.state.PutIfPresent(rec)
+						if perr == nil && !wrote {
+							// Deleted while we waited on the stop (destroy or
+							// markStale): whoever deleted it owns the teardown, and
+							// recreating the row would resurrect it and rebind a
+							// freed slot.
+							return nil, false
 						}
-						confirmed = killUnitSIGKILL(ctx, systemdUnitName(rec.ID))
+						if perr != nil {
+							log.Error().Err(perr).Msg("failed to persist error status for unstopped VM")
+							// Without a durable refusal, a restart could re-adopt
+							// the Running row. Escalate instead of retrying the
+							// broken store — kill by verified PID when possible,
+							// then have systemd kill whatever remains — and let
+							// one probe decide: SIGKILL delivery does not prove
+							// exit (a D-state process survives it), and an
+							// unconfirmed kill must not release the record.
+							if pidIsVMFirecracker(rec.PID, rec.ID) {
+								sigkillPID(rec.PID, 500*time.Millisecond)
+							}
+							confirmed = killUnitSIGKILL(ctx, systemdUnitName(rec.ID))
+						}
 					}
 				}
+				if confirmed && interruptedResume(rec) {
+					// The launch was interrupted, not the paused image.
+					return m.returnInterruptedResumeToPaused(ctx, rec, cleanupStale, log)
+				}
 				if confirmed {
-					if derr := m.state.Delete(rec.ID); derr == nil {
+					if derr := m.state.ReleaseRetainingStorage(rec.ID); derr == nil {
 						m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 						return nil, false
 					} else {
@@ -2652,6 +5723,16 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	}
 
 	inst := toInstance(rec)
+	// The flag is the circuit breaker, so a persisted token must not survive
+	// turning it off: toInstance re-arms optimistically from the record alone
+	// (it is pure, with no view of config). The capability is deliberately
+	// not consulted here — the watcher may not have answered yet at startup,
+	// and a token that meets an older binary degrades to Full at pause time.
+	if !m.cfg.DirtyTrackingSessionEnabled {
+		inst.DirtyTracked = false
+		inst.DirtyTrackingSessionID = ""
+		inst.DirtyTrackingGeneration = 0
+	}
 
 	// Bail early if another caller (a request, or the background pass) already
 	// published this VM.
@@ -2674,6 +5755,45 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		}
 	}
 
+	// A live guest may still owe something from the process that died: a
+	// pause that froze it and never finished, or a restore that never woke
+	// it. Neither may be served as Running until resolved.
+	if rec.Status == StatusRunning && !m.recoverPauseIntent(ctx, inst, log) {
+		rec.Status = StatusError
+		m.parkUnservable(inst, true)
+	}
+	// A guest a pause parked Error with its token kept is offered that
+	// release now; it is served as Running only once confirmed. Anything
+	// else leaves it parked, its process kept for the reconciler.
+	if rec.Status == StatusError && m.frozenPauseIntent(rec.ID) && m.recoverPauseIntent(ctx, inst, log) {
+		rec.Status = StatusRunning
+		inst.mu.Lock()
+		inst.Status = StatusRunning
+		inst.mu.Unlock()
+		m.vmStopUnconfirmed.Delete(rec.ID)
+		log.Warn().Msg("reattach: released a guest a pause had parked as error; served as running")
+	}
+	if rec.Status == StatusRunning && inst.WakePending {
+		if cleanupStale {
+			// Queued for the pool after the pass, holding the lifecycle lock
+			// until the pool publishes the outcome, so a restore or resume for
+			// this id waits on the lock, never on the pool. A request already
+			// holding the lock completes the wake inline.
+			unlock, ok := m.tryLockVMOp(inst.ID)
+			if !ok {
+				log.Info().Msg("reattach: a request holds this VM's lock; leaving its owed wake to that request")
+				m.reattachDeferred.Store(inst.ID, struct{}{})
+				return nil, false
+			}
+			m.queuePendingWake(inst, unlock)
+			return nil, false
+		}
+		if err := m.completeOwedWake(ctx, inst, log); err != nil {
+			rec.Status = StatusError
+			m.parkUnservable(inst, errors.Is(err, ErrGuestTokenMismatch))
+		}
+	}
+
 	// Publish, re-checking under the write lock in case another caller won the
 	// race while we restored network state; if so, keep theirs.
 	m.mu.Lock()
@@ -2682,17 +5802,58 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		return existing, true
 	}
 	m.vms[rec.ID] = inst
+	m.indexVM(rec.ID, inst)
 	m.mu.Unlock()
+
+	// Legacy records only. Callers declare the allocation on restore, so
+	// anything created since carries its real size; what remains is
+	// records persisted before that — zero-sized, and unreadable without
+	// asking Firecracker. Startup-only, detached, a no-op for every
+	// record that already knows its size, and skipped entirely on hosts
+	// that never publish pressure: this exists solely to keep capacity
+	// accounting honest, so a host doing no accounting must not pay for
+	// it. A paused VM has no Firecracker to ask and is left alone.
+	if rec.Status == StatusRunning && m.pressureAccounting {
+		m.backfillMachineConfigAsync(inst)
+	}
 
 	// Commit only if a concurrent DestroyVM didn't delete the record during
 	// reattach (the gate is open, so deletes race the background pass); otherwise
 	// undo the in-memory reattach.
 	if rec.Status == StatusPaused {
-		if m.recordDeleted(rec.ID) {
+		// The paused branch is deliberately read-only (no mass rewrite of
+		// every paused record at startup) — except a supervision correction,
+		// which must land durably or a second restart resolves the record
+		// back to unit.
+		if supervisionCorrected {
+			switch wrote, perr := m.persistStateIfPresent(inst); {
+			case perr == nil && !wrote: // deleted by a concurrent destroy
+				m.undoReattach(rec.ID)
+				return nil, false
+			case perr != nil:
+				// Not a deletion: keep the VM published with the corrected mode
+				// in memory (undoing would leave a live cgroup FC untracked). A
+				// restart re-derives the correction from the live cgroup.
+				log.Warn().Err(perr).Msg("supervision correction not durable; kept in memory")
+			}
+		} else if m.recordDeleted(rec.ID) {
 			m.undoReattach(rec.ID)
 			return nil, false
+		} else if fresh, ferr := m.state.Get(rec.ID); ferr == nil && fresh != nil && fresh.Supervision != rec.Supervision {
+			// The rollback demotion (reconciler, under the vm-op lock) may
+			// have rewritten the durable mode while this lock-free reattach
+			// was in flight; adopt it, or a resume acts on the stale mode and
+			// re-promotes a demoted record. Skipped when the correction above
+			// ran — that value is proven by the live cgroup, not the store.
+			inst.mu.Lock()
+			inst.Supervision = fresh.Supervision
+			inst.mu.Unlock()
 		}
-		log.Info().Msg("reattached paused VM")
+		// Deliberately no per-record log: paused records dominate a large
+		// host's store, and one line per record is enough volume to trip
+		// journald's rate limit and suppress whatever the daemon logs next —
+		// including request errors. The pass logs its count up front and its
+		// totals on completion; anomalies on this path log above.
 	} else {
 		// Only a deletion undoes the reattach (see persistStateIfPresent).
 		if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {
@@ -2730,7 +5891,7 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 	if m.state == nil {
 		return nil
 	}
-	v, _, _ := m.reattachSF.Do(vmID, func() (any, error) {
+	v, err, _ := m.reattachSF.Do(vmID, func() (any, error) {
 		m.mu.RLock()
 		inst, ok := m.vms[vmID]
 		m.mu.RUnlock()
@@ -2749,32 +5910,64 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		got, _ := m.reattachRecord(ctx, *rec, cleanupStale)
+		if got == nil {
+			if _, deferred := m.reattachDeferred.LoadAndDelete(vmID); deferred {
+				return (*VMInstance)(nil), errReattachDeferred
+			}
+		}
 		return got, nil
 	})
+	if errors.Is(err, errReattachDeferred) && !cleanupStale {
+		// The startup pass found this VM's lock held and left its owed wake to
+		// the holder, a caller that joined this flight: it reattaches itself,
+		// completing the wake inline through a flight of its own, so joiners
+		// share one recovery.
+		v2, _, _ := m.reattachSF.Do(vmID+"\x00retry", func() (any, error) {
+			rec, gerr := m.state.Get(vmID)
+			if gerr != nil || rec == nil {
+				return (*VMInstance)(nil), nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), boxdResumeReadyBudget+5*time.Second)
+			defer cancel()
+			got, _ := m.reattachRecord(ctx, *rec, false)
+			return got, nil
+		})
+		inst, _ := v2.(*VMInstance)
+		return inst
+	}
 	inst, _ := v.(*VMInstance)
 	return inst
 }
+
+// errReattachDeferred: the startup pass left a VM's owed wake to the request
+// holding its lifecycle lock. See reattachByID.
+var errReattachDeferred = errors.New("reattach deferred to the lifecycle lock holder")
 
 // SweepStartupOrphanNamespaces removes host network namespaces (ns-N / veth-N)
 // that no live BoltDB record claims — leaked by crashed template builds or a
 // teardown that raced the kernel delete. Reads BoltDB directly, so it is safe
 // to run before the eager reattach and before the network pool fills.
-func (m *Manager) SweepStartupOrphanNamespaces() {
+func (m *Manager) SweepStartupOrphanNamespaces(extraKeep ...string) {
 	if m.state == nil {
 		return
 	}
-	recs, err := m.state.All()
+	// Keep-set from the slot index — same content the record scan produced.
+	nsByID, err := m.state.SlotNamespaces()
 	if err != nil {
 		// Sweeping with an empty keep-set would delete every live VM's
-		// namespace — skip entirely when the records can't be read.
-		m.log.Error().Err(err).Msg("sweep: cannot read state — skipping orphan namespace sweep")
+		// namespace — skip entirely when the index can't be read.
+		m.log.Error().Err(err).Msg("sweep: cannot read slot index — skipping orphan namespace sweep")
 		return
 	}
-	keepNs := make(map[string]bool)
-	for _, rec := range recs {
-		if rec.Namespace != "" {
-			keepNs[rec.Namespace] = true
-		}
+	keepNs := make(map[string]bool, len(nsByID))
+	for _, ns := range nsByID {
+		keepNs[ns] = true
+	}
+	// Recordless cgroup survivors whose FC outlived the reap: keep their tap
+	// intact so the slot isn't recycled under a live process. The reconciler
+	// reclaims them once confirmed dead.
+	for _, ns := range extraKeep {
+		keepNs[ns] = true
 	}
 	if swept := m.netMgr.SweepOrphanNamespaces(keepNs); swept > 0 {
 		m.log.Info().Int("swept", swept).Msg("sweep: removed orphan namespaces")
@@ -2795,13 +5988,124 @@ func (m *Manager) ReserveStartupSlots(context.Context) bool {
 	if m.state == nil {
 		return false
 	}
-	recs, err := m.state.All()
+	tLoad := time.Now()
+	slots, err := m.state.SlotNamespaces()
 	if err != nil {
-		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
+		m.log.Error().Err(err).Msg("failed to read slot index for startup slot reservation")
 		return false
 	}
-	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
+	loadMS := time.Since(tLoad)
+	tReserve := time.Now()
+	m.netMgr.ReserveSlotsAbove(slots)
+	// Reservations pin the allocator above the highest record index, stranding
+	// every unused index below it. Hand those back now, while records are the
+	// only owners and "unowned with no namespace" provably means free.
+	reclaimed := m.netMgr.ReclaimUnusedSlots()
+	// Async: the write must not sit on the startup path.
+	reserveDur := time.Since(tReserve)
+	go func() {
+		m.log.Info().Dur("slot_index_load_ms", loadMS).Dur("reserve_reclaim_ms", reserveDur).
+			Int("reservations", len(slots)).Int("reclaimed", reclaimed).
+			Msg("startup slot reservation breakdown")
+	}()
+	if reclaimed > 0 {
+		m.log.Info().Int("slots", reclaimed).Msg("reclaimed unused network slot indexes")
+	}
 	return true
+}
+
+// ReapRecordlessCgroupVMs kills direct-spawn VMs that have a live cgroup but
+// no BoltDB record — a crash between spawn and the first persist. It runs
+// synchronously at startup, BEFORE the request gate opens, so every recordless
+// cgroup is genuinely a previous-life survivor (no create has happened yet);
+// the racy post-gate case is left to the reconciler under its op lock. No-op
+// unless direct spawn is armed/managed and the state store is attached.
+//
+// A SIGKILL-immune FC (D-state, UFFD-wedged) survives the kill still holding
+// its tap. For each such survivor this reserves the slot under its id — the
+// same way a record protects its own, so the pool won't fresh-claim it and
+// adoption skips owned slots — and returns its namespace so the non-adoption
+// orphan sweep keeps it too. Either reclaim path recycling the slot under a
+// live FC would break death-before-recycle. Drift-0 releases the reservation
+// via CleanupVMOrNamespace once the FC is finally dead.
+//
+// sweepSafe is false when a possible live survivor's namespace could NOT be
+// resolved (or its record read, or the cgroup scan, failed): the sweep can't
+// be told which ns to spare, so the caller must skip it entirely rather than
+// reclaim that live FC's tap.
+func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []string, sweepSafe bool) {
+	if m.cgroups == nil || m.state == nil {
+		return nil, true // not managing cgroup VMs — no survivors to spare
+	}
+	cgIDs, err := m.cgroups.scanVMCgroups()
+	if err != nil {
+		// Can't enumerate cgroups, so can't rule out a live survivor: the
+		// sweep must not run this startup.
+		m.log.Warn().Err(err).Msg("failed to scan vm cgroups for recordless reap — skipping startup orphan sweep")
+		return nil, false
+	}
+	sweepSafe = true
+	scanned := len(cgIDs)
+	var recorded, recordless, reaped int
+	liveBuilds := make(map[string]bool, len(m.survivingBuilders))
+	for _, proc := range m.survivingBuilders {
+		liveBuilds[proc.buildID] = true
+	}
+	for _, id := range cgIDs {
+		// A predecessor builder still owns its recordless build VM.
+		if liveBuilds[id] {
+			continue
+		}
+		if has, herr := m.state.Has(id); herr != nil || has {
+			if herr != nil {
+				// Unreadable: skip the kill (conservative), but this VM may be
+				// a live recordless survivor whose slot and ns are now in NO
+				// protected set — the sweep must not run on this startup.
+				sweepSafe = false
+				m.log.Warn().Err(herr).Str("vm_id", id).Msg("record lookup failed for cgroup survivor — skipping startup orphan sweep")
+			} else {
+				recorded++
+			}
+			continue // recorded (reattach owns it) or unreadable
+		}
+		recordless++
+		m.log.Warn().Str("vm_id", id).Msg("recordless cgroup survivor at startup — reaping")
+		// Capture the netns before the kill: an FC that survives it is still in
+		// the group, but a clean kill removes it and firstPID would read empty.
+		ns := m.netMgr.NamespaceForPID(m.cgroups.firstPID(id))
+		serr := m.stopVM(ctx, id, SupervisionCgroup)
+		if serr == nil {
+			reaped++
+		}
+		if serr != nil {
+			m.log.Error().Err(serr).Str("vm_id", id).Msg("failed to reap recordless cgroup")
+			// Liveness decides first — populated or unreadable == maybe-alive.
+			// A confirmed-empty group whose rmdir merely failed is dead, its
+			// slot genuinely free to reclaim.
+			if pop, perr := m.cgroups.vmCgroupPopulated(id); perr != nil || pop {
+				if ns != "" {
+					m.netMgr.ReserveSlotsAbove(map[string]string{id: ns})
+					m.survivorNS.Store(id, ns)
+					protected = append(protected, ns)
+				} else {
+					// Alive, but its namespace couldn't be resolved (a
+					// transient /proc read), so this specific slot can't be
+					// spared by name. The one-time sweep must not run, or it
+					// would reclaim the live FC's tap; a later boot reclaims
+					// genuine orphans once the read succeeds.
+					sweepSafe = false
+					m.log.Warn().Str("vm_id", id).Msg("live recordless survivor with unresolved netns — skipping startup orphan sweep")
+				}
+			}
+		}
+	}
+	// Async: the write must not sit on the startup path.
+	nProtected := len(protected)
+	go func() {
+		m.log.Info().Int("scanned", scanned).Int("recorded", recorded).Int("recordless", recordless).
+			Int("reaped", reaped).Int("protected", nProtected).Msg("cgroup reap breakdown")
+	}()
+	return protected, sweepSafe
 }
 
 // collectStartupSlots returns vmID→namespace for every record that has one, so
@@ -2901,8 +6205,8 @@ func (m *Manager) getRunningVMIP(vmID string) (string, error) {
 }
 
 // handleVMError checks whether a connection error to a VM means the VM is
-// dead. If the systemd unit is no longer active, it marks the VM as failed
-// in BoltDB, removes it from the in-memory map, and returns NotFound so
+// dead. If the process is definitively dead, it archives the durable record,
+// removes it from the in-memory map, and returns NotFound so
 // the control plane returns 410 Gone. If the unit is still active (transient
 // error), it returns the original error unchanged.
 func (m *Manager) handleVMError(vmID string, origErr error) error {
@@ -2911,12 +6215,23 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 	}
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer checkCancel()
-	if isUnitActive(checkCtx, systemdUnitName(vmID)) {
+	// Only a definitive death lets the teardown proceed — a cgroup VM has no
+	// unit, so the unit oracle would call it dead and reap a live VM on any
+	// transient FC error. vmDefinitelyDead dispatches on mode and reads an
+	// inconclusive answer as alive.
+	if !m.vmDefinitelyDead(checkCtx, vmID, m.supervisionForVM(vmID)) {
 		return origErr
 	}
+	// Test-only coordination point after the definitive-death preflight. The
+	// hook is nil in production and deliberately runs before m.mu is acquired,
+	// so lock-order tests can schedule cleanup without holding either manager or
+	// instance mutex.
+	if hook := m.handleVMErrorPreManagerLockHook; hook != nil {
+		hook(vmID)
+	}
 
-	// Single lock acquisition for both status update and removal so
-	// concurrent callers can't race on the same VM.
+	// Keep a stopped instance tracked until archival succeeds so a lazy lookup
+	// cannot adopt the durable record's stale running status after a write failure.
 	m.mu.Lock()
 	inst, ok := m.vms[vmID]
 	if !ok {
@@ -2924,16 +6239,28 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 		// Already cleaned up by another goroutine.
 		return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 	}
+	if hook := m.handleVMErrorManagerLockHook; hook != nil {
+		hook(vmID)
+	}
 	inst.mu.Lock()
 	inst.Status = StatusStopped
 	inst.mu.Unlock()
-	delete(m.vms, vmID)
 	m.mu.Unlock()
 
 	m.log.Warn().Str("vm_id", vmID).Err(origErr).
 		Msg("VM process is dead — cleaning up and returning NotFound")
-	m.persistState(inst)
-	m.deleteState(vmID)
+	if m.state != nil && !isBuildVM(vmID) {
+		if err := m.state.ReleaseRetainingStorage(vmID); err != nil {
+			m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to preserve dead VM storage metadata")
+			return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
+		}
+	}
+	m.mu.Lock()
+	if m.vms[vmID] == inst {
+		delete(m.vms, vmID)
+		m.unindexVM(vmID)
+	}
+	m.mu.Unlock()
 	return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 }
 
@@ -3204,6 +6531,91 @@ func (m *Manager) getInstance(vmID string) (*VMInstance, error) {
 	return nil, status.Errorf(codes.NotFound, "vm %s not found", vmID)
 }
 
+// supervisionForVM resolves a VM's supervision mode from the in-memory
+// instance, else the persisted record, else "" (unit — the safe legacy
+// default). Cheap: an RLock and at most one BoltDB read. Every stop and
+// liveness site that lacks an instance in hand uses this so a cgroup VM is
+// never treated as a unit VM (which would leave its process unkilled and
+// read it as dead).
+func (m *Manager) supervisionForVM(vmID string) Supervision {
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if ok {
+		inst.mu.RLock()
+		s := inst.Supervision
+		inst.mu.RUnlock()
+		return s
+	}
+	if m.state != nil {
+		if rec, err := m.state.Get(vmID); err == nil && rec != nil {
+			return rec.Supervision
+		}
+	}
+	return SupervisionUnit
+}
+
+// instanceClaimsCgroup reports whether a tracked in-memory instance exists for
+// vmID AND is cgroup-supervised. Unlike supervisionForVM it does NOT fall back
+// to the record or default to unit; an absent instance reads as no claim.
+func (m *Manager) instanceClaimsCgroup(vmID string) bool {
+	m.mu.RLock()
+	inst, ok := m.vms[vmID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return cgroupSupervised(inst.Supervision)
+}
+
+// errSpawnedStopUnconfirmed marks a cold-boot failure whose spawned VM
+// could not be confirmed stopped; its resources and error record were
+// deliberately retained for a forced teardown.
+var errSpawnedStopUnconfirmed = errors.New("spawned VM stop unconfirmed")
+
+// reattachStopPassBudget bounds the aggregate residue-stop time of one
+// eager reattach pass (see reattachStopDeadline).
+const reattachStopPassBudget = 90 * time.Second
+
+// coldBootStopBudget bounds the detached stop of a spawned VM after a
+// failed cold boot: detachment protects the stop from the caller's spent
+// deadline, but an unbounded stop would let a hung systemctl wedge the
+// lifecycle path indefinitely (see stopUnitBudget for the same
+// discipline).
+const coldBootStopBudget = 30 * time.Second
+
+// lockRecordOwner acquires vmID's record-ownership mutex (see
+// recordOwnerMus) and returns its unlock.
+func (m *Manager) lockRecordOwner(vmID string) func() {
+	v, _ := m.recordOwnerMus.LoadOrStore(vmID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// recordRevivalPending reports whether vmID's durable record is marked
+// as an in-flight revival's retry anchor (see VMRecord.RevivalPending).
+func (m *Manager) recordRevivalPending(vmID string) bool {
+	if m.state == nil {
+		return false
+	}
+	rec, err := m.state.Get(vmID)
+	return err == nil && rec != nil && rec.RevivalPending
+}
+
+// destroyEpoch reads vmID's completed-destroy counter.
+func (m *Manager) destroyEpoch(vmID string) uint64 {
+	v, _ := m.destroyEpochs.LoadOrStore(vmID, new(uint64))
+	return atomic.LoadUint64(v.(*uint64))
+}
+
+func (m *Manager) bumpDestroyEpoch(vmID string) {
+	v, _ := m.destroyEpochs.LoadOrStore(vmID, new(uint64))
+	atomic.AddUint64(v.(*uint64), 1)
+}
+
 func (m *Manager) setStatus(vmID string, s VMStatus) {
 	m.mu.RLock()
 	inst, ok := m.vms[vmID]
@@ -3215,6 +6627,869 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 	inst.Status = s
 	inst.mu.Unlock()
 	m.persistState(inst)
+}
+
+// HostPressure is the host-level capacity summary the pressure publisher
+// reports for placement: live counts and allocations only — vmd stays
+// authoritative for slot IDs, namespaces, and per-VM lifecycle. Warm
+// inventory is reported separately from consumed capacity, and the
+// operator's schedulable slot limit separately from the kernel-bounded
+// prepared-slot ceiling: collapsing either pair would make "can I place
+// here" and "can this host prepare another slot" indistinguishable.
+type HostPressure struct {
+	// IncludedBuildVMIDs names builds already charged in this sample.
+	IncludedBuildVMIDs     []string
+	IncludedBuildSlotVMIDs []string
+	RunningSandboxes       int32
+	ProvisioningSandboxes  int32 // creating VMs + in-flight template builds
+	PausedSandboxes        int32
+	AllocatedMemoryMib     int64 // running + creating VMs + in-flight builds
+	AllocatedVcpus         int64
+	UsedNetSlots           int32
+	ProvisioningNetSlots   int32 // pool refill workers building/delivering
+	WarmNetSlots           int32 // fully built, claimable now
+	NetSlotCeiling         int32 // IP-scheme hard bound, not an operator knob
+	// UnknownAllocationVMs counts VMs charged to this host whose size is
+	// not known — records that predate the declared-allocation contract
+	// and whose recovery has not landed yet.
+	//
+	// It exists because an unsized VM is indistinguishable, in the
+	// allocation totals alone, from no VM at all: its memory adds zero,
+	// so the host reads as having that capacity free. That is the exact
+	// failure this feature is meant to prevent, so the undercount is
+	// published rather than hidden, and a consumer that cares about
+	// memory must treat a host reporting any unknowns as not fully
+	// described rather than as idle.
+	UnknownAllocationVMs int32
+}
+
+// builderProc identifies a surviving builder by pid AND its kernel
+// start time: a bare pid can be recycled by an unrelated process between
+// probes, and a signal-0 check against the recycled pid would keep the
+// pressure gate closed for as long as that stranger lives.
+type builderProc struct {
+	pid     int
+	start   uint64
+	buildID string
+	slot    int
+	hasSlot bool
+}
+
+// ProtectSurvivingBuildSlots runs before the startup namespace sweep and pool.
+// A predecessor builder may still be pulling its image, so its namespace need
+// not exist yet; its command-line slot is the reservation authority. The /proc
+// pass scales with host process count and must finish before either path can
+// safely reclaim a slot.
+func (m *Manager) ProtectSurvivingBuildSlots() ([]string, error) {
+	scan := m.builderScan
+	if scan == nil {
+		scan = findSurvivingBuilders
+	}
+	procs, err := scan(m.cfg.TemplateBuilderBin)
+	if err != nil {
+		return nil, err
+	}
+	protected := make([]string, 0, len(procs))
+	for _, proc := range procs {
+		if proc.buildID == "" || !proc.hasSlot || proc.slot < 1 || proc.slot > network.MaxSlots {
+			return nil, fmt.Errorf("surviving builder pid %d has no valid network slot", proc.pid)
+		}
+		ns := fmt.Sprintf("ns-%d", proc.slot)
+		m.netMgr.ReserveSlotsAbove(map[string]string{proc.buildID: ns})
+		protected = append(protected, ns)
+	}
+	m.SetSurvivingBuilders(procs)
+	if len(procs) > 0 {
+		m.log.Warn().Int("builders", len(procs)).Msg("surviving template builders protected at startup")
+	}
+	return protected, nil
+}
+
+// SetSurvivingBuilders records template-builder subprocesses that
+// outlived the previous daemon. Startup-only, before the heartbeat
+// starts; tests use it directly.
+func (m *Manager) SetSurvivingBuilders(procs []builderProc) {
+	m.survivingBuilders = procs
+}
+
+// ScanSurvivingBuildersAsync discovers builder subprocesses orphaned by
+// the previous daemon WITHOUT costing startup anything: the /proc walk
+// (one cmdline read per process on the host) runs in a goroutine, off
+// the path that gates gRPC readiness. The pending flag is set
+// synchronously before this returns, so a heartbeat that fires mid-scan
+// keeps publication closed rather than publishing as though no
+// survivors exist. Callers skip this entirely when pressure publication
+// is not configured — an unpublished host has no reader to protect.
+func (m *Manager) ScanSurvivingBuildersAsync(builderBin string) {
+	m.builderScanPending.Store(true)
+	go func() {
+		defer sentrylog.Recover("surviving-builder-scan")
+		scan := m.builderScan
+		if scan == nil {
+			scan = findSurvivingBuilders
+		}
+		// Retry with backoff until a scan SUCCEEDS; the gate stays closed
+		// throughout. A transiently unreadable /proc must never read as
+		// "no survivors" — that would publish an undercount for the rest
+		// of a predecessor build's lifetime.
+		backoff := time.Second
+		for {
+			procs, err := scan(builderBin)
+			if err == nil {
+				if len(procs) > 0 {
+					pids := make([]int, 0, len(procs))
+					for _, bp := range procs {
+						pids = append(pids, bp.pid)
+					}
+					m.log.Warn().Ints("pids", pids).
+						Msg("surviving template-builder processes detected; pressure publication deferred until they exit")
+				}
+				m.survivingBuilders = procs
+				m.builderScanPending.Store(false)
+				return
+			}
+			m.log.Warn().Err(err).Dur("retry_in", backoff).
+				Msg("survivor scan failed; pressure publication stays deferred")
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+		}
+	}()
+}
+
+// PressureReady reports whether pressure publication may begin: false
+// until the startup reattach has rebuilt the instance map (see
+// reattachComplete), and false while any surviving template-builder
+// subprocess is still running — its build VM consumes memory this
+// process cannot size (the registry died with its predecessor), so a
+// report would undercount until the survivor exits. The pid list only
+// shrinks; liveness is a signal-0 probe per surviving pid per beat.
+func (m *Manager) PressureReady() bool {
+	if !m.reattachComplete.Load() {
+		return false
+	}
+	if m.builderScanPending.Load() {
+		return false
+	}
+	// Snapshot under the lock, PROBE OUTSIDE it: cgroupDefinitelyDead is
+	// a filesystem read, and m.mu is the same mutex create/restore need
+	// to publish instances — holding it across cgroup I/O would put this
+	// beat's probes on the lifecycle hot path. Reacquire only to shrink
+	// the list; entries proven dead in this pass are dropped, anything
+	// else (including ids appended concurrently) is kept.
+	m.mu.Lock()
+	pendingCg := append([]string(nil), m.pendingBuildCgroups...)
+	pendingUnits := append([]string(nil), m.pendingBuildUnits...)
+	m.mu.Unlock()
+	if len(pendingCg) > 0 || len(pendingUnits) > 0 {
+		deadCg := make(map[string]bool, len(pendingCg))
+		for _, id := range pendingCg {
+			// Populated or unreadable keeps the gate closed; only a
+			// conclusively empty-or-absent group releases it. Bounded:
+			// one read per REMAINING leftover per beat, normally zero.
+			if m.cgroups != nil && m.cgroupDefinitelyDead(id) {
+				deadCg[id] = true
+			}
+		}
+		deadUnit := make(map[string]bool, len(pendingUnits))
+		for _, id := range pendingUnits {
+			// Same bound and same standard: only a TERMINALLY down unit
+			// releases the gate — deactivating may still flush guest
+			// writes. Through the vmUnitFullyDown seam so tests control
+			// the verdict (real runners answer "not loaded" for absent
+			// units, containers error — both environment artifacts).
+			if vmUnitFullyDown(id) {
+				deadUnit[id] = true
+			}
+		}
+		m.mu.Lock()
+		remainingCg := m.pendingBuildCgroups[:0]
+		for _, id := range m.pendingBuildCgroups {
+			if !deadCg[id] {
+				remainingCg = append(remainingCg, id)
+			}
+		}
+		m.pendingBuildCgroups = remainingCg
+		remainingUnits := m.pendingBuildUnits[:0]
+		for _, id := range m.pendingBuildUnits {
+			if !deadUnit[id] {
+				remainingUnits = append(remainingUnits, id)
+			}
+		}
+		m.pendingBuildUnits = remainingUnits
+		open := len(remainingCg) == 0 && len(remainingUnits) == 0
+		m.mu.Unlock()
+		if !open {
+			return false
+		}
+	}
+	if len(m.survivingBuilders) > 0 {
+		alive := m.builderAlive
+		if alive == nil {
+			alive = builderProcAlive
+		}
+		remaining := m.survivingBuilders[:0]
+		for _, bp := range m.survivingBuilders {
+			if alive(bp) {
+				remaining = append(remaining, bp)
+			} else if bp.hasSlot && m.netMgr != nil {
+				// The predecessor's deferred release cannot run in this daemon.
+				// ReleaseSlot checks both owner and index before touching the slot.
+				m.netMgr.ReleaseSlot(bp.buildID, bp.slot)
+			}
+		}
+		m.survivingBuilders = remaining
+		if len(remaining) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// builderProcAlive reports whether the ORIGINAL surviving builder still
+// runs. Three-way, never collapsing errors into a verdict: the process
+// is GONE only on conclusive evidence — the stat is absent (exited) or
+// its start time no longer matches (pid recycled by a stranger). Any
+// other read failure is about THIS process's ability to look (fd
+// exhaustion, transient I/O), not about the builder — inconclusive
+// retains the entry and the next beat re-probes, because dropping a
+// live unsized builder publishes an allocation undercount for the rest
+// of its build.
+func builderProcAlive(bp builderProc) bool {
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(bp.pid) + "/stat")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			return false // conclusively gone
+		}
+		return true // inconclusive: retain, re-probe next beat
+	}
+	start, ok := parseProcStartTime(stat)
+	if !ok {
+		return true // readable but unparseable: inconclusive, retain
+	}
+	return start == bp.start
+}
+
+// procStartTime reads a process's kernel start time (clock ticks since
+// boot, /proc stat field 22) — the stable identity a pid alone lacks.
+func procStartTime(pidDir string) (uint64, bool) {
+	stat, err := os.ReadFile("/proc/" + pidDir + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	return parseProcStartTime(stat)
+}
+
+func parseProcStartTime(stat []byte) (uint64, bool) {
+	i := strings.LastIndexByte(string(stat), ')')
+	if i < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	// Fields after comm: state=1, ppid=2, ... starttime is overall field
+	// 22, i.e. index 19 here.
+	if len(fields) < 20 {
+		return 0, false
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return start, true
+}
+
+// findSurvivingBuilders scans /proc for template-builder processes left
+// over from a previous daemon (KillMode=process restarts orphan them).
+// One directory walk with a cmdline read per process. Startup also needs a
+// synchronous pass before it can safely reclaim namespaces or start the pool.
+// A failed walk is an error: absence of survivors cannot be inferred.
+func findSurvivingBuilders(builderBin string) ([]builderProc, error) {
+	if builderBin == "" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("survivor scan: read /proc: %w", err)
+	}
+	self := os.Getpid()
+	var procs []builderProc
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		cmdline, err := os.ReadFile("/proc/" + e.Name() + "/cmdline")
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // exited between the readdir and here
+			}
+			// Inconclusive (fd exhaustion, transient I/O): this pid could
+			// BE the surviving builder, and skipping it would let the
+			// scan "succeed" without it. Fail the whole scan; the caller
+			// retries with the gate closed.
+			return nil, fmt.Errorf("survivor scan: read cmdline of pid %s: %w", e.Name(), err)
+		}
+		args := strings.Split(string(cmdline), "\x00")
+		if len(args) == 0 || args[0] != builderBin {
+			continue
+		}
+		// Only PREDECESSOR builders: a builder whose parent is this
+		// daemon belongs to a current, fully sized build (its registry
+		// counters already carry it) — classifying it as a survivor
+		// would suppress publication for the length of the build.
+		// Orphaned predecessors are reparented away from us, so the
+		// parent pid distinguishes the two.
+		ppid, perr := procPPID(e.Name())
+		if perr != nil {
+			if errors.Is(perr, os.ErrNotExist) {
+				continue // exited between the readdir and here
+			}
+			// Inconclusive: classifying a CURRENT build's freshly
+			// launched builder as a predecessor would suppress
+			// publication for its whole build. Fail the scan; the
+			// caller retries with the gate closed.
+			return nil, fmt.Errorf("survivor scan: parent of pid %s: %w", e.Name(), perr)
+		}
+		if ppid == self {
+			continue
+		}
+		stat, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // exited between the readdir and here
+			}
+			return nil, fmt.Errorf("survivor scan: read stat of pid %s: %w", e.Name(), err)
+		}
+		start, ok := parseProcStartTime(stat)
+		if !ok {
+			// Readable but unparseable: cannot record an identity for a
+			// process that matched the builder binary — inconclusive.
+			return nil, fmt.Errorf("survivor scan: unparseable stat for pid %s", e.Name())
+		}
+		proc := builderProc{pid: pid, start: start, buildID: builderArg(args, "--build-id")}
+		proc.slot, proc.hasSlot = builderSlotFromArgs(args)
+		procs = append(procs, proc)
+	}
+	return procs, nil
+}
+
+func builderSlotFromArgs(args []string) (int, bool) {
+	slot, err := strconv.Atoi(builderArg(args, "--slot-index"))
+	return slot, err == nil
+}
+
+func builderArg(args []string, flag string) string {
+	for i := 1; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// procPPID reads a process's parent pid from /proc/<pid>/stat. Errors
+// propagate — a transient read or parse failure is NOT a verdict about
+// the process (converting it into "not our child" would misclassify a
+// current build's builder as a predecessor), and the caller decides how
+// to fail.
+func procPPID(pidDir string) (int, error) {
+	stat, err := os.ReadFile("/proc/" + pidDir + "/stat")
+	if err != nil {
+		return 0, err
+	}
+	// Fields follow the parenthesized comm, which may itself contain
+	// spaces or parens: parse after the LAST ')'.
+	i := strings.LastIndexByte(string(stat), ')')
+	if i < 0 {
+		return 0, fmt.Errorf("unparseable stat for pid %s", pidDir)
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("short stat for pid %s", pidDir)
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, fmt.Errorf("unparseable ppid for pid %s: %w", pidDir, err)
+	}
+	return ppid, nil
+}
+
+// vmPossiblyLive reports whether a VM whose status claims its process
+// should be gone (paused, error) may in fact still be running, from
+// in-memory signals only: an unconfirmed stop marker (either supervision
+// mode), a lifecycle op in flight (mid-resume restore, mid-teardown), or
+// the unit oracle remembering an unconfirmed stop (including the
+// young-process settle window after a restart, when stops from the
+// previous daemon are unobservable — deliberate over-reporting).
+// Residual, shared with the pause path: an unconfirmed CGROUP-mode stop
+// on a path that does not set the marker is invisible here; that window
+// is rare, short, and reconciler-owned, and probing cgroups would put
+// filesystem reads on every beat.
+func (m *Manager) vmPossiblyLive(id string) bool {
+	if _, unconfirmed := m.vmStopUnconfirmed.Load(id); unconfirmed {
+		return true
+	}
+	return len(m.vmOpCh(id)) > 0 || unitMaybeWindingDown(systemdUnitName(id))
+}
+
+// CapacityPressure computes the pressure summary from maintained
+// in-memory state only: a pointer snapshot of the instance map under the
+// manager lock, per-instance reads under each instance's own lock, the
+// build registry, and the network manager's counter reads. No filesystem
+// or namespace inspection — safe at any cadence, called from the
+// heartbeat goroutine (30s), never a lifecycle path. The result is an
+// eventually consistent sample by design; cross-subsystem atomicity is
+// deliberately not attempted.
+func (m *Manager) CapacityPressure() HostPressure {
+	var p HostPressure
+	type instSnap struct {
+		id   string
+		inst *VMInstance
+	}
+	// Range the membership mirror, never m.vms: the walk is fleet-sized,
+	// and holding (even read-locking) the lifecycle mutex for it once per
+	// beat would stall cold boot and restore publishes behind telemetry.
+	var instances []instSnap
+	m.pressureIndex.Range(func(k, v any) bool {
+		instances = append(instances, instSnap{id: k.(string), inst: v.(*VMInstance)})
+		return true
+	})
+	for _, snap := range instances {
+		// Build-pipeline VMs in the instance map (the access-pattern
+		// recorder that RecordAccessPattern restores) are skipped ONLY
+		// while the build pressure counters still size them — counting
+		// both would double the allocation for the recording window. A
+		// recorder still alive after its allocation was returned (its
+		// DestroyVM failed; the build moved on to hashing) is covered
+		// here like any other live instance, or it would be invisible
+		// forever: the reconciler also skips build-prefixed ids.
+		if m.buildAllocCovers(snap.id) {
+			continue
+		}
+		inst := snap.inst
+		inst.mu.RLock()
+		status, vcpu, mem := inst.Status, inst.Config.VCPU, inst.Config.MemoryMiB
+		inst.mu.RUnlock()
+		// Unknown-size accounting happens at the CHARGE points below,
+		// never here: a settled paused VM or a provably dead error
+		// record is charged nothing whatever its size, so flagging it
+		// unknown would report a host as indescribable over VMs that
+		// hold nothing.
+		unsized := vcpu == 0 || mem == 0
+		switch status {
+		case StatusRunning:
+			p.RunningSandboxes++
+		case StatusCreating:
+			p.ProvisioningSandboxes++
+		case StatusPaused:
+			p.PausedSandboxes++
+			// A settled paused VM holds no memory or CPU — only disk and
+			// (until reclaim) a network slot, which UsedNetSlots already
+			// counts. But "paused" is also what the record reads while
+			// Firecracker may in fact be live: mid-resume (the restore
+			// window keeps StatusPaused until the flip to Running, with
+			// the VM's lifecycle lock held throughout), and after a pause
+			// whose stop was never confirmed (the unit oracle remembers
+			// exactly those). Count the allocation in both windows —
+			// capacity a live process consumes must never be advertised
+			// as free; vmPossiblyLive documents the signals and the shared
+			// residual.
+			if m.vmPossiblyLive(snap.id) {
+				p.AllocatedMemoryMib += int64(mem)
+				p.AllocatedVcpus += int64(vcpu)
+				if unsized {
+					p.UnknownAllocationVMs++
+				}
+			}
+			continue
+		case StatusError:
+			// Error records split the same way paused ones do: one that
+			// deliberately retains a possibly-live Firecracker (stop
+			// unconfirmed) keeps its allocation counted, while one whose
+			// process provably never launched (pre-launch rootfs/network
+			// failure) or was confirmed stopped holds nothing — and a
+			// failed-resume record retained for retry can sit for a long
+			// time, so blanket-counting it would subtract phantom
+			// capacity from placement indefinitely. Not a running or
+			// provisioning sandbox either way; only the allocation is at
+			// stake.
+			if !m.vmPossiblyLive(snap.id) {
+				continue
+			}
+		default:
+			continue
+		}
+		p.AllocatedMemoryMib += int64(mem)
+		p.AllocatedVcpus += int64(vcpu)
+		if unsized {
+			p.UnknownAllocationVMs++
+		}
+	}
+	// In-flight template builds run in a subprocess and never enter the
+	// instance map, but their memory and CPU are as real as any
+	// sandbox's, and build distribution (multi-host) will place against
+	// this number — a busy build host must not look idle. The counters
+	// release only at worker exit (see registerBuild/buildTemplateWorker),
+	// keeping a cancelled build counted until its subprocess is gone. Read
+	// the registry under the same lock so only builds reflected by the
+	// counters can be named as included in this sample.
+	m.buildsMu.RLock()
+	p.ProvisioningSandboxes += int32(m.buildPressureCount.Load())
+	p.AllocatedMemoryMib += m.buildPressureMem.Load()
+	p.AllocatedVcpus += m.buildPressureVcpus.Load()
+	for id, rec := range m.builds {
+		if rec.workerDone == nil {
+			continue
+		}
+		select {
+		case <-rec.workerDone:
+		default:
+			p.IncludedBuildVMIDs = append(p.IncludedBuildVMIDs, id)
+		}
+	}
+	m.buildsMu.RUnlock()
+	if m.netMgr != nil {
+		st := m.netMgr.SlotPressure()
+		p.UsedNetSlots = int32(st.Used)
+		p.IncludedBuildSlotVMIDs = st.BuildSlotOwners
+		p.ProvisioningNetSlots = int32(st.Provisioning)
+		p.WarmNetSlots = int32(st.WarmReady)
+		p.NetSlotCeiling = int32(st.Ceiling)
+	}
+	return p
+}
+
+type pausedNetworkPressureSnapshot struct {
+	totalSlots    int
+	freeSlots     int
+	netnsTotal    int
+	ownedSlots    int
+	orphaned      int
+	mountTotal    int
+	mountNsfs     int
+	freshPool     int
+	recycledPool  int
+	poolAvailable bool
+}
+
+func (m *Manager) pausedNetworkPressureSnapshot() pausedNetworkPressureSnapshot {
+	snapshot := pausedNetworkPressureSnapshot{totalSlots: network.MaxSlots}
+	if m.netMgr != nil {
+		snapshot.netnsTotal, snapshot.ownedSlots, snapshot.orphaned = m.netMgr.NetnsStats()
+		snapshot.freshPool, snapshot.recycledPool, snapshot.poolAvailable = m.netMgr.PoolStats()
+	}
+	snapshot.mountTotal, snapshot.mountNsfs = hostMountCounts()
+	snapshot.freeSlots = snapshot.totalSlots - snapshot.ownedSlots
+	if snapshot.poolAvailable {
+		snapshot.freeSlots += snapshot.freshPool + snapshot.recycledPool
+	}
+	if snapshot.freeSlots > snapshot.totalSlots {
+		snapshot.freeSlots = snapshot.totalSlots
+	}
+	if snapshot.freeSlots < 0 {
+		snapshot.freeSlots = 0
+	}
+	return snapshot
+}
+
+func (m *Manager) pausedNetworkSlotWatermarks(totalSlots int) (low, high int) {
+	low = m.cfg.PausedNetworkSlotHeadroomReserve
+	if pct := (totalSlots * m.cfg.PausedNetworkSlotHeadroomPercent) / 100; pct > low {
+		low = pct
+	}
+	if low < 0 {
+		low = 0
+	}
+	if low > totalSlots {
+		low = totalSlots
+	}
+	high = low + m.cfg.PausedNetworkSlotHeadroomHysteresis
+	if high <= low {
+		high = low + 1
+	}
+	if high > totalSlots {
+		high = totalSlots
+	}
+	if high < low {
+		high = low
+	}
+	return low, high
+}
+
+func (m *Manager) pausedNetworkCountWatermarks(threshold, hysteresis int) (low, high int, enabled bool) {
+	if threshold <= 0 {
+		return 0, 0, false
+	}
+	high = threshold
+	low = high - hysteresis
+	if hysteresis <= 0 {
+		low = high - 1
+	}
+	if low < 0 {
+		low = 0
+	}
+	if high <= low {
+		high = low + 1
+	}
+	return low, high, true
+}
+
+func (m *Manager) pausedAtForOrder(rec VMRecord) time.Time {
+	if !rec.PausedAt.IsZero() {
+		return rec.PausedAt
+	}
+	if !rec.CreatedAt.IsZero() {
+		return rec.CreatedAt
+	}
+	return time.Time{}
+}
+
+func (m *Manager) reclaimPausedNetworkInventory(now time.Time) int {
+	if m.state == nil || m.netMgr == nil || !m.cfg.PausedNetworkReclaimEnabled {
+		return 0
+	}
+	m.pausedNetworkControllerMu.Lock()
+	active := m.pausedNetworkControllerActive
+	last := m.pausedNetworkControllerLastRun
+	m.pausedNetworkControllerMu.Unlock()
+	if cooldown := m.cfg.PausedNetworkReclaimCooldown; cooldown > 0 {
+		if !last.IsZero() && now.Sub(last) < cooldown {
+			return 0
+		}
+	}
+
+	snapshot := m.pausedNetworkPressureSnapshot()
+	slotLow, slotHigh := m.pausedNetworkSlotWatermarks(snapshot.totalSlots)
+	netnsLow, netnsHigh, netnsEnabled := m.pausedNetworkCountWatermarks(m.cfg.PausedNetworkNetnsThreshold, m.cfg.PausedNetworkNetnsHysteresis)
+	mountLow, mountHigh, mountEnabled := m.pausedNetworkCountWatermarks(m.cfg.PausedNetworkMountThreshold, m.cfg.PausedNetworkMountHysteresis)
+
+	slotPressure := snapshot.freeSlots < slotLow
+	netnsPressure := netnsEnabled && snapshot.netnsTotal > netnsHigh
+	mountPressure := mountEnabled && snapshot.mountTotal > mountHigh
+	kernelPressure := netnsPressure || mountPressure
+	pressureState := "idle"
+	switch {
+	case slotPressure && kernelPressure:
+		pressureState = "both"
+	case slotPressure:
+		pressureState = "slot"
+	case kernelPressure:
+		pressureState = "kernel"
+	}
+	healthyNetns := !netnsEnabled || snapshot.netnsTotal <= netnsLow
+	healthyMount := !mountEnabled || snapshot.mountTotal <= mountLow
+	healthy := snapshot.freeSlots >= slotHigh && healthyNetns && healthyMount
+	telemetrySnapshot := telemetry.PausedNetworkPressure{
+		TotalSlots:     int64(snapshot.totalSlots),
+		UsedSlots:      int64(snapshot.totalSlots - snapshot.freeSlots),
+		AvailableSlots: int64(snapshot.freeSlots),
+		FreshPool:      int64(snapshot.freshPool),
+		RecycledPool:   int64(snapshot.recycledPool),
+		NetnsTotal:     int64(snapshot.netnsTotal),
+		MountTotal:     int64(snapshot.mountTotal),
+		PressureState:  pressureState,
+	}
+	defer func() {
+		if m.recorder != nil {
+			m.recorder.RecordPausedNetworkPressure(context.Background(), telemetrySnapshot)
+		}
+	}()
+	if active && healthy {
+		m.pausedNetworkControllerMu.Lock()
+		m.pausedNetworkControllerActive = false
+		m.pausedNetworkControllerMu.Unlock()
+		return 0
+	}
+	if !active && !slotPressure && !kernelPressure {
+		return 0
+	}
+	m.pausedNetworkControllerMu.Lock()
+	m.pausedNetworkControllerActive = true
+	m.pausedNetworkControllerMu.Unlock()
+
+	recs, err := m.state.All()
+	if err != nil {
+		m.log.Error().Err(err).Msg("failed to read VM state for paused network controller")
+		return 0
+	}
+	type candidate struct {
+		rec  VMRecord
+		when time.Time
+	}
+	candidates := make([]candidate, 0, len(recs))
+	for _, rec := range recs {
+		if rec.Status != StatusPaused || rec.Namespace == "" {
+			continue
+		}
+		candidates = append(candidates, candidate{rec: rec, when: m.pausedAtForOrder(rec)})
+	}
+	if len(candidates) == 0 {
+		return 0
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].when.Equal(candidates[j].when) {
+			return candidates[i].rec.ID < candidates[j].rec.ID
+		}
+		if candidates[i].when.IsZero() {
+			return false
+		}
+		if candidates[j].when.IsZero() {
+			return true
+		}
+		return candidates[i].when.Before(candidates[j].when)
+	})
+
+	maxReclaims := m.cfg.PausedNetworkMaxReclaims
+	if maxReclaims <= 0 {
+		maxReclaims = 1
+	}
+	reclaimed := 0
+	for _, cand := range candidates {
+		if reclaimed >= maxReclaims {
+			break
+		}
+		// Warmth is protected under every pressure type. Gating this on slot
+		// pressure alone made it dead in practice: slot headroom is measured
+		// against the whole index range, so kernel pressure is what actually
+		// fires, and a sandbox paused seconds ago was eligible immediately.
+		// Skipping a too-fresh candidate costs nothing — the backlog supplies
+		// older ones, and the next pass re-evaluates.
+		if m.cfg.PausedNetworkMinWarmAge > 0 {
+			age := now.Sub(m.pausedAtForOrder(cand.rec))
+			if age < m.cfg.PausedNetworkMinWarmAge {
+				continue
+			}
+		}
+		if unlock, ok := m.tryLockVMOp(cand.rec.ID); ok {
+			cur := cand.rec
+			if inst := m.trackedInstance(cand.rec.ID); inst != nil {
+				inst.mu.RLock()
+				cur.Status = inst.Status
+				cur.Namespace = inst.Namespace
+				cur.IP = inst.IP
+				cur.TAPDevice = inst.TAPDevice
+				cur.MACAddress = inst.MACAddress
+				cur.PausedAt = inst.PausedAt
+				inst.mu.RUnlock()
+			} else if m.state != nil {
+				stored, gerr := m.state.Get(cand.rec.ID)
+				if gerr != nil || stored == nil || stored.ID == "" {
+					unlock()
+					continue
+				}
+				cur = *stored
+			}
+			if cur.Status != StatusPaused || cur.Namespace == "" {
+				unlock()
+				continue
+			}
+			shrink := kernelPressure || !snapshot.poolAvailable
+			released, relErr := m.releasePausedNetworkSlot(cur, shrink)
+			if relErr != nil {
+				m.log.Error().Err(relErr).Str("vm_id", cand.rec.ID).Bool("shrink", shrink).Msg("failed to release paused network slot")
+				unlock()
+				continue
+			}
+			if released {
+				reclaimed++
+				telemetrySnapshot.ReclaimedPaused++
+				if shrink {
+					telemetrySnapshot.ReclaimedTeardown++
+				} else {
+					telemetrySnapshot.ReclaimedRecycle++
+				}
+			}
+			unlock()
+			continue
+		}
+	}
+	if kernelPressure && reclaimed < maxReclaims {
+		drained := m.netMgr.DrainWarmPool(maxReclaims - reclaimed)
+		reclaimed += drained
+		telemetrySnapshot.ReclaimedTeardown += int64(drained)
+	}
+	// Stamp on any pass that got this far, not only ones that reclaimed. A
+	// pressured host whose candidates are all lock-contended (or already
+	// released) otherwise never arms the cooldown, and repeats the full record
+	// scan, /proc/mounts read and netns readdir on every single tick.
+	m.pausedNetworkControllerMu.Lock()
+	m.pausedNetworkControllerLastRun = now
+	m.pausedNetworkControllerMu.Unlock()
+	return reclaimed
+}
+
+// releasePausedNetworkSlot tears down or recycles a paused sandbox's network
+// namespace and clears the persisted network identity so the slot can be
+// reclaimed.
+func (m *Manager) releasePausedNetworkSlot(rec VMRecord, shrink bool) (bool, error) {
+	if rec.Namespace == "" || m.netMgr == nil {
+		return false, nil
+	}
+
+	if inst := m.trackedInstance(rec.ID); inst != nil {
+		inst.mu.Lock()
+		if inst.Status != StatusPaused {
+			inst.mu.Unlock()
+			return false, nil
+		}
+		ns := inst.Namespace
+		if ns == "" {
+			inst.mu.Unlock()
+			return false, nil
+		}
+		inst.mu.Unlock()
+		cleared := toRecord(inst)
+		cleared.Namespace = ""
+		cleared.IP = ""
+		cleared.TAPDevice = ""
+		cleared.MACAddress = ""
+		if m.state != nil && !isBuildVM(inst.ID) {
+			if wrote, err := m.state.PutIfPresent(cleared); err != nil {
+				return false, fmt.Errorf("persist paused slot release for vm %s: %w", rec.ID, err)
+			} else if !wrote {
+				return false, nil
+			}
+		}
+		inst.mu.Lock()
+		inst.Namespace = ""
+		inst.IP = ""
+		inst.TAPDevice = ""
+		inst.MACAddress = ""
+		inst.mu.Unlock()
+		// Name the namespace explicitly rather than relying on the net
+		// manager's device table: a VM whose startup reattach failed is absent
+		// from it, and the by-vmID calls silently no-op for those. The record's
+		// namespace has already been cleared above, so a no-op here would strand
+		// the netns, veth, tap and mount entries with nothing left naming them —
+		// invisible to every sweep and reclaim until the next restart. These
+		// variants take the same by-vmID path when the VM is tracked.
+		if shrink {
+			m.netMgr.TeardownVMOrNamespace(rec.ID, ns)
+		} else {
+			m.netMgr.CleanupVMOrNamespace(rec.ID, ns)
+		}
+		return true, nil
+	}
+
+	cleared := rec
+	cleared.Namespace = ""
+	cleared.IP = ""
+	cleared.TAPDevice = ""
+	cleared.MACAddress = ""
+	if m.state != nil {
+		if wrote, err := m.state.PutIfPresent(cleared); err != nil {
+			return false, fmt.Errorf("persist paused slot release for vm %s: %w", rec.ID, err)
+		} else if !wrote {
+			return false, nil
+		}
+	}
+	if shrink {
+		m.netMgr.TeardownVMOrNamespace(rec.ID, rec.Namespace)
+	} else {
+		m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
+	}
+	return true, nil
 }
 
 // persistState writes the current VM state to BoltDB. No-op if no state
@@ -3269,6 +7544,7 @@ func (m *Manager) recordDeleted(vmID string) bool {
 func (m *Manager) undoReattach(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
+	m.unindexVM(vmID)
 	m.mu.Unlock()
 	m.netMgr.Forget(vmID)
 }
@@ -3281,15 +7557,42 @@ func (m *Manager) deleteState(vmID string) {
 	if isBuildVM(vmID) {
 		return
 	}
+	if v, ok := m.preserveRecordOnDestroy.Load(vmID); ok {
+		// A revival is in flight: the record is its retry anchor, so
+		// deletion becomes an overwrite with the pending-marked record.
+		// There is no recordless instant for a crash to land in.
+		rec := v.(VMRecord)
+		if err := m.state.Put(rec); err != nil {
+			m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to preserve revival anchor in BoltDB")
+		}
+		return
+	}
 	if err := m.state.Delete(vmID); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
+		return
 	}
+}
+
+// reviveTeardownCtxKey marks a context as belonging to revival's own
+// teardown calls: DestroyVM preserves the revival anchor for those and
+// retires it for every other caller.
+type reviveTeardownCtxKey struct{}
+
+// deleteStateForce removes the durable record even while a revival's
+// preserve entry is active: revival's own destroy-wins paths call it
+// once an external destroy is detected, because the deletion is then
+// authoritative and the anchor must not survive it.
+func (m *Manager) deleteStateForce(vmID string) {
+	m.preserveRecordOnDestroy.Delete(vmID)
+	m.deleteState(vmID)
 }
 
 func (m *Manager) removeVM(vmID string) {
 	m.mu.Lock()
 	delete(m.vms, vmID)
+	m.unindexVM(vmID)
 	m.mu.Unlock()
+	m.vmStopUnconfirmed.Delete(vmID)
 	m.deleteState(vmID)
 }
 
@@ -3308,6 +7611,70 @@ func (m *Manager) copyRootfs(ctx context.Context, dirName, srcRootfs string) (st
 	}
 
 	return diskPath, nil
+}
+
+// copyRootfsExact reflinks the source into the VM's run dir with no
+// fallback: extent-exact or error, for overlay sources whose holes are
+// semantically load-bearing.
+func (m *Manager) copyRootfsExact(ctx context.Context, dirName, srcRootfs string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	diskPath := filepath.Join(vmDir, "rootfs.ext4")
+	cmd := exec.CommandContext(ctx, "cp", "--reflink=always", srcRootfs, diskPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("exact copy (source and run dir must share a reflink filesystem): %s: %w", string(out), err)
+	}
+	return diskPath, nil
+}
+
+// placeBlockMap puts a snapshot's saved overlay block map where Firecracker
+// looks for one when it opens the per-VM overlay: a link when the map
+// shares the run dir's filesystem (Firecracker only reads it and unlinks
+// its own name), a copy of the small file otherwise.
+func placeBlockMap(blockMap, diskPath string) error {
+	dst := diskPath + ".bitmap"
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Link(blockMap, dst); !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	data, err := os.ReadFile(blockMap)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o644)
+}
+
+// cloneSavedDisk gives the VM its own copy of a saved snapshot's disk. An
+// overlay is reflinked extent-exact or refused, as captureSavedDisk made it;
+// a standalone rootfs may be copied.
+func (m *Manager) cloneSavedDisk(ctx context.Context, dirName, savedDisk, basePath string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	name := "rootfs.ext4"
+	if basePath != "" {
+		name = "overlay.ext4"
+	}
+	clone := reflinkFileExact
+	if m.reflinkFile != nil {
+		clone = m.reflinkFile
+	}
+	dst := filepath.Join(vmDir, name)
+	if err := clone(ctx, savedDisk, dst); err != nil {
+		// A partial file left here would pass a same-id retry as the VM's
+		// existing disk.
+		_ = os.Remove(dst)
+		if errors.Is(err, errNoReflink) {
+			return "", status.Errorf(codes.FailedPrecondition, "saved disk %s needs a reflink filesystem shared with %s: %v", savedDisk, m.cfg.RunDir, err)
+		}
+		return "", fmt.Errorf("clone saved disk: %w", err)
+	}
+	return dst, nil
 }
 
 // createOverlay creates a sparse per-VM overlay file pre-sized to the base
@@ -3389,13 +7756,13 @@ func isLeafName(s string) bool {
 // isReservedRunDirName reports whether name is a shared dir under RunDir
 // (template mount target, build tree) rather than a per-VM dir.
 func isReservedRunDirName(name string) bool {
-	return name == templateDirName || name == TemplatesDirName
+	return name == templateDirName || name == TemplatesDirName || name == stallForensicsDirName || name == SavedSnapshotsDirName
 }
 
 // abortResumeLocked reverts a freshly-resumed VM back to Paused when a
 // post-restore step fails; the caller must hold vmID's lifecycle lock,
 // continuously since the resume it is aborting — that continuity is what
-// guarantees no retry has adopted the instance in between. The unit is
+// guarantees no retry has adopted the instance in between. The VM is
 // stopped and the record re-marked Paused so the host matches the caller's
 // view of a failed resume. A restore never mutates the snapshot artifacts it
 // resumed from, so a later resume simply restores them again.
@@ -3420,28 +7787,126 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	inst.mu.Lock()
 	inst.Status = StatusPaused
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
+	inst.DirtyTrackingSessionID = ""
+	inst.DirtyTrackingGeneration = 0
+	inst.PausedAt = time.Now()
 	inst.mu.Unlock()
-	// Conditional: a concurrent destroy may have deleted the record; it owns
-	// the teardown then, and an unconditional write would resurrect a
-	// destroyed VM's record.
-	// Best-effort: an undurable revert is re-derived by the reconciler.
-	_, _ = m.persistStateIfPresent(inst)
+	// Durable convergence is deferred: the write is unbounded fsync work
+	// and this runs on reply paths whose deadline reserve covers only the
+	// bounded stop. In-memory Paused above is what a same-ID retry reads.
+	// The worker carries the standard protections: the lifecycle lock
+	// serializes it against retries, a replacement's record is repaired
+	// rather than clobbered by our stale instance, and the lock-bypassing
+	// destroy is compensated after the write (an undurable revert is also
+	// re-derived by the reconciler).
+	m.deferStatePersist("resume-abort-persist", vmID, inst, true)
 }
 
-// stopUnitDuringRestoreError stops the per-VM systemd unit when a restore
-// aborts after Firecracker started. Uses a fresh context because the
-// caller's gRPC ctx is often already cancelled (deadline exceeded under
-// load). Without this, the firecracker process leaks.
+// releaseFailedRestore frees a failed restore's network slot and rundir —
+// unless a cgroup FC survived the failure (or its death cannot be proven), in
+// which case it still holds the tap and its disk, and freeing either would
+// hand live resources to the next claimant. Ownership (record, rundir, slot)
+// is then retained: the record reads Error with cgroup supervision, and the
+// reconciler's error rules complete the stop and release. Unit-mode VMs are
+// unaffected — cgroupStillLive consults the cgroup, not the record, and is
+// false when no delegated subtree exists.
+func (m *Manager) releaseFailedRestore(vmID string, inPlace, tapBusy bool, cleanupRunDir func()) {
+	if m.cgroupStillLive(vmID) {
+		m.log.Warn().Str("vm_id", vmID).
+			Msg("restore failed with a live cgroup — keeping rundir and network until the reconciler confirms death")
+		// Best-effort persist — the in-memory marker still guides this
+		// life, and a restart re-parks via reattach either way.
+		m.mu.RLock()
+		inst := m.vms[vmID]
+		m.mu.RUnlock()
+		if inst != nil {
+			inst.mu.Lock()
+			inst.TeardownPending = "restore failed; cgroup process not proven dead; rundir and network retained; reconciler owns stop and release"
+			inst.mu.Unlock()
+			// SYNCHRONOUS on purpose, unlike this path's other durable
+			// writes: the marker is crash-safety-critical (pinned by test).
+			// A crash before it lands would lose the "reconciler owns stop
+			// and release" instruction while a possibly-live Firecracker
+			// still holds the tap and rundir. This branch fires only when a
+			// cgroup is provably live or unprovable — rare enough that the
+			// verdict reserve yields to resource safety here.
+			_, _ = m.persistStateIfPresent(inst)
+		}
+		return
+	}
+	if !inPlace {
+		// A tap-busy slot is suspect — tear it down rather than recycle it,
+		// so it isn't handed to another create with the same bad tap.
+		if tapBusy {
+			m.netMgr.TeardownVM(vmID)
+		} else {
+			m.netMgr.CleanupVM(vmID)
+		}
+	}
+	cleanupRunDir()
+}
+
+// stopUnitDuringRestoreError stops a VM when a restore aborts after
+// Firecracker started. Uses a fresh context because the caller's gRPC ctx is
+// often already cancelled (deadline exceeded under load). Without this, the
+// firecracker process leaks. Mode-aware: cgroup mode's kill waits for the
+// group to empty by construction (so the slot-recycle-races-tap concern the
+// unit path handles with a MainPID SIGKILL is already covered).
+// restoreErrorStopBudget bounds the stop of what a failed launch started,
+// and restoreErrorProcessWait the wait for its process to go, on the error
+// paths of restore and resume and in wake recovery.
+const (
+	restoreErrorStopBudget  = 10 * time.Second
+	restoreErrorProcessWait = 2 * time.Second
+)
+
 func (m *Manager) stopUnitDuringRestoreError(vmID string) {
-	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	supervision := m.supervisionForVM(vmID)
+	stopCtx, cancel := context.WithTimeout(context.Background(), restoreErrorStopBudget)
 	defer cancel()
-	if err := stopUnit(stopCtx, systemdUnitName(vmID)); err != nil {
-		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("systemctl stop failed during restore error cleanup")
+	stopErr := m.stopVM(stopCtx, vmID, supervision)
+	if stopErr != nil {
+		m.log.Warn().Err(stopErr).Str("vm_id", vmID).Msg("stop failed during restore error cleanup")
+	}
+	// Marker symmetry keys on PROCESS death, not on the stop call's full
+	// success: a cgroup kill that emptied the group but failed the final
+	// rmdir returns an error while the processes are provably gone (the
+	// leftover directory is the harmless-residue class). A confirmed
+	// resolution clears any STALE marker from an earlier unconfirmed stop
+	// too — the resume's relaunch displaced that residue, and without the
+	// clear a retained Error/Paused record would charge memory for a
+	// process that no longer exists on every report until the sandbox
+	// next cycles.
+	resolved := stopErr == nil ||
+		(cgroupSupervised(supervision) && m.cgroupDefinitelyDead(vmID))
+	if resolved {
+		m.vmStopUnconfirmed.Delete(vmID)
+	}
+	if cgroupSupervised(supervision) {
+		// stopVM's cgroup path already sent cgroup.kill (SIGKILL to every
+		// process) and waited for the group to empty; a nil error means it
+		// is gone. On error the FC is wedged (e.g. uninterruptible I/O) —
+		// there is no stronger signal than SIGKILL — so do NOT claim clean:
+		// log it, and the slot stays safe because the pool recycles only
+		// after verifyAndRecycle confirms the netns empty, with the
+		// reconciler reaping the residual cgroup.
+		if stopErr != nil && !resolved {
+			// The unit oracle cannot see this residue, and the caller is
+			// about to persist a non-live status (Error/Paused) over a
+			// possibly-live Firecracker: preserve the verdict so pressure
+			// keeps charging its memory until the reconciler's reap (which
+			// clears the marker through removeVM) proves the group empty.
+			m.vmStopUnconfirmed.Store(vmID, struct{}{})
+			m.log.Error().Err(stopErr).Str("vm_id", vmID).
+				Msg("cgroup VM not confirmed stopped; slot recycle gated on pool verification")
+		}
+		return
 	}
 
-	// Slot is recycled right after this returns; if stopUnit timed out the FC
-	// may still hold tap0. Resolve the unit's live MainPID (inst.PID is set
-	// asynchronously and often still 0 this early), SIGKILL, and wait for exit.
+	// Unit path: slot is recycled right after this returns; if stopUnit timed
+	// out the FC may still hold tap0. Resolve the unit's live MainPID
+	// (inst.PID is set asynchronously and often still 0 this early), SIGKILL,
+	// and wait for exit.
 	killCtx, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel2()
 	sigkillPID(m.unitMainPID(killCtx, vmID), 500*time.Millisecond)
@@ -3505,10 +7970,10 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 	switch {
 	case !exists:
 		m.log.Warn().Str("template_vm", vmID).Str("path", outputPath).
-			Msg("recorder produced no access log; restores will fall back to sequential prefetch")
+			Msg("recorder produced no access log; restores will run without prefetch")
 	case pages == 0:
 		m.log.Warn().Str("template_vm", vmID).Str("path", outputPath).
-			Msg("recorder produced an empty access log; restores will fall back to sequential prefetch")
+			Msg("recorder produced an empty access log; restores will run without prefetch")
 	default:
 		m.log.Info().Str("template_vm", vmID).Str("path", outputPath).Int("pages", pages).
 			Msg("access pattern recorded")
@@ -3624,6 +8089,53 @@ func fcSetupCmds(templateDir, basePath, perVMRootfs string) string {
 		shellquote.Single(templateDir), shellquote.Single(perVMRootfs), shellquote.Single(rootfsLink))
 }
 
+// LaunchNSEntry is how a Firecracker launch enters its VM's network
+// namespace, in both the forms the two launch sites need: vmd renders a shell
+// script, template-builder execs an argv directly.
+type LaunchNSEntry struct {
+	// Argv enters the namespace as an exec prefix.
+	Argv []string
+	// Shell is the same prefix rendered into a `sh -c` script.
+	Shell string
+	// SysfsSetup is extra shell the caller MUST append to its in-namespace
+	// setup commands. `ip netns exec` remounts /sys inside the namespace;
+	// nsenter does not, so a launcher-pin entry that omits this leaves
+	// /sys/class/net showing the host's interfaces instead of the VM's tap.
+	// Empty for the legacy entry, which already gets the remount.
+	SysfsSetup string
+}
+
+// LaunchNamespaceEntry resolves how a launch enters netNS.
+//
+// launcherNSPath == "" selects the legacy `ip netns exec`, which clones the
+// FULL host mount table into a throwaway mount namespace on every call — the
+// cost the launcher pin exists to avoid. A non-empty path enters the pruned
+// launcher mount namespace instead, so the following `unshare -m` clones that
+// small table rather than the host's.
+//
+// Both launch sites go through here because the entry mode and the sysfs
+// remount are coupled: picking nsenter without adding SysfsSetup is a silent
+// correctness bug, not a performance one.
+func LaunchNamespaceEntry(netNS, launcherNSPath string) LaunchNSEntry {
+	if launcherNSPath == "" {
+		return LaunchNSEntry{
+			Argv:  []string{"ip", "netns", "exec", netNS},
+			Shell: fmt.Sprintf("ip netns exec %s", netNS),
+		}
+	}
+	return LaunchNSEntry{
+		Argv: []string{
+			"nsenter",
+			"--net=/run/netns/" + netNS,
+			"--mount=" + launcherNSPath,
+			"--",
+		},
+		Shell: fmt.Sprintf("nsenter --net=/run/netns/%s --mount=%s --",
+			netNS, shellquote.Single(launcherNSPath)),
+		SysfsSetup: " && mount -t sysfs sysfs /sys",
+	}
+}
+
 // fcStartScript renders the per-VM start.sh that systemd's ExecStart runs.
 //
 // launcherNSPath == "" → legacy: `ip netns exec <ns> unshare -m …`.
@@ -3633,21 +8145,54 @@ func fcSetupCmds(templateDir, basePath, perVMRootfs string) string {
 // netns resolves even though the launcher has /run/netns pruned — which is why
 // `ip netns exec` (resolves the netns from inside the mount ns) can't be used.
 func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID string) string {
-	prefix := fmt.Sprintf("ip netns exec %s", netNS)
-	sysfs := ""
-	if launcherNSPath != "" {
-		prefix = fmt.Sprintf("nsenter --net=/run/netns/%s --mount=%s --", netNS, shellquote.Single(launcherNSPath))
-		// nsenter, unlike `ip netns exec`, doesn't remount /sys, so /sys/class/net
-		// would show the host's interfaces, not the VM's tap. Remount a netns-aware
-		// sysfs inside the per-VM ns (after make-rprivate, so it can't reach the host).
-		sysfs = " && mount -t sysfs sysfs /sys"
-	}
+	// Entry mode and its sysfs obligation come from the shared resolver, so
+	// this script and template-builder's build VM cannot drift on them.
+	entry := LaunchNamespaceEntry(netNS, launcherNSPath)
+	prefix, sysfs := entry.Shell, entry.SysfsSetup
 	// Each value is single-quoted, then the whole inner script is single-quoted as
 	// the `sh -c` arg — two shellquote.Single layers, so a caller-influenced path
 	// (base_path, perVMRootfs) can't close a quote and inject shell as root.
-	inner := fmt.Sprintf("%s%s && exec %s --api-sock %s --id %s",
-		setupCmds, sysfs, shellquote.Single(fcBin), shellquote.Single(socketPath), shellquote.Single(vmID))
+	//
+	// The date stamp right before the exec splits wait_socket into shell-chain
+	// time and Firecracker-side time (see readFCExecStamp). Best-effort: a date
+	// without %N or an unwritable dir must never block the launch. Cost: one
+	// fork+exec and a one-line page-cache write, ~1ms inside a phase measured
+	// in tens of ms — and it lands INSIDE wait_socket, so the split it buys is
+	// also what would expose it if it ever grew. No fork-free alternative
+	// exists here: POSIX sh has no sub-second clock builtin, and Firecracker's
+	// own --start-time-us reporting lands in a metrics sink this fleet does
+	// not run.
+	inner := fmt.Sprintf("%s%s && { date +%%s%%N >%s 2>/dev/null || true; } && exec %s --api-sock %s --id %s",
+		setupCmds, sysfs, shellquote.Single(fcExecStampPath(socketPath)),
+		shellquote.Single(fcBin), shellquote.Single(socketPath), shellquote.Single(vmID))
 	return fmt.Sprintf("#!/bin/sh\nexec %s unshare -m -- sh -c %s\n", prefix, shellquote.Single(inner))
+}
+
+// fcExecStampPath is the per-VM file the launch script writes (wall-clock
+// nanoseconds) immediately before exec'ing Firecracker.
+func fcExecStampPath(socketPath string) string {
+	return filepath.Join(filepath.Dir(socketPath), "fcexec.ts")
+}
+
+// readFCExecStamp returns the launch script's pre-exec timestamp, or false
+// when it is missing, unparsable (a shell whose date lacks %N), or outside
+// (notBefore, notAfter) — a stale stamp from a prior launch of the same VM
+// must not be attributed to this one. Wall clock on both sides: the script's
+// date and the phase timestamps compared against it.
+func readFCExecStamp(socketPath string, notBefore, notAfter time.Time) (time.Time, bool) {
+	data, err := os.ReadFile(fcExecStampPath(socketPath))
+	if err != nil {
+		return time.Time{}, false
+	}
+	ns, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	ts := time.Unix(0, ns)
+	if ts.Before(notBefore) || ts.After(notAfter) {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 // startFirecrackerViaSystemd writes the start script and launches Firecracker
@@ -3666,32 +8211,12 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	setupCmds := fcSetupCmds(templateDir, basePath, perVMRootfs)
 
 	scriptPath := filepath.Join(filepath.Dir(socketPath), "start.sh")
-	// Re-check the pin here, not just launcherReady: a pin unmounted since the
-	// last revalidation tick would otherwise bake a dead nsenter --mount into
-	// start.sh and hard-fail. pinIsMounted is one statfs — no fork on the hot
-	// path, no transient exec failure under burst load. On failure fall back to
-	// legacy for THIS launch only; launcherReady stays with the sampler, so one
-	// blip can't knock the whole fleet onto the O(fleet) legacy path for a tick.
-	launcherPath := ""
-	pin := m.launcherNSPath()
-	switch {
-	case pin == "":
-		// Launcher mode disabled: legacy is the configured path.
-	case !m.launcherReady.Load():
-		// Every launch here copies the full host mount table, so concurrent
-		// launches degrade with fleet size. launcherBuilt splits the causes:
-		// a build still in progress resolves itself; a failed build or an
-		// invalidated pin does not.
-		if m.launcherBuilt.Load() {
-			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin invalidated — using legacy path for this launch")
-		} else {
-			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not built — using legacy path for this launch")
-		}
-	case pinIsMounted(pin):
-		launcherPath = pin
-	default:
-		m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not mounted at launch — using legacy path for this launch")
-	}
+	// Re-check the pin here (shared with the direct path via launchLauncherPath):
+	// a pin unmounted since the last revalidation tick would otherwise bake a
+	// dead nsenter --mount into start.sh and hard-fail. On failure it falls back
+	// to legacy for THIS launch only; launcherReady stays with the sampler, so
+	// one blip can't knock the whole fleet onto the O(fleet) legacy path.
+	launcherPath := m.launchLauncherPath(vmID)
 	scriptContent := fcStartScript(netNS, launcherPath, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
 		return 0, fmt.Errorf("write start script: %w", err)
@@ -3712,6 +8237,13 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 
 	tStartUnit := time.Now()
 	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
+		// A failed unit start (D-Bus round trip or systemctl fallback eating
+		// the deadline) can be the slowest part of a launch — sample it.
+		m.recordPhases("launch", "unit", map[string]time.Duration{
+			"prestart":   tStartUnit.Sub(tPrestart),
+			"linger":     time.Duration(lingerCheckMs) * time.Millisecond,
+			"start_unit": time.Since(tStartUnit),
+		})
 		return 0, fmt.Errorf("start systemd unit: %w", err)
 	}
 	tStartUnitDone := time.Now()
@@ -3734,6 +8266,14 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 		status := unitFailureSummary(ctx, systemdUnitName(vmID))
 		m.log.Warn().Str("vm_id", vmID).Str("unit_state", status).Err(err).
 			Msg("firecracker socket missing after launch")
+		// Emit the coarse phases with the exhausted wait: the slowest launch
+		// incidents must form the histogram's tail, not vanish from it.
+		m.recordPhases("launch", "unit", map[string]time.Duration{
+			"prestart":    tStartUnit.Sub(tPrestart),
+			"linger":      time.Duration(lingerCheckMs) * time.Millisecond,
+			"start_unit":  tStartUnitDone.Sub(tStartUnit),
+			"wait_socket": time.Since(tStartUnitDone),
+		})
 		// Detached budget: the caller's ctx may be at its deadline here, and
 		// this stop must run or the just-launched unit leaks.
 		_ = stopUnitWithBudget(ctx, systemdUnitName(vmID))
@@ -3741,19 +8281,43 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	}
 	tSocketReady := time.Now()
 
-	m.log.Info().
+	ev := m.log.Info().
 		Str("vm_id", vmID).
 		Int64("prestart_ms", tStartUnit.Sub(tPrestart).Milliseconds()).
 		Int64("linger_check_ms", lingerCheckMs).
 		Bool("linger_skipped", freshUnit).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
-		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
-		Msg("fc startup phases")
+		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds())
+	// On the unit path chain also contains PID 1's dispatch of the unit;
+	// fc_socket is Firecracker init plus our detection latency. Emitted to
+	// both the log and the phase histogram when the stamp is usable.
+	unitPhases := map[string]time.Duration{
+		"prestart":    tStartUnit.Sub(tPrestart),
+		"linger":      time.Duration(lingerCheckMs) * time.Millisecond,
+		"start_unit":  tStartUnitDone.Sub(tStartUnit),
+		"wait_socket": tSocketReady.Sub(tStartUnitDone),
+	}
+	// Window opens at tStartUnit (pre-enqueue): the unit's script can stamp
+	// before the no-block start call returns. The split boundary is clamped
+	// to tStartUnitDone so both sides use it: chain + fc_socket always
+	// equals wait_socket exactly.
+	if ts, ok := readFCExecStamp(socketPath, tStartUnit, tSocketReady); ok {
+		boundary := ts
+		if boundary.Before(tStartUnitDone) {
+			boundary = tStartUnitDone
+		}
+		ev = ev.Int64("chain_ms", boundary.Sub(tStartUnitDone).Milliseconds()).
+			Int64("fc_socket_ms", tSocketReady.Sub(boundary).Milliseconds())
+		unitPhases["chain"] = boundary.Sub(tStartUnitDone)
+		unitPhases["fc_socket"] = tSocketReady.Sub(boundary)
+	}
+	ev.Msg("fc startup phases")
+	m.recordPhases("launch", "unit", unitPhases)
 
 	// Read the PID asynchronously so the create path isn't slowed down
 	// by the ~15ms dbus roundtrip. The PID is populated in the instance
 	// shortly after create returns and persisted to BoltDB.
-	go m.resolveAndSetPID(vmID)
+	go m.resolveAndSetPID(vmID, m.launchGenFor(vmID))
 
 	return 0, nil
 }
@@ -3780,7 +8344,7 @@ func (m *Manager) unitMainPID(ctx context.Context, vmID string) int {
 	return pid
 }
 
-func (m *Manager) resolveAndSetPID(vmID string) {
+func (m *Manager) resolveAndSetPID(vmID string, gen uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -3796,9 +8360,11 @@ func (m *Manager) resolveAndSetPID(vmID string) {
 		return
 	}
 
-	inst.mu.Lock()
-	inst.PID = pid
-	inst.mu.Unlock()
+	if !publishResolvedPID(inst, gen, pid) {
+		// A newer launch attempt owns this record; publishing here would
+		// point every later reader at a stopped unit.
+		return
+	}
 
 	// The persist must join the vm op critical section: unserialized, its
 	// snapshot could commit after the launching op's own writes (e.g. the
@@ -3924,6 +8490,311 @@ func waitForSocketConnectable(path string, deadline time.Time) error {
 	}
 }
 
+// psiSample caches the three PSI gauges: avg10 moves on a ten-second
+// window, so re-reading /proc on every semaphore-held restore buys nothing.
+// A burst of restores shares one refresh; a lone restore pays at most three
+// small /proc reads every cache period.
+type psiSample struct {
+	at            time.Time
+	cpu, mem, io1 float64
+}
+
+var (
+	psiCache      atomic.Pointer[psiSample]
+	psiRefreshing atomic.Bool
+)
+
+func cachedPSI() (cpu, mem, io1 float64) {
+	p := psiCache.Load()
+	if p != nil && time.Since(p.at) < 2*time.Second {
+		return p.cpu, p.mem, p.io1
+	}
+	// Exactly one caller refreshes; a concurrent burst on an expired cache
+	// serves the stale sample instead of stacking /proc reads on the
+	// semaphore-held path (avg10 moves on a ten-second window — staleness
+	// is immaterial, per-restore syscalls are not).
+	if !psiRefreshing.CompareAndSwap(false, true) {
+		if p != nil {
+			return p.cpu, p.mem, p.io1
+		}
+		return -1, -1, -1
+	}
+	defer psiRefreshing.Store(false)
+	s := &psiSample{
+		at:  time.Now(),
+		cpu: psiSomeAvg10("/proc/pressure/cpu"),
+		mem: psiSomeAvg10("/proc/pressure/memory"),
+		io1: psiSomeAvg10("/proc/pressure/io"),
+	}
+	psiCache.Store(s)
+	return s.cpu, s.mem, s.io1
+}
+
+// tailFile returns up to n trailing bytes of the file and its total size.
+func tailFile(path string, n int64) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	off := st.Size() - n
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, st.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return "", st.Size(), err
+	}
+	return string(buf), st.Size(), nil
+}
+
+// stallJournalSem bounds concurrent journalctl fallbacks: a mass stall of
+// unit-supervised restores must not spawn hundreds of five-second processes
+// on an already pressured host. Saturated captures are skipped, not queued —
+// the first few consoles tell a burst's story, and the journal keeps the
+// rest for manual inspection.
+var stallJournalSem = make(chan struct{}, 2)
+
+// deferStatePersist converges an instance's durable record OFF the reply
+// path — persistence is unbounded fsync work and BoltDB is slow under
+// exactly the pressure that puts these paths in play. The in-memory state
+// must already be correct before calling (that is what concurrent readers
+// and same-ID retries see). The worker carries the standard protections:
+// the lifecycle lock serializes it against retries, a replacement's record
+// is repaired rather than clobbered by the stale instance, and the
+// lock-bypassing destroy is compensated after the write.
+func (m *Manager) deferStatePersist(scope, vmID string, inst *VMInstance, ifPresent bool) {
+	go func() {
+		defer sentrylog.Recover(scope)
+		unlock, lockErr := m.lockVMOp(context.Background(), vmID)
+		if lockErr != nil {
+			return
+		}
+		defer unlock()
+		m.mu.RLock()
+		cur, tracked := m.vms[vmID]
+		m.mu.RUnlock()
+		if !tracked {
+			return // the destroy owns teardown; nothing to write
+		}
+		if cur != inst {
+			m.persistState(cur)
+		} else if ifPresent {
+			_, _ = m.persistStateIfPresent(inst)
+		} else {
+			m.persistState(inst)
+		}
+		m.mu.RLock()
+		_, still := m.vms[vmID]
+		m.mu.RUnlock()
+		if !still {
+			m.deleteState(vmID)
+		}
+	}()
+}
+
+// bootVerdictReserve is the deadline slice reserved for a boot's WORST-CASE
+// error path so the definitive verdict still returns in-band: the 10s
+// bounded unit stop, the 2s surviving-unit resolve, and a reply margin.
+// Shared by the restore readiness clamp and the resume readiness clamp —
+// both gates tear down on timeout before replying.
+const bootVerdictReserve = 13 * time.Second
+
+// stallForensicsDirName holds quarantined consoles from readiness-timeout
+// teardowns, inside RunDir (dot-prefixed so it can never collide with a VM
+// id). Files are root-only: guest serial is tenant-controlled data and must
+// not reach service logs or wider-readable paths.
+const stallForensicsDirName = ".stall-forensics"
+
+// stallForensicsKeep caps the quarantine so a stall storm cannot grow it
+// unbounded; oldest are dropped first (names sort by capture time).
+const stallForensicsKeep = 20
+
+// summarizeConsoleTail classifies console lines without exposing content:
+// Firecracker's own lines (timestamp + [vmid:fc_*] prefix), boxd's lines,
+// and anything else — which can only be guest output. That split answers
+// the diagnostic question by itself: zero guest/boxd lines means the guest
+// stalled before its first output (the resume/page-fault window), while
+// boxd lines mean it reached userspace.
+func summarizeConsoleTail(tail string) (fcLines, boxdLines, guestLines int, panicked bool) {
+	for _, line := range strings.Split(tail, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "[boxd]"):
+			boxdLines++
+		case strings.Contains(line, ":fc_") && strings.HasPrefix(line, "20"):
+			fcLines++
+		default:
+			guestLines++
+		}
+	}
+	panicked = strings.Contains(tail, "Kernel panic")
+	return
+}
+
+// captureStallForensics records a content-free summary of a VM's console
+// after the guest failed to become ready, and quarantines the raw file
+// (root-only, capped) for operator inspection — the failure teardown would
+// otherwise delete the only evidence. An empty console is itself the
+// strongest signal: the guest stalled before its first line.
+//
+// Two things run synchronously because the teardown destroys their subject:
+// the console rename (the rundir is deleted) and the procfs read of the
+// Firecracker process (the process is killed). Both are in-memory operations
+// — a rename and a handful of procfs reads, no disk I/O — so the in-band
+// verdict margin is preserved. Formatting, logging, quarantine writes, and
+// the journald fallback all run detached.
+func (m *Manager) captureStallForensics(vmID string, pid int, waited time.Duration, launchedAt time.Time) {
+	failedAt := time.Now()
+
+	src := filepath.Join(m.cfg.RunDir, vmID, "console.log")
+	// The ONLY work that must beat the teardown's rundir delete is moving
+	// the file out (direct-spawn mode; unit mode has no file, and its
+	// journal survives on its own). Everything else — read, summary,
+	// chmod, pruning, the journald fallback — runs detached, so the
+	// verdict reserve is never spent on forensics.
+	dir := filepath.Join(m.cfg.RunDir, stallForensicsDirName)
+	dst := filepath.Join(dir, fmt.Sprintf("%d-%s.console.log", failedAt.Unix(), vmID))
+	renamed := m.forensicsOK && os.Rename(src, dst) == nil // dir pre-created and secured at startup
+	// Proc capture runs AFTER the rename: both are best-effort and race a
+	// concurrent DestroyVM (which bypasses the lifecycle lock and deletes the
+	// rundir), but the rename is microseconds while the capture may spend its
+	// whole budget — doing the cheap one first keeps a slow capture from
+	// costing us the console too.
+	var proc *procStallState
+	if pid > 0 {
+		var outcome captureOutcome
+		// A late capture publishes itself rather than being discarded: a read
+		// slow enough to miss the budget signals exactly the host conditions
+		// worth diagnosing.
+		onLate := func(st *procStallState) {
+			m.log.Warn().Str("vm_id", vmID).Msg("guest not ready — proc capture completed after its budget")
+			m.logStallProcState(vmID, waited, st, dir, failedAt)
+			// This write lands after the forensics goroutine's own prune has
+			// already run, so it must prune for itself or late captures
+			// accumulate outside the cap entirely. Concurrent prunes race
+			// benignly — removing an already-removed entry is a no-op.
+			if m.forensicsOK {
+				pruneOldest(dir, stallForensicsKeep)
+			}
+		}
+		if proc, outcome = captureProcStateBounded(pid, vmID, onLate); outcome != captureOK {
+			m.log.Warn().Str("vm_id", vmID).Int("fc_pid", pid).Str("outcome", string(outcome)).
+				Msg("guest not ready — proc capture did not complete inline; proceeding to teardown")
+		}
+	}
+	go func() {
+		defer sentrylog.Recover("stall-forensics")
+		// One prune covering every exit path: a stall can add a console file,
+		// a procstate file, or both, and the paths that produce no console
+		// (unit supervision, a console already gone) must not grow the
+		// quarantine without bound.
+		if m.forensicsOK {
+			defer pruneOldest(dir, stallForensicsKeep)
+		}
+		if proc != nil {
+			m.logStallProcState(vmID, waited, proc, dir, failedAt)
+		}
+		if renamed {
+			_ = os.Chmod(dst, 0o600)
+			tail, size, err := tailFile(dst, 4096)
+			if err != nil {
+				m.log.Warn().Str("vm_id", vmID).Err(err).
+					Msg("guest not ready — quarantined console unreadable")
+			} else {
+				m.logStallSummary(vmID, waited, tail, size, dst)
+			}
+			return
+		}
+		select {
+		case stallJournalSem <- struct{}{}:
+			defer func() { <-stallJournalSem }()
+		default:
+			m.log.Warn().Str("vm_id", vmID).
+				Msg("guest not ready — journal forensics skipped (concurrent captures saturated)")
+			return
+		}
+		jctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// --since/--until bound the sample to THIS launch: -u alone would
+		// mix in a prior invocation of the same unit name, and this
+		// detached read can also outlive the teardown into a same-ID
+		// retry whose newer lines -n would otherwise select. Microsecond
+		// stamps, since whole-second flooring could drop the failure
+		// second's own tail.
+		unit := systemdUnitName(vmID)
+		args := []string{"-u", unit,
+			"--since", journalStamp(launchedAt),
+			"--until", journalStamp(failedAt),
+			"-n", "60", "--no-pager", "-o", "cat"}
+		// Best-effort invocation pinning on top of the time bounds: the
+		// window can straddle a unit REPLACEMENT (a lingering same-ID unit
+		// restarted into this launch), whose tail time alone would admit.
+		// The lookup races both the teardown (unit unloaded → empty id)
+		// and a same-ID retry (id belongs to the NEW launch, whose entries
+		// the --until bound excludes → empty result). Both races degrade
+		// to the time-bounded query below instead of losing the summary.
+		pinned := false
+		if idOut, idErr := exec.CommandContext(jctx, "systemctl", "show", "-p", "InvocationID", "--value", unit).Output(); idErr == nil {
+			if id := strings.TrimSpace(string(idOut)); id != "" {
+				args = append(args, "_SYSTEMD_INVOCATION_ID="+id)
+				pinned = true
+			}
+		}
+		out, jErr := exec.CommandContext(jctx, "journalctl", args...).Output()
+		if pinned && jErr == nil && len(out) == 0 {
+			out, jErr = exec.CommandContext(jctx, "journalctl", args[:len(args)-1]...).Output()
+		}
+		if jErr != nil || len(out) == 0 {
+			m.log.Warn().Str("vm_id", vmID).AnErr("journal_err", jErr).
+				Msg("guest not ready — console unavailable for forensics")
+			return
+		}
+		m.logStallSummary(vmID, waited, string(out), int64(len(out)), "journald")
+	}()
+}
+
+func (m *Manager) logStallSummary(vmID string, waited time.Duration, tail string, size int64, preserved string) {
+	fcLines, boxdLines, guestLines, panicked := summarizeConsoleTail(tail)
+	m.log.Warn().Str("vm_id", vmID).
+		Int64("wait_boxd_ms", waited.Milliseconds()).
+		Int64("console_bytes", size).
+		Int("console_fc_lines", fcLines).
+		Int("console_boxd_lines", boxdLines).
+		Int("console_guest_lines", guestLines).
+		Bool("console_panic", panicked).
+		Str("console_preserved", preserved).
+		Msg("guest not ready within the readiness window — tearing down")
+}
+
+// journalStamp renders a journalctl @-timestamp with microsecond precision.
+func journalStamp(t time.Time) string {
+	return fmt.Sprintf("@%d.%06d", t.Unix(), t.Nanosecond()/1000)
+}
+
+// pruneOldest keeps at most keep entries in dir, dropping the oldest by
+// name (names begin with the capture unix time).
+func pruneOldest(dir string, keep int) {
+	ents, err := os.ReadDir(dir)
+	if err != nil || len(ents) <= keep {
+		return
+	}
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	for _, n := range names[:len(names)-keep] {
+		_ = os.Remove(filepath.Join(dir, n))
+	}
+}
+
 // boxdHealthProbe is the /health poll behind waitForBoxd; a var so tests can
 // drive the readiness gate without a live guest.
 var boxdHealthProbe = waitForHTTPHealth
@@ -3950,7 +8821,19 @@ const boxdResumeReadyBudget = 30 * time.Second
 // snapshot so the retry does a clean fresh restore. Caller holds the VM's
 // lifecycle lock (abort mutates the record).
 func (m *Manager) resumeReadyOrAbort(callerCtx context.Context, vmID, ip string) error {
-	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, boxdResumeReadyBudget); err != nil {
+	// Detached from caller CANCELLATION on purpose (a disconnect must not
+	// abort a healthy resume mid-probe) — but clamped to the caller's
+	// DEADLINE like the restore gate: the abort below is bounded teardown
+	// plus persistence, and the definitive verdict must return in-band
+	// rather than losing the race to the client deadline and triggering a
+	// transient retry against the still-held lifecycle lock.
+	budget := boxdResumeReadyBudget
+	if dl, ok := callerCtx.Deadline(); ok {
+		if remaining := time.Until(dl) - bootVerdictReserve; remaining < budget {
+			budget = remaining
+		}
+	}
+	if err := m.waitForBoxd(context.WithoutCancel(callerCtx), ip, budget); err != nil {
 		m.abortResumeLocked(vmID)
 		return err
 	}
@@ -3978,17 +8861,19 @@ func (m *Manager) resumeReadyOrAbort(callerCtx context.Context, vmID, ip string)
 // drops an instance a concurrent destroy removed.
 //
 // A reset-to-snapshot flow (none today) must not reuse these RPCs as-is.
-// vmUnitDead reports a VM's systemd unit as definitively not-active;
-// swappable in tests. Inconclusive answers read as alive (not dead).
-var vmUnitDead = func(vmID string) bool {
+// vmDeadForRetry reports a VM as definitively not running, dispatching on
+// supervision mode; swappable in tests. Inconclusive answers read as alive
+// (never relaunch on doubt). The Manager receiver is captured so the cgroup
+// oracle can reach the delegated subtree.
+var vmDeadForRetry = func(m *Manager, vmID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return unitDefinitelyDead(ctx, systemdUnitName(vmID))
+	return m.vmDefinitelyDead(ctx, vmID, m.supervisionForVM(vmID))
 }
 
 // vmUnitFullyDown reports a VM's unit in a TERMINAL state (unitFullyDown);
 // swappable in tests. Sites that release a record and its namespace need
-// this claim, not vmUnitDead — deactivating reads dead there while the
+// this claim, not vmDeadForRetry — deactivating reads dead there while the
 // process may still be exiting.
 var vmUnitFullyDown = func(vmID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -3998,7 +8883,7 @@ var vmUnitFullyDown = func(vmID string) bool {
 
 // adoptionBoxdReady is the boxd readiness gate for restore adoption and the
 // unverified relaunch (via verifyBoxdReady); a var for the same test seam
-// vmUnitDead uses.
+// vmDeadForRetry uses.
 var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
 	return m.waitForBoxd(ctx, ip, 30*time.Second)
 }
@@ -4013,8 +8898,673 @@ var adoptionBoxdReady = func(ctx context.Context, m *Manager, ip string) error {
 // of it, so an inherited ctx always expires first and every attempt would end
 // "no verdict", leaving the record unchanged for the next attempt to repeat.
 // The wall-clock bound inside waitForBoxd still caps the wait.
-func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string) error {
-	return adoptionBoxdReady(context.WithoutCancel(callerCtx), m, ip)
+//
+// A record still owing a wake gets one, with the policy its restore used: a
+// health poll would accept a stopped workload as ready.
+func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VMInstance) error {
+	ctx := context.WithoutCancel(callerCtx)
+	inst.mu.RLock()
+	pending, frozen, token := inst.WakePending, inst.ClockFrozen, inst.WakeToken
+	wakeSnap, wakeMem := inst.WakeSnapshotPath, inst.WakeMemPath
+	inst.mu.RUnlock()
+	if !pending {
+		return adoptionBoxdReady(ctx, m, ip)
+	}
+	if err := boxdWakeGuest(ctx, ip, 30*time.Second, frozen, token); err != nil {
+		if errors.Is(err, ErrGuestClockUnready) {
+			m.noteGuestClockUnready(m.log.With().Str("vm_id", inst.ID).Logger(), err)
+		}
+		return err
+	}
+	// The image this wake was owed for is the one running now: a resume
+	// from an override that died before its commit commits here, so a retry
+	// finds the sandbox up instead of relaunching over it. One manifest
+	// read, on the recovery path only.
+	var image *WallClockManifest
+	if wakeMem != "" {
+		image, _ = imageManifest(wakeMem)
+	}
+	inst.mu.Lock()
+	inst.WakePending = false
+	inst.WakeOwedFromPaused = false
+	if wakeMem != "" {
+		inst.SnapshotPath, inst.MemFilePath, inst.FreezeToken = wakeSnap, wakeMem, token
+		inst.BaseMemPath, _ = readLayeredBase(wakeMem)
+		frozen := true
+		inst.SnapshotWorkloadFrozen = &frozen
+		inst.CorrectsWallClock = nil // unresolved: the next pause asks the disk
+		if image != nil {
+			corrects := image.GuestCorrectsClock
+			inst.CorrectsWallClock = &corrects
+			inst.SnapshotWorkloadFrozen = &image.WorkloadFrozen
+			inst.ArtifactID = image.ArtifactID
+		}
+	}
+	inst.dropWakeImage()
+	inst.mu.Unlock()
+	return nil
+}
+
+// dropWakeImage forgets the image an owed wake was for. The caller holds
+// inst.mu.
+func (inst *VMInstance) dropWakeImage() {
+	inst.WakeToken, inst.WakeSnapshotPath, inst.WakeMemPath = "", "", ""
+}
+
+// ensureWakeFloorTimed is ensureWakeProtocolFloor on a request path: free
+// once the floor is durable, which startup priming normally makes it before
+// any request; when a request does have to prove it, the time it spent is
+// attributed to the operation as its own phase rather than hidden in it.
+func (m *Manager) ensureWakeFloorTimed(op string) error {
+	if wakeProtocolEvidenceDurable.Load() {
+		return nil
+	}
+	t := time.Now()
+	err := ensureWakeProtocolFloor()
+	m.recordPhases(op, "", map[string]time.Duration{"wake_floor": time.Since(t)})
+	return err
+}
+
+// failAfterSnapshot is the error return for a pause that fails after its
+// snapshot: Firecracker left the vCPUs paused and the record says Running,
+// so the guest is resumed first. An unpause that did not confirm leaves the
+// guest's state unknown, so only a guest that answers stays recorded
+// Running; otherwise it is parked as Error, its artifacts kept. The snapshot
+// consumed the dirty bitmap, so the retry must be Full.
+func (m *Manager) failAfterSnapshot(inst *VMInstance, socketPath string, err error) error {
+	m.abandonDirtyBaseline(inst)
+	uctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	uerr := fcUnpauseVM(uctx, socketPath)
+	cancel()
+	if uerr == nil {
+		return m.handleVMError(inst.ID, err)
+	}
+	inst.mu.RLock()
+	ip := inst.IP
+	inst.mu.RUnlock()
+	if perr := boxdHealthProbe(context.Background(), ip, 5*time.Second); perr == nil {
+		m.log.Warn().Err(uerr).Str("vm_id", inst.ID).Msg("pause failed after its snapshot; the unpause did not confirm but the guest answers")
+		return m.handleVMError(inst.ID, err)
+	}
+	m.log.Error().Err(uerr).Str("vm_id", inst.ID).Msg("pause failed after its snapshot and the guest neither resumed nor answers; parking as error")
+	m.parkUnservable(inst, true)
+	_, _ = m.persistStateIfPresent(inst)
+	return fmt.Errorf("%w; the guest could not be resumed and was parked as error", err)
+}
+
+// markUnservable records, durably, that this guest's workload may be frozen
+// with no confirmed release: Error, so it is not served as running, with its
+// process, intent and artifacts kept for a release that still has the token.
+func (m *Manager) markUnservable(inst *VMInstance, cause error, log zerolog.Logger) {
+	// The process stays: capacity must keep charging it behind the Error
+	// record until a confirmed stop or the reconciler's reap clears this.
+	m.vmStopUnconfirmed.Store(inst.ID, struct{}{})
+	inst.mu.Lock()
+	inst.Status = StatusError
+	inst.mu.Unlock()
+	if _, err := m.persistStateIfPresent(inst); err != nil {
+		log.Error().Err(err).Msg("pause: guest with an unconfirmed release could not be recorded as error")
+	}
+	log.Error().Err(cause).Msg("pause: guest workload may still be frozen and could not be released; recorded as error")
+}
+
+// preWakeFailureStatus is the status a restore failure before the wake
+// leaves. A wake-owed record published for a paused image returns to Paused,
+// owing nothing: the image is intact, and an Error record a restart would
+// reap as stale. Anything else is Error.
+func (m *Manager) preWakeFailureStatus(inst *VMInstance, returnToPaused bool) VMStatus {
+	if !returnToPaused {
+		return StatusError
+	}
+	inst.mu.Lock()
+	inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
+	inst.dropWakeImage()
+	inst.mu.Unlock()
+	return StatusPaused
+}
+
+// abandonDirtyBaseline forgets a dirty-tracking baseline a snapshot consumed
+// and this pause then abandoned: the next pause must be Full.
+func (m *Manager) abandonDirtyBaseline(inst *VMInstance) {
+	inst.mu.Lock()
+	inst.DirtyTracked = false
+	inst.DirtyTrackingSessionID = ""
+	inst.DirtyTrackingGeneration = 0
+	inst.mu.Unlock()
+}
+
+// mayBeFrozenAt reports whether any of the paths carries a manifest that
+// says frozen, or one that cannot be read or looked up: an unknown manifest
+// is journalled like a frozen one, never rewritten over blind. A stat first:
+// absent manifests, the common case, cost one lookup each and no read.
+func (m *Manager) mayBeFrozenAt(paths ...string) bool {
+	for _, p := range paths {
+		if _, err := os.Stat(WallClockMarkerPath(p)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return true
+		}
+		if man, err := ReadWallClockManifest(p); err != nil || (man != nil && man.WorkloadFrozen) {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseThawBudget bounds one release's thaw attempts. A thaw that timed
+// out is asked again within it: the vCPUs may still be catching up on a
+// resume the API answered late, or the host may be mid-fsync.
+var releaseThawBudget = 8 * time.Second
+
+// releaseFrozenGuest thaws a workload a pause froze, after resuming the
+// vCPUs a snapshot may have paused so the guest can answer. The unpause is
+// best-effort; the thaw is the verdict: an answer from the guest is taken
+// at once, a thaw that never answered is asked again.
+func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token string) error {
+	// Each step bounded on its own: a stuck Firecracker API must neither hang
+	// this caller nor eat the thaw's budget.
+	base := context.WithoutCancel(ctx)
+	var uerr error
+	if socketPath != "" {
+		uctx, cancel := context.WithTimeout(base, 2*time.Second)
+		uerr = fcUnpauseVM(uctx, socketPath)
+		cancel()
+	}
+	deadline := time.Now().Add(releaseThawBudget)
+	var terr error
+	for attempt := 0; ; attempt++ {
+		tctx, cancel := context.WithTimeout(base, min(2*time.Second, time.Until(deadline)))
+		terr = boxdThawGuest(tctx, ip, token)
+		cancel()
+		if terr == nil {
+			if uerr != nil {
+				m.log.Warn().Err(uerr).Str("socket", socketPath).Msg("release: the unpause did not confirm, and the guest thawed regardless")
+			}
+			return nil
+		}
+		wait := time.Duration(attempt+1) * 100 * time.Millisecond
+		if !answerTimedOut(terr) || time.Until(deadline) <= wait {
+			break
+		}
+		time.Sleep(wait)
+	}
+	if uerr != nil {
+		return fmt.Errorf("thaw: %w; unpause: %v", terr, uerr)
+	}
+	return terr
+}
+
+// answerTimedOut reports an answer that never came, as opposed to one that
+// came and refused.
+func answerTimedOut(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// resolveOutstandingFreeze releases, or confirms released, a workload an
+// earlier pause may have left frozen, before any image of the guest is
+// published as unfrozen. Its intent is cleared once nothing is frozen under
+// it and kept otherwise; a completed pause's leftover names the record's
+// artifact and is nothing to resolve. Only a host whose floor is up holds intents.
+func (m *Manager) resolveOutstandingFreeze(ctx context.Context, vmID, socketPath, ip, recordedArtifact string, log zerolog.Logger) error {
+	if !wakeProtocolFloorRaised() {
+		return nil
+	}
+	dir := filepath.Join(m.cfg.SnapshotDir, vmID)
+	prior, err := readPauseIntent(dir)
+	if err != nil {
+		return fmt.Errorf("read the earlier pause intent: %w", err)
+	}
+	if prior == nil || prior.FreezeToken == "" || prior.ArtifactID == recordedArtifact {
+		return nil
+	}
+	// The vCPUs may still be paused from that pause's snapshot attempt; the
+	// guest cannot answer a thaw until Firecracker resumes them.
+	if err := m.releaseOrConfirmRunning(ctx, socketPath, ip, prior.FreezeToken); err != nil {
+		return fmt.Errorf("an earlier pause's freeze could not be released: %w", err)
+	}
+	log.Warn().Msg("released a guest an earlier pause had left frozen")
+	if err := clearPauseIntent(dir); err != nil {
+		return fmt.Errorf("clear the earlier pause intent: %w", err)
+	}
+	return nil
+}
+
+// releaseOrConfirmRunning releases a workload frozen under token or, when the
+// guest holds no freeze under it, confirms the workload runs: a thaw refused
+// for one token says nothing about a freeze under an earlier one, and only a
+// workload confirmed running owes nothing.
+func (m *Manager) releaseOrConfirmRunning(ctx context.Context, socketPath, ip, token string) error {
+	err := m.releaseFrozenGuest(ctx, socketPath, ip, token)
+	if errors.Is(err, ErrGuestTokenMismatch) {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		err = boxdGuestRunning(rctx, ip)
+		cancel()
+	}
+	return err
+}
+
+// fcUnpauseVM is a seam over the Firecracker resume call.
+var fcUnpauseVM = UnpauseVMContext
+
+// persistWakeOwed publishes Running with a wake owed and starts the durable
+// write under the launch: a crash after the load must find a record owing a
+// wake. The join waits for the write, re-persists if the launch landed in
+// another supervision mode, and reports durability; the caller must not load
+// otherwise. PausedAt is kept so a failure returns a resume to its place.
+// fromPaused says recovery may return the record to Paused.
+func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clockFrozen, fromPaused bool) (join func(actual Supervision) bool) {
+	inst.mu.Lock()
+	inst.Status = StatusRunning
+	inst.Unverified = true
+	inst.Supervision = predicted
+	inst.WakePending = true
+	inst.ClockFrozen = clockFrozen
+	inst.WakeOwedFromPaused = fromPaused
+	inst.mu.Unlock()
+	done := make(chan struct{})
+	ok := false
+	go func() {
+		defer sentrylog.Recover("wake-owed-persist")
+		defer close(done)
+		ok = m.persistWhileTracked(inst)
+	}()
+	return func(actual Supervision) bool {
+		<-done
+		if !ok || actual != predicted {
+			ok = m.persistWhileTracked(inst)
+		}
+		return ok
+	}
+}
+
+// persistWhileTracked writes the record, then checks the instance still owns
+// its id: DestroyVM takes no lifecycle lock, so its delete can land either
+// side of this write, and a write landing after it would resurrect the VM.
+// Checked after the write there is no window; the write is erased and false
+// returned when the VM is gone.
+func (m *Manager) persistWhileTracked(inst *VMInstance) bool {
+	ok := m.persistState(inst)
+	m.mu.RLock()
+	tracked := m.vms[inst.ID] == inst
+	m.mu.RUnlock()
+	if !tracked {
+		m.deleteState(inst.ID)
+		return false
+	}
+	return ok
+}
+
+// pendingWake is a reattached instance that owes its guest a wake. The startup
+// pass finds them faster than a wake can be completed, so they are queued and
+// resolved by a bounded pool after the pass; a request for one waits on done.
+type pendingWake struct {
+	inst *VMInstance
+	done chan struct{}
+	// unlock releases the VM's lifecycle lock, held since the startup pass
+	// queued it, once the outcome is published.
+	unlock func()
+}
+
+const wakeRecoveryWorkers = 4
+
+func (m *Manager) pendingWake(id string) *pendingWake {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	return m.pendingWakes[id]
+}
+
+func (m *Manager) pendingWakeCount() int {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	return len(m.pendingWakes)
+}
+
+// wakeDrainStartedCh is closed once the pool has begun serving queued wakes.
+func (m *Manager) wakeDrainStartedCh() <-chan struct{} {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	if m.wakeDrainStarted == nil {
+		m.wakeDrainStarted = make(chan struct{})
+		if m.wakeDrainBegun {
+			close(m.wakeDrainStarted)
+		}
+	}
+	return m.wakeDrainStarted
+}
+
+func (m *Manager) noteWakeDrainStarted() {
+	m.pendingWakeMu.Lock()
+	defer m.pendingWakeMu.Unlock()
+	if m.wakeDrainBegun {
+		return
+	}
+	m.wakeDrainBegun = true
+	if m.wakeDrainStarted == nil {
+		m.wakeDrainStarted = make(chan struct{})
+	}
+	close(m.wakeDrainStarted)
+}
+
+// pendingWakeWaitBoundFor is a seam over pendingWakeWaitBound for tests.
+var pendingWakeWaitBoundFor = pendingWakeWaitBound
+
+// wakeRecoveryRound is how long one queued wake can occupy a pool worker:
+// the wake's own budget and then, if it failed, the teardown of what was
+// launched — the bounded stop and the wait for its process — with a margin.
+const wakeRecoveryRound = boxdResumeReadyBudget + restoreErrorStopBudget + restoreErrorProcessWait + 5*time.Second
+
+// pendingWakeWaitBound is how long a request may wait for a queued wake: the
+// pool serves queued wakes wakeRecoveryWorkers at a time, each within a
+// round, so a wake queued behind n others is served within that many rounds.
+func pendingWakeWaitBound(queued int) time.Duration {
+	rounds := (queued + wakeRecoveryWorkers - 1) / wakeRecoveryWorkers
+	if rounds < 1 {
+		rounds = 1
+	}
+	return time.Duration(rounds) * wakeRecoveryRound
+}
+
+func (m *Manager) queuePendingWake(inst *VMInstance, unlock func()) {
+	m.pendingWakeMu.Lock()
+	if m.pendingWakes == nil {
+		m.pendingWakes = map[string]*pendingWake{}
+	}
+	if _, queued := m.pendingWakes[inst.ID]; queued {
+		m.pendingWakeMu.Unlock()
+		unlock()
+		return
+	}
+	pw := &pendingWake{inst: inst, done: make(chan struct{}), unlock: unlock}
+	m.pendingWakes[inst.ID] = pw
+	started := m.wakePoolCtx != nil
+	if started {
+		m.wakeWG.Add(1)
+	}
+	m.pendingWakeMu.Unlock()
+	if started {
+		go m.serveWake(pw)
+	}
+}
+
+// startWakePool begins serving queued wakes, wakeRecoveryWorkers at a time,
+// including any queued before it started. Idempotent.
+func (m *Manager) startWakePool(ctx context.Context) {
+	m.pendingWakeMu.Lock()
+	if m.wakePoolCtx != nil {
+		m.pendingWakeMu.Unlock()
+		return
+	}
+	m.wakePoolCtx = ctx
+	m.wakeSem = make(chan struct{}, wakeRecoveryWorkers)
+	backlog := make([]*pendingWake, 0, len(m.pendingWakes))
+	for _, pw := range m.pendingWakes {
+		backlog = append(backlog, pw)
+	}
+	m.wakeWG.Add(len(backlog))
+	m.pendingWakeMu.Unlock()
+	m.noteWakeDrainStarted()
+	for _, pw := range backlog {
+		go m.serveWake(pw)
+	}
+}
+
+// serveWake completes one queued wake under the pool's worker bound and
+// publishes the outcome: Running once woken, Error otherwise — never a
+// frozen guest presented as ready.
+func (m *Manager) serveWake(pw *pendingWake) {
+	defer m.wakeWG.Done()
+	m.wakeSem <- struct{}{}
+	defer func() { <-m.wakeSem }()
+	defer sentrylog.Recover("wake-recovery")
+	defer func() {
+		m.pendingWakeMu.Lock()
+		delete(m.pendingWakes, pw.inst.ID)
+		m.pendingWakeMu.Unlock()
+		close(pw.done)
+		pw.unlock()
+	}()
+	log := m.log.With().Str("vm_id", pw.inst.ID).Logger()
+	// The lifecycle lock has been held since the startup pass queued this
+	// VM, so no restore or resume for the id can have run meanwhile; the
+	// map check below is belt and braces.
+	m.mu.RLock()
+	_, taken := m.vms[pw.inst.ID]
+	m.mu.RUnlock()
+	if taken {
+		log.Info().Msg("reattach: a request replaced this VM before its wake completed; recovery instance abandoned")
+		return
+	}
+	if err := m.completeOwedWake(m.wakePoolCtx, pw.inst, log); err == nil {
+		m.wakeWoken.Add(1)
+	} else {
+		m.parkUnservable(pw.inst, errors.Is(err, ErrGuestTokenMismatch))
+	}
+	m.publishRecovered(pw.inst)
+}
+
+// drainPendingWakes starts the pool if the startup pass has not, then waits
+// for every queued wake. Returns how many the pool has published Running.
+func (m *Manager) drainPendingWakes(ctx context.Context) int {
+	m.startWakePool(ctx)
+	m.wakeWG.Wait()
+	return int(m.wakeWoken.Load())
+}
+
+// completeOwedWake sends the wake a reattached record still owes. Nil once
+// the guest is awake; the error otherwise, with the instance still owing it.
+func (m *Manager) completeOwedWake(ctx context.Context, inst *VMInstance, log zerolog.Logger) error {
+	if err := m.verifyBoxdReady(ctx, inst.IP, inst); err != nil {
+		log.Error().Err(err).Msg("reattach: guest still owes its wake and could not be woken; parking")
+		return err
+	}
+	inst.mu.Lock()
+	inst.Unverified = false
+	inst.mu.Unlock()
+	log.Info().Msg("reattach: completed the wake a restore owed this guest")
+	return nil
+}
+
+// frozenPauseIntent reports whether an intent with a token stands for vmID:
+// a pause froze the guest and did not finish.
+func (m *Manager) frozenPauseIntent(vmID string) bool {
+	if !wakeProtocolFloorRaised() {
+		return false
+	}
+	in, err := readPauseIntent(filepath.Join(m.cfg.SnapshotDir, vmID))
+	return err == nil && in != nil && in.FreezeToken != ""
+}
+
+// recoverPauseIntent releases a guest a pause froze and then died before
+// finishing. True when nothing is owed or the guest is released; false when
+// a frozen guest could not be released and must not be served.
+func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log zerolog.Logger) bool {
+	if !wakeProtocolFloorRaised() {
+		return true
+	}
+	dir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
+	in, err := readPauseIntent(dir)
+	if err != nil {
+		log.Error().Err(err).Msg("reattach: pause intent unreadable; parking as error")
+		return false
+	}
+	if in == nil {
+		return true
+	}
+	// A rewrite's images are settled first, from what the rewrite left
+	// beside them: the record then names a chain written whole, or nothing
+	// relaunches from one it may not trust. A staged write left them as
+	// they were. A rewrite that cannot be settled keeps its intent, which
+	// refuses a relaunch until a reattach settles it.
+	adopted, settled := false, true
+	if !in.Staged {
+		adopted, settled = m.settleInterruptedRewrite(dir, in, inst, log)
+	}
+	if in.FreezeToken == "" {
+		// An unfrozen rewrite that was interrupted: the images here are
+		// unfrozen or torn, so a manifest beside them that says frozen is
+		// stale either way and must not outlive the intent, unless it is
+		// the rewrite's own, just adopted.
+		for _, name := range []string{"mem.diff", "mem.snap"} {
+			if in.Staged || adopted {
+				break
+			}
+			if _, err := removeWallClockManifest(filepath.Join(dir, name)); err != nil {
+				log.Error().Err(err).Msg("reattach: a stale frozen manifest beside an interrupted rewrite could not be removed; parking as error")
+				return false
+			}
+		}
+		// The snapshot may have paused the vCPUs before the crash: resume
+		// them and confirm the guest answers, or it is not served as running.
+		if inst.SocketPath != "" && inst.IP != "" {
+			uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			_ = fcUnpauseVM(uctx, inst.SocketPath)
+			cancel()
+			if err := boxdHealthProbe(context.WithoutCancel(ctx), inst.IP, 5*time.Second); err != nil {
+				log.Error().Err(err).Msg("reattach: guest did not answer after an interrupted rewrite; parking as error")
+				return false
+			}
+		}
+	}
+	if in.FreezeToken != "" && inst.IP != "" {
+		terr := m.releaseOrConfirmRunning(ctx, inst.SocketPath, inst.IP, in.FreezeToken)
+		if terr != nil {
+			log.Error().Err(terr).Msg("reattach: a pause left this guest frozen and it could not be released; parking as error")
+			return false
+		}
+		log.Warn().Msg("reattach: released a guest an interrupted pause had frozen")
+	}
+	if !settled {
+		log.Warn().Msg("reattach: interrupted rewrite could not be settled; its intent stays, and refuses a relaunch, until a reattach settles it")
+		return true
+	}
+	if cerr := clearPauseIntent(dir); cerr != nil {
+		log.Warn().Err(cerr).Msg("reattach: interrupted pause's intent could not be cleared; the next pause rewrites it")
+	}
+	return true
+}
+
+// presenceWrittenSince reports whether the overlay's presence map was
+// written no earlier than the intent. The intent is durable before the diff
+// and the map is written after it, so a map a Firecracker from before the
+// map left alone, or a crash rolled back, is older; the pre-save mark is not
+// synced and proves nothing after a crash.
+func presenceWrittenSince(mem, intentPath string) bool {
+	in, err := os.Stat(intentPath)
+	if err != nil {
+		return false
+	}
+	sc, err := os.Stat(presence.SidecarPath(mem))
+	return err == nil && !sc.ModTime().Before(in.ModTime())
+}
+
+// settleInterruptedRewrite reconciles the record with the chain a rewrite
+// left behind. An image whose manifest names the intent's artifact was
+// written whole, its manifest after it, so the record takes it, durably, as
+// the rewrite would have once the guest was released: a relaunch from the
+// chain then wakes it under the token it was frozen with. An overlay is
+// taken only with its base record and a presence map the rewrite refreshed,
+// which a Firecracker from before the map leaves stale or absent. Any other
+// chain may be torn, or whole with a manifest that is not its own, and is
+// withdrawn: its vmstate goes, so nothing relaunches from it before the next
+// pause writes it whole, and a first-pass overlay the record never named
+// goes with it. Whether Firecracker moved on is unknown, so the baseline is
+// spent, durably, and that pause is a full one. Adopted reports the first
+// case; settled is false when the record or the withdrawal could not be
+// written.
+func (m *Manager) settleInterruptedRewrite(dir string, in *pauseIntent, inst *VMInstance, log zerolog.Logger) (adopted, settled bool) {
+	inst.mu.RLock()
+	recordedArtifact, recordedMem := inst.ArtifactID, inst.MemFilePath
+	inst.mu.RUnlock()
+	if in.ArtifactID != "" && in.ArtifactID == recordedArtifact {
+		// The record was written; only the intent's removal was lost.
+		return false, true
+	}
+	vmstate, intentPath := filepath.Join(dir, "vmstate.snap"), pauseIntentPath(dir)
+	for _, name := range []string{"mem.diff", "mem.snap"} {
+		mem := filepath.Join(dir, name)
+		man, err := ReadWallClockManifest(mem)
+		if err != nil || man == nil || in.ArtifactID == "" || man.ArtifactID != in.ArtifactID || !fileExists(vmstate) {
+			continue
+		}
+		base, layered := readLayeredBase(mem)
+		if name == "mem.diff" && (!layered || !fileExists(base)) {
+			log.Warn().Str("mem", mem).Msg("reattach: a rewritten overlay has no base to be served over; not adopted")
+			continue
+		}
+		if layered && !presenceWrittenSince(mem, intentPath) {
+			log.Warn().Str("mem", mem).Msg("reattach: a rewritten overlay's presence map is not the rewrite's; not adopted")
+			continue
+		}
+		advanceChain(inst, vmstate, mem, base, man)
+		if _, err := m.persistStateIfPresent(inst); err != nil {
+			log.Error().Err(err).Msg("reattach: a completed rewrite's record could not be written")
+			return true, false
+		}
+		log.Warn().Str("mem", mem).Msg("reattach: recorded a chain image a rewrite completed before its record was written")
+		return true, true
+	}
+	m.abandonDirtyBaseline(inst)
+	if _, err := m.persistStateIfPresent(inst); err != nil {
+		log.Error().Err(err).Msg("reattach: the baseline an uncertain rewrite spent could not be recorded")
+		return false, false
+	}
+	withdraw := []string{vmstate, overlayBlockMapPath(vmstate), overlayBlockMapPath(vmstate) + ".prev"}
+	if overlay := filepath.Join(dir, "mem.diff"); recordedMem != overlay {
+		withdraw = append(withdraw, overlay, layeredBaseSidecarPath(overlay), presence.SidecarPath(overlay), WallClockMarkerPath(overlay))
+	}
+	for _, p := range withdraw {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Error().Err(err).Str("path", p).Msg("reattach: an uncertain chain image could not be withdrawn")
+			return false, false
+		}
+	}
+	log.Warn().Msg("reattach: withdrew a chain image an interrupted rewrite left uncertain; the next pause writes it whole")
+	return false, true
+}
+
+// publishRecovered publishes an instance the wake pool resolved, durably —
+// only if nothing else took the id meanwhile: the record belongs to whoever
+// owns the map entry, and a stale instance must never write over it.
+func (m *Manager) publishRecovered(inst *VMInstance) {
+	m.mu.Lock()
+	if _, present := m.vms[inst.ID]; present {
+		m.mu.Unlock()
+		return
+	}
+	m.vms[inst.ID] = inst
+	m.indexVM(inst.ID, inst)
+	m.mu.Unlock()
+	if wrote, perr := m.persistStateIfPresent(inst); perr == nil && !wrote {
+		m.undoReattach(inst.ID)
+	}
+}
+
+// parkUnservable stops a guest whose recovery could not settle, confirmed as
+// far as the stop can, so an unknown guest never runs on behind a record. A
+// resume that never completed returns to Paused, its image intact; a refused
+// wake, or anything else, is Error.
+func (m *Manager) parkUnservable(inst *VMInstance, terminal bool) {
+	m.stopUnitDuringRestoreError(inst.ID)
+	inst.mu.Lock()
+	switch {
+	case !terminal && inst.WakePending && inst.WakeOwedFromPaused:
+		inst.Status = StatusPaused
+		inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
+		inst.dropWakeImage()
+	case terminal:
+		// Owing nothing: no restart returns it to Paused.
+		inst.Status = StatusError
+		inst.WakePending, inst.WakeOwedFromPaused = false, false
+		inst.dropWakeImage()
+	default:
+		inst.Status = StatusError
+	}
+	inst.mu.Unlock()
 }
 
 // commitResumeState persists a resumed instance and verifies the VM was not
@@ -4025,6 +9575,11 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string) error {
 // destroy either erased the record itself or is caught here, and we erase our
 // own resurrecting write rather than hand back a destroyed VM.
 func (m *Manager) commitResumeState(inst *VMInstance) error {
+	// A successful relaunch retires any parked-teardown marker: the process
+	// below this record is now the live one it manages.
+	inst.mu.Lock()
+	inst.TeardownPending = ""
+	inst.mu.Unlock()
 	wrote := m.persistState(inst)
 	m.mu.RLock()
 	_, stillTracked := m.vms[inst.ID]
@@ -4046,6 +9601,8 @@ func (m *Manager) commitResumeState(inst *VMInstance) error {
 			inst.mu.Lock()
 			inst.Status = StatusError
 			inst.DirtyTracked = false // unit stopped; a relaunch re-arms tracking
+			inst.DirtyTrackingSessionID = ""
+			inst.DirtyTrackingGeneration = 0
 			inst.mu.Unlock()
 			return fmt.Errorf("vm %s resumed but its state could not be persisted", inst.ID)
 		}
@@ -4103,7 +9660,7 @@ func (m *Manager) retriedLaunchTarget(vmID, snapshotPath, memPath string) (*VMIn
 	// still active, so this catches a corpse without false-negativing a
 	// warming one — the trap the removed boxd probe fell into. Inconclusive
 	// (systemctl slow) reads as alive: never relaunch on doubt.
-	if vmUnitDead(vmID) {
+	if vmDeadForRetry(m, vmID) {
 		return nil, false
 	}
 	m.mu.RLock()

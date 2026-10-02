@@ -7,6 +7,22 @@ on:
     branches: [main]
 
 jobs:
+  migration-cli:
+    name: Migration CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Exercise the same runner as CD, including migration-history writes.
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Validate fresh and interrupted migrations
+        run: |
+          python3 scripts/test_migration_cli.py
+          python3 scripts/test_migration_overlay.py
+
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -20,6 +36,17 @@ jobs:
       - name: Run unit tests
         run: go test -v -short -count=1 -race ./...
 
+      - name: Run deploy-script tests
+        run: python3 -m unittest discover -s .github/workflows/scripts -p 'test_*.py'
+
+      - name: Run host identity provisioning tests
+        run: python3 -m unittest discover -v -s deploy -p 'test_host_identity.py'
+
+      - name: Run peer identity bootstrap tests
+        run: |
+          python3 -m unittest discover -s deploy -p 'test_peer*.py'
+          python3 -m unittest discover -s infra/modules/peer-identity -p '*test*.py'
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
@@ -30,6 +57,7 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: sandbox_test
+          POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
         ports:
           - 5432:5432
         options: >-
@@ -45,10 +73,46 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: sqlc-dev/setup-sqlc@v4
+        with:
+          sqlc-version: '1.30.0'
+
+      # The credential contract requires a fresh cluster before migrations create the role.
+      - name: Run proxy ownership database contracts
+        env:
+          PEER_ROUTING_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: go test -v -count=1 -race ./internal/proxy/... ./cmd/proxy/... ./cmd/check-legacy-heartbeat/...
+
+      - name: Validate billing suites and worker load
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xfsprogs
+          storage_test_root=$(mktemp -d "$RUNNER_TEMP/retained-storage.XXXXXX")
+          export RETAINED_STORAGE_TEST_DIR="$storage_test_root/mount"
+          cleanup() {
+            if mountpoint -q "$RETAINED_STORAGE_TEST_DIR"; then
+              sudo umount "$RETAINED_STORAGE_TEST_DIR" || return 1
+            fi
+            rm -rf "$storage_test_root"
+          }
+          trap cleanup EXIT
+          truncate -s 1G "$storage_test_root/storage.xfs"
+          mkfs.xfs -f -m reflink=1 "$storage_test_root/storage.xfs"
+          mkdir "$RETAINED_STORAGE_TEST_DIR"
+          sudo mount -t xfs -o loop "$storage_test_root/storage.xfs" "$RETAINED_STORAGE_TEST_DIR"
+          sudo chown "$(id -u):$(id -g)" "$RETAINED_STORAGE_TEST_DIR"
+          xfs_info "$RETAINED_STORAGE_TEST_DIR"
+          bash scripts/validate-billing.sh
+
       - name: Run integration tests
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
-        run: go test -v -tags integration -count=1 -race -timeout 10m ./internal/integration/ ./cmd/migrate-team/
+        # Database roles are cluster-wide, even across the suites' separate databases.
+        run: |
+          go test -p 1 -v -tags integration -count=1 -race -timeout 10m ./internal/integration/ ./cmd/migrate-team/
+          go test -v -tags integration -count=1 -race -timeout 10m ./cmd/seed-templates/
 
   build:
     name: Build
@@ -78,6 +142,27 @@ jobs:
 
       - name: Go vet
         run: go vet ./...
+
+  fc-client-check:
+    name: FC Client Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify the Firecracker client matches the spec
+        run: |
+          go generate ./internal/vm/fc/...
+          # Porcelain, not diff: a spec change that adds a definition generates a
+          # new file, which is untracked and so invisible to git diff.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Firecracker client is out of date. Run 'go generate ./internal/vm/fc/...' and commit the result."
+            git status --porcelain
+            exit 1
+          fi
 
   sqlc-check:
     name: sqlc Check
@@ -136,4 +221,99 @@ jobs:
             fi
           done
           [ $fail -eq 0 ] && echo "all new migrations are correctly ordered"
+          exit $fail
+
+  deploy-trigger-coverage:
+    name: Deploy Trigger Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # A push touching only paths absent from a deploy workflow's filters runs
+      # no job at all — the change merges and never ships, with nothing in the
+      # Actions tab to notice. Derive what each workflow builds and require its
+      # filters to cover everything those binaries are built from.
+      - name: Every imported package must trigger its deploy
+        run: |
+          fail=0
+          # A source directory is covered only by a recursive filter on it or an
+          # ancestor. GitHub's non-recursive form matches a file at exactly that
+          # path, so 'internal/db' does NOT start a deploy for internal/db/db.go
+          # — treating the two forms alike would pass a workflow that never fires.
+          covered_dir() {
+            for t in $2; do
+              case "$t" in */'**') base=${t%/'**'};; *) continue;; esac
+              case "$1" in "$base"|"$base"/*) return 0;; esac
+            done
+            return 1
+          }
+          # A single file is covered by naming it exactly, or by a recursive
+          # filter on a directory above it.
+          covered_file() {
+            for t in $2; do
+              case "$t" in
+                */'**') base=${t%/'**'}; case "$1" in "$base"/*) return 0;; esac ;;
+                *) [ "$1" = "$t" ] && return 0 ;;
+              esac
+            done
+            return 1
+          }
+          report() {
+            echo "::error file=$1::$1 does not list $2 in its trigger paths — changes to $2 would merge without deploying"
+            fail=1
+          }
+          check() {
+            workflow="$1"; files="$2"; shift 2
+            # Globs are kept, not stripped: the two filter forms mean different
+            # things and covered_dir/covered_file rely on telling them apart.
+            # Only real sequence entries count: a commented-out path (# - '...')
+            # is ignored by GitHub and must be ignored here too, or the check
+            # blesses exactly the silent missed deployment it exists to catch.
+            triggers=$(awk '/^on:/,/^jobs:/' "$workflow" \
+              | sed -n "s/^[[:space:]]*- '\([A-Za-z.][A-Za-z0-9._/*-]*\)'.*/\1/p" | sort -u || true)
+            # Module-local deps — not just internal/, since the proxy reaches
+            # proto/boxdpb and stale generated protocol code is the same hazard.
+            deps=$(go list -deps "$@" \
+              | sed -n 's|^github.com/superserve-ai/sandbox/||p' | sort -u)
+            for path in $deps; do
+              covered_dir "$path" "$triggers" || report "$workflow" "$path"
+            done
+            # Module files, any Dockerfile this workflow builds through, and
+            # the workflow itself: a dependency bump, an image change, or a
+            # deployment-command fix must each redeploy too.
+            for path in go.mod go.sum "$workflow" $files; do
+              covered_file "$path" "$triggers" || report "$workflow" "$path"
+            done
+          }
+          # Expand the workflow list while globbing is still on, then turn it off
+          # for the rest: trigger patterns contain ** and must be compared as
+          # literals, not expanded against the working tree.
+          workflows=$(echo .github/workflows/deploy-*.yml)
+          set -f
+          # Binaries come from each workflow's build commands (or the Dockerfile
+          # it builds), never from its path filters: deriving them from the very
+          # list being validated would let an omitted cmd/ entry hide itself.
+          # `|| true` throughout: the step runs under `-eo pipefail`, so an
+          # unmatched grep would kill the job instead of reaching the checks.
+          for wf in $workflows; do
+            files=""
+            bins=$(grep -oE 'go build[^|;]*\./cmd/[a-z-]+' "$wf" \
+              | grep -oE '\./cmd/[a-z-]+' | sort -u || true)
+            if [ -z "$bins" ] && grep -q 'docker build' "$wf"; then
+              bins=$(grep -oE 'go build[^|;]*\./cmd/[a-z-]+' Dockerfile \
+                | grep -oE '\./cmd/[a-z-]+' | sort -u || true)
+              files="Dockerfile"
+            fi
+            if [ -z "$bins" ]; then
+              echo "$(basename "$wf"): builds no Go binary, skipping"
+              continue
+            fi
+            echo "$(basename "$wf"): $(echo $bins)"
+            check "$wf" "$files" $bins
+          done
+          [ $fail -eq 0 ] && echo "deploy triggers cover every imported package"
           exit $fail

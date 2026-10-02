@@ -1,11 +1,15 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -15,9 +19,23 @@ import (
 
 // Config holds all configuration for the Superserve Sandbox control plane.
 type Config struct {
-	Port        string // API_PORT, default "8080"
-	VMDAddress  string // VMD_GRPC_ADDRESS, default "localhost:50051"
-	DatabaseURL string // DATABASE_URL, required
+	TemplateBuildRegion     string                       // TEMPLATE_BUILD_REGION matches the host registry region exactly
+	TemplateBackupBucket    string                       // BACKUP_BUCKET, cell-local durable template storage
+	ComputeRestrictionsFile string                       // COMPUTE_RESTRICTIONS_FILE; empty disables config loading
+	Port                    string                       // API_PORT, default "8080"
+	VMDAddress              string                       // VMD_GRPC_ADDRESS, default "localhost:50051"
+	DatabaseURL             string                       // DATABASE_URL, required
+	TeamCreationRegion      string                       // TEAM_CREATION_REGION; receiving cell identifier
+	TeamCreationKeys        map[string]ed25519.PublicKey // TEAM_CREATION_PUBLIC_KEYS; kid to base64 public key
+
+	StripeSecretKey               string   // STRIPE_SECRET_KEY
+	StripeWebhookSecret           string   // STRIPE_WEBHOOK_SECRET (snapshot lifecycle destination)
+	StripeMeterErrorWebhookSecret string   // STRIPE_METER_ERROR_WEBHOOK_SECRET (thin meter-error destination)
+	StripeAPIBaseURL              string   // STRIPE_API_BASE_URL, default "https://api.stripe.com"
+	StripeAPIVersion              string   // STRIPE_API_VERSION, required for Stripe requests
+	StripeCheckoutPriceIDs        []string // STRIPE_CHECKOUT_PRICE_IDS, required for checkout sessions
+	BillingResources              []BillingResourceConfig
+	AppAllowedOrigins             []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
 
 	// SandboxAccessTokenSeed is the HMAC seed shared with the edge
 	// proxy. Both sides derive per-sandbox access tokens as
@@ -32,6 +50,18 @@ type Config struct {
 	// DefaultHostID is the fallback host identifier used when no scheduler
 	// is configured. Set via DEFAULT_HOST_ID; defaults to "default".
 	DefaultHostID string
+
+	// SchedulerCapacityShadow runs capacity ranking alongside real
+	// placement and reports what it WOULD have chosen, without
+	// influencing any create. Opt-in via SCHEDULER_CAPACITY_SHADOW=1.
+	//
+	// Shadow only, deliberately: ranking without a host-side admission
+	// gate cannot enforce a limit — two API replicas can still exceed a
+	// host's cap between reports — so there is no configuration in which
+	// this decides placement. Enforcement will require its own
+	// control-plane flag AND the host advertising that it admits
+	// locally.
+	SchedulerCapacityShadow bool
 
 	// SystemTeamID owns curated templates that are visible to every team
 	// (python-3.11, node-22, etc.). Set via SYSTEM_TEAM_ID; empty means
@@ -64,6 +94,10 @@ type Config struct {
 	OTelEndpoint       string
 	OTelInsecure       bool
 	OTelExportInterval time.Duration
+	// BackupGCServiceAccount turns on the purge of deleted sandboxes' backups
+	// from the cell's backup bucket: the identity, impersonated by the
+	// runtime, that may delete from it. Empty leaves the job off.
+	BackupGCServiceAccount string
 }
 
 // Load reads configuration from environment variables.
@@ -71,6 +105,14 @@ func Load() (*Config, error) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")
+	}
+	buildRegion := strings.TrimSpace(os.Getenv("TEMPLATE_BUILD_REGION"))
+	if buildRegion == "" {
+		return nil, fmt.Errorf("TEMPLATE_BUILD_REGION is required for template builds")
+	}
+	backupBucket := strings.TrimSpace(os.Getenv("BACKUP_BUCKET"))
+	if backupBucket == "" {
+		return nil, fmt.Errorf("BACKUP_BUCKET is required for template builds")
 	}
 
 	seed, err := loadSeed(
@@ -85,28 +127,212 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	checkoutPriceIDs := checkoutPriceIDs()
 
 	cfg := &Config{
-		Port:                   envOrDefault("API_PORT", "8080"),
-		VMDAddress:             envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
-		DatabaseURL:            dbURL,
-		SandboxAccessTokenSeed: seed,
-		EdgeProxyDomain:        envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
-		DefaultHostID:          envOrDefault("DEFAULT_HOST_ID", "default"),
-		SystemTeamID:           os.Getenv("SYSTEM_TEAM_ID"),
-		SentryDSN:              os.Getenv("SENTRY_DSN"),
-		KMSKeyResource:         os.Getenv("KMS_KEY_RESOURCE"),
-		SecretsSigningKey:      os.Getenv("SECRETS_SIGNING_KEY"),
-		SecretsSigningKeyID:    envOrDefault("SECRETS_SIGNING_KEY_ID", "v1"),
-		OTelMetricsEnabled:     boolEnv("OTEL_METRICS_ENABLED", false),
-		OTelServiceName:        envOrDefault("OTEL_SERVICE_NAME", "sandbox-controlplane"),
-		OTelServiceVersion:     os.Getenv("OTEL_SERVICE_VERSION"),
-		OTelEnvironment:        envOrDefault("OTEL_ENVIRONMENT", "dev"),
-		OTelEndpoint:           envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
-		OTelInsecure:           boolEnv("OTEL_EXPORTER_OTLP_INSECURE", false),
-		OTelExportInterval:     exportInterval,
+		TeamCreationRegion:            os.Getenv("TEAM_CREATION_REGION"),
+		TeamCreationKeys:              teamCreationKeys(os.Getenv("TEAM_CREATION_PUBLIC_KEYS")),
+		ComputeRestrictionsFile:       os.Getenv("COMPUTE_RESTRICTIONS_FILE"),
+		Port:                          envOrDefault("API_PORT", "8080"),
+		VMDAddress:                    envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
+		DatabaseURL:                   dbURL,
+		StripeSecretKey:               os.Getenv("STRIPE_SECRET_KEY"),
+		StripeWebhookSecret:           os.Getenv("STRIPE_WEBHOOK_SECRET"),
+		StripeMeterErrorWebhookSecret: os.Getenv("STRIPE_METER_ERROR_WEBHOOK_SECRET"),
+		StripeAPIBaseURL:              envOrDefault("STRIPE_API_BASE_URL", "https://api.stripe.com"),
+		StripeAPIVersion:              strings.TrimSpace(os.Getenv("STRIPE_API_VERSION")),
+		StripeCheckoutPriceIDs:        checkoutPriceIDs,
+		BillingResources:              billingResources(checkoutPriceIDs),
+		AppAllowedOrigins:             splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
+		SandboxAccessTokenSeed:        seed,
+		EdgeProxyDomain:               envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
+		TemplateBuildRegion:           buildRegion,
+		TemplateBackupBucket:          backupBucket,
+		DefaultHostID:                 envOrDefault("DEFAULT_HOST_ID", "default"),
+		SchedulerCapacityShadow:       boolEnv("SCHEDULER_CAPACITY_SHADOW", false),
+		SystemTeamID:                  os.Getenv("SYSTEM_TEAM_ID"),
+		SentryDSN:                     os.Getenv("SENTRY_DSN"),
+		KMSKeyResource:                os.Getenv("KMS_KEY_RESOURCE"),
+		SecretsSigningKey:             os.Getenv("SECRETS_SIGNING_KEY"),
+		SecretsSigningKeyID:           envOrDefault("SECRETS_SIGNING_KEY_ID", "v1"),
+		OTelMetricsEnabled:            boolEnv("OTEL_METRICS_ENABLED", false),
+		OTelServiceName:               envOrDefault("OTEL_SERVICE_NAME", "sandbox-controlplane"),
+		OTelServiceVersion:            os.Getenv("OTEL_SERVICE_VERSION"),
+		OTelEnvironment:               envOrDefault("OTEL_ENVIRONMENT", "dev"),
+		OTelEndpoint:                  envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+		OTelInsecure:                  boolEnv("OTEL_EXPORTER_OTLP_INSECURE", false),
+		OTelExportInterval:            exportInterval,
+		BackupGCServiceAccount:        strings.TrimSpace(os.Getenv("BACKUP_GC_SERVICE_ACCOUNT")),
 	}
 	return cfg, nil
+}
+
+// Invalid or missing verifier configuration disables only team creation.
+func teamCreationKeys(raw string) map[string]ed25519.PublicKey {
+	if raw == "" {
+		return nil
+	}
+	var encoded map[string]string
+	if json.Unmarshal([]byte(raw), &encoded) != nil || len(encoded) == 0 {
+		return nil
+	}
+	keys := make(map[string]ed25519.PublicKey, len(encoded))
+	for kid, value := range encoded {
+		if kid == "" || len(kid) > 128 {
+			return nil
+		}
+		key, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || len(key) != ed25519.PublicKeySize {
+			return nil
+		}
+		keys[kid] = ed25519.PublicKey(key)
+	}
+	return keys
+}
+
+func checkoutPriceIDs() []string {
+	ids := splitCSV(os.Getenv("STRIPE_CHECKOUT_PRICE_IDS"))
+	if len(ids) == 0 {
+		ids = splitCSV(os.Getenv("STRIPE_CHECKOUT_PRICE_ID"))
+	}
+	return ids
+}
+
+// BillingResourceConfig describes one metered resource in the billing model.
+// The default configuration is loaded from the existing Stripe checkout price
+// environment variables, but a JSON resource list can override it when needed.
+type BillingResourceConfig struct {
+	ResourceKey         string `json:"resource_key"`
+	DisplayName         string `json:"display_name"`
+	SortOrder           int    `json:"sort_order"`
+	UsageUnit           string `json:"usage_unit"`
+	DisplayUnit         string `json:"display_unit"`
+	StripeEventName     string `json:"stripe_event_name"`
+	StripePriceID       string `json:"stripe_price_id"`
+	Tracked             bool   `json:"tracked"`
+	Billable            bool   `json:"billable"`
+	CheckoutEnabled     bool   `json:"checkout_enabled"`
+	SubscriptionEnabled *bool  `json:"subscription_enabled,omitempty"`
+}
+
+// SubscriptionIncluded preserves the legacy config spelling while allowing an
+// explicit subscription_enabled value independent of payable usage.
+func (r BillingResourceConfig) SubscriptionIncluded() bool {
+	if r.SubscriptionEnabled != nil {
+		return *r.SubscriptionEnabled
+	}
+	return r.CheckoutEnabled
+}
+
+func billingResources(checkoutPriceIDs []string) []BillingResourceConfig {
+	if raw := strings.TrimSpace(os.Getenv("BILLING_RESOURCE_CONFIG")); raw != "" {
+		var resources []BillingResourceConfig
+		if err := json.Unmarshal([]byte(raw), &resources); err == nil && len(resources) > 0 {
+			normalizeBillingResources(resources)
+			// Before subscription_enabled existed, storage was commonly marked
+			// checkout_enabled=true without a configured price. Preserve that
+			// legacy omission until preload supplies an actual storage price;
+			// an explicit subscription_enabled=true remains strict at checkout.
+			for i := range resources {
+				if resources[i].ResourceKey == "storage_gib" && resources[i].SubscriptionEnabled == nil && strings.TrimSpace(resources[i].StripePriceID) == "" {
+					resources[i].CheckoutEnabled = false
+				}
+			}
+			return resources
+		}
+	}
+
+	resources := []BillingResourceConfig{
+		{
+			ResourceKey:     "vcpu",
+			UsageUnit:       "second",
+			StripeEventName: "cpu_vcpu_hours",
+			Tracked:         true,
+			Billable:        true,
+			CheckoutEnabled: true,
+		},
+		{
+			ResourceKey:     "memory_gib",
+			UsageUnit:       "second",
+			StripeEventName: "memory_gib_hours",
+			Tracked:         true,
+			Billable:        true,
+			CheckoutEnabled: true,
+		},
+		{
+			ResourceKey:     "storage_gib",
+			UsageUnit:       "second",
+			StripeEventName: "storage_gib_hours",
+			Tracked:         true,
+			Billable:        false,
+			CheckoutEnabled: true,
+		},
+	}
+	for i := range resources {
+		if i < len(checkoutPriceIDs) {
+			resources[i].StripePriceID = checkoutPriceIDs[i]
+		}
+	}
+	// Legacy two-price installations can continue compute Checkout until the
+	// shared storage price is configured for preload.
+	resources[2].CheckoutEnabled = strings.TrimSpace(resources[2].StripePriceID) != ""
+
+	normalizeBillingResources(resources)
+	return resources
+}
+
+func normalizeBillingResources(resources []BillingResourceConfig) {
+	for i := range resources {
+		if resources[i].UsageUnit == "" {
+			resources[i].UsageUnit = "second"
+		}
+		if resources[i].DisplayUnit == "" {
+			resources[i].DisplayUnit = defaultBillingResourceDisplayUnit(resources[i].ResourceKey)
+		}
+		if resources[i].DisplayName == "" {
+			resources[i].DisplayName = defaultBillingResourceDisplayName(resources[i].ResourceKey)
+		}
+		if resources[i].SortOrder == 0 {
+			resources[i].SortOrder = (i + 1) * 10
+		}
+	}
+}
+
+func defaultBillingResourceDisplayName(resourceKey string) string {
+	switch resourceKey {
+	case "vcpu":
+		return "CPU"
+	case "memory_gib":
+		return "Memory"
+	case "storage_gib":
+		return "Storage"
+	default:
+		return resourceKey
+	}
+}
+
+func defaultBillingResourceDisplayUnit(resourceKey string) string {
+	switch resourceKey {
+	case "vcpu":
+		return "vCPU-hours"
+	case "memory_gib":
+		return "GiB-hours"
+	case "storage_gib":
+		return "GiB-hours"
+	default:
+		return resourceKey
+	}
+}
+
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func loadSeed(envValue string, allowEphemeral bool) ([]byte, error) {

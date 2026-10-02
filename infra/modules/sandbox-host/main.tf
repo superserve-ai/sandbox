@@ -9,6 +9,7 @@ resource "google_compute_instance" "this" {
   machine_type              = var.machine_type
   can_ip_forward            = var.can_ip_forward
   allow_stopping_for_update = var.allow_stopping_for_update
+  desired_status            = var.desired_status
   tags                      = var.tags
   labels                    = local.instance_labels
 
@@ -25,6 +26,11 @@ resource "google_compute_instance" "this" {
   network_interface {
     subnetwork = var.subnet
     network_ip = var.internal_ip
+
+    dynamic "access_config" {
+      for_each = var.external_ip ? [1] : []
+      content {}
+    }
   }
 
   # Prepend the host patching policy to whatever startup script the
@@ -34,10 +40,15 @@ resource "google_compute_instance" "this" {
   # the same policy up from the vmd deploy step instead.
   metadata = merge(
     var.metadata,
+    var.provisioning_run_id != "" ? { host-provisioning-run = var.provisioning_run_id } : {},
     {
+      user-data = "#cloud-config\n${yamlencode(merge(local.host_cloud_config, {
+        bootcmd = concat([local.host_identity_prerequisite], var.provisioning ? [local.host_provisioning_hold] : [], [for command in local.host_boot_commands : yamldecode(command)])
+      }))}"
       startup-script = trimspace(join("\n\n", compact([
         local.host_patching_policy,
-        lookup(var.metadata, "startup-script", ""),
+        var.provisioning ? local.host_provisioning_hold : "",
+        var.provisioning ? "if [ -f /etc/sandbox/provisioning-complete ]; then\n:\n${lookup(var.metadata, "startup-script", ":")}\nfi" : lookup(var.metadata, "startup-script", ""),
       ])))
     },
   )
@@ -93,6 +104,57 @@ resource "google_compute_instance" "this" {
 }
 
 locals {
+  host_provisioning_hold = <<-EOT
+    set -eu
+    mkdir -p /etc/sandbox
+    # Creation metadata persists after explicit runtime initialization.
+    if [ ! -f /etc/sandbox/provisioning-complete ]; then
+      touch /etc/sandbox/provisioning-hold
+      for unit in superserve-vmd.service superserve-vmd.socket; do
+        mkdir -p "/etc/systemd/system/$unit.d"
+        printf '[Unit]\nConditionPathExists=!/etc/sandbox/provisioning-hold\n' > "/etc/systemd/system/$unit.d/05-provisioning-hold.conf"
+      done
+      systemctl daemon-reload
+      systemctl stop superserve-vmd.socket superserve-vmd.service || true
+    fi
+  EOT
+
+  # Images must already contain the identity-gated units and fencing-aware VMD.
+  # Reassert the gate before caller boot commands; bootcmd can race socket activation.
+  host_cloud_config = yamldecode(lookup(var.metadata, "user-data", "{}"))
+
+  host_boot_commands = [for command in try(local.host_cloud_config.bootcmd, []) :
+    var.provisioning ? yamlencode(concat(
+      ["sh", "-c", "if [ -f /etc/sandbox/provisioning-complete ]; then exec \"$@\"; fi", "provisioning-boot"],
+      try(tolist(command), ["sh", "-c", tostring(command)])
+    )) : yamlencode(command)
+  ]
+
+  host_identity_prerequisite = <<-EOT
+    set -eu
+    # Preserve normal boot activation once installed; VMD validates the identity.
+    if [ ! -s /etc/sandbox/host-identity.json ] || [ ! -s /etc/sandbox/host-identity.env ]; then
+      for unit in superserve-vmd.socket superserve-vmd.service; do
+        if systemctl cat "$unit" >/dev/null 2>&1; then
+          systemctl stop "$unit"
+        fi
+      done
+    fi
+    mkdir -p /etc/systemd/system/superserve-vmd.service.d /etc/systemd/system/superserve-vmd.socket.d
+    cat > /etc/systemd/system/superserve-vmd.socket.d/10-identity-required.conf <<'IDENTITY'
+    [Unit]
+    ConditionPathExists=/etc/sandbox/host-identity.json
+    ConditionPathExists=/etc/sandbox/host-identity.env
+    IDENTITY
+    cat > /etc/systemd/system/superserve-vmd.service.d/10-identity-required.conf <<'IDENTITY'
+    [Service]
+    Environment=HOST_IDENTITY_REQUIRED=1
+    ExecStartPre=/usr/bin/test -s /etc/sandbox/host-identity.json
+    EnvironmentFile=/etc/sandbox/host-identity.env
+    IDENTITY
+    systemctl daemon-reload
+  EOT
+
   # Host patching policy: no automatic OS upgrades, and library-upgrade
   # tooling must never restart the VM or platform units — a restarted
   # firecracker unit is a destroyed customer VM. Mirrors the deploy assets
@@ -121,6 +183,7 @@ locals {
       managed_by  = "terraform"
       region      = var.region
     },
+    var.provisioning ? { component = "vmd-provisioning", sandbox_status = "provisioning" } : {},
   )
 
   sandbox_host_contract = {

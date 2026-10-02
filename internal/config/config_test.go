@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -8,6 +9,8 @@ import (
 func TestLoadOTelEnvVars(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://example.invalid/sandbox")
 	t.Setenv("SANDBOX_ACCESS_TOKEN_SEED", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	t.Setenv("TEMPLATE_BUILD_REGION", "example-region")
+	t.Setenv("BACKUP_BUCKET", "example-bucket")
 	t.Setenv("OTEL_METRICS_ENABLED", "true")
 	t.Setenv("OTEL_SERVICE_NAME", "sandbox-controlplane")
 	t.Setenv("OTEL_ENVIRONMENT", "production")
@@ -33,5 +36,30 @@ func TestLoadOTelEnvVars(t *testing.T) {
 	}
 	if got, want := cfg.OTelExportInterval, 15*time.Second; got != want {
 		t.Fatalf("OTelExportInterval = %s, want %s", got, want)
+	}
+}
+
+func TestLoadRequiresTemplateBuildStorageConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://example.invalid/sandbox")
+	t.Setenv("SANDBOX_ACCESS_TOKEN_SEED", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	for _, tc := range []struct {
+		name   string
+		region string
+		bucket string
+		want   string
+	}{
+		{name: "missing region", bucket: "example-bucket", want: "TEMPLATE_BUILD_REGION"},
+		{name: "blank region", region: "  ", bucket: "example-bucket", want: "TEMPLATE_BUILD_REGION"},
+		{name: "missing bucket", region: "example-region", want: "BACKUP_BUCKET"},
+		{name: "blank bucket", region: "example-region", bucket: "  ", want: "BACKUP_BUCKET"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TEMPLATE_BUILD_REGION", tc.region)
+			t.Setenv("BACKUP_BUCKET", tc.bucket)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load() error = %v, want %s", err, tc.want)
+			}
+		})
 	}
 }

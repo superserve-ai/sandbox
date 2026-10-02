@@ -3,8 +3,12 @@ package vm
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
 
 const (
@@ -114,7 +119,7 @@ func TestDirSize(t *testing.T) {
 // reclaim only UUIDs present in no source at all.
 func TestDiskKeepSet(t *testing.T) {
 	row := func(s db.SandboxStatus) db.ListSandboxesByHostRow {
-		return db.ListSandboxesByHostRow{Sandbox: db.Sandbox{Status: s}}
+		return db.ListSandboxesByHostRow{Status: s}
 	}
 	const (
 		recentID = "44444444-4444-4444-4444-444444444444" // recently destroyed → kept
@@ -275,7 +280,7 @@ func TestReclaimDiskOrphans_SkipsLiveSandbox(t *testing.T) {
 		onDisk[id] = sandboxDirInfo{paths: []string{p}}
 	}
 	dbSandboxes := map[string]db.ListSandboxesByHostRow{
-		uuidA: {Sandbox: db.Sandbox{Status: db.SandboxStatusPaused}}, // live → must not move
+		uuidA: {Status: db.SandboxStatusPaused}, // live → must not move
 	}
 
 	r := &Reconciler{
@@ -325,12 +330,265 @@ func TestReclaimDiskOrphans_StopsOnCancel(t *testing.T) {
 	}
 }
 
+// An archived orphan's private directory can be quarantined while its
+// template/base remains referenced by another sandbox. Retirement must use
+// the authoritative owner termination plus the private cleanup, and must not
+// wait for shared artifacts to disappear. The state reopen and inventory at
+// the end model the restart that previously left the survivor unmeasurable.
+func TestRetireArchivedOrphanAfterQuarantinePreservesSharedBase(t *testing.T) {
+	root := t.TempDir()
+	runDir := filepath.Join(root, "run")
+	snapshotDir := filepath.Join(root, "snapshots")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if state != nil {
+			_ = state.Close()
+		}
+	}()
+
+	sharedBase := filepath.Join(root, "templates", "base.ext4")
+	if err := os.MkdirAll(filepath.Dir(sharedBase), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sharedBase, []byte("shared base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orphanID := uuid.NewString()
+	orphanDir := filepath.Join(runDir, orphanID)
+	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sharedSnapshotDir := filepath.Join(snapshotDir, TemplatesDirName, "template-a")
+	if err := os.MkdirAll(sharedSnapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sharedSnapshot := filepath.Join(sharedSnapshotDir, "vmstate.snap")
+	sharedMemory := filepath.Join(sharedSnapshotDir, "mem.snap")
+	orphan := VMRecord{
+		ID: orphanID, Status: StatusPaused,
+		DiskPath:     filepath.Join(orphanDir, "overlay.ext4"),
+		SnapshotPath: sharedSnapshot,
+		MemFilePath:  sharedMemory,
+		BasePath:     sharedBase,
+	}
+	for _, path := range []string{orphan.DiskPath, orphan.SnapshotPath, orphan.MemFilePath} {
+		if err := os.WriteFile(path, []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := state.Put(orphan); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReleaseRetainingStorage(orphanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineDir(orphanDir, "2026-10-01"); err != nil {
+		t.Fatal(err)
+	}
+
+	survivorID := uuid.NewString()
+	survivorDir := filepath.Join(runDir, survivorID)
+	if err := os.MkdirAll(survivorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	survivor := VMRecord{
+		ID: survivorID, Status: StatusRunning,
+		DiskPath: filepath.Join(survivorDir, "overlay.ext4"),
+		BasePath: sharedBase, SourceSnapshotID: uuid.NewString(),
+	}
+	if err := os.WriteFile(survivor.DiskPath, []byte("survivor"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Put(survivor); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &Manager{state: state, cfg: ManagerConfig{RunDir: runDir, SnapshotDir: snapshotDir}, log: zerolog.Nop()}
+	r := NewReconciler(mgr, ReconcilerConfig{GracePeriod: 0})
+	dbSandboxes := map[string]db.ListSandboxesByHostRow{}
+	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	r.retireArchivedOrphans(context.Background(), now, dbSandboxes, nil, nil, zerolog.Nop())
+	r.retireArchivedOrphans(context.Background(), now.Add(time.Second), dbSandboxes, nil, nil, zerolog.Nop())
+	archived, err := state.retainedArchivedRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archived) != 0 {
+		t.Fatalf("quarantined orphan archive remains: %+v", archived)
+	}
+	if _, err := os.Stat(sharedBase); err != nil {
+		t.Fatalf("shared base was removed while survivor retained it: %v", err)
+	}
+	for _, path := range []string{sharedSnapshot, sharedMemory} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("shared template dependency was removed while survivor retained it: %v", err)
+		}
+	}
+
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, err = OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.state = state
+	inv, err := mgr.retainedStorageInventoryWithPersistence(context.Background(), func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+		return []retainedstorage.Extent{{Device: "fixture", Start: 0, Length: 4096}}, "fixture", nil
+	}, false)
+	if err != nil {
+		t.Fatalf("survivor inventory failed after restart: %v", err)
+	}
+	if len(inv.Owners) != 1 || inv.Owners[0].ID != survivorID {
+		t.Fatalf("inventory owners = %+v, want survivor %s", inv.Owners, survivorID)
+	}
+}
+
+// A stale archive scan must not retire an archive after a replacement live
+// generation appears. The live record's indexes and preview policy are kept
+// intact, and the archive remains available for live-over-archive precedence.
+func TestRetireArchivedOrphanReplacementGenerationWins(t *testing.T) {
+	root := t.TempDir()
+	runDir := filepath.Join(root, "run")
+	snapshotDir := filepath.Join(root, "snapshots")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+
+	id := uuid.NewString()
+	old := VMRecord{ID: id, Status: StatusPaused, CreatedAt: time.Unix(10, 0).UTC(),
+		DiskPath: filepath.Join(runDir, id, "overlay.ext4"), SnapshotPath: filepath.Join(runDir, id, "vmstate.snap"),
+		MemFilePath: filepath.Join(runDir, id, "mem.snap")}
+	if err := state.Put(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReleaseRetainingStorage(id); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{state: state, cfg: ManagerConfig{RunDir: runDir, SnapshotDir: snapshotDir}, log: zerolog.Nop()}
+	r := NewReconciler(mgr, ReconcilerConfig{GracePeriod: 0})
+	unlock, err := mgr.lockVMOp(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An in-flight lifecycle operation wins before the replacement is visible.
+	r.retireArchivedOrphans(context.Background(), time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), nil, nil, nil, zerolog.Nop())
+	unlock()
+
+	// This is the replacement that raced the pass-level archive snapshot.
+	newer := old
+	newer.Status = StatusRunning
+	newer.CreatedAt = time.Unix(20, 0).UTC()
+	newer.PID = 1234
+	newer.Supervision = SupervisionCgroup
+	newer.Namespace = "ns-replacement"
+	newer.PreviewAccess = "private"
+	newer.PreviewPolicyRevision = 7
+	if err := state.Put(newer); err != nil {
+		t.Fatal(err)
+	}
+
+	r.retireArchivedOrphans(context.Background(), time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), nil, nil, nil, zerolog.Nop())
+
+	got, err := state.Get(id)
+	if err != nil || got == nil || got.CreatedAt != newer.CreatedAt || got.PreviewPolicyRevision != 7 {
+		t.Fatalf("replacement live record changed or disappeared: got=%+v err=%v", got, err)
+	}
+	if gotNamespaces, err := state.SlotNamespaces(); err != nil || gotNamespaces[id] != newer.Namespace {
+		t.Fatalf("replacement slot index = %#v err=%v", gotNamespaces, err)
+	}
+	hasCgroup, err := state.HasCgroupRecords()
+	if err != nil || !hasCgroup {
+		t.Fatalf("replacement cgroup index missing: has=%v err=%v", hasCgroup, err)
+	}
+	archived, err := state.retainedArchivedRecords()
+	if err != nil || len(archived) != 1 || archived[0].CreatedAt != old.CreatedAt {
+		t.Fatalf("stale archive was retired or changed: archived=%+v err=%v", archived, err)
+	}
+}
+
 func keysOf(m map[string]sandboxDirInfo) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
 	}
 	return out
+}
+
+// The direct-spawn service weight must track the LIVE direct-VM count (100
+// per VM = one legacy peer each), clamp to cgroup v2's [100, 10000], skip the
+// set-property when unchanged, and only run when managing cgroup VMs.
+func TestAdjustDirectSpawnWeight(t *testing.T) {
+	orig := setUnitWeight
+	var got []int
+	setUnitWeight = func(_ context.Context, _ string, w int) error { got = append(got, w); return nil }
+	defer func() { setUnitWeight = orig }()
+
+	tree := &cgroupTree{vms: t.TempDir()} // non-nil => managing cgroup VMs
+	r := &Reconciler{mgr: &Manager{cgroups: tree, log: zerolog.Nop()}}
+
+	sup := func(ids ...string) (map[string]bool, map[string]Supervision) {
+		a := map[string]bool{}
+		s := map[string]Supervision{}
+		for _, id := range ids {
+			a[id] = true
+			s[id] = SupervisionCgroup
+		}
+		// A legacy unit in the set must NOT count toward the weight.
+		a["legacy-1"] = true
+		s["legacy-1"] = SupervisionUnit
+		return a, s
+	}
+
+	// 3 live direct VMs -> 300.
+	a, s := sup("d1", "d2", "d3")
+	r.adjustDirectSpawnWeight(context.Background(), a, s)
+	// Same count again -> no second call.
+	r.adjustDirectSpawnWeight(context.Background(), a, s)
+	// Zero direct VMs -> floor 100.
+	r.adjustDirectSpawnWeight(context.Background(), map[string]bool{"legacy-1": true}, map[string]Supervision{"legacy-1": SupervisionUnit})
+	// 200 direct VMs -> clamped to 10000.
+	many := []string{}
+	for i := 0; i < 200; i++ {
+		many = append(many, "d"+strconv.Itoa(i))
+	}
+	a2, s2 := sup(many...)
+	r.adjustDirectSpawnWeight(context.Background(), a2, s2)
+
+	want := []int{300, 100, 10000}
+	if len(got) != len(want) {
+		t.Fatalf("set-property calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("call %d weight = %d, want %d (all: %v)", i, got[i], want[i], got)
+		}
+	}
+
+	// Not managing cgroup VMs => never touches the weight.
+	got = nil
+	r2 := &Reconciler{mgr: &Manager{cgroups: nil, log: zerolog.Nop()}}
+	r2.adjustDirectSpawnWeight(context.Background(), a, s)
+	if len(got) != 0 {
+		t.Fatalf("unarmed reconciler set weight %v, want none", got)
+	}
 }
 
 // The crash-window orphan rule (Drift 7b) must lose the race with adoption: a
@@ -389,6 +647,156 @@ func TestUnverifiedOrphanGrace(t *testing.T) {
 		if cfg.UnverifiedOrphanGrace <= cfg.GracePeriod {
 			t.Fatalf("orphan grace (%s) must far exceed the default grace (%s)",
 				cfg.UnverifiedOrphanGrace, cfg.GracePeriod)
+		}
+	})
+}
+
+// A reconciler rule that proves an interrupted resume's process dead must
+// not delete its record: the paused image is intact. The record is returned
+// to Paused by the reattach flight, which serializes with lazy loads, so a
+// reattach that read the older record can never publish over the recovery.
+func TestMarkStaleReturnsAnInterruptedResumeToPaused(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return true }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+	newCase := func(t *testing.T) (*Reconciler, *Manager, *StateStore, VMRecord, *fakeNetMgr) {
+		t.Helper()
+		st, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, WakeOwedFromPaused: true, WakeToken: "disk", FreezeToken: "rec", Supervision: SupervisionUnit, Namespace: "ns-1", IP: "10.0.0.2", MemFilePath: "/snap/mem.snap"}
+		if err := st.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		net := &fakeNetMgr{}
+		m := &Manager{log: zerolog.Nop(), state: st, netMgr: net, vms: map[string]*VMInstance{}}
+		return NewReconciler(m, DefaultReconcilerConfig()), m, st, rec, net
+	}
+
+	t.Run("untracked_record_returns_to_paused", func(t *testing.T) {
+		r, m, st, _, net := newCase(t)
+		if err := r.markStale("vm-1"); err != nil {
+			t.Fatalf("markStale: %v", err)
+		}
+		got, _ := st.Get("vm-1")
+		if got == nil || got.Status != StatusPaused || got.WakePending || got.WakeOwedFromPaused || got.Unverified || got.WakeToken != "" {
+			t.Fatalf("record = %+v; want Paused with nothing owed", got)
+		}
+		if got.Namespace != "ns-1" || got.FreezeToken != "rec" || got.MemFilePath != "/snap/mem.snap" {
+			t.Errorf("record = %+v; want the slot, image and token kept", got)
+		}
+		m.mu.RLock()
+		inst := m.vms["vm-1"]
+		m.mu.RUnlock()
+		if inst == nil || inst.Status != StatusPaused {
+			t.Fatalf("instance = %+v; want the flight to publish it Paused", inst)
+		}
+		if len(net.cleanupCalls) != 0 {
+			t.Fatalf("cleanup calls = %+v; the slot stays with the paused record", net.cleanupCalls)
+		}
+	})
+
+	// An instance already tracked (parked Error behind a stop that could not
+	// be confirmed at startup) is rewritten in place once its process is
+	// gone: the flight cannot reach it, the instance owns its record.
+	t.Run("tracked_record_is_returned_to_paused_in_place", func(t *testing.T) {
+		r, m, st, rec, net := newCase(t)
+		rec.Status = StatusError
+		if err := st.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		inst := toInstance(rec)
+		m.vms["vm-1"] = inst
+		if err := r.markStale("vm-1"); err != nil {
+			t.Fatalf("markStale: %v", err)
+		}
+		if inst.Status != StatusPaused || inst.WakePending || inst.WakeOwedFromPaused || inst.Unverified || inst.WakeToken != "" {
+			t.Fatalf("instance = %+v; want Paused with nothing owed", inst)
+		}
+		got, _ := st.Get("vm-1")
+		if got == nil || got.Status != StatusPaused || got.WakePending || got.Namespace != "ns-1" {
+			t.Fatalf("record = %+v; want Paused on its slot", got)
+		}
+		if m.vms["vm-1"] != inst || len(net.cleanupCalls) != 0 {
+			t.Fatal("the instance must stay tracked with its slot")
+		}
+	})
+
+	// A sandbox the control plane has forgotten is deleted whatever its
+	// record says: paused, or a resume that never ran its guest.
+	t.Run("orphans_are_deleted_regardless", func(t *testing.T) {
+		for _, paused := range []bool{false, true} {
+			r, m, st, rec, net := newCase(t)
+			if paused {
+				rec.returnToPaused()
+				if err := st.Put(rec); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.reapOrphan("vm-1"); err != nil {
+				t.Fatalf("reapOrphan(paused=%v): %v", paused, err)
+			}
+			if got, _ := st.Get("vm-1"); got != nil {
+				t.Fatalf("record = %+v after reapOrphan(paused=%v); want it deleted", got, paused)
+			}
+			if len(net.cleanupCalls) != 1 || m.vms["vm-1"] != nil {
+				t.Fatalf("paused=%v: cleanup calls = %+v; want the slot released once and nothing tracked", paused, net.cleanupCalls)
+			}
+		}
+	})
+
+	// The reconciler's recovery joins a reattach already in flight for the VM
+	// rather than writing beside it: it returns only after that flight.
+	t.Run("recovery_joins_an_in_flight_reattach", func(t *testing.T) {
+		r, m, st, _, _ := newCase(t)
+		origHook, origWake := reattachHook, boxdWakeGuest
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return errors.New("no answer") }
+		t.Cleanup(func() { reattachHook, boxdWakeGuest = origHook, origWake })
+		release := make(chan struct{})
+		staleDone := make(chan error, 1)
+		var once sync.Once
+		reattachHook = func(string) {
+			once.Do(func() {
+				go func() { staleDone <- r.markStale("vm-1") }()
+				select {
+				case err := <-staleDone:
+					t.Errorf("markStale returned (%v) while a reattach was in flight", err)
+				case <-time.After(100 * time.Millisecond):
+				}
+				close(release)
+			})
+		}
+		if inst := m.reattachByID("vm-1", false); inst == nil || inst.Status != StatusPaused {
+			t.Fatalf("lazy reattach = %+v; want it to return the record to Paused itself", inst)
+		}
+		<-release
+		if err := <-staleDone; err != nil {
+			t.Fatalf("markStale after the flight: %v", err)
+		}
+		got, _ := st.Get("vm-1")
+		if got == nil || got.Status != StatusPaused || got.Namespace != "ns-1" {
+			t.Fatalf("record = %+v; want Paused on its slot", got)
+		}
+	})
+
+	// A record converged to Paused between a rule's snapshot and its
+	// markStale is whole, not stale: it is refused, not deleted.
+	t.Run("a_record_paused_meanwhile_is_refused", func(t *testing.T) {
+		r, _, st, rec, net := newCase(t)
+		rec.returnToPaused()
+		if err := st.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.markStale("vm-1"); err == nil {
+			t.Fatal("markStale must refuse a paused record")
+		}
+		if got, _ := st.Get("vm-1"); got == nil || got.Status != StatusPaused {
+			t.Fatalf("record = %+v; want it kept", got)
+		}
+		if len(net.cleanupCalls) != 0 {
+			t.Fatalf("cleanup calls = %+v; nothing may be released", net.cleanupCalls)
 		}
 	})
 }
@@ -600,7 +1008,7 @@ func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
 	rows := func(id string) map[string]db.ListSandboxesByHostRow {
 		sbID := uuid.MustParse(id)
 		return map[string]db.ListSandboxesByHostRow{
-			id: {Sandbox: db.Sandbox{ID: sbID, Status: db.SandboxStatusActive}},
+			id: {ID: sbID, Status: db.SandboxStatusActive},
 		}
 	}
 	noError := func(string) bool { return false }
@@ -634,6 +1042,62 @@ func TestReapDeadActiveVMs_StaleRunningRecordDoesNotVetoReap(t *testing.T) {
 	})
 }
 
+// A large stale-record backlog must not blow through the pass's own
+// deadline: markStale's netns teardown and BoltDB delete run on their own
+// unrelated context, so nothing but an explicit ctx.Err() check between
+// candidates stops the loop once the pass budget is spent. An already-
+// expired context must make the rule a no-op rather than grinding through
+// every candidate anyway.
+func TestReapDeadActiveVMs_ExpiredContextStopsBeforeAnyWork(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	ids := make([]string, 5)
+	rows := make(map[string]db.ListSandboxesByHostRow, len(ids))
+	for i := range ids {
+		sbID := uuid.New()
+		id := sbID.String()
+		ids[i] = id
+		if err := store.Put(VMRecord{ID: id, Status: StatusRunning}); err != nil {
+			t.Fatal(err)
+		}
+		rows[id] = db.ListSandboxesByHostRow{ID: sbID, Status: db.SandboxStatusActive}
+	}
+
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	for _, id := range ids {
+		r.driftSeen[id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	}
+
+	origProbe := unitFullyDownProbe
+	unitFullyDownProbe = func(context.Context, string) bool { return true } // every unit conclusively dead
+	t.Cleanup(func() { unitFullyDownProbe = origProbe })
+
+	flips := &[]string{}
+	r.markFailed = func(_ context.Context, vmID string, _ db.SandboxStatus) bool {
+		*flips = append(*flips, vmID)
+		return true
+	}
+
+	expiredCtx, cancel := context.WithCancel(context.Background())
+	cancel() // already expired before the rule ever runs
+
+	r.reapDeadActiveVMs(expiredCtx, zerolog.Nop(), rows, map[string]bool{}, func(string) bool { return false }, time.Now())
+
+	if len(*flips) != 0 {
+		t.Fatalf("an expired pass context must stop the loop before touching any candidate, got %d flips: %v", len(*flips), *flips)
+	}
+	for _, id := range ids {
+		if rec, _ := store.Get(id); rec == nil {
+			t.Fatalf("record %s must survive an aborted pass — it was never processed, not cleaned up", id)
+		}
+	}
+}
+
 // The lock-window race: a resume + re-pause can write a NEW artifact at the
 // same path while this rule waits on the lifecycle lock. The re-stat under
 // the lock must see it and heal rather than fail the fresh generation; an
@@ -656,14 +1120,18 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		}
 		return r, id, flips
 	}
-	rows := func(id, snapPath string) map[string]db.ListSandboxesByHostRow {
+	// input builds a paused row plus the batched snapshot-path map that
+	// resolvePausedSnapshotPaths would supply in production (path is a
+	// missing file, so Drift 4 evaluates the miss).
+	input := func(t *testing.T, id string) (map[string]db.ListSandboxesByHostRow, map[uuid.UUID]string) {
+		t.Helper()
 		sbID := uuid.MustParse(id)
+		snapPath := filepath.Join(t.TempDir(), "gone.snap")
 		return map[string]db.ListSandboxesByHostRow{
-			id: {
-				Sandbox:      db.Sandbox{ID: sbID, Status: db.SandboxStatusPaused, SnapshotID: pgtype.UUID{Bytes: sbID, Valid: true}},
-				SnapshotPath: &snapPath,
-			},
-		}
+				id: {ID: sbID, Status: db.SandboxStatusPaused, SnapshotID: pgtype.UUID{Bytes: sbID, Valid: true}},
+			}, map[uuid.UUID]string{
+				sbID: snapPath,
+			}
 	}
 	stubStat := func(t *testing.T, present, missing bool) {
 		t.Helper()
@@ -675,7 +1143,8 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 	t.Run("new generation written while waiting on the lock heals", func(t *testing.T) {
 		r, id, flips := newFixture(t)
 		stubStat(t, true, false) // the pause completed: artifact present at re-stat
-		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		dbRows, paths := input(t, id)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 0 {
 			t.Fatalf("a fresh pause generation must not be failed, got %v", *flips)
 		}
@@ -690,7 +1159,8 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 	t.Run("inconclusive stat defers and keeps the marker", func(t *testing.T) {
 		r, id, flips := newFixture(t)
 		stubStat(t, false, false)
-		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		dbRows, paths := input(t, id)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 0 {
 			t.Fatalf("an inconclusive read must never fail a sandbox, got %v", *flips)
 		}
@@ -705,7 +1175,8 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 	t.Run("proven absence flips the row", func(t *testing.T) {
 		r, id, flips := newFixture(t)
 		stubStat(t, false, true)
-		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		dbRows, paths := input(t, id)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 1 {
 			t.Fatalf("proven absence must flip exactly once, got %v", *flips)
 		}
@@ -716,9 +1187,349 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		stubStat(t, false, true)
 		r.mgr.vmOpCh(id) <- struct{}{} // a pause/resume holds the lock
 		defer func() { <-r.mgr.vmOpCh(id) }()
-		r.failMissingSnapshots(context.Background(), zerolog.Nop(), rows(id, filepath.Join(t.TempDir(), "gone.snap")), time.Now())
+		dbRows, paths := input(t, id)
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 0 {
 			t.Fatalf("a locked VM must defer, got %v", *flips)
 		}
 	})
+}
+
+// --- Mode-aware release rules: a cgroup VM must never be released on the
+// unit oracle's vacuous answers (no firecracker@ unit exists for it). ---
+
+// shimSystemctlDown puts a systemctl on PATH that answers every unit query
+// with the conclusively-down answers a NONEXISTENT unit produces: exactly the
+// vacuous evidence these rules must refuse to release cgroup VMs on.
+func shimSystemctlDown(t *testing.T) {
+	t.Helper()
+	shim := t.TempDir()
+	script := "#!/bin/sh\ncase \"$1\" in\nlist-units) exit 0 ;;\nshow) echo inactive ;;\nis-active) exit 3 ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(shim, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// cgroupFixtureTree builds a delegated-subtree stand-in with one per-VM group
+// whose cgroup.events reads as given.
+func cgroupFixtureTree(t *testing.T, id, events string) *cgroupTree {
+	t.Helper()
+	vms := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vms, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vms, id, "cgroup.events"), []byte(events), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &cgroupTree{vms: vms}
+}
+
+func setCgroupPopulated(t *testing.T, tree *cgroupTree, id string, populated bool) {
+	t.Helper()
+	v := "0"
+	if populated {
+		v = "1"
+	}
+	if err := os.WriteFile(filepath.Join(tree.vms, id, "cgroup.events"), []byte("populated "+v+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The prod-reachable shape releaseFailedRestore parks: an Error record in
+// cgroup mode whose FC is still alive. Driving the REAL pass (BoltDB-only
+// mode): the error rule must stop by the scanned mode and must not release
+// the record while the group stays populated; once the group is conclusively
+// empty, the next pass completes the release.
+func TestRunOnce_ErrorCgroupVM_ModeAwareStopAndRelease(t *testing.T) {
+	shimSystemctlDown(t)
+	id := uuid.New().String()
+	tree := cgroupFixtureTree(t, id, "populated 1\n")
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: id, Status: StatusError, Supervision: SupervisionCgroup, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	runDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(runDir, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log:     zerolog.Nop(),
+		state:   store,
+		netMgr:  nil,
+		cgroups: tree,
+		cfg:     ManagerConfig{RunDir: runDir},
+		vms:     map[string]*VMInstance{},
+	}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	var stops []Supervision
+	r.stopVM = func(_ context.Context, _ string, sup Supervision) error {
+		stops = append(stops, sup)
+		return nil // reported stopped — but the group stays populated (wedged FC)
+	}
+	past := time.Now().Add(-2 * r.cfg.GracePeriod)
+	r.driftSeen["errunit:"+id] = past
+
+	r.runOnce(context.Background())
+	if len(stops) != 1 || stops[0] != SupervisionCgroup {
+		t.Fatalf("the error rule must stop by the scanned mode (cgroup), got %v", stops)
+	}
+	if rec, gerr := store.Get(id); gerr != nil || rec == nil {
+		t.Fatal("a populated group must veto the release — record was freed under a live FC")
+	}
+
+	// The FC finally exits; the dead half completes the release.
+	setCgroupPopulated(t, tree, id, false)
+	r.driftSeen["errdead:"+id] = past
+	r.runOnce(context.Background())
+	if rec, gerr := store.Get(id); gerr == nil && rec != nil {
+		t.Fatalf("a conclusively-empty group must release the record, still present: %+v", rec)
+	}
+}
+
+// Drift 7b on a direct-spawn crash-window orphan: stop must dispatch by mode,
+// and the release needs the group conclusively empty — a stop that could not
+// kill the FC must leave record, instance and slot owned for the next pass.
+func TestReapUnverifiedOrphans_CgroupOrphan_ModeAwareStopAndProof(t *testing.T) {
+	id := uuid.New().String()
+	tree := cgroupFixtureTree(t, id, "populated 1\n")
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning, Unverified: true, Supervision: SupervisionCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: id, Status: StatusRunning, Unverified: true, Supervision: SupervisionCgroup}
+	m := &Manager{log: zerolog.Nop(), state: store, cgroups: tree, vms: map[string]*VMInstance{id: inst}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	var stops []Supervision
+	r.stopVM = func(_ context.Context, _ string, sup Supervision) error {
+		stops = append(stops, sup)
+		return nil
+	}
+	r.driftSeen["unverifiedorphan:"+id] = time.Now().Add(-2 * r.cfg.UnverifiedOrphanGrace)
+
+	sbID := uuid.MustParse(id)
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {ID: sbID, Status: db.SandboxStatusPaused},
+	}
+	active := map[string]bool{id: true}
+	sup := map[string]Supervision{id: SupervisionCgroup}
+
+	r.reapUnverifiedOrphans(context.Background(), zerolog.Nop(), rows, active, sup, time.Now())
+	if len(stops) != 1 || stops[0] != SupervisionCgroup {
+		t.Fatalf("orphan stop must dispatch by mode, got %v", stops)
+	}
+	if rec, gerr := store.Get(id); gerr != nil || rec == nil {
+		t.Fatal("a populated group must veto the release")
+	}
+
+	setCgroupPopulated(t, tree, id, false)
+	r.driftSeen["unverifiedorphan:"+id] = time.Now().Add(-2 * r.cfg.UnverifiedOrphanGrace)
+	r.reapUnverifiedOrphans(context.Background(), zerolog.Nop(), rows, active, sup, time.Now())
+	if rec, gerr := store.Get(id); gerr == nil && rec != nil {
+		t.Fatal("a conclusively-empty group must complete the release")
+	}
+}
+
+// Drift 1b on a direct-spawn empty shell: the probe finds no microVM behind
+// the socket, but the stop must dispatch by mode and the row flip + release
+// need the group conclusively empty.
+func TestFailEmptyShells_CgroupShell_ModeAwareStopAndProof(t *testing.T) {
+	id := uuid.New().String()
+	tree := cgroupFixtureTree(t, id, "populated 1\n")
+	// A short base dir: the rule dials RunDir/<id>/firecracker.sock, and
+	// t.TempDir's long test-name path would blow the 108-char sun_path cap.
+	runDir, err := os.MkdirTemp("", "fes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	if err := os.MkdirAll(filepath.Join(runDir, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A fake FC API socket answering "Not started" — the empty-shell answer.
+	sock := filepath.Join(runDir, id, "firecracker.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"x","state":"Not started"}`))
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	store, serr := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: id, Status: StatusRunning, Supervision: SupervisionCgroup}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, cgroups: tree, cfg: ManagerConfig{RunDir: runDir}, vms: map[string]*VMInstance{}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	var stops []Supervision
+	r.stopVM = func(_ context.Context, _ string, sup Supervision) error {
+		stops = append(stops, sup)
+		return nil
+	}
+	r.driftSeen["fcempty:"+id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+
+	sbID := uuid.MustParse(id)
+	rows := map[string]db.ListSandboxesByHostRow{
+		id: {ID: sbID, Status: db.SandboxStatusActive},
+	}
+	active := map[string]bool{id: true}
+	sup := map[string]Supervision{id: SupervisionCgroup}
+
+	r.failEmptyShells(context.Background(), zerolog.Nop(), rows, active, sup, time.Now())
+	if len(stops) != 1 || stops[0] != SupervisionCgroup {
+		t.Fatalf("empty-shell stop must dispatch by mode, got %v", stops)
+	}
+	if rec, gerr := store.Get(id); gerr != nil || rec == nil {
+		t.Fatal("a populated group must veto the flip and release")
+	}
+
+	setCgroupPopulated(t, tree, id, false)
+	r.driftSeen["fcempty:"+id] = time.Now().Add(-2 * r.cfg.GracePeriod)
+	r.failEmptyShells(context.Background(), zerolog.Nop(), rows, active, sup, time.Now())
+	if rec, gerr := store.Get(id); gerr == nil && rec != nil {
+		t.Fatal("a conclusively-empty group must complete the flip and release")
+	}
+}
+
+// The rollback drain: with direct spawn disarmed, a paused cgroup record must
+// demote to unit supervision — durably, and in the tracked instance when one
+// exists — but ONLY with the group conclusively empty and no lifecycle op in
+// flight. (Dir removal is not asserted: the fixture's cgroup.events is a real
+// file, so rmdir legitimately fails where a real cgroup's would succeed.)
+func TestDemotePausedCgroupRecords(t *testing.T) {
+	newFixture := func(t *testing.T, events string, inst *VMInstance) (*Reconciler, *StateStore, string) {
+		t.Helper()
+		id := uuid.New().String()
+		tree := cgroupFixtureTree(t, id, events)
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.Put(VMRecord{ID: id, Status: StatusPaused, Supervision: SupervisionCgroup}); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{log: zerolog.Nop(), state: store, cgroups: tree, vms: map[string]*VMInstance{}}
+		if inst != nil {
+			inst.ID = id
+			m.vms[id] = inst
+		}
+		return NewReconciler(m, DefaultReconcilerConfig()), store, id
+	}
+	supOf := func(store *StateStore, id string) Supervision {
+		rec, err := store.Get(id)
+		if err != nil || rec == nil {
+			return Supervision("gone")
+		}
+		return rec.Supervision
+	}
+
+	t.Run("empty group demotes the tracked instance and the record", func(t *testing.T) {
+		inst := &VMInstance{Status: StatusPaused, Supervision: SupervisionCgroup}
+		r, store, id := newFixture(t, "populated 0\n", inst)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionUnit {
+			t.Fatalf("record must demote to unit, got %q", got)
+		}
+		inst.mu.RLock()
+		got := inst.Supervision
+		inst.mu.RUnlock()
+		if got != SupervisionUnit {
+			t.Fatalf("tracked instance must demote too, got %q", got)
+		}
+	})
+
+	t.Run("untracked record demotes via the store", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 0\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionUnit {
+			t.Fatalf("record must demote to unit, got %q", got)
+		}
+	})
+
+	t.Run("populated group defers", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 1\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a populated group must defer the demotion, got %q", got)
+		}
+	})
+
+	t.Run("malformed events defers (unprovably empty)", func(t *testing.T) {
+		r, store, id := newFixture(t, "frozen 0\n", nil)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("an unprovably-empty group must defer the demotion, got %q", got)
+		}
+	})
+
+	t.Run("a resume that raced to Running defers", func(t *testing.T) {
+		inst := &VMInstance{Status: StatusRunning, Supervision: SupervisionCgroup}
+		r, store, id := newFixture(t, "populated 0\n", inst)
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a running instance must veto the demotion, got %q", got)
+		}
+		inst.mu.RLock()
+		got := inst.Supervision
+		inst.mu.RUnlock()
+		if got != SupervisionCgroup {
+			t.Fatal("the running instance's mode must be untouched")
+		}
+	})
+
+	t.Run("an in-flight lifecycle op defers", func(t *testing.T) {
+		r, store, id := newFixture(t, "populated 0\n", nil)
+		r.mgr.vmOpCh(id) <- struct{}{}
+		defer func() { <-r.mgr.vmOpCh(id) }()
+		r.demotePausedCgroupRecords(context.Background(), zerolog.Nop())
+		if got := supOf(store, id); got != SupervisionCgroup {
+			t.Fatalf("a locked VM must defer, got %q", got)
+		}
+	})
+}
+
+// The release chokepoint must refuse unknown supervision modes: every rule
+// proves death via the unit and cgroup oracles, and a mode this binary
+// predates may supervise a live FC neither can see. The record, its instance
+// and its slot must all stay owned.
+func TestMarkStaleRefusesUnknownSupervision(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Supervision: Supervision("checkpointed"), Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{
+		"vm-1": {ID: "vm-1", Status: StatusError, Supervision: Supervision("checkpointed")},
+	}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+
+	if err := r.markStale("vm-1"); err == nil {
+		t.Fatal("an unknown supervision mode must refuse release, not delete the record")
+	}
+	if rec, gerr := store.Get("vm-1"); gerr != nil || rec == nil {
+		t.Fatal("the record must survive the refusal")
+	}
+	if _, tracked := m.vms["vm-1"]; !tracked {
+		t.Fatal("the instance must stay tracked")
+	}
 }

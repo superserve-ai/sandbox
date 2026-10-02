@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -23,17 +24,146 @@ import (
 	"github.com/superserve-ai/sandbox/internal/presence"
 )
 
+type fakeNetMgr struct {
+	netlinkSlotOps  bool
+	setupInfo       map[string]*network.VMNetInfo
+	setupCalls      []string
+	cleanupVMCalls  []string
+	teardownCalls   []string
+	teardownNSCalls []struct {
+		vmID string
+		ns   string
+	}
+	claimCalls   []string
+	cleanupCalls []struct {
+		vmID string
+		ns   string
+	}
+	reserved      map[string]string
+	poolFresh     int
+	poolRecycled  int
+	poolEnabled   bool
+	netnsTotal    int
+	ownedSlots    int
+	orphaned      int
+	firewallCalls []struct {
+		vmID         string
+		allowedCIDRs []string
+		deniedCIDRs  []string
+	}
+	beforeRelease func(op, vmID, ns string)
+}
+
+func (f *fakeNetMgr) CleanupVM(vmID string) {
+	if f.beforeRelease != nil {
+		f.beforeRelease("cleanup", vmID, "")
+	}
+	f.cleanupVMCalls = append(f.cleanupVMCalls, vmID)
+}
+
+func (f *fakeNetMgr) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
+	if f.beforeRelease != nil {
+		f.beforeRelease("cleanup_ns", vmID, fallbackNamespace)
+	}
+	f.cleanupCalls = append(f.cleanupCalls, struct {
+		vmID string
+		ns   string
+	}{vmID: vmID, ns: fallbackNamespace})
+}
+
+func (f *fakeNetMgr) ClaimFreshSlot(owner string) (int, error) {
+	f.claimCalls = append(f.claimCalls, owner)
+	return 0, nil
+}
+
+func (f *fakeNetMgr) EnsureVMSlot(context.Context, string, string, string, string) (*network.VMNetInfo, error) {
+	return &network.VMNetInfo{}, nil
+}
+
+func (f *fakeNetMgr) Forget(string) {}
+
+func (f *fakeNetMgr) GetVMNetInfo(string) *network.VMNetInfo { return nil }
+
+func (f *fakeNetMgr) NetnsStats() (int, int, int) { return f.netnsTotal, f.ownedSlots, f.orphaned }
+
+func (f *fakeNetMgr) PoolStats() (int, int, bool)             { return f.poolFresh, f.poolRecycled, f.poolEnabled }
+func (f *fakeNetMgr) SlotPressure() network.SlotPressureStats { return network.SlotPressureStats{} }
+
+func (f *fakeNetMgr) NamespaceForPID(int) string { return "" }
+
+func (f *fakeNetMgr) ReattachVM(string, string, string, string) error { return nil }
+
+func (f *fakeNetMgr) ReclaimUnusedSlots() int { return 0 }
+
+func (f *fakeNetMgr) DrainWarmPool(int) int { return 0 }
+
+func (f *fakeNetMgr) ReleaseSlot(string, int) {}
+
+func (f *fakeNetMgr) ReserveSlotsAbove(reservations map[string]string) {
+	f.reserved = make(map[string]string, len(reservations))
+	for vmID, ns := range reservations {
+		f.reserved[vmID] = ns
+	}
+}
+
+func (f *fakeNetMgr) SetupVM(_ context.Context, vmID string, _ *network.Config) (*network.VMNetInfo, error) {
+	f.setupCalls = append(f.setupCalls, vmID)
+	if info, ok := f.setupInfo[vmID]; ok {
+		cp := *info
+		return &cp, nil
+	}
+	return &network.VMNetInfo{
+		Namespace:  "ns-99",
+		TAPDevice:  network.TAPName,
+		VMIP:       network.VMInternalIP,
+		GatewayIP:  network.VMGatewayIP,
+		HostIP:     "10.11.0.99",
+		MACAddress: "02:FC:00:00:00:63",
+	}, nil
+}
+
+func (f *fakeNetMgr) SweepOrphanNamespaces(map[string]bool) int { return 0 }
+
+func (f *fakeNetMgr) UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []string) error {
+	f.firewallCalls = append(f.firewallCalls, struct {
+		vmID         string
+		allowedCIDRs []string
+		deniedCIDRs  []string
+	}{vmID: vmID, allowedCIDRs: append([]string(nil), allowedCIDRs...), deniedCIDRs: append([]string(nil), deniedCIDRs...)})
+	return nil
+}
+
+func (f *fakeNetMgr) TeardownVM(vmID string) {
+	if f.beforeRelease != nil {
+		f.beforeRelease("teardown", vmID, "")
+	}
+	f.teardownCalls = append(f.teardownCalls, vmID)
+}
+
+func (f *fakeNetMgr) UsesNetlinkSlotOps() bool { return f.netlinkSlotOps }
+
+func (f *fakeNetMgr) TeardownVMOrNamespace(vmID, fallbackNamespace string) {
+	if f.beforeRelease != nil {
+		f.beforeRelease("teardown_ns", vmID, fallbackNamespace)
+	}
+	f.teardownNSCalls = append(f.teardownNSCalls, struct {
+		vmID string
+		ns   string
+	}{vmID: vmID, ns: fallbackNamespace})
+}
+
 // TestPlanRestore pins the restore-decision behavior across the four input
 // shapes. Earlier code had two switches keying off different signals; a
 // stale combination could clobber the per-VM overlay.
 func TestPlanRestore(t *testing.T) {
 	tests := []struct {
-		name       string
-		basePath   string
-		deltaDir   string
-		inPlace    bool
-		wantAction restoreDiskAction
-		wantDelta  string
+		name        string
+		basePath    string
+		deltaDir    string
+		inPlace     bool
+		priorRunDir bool
+		wantAction  restoreDiskAction
+		wantDelta   string
 	}{
 		{
 			name:       "create-from-template: fresh overlay, hydrate from delta",
@@ -52,12 +182,21 @@ func TestPlanRestore(t *testing.T) {
 			wantDelta:  "",
 		},
 		{
-			name:       "in-place resume: reuse, force-empty delta even if caller passes one",
+			name:        "in-place resume: reuse, force-empty delta even if caller passes one",
+			basePath:    "/run/templates/t/b/base.ext4",
+			deltaDir:    "/snap/templates/t/b",
+			inPlace:     true,
+			priorRunDir: true,
+			wantAction:  restoreReuseOverlay,
+			wantDelta:   "",
+		},
+		{
+			name:       "in-place retry after a cleaned-up failure → build the overlay again",
 			basePath:   "/run/templates/t/b/base.ext4",
 			deltaDir:   "/snap/templates/t/b",
 			inPlace:    true,
-			wantAction: restoreReuseOverlay,
-			wantDelta:  "",
+			wantAction: restoreCreateOverlay,
+			wantDelta:  "/snap/templates/t/b",
 		},
 		{
 			name:       "legacy: no overlay fields → resolve disk the old way",
@@ -70,7 +209,7 @@ func TestPlanRestore(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := planRestore(tc.basePath, tc.deltaDir, tc.inPlace)
+			got := planRestore(tc.basePath, tc.deltaDir, false, tc.inPlace && tc.priorRunDir)
 			if got.action != tc.wantAction {
 				t.Errorf("action = %v, want %v", got.action, tc.wantAction)
 			}
@@ -128,7 +267,7 @@ func TestResolveRestoreDisk_NonTemplate_NoExistingRootfs_Errors(t *testing.T) {
 		BaseRootfsPath: "/should/not/be/used.ext4",
 	}}
 
-	_, err := mgr.resolveRestoreDisk(context.Background(), "vm-abc", "/snapshots/not-a-template/vmstate.snap")
+	_, _, err := mgr.resolveRestoreDisk(context.Background(), "vm-abc", "/snapshots/not-a-template/vmstate.snap")
 	if err == nil {
 		t.Fatalf("expected error for non-template snapshot with no per-VM rootfs; got nil")
 	}
@@ -150,12 +289,15 @@ func TestResolveRestoreDisk_SandboxResume_UsesExistingPerVMRootfs(t *testing.T) 
 	}
 
 	mgr := &Manager{cfg: ManagerConfig{RunDir: runDir}}
-	got, err := mgr.resolveRestoreDisk(context.Background(), vmID, "/snapshots/sb-1/snap-1/vmstate.snap")
+	got, rootfs, err := mgr.resolveRestoreDisk(context.Background(), vmID, "/snapshots/sb-1/snap-1/vmstate.snap")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got != existing {
 		t.Errorf("got %q, want %q", got, existing)
+	}
+	if rootfs != "" {
+		t.Errorf("sandbox resume inferred a template rootfs: %q", rootfs)
 	}
 }
 
@@ -176,6 +318,16 @@ func TestTemplateRootfsForSnapshot(t *testing.T) {
 			name:     "mem.snap also resolves to the same template",
 			snapPath: "/var/lib/sandbox/snapshots/templates/abcd-1234/mem.snap",
 			want:     "/var/lib/sandbox/rundir/templates/abcd-1234/rootfs.ext4",
+		},
+		{
+			name:     "build-specific snapshot retains build identity",
+			snapPath: "/var/lib/sandbox/snapshots/templates/abcd-1234/build-5678/vmstate.snap",
+			want:     "/var/lib/sandbox/rundir/templates/abcd-1234/build-5678/rootfs.ext4",
+		},
+		{
+			name:     "build-specific memory retains build identity",
+			snapPath: "/var/lib/sandbox/snapshots/templates/abcd-1234/build-5678/mem.snap",
+			want:     "/var/lib/sandbox/rundir/templates/abcd-1234/build-5678/rootfs.ext4",
 		},
 		{
 			name:     "non-template snapshot path is rejected (re-pause / sandbox snapshots)",
@@ -210,6 +362,314 @@ func TestTemplateRootfsForSnapshot(t *testing.T) {
 func TestTemplateDirNameIsFixed(t *testing.T) {
 	if templateDirName != "template" {
 		t.Errorf("templateDirName = %q, want %q", templateDirName, "template")
+	}
+}
+
+func TestReclaimPausedNetworkInventory_RecyclesOldestPausedInstance(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+	rec := VMRecord{
+		ID:         "vm-tracked",
+		Status:     StatusPaused,
+		Namespace:  "ns-17",
+		IP:         "10.11.0.17",
+		TAPDevice:  network.TAPName,
+		MACAddress: "02:FC:00:00:00:11",
+		PausedAt:   now.Add(-time.Hour),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	inst := toInstance(rec)
+	fake := &fakeNetMgr{
+		poolEnabled:  true,
+		poolFresh:    4,
+		poolRecycled: 2,
+		netnsTotal:   1,
+		ownedSlots:   network.MaxSlots - 1,
+	}
+	// A tracked instance still releases by namespace name: the by-vmID call
+	// no-ops for a VM missing from the net manager's device table, which would
+	// strand the kernel state after the record has already been cleared.
+	fake.beforeRelease = func(op, vmID, ns string) {
+		if op != "cleanup_ns" || vmID != rec.ID || ns != rec.Namespace {
+			t.Fatalf("unexpected release hook call: op=%q vmID=%q ns=%q", op, vmID, ns)
+		}
+		got, err := store.Get(rec.ID)
+		if err != nil {
+			t.Fatalf("get during release hook: %v", err)
+		}
+		if got.Namespace != "" || got.IP != "" || got.TAPDevice != "" || got.MACAddress != "" {
+			t.Fatalf("record not cleared before cleanup: %+v", got)
+		}
+	}
+	mgr := &Manager{
+		cfg: ManagerConfig{
+			PausedNetworkReclaimEnabled:         true,
+			PausedNetworkSlotHeadroomReserve:    10,
+			PausedNetworkSlotHeadroomHysteresis: 1,
+			PausedNetworkNetnsThreshold:         1_000_000,
+			PausedNetworkNetnsHysteresis:        1,
+			PausedNetworkMountThreshold:         1_000_000,
+			PausedNetworkMountHysteresis:        1,
+			PausedNetworkMaxReclaims:            1,
+		},
+		state:  store,
+		netMgr: fake,
+		vms:    map[string]*VMInstance{rec.ID: inst},
+		log:    zerolog.Nop(),
+	}
+
+	reclaimed := mgr.reclaimPausedNetworkInventory(now)
+	if reclaimed != 1 {
+		t.Fatalf("reclaimed = %d, want 1", reclaimed)
+	}
+	if got := fake.cleanupCalls; len(got) != 1 || got[0].vmID != rec.ID || got[0].ns != rec.Namespace {
+		t.Fatalf("cleanup calls = %+v, want one recycle for %q/%q", got, rec.ID, rec.Namespace)
+	}
+	if len(fake.teardownCalls) != 0 || len(fake.teardownNSCalls) != 0 {
+		t.Fatalf("teardown calls = %v/%v, want none", fake.teardownCalls, fake.teardownNSCalls)
+	}
+	if inst.Namespace != "" || inst.IP != "" || inst.TAPDevice != "" || inst.MACAddress != "" {
+		t.Fatalf("tracked instance still held network identity: %+v", inst)
+	}
+	got, err := store.Get(rec.ID)
+	if err != nil {
+		t.Fatalf("get cleared record: %v", err)
+	}
+	if got.Namespace != "" || got.IP != "" || got.TAPDevice != "" || got.MACAddress != "" {
+		t.Fatalf("stored record still held network identity: %+v", got)
+	}
+	if !got.PausedAt.Equal(rec.PausedAt) {
+		t.Fatalf("stored paused_at = %v, want %v", got.PausedAt, rec.PausedAt)
+	}
+}
+
+func TestReclaimPausedNetworkInventory_ShrinksKernelPressure(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{
+		ID:         "vm-shrink",
+		Status:     StatusPaused,
+		Namespace:  "ns-18",
+		IP:         "10.11.0.18",
+		TAPDevice:  network.TAPName,
+		MACAddress: "02:FC:00:00:00:12",
+		PausedAt:   time.Now().Add(-time.Minute),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	fake := &fakeNetMgr{
+		poolEnabled: true,
+		netnsTotal:  2,
+		ownedSlots:  network.MaxSlots - 1,
+	}
+	fake.beforeRelease = func(op, vmID, ns string) {
+		if op != "teardown_ns" || vmID != rec.ID || ns != rec.Namespace {
+			t.Fatalf("unexpected release hook call: op=%q vmID=%q ns=%q", op, vmID, ns)
+		}
+		got, err := store.Get(rec.ID)
+		if err != nil {
+			t.Fatalf("get during release hook: %v", err)
+		}
+		if got.Namespace != "" || got.IP != "" || got.TAPDevice != "" || got.MACAddress != "" {
+			t.Fatalf("record not cleared before teardown: %+v", got)
+		}
+	}
+	mgr := &Manager{
+		cfg: ManagerConfig{
+			PausedNetworkReclaimEnabled:         true,
+			PausedNetworkSlotHeadroomReserve:    10,
+			PausedNetworkSlotHeadroomHysteresis: 1,
+			PausedNetworkNetnsThreshold:         1,
+			PausedNetworkNetnsHysteresis:        0,
+			PausedNetworkMountThreshold:         1_000_000,
+			PausedNetworkMountHysteresis:        1,
+		},
+		state:  store,
+		netMgr: fake,
+		log:    zerolog.Nop(),
+	}
+
+	reclaimed := mgr.reclaimPausedNetworkInventory(time.Now())
+	if reclaimed != 1 {
+		t.Fatalf("reclaimed = %d, want 1", reclaimed)
+	}
+	if len(fake.cleanupVMCalls) != 0 {
+		t.Fatalf("cleanup calls = %v, want none in shrink mode", fake.cleanupVMCalls)
+	}
+	if len(fake.teardownNSCalls) != 1 || fake.teardownNSCalls[0].vmID != rec.ID || fake.teardownNSCalls[0].ns != rec.Namespace {
+		t.Fatalf("teardown-ns calls = %+v, want one full teardown for %q/%q", fake.teardownNSCalls, rec.ID, rec.Namespace)
+	}
+}
+
+func TestReclaimPausedNetworkInventory_HonorsMinWarmAgeAndCooldown(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	defer store.Close()
+
+	oldRec := VMRecord{ID: "vm-old", Status: StatusPaused, Namespace: "ns-19", PausedAt: time.Now().Add(-time.Hour)}
+	newRec := VMRecord{ID: "vm-new", Status: StatusPaused, Namespace: "ns-20", PausedAt: time.Now().Add(-time.Minute)}
+	for _, rec := range []VMRecord{oldRec, newRec} {
+		if err := store.Put(rec); err != nil {
+			t.Fatalf("put %s: %v", rec.ID, err)
+		}
+	}
+
+	fake := &fakeNetMgr{
+		poolEnabled: true,
+		netnsTotal:  1,
+		ownedSlots:  network.MaxSlots - 1,
+	}
+	mgr := &Manager{
+		cfg: ManagerConfig{
+			PausedNetworkReclaimEnabled:         true,
+			PausedNetworkSlotHeadroomReserve:    10,
+			PausedNetworkSlotHeadroomHysteresis: 1,
+			PausedNetworkNetnsThreshold:         1_000_000,
+			PausedNetworkNetnsHysteresis:        1,
+			PausedNetworkMountThreshold:         1_000_000,
+			PausedNetworkMountHysteresis:        1,
+			PausedNetworkMinWarmAge:             10 * time.Minute,
+			PausedNetworkMaxReclaims:            1,
+			PausedNetworkReclaimCooldown:        time.Hour,
+		},
+		state:  store,
+		netMgr: fake,
+		log:    zerolog.Nop(),
+	}
+	now := time.Now()
+	if reclaimed := mgr.reclaimPausedNetworkInventory(now); reclaimed != 1 {
+		t.Fatalf("first reclaim = %d, want 1", reclaimed)
+	}
+	if len(fake.cleanupCalls) != 1 || fake.cleanupCalls[0].vmID != oldRec.ID {
+		t.Fatalf("cleanup calls = %+v, want oldest record first", fake.cleanupCalls)
+	}
+	if reclaimed := mgr.reclaimPausedNetworkInventory(now); reclaimed != 0 {
+		t.Fatalf("second reclaim = %d, want 0 while cooldown active", reclaimed)
+	}
+}
+
+func TestPausedNetworkPressureSnapshot_CountsWarmPoolAsAvailableHeadroom(t *testing.T) {
+	mgr := &Manager{
+		netMgr: &fakeNetMgr{
+			ownedSlots:   network.MaxSlots - 12,
+			poolFresh:    3,
+			poolRecycled: 4,
+			poolEnabled:  true,
+		},
+	}
+
+	snapshot := mgr.pausedNetworkPressureSnapshot()
+	if snapshot.freeSlots != 12+3+4 {
+		t.Fatalf("freeSlots = %d, want %d", snapshot.freeSlots, 19)
+	}
+}
+
+func TestReleasePausedNetworkSlot_SkipsResurrectionWhenRecordDeleted(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{
+		ID:         "vm-deleted",
+		Status:     StatusPaused,
+		Namespace:  "ns-19",
+		IP:         "10.11.0.19",
+		TAPDevice:  network.TAPName,
+		MACAddress: "02:FC:00:00:00:13",
+		PausedAt:   time.Now().Add(-time.Minute),
+	}
+	if err := store.Put(rec); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := store.Delete(rec.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	fake := &fakeNetMgr{}
+	mgr := &Manager{
+		state:  store,
+		netMgr: fake,
+		log:    zerolog.Nop(),
+	}
+	released, err := mgr.releasePausedNetworkSlot(rec, false)
+	if err != nil {
+		t.Fatalf("releasePausedNetworkSlot: %v", err)
+	}
+	if released {
+		t.Fatal("releasePausedNetworkSlot reported success for a deleted record")
+	}
+	if len(fake.cleanupVMCalls) != 0 || len(fake.teardownCalls) != 0 {
+		t.Fatalf("network teardown should not run after record deletion: cleanup=%v teardown=%v", fake.cleanupVMCalls, fake.teardownCalls)
+	}
+	if got, gerr := store.Get(rec.ID); gerr != nil {
+		t.Fatalf("get after release: %v", gerr)
+	} else if got != nil {
+		t.Fatalf("record resurrected after delete: %+v", got)
+	}
+}
+
+func TestReclaimPausedNetworkInventory_ActiveControllerContinuesThroughBand(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open state: %v", err)
+	}
+	defer store.Close()
+
+	rec := VMRecord{ID: "vm-band", Status: StatusPaused, Namespace: "ns-band", PausedAt: time.Now().Add(-time.Hour)}
+	if err := store.Put(rec); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	fake := &fakeNetMgr{
+		poolEnabled: true,
+		netnsTotal:  1,
+		ownedSlots:  network.MaxSlots - 101,
+	}
+	mgr := &Manager{
+		cfg: ManagerConfig{
+			PausedNetworkReclaimEnabled:         true,
+			PausedNetworkSlotHeadroomReserve:    100,
+			PausedNetworkSlotHeadroomHysteresis: 10,
+			PausedNetworkNetnsThreshold:         1_000_000,
+			PausedNetworkNetnsHysteresis:        1,
+			PausedNetworkMountThreshold:         1_000_000,
+			PausedNetworkMountHysteresis:        1,
+			PausedNetworkMaxReclaims:            1,
+		},
+		state:                          store,
+		netMgr:                         fake,
+		log:                            zerolog.Nop(),
+		pausedNetworkControllerActive:  true,
+		pausedNetworkControllerLastRun: time.Now().Add(-time.Hour),
+	}
+
+	if reclaimed := mgr.reclaimPausedNetworkInventory(time.Now()); reclaimed != 1 {
+		t.Fatalf("reclaimed = %d, want 1 while active controller is still recovering", reclaimed)
+	}
+	got, err := store.Get(rec.ID)
+	if err != nil {
+		t.Fatalf("get cleared record: %v", err)
+	}
+	if got.Namespace != "" {
+		t.Fatalf("record not cleared during active-band reclaim: %+v", got)
 	}
 }
 
@@ -940,7 +1400,7 @@ func TestPauseVM_AlreadyPaused_ReturnsRecordedSnapshot(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
 
-	snap, mem, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	snap, mem, _, err := mgr.PauseVM(context.Background(), "vm-1", "", "tok-test")
 	if err != nil {
 		t.Fatalf("retried pause of a paused VM should succeed, got %v", err)
 	}
@@ -959,16 +1419,16 @@ func TestPauseVM_AlreadyPausedButArtifactsMissing_Fails(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
 
-	_, _, _, err := mgr.PauseVM(context.Background(), "vm-1", "")
+	_, _, _, err := mgr.PauseVM(context.Background(), "vm-1", "", "tok-test")
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for dangling artifacts, got %v", err)
 	}
 }
 
 func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	gated := false
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error { gated = true; return nil }
@@ -1015,9 +1475,9 @@ func TestRestoreVMSnapshot_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 // meant "no verdict" the record would never flip and every retry would repeat
 // the same wait — the sandbox stuck until the orphan reaper hours later.
 func TestRestoreVMSnapshot_AdoptionWaitCanceled_StillReachesVerdict(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	ctx, cancel := context.WithCancel(context.Background())
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(c context.Context, _ *Manager, _ string) error {
@@ -1069,9 +1529,9 @@ func TestRestoreVMSnapshot_AdoptionWaitCanceled_StillReachesVerdict(t *testing.T
 // A destroy landing inside the adoption readiness wait must not be reported
 // as a successful restore.
 func TestRestoreVMSnapshot_DestroyedDuringAdoptionWait_Fails(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(_ context.Context, m *Manager, _ string) error {
 		m.mu.Lock()
@@ -1107,9 +1567,9 @@ func TestRestoreVMSnapshot_DestroyedDuringAdoptionWait_Fails(t *testing.T) {
 // The crash-window guard: a reattached Running record whose restore was
 // interrupted before readiness must not be adopted as a successful create.
 func TestRestoreVMSnapshot_AdoptedButBoxdNeverReady_Fails(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error {
 		return errors.New("boxd never became ready")
@@ -1177,9 +1637,9 @@ func TestRestoreVMSnapshot_DifferentArtifacts_NotTreatedAsRetry(t *testing.T) {
 }
 
 func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 
 	existing := &VMInstance{
 		ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5",
@@ -1188,7 +1648,7 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "")
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	if err != nil {
 		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
 	}
@@ -1201,9 +1661,9 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 // verdict comes back negative the record is a corpse, so it must not be
 // adopted — the resume falls through to a fresh launch instead.
 func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error {
 		return errors.New("boxd never became ready") // a genuine corpse verdict
@@ -1219,9 +1679,90 @@ func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
 
 	// The fallthrough fails on the missing snapshot files — the assertion is
 	// only that the corpse was not returned as a healthy VM.
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "")
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	if err == nil && inst == existing {
 		t.Fatal("an unverified record that fails verification must not be adopted")
+	}
+}
+
+func TestResumeVM_RebuildsNetworkSlotWhenNamespaceMissingAndCleansUpOnLaunchFailure(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	if err := os.WriteFile(snapPath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	if err := os.WriteFile(memPath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write mem: %v", err)
+	}
+
+	fake := &fakeNetMgr{
+		setupInfo: map[string]*network.VMNetInfo{
+			"vm-1": {
+				Namespace:  "ns-99",
+				TAPDevice:  network.TAPName,
+				VMIP:       network.VMInternalIP,
+				GatewayIP:  network.VMGatewayIP,
+				HostIP:     "10.11.0.99",
+				MACAddress: "02:FC:00:00:00:63",
+			},
+		},
+	}
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		SnapshotPath: snapPath,
+		MemFilePath:  memPath,
+		DiskPath:     filepath.Join(dir, "rootfs.ext4"),
+	}
+	mgr := &Manager{
+		log:    zerolog.Nop(),
+		cfg:    ManagerConfig{RunDir: dir},
+		netMgr: fake,
+		vms:    map[string]*VMInstance{"vm-1": inst},
+	}
+	resumeRules := &sandboxNetworkRules{
+		allowedCIDRs:   []string{"10.0.0.0/8"},
+		deniedCIDRs:    []string{"198.51.100.0/24"},
+		allowedDomains: []string{"example.com"},
+	}
+	mgr.launchFirecrackerHook = func(_ context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (int, Supervision, error) {
+		if vmID != "vm-1" {
+			t.Fatalf("vmID = %q, want vm-1", vmID)
+		}
+		if netNS != "ns-99" {
+			t.Fatalf("netNS = %q, want ns-99", netNS)
+		}
+		if len(fake.firewallCalls) != 1 {
+			t.Fatalf("firewall calls = %+v, want one pre-launch apply", fake.firewallCalls)
+		}
+		got := fake.firewallCalls[0]
+		if got.vmID != "vm-1" || !slices.Equal(got.allowedCIDRs, resumeRules.allowedCIDRs) || !slices.Equal(got.deniedCIDRs, resumeRules.deniedCIDRs) {
+			t.Fatalf("firewall call = %+v, want vm-1 with resume rules", got)
+		}
+		if existing != SupervisionUnit || !hadPriorLife || freshUnit {
+			t.Fatalf("unexpected launch args: existing=%q hadPriorLife=%v freshUnit=%v", existing, hadPriorLife, freshUnit)
+		}
+		if socketPath == "" || perVMRootfs == "" || basePath != "" {
+			t.Fatalf("unexpected launch paths: socket=%q rootfs=%q base=%q", socketPath, perVMRootfs, basePath)
+		}
+		return 0, SupervisionUnit, errors.New("launch failed")
+	}
+
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatalf("lock op: %v", err)
+	}
+	defer unlock()
+
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", resumeRules); err == nil {
+		t.Fatal("expected launch failure")
+	}
+	if got := fake.setupCalls; len(got) != 1 || got[0] != "vm-1" {
+		t.Fatalf("setup calls = %v, want [vm-1]", got)
+	}
+	if got := fake.teardownCalls; len(got) != 1 || got[0] != "vm-1" {
+		t.Fatalf("teardown calls = %v, want [vm-1]", got)
 	}
 }
 
@@ -1277,9 +1818,9 @@ func TestRestoreVMSnapshot_RunningRecordButUnitDead_NotReturned(t *testing.T) {
 	// A record can read Running while the firecracker process is gone. The
 	// retry guard must not hand back that corpse — it must fall through to
 	// a fresh restore.
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return true } // unit definitively dead
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return true } // unit definitively dead
+	defer func() { vmDeadForRetry = orig }()
 
 	dir := t.TempDir()
 	snapPath := filepath.Join(dir, "vmstate.snap")
@@ -1324,9 +1865,9 @@ func TestInstanceRunning(t *testing.T) {
 // durable flag must also stay off the wire for verified records so rollback
 // binaries read them unchanged.
 func TestRetriedLaunchTargetFlagsUnverifiedRecord(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 
 	existing := &VMInstance{
 		ID: "vm-1", Status: StatusRunning, Unverified: true, IP: "192.0.2.5",
@@ -1371,9 +1912,9 @@ func TestRetriedLaunchTargetFlagsUnverifiedRecord(t *testing.T) {
 // restart a duplicate delivery adopts the live VM instead of refusing the
 // record and relaunching it (which rolls the guest back to its snapshot).
 func TestRestoreVMSnapshot_VerifiedRecordAfterRestart_Adopted(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
 	defer func() { adoptionBoxdReady = origReady }()
@@ -1436,9 +1977,9 @@ func TestRestoreVMSnapshot_VerifiedRecordAfterRestart_Adopted(t *testing.T) {
 // re-verify and adopt it — and heal the marker — rather than relaunching it
 // and rolling the guest back.
 func TestRestoreVMSnapshot_UnverifiedRecordAfterRestart_ReverifiedAndAdopted(t *testing.T) {
-	orig := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = orig }()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = orig }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil } // boxd healthy
 	defer func() { adoptionBoxdReady = origReady }()
@@ -1533,7 +2074,7 @@ func TestVerifyBoxdReadyDetachedFromCaller(t *testing.T) {
 	defer func() { adoptionBoxdReady = orig }()
 
 	m := &Manager{log: zerolog.Nop()}
-	if err := m.verifyBoxdReady(callerCtx, "192.0.2.5"); err != nil {
+	if err := m.verifyBoxdReady(callerCtx, "192.0.2.5", &VMInstance{}); err != nil {
 		t.Fatalf("healthy gate must pass, got %v", err)
 	}
 	if gateCtxDone {
@@ -1546,9 +2087,9 @@ func TestVerifyBoxdReadyDetachedFromCaller(t *testing.T) {
 // marker (swallowed clear, crash before the verified persist) would make that
 // rollback happen to a healthy VM. Success must also heal the marker durably.
 func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive
-	defer func() { vmUnitDead = origDead }()
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive
+	defer func() { vmDeadForRetry = origDead }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error { return nil }
 	defer func() { adoptionBoxdReady = origReady }()
@@ -1569,7 +2110,7 @@ func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "")
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	if err != nil {
 		t.Fatalf("verified adoption must succeed, got %v", err)
 	}
@@ -1585,6 +2126,88 @@ func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
 	}
 	if rec.Unverified {
 		t.Fatal("adoption must clear the marker durably")
+	}
+}
+
+// When a paused record has had its network identity cleared, the unverified
+// resume path must verify the replacement slot's IP, not the empty pre-release
+// address. Otherwise a healthy relaunch gets stopped as "unready" and marked
+// failed.
+func TestResumeVM_UnverifiedRelaunchVerifiesReplacementIP(t *testing.T) {
+	var verifiedIP string
+	origReady := adoptionBoxdReady
+	defer func() { adoptionBoxdReady = origReady }()
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	rootfsPath := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snapPath, memPath, rootfsPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fake := &fakeNetMgr{
+		setupInfo: map[string]*network.VMNetInfo{
+			"vm-1": {
+				Namespace:  "ns-99",
+				TAPDevice:  network.TAPName,
+				VMIP:       network.VMInternalIP,
+				GatewayIP:  network.VMGatewayIP,
+				HostIP:     "10.11.0.99",
+				MACAddress: "02:FC:00:00:00:63",
+			},
+		},
+	}
+	inst := &VMInstance{
+		ID:           "vm-1",
+		Status:       StatusPaused,
+		Unverified:   true,
+		SnapshotPath: snapPath,
+		MemFilePath:  memPath,
+		DiskPath:     rootfsPath,
+	}
+	mgr := &Manager{
+		log:    zerolog.Nop(),
+		cfg:    ManagerConfig{RunDir: dir},
+		netMgr: fake,
+		vms:    map[string]*VMInstance{"vm-1": inst},
+	}
+	mgr.launchFirecrackerHook = func(_ context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (int, Supervision, error) {
+		if vmID != "vm-1" {
+			t.Fatalf("vmID = %q, want vm-1", vmID)
+		}
+		if netNS != "ns-99" {
+			t.Fatalf("netNS = %q, want ns-99", netNS)
+		}
+		if perVMRootfs != rootfsPath || basePath != "" || socketPath == "" {
+			t.Fatalf("unexpected launch paths: socket=%q rootfs=%q base=%q", socketPath, perVMRootfs, basePath)
+		}
+		if existing != SupervisionUnit || !hadPriorLife || freshUnit {
+			t.Fatalf("unexpected launch args: existing=%q hadPriorLife=%v freshUnit=%v", existing, hadPriorLife, freshUnit)
+		}
+		return 4321, SupervisionUnit, nil
+	}
+	mgr.restoreForResumeHook = func(_ string, _ string, _ string, _ string, _ *network.VMNetInfo) (bool, string, error) {
+		return true, "", nil
+	}
+	adoptionBoxdReady = func(_ context.Context, _ *Manager, ip string) error {
+		verifiedIP = ip
+		return nil
+	}
+
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatalf("lock op: %v", err)
+	}
+	defer unlock()
+
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err != nil {
+		t.Fatalf("resumeVMLocked: %v", err)
+	}
+	if verifiedIP != "10.11.0.99" {
+		t.Fatalf("verified IP = %q, want replacement host IP", verifiedIP)
 	}
 }
 
@@ -1771,7 +2394,7 @@ func TestVerifyBoxdReadyReachesVerdictUnderShorterCallerDeadline(t *testing.T) {
 	defer cancel()
 
 	m := &Manager{log: zerolog.Nop()}
-	err := m.verifyBoxdReady(callerCtx, "192.0.2.5")
+	err := m.verifyBoxdReady(callerCtx, "192.0.2.5", &VMInstance{})
 	if err == nil {
 		t.Fatal("a silent guest must produce a verdict, not be swallowed")
 	}
@@ -1785,9 +2408,9 @@ func TestVerifyBoxdReadyReachesVerdictUnderShorterCallerDeadline(t *testing.T) {
 // touching status. The corpse verdict must therefore be recorded first, or the
 // crash-window record keeps advertising Running for a VM that never came back.
 func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive → adoption considered
-	defer func() { vmUnitDead = origDead }()
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive → adoption considered
+	defer func() { vmDeadForRetry = origDead }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error {
 		return errors.New("boxd silent for the whole budget")
@@ -1812,7 +2435,7 @@ func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
 	}
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
 
-	if _, err := m.resumeVMLocked(context.Background(), "vm-1", "", ""); err == nil {
+	if _, _, err := m.resumeVMLocked(context.Background(), "vm-1", "", "", nil); err == nil {
 		t.Fatal("a relaunch with missing artifacts must fail")
 	}
 	existing.mu.RLock()
@@ -1855,6 +2478,84 @@ func TestToRecordIgnoresDirtyTracked(t *testing.T) {
 	}
 }
 
+// The dirty-tracking session id IS persisted (unlike DirtyTracked): the
+// pause-time token check makes a stale value safe, and reattach uses it to
+// keep a post-restart pause incremental — but only for RUNNING records, and
+// only when a session was actually armed.
+func TestDirtyTrackingSessionRoundTripAndRearm(t *testing.T) {
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTrackingSessionID: "abc123"}
+	rec := toRecord(inst)
+	if rec.DirtyTrackingSessionID != "abc123" {
+		t.Fatalf("session id not persisted: %+v", rec)
+	}
+	back := toInstance(rec)
+	if back.DirtyTrackingSessionID != "abc123" {
+		t.Fatalf("session id lost on fromRecord: %+v", back)
+	}
+	if !back.DirtyTracked {
+		t.Fatal("running record with a session must re-arm DirtyTracked optimistically")
+	}
+	// No session → no optimistic re-arm (flag off / pre-flag records).
+	rec.DirtyTrackingSessionID = ""
+	if toInstance(rec).DirtyTracked {
+		t.Fatal("running record without a session must not re-arm")
+	}
+	// Paused records never re-arm: the FC run the session named is gone.
+	rec.DirtyTrackingSessionID = "abc123"
+	rec.Status = StatusPaused
+	if toInstance(rec).DirtyTracked {
+		t.Fatal("paused record must not re-arm DirtyTracked")
+	}
+}
+
+// The session flag is the feature's circuit breaker, so it must also govern
+// the optimistic re-arm on reattach: toInstance re-arms from the record alone
+// (it is pure), and a host restarted with the flag OFF must not keep sending
+// guarded pauses — against a rolled-back Firecracker the unknown field would
+// fail the pause outright instead of degrading to Full.
+func TestReattachRecord_SessionRearmHonorsFeatureGate(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive: not stale
+	defer func() { vmUnitFullyDown = origDown }()
+
+	reattach := func(t *testing.T, flagOn bool) *VMInstance {
+		t.Helper()
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		rec := VMRecord{
+			ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit,
+			DirtyTrackingSessionID: "session-a",
+		}
+		if err := store.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+			vms: map[string]*VMInstance{},
+			cfg: ManagerConfig{DirtyTrackingSessionEnabled: flagOn},
+		}
+		inst, ok := m.reattachRecord(context.Background(), rec, true)
+		if inst == nil || !ok {
+			t.Fatalf("a live unit must be adopted, got inst=%+v ok=%v", inst, ok)
+		}
+		return inst
+	}
+
+	on := reattach(t, true)
+	if !on.DirtyTracked || on.DirtyTrackingSessionID != "session-a" {
+		t.Fatalf("flag on: the persisted session must re-arm tracking, got tracked=%v id=%q",
+			on.DirtyTracked, on.DirtyTrackingSessionID)
+	}
+	off := reattach(t, false)
+	if off.DirtyTracked || off.DirtyTrackingSessionID != "" {
+		t.Fatalf("flag off: the persisted session must be ignored, got tracked=%v id=%q",
+			off.DirtyTracked, off.DirtyTrackingSessionID)
+	}
+}
+
 // The ad-hoc snapshot path must not write the record at all: it holds no
 // vm-op lock, so any write races whatever lifecycle op is in flight.
 func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
@@ -1880,9 +2581,9 @@ func TestCreateVMSnapshotDoesNotPersist(t *testing.T) {
 // on a precondition and return, so an unrecorded verdict would leave the record
 // still claiming Running. A failed write must refuse the relaunch outright.
 func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
-	origDead := vmUnitDead
-	vmUnitDead = func(string) bool { return false } // unit alive → adoption considered
-	defer func() { vmUnitDead = origDead }()
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false } // unit alive → adoption considered
+	defer func() { vmDeadForRetry = origDead }()
 	origReady := adoptionBoxdReady
 	adoptionBoxdReady = func(context.Context, *Manager, string) error {
 		return errors.New("boxd silent for the whole budget")
@@ -1903,7 +2604,7 @@ func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
 	store.Close() // every later write fails — the store is broken
 
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
-	_, err = m.resumeVMLocked(context.Background(), "vm-1", "", "")
+	_, _, err = m.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
 	if err == nil {
 		t.Fatal("an unrecordable verdict must fail the resume")
 	}
@@ -1947,7 +2648,7 @@ func TestCommitResumeState_DestroyInProgress_NotReportedSuccessful(t *testing.T)
 func TestPauseVM_ErrorInstance_FailsFast(t *testing.T) {
 	inst := &VMInstance{ID: "vm-1", Status: StatusError}
 	m := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": inst}}
-	_, _, _, err := m.PauseVM(context.Background(), "vm-1", "")
+	_, _, _, err := m.PauseVM(context.Background(), "vm-1", "", "tok-test")
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for an error-state VM, got %v", err)
 	}
@@ -2119,6 +2820,79 @@ func TestReattachRecord_ErrorPersistFails_StillRefusedInMemory(t *testing.T) {
 // A socket-missing record whose unit stop cannot be confirmed must keep its
 // BoltDB record: deleting it would leave a live Firecracker no record points
 // to, invisible to the next reattach.
+// A record with an unknown supervision mode must be PARKED at reattach, not
+// released: the stale-cleanup's unit probe answers vacuously "down" for a
+// nonexistent unit, and acting on that evidence would delete the record and
+// free the network under whatever the unknown mode left running.
+func TestReattachRecord_UnknownSupervision_ParksUnmanageable(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return true } // the vacuous answer
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: Supervision("checkpointed"), Namespace: "ns-1"}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok || inst.Status != StatusError {
+		t.Fatalf("an unknown mode must park as Error, got inst=%+v ok=%v", inst, ok)
+	}
+	kept, err := store.Get("vm-1")
+	if err != nil || kept == nil {
+		t.Fatalf("the record must be kept, got rec=%v err=%v", kept, err)
+	}
+	if kept.Supervision != Supervision("checkpointed") {
+		t.Fatalf("the unknown value must be preserved for the binary that understands it, got %q", kept.Supervision)
+	}
+	if kept.Status != StatusError {
+		t.Fatalf("the refusal must be durable, got %s", kept.Status)
+	}
+}
+
+// A failed restore whose direct-spawned FC survived (populated group, or a
+// kill whose completion cannot be proven) still holds its tap and disk: the
+// failure path must NOT free the network slot or rundir — ownership stays
+// with the record until the reconciler confirms death. Only a confirmed-dead
+// or unit-mode VM releases.
+func TestReleaseFailedRestore_LiveCgroupRetainsOwnership(t *testing.T) {
+	newMgr := func(events string) *Manager {
+		vms := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(vms, "vm-1", "cgroup.events"), []byte(events), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}, cgroups: &cgroupTree{vms: vms}}
+	}
+	release := func(m *Manager) bool {
+		cleaned := false
+		m.releaseFailedRestore("vm-1", false, false, func() { cleaned = true })
+		return cleaned
+	}
+
+	if release(newMgr("populated 1\n")) {
+		t.Fatal("a live cgroup FC still holds its disk — the rundir must not be freed")
+	}
+	if release(newMgr("frozen 0\n")) { // malformed events: death unprovable
+		t.Fatal("an unprovable kill must retain ownership, not free the rundir")
+	}
+	if !release(newMgr("populated 0\n")) {
+		t.Fatal("a confirmed-dead VM must release its rundir")
+	}
+	unitMode := &Manager{log: zerolog.Nop(), netMgr: &network.Manager{}}
+	if !release(unitMode) {
+		t.Fatal("a plain unit VM must not be blocked by the cgroup guard")
+	}
+}
+
 func TestReattachRecord_SocketMissingStopUnconfirmed_KeepsRecord(t *testing.T) {
 	origDown := vmUnitFullyDown
 	vmUnitFullyDown = func(string) bool { return false } // unit alive (not terminal)
@@ -2206,7 +2980,7 @@ func TestPauseVM_RetryRepersistsPausedState(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir); err == nil {
+	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", dir, "tok-test"); err == nil {
 		t.Fatal("a retry that cannot record the paused state must not report success")
 	}
 
@@ -2217,7 +2991,7 @@ func TestPauseVM_RetryRepersistsPausedState(t *testing.T) {
 	}
 	defer reopened.Close()
 	m.state = reopened
-	gotSnap, gotMem, _, err := m.PauseVM(context.Background(), "vm-1", dir)
+	gotSnap, gotMem, _, err := m.PauseVM(context.Background(), "vm-1", dir, "tok-test")
 	if err != nil {
 		t.Fatalf("retry must succeed once the store recovers: %v", err)
 	}
@@ -2258,5 +3032,220 @@ func TestCommitResumeState_UndurableRunning_FailsResume(t *testing.T) {
 	}
 	if dirty {
 		t.Fatal("DirtyTracked must clear with the unit stopped")
+	}
+}
+
+// A failed record lookup for a cgroup survivor skips the kill but leaves the
+// VM in no protected set, so it must also disable the startup orphan sweep —
+// otherwise the sweep could reclaim a live FC's namespace.
+func TestReapRecordlessCgroupVMsUnreadableRecordDisablesSweep(t *testing.T) {
+	vms := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close() // every read now errors — the unreadable-record case
+	m := &Manager{log: zerolog.Nop(), cgroups: &cgroupTree{vms: vms}, state: store}
+	if _, sweepSafe := m.ReapRecordlessCgroupVMs(t.Context()); sweepSafe {
+		t.Fatal("unreadable record for a cgroup survivor must disable the sweep")
+	}
+}
+
+// The reattach half of the demotion handshake: the rollback demotion can
+// rewrite the durable supervision while a lock-free reattach holds a stale
+// record; the paused publish must adopt the fresh durable mode, or the next
+// resume acts on the stale one and re-promotes a demoted record.
+func TestReattachRecord_PausedAdoptsDemotedSupervision(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// The store already holds the DEMOTED record (unit)...
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionUnit}); err != nil {
+		t.Fatal(err)
+	}
+	// ...while this reattach still carries the pre-demotion snapshot (cgroup).
+	stale := VMRecord{ID: "vm-1", Status: StatusPaused, Supervision: SupervisionCgroup}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), stale, true)
+	if inst == nil || !ok {
+		t.Fatalf("paused reattach must publish, got inst=%v ok=%v", inst, ok)
+	}
+	inst.mu.RLock()
+	got := inst.Supervision
+	inst.mu.RUnlock()
+	if got != SupervisionUnit {
+		t.Fatalf("published instance must adopt the demoted durable mode, got %q", got)
+	}
+}
+
+// When a failed restore retains a possibly-live VM's resources, the parked
+// state must be explicit and durable: the record itself says what is held
+// and that the reconciler owns the teardown — and a successful relaunch
+// retires the claim.
+func TestReleaseFailedRestore_ParksExplicitDurableMarker(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	vms := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(vms, "vm-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vms, "vm-1", "cgroup.events"), []byte("populated 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1", Status: StatusError, Supervision: SupervisionCgroup}
+	if err := store.Put(toRecord(inst)); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: vms}, vms: map[string]*VMInstance{"vm-1": inst}}
+
+	m.releaseFailedRestore("vm-1", false, false, func() { t.Fatal("must not clean the rundir of a possibly-live VM") })
+
+	inst.mu.RLock()
+	marker := inst.TeardownPending
+	inst.mu.RUnlock()
+	if marker == "" {
+		t.Fatal("a retained release must stamp the explicit teardown marker")
+	}
+	rec, gerr := store.Get("vm-1")
+	if gerr != nil || rec == nil || rec.TeardownPending == "" {
+		t.Fatalf("the marker must be durable, got rec=%+v err=%v", rec, gerr)
+	}
+
+	// A successful relaunch retires the claim durably.
+	inst.mu.Lock()
+	inst.Status = StatusRunning
+	inst.mu.Unlock()
+	if err := m.commitResumeState(inst); err != nil {
+		t.Fatalf("commitResumeState: %v", err)
+	}
+	rec, gerr = store.Get("vm-1")
+	if gerr != nil || rec == nil {
+		t.Fatal(gerr)
+	}
+	if rec.TeardownPending != "" {
+		t.Fatal("a successful relaunch must retire the parked-teardown claim")
+	}
+}
+
+// The scope-gone fallback's crash window leaves a cgroup RECORD over a live
+// firecracker@ UNIT. Every record-keyed release must require BOTH supervisors
+// down — the cgroup oracle alone reads that state as dead and would free the
+// tap under the running unit.
+func TestDestroyVM_CgroupRecordOverFallbackUnit_RefusesUntilUnitDown(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put(VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, Namespace: "ns-1"}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{
+		log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, // no group: the cgroup side reads dead
+		vms:     map[string]*VMInstance{},
+		cfg:     ManagerConfig{RunDir: t.TempDir()},
+	}
+
+	shimSystemctlActive(t) // the fallback unit is alive
+	err = m.DestroyVM(context.Background(), "vm-1", false)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("destroy over a live fallback unit must refuse Unavailable, got %v", err)
+	}
+	if rec, gerr := store.Get("vm-1"); gerr != nil || rec == nil {
+		t.Fatal("the record must survive the refusal")
+	}
+
+	shimSystemctlDown(t) // unit finally terminal
+	if err := m.DestroyVM(context.Background(), "vm-1", false); err != nil {
+		t.Fatalf("destroy must complete once both supervisors are down, got %v", err)
+	}
+	if rec, _ := store.Get("vm-1"); rec != nil {
+		t.Fatal("the record must be released after a confirmed destroy")
+	}
+}
+
+// The reattach stale-sweep's release proof must also see the fallback unit.
+func TestReattachRecord_CgroupRecordOverFallbackUnit_NotReleased(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // fallback unit alive
+	defer func() { vmUnitFullyDown = origDown }()
+
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "fc.sock")
+	if err := os.WriteFile(sock, []byte(""), 0o644); err != nil { // socket present
+		t.Fatal(err)
+	}
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, SocketPath: sock}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, vms: map[string]*VMInstance{}}
+
+	inst, ok := m.reattachRecord(context.Background(), rec, true)
+	if inst == nil || !ok {
+		t.Fatalf("the record must be kept and published, got inst=%v ok=%v", inst, ok)
+	}
+	if kept, gerr := store.Get("vm-1"); gerr != nil || kept == nil {
+		t.Fatal("a cgroup record over a live fallback unit must never be released")
+	}
+
+	vmUnitFullyDown = func(string) bool { return true } // both down now
+	m2 := &Manager{log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+		cgroups: &cgroupTree{vms: t.TempDir()}, vms: map[string]*VMInstance{}}
+	if _, ok := m2.reattachRecord(context.Background(), rec, true); ok {
+		t.Fatal("with both supervisors down the stale record must be released")
+	}
+	if kept, _ := store.Get("vm-1"); kept != nil {
+		t.Fatal("release must delete the record")
+	}
+}
+
+func TestRestoreVMSnapshot_FailedAttemptWithoutRunDir_StartsOver(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first attempt failed after cleanup removed its rundir; the same-ID
+	// retry must not be treated as an in-place restart of it. A missing base
+	// stops the fresh path at the overlay step, which is all this needs.
+	basePath := filepath.Join(dir, "missing-base.ext4")
+	failed := &VMInstance{ID: "vm-1", Status: StatusError, SnapshotPath: snapPath, MemFilePath: memPath}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		cfg:        ManagerConfig{RunDir: filepath.Join(dir, "rundir")},
+		vms:        map[string]*VMInstance{"vm-1": failed},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	_, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath, DeltaDir: dir}, nil, "team", "owner", "", nil, 0)
+	if err == nil || !strings.Contains(err.Error(), "stat base") {
+		t.Fatalf("retry after a cleaned-up failure must start over from the base, got %v", err)
+	}
+	mgr.mu.RLock()
+	cur := mgr.vms["vm-1"]
+	mgr.mu.RUnlock()
+	if cur == failed {
+		t.Fatal("the failed instance must be dropped before the retry")
 	}
 }

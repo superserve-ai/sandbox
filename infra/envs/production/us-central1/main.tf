@@ -109,6 +109,14 @@ module "iam" {
         "serviceAccount:${local.api_service_account_email}"
       ]
     }
+    cd_privateca_auditor = {
+      role    = "roles/privateca.auditor"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    cd_role_admin = {
+      role    = "roles/iam.roleAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
     grafana_monitoring_viewer = {
       role = "roles/monitoring.viewer"
       members = [
@@ -131,6 +139,12 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
     "slack-quota-alert-webhook",
     coalesce(var.sentry_dsn_secret_name, "sentry-dsn"),
     coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
+    "stripe-secret-key-use",
+    "stripe-webhook-secret-use",
+    "stripe-meter-error-webhook-secret-use",
+    "stripe-secret-key-usw",
+    "stripe-webhook-secret-usw",
+    "stripe-meter-error-webhook-secret-usw",
   ])
 
   project   = local.project_id
@@ -140,9 +154,8 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
 }
 
 # The api-runner SA's encrypt/decrypt grant on the credentials-kek KMS key is
-# managed out-of-band: the CD Terraform SA lacks KMS setIamPolicy on the key,
-# and the SA is shared across cells, so this follows the same out-of-band
-# pattern as the shared runtime secrets.
+# retained out-of-band for the legacy shared host identity. Regional roots own
+# the dedicated control-plane grants; do not adopt the legacy host grant here.
 
 
 # Production monitoring dashboards. These are fleet-wide (whole-fleet
@@ -153,6 +166,8 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
 # per-host CPU alert that used to live here was removed with the host it watched.
 module "observability" {
   source = "../../../modules/observability"
+
+  runbook_urls = module.alert_runbooks.urls
 
   project_id               = local.project_id
   environment              = local.environment

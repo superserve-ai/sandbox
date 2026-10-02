@@ -41,6 +41,12 @@ service VMDaemon {
   // may resume.
   rpc DeleteSandboxSnapshots(DeleteSandboxSnapshotsRequest) returns (DeleteSandboxSnapshotsResponse);
 
+  // Saved snapshots: customer captures a new sandbox can be created from.
+  // Idempotent on snapshot_id; the caller syncs the guest before capturing a
+  // running source.
+  rpc CreateSavedSnapshot(CreateSavedSnapshotRequest) returns (CreateSavedSnapshotResponse);
+  rpc DeleteSavedSnapshot(DeleteSavedSnapshotRequest) returns (DeleteSavedSnapshotResponse);
+
   // DeleteTemplateArtifacts removes a template's on-disk snapshot dir and
   // rootfs. Idempotent.
   rpc DeleteTemplateArtifacts(DeleteTemplateArtifactsRequest) returns (DeleteTemplateArtifactsResponse);
@@ -65,6 +71,12 @@ service VMDaemon {
 
   // SetupNetwork configures networking for a VM (TAP device, NAT, IP allocation).
   rpc SetupNetwork(SetupNetworkRequest) returns (SetupNetworkResponse);
+
+  // ReviveVM cold-boots a sandbox whose VM died, from a salvaged copy of
+  // its own disk. Operator recovery surface: the salvaged image already
+  // carries the sandbox's identity, so nothing is re-injected, and any
+  // residue of the dead VM is force-torn-down first.
+  rpc ReviveVM(ReviveVMRequest) returns (ReviveVMResponse);
 
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
@@ -187,6 +199,12 @@ message GetBuildStatusResponse {
   // Supervisors treat "unknown on this host" as a hard failure since vmd
   // doesn't survive across restarts for in-memory registry.
   bool not_found = 10;
+
+  // Host-side physical allocation for the reported template artifacts.
+  int64 rootfs_allocated_bytes = 13;
+  int64 base_allocated_bytes = 14;
+  int64 delta_allocated_bytes = 15;
+  bool allocated_bytes_supported = 16;
 }
 
 message CancelBuildRequest {
@@ -210,6 +228,7 @@ message BuildLogEvent {
   // should close its SSE connection after receiving a finished event.
   bool finished = 5;
   string status = 6; // "ready" | "failed" | "cancelled", set when finished.
+  uint64 sequence = 7; // Append order within one build VM's log buffer.
 }
 
 // ---------------------------------------------------------------------------
@@ -264,9 +283,74 @@ message DestroyVMResponse {
 // PauseVM (sleep — snapshot then stop)
 // ---------------------------------------------------------------------------
 
+message ReviveVMRequest {
+  string vm_id = 1;
+  // Absolute path on the host to the salvaged disk image. Copied, never
+  // mounted in place: a failed boot leaves the salvage pristine.
+  string disk_path = 2;
+  uint32 vcpu = 3;
+  uint32 mem_mib = 4;
+  // Egress policy, applied before revival reports success: a sandbox
+  // with allow or deny rules must not come back running open. Same
+  // ownership as ResumeVM's rules: the control plane knows them, the
+  // host does not.
+  // Base image for overlay-mode salvages: the sparse overlay's holes
+  // are windows to this shared read-only base, and booting the overlay
+  // standalone would corrupt the guest. Empty defaults to the zombie's
+  // recorded base; explicitly empty with no record boots standalone.
+  string base_path = 8;
+  repeated string allowed_cidrs = 5;
+  repeated string denied_cidrs = 6;
+  repeated string allowed_domains = 7;
+  // Sandbox configuration to re-inject after the guest is ready: a cold
+  // boot starts boxd with an empty context, and unlike snapshot resume
+  // no in-memory init state survives, so env and secret bindings must
+  // be delivered again. Same semantics as InjectSandboxEnv; when both
+  // are empty the caller owns re-injection before activating the row
+  // (the operator CLI prints that obligation per revived sandbox).
+  map<string, string> env_vars = 9;
+  string secrets_jwt = 10;
+  // The salvage is a standalone or flattened image: boot it without any
+  // base, ignoring the base recorded on the sandbox. Needed because an
+  // empty base_path means "use the recorded base", and a flattened
+  // image's sparse zero regions must not read through to the old base.
+  bool standalone_disk = 11;
+  // Operator attestation that this sandbox belongs to this host even
+  // though no durable record remains (startup stale cleanup deletes
+  // dead records, exactly the state a to-be-revived zombie is in after
+  // a vmd restart). Requires explicit vcpu, mem_mib, and a base
+  // disposition (base_path or standalone_disk): there is no record to
+  // default from. Ownership, preview policy, env, secrets, and egress
+  // all re-establish through the control plane before the row flips.
+  bool allow_recordless = 12;
+  // Ownership for the synthesized record: required whenever
+  // allow_recordless is set (there is no other source), and threaded
+  // straight to data-plane usage attribution.
+  string team_id = 13;
+  string owner_id = 14;
+  // The overlay's saved block map, restored beside the salvage: the boot
+  // takes it as the record of which blocks the disk holds. Empty derives
+  // the map from the disk's allocation.
+  string block_map_path = 15;
+}
+
+message ReviveVMResponse {
+  // The per-VM copy the revived VM actually boots from.
+  string disk_path = 1;
+  string host_ip = 2;
+}
+
 message PauseVMRequest {
   string vm_id = 1;
   string snapshot_dir = 2;   // Directory to store the snapshot artifacts.
+  // Caller-minted identity for THIS pause. The daemon threads it through
+  // the backup pipeline so the eventual upload report can name the exact
+  // pause it covers — content digests cannot (identical vmstate bytes with
+  // different disk contents are possible), and timestamps cannot (reports
+  // are delivered at-least-once from a durable outbox, arbitrarily late).
+  // Empty from an older caller: the report simply carries no token and
+  // coverage matching falls back to content.
+  string pause_token = 3;
 }
 
 message PauseVMResponse {
@@ -277,6 +361,12 @@ message PauseVMResponse {
   // vmstate). Memory files are deliberately absent: they never leave the
   // host, and hashing multi-GiB mem images would stretch the pause RPC.
   repeated ArtifactManifestEntry manifest = 4;
+  // Echo of the request's pause_token, present only when this daemon
+  // threaded it into the backup pipeline. The caller stores the token on
+  // the snapshot row ONLY on a matching echo: a token stored for a
+  // daemon that dropped it would demand an echo its reports can never
+  // produce, reading every backup as unmatched.
+  string pause_token = 5;
 }
 
 // ArtifactManifestEntry describes one finalized artifact file: its identity
@@ -287,7 +377,9 @@ message ArtifactManifestEntry {
   string path = 2;        // absolute path on the host
   int64 size_bytes = 3;
   string sha256 = 4;      // lowercase hex
-  string base_path = 5;   // overlay dependency ("" when self-contained)
+	string base_path = 5;   // overlay dependency ("" when self-contained)
+	// -1 means allocation metadata was unavailable; zero is a valid measurement.
+	int64 allocated_bytes = 6; // host physical allocation (st_blocks * 512)
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +394,17 @@ message ResumeVMRequest {
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
   reserved 6;                                 // was secrets_broker (SecretsBrokerConfig)
   reserved "secrets_broker";
+  // Preview policy stamped on the record before the guest runs, with the
+  // same fields and rules as RestoreSnapshotRequest. Empty preview_access
+  // means a sender from before these fields: the record keeps its policy
+  // and the response carries no attestation.
+  string preview_access = 7;
+  repeated PreviewPort preview_ports = 8;
+  int64 preview_policy_revision = 9;
+  // The backup generation the control plane recorded as covering the pause
+  // being resumed. When the pause artifacts are gone from the host, only
+  // that generation may stand in for them.
+  string backup_generation = 10;
 }
 
 message ResumeVMResponse {
@@ -310,6 +413,22 @@ message ResumeVMResponse {
   string ip_address = 3;
   uint32 pid = 4;
   ResourceLimits resource_limits = 5;
+  // Attests that the request's preview policy fields were applied; same
+  // value and rules as RestoreSnapshotResponse.preview_protocol. Empty
+  // means the request carried no policy or the vmd predates this field.
+  string preview_protocol = 6;
+  // True when the request's egress rules are fully in place on the VM,
+  // including one adopted from an earlier attempt. False means the caller
+  // must push them itself.
+  bool network_rules_applied = 7;
+  // The guest booted cold from a backup of its disk rather than waking
+  // from its memory image: everything injected at create, secrets
+  // included, is gone from it and must be applied again.
+  bool cold_boot = 9;
+  // The policy revision the record holds after the stamp: the request's
+  // when it was applied, higher when the record already held a newer
+  // policy and kept it. Set only with preview_protocol.
+  int64 preview_policy_revision = 8;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +483,18 @@ message RestoreSnapshotRequest {
   repeated PreviewPort preview_ports = 13;
   // Monotonic generation used to reject stale full-allowlist pushes.
   int64 preview_policy_revision = 14;
+  // A saved snapshot to create this VM from. The daemon gives the VM its own
+  // copy of every file the snapshot owns before using any of them, so
+  // snapshot_path and mem_file_path must be empty and base_path, if set,
+  // must be the snapshot's.
+  string saved_snapshot_id = 15;
+  // Egress rules installed before the guest runs: a VM created from a saved
+  // snapshot resumes the workload it was captured with.
+  SandboxNetworkConfig sandbox_network = 16;
+  // The backup generation of saved_snapshot_id to cold boot from when the
+  // host no longer has the snapshot's files; sent after the daemon refuses
+  // with SAVED_SNAPSHOT_MISSING.
+  string backup_generation = 17;
 }
 
 message PreviewPort {
@@ -388,6 +519,9 @@ message RestoreSnapshotResponse {
   // Empty means the vmd predates this field — it may still enforce, so
   // callers attest such vmds via UpdateSandboxPreviewPolicy instead.
   string preview_protocol = 6;
+  // True when the request's sandbox_network rules are in place on the VM.
+  // False means none were sent or the vmd predates the field.
+  bool network_rules_applied = 7;
 }
 
 // InjectSandboxEnv pushes env vars into a running sandbox's boxd. When
@@ -577,3 +711,32 @@ message InvalidateSandboxRulesRequest {
   string sandbox_id = 1;
 }
 message InvalidateSandboxRulesResponse {}
+
+message CreateSavedSnapshotRequest {
+  string vm_id = 1;        // Source sandbox, running or paused.
+  string snapshot_id = 2;  // Caller-minted UUID; a retry with it returns the committed snapshot.
+  string kind = 3;         // "fs" or "mem+fs".
+}
+message CreateSavedSnapshotResponse {
+  string snapshot_id = 1;
+  string kind = 2;
+  // Files the snapshot owns; base paths belong to the template it pins.
+  string base_path = 3;
+  string disk_path = 4;
+  string snapshot_path = 5;    // vmstate; empty for fs.
+  string mem_path = 6;         // empty for fs.
+  string base_mem_path = 7;    // set when mem_path is a diff over a template image.
+  uint32 vcpu_count = 8;
+  uint32 memory_mib = 9;
+  uint32 disk_size_mib = 10;
+  int64 size_bytes = 11;       // Allocated bytes of the owned files.
+  // The Firecracker process that wrote the memory image; empty when unknown.
+  string firecracker_sha256 = 13;
+  int64 created_at_unix = 14;
+}
+message DeleteSavedSnapshotRequest {
+  string snapshot_id = 1;
+}
+message DeleteSavedSnapshotResponse {
+  bool deleted = 1;
+}

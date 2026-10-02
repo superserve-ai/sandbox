@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.9.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state"
@@ -7,11 +7,20 @@ terraform {
   }
 
   required_providers {
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "= 8.2.0"
+    }
     google = {
       source  = "hashicorp/google"
       version = "~> 7.0"
     }
   }
+}
+
+provider "google-beta" {
+  project = local.project_id
+  region  = local.region
 }
 
 provider "google" {
@@ -39,7 +48,11 @@ locals {
     application        = "sandbox-host"
   })
 
-  staging_otlp_endpoint = "http://10.0.0.2:4318"
+  staging_otlp_endpoint = format("http://%s:4318", module.sandbox_host_b.internal_ip)
+
+  # Admit only the two staging VMD host addresses to the dedicated peer
+  # listener. Keep these selectors peer-only as additional hosts are added.
+  staging_peer_source_ranges = ["10.0.0.2/32", "10.0.0.3/32"]
 }
 
 module "network" {
@@ -70,7 +83,20 @@ module "network" {
           ports    = ["5007", "5008", "50051"]
         }
       ]
-      description = "Allow private sandbox control traffic only."
+      description = "Allow private sandbox control and HTTP redirect traffic."
+    }
+    peer_ingress = {
+      name          = "superserve-allow-staging-peer-ingress"
+      direction     = "INGRESS"
+      source_ranges = local.staging_peer_source_ranges
+      target_tags   = ["superserve-vmd"]
+      allow = [
+        {
+          protocol = "tcp"
+          ports    = ["5009"]
+        }
+      ]
+      description = "Allow staging VMD peers to reach the private peer proxy ingress."
     }
     api_to_host_otel = {
       name          = "superserve-staging-api-to-host-otel"
@@ -117,12 +143,21 @@ module "iam" {
       role    = "roles/monitoring.metricWriter"
       members = ["serviceAccount:superserve-api@${local.project_id}.iam.gserviceaccount.com"]
     }
-    # The CD service account needs subnetworks.update to enable VPC flow logs
-    # (added in #257). Granted out-of-band to unblock the staging apply; imported
+    # The CD service account needs subnetworks.update to enable VPC flow logs.
+    # Granted out-of-band to unblock the staging apply; imported
     # (see imports.tf) so a rebuild adopts it instead of creating a duplicate.
     # Prod's CD SA already carries networkAdmin.
     cd_network_admin = {
       role    = "roles/compute.networkAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    # Bootstrap this grant before a full plan can refresh existing CA resources.
+    cd_privateca_auditor = {
+      role    = "roles/privateca.auditor"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    cd_role_admin = {
+      role    = "roles/iam.roleAdmin"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
     }
     grafana_monitoring_viewer = {
@@ -165,10 +200,12 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api"
-  service_account_email = module.iam.service_account_emails["superserve_api"]
+  service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
     API_PORT                    = "8080"
+    TEAM_CREATION_REGION        = "use"
+    TEAM_CREATION_PUBLIC_KEYS   = var.team_creation_public_keys
     EDGE_PROXY_DOMAIN           = "staging-sandbox.superserve.ai"
     OTEL_ENVIRONMENT            = local.environment
     OTEL_EXPORTER_OTLP_ENDPOINT = local.staging_otlp_endpoint
@@ -176,9 +213,22 @@ module "api" {
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
-    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
+    TEMPLATE_BUILD_REGION       = local.region
+    BACKUP_BUCKET               = "superserve-artifact-backup-staging-usc1"
+    DEFAULT_HOST_ID             = var.build_host_id
+    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host_b.internal_ip)
+    STRIPE_API_BASE_URL         = "https://api.stripe.com"
+    STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
+    STRIPE_API_VERSION          = "2026-05-27.dahlia"
+    APP_ALLOWED_ORIGINS         = "https://console-staging.superserve.ai"
+
+    # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
+
+    # identity the runtime impersonates to delete from it.
+
+    BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
   }
-  secrets = {
+  secrets = merge(local.promotion_evidence_secrets, {
     SANDBOX_ACCESS_TOKEN_SEED = {
       secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
     }
@@ -194,11 +244,26 @@ module "api" {
     SYSTEM_TEAM_ID = {
       secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
     }
-  }
+    STRIPE_SECRET_KEY = {
+      secret = google_secret_manager_secret.stripe_secret_key.secret_id
+    }
+
+    STRIPE_WEBHOOK_SECRET = {
+      secret = google_secret_manager_secret.stripe_webhook_secret.secret_id
+    }
+    STRIPE_METER_ERROR_WEBHOOK_SECRET = {
+      secret = google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id
+    }
+  })
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
 
-  depends_on = [google_secret_manager_secret_iam_member.api_runtime_system_team_id]
+  depends_on = [
+    google_secret_manager_secret_iam_member.controlplane_runtime,
+    google_project_iam_member.controlplane_metric_writer,
+    google_service_account_iam_member.controlplane_deploy_act_as,
+    module.backup_storage,
+  ]
 }
 resource "google_compute_disk" "sandbox_data" {
   project = local.project_id
@@ -227,11 +292,66 @@ resource "google_compute_attached_disk" "sandbox_data" {
 
   deletion_policy = "PREVENT"
 }
+# Legacy Cloud Run revisions retain these grants until the staged cutover is
+# drained. The new serving identity's grants live in control-plane-identity.tf;
+# the shared identity remains attached to the draining VMD host.
 resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
   project   = local.project_id
   secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_secret_key" {
+  project   = local.project_id
+  secret_id = google_secret_manager_secret.stripe_secret_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_webhook_secret" {
+  project   = local.project_id
+  secret_id = google_secret_manager_secret.stripe_webhook_secret.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+
+resource "google_secret_manager_secret_iam_member" "api_runtime_stripe_meter_error_webhook_secret" {
+  project   = local.project_id
+  secret_id = google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${module.iam.service_account_emails["superserve_api"]}"
+}
+resource "google_secret_manager_secret" "stripe_secret_key" {
+  project   = local.project_id
+  secret_id = "stripe-secret-key-${local.resource_suffix}"
+
+  replication {
+    auto {}
+  }
+
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "stripe_webhook_secret" {
+  project   = local.project_id
+  secret_id = "stripe-webhook-secret-${local.resource_suffix}"
+
+  replication {
+    auto {}
+  }
+
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "stripe_meter_error_webhook_secret" {
+  project   = local.project_id
+  secret_id = "stripe-meter-error-webhook-secret-${local.resource_suffix}"
+
+  replication {
+    auto {}
+  }
+
+  labels = local.common_labels
 }
 
 module "sandbox_host" {
@@ -249,20 +369,21 @@ module "sandbox_host" {
   tags        = ["superserve-vmd"]
 
   labels = merge(local.sandbox_host_labels, {
-    component    = "vmd"
+    component    = "vmd-staging-draining"
     sandbox_role = "vmd"
   })
 
   service_account_email = module.iam.service_account_emails["superserve_api"]
-  boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_image       = lookup(var.host_image_overrides, "sandbox_host", var.boot_disk_image)
+  provisioning          = contains(var.provisioning_hosts, "sandbox_host")
   boot_disk_size_gb     = 200
   can_ip_forward        = true
 
   metadata = {
     startup-script = <<-EOT
       #!/bin/bash
-      # Minimal startup script — the Packer image has everything pre-installed.
-      # This just detects the host network interface and starts VMD.
+      # Restore runtime and private configuration before admission.
+      # Identity-gated units prevent activation until identity is installed.
       set -euo pipefail
       exec > /var/log/startup-script.log 2>&1
 
@@ -293,11 +414,227 @@ module "sandbox_host" {
   }
 }
 
+# Second vmd host for the staging cell. Same image and shape as the first so
+# the two are interchangeable and receive routine deployments. Exclude Host 2
+# explicitly in a reviewed maintenance plan before any identity migration.
+#
+# The host self-registers as provisioning and stays invisible to placement
+# until an operator activates it, so creating it changes nothing for the cell
+# until that deliberate step.
+module "sandbox_host_b" {
+  source                    = "../../../modules/managed-identity-host"
+  managed_workload_identity = module.peer_identity.creation_identity
+  sandbox_data_disk         = google_compute_disk.sandbox_data_b.id
+
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-staging-2"
+  machine_type  = "n2-standard-32"
+
+  subnet      = "projects/rayai-dev/regions/us-central1/subnetworks/superserve-subnet-05cb005"
+  internal_ip = "10.0.0.3"
+  tags        = ["superserve-vmd"]
+
+  labels = merge(local.sandbox_host_labels, {
+    component    = "vmd"
+    sandbox_role = "vmd"
+  })
+
+  service_account_email     = google_service_account.vmd_runtime.email
+  allow_stopping_for_update = true
+  depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
+  boot_disk_image           = lookup(var.host_image_overrides, "sandbox_host_b", var.boot_disk_image)
+  provisioning              = contains(var.provisioning_hosts, "sandbox_host_b")
+  boot_disk_size_gb         = 200
+  # Declared explicitly so both hosts use the same boot disk type; the
+  # module's own default is the API's pd-standard.
+  boot_disk_type = "pd-ssd"
+  can_ip_forward = true
+
+  metadata = {
+    # cloud-init runs bootcmd on every boot before any service starts, so
+    # the identity is already this host's own by the time vmd can launch.
+    # A daemon that came up under another host's HOST_ID would heartbeat
+    # as that host and reconcile its sandboxes; stopping it afterward is
+    # too late.
+    user-data = <<-EOT
+      #cloud-config
+      bootcmd:
+        - |
+          NAME=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name) || exit 0
+          for f in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
+            [ -f "$f" ] || continue
+            if grep -q '^HOST_ID=' "$f"; then
+              sed -i "s/^HOST_ID=.*/HOST_ID=$${NAME}/" "$f"
+            else
+              echo "HOST_ID=$${NAME}" >> "$f"
+            fi
+          done
+          mkdir -p /run/sandbox && touch /run/sandbox/host-identity-pinned
+    EOT
+
+    startup-script = <<-EOT
+      #!/bin/bash
+      # Runs on every boot, after services. Everything here is idempotent.
+      set -euo pipefail
+      exec > /var/log/startup-script.log 2>&1
+
+      echo "=== Superserve VMD startup ==="
+
+      NAME=$(curl -sf -H 'Metadata-Flavor: Google' \
+        http://metadata.google.internal/computeMetadata/v1/instance/name)
+      HOST_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
+      PREPARED=/var/lib/sandbox/.host-prepared
+
+      # Identity is pinned early by cloud-init (see user-data). If that did
+      # not run this boot, fall back to stopping whatever the image started
+      # — but only on the first boot, when nothing has been deployed yet.
+      # On later boots the units are the deploy's, and stopping them would
+      # take an active host offline until the next deploy.
+      if [ ! -e /run/sandbox/host-identity-pinned ] && [ ! -e "$PREPARED" ]; then
+        echo "identity was not pinned before services; stopping the image's vmd"
+        systemctl stop superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+        systemctl disable superserve-vmd.socket superserve-vmd.service 2>/dev/null || true
+      fi
+
+      # Same pin, repeated here so the file is right even if cloud-init is
+      # ever removed from the image. Only files that exist: the deploy owns
+      # the current one, and a bare file here would shadow it.
+      for f in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
+        [ -f "$f" ] || continue
+        if grep -q '^HOST_ID=' "$f"; then
+          sed -i "s/^HOST_ID=.*/HOST_ID=$${NAME}/" "$f"
+        else
+          echo "HOST_ID=$${NAME}" >> "$f"
+        fi
+        sed -i "s/^HOST_INTERFACE=.*/HOST_INTERFACE=$${HOST_IFACE}/" "$f"
+      done
+
+      # Background-data disk: backup journal and upload staging. The disk is
+      # attached by a separate resource and can appear after this script
+      # runs, so the mount is a device-bound unit rather than a one-shot
+      # wait: it fires when the disk shows up, whenever that is, and again
+      # on every boot. Formats only a blank disk; mounts otherwise.
+      DEV=/dev/disk/by-id/google-superserve-sandbox-data
+      DEVUNIT=$(systemd-escape -p --suffix=device "$DEV")
+      cat > /usr/local/bin/sandbox-data-mount <<'SH'
+      #!/bin/bash
+      set -euo pipefail
+      DEV=/dev/disk/by-id/google-superserve-sandbox-data
+      if [ -z "$(blkid -s TYPE -o value "$DEV" 2>/dev/null)" ]; then
+        mkfs.xfs -m crc=1,reflink=1 "$DEV"
+      fi
+      mkdir -p /mnt/sandbox-data
+      mountpoint -q /mnt/sandbox-data || mount -t xfs -o noatime,discard "$DEV" /mnt/sandbox-data
+      SH
+      chmod 0755 /usr/local/bin/sandbox-data-mount
+      cat > /etc/systemd/system/sandbox-data.service <<UNIT
+      [Unit]
+      Description=Mount the sandbox background-data disk
+      BindsTo=$${DEVUNIT}
+      After=$${DEVUNIT}
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/sandbox-data-mount
+      [Install]
+      WantedBy=$${DEVUNIT}
+      UNIT
+      # vmd keeps its backup journal on that disk, so it must not start
+      # without it.
+      mkdir -p /etc/systemd/system/superserve-vmd.service.d
+      printf '[Unit]\nRequires=sandbox-data.service\nAfter=sandbox-data.service\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/sandbox-data.conf
+
+      # Runtime flags this cell's hosts run with. Set here so both hosts
+      # launch and track VMs the same way.
+      printf '[Service]\nEnvironment=VMD_DIRTY_TRACKING_SESSION=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/dirty-session.conf
+      printf '[Service]\nEnvironment=VMD_LAUNCH_VIA_LAUNCHER_NS=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/launcher.conf
+      printf '[Service]\nEnvironment=VMD_SYSTEMD_DBUS=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/sdbus.conf
+      printf '[Service]\nEnvironment=VMD_RECYCLE_TAP_RESET=true\n' \
+        > /etc/systemd/system/superserve-vmd.service.d/tap-reset.conf
+
+      systemctl daemon-reload
+      systemctl enable sandbox-data.service
+      systemctl start --no-block sandbox-data.service
+
+      modprobe kvm
+      modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
+      chmod 0666 /dev/kvm 2>/dev/null || true
+      sysctl -w net.ipv4.ip_forward=1
+
+      # vmd is not started here. On the first boot the deploy installs the
+      # current units and starts it; on every later boot systemd already
+      # started the deployed units under the pinned identity.
+      mkdir -p "$(dirname "$PREPARED")" && touch "$PREPARED"
+      echo "=== host prepared ==="
+    EOT
+  }
+}
+
+# The second host's own background-data disk, same shape as the first's.
+resource "google_compute_disk" "sandbox_data_b" {
+  project = local.project_id
+  name    = "superserve-vmd-staging-2-sandbox-data"
+  zone    = local.zone
+  type    = "pd-balanced"
+  size    = 500
+
+  labels = merge(local.common_labels, {
+    component = "vmd"
+    purpose   = "sandbox-data"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Attachment is now owned by the VM create request. Forget the standalone
+# record without detaching or deleting the independently protected data disk.
+removed {
+  from = google_compute_attached_disk.sandbox_data_b
+  lifecycle { destroy = false }
+}
+
 module "observability" {
   source = "../../../modules/observability"
 
+  runbook_urls = module.alert_runbooks.urls
+
   project_id  = local.project_id
   environment = local.environment
+  # Backup pipeline alerts, same set as the production cells so staging
+  # validates the queries before they matter. The disabled-host alert
+  # stays off here: staging toggles BACKUP_BUCKET deliberately.
+  backup_alerts = {
+    collector_host_id   = module.sandbox_host_b.instance_name
+    host_id             = var.build_host_id
+    display_prefix      = "Backup / ${module.sandbox_host_b.instance_name}"
+    alert_disabled_host = false
+  }
+  # Backup coverage, same disabled-by-default shape as the production
+  # cells so staging validates the policy config (including the
+  # region-scoped companion condition) before it matters. regions lists
+  # the host table's region column values in this cell's database, not
+  # GCP region names; "us-central1" is the only value present.
+  backup_coverage_alerts = {
+    enabled        = false
+    display_prefix = "Backup coverage / staging"
+    regions        = ["us-central1"]
+  }
+  # Root-filesystem (OS disk) utilization, same policies as the production
+  # cells so staging validates the query shape first. Module defaults:
+  # warn at 85% sustained 30 minutes, page at 95%.
+  host_disk_alerts = {
+    host_id        = module.sandbox_host_b.instance_name
+    display_prefix = "Infrastructure / ${module.sandbox_host_b.instance_name}"
+  }
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Staging Operations"
@@ -368,7 +705,19 @@ module "backup_storage" {
     "serviceAccount:${module.iam.service_account_emails["superserve_api"]}",
   ]
 
+  reader_members = [
+    "serviceAccount:${google_service_account.controlplane_runtime.email}",
+  ]
+
   labels = merge(local.common_labels, {
     component = "backup"
   })
+}
+
+# The control plane deletes deleted sandboxes' backups as the bucket's GC
+# identity, which it impersonates only for that client.
+resource "google_service_account_iam_member" "controlplane_backup_gc" {
+  service_account_id = "projects/${local.project_id}/serviceAccounts/${module.backup_storage.gc_service_account_email}"
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.controlplane_runtime.email}"
 }

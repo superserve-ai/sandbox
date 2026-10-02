@@ -2,9 +2,11 @@ package vm
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/superserve-ai/sandbox/internal/preview"
 	bolt "go.etcd.io/bbolt"
@@ -66,6 +68,72 @@ func TestLegacyVMRecordRetainsAllPortCompatibility(t *testing.T) {
 	}
 	if inst.PreviewPorts != nil || inst.PreviewPolicyRevision != 0 {
 		t.Fatalf("legacy policy = (%#v, %d), want (nil, 0)", inst.PreviewPorts, inst.PreviewPolicyRevision)
+	}
+}
+
+func TestPausedAtRoundTrip(t *testing.T) {
+	pausedAt := time.Unix(1_725_000_000, 0).UTC()
+	inst := &VMInstance{
+		ID:       "vm-paused",
+		PausedAt: pausedAt,
+	}
+
+	rec := toRecord(inst)
+	if !rec.PausedAt.Equal(pausedAt) {
+		t.Fatalf("record paused_at = %v, want %v", rec.PausedAt, pausedAt)
+	}
+
+	restored := toInstance(rec)
+	if !restored.PausedAt.Equal(pausedAt) {
+		t.Fatalf("restored paused_at = %v, want %v", restored.PausedAt, pausedAt)
+	}
+}
+
+func TestStateStorePausedAtRoundTrip(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "state.db")
+	pausedAt := time.Unix(1_725_000_000, 0).UTC()
+
+	store, err := OpenStateStore(storePath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Put(VMRecord{
+		ID:       "vm-paused",
+		Status:   StatusPaused,
+		PausedAt: pausedAt,
+	}); err != nil {
+		t.Fatalf("put paused record: %v", err)
+	}
+	if err := store.Put(VMRecord{
+		ID:     "vm-legacy",
+		Status: StatusPaused,
+	}); err != nil {
+		t.Fatalf("put legacy record: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	store, err = OpenStateStore(storePath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer store.Close()
+
+	got, err := store.Get("vm-paused")
+	if err != nil {
+		t.Fatalf("get paused record: %v", err)
+	}
+	if !got.PausedAt.Equal(pausedAt) {
+		t.Fatalf("stored paused_at = %v, want %v", got.PausedAt, pausedAt)
+	}
+
+	legacy, err := store.Get("vm-legacy")
+	if err != nil {
+		t.Fatalf("get legacy record: %v", err)
+	}
+	if !legacy.PausedAt.IsZero() {
+		t.Fatalf("legacy paused_at = %v, want zero", legacy.PausedAt)
 	}
 }
 
@@ -1117,5 +1185,27 @@ func TestPutIfPresent(t *testing.T) {
 	}
 	if has, _ := s.Has("vm-1"); has {
 		t.Fatal("record resurrected after delete — PutIfPresent must be a no-op")
+	}
+}
+
+// The rollback guard finds the store solely through this file, so the write
+// must be atomic-replace with the exact resolved path.
+func TestWriteStateBreadcrumb(t *testing.T) {
+	at := filepath.Join(t.TempDir(), "nested", "state-path")
+	if err := writeStateBreadcrumbTo(at, "/somewhere/vm state/vmd.db"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "/somewhere/vm state/vmd.db\n" {
+		t.Fatalf("content %q", b)
+	}
+	if err := writeStateBreadcrumbTo(at, "/elsewhere/vmd.db"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ = os.ReadFile(at); string(b) != "/elsewhere/vmd.db\n" {
+		t.Fatalf("content after rewrite %q", b)
 	}
 }

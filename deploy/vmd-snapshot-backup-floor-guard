@@ -1,0 +1,24 @@
+#!/bin/sh
+# Refuses a vmd that cannot read saved-snapshot backup queue entries once this
+# host has queued one; such a vmd would retry them forever.
+set -u
+LC_ALL=C
+export LC_ALL
+BIN="${1:-/usr/local/bin/vmd}"
+SNAPSHOT_BACKUP_EVIDENCE=/var/lib/sandbox/snapshot-backup-evidence
+
+# Only a definite "does not exist" admits any vmd; other lookup failures count as present.
+lookup=$(stat -L "$SNAPSHOT_BACKUP_EVIDENCE" 2>&1 >/dev/null)
+if [ $? -ne 0 ]; then
+    case "$lookup" in
+        *"No such file or directory"*) exit 0 ;;
+        *) echo "vmd-snapshot-backup-floor-guard: cannot look up ${SNAPSHOT_BACKUP_EVIDENCE} (${lookup}); only a vmd that reads snapshot backups may start" >&2 ;;
+    esac
+fi
+
+if grep -qa snapshot-backup-1 "$BIN" 2>/dev/null; then
+    exit 0
+fi
+echo "vmd-snapshot-backup-floor-guard: REFUSING to start a vmd without snapshot-backup-1: this host has queued saved snapshot backups (${SNAPSHOT_BACKUP_EVIDENCE})" >&2
+echo "vmd-snapshot-backup-floor-guard: deploy a build that reads them; the floor comes down only once no such queue entry can remain here" >&2
+exit 1

@@ -1,6 +1,7 @@
 # Deploy VMD — control plane VMs.
 #
-# Production NEVER deploys without staging first — same discipline as Deploy API.
+# Staging runs first; manual production standby deploys may skip an absent
+# staging standby. Serving deployments still require staging to succeed.
 # The deploy-production job reuses the same step body as deploy-staging; env vars
 # like GCP_PROJECT resolve per-environment from GitHub environment vars.
 # The us-west2 cell host deploys as a final production step, after the
@@ -18,6 +19,22 @@ on:
         options:
           - staging
           - production
+      target:
+        description: 'Host target (applies to staging first, then the selected production cell)'
+        required: true
+        type: choice
+        default: standby
+        options:
+          - standby
+          - serving
+      cell:
+        description: 'Production cell (ignored for staging; use4 standby is not provisioned yet)'
+        required: true
+        type: choice
+        default: usw2
+        options:
+          - usw2
+          - use4
   push:
     branches: [main]
     paths:
@@ -26,30 +43,135 @@ on:
       - 'cmd/template-builder/**'
       - 'cmd/secretsproxy/**'
       - 'proto/**'
-      - 'internal/vm/**'
+      # Every internal package the host binaries import must be listed, or a
+      # change to it merges without deploying. Enforced by the
+      # deploy-trigger-coverage CI check against `go list -deps`.
+      - 'internal/analytics/**'
+      - 'internal/auth/**'
       - 'internal/backup/**'
-      - 'internal/network/**'
+      - 'internal/blocklist/**'
       - 'internal/builder/**'
       - 'internal/db/**'
+      - 'internal/egresspolicy/**'
+      - 'internal/hostidentity/**'
+      - 'internal/network/**'
+      - 'internal/presence/**'
+      - 'internal/preview/**'
+      - 'internal/proxy/**'
+      - 'internal/retainedstorage/**'
       - 'internal/secretsproxy/**'
+      - 'internal/sentrylog/**'
+      - 'internal/shellquote/**'
+      - 'internal/telemetry/**'
+      - 'internal/vm/**'
+      - 'internal/vmdclient/**'
       - 'deploy/superserve-vmd.service'
       - 'deploy/superserve-vmd.socket'
+      - 'deploy/superserve-vms.service'
+      - 'deploy/vmd-rollback-guard'
+      - 'deploy/superserve-vmd-rollback-guard.conf'
+      - 'deploy/vmd-wake-floor-guard'
+      - 'deploy/vmd-compatibility-preflight'
+      - 'deploy/superserve-vmd-wake-floor-guard.conf'
+      - 'deploy/vmd-staged-intent-floor-guard'
+      - 'deploy/superserve-vmd-staged-intent-floor-guard.conf'
+      - 'deploy/vmd-snapshot-backup-floor-guard'
+      - 'deploy/superserve-vmd-snapshot-backup-floor-guard.conf'
+      - 'deploy/superserve-vmd-start-generation.conf'
       - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
       - 'deploy/needrestart-superserve.conf'
       - 'deploy/apt-no-auto-upgrades.conf'
+      - 'deploy/maintenance-watch.sh'
+      - 'deploy/superserve-maintenance-watch.service'
+      - 'deploy/superserve-maintenance-watch.timer'
       - 'scripts/fc-cleanup'
+      - 'go.mod'
+      - 'go.sum'
       # The workflow + its deploy script must self-trigger (as deploy-otel does),
       # or a new cell/step lands without ever running until an unrelated vmd
       # asset changes — leaving that host on stale binaries.
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
+
+# Serialize runs rather than canceling: deploy-vmd.py stops vmd, rewrites
+# /etc/sandbox/vmd.env, and restarts it non-atomically across several steps
+# per host. Two overlapping runs racing that sequence on the same host can
+# interleave (e.g. both pass the backup-journal migration's source-present
+# check before either finishes), and canceling a run mid-sequence would
+# leave a host stopped or on a half-written env file. A queued run always
+# starts from the finished state of the one before it.
+concurrency:
+  group: deploy-vmd
+  cancel-in-progress: false
+  queue: max
+
+# Push runs ignore manual selectors and retain the environment's serving label.
+env:
+  DEPLOY_EVENT: ${{ github.event_name }}
+  DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+  DEPLOY_TARGET: ${{ inputs.target }}
+  DEPLOY_PRODUCTION_CELL: ${{ inputs.cell }}
 
 jobs:
+  migration-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require host identity rollout readiness for push deployments
+        env:
+          DEPLOY_EVENT: ${{ github.event_name }}
+          ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
+        run: |
+          if [ "$DEPLOY_EVENT" = push ] && [ "$ROLLOUT_READY" != true ]; then
+            echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
+            exit 1
+          fi
+
+  # Failing CI must not reach production control-plane hosts. CI is a
+  # separate workflow, so `needs:` can't reach it directly — poll the
+  # same-SHA run instead, same pattern as Deploy API's wait-for-migrations.
+  wait-for-ci:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for same-SHA CI to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Manual dispatch — operator owns this decision; skipping gate."
+            exit 0
+          fi
+
+          # CI runs on every push to main (no path filter), so a run for this
+          # SHA always exists — poll until it's visible and completed. ~20 min
+          # budget (60 × 20s), then fail closed: a deploy built from code that
+          # hasn't passed CI is worse than a late deploy.
+          for i in $(seq 1 60); do
+            run=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&event=push" \
+              --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
+            status=${run% *}; conclusion=${run#* }
+            echo "attempt $i: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI succeeded; proceeding."
+                exit 0
+              fi
+              echo "CI concluded '$conclusion' — refusing to deploy unvalidated code."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for CI; refusing to deploy."
+          exit 1
+
   deploy-staging:
     runs-on: ubuntu-latest
+    needs: [wait-for-ci, migration-gate]
     environment: staging
     permissions:
       contents: read
@@ -88,16 +210,84 @@ jobs:
       # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy to VMD instances
         env:
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_STAGING }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+          INTERNAL_API_TOKEN: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
+          DEPLOY_CELL: staging
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "6000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "150"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           # Staging validates the backup uploader first; the production
           # cells get their buckets after the staging soak.
           BACKUP_BUCKET: superserve-artifact-backup-staging-usc1
+          # Stage one of the backfill rollout: staging first, then use4,
+          # then usw2, each gated on coverage convergence verified via
+          # the backup_generation table. Removing this line disables the
+          # sweep on the next deploy.
+          BACKUP_BACKFILL: "1"
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills. Staging is a smaller instance
+          # with no NVMe-backed local SSD (unlike use4/usw2), so this
+          # points at its attached persistent disk instead of /mnt/localssd.
+          BACKUP_JOURNAL_PATH: /mnt/sandbox-data/backup.db
+          # Keeps staged generations off whatever disk serves live VM I/O
+          # (here, the root disk, since staging has no local SSD): every
+          # staged file is read twice before upload (digest pre-check,
+          # then the stream), and that read traffic must not contend with
+          # tenant workloads. Shares the same attached disk as the backup
+          # journal above.
+          BACKUP_STAGING_DIR: /mnt/sandbox-data/backup-staging
+          # Staging validates parallel drain first; production stays on
+          # vmd's single-worker default until this soaks. Workers share
+          # one bandwidth cap, so this raises task throughput only.
+          BACKUP_UPLOAD_CONCURRENCY: "2"
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the backup alert policies read these series.
+          OTEL_ENVIRONMENT: staging
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
+          source .github/workflows/scripts/select-deploy-target.sh
+          # Only an absent staging standby is optional. Discovery errors and
+          # existing but stopped/misconfigured hosts must still fail closed.
+          if [ "${DEPLOY_EVENT:-}" = workflow_dispatch ] && \
+             [ "${DEPLOY_ENVIRONMENT:-}" = production ] && \
+             [ "${DEPLOY_TARGET:-standby}" = standby ] && [ "$DEPLOY_CELL" = staging ]; then
+            : "${GCP_PROJECT:?Refusing standby discovery without a project}"
+            standby_zones=$(gcloud compute instances list \
+              --project="$GCP_PROJECT" --filter="labels.${VMD_LABEL}" \
+              --format='value(zone)')
+            staging_standby_present=false
+            while IFS= read -r zone; do
+              case "${zone##*/}" in
+                "$GCP_REGION"-*) staging_standby_present=true ;;
+              esac
+            done <<< "$standby_zones"
+            if [ "$staging_standby_present" = false ]; then
+              echo 'No staging standby found; continuing to the selected production standby.'
+              exit 0
+            fi
+          fi
+          : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL_STAGING is unset — refusing to deploy without it}"
+          : "${DATABASE_URL:?DATABASE_URL_STAGING is unset — refusing to deploy without it}"
+          : "${INTERNAL_API_TOKEN:?STAGING_INTERNAL_API_TOKEN is unset — refusing to deploy without it}"
           python3 .github/workflows/scripts/deploy-vmd.py
 
   deploy-production:
@@ -140,32 +330,75 @@ jobs:
       # routes there — so it deploys FIRST, before the usw secondary cell. A
       # failure or zero-match in usw must not stop the job and leave the public
       # host on old vmd/boxd/secretsproxy binaries. Reuses the binaries built
-      # above. Unguarded: use4 is the permanent primary, so a missing
+      # above. On push, use4 is the permanent primary, so a missing
       # CLOUD_RUN_SERVICE_USE4/GCP_REGION_USE4 must fail the deploy rather than
       # silently skip the only primary-host rollout. Discovery is the VMD_LABEL
       # filter scoped to GCP_REGION_USE4 (deploy-vmd.py fails on zero matches).
       - name: Deploy to use4 cell VMD instances
+        if: github.event_name != 'workflow_dispatch' || inputs.cell == 'use4'
         env:
+          DEPLOY_CELL: use4
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "6000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "150"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           BACKUP_BUCKET: superserve-artifact-backup-use4
+          # Stage two of the backfill rollout, expedited: 585 of the
+          # cell's 678 paused sandboxes predate the uploader and have no
+          # copy off the host's SSD, which has now failed twice in one
+          # day. The sweep makes them durable within hours of the host
+          # returning. Removing this line disables the sweep on the next
+          # deploy.
+          BACKUP_BACKFILL: "1"
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills.
+          BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
+          # BACKUP_STAGING_DIR (moves staged generations off the
+          # local-SSD array onto the host's dedicated background-data
+          # disk) is deliberately NOT set here yet. The Terraform disk
+          # is attached but not formatted or mounted — that step is
+          # manual (see host-dr-runbook.md) — and deploy-vmd.py's mount
+          # precondition refuses to deploy with this set against an
+          # absent mount, which would block every future deploy to this
+          # host until someone notices and preps it out of band. Enable
+          # once /mnt/sandbox-data is confirmed mounted here, matching
+          # the staged rollout below it validated on staging first.
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the cell's backup alert policies, including backup-disabled,
+          # cannot fire without these series.
+          OTEL_ENVIRONMENT: production
           # use4 is the "use" cell's Supabase + control plane.
           CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_PROD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
           INTERNAL_API_TOKEN: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
+          source .github/workflows/scripts/select-deploy-target.sh
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match. use4 is the permanent
           # primary, so a missing GCP_REGION_USE4 must abort, not run unscoped.
           : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary fan-out}"
           # deploy-vmd.py treats an empty CONTROL_PLANE_URL/DATABASE_URL/
           # INTERNAL_API_TOKEN as "skip, leave the host's existing value alone" —
-          # the right behavior for staging/unprovisioned hosts, but silently
+          # supported for already-configured hosts, but silently
           # deploying-and-reporting-success while these are unset on a
           # production host is exactly the failure mode this workflow exists
           # to prevent. Fail closed rather than skip.
@@ -182,14 +415,29 @@ jobs:
       # scoped to GCP_REGION_USW, so the cell host must carry the label; zero
       # matches fails the deploy rather than silently skipping the cell.
       - name: Deploy to usw cell VMD instances
-        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        if: (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '') || (github.event_name == 'workflow_dispatch' && (inputs.cell == 'usw2' || inputs.cell == ''))
         env:
+          DEPLOY_CELL: usw2
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
+          # Fleet defaults for paused-network reclaim live in deployment
+          # config, not the binary. Operators can override them per host in
+          # /etc/sandbox/vmd.env after deployment.
+          VMD_PAUSED_NETWORK_RECLAIM: "true"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
+          VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_NETNS_THRESHOLD: "6000"
+          VMD_PAUSED_NETWORK_NETNS_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MOUNT_THRESHOLD: "0"
+          VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS: "3000"
+          VMD_PAUSED_NETWORK_MIN_WARM_AGE: "0s"
+          VMD_PAUSED_NETWORK_MAX_RECLAIMS: "150"
+          VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN: "30s"
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # usw is its own cell — separate Supabase project + control plane
           # from the "use" cell above.
@@ -199,7 +447,57 @@ jobs:
           # Enables the pause-backup uploader for the cell (validated on
           # staging first; the bucket is create-only for hosts).
           BACKUP_BUCKET: superserve-artifact-backup-usw2
+          # Sweeps paused sandboxes that predate the uploader into the
+          # backup bucket; without it they have no copy off the host's
+          # local SSD. Backfill work rides the best-effort tier, so live
+          # pause uploads keep queue priority and egress stays under the
+          # shared bandwidth cap. Removing this line disables the sweep
+          # on the next deploy.
+          BACKUP_BACKFILL: "1"
+          # Keeps the backup journal off the root disk — it's written
+          # continuously while backups drain and can stall the uploader
+          # if the (small) root disk fills.
+          BACKUP_JOURNAL_PATH: /mnt/localssd/backup.db
+          # Moves staged generations off the local-SSD array onto the
+          # host's dedicated background-data disk — at
+          # BACKUP_UPLOAD_CONCURRENCY workers below, the sharpest
+          # contention risk against tenant VM disk I/O on that array,
+          # confirmed live in production: pause snapshot writes to
+          # md0 stalled from ~3s to 27-135s under a concurrent backfill
+          # sweep, exceeding the control plane's deadline and failing
+          # pauses outright. The disk is formatted (XFS) and mounted at
+          # /mnt/sandbox-data (fstab, not the staging host's migration
+          # unit — this disk holds only backup staging, nothing to
+          # migrate). deploy-vmd.py's mount precondition would refuse
+          # this deploy outright if that were not true.
+          BACKUP_STAGING_DIR: /mnt/sandbox-data/backup-staging
+          # Drain workers to clear the cell's pause-backup backlog:
+          # arrivals outpace the single-worker default here. Workers
+          # share one bandwidth cap (task throughput rises, egress does
+          # not), and the incremental host cost is one extra hash/read
+          # stream on a 192-core metal host with a 12-drive array.
+          # Arrivals are not steady: a share of this cell's traffic pauses
+          # in scheduled batches rather than continuously, so a batch can
+          # arrive faster than it drains even when the hourly average is
+          # comfortable. At 6 workers a batch took long enough to drain
+          # that the next one landed before the backlog cleared, so the
+          # backlog-age alert paged on every batch (confirmed against
+          # backup_journal_pending{priority="pause"} and the control
+          # plane's pause-endpoint request log). 12 workers roughly halves
+          # the drain time, leaving real idle time between batches;
+          # re-check against the same series if batch sizes grow.
+          # Aggregate egress stays under the shared bandwidth cap (~22
+          # Mbit/s observed at 2 workers, cap 100) since throughput here
+          # is bounded by per-task overhead, not bandwidth. Rollback is
+          # lowering the number.
+          BACKUP_UPLOAD_CONCURRENCY: "12"
+          # Enables vmd's backup metrics exporter (host-local collector);
+          # the cell's backup alert policies, including backup-disabled,
+          # cannot fire without these series.
+          OTEL_ENVIRONMENT: production
+          MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
+          source .github/workflows/scripts/select-deploy-target.sh
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match — which would push
           # usw's DATABASE_URL/CONTROL_PLANE_URL/INTERNAL_API_TOKEN onto the

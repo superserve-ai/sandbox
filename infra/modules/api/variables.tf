@@ -61,6 +61,17 @@ variable "secrets" {
   default = {}
 }
 
+variable "secret_volumes" {
+  description = "Secret files mounted read-only in the API container, keyed by volume name."
+  type = map(object({
+    secret     = string
+    mount_path = string
+    path       = string
+    version    = optional(string, "latest")
+  }))
+  default = {}
+}
+
 variable "vpc_connector" {
   description = "Optional Serverless VPC Access connector resource name."
   type        = string

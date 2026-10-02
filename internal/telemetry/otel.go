@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric"
@@ -15,6 +17,18 @@ import (
 
 const instrumentationName = "github.com/superserve-ai/sandbox/internal/telemetry"
 
+// latencyBuckets are the histogram boundaries (seconds) for every duration
+// instrument. The SDK default boundaries start at 5s, which flattens the
+// sub-second range all sandbox latencies live in; these cover 100µs–30min so
+// histogram_quantile can resolve millisecond-scale p50s, second-scale tails,
+// and the legitimately long operations (caller-timed execs, streaming
+// responses, boot-retry worst cases) from the same series. Anything past
+// 30 minutes is pathological and may collapse into +Inf.
+var latencyBuckets = []float64{
+	0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60, 120, 300, 900, 1800,
+}
+
 // OTelConfig contains the app-level metrics settings needed by the recorder.
 type OTelConfig struct {
 	ServiceName    string
@@ -23,23 +37,72 @@ type OTelConfig struct {
 	Endpoint       string
 	Insecure       bool
 	ExportInterval time.Duration
+	// HostID scopes per-host series to the host that produced them. The
+	// collector stamps host_id only onto its own hostmetrics pipeline,
+	// assuming OTLP senders label their own series — so without this, a
+	// per-host gauge is indistinguishable between cells and cannot be
+	// alerted on per host. Empty (the control plane, which is not per-host)
+	// records as "unknown".
+	HostID string
+	// InstanceID identifies this specific process for the resource-level
+	// service.instance.id attribute. Every db_pool_*/vmd_call_*/etc. series
+	// this recorder emits shares the same metric name, service.name, and
+	// (for host-scoped calls) host_id — nothing distinguishes one process
+	// from another. That's invisible with exactly one process per service,
+	// but the control plane runs as multiple concurrent Cloud Run
+	// instances, so every replica exports identical series in the same
+	// window. The collector's resourcedetection/gcp processor only fills in
+	// a resource attribute when the sender didn't already set it (its
+	// override:false), and it has nothing GCP-native to detect for a
+	// Cloud Run OTLP client — so without InstanceID every replica's data
+	// collapses onto the collector's own host identity once it lands in
+	// Google Managed Prometheus, and GMP's one-point-per-series-per-request
+	// rule drops every write past the first. Left empty, NewOTelRecorder
+	// generates a random one so uniqueness never depends on the caller
+	// remembering to plumb one through.
+	InstanceID string
 }
 
 // OTelRecorder emits the sandbox control plane's bounded operational metrics
 // through OTLP. It intentionally exposes only a small label vocabulary.
 type OTelRecorder struct {
-	provider *sdkmetric.MeterProvider
+	billing           *billingMetrics
+	computeDecisions  metric.Int64Counter
+	computeRefreshes  metric.Int64Counter
+	computeReconciles metric.Int64Counter
+	provider          *sdkmetric.MeterProvider
+	signupDecisions   metric.Int64Counter
 
 	serviceName string
 	environment string
+	hostID      string
+	instanceID  string
 
 	sandboxTransitions       metric.Int64Counter
 	sandboxDuration          metric.Float64Histogram
+	resumeSettleWaits        metric.Int64Counter
+	resumeSettleWaitDuration metric.Float64Histogram
+	resumeSettleWaitReads    metric.Int64Histogram
 	vmdCalls                 metric.Int64Counter
+	routingOutcomes          metric.Int64Counter
+	ownershipLookupDuration  metric.Float64Histogram
 	vmdDuration              metric.Float64Histogram
+	hostResolutionDuration   metric.Float64Histogram
+	capacityShadowDuration   metric.Float64Histogram
+	capacityShadowHosts      metric.Int64Gauge
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
+	// Observable, uniquely in this file: coverage is published by one
+	// lease-elected replica per cell, and a synchronous gauge retains
+	// its last value per process, so a replica that lost leadership
+	// would keep exporting stale competing series for its lifetime.
+	// The callback exports only the current snapshot, so a non-leader
+	// (holding an empty snapshot) exports nothing at all.
+	backupUncoveredPaused    metric.Int64ObservableGauge
+	backupUncoveredOldestAge metric.Float64ObservableGauge
+	backupCoverageMu         sync.Mutex
+	backupCoverage           []BackupCoverage
 	dbAcquiredConns          metric.Int64Gauge
 	dbIdleConns              metric.Int64Gauge
 	dbTotalConns             metric.Int64Gauge
@@ -47,6 +110,27 @@ type OTelRecorder struct {
 	dbEmptyAcquire           metric.Int64Counter
 	dbCanceledAcquire        metric.Int64Counter
 	dbAcquireDurationSeconds metric.Float64Counter
+	phaseDuration            metric.Float64Histogram
+	pausedNetworkSlotsTotal  metric.Int64Gauge
+	teardownAttempts         metric.Int64Counter
+	teardownBacklog          metric.Int64Gauge
+	teardownOldestAge        metric.Float64Gauge
+	pausedNetworkSlotsUsed   metric.Int64Gauge
+	pausedNetworkSlotsAvail  metric.Int64Gauge
+	pausedNetworkPoolSlots   metric.Int64Gauge
+	pausedNetworkNetnsTotal  metric.Int64Gauge
+	pausedNetworkMountTotal  metric.Int64Gauge
+	pausedNetworkPressure    metric.Int64Gauge
+	pausedNetworkReclaimed   metric.Int64Counter
+	pausedNetworkPaused      metric.Int64Counter
+	launcherReady            metric.Int64Gauge
+	peerIngressEvents        metric.Int64Counter
+	peerIngressDuration      metric.Float64Histogram
+	peerConnections          metric.Int64UpDownCounter
+	peerStreams              metric.Int64UpDownCounter
+	peerEvents               metric.Int64Counter
+	peerHandshakeDuration    metric.Float64Histogram
+	storageReportFailures    metric.Int64Counter
 }
 
 // NewOTelRecorder constructs an OTLP/HTTP metrics recorder. Call Shutdown on
@@ -64,49 +148,83 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if cfg.ExportInterval <= 0 {
 		cfg.ExportInterval = 15 * time.Second
 	}
+	cfg.InstanceID = resolveInstanceID(cfg.InstanceID)
 
-	exporterOpts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpointURL(cfg.Endpoint)}
-	if cfg.Insecure || strings.HasPrefix(cfg.Endpoint, "http://") {
-		exporterOpts = append(exporterOpts, otlpmetrichttp.WithInsecure())
-	}
-	exporter, err := otlpmetrichttp.New(ctx, exporterOpts...)
+	provider, err := newOTLPMeterProvider(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
+		return nil, err
 	}
-
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes("",
-			attribute.String("service.name", cfg.ServiceName),
-			attribute.String("service.version", cfg.ServiceVersion),
-			attribute.String("environment", cfg.Environment),
-		),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create otel resource: %w", err)
-	}
-
-	provider := sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))),
-	)
 	meter := provider.Meter(instrumentationName)
 
 	r := &OTelRecorder{
 		provider:    provider,
 		serviceName: cfg.ServiceName,
 		environment: cfg.Environment,
+		hostID:      safeHostID(cfg.HostID),
+		instanceID:  cfg.InstanceID,
+	}
+	if r.computeDecisions, err = meter.Int64Counter("compute_restriction_decision_total"); err != nil {
+		return nil, err
+	}
+	if r.computeRefreshes, err = meter.Int64Counter("compute_restriction_refresh_total"); err != nil {
+		return nil, err
+	}
+	if r.computeReconciles, err = meter.Int64Counter("compute_reconciliation_total"); err != nil {
+		return nil, err
+	}
+	if r.signupDecisions, err = meter.Int64Counter("signup_restriction_decision_total"); err != nil {
+		return nil, err
 	}
 	if r.sandboxTransitions, err = meter.Int64Counter("sandbox_transition_total"); err != nil {
 		return nil, err
 	}
-	if r.sandboxDuration, err = meter.Float64Histogram("sandbox_transition_duration_seconds"); err != nil {
+	if r.sandboxDuration, err = meter.Float64Histogram("sandbox_transition_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.resumeSettleWaits, err = meter.Int64Counter("sandbox_resume_settle_wait_total"); err != nil {
+		return nil, err
+	}
+	if r.resumeSettleWaitDuration, err = meter.Float64Histogram("sandbox_resume_settle_wait_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.resumeSettleWaitReads, err = meter.Int64Histogram("sandbox_resume_settle_wait_reads"); err != nil {
 		return nil, err
 	}
 	if r.vmdCalls, err = meter.Int64Counter("vmd_call_total"); err != nil {
 		return nil, err
 	}
-	if r.vmdDuration, err = meter.Float64Histogram("vmd_call_duration_seconds"); err != nil {
+	if r.ownershipLookupDuration, err = meter.Float64Histogram("proxy_ownership_lookup_duration_seconds", metric.WithUnit("s"), metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.routingOutcomes, err = meter.Int64Counter("proxy_routing_outcome_total"); err != nil {
+		return nil, err
+	}
+	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.capacityShadowDuration, err = meter.Float64Histogram("capacity_shadow_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.capacityShadowHosts, err = meter.Int64Gauge("capacity_shadow_hosts"); err != nil {
+		return nil, err
+	}
+	if r.vmdDuration, err = meter.Float64Histogram("vmd_call_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.phaseDuration, err = meter.Float64Histogram("sandbox_phase_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.peerIngressEvents, err = meter.Int64Counter("peer_ingress_event_total"); err != nil {
+		return nil, err
+	}
+	if r.peerIngressDuration, err = meter.Float64Histogram("peer_ingress_event_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
 		return nil, err
 	}
 	if r.hostVCPU, err = meter.Int64Gauge("host_capacity_used_vcpu"); err != nil {
@@ -118,7 +236,25 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if r.hostSandboxes, err = meter.Int64Gauge("host_capacity_running_sandboxes"); err != nil {
 		return nil, err
 	}
+	if r.backupUncoveredPaused, err = meter.Int64ObservableGauge("backup_uncovered_paused_sandboxes"); err != nil {
+		return nil, err
+	}
+	if r.backupUncoveredOldestAge, err = meter.Float64ObservableGauge("backup_uncovered_oldest_age_seconds"); err != nil {
+		return nil, err
+	}
+	if _, err = meter.RegisterCallback(r.observeBackupCoverage, r.backupUncoveredPaused, r.backupUncoveredOldestAge); err != nil {
+		return nil, err
+	}
 	if r.dbAcquiredConns, err = meter.Int64Gauge("db_pool_acquired_conns"); err != nil {
+		return nil, err
+	}
+	if r.teardownAttempts, err = meter.Int64Counter("sandbox_teardown_attempt_total"); err != nil {
+		return nil, err
+	}
+	if r.teardownBacklog, err = meter.Int64Gauge("sandbox_teardown_backlog"); err != nil {
+		return nil, err
+	}
+	if r.teardownOldestAge, err = meter.Float64Gauge("sandbox_teardown_oldest_age_seconds"); err != nil {
 		return nil, err
 	}
 	if r.dbIdleConns, err = meter.Int64Gauge("db_pool_idle_conns"); err != nil {
@@ -139,7 +275,91 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if r.dbAcquireDurationSeconds, err = meter.Float64Counter("db_pool_acquire_duration_seconds_total"); err != nil {
 		return nil, err
 	}
+	if r.pausedNetworkSlotsTotal, err = meter.Int64Gauge("vmd_network_slots_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkSlotsUsed, err = meter.Int64Gauge("vmd_network_slots_used"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkSlotsAvail, err = meter.Int64Gauge("vmd_network_slots_available"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkPoolSlots, err = meter.Int64Gauge("vmd_network_pool_slots"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkNetnsTotal, err = meter.Int64Gauge("vmd_network_netns_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkMountTotal, err = meter.Int64Gauge("vmd_network_mounts_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkPressure, err = meter.Int64Gauge("vmd_network_controller_pressure_state"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkReclaimed, err = meter.Int64Counter("vmd_network_slots_reclaimed_total"); err != nil {
+		return nil, err
+	}
+	if r.pausedNetworkPaused, err = meter.Int64Counter("vmd_network_slots_reclaimed_paused_total"); err != nil {
+		return nil, err
+	}
+	if r.launcherReady, err = meter.Int64Gauge("vmd_launcher_ready"); err != nil {
+		return nil, err
+	}
+	if r.peerConnections, err = meter.Int64UpDownCounter("peer_connections"); err != nil {
+		return nil, err
+	}
+	if r.peerStreams, err = meter.Int64UpDownCounter("peer_active_streams"); err != nil {
+		return nil, err
+	}
+	if r.peerEvents, err = meter.Int64Counter("peer_events_total"); err != nil {
+		return nil, err
+	}
+	if r.peerHandshakeDuration, err = meter.Float64Histogram("peer_handshake_duration_seconds", metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.storageReportFailures, err = meter.Int64Counter("storage_measurement_processing_failure_total"); err != nil {
+		return nil, err
+	}
+	if err = r.initBilling(meter); err != nil {
+		return nil, err
+	}
 	return r, nil
+}
+
+func (r *OTelRecorder) RecordStorageReportFailure(ctx context.Context, f StorageReportFailure) {
+	if r == nil {
+		return
+	}
+	r.storageReportFailures.Add(ctx, 1, metric.WithAttributes(r.attrs(attribute.String("result", safeResult(f.Result)))...))
+}
+
+// RecordPeerEvent emits peer lifecycle observations with bounded enum labels.
+func (r *OTelRecorder) RecordPeerEvent(ctx context.Context, e PeerEvent) {
+	if r == nil {
+		return
+	}
+	attrs := metric.WithAttributes(r.attrs(attribute.String("kind", safePeerKind(e.Kind)), attribute.String("result", safeResult(e.Result)), attribute.String("region", safeRegion(e.Region)), attribute.String("host_id", safeHostID(e.HostID)), attribute.Bool("forced", e.Forced))...)
+	switch e.Kind {
+	case "connection":
+		r.peerConnections.Add(ctx, e.Delta, attrs)
+	case "stream":
+		r.peerStreams.Add(ctx, e.Delta, attrs)
+	case "handshake":
+		if e.Duration > 0 {
+			r.peerHandshakeDuration.Record(ctx, e.Duration.Seconds(), attrs)
+		}
+	default:
+		r.peerEvents.Add(ctx, 1, attrs)
+	}
+}
+
+func safePeerKind(v string) string {
+	switch v {
+	case "connection", "stream", "handshake", "reconnect", "failure", "drain":
+		return v
+	default:
+		return "unknown"
+	}
 }
 
 func (r *OTelRecorder) Shutdown(ctx context.Context) error {
@@ -166,6 +386,28 @@ func (r *OTelRecorder) RecordSandboxTransition(ctx context.Context, t SandboxTra
 	}
 }
 
+// RecordSandboxResumeSettleWait is called at most once per resume request —
+// only when ResumeSandbox actually had to wait out a racing finalize-pause —
+// so its cost does not scale with poll count.
+func (r *OTelRecorder) RecordSandboxResumeSettleWait(ctx context.Context, w SandboxResumeSettleWait) {
+	if r == nil {
+		return
+	}
+	attrs := r.attrs(
+		attribute.String("result", safeSettleResult(w.Result)),
+		attribute.String("region", safeRegion(w.Region)),
+		attribute.String("host_id", safeHostID(w.HostID)),
+	)
+	opt := metric.WithAttributes(attrs...)
+	r.resumeSettleWaits.Add(ctx, 1, opt)
+	if w.Duration > 0 {
+		r.resumeSettleWaitDuration.Record(ctx, w.Duration.Seconds(), opt)
+	}
+	if w.Reads > 0 {
+		r.resumeSettleWaitReads.Record(ctx, w.Reads, opt)
+	}
+}
+
 func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	if r == nil {
 		return
@@ -183,6 +425,106 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	}
 }
 
+func (r *OTelRecorder) RecordRoutingOutcome(ctx context.Context, o RoutingOutcome) {
+	if r == nil {
+		return
+	}
+	r.routingOutcomes.Add(ctx, 1, metric.WithAttributes(r.attrs(
+		attribute.String("outcome", safeRoutingOutcome(o.Outcome)),
+		attribute.String("host_id", safeHostID(o.HostID)),
+	)...))
+}
+
+// normalizeShadowResult and normalizeShadowAgreement keep metric labels
+// bounded. Extracted so the accepted values can be tested against the
+// emitter's: when these drifted apart, every meaningful agreement was
+// silently exported as "other" and the metric looked healthy while
+// measuring nothing.
+// shadowPublishesComposition reports whether a result carries real
+// counts. A failed ranking counted nothing, and composition is a
+// last-value gauge, so its zeros would erase readiness until the next
+// success. "no_candidates" is a genuine answer and does publish.
+func shadowPublishesComposition(result string) bool { return result != "error" }
+
+func normalizeShadowProfile(v string) string {
+	switch v {
+	case "none", "basic", "extended":
+		return v
+	}
+	return "other"
+}
+
+func normalizeShadowResult(v string) string {
+	switch v {
+	case "ranked", "no_candidates", "error":
+		return v
+	}
+	return "other"
+}
+
+func normalizeShadowAgreement(v string) string {
+	switch v {
+	case "in_band", "out_of_band", "unknown":
+		return v
+	}
+	return "other"
+}
+
+// RecordCapacityShadow emits the shadow evaluation. The host-composition
+// gauges are what tell an operator whether the fleet is ready for
+// enforcement: enabling admission while most hosts are legacy or stale
+// would rank on numbers that barely exist.
+func (r *OTelRecorder) RecordCapacityShadow(ctx context.Context, c CapacityShadow) {
+	if r == nil {
+		return
+	}
+	result, agreement := normalizeShadowResult(c.Result), normalizeShadowAgreement(c.Agreement)
+	profile := normalizeShadowProfile(c.Profile)
+	// A periodic refresh republishes composition only. It has no create
+	// behind it, so it belongs in neither the agreement breakdown nor
+	// the duration distribution — both describe sampled traffic, and
+	// refreshes are densest precisely when traffic is absent.
+	if !c.Refresh {
+		// The agreement histogram carries the profile too: without it,
+		// traffic from the dominant capability profile drowns out poor
+		// agreement on another.
+		r.capacityShadowDuration.Record(ctx, c.Duration.Seconds(), metric.WithAttributes(r.attrs(
+			attribute.String("result", result),
+			attribute.String("agreement", agreement),
+			attribute.String("profile", profile),
+		)...))
+	}
+	if !shadowPublishesComposition(result) {
+		return
+	}
+	for kind, n := range map[string]int{
+		"described":       c.Described,
+		"under_described": c.UnderDescribed,
+		"legacy":          c.Legacy,
+		"stale":           c.Stale,
+	} {
+		r.capacityShadowHosts.Record(ctx, int64(n), metric.WithAttributes(r.attrs(
+			attribute.String("kind", kind),
+			attribute.String("profile", profile),
+		)...))
+	}
+}
+
+func (r *OTelRecorder) RecordHostResolution(ctx context.Context, h HostResolution) {
+	if r == nil {
+		return
+	}
+	kind := h.Kind
+	if kind != "cold" && kind != "due" {
+		kind = "other"
+	}
+	opt := metric.WithAttributes(r.attrs(
+		attribute.String("kind", kind),
+		attribute.String("result", safeResult(h.Result)),
+	)...)
+	r.hostResolutionDuration.Record(ctx, h.Duration.Seconds(), opt)
+}
+
 func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {
 	if r == nil {
 		return
@@ -192,6 +534,45 @@ func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {
 	r.hostVCPU.Record(ctx, c.UsedVCPU, opt)
 	r.hostMemoryMiB.Record(ctx, c.UsedMemoryMiB, opt)
 	r.hostSandboxes.Record(ctx, c.Sandboxes, opt)
+}
+
+// RecordBackupCoverage replaces the published durability-coverage
+// snapshot. Zero-valued entries are kept (an explicit zero is what lets
+// the coverage alert clear deterministically), a negative age from
+// clock skew between the database and the sampler clamps to zero, and
+// a nil snapshot means this replica is not the elected sampler and must
+// export nothing.
+func (r *OTelRecorder) RecordBackupCoverage(_ context.Context, snapshot []BackupCoverage) {
+	if r == nil {
+		return
+	}
+	cleaned := make([]BackupCoverage, 0, len(snapshot))
+	for _, c := range snapshot {
+		if c.OldestUncoveredAgeSeconds < 0 {
+			c.OldestUncoveredAgeSeconds = 0
+		}
+		cleaned = append(cleaned, c)
+	}
+	r.backupCoverageMu.Lock()
+	r.backupCoverage = cleaned
+	r.backupCoverageMu.Unlock()
+}
+
+// observeBackupCoverage exports the current coverage snapshot. Series
+// absent from the snapshot are simply not observed, which is how a
+// group that lost its last paused sandbox (or a replica that lost the
+// sampler lease) retires its series instead of freezing them.
+func (r *OTelRecorder) observeBackupCoverage(_ context.Context, o metric.Observer) error {
+	r.backupCoverageMu.Lock()
+	snapshot := r.backupCoverage
+	r.backupCoverageMu.Unlock()
+	for _, c := range snapshot {
+		attrs := r.attrs(attribute.String("region", safeRegion(c.Region)), attribute.String("host_id", safeHostID(c.HostID)))
+		opt := metric.WithAttributes(attrs...)
+		o.ObserveInt64(r.backupUncoveredPaused, c.UncoveredPaused, opt)
+		o.ObserveFloat64(r.backupUncoveredOldestAge, c.OldestUncoveredAgeSeconds, opt)
+	}
+	return nil
 }
 
 func (r *OTelRecorder) RecordDBPoolStats(ctx context.Context, s DBPoolStats) {
@@ -217,6 +598,139 @@ func (r *OTelRecorder) RecordDBPoolStats(ctx context.Context, s DBPoolStats) {
 	}
 }
 
+// RecordTeardownAttempt counts one reclaim attempt by where it ran and how
+// it ended.
+func (r *OTelRecorder) RecordTeardownAttempt(ctx context.Context, a TeardownAttempt) {
+	if r == nil {
+		return
+	}
+	r.teardownAttempts.Add(ctx, 1, metric.WithAttributes(r.attrs(
+		attribute.String("path", safeTeardownPath(a.Path)),
+		attribute.String("result", safeTeardownResult(a.Result)),
+	)...))
+}
+
+// RecordTeardownBacklog publishes the reclaims still owed: all of them, the
+// ones being retried, the ones no retry can fix, and the age of the oldest.
+func (r *OTelRecorder) RecordTeardownBacklog(ctx context.Context, b TeardownBacklog) {
+	if r == nil {
+		return
+	}
+	for state, n := range map[string]int64{"total": b.Total, "retrying": b.Retrying, "permanent": b.Permanent} {
+		r.teardownBacklog.Record(ctx, n, metric.WithAttributes(r.selfAttrs(attribute.String("state", state))...))
+	}
+	r.teardownOldestAge.Record(ctx, max(b.OldestAgeSeconds, 0), metric.WithAttributes(r.selfAttrs()...))
+}
+
+// RecordLauncherState emits vmd_launcher_ready as 1/0. Alert on it: a sustained
+// 0 means every Firecracker start on that host is walking the full mount table,
+// which is customer-visible latency long before anything errors.
+func (r *OTelRecorder) RecordLauncherState(ctx context.Context, s LauncherState) {
+	if r == nil {
+		return
+	}
+	ready := int64(0)
+	if s.Ready {
+		ready = 1
+	}
+	r.launcherReady.Record(ctx, ready, metric.WithAttributes(r.selfAttrs()...))
+}
+
+// RecordLatencyPhase emits one phase sample into the shared phase histogram.
+// Empty labels record as "unknown"/"none" so a missing value can never mint
+// an unbounded series, and the host label falls back to the recorder's own
+// host identity (vmd/proxy set it at construction; the control plane passes
+// the scheduled host per call).
+func (r *OTelRecorder) RecordLatencyPhase(ctx context.Context, p LatencyPhase) {
+	if r == nil {
+		return
+	}
+	host := p.HostID
+	if host == "" {
+		host = r.hostID
+	}
+	mode := p.Mode
+	if mode == "" {
+		mode = "none"
+	}
+	r.phaseDuration.Record(ctx, p.Duration.Seconds(), metric.WithAttributes(r.attrs(
+		attribute.String("plane", safeLabel(p.Plane)),
+		attribute.String("op", safeLabel(p.Op)),
+		attribute.String("phase", safeLabel(p.Phase)),
+		attribute.String("mode", safeLabel(mode)),
+		attribute.String("region", safeRegion(p.Region)),
+		attribute.String("host_id", safeHostID(host)),
+	)...))
+}
+
+// RecordPeerIngress emits one bounded listener/authentication/stream event.
+func (r *OTelRecorder) RecordPeerIngress(ctx context.Context, p PeerIngress) {
+	if r == nil {
+		return
+	}
+	hostID := p.HostID
+	if hostID == "" {
+		hostID = r.hostID
+	}
+	opts := metric.WithAttributes(r.attrs(
+		attribute.String("event", safeLabel(p.Event)),
+		attribute.String("result", safeResult(p.Result)),
+		attribute.String("region", safeRegion(p.Region)),
+		attribute.String("host_id", safeHostID(hostID)),
+	)...)
+	r.peerIngressEvents.Add(ctx, 1, opts)
+	if p.Duration > 0 {
+		r.peerIngressDuration.Record(ctx, p.Duration.Seconds(), opts)
+	}
+}
+
+func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p PausedNetworkPressure) {
+	if r == nil {
+		return
+	}
+	// These describe the emitting host's own network state, so they carry
+	// host_id — without it every cell's series collapse into one and cannot be
+	// alerted on or attributed per host.
+	attrs := r.selfAttrs()
+	opt := metric.WithAttributes(attrs...)
+	r.pausedNetworkSlotsTotal.Record(ctx, p.TotalSlots, opt)
+	r.pausedNetworkSlotsUsed.Record(ctx, p.UsedSlots, opt)
+	r.pausedNetworkSlotsAvail.Record(ctx, p.AvailableSlots, opt)
+	r.pausedNetworkPoolSlots.Record(ctx, p.FreshPool, metric.WithAttributes(append(attrs, attribute.String("type", "fresh"))...))
+	r.pausedNetworkPoolSlots.Record(ctx, p.RecycledPool, metric.WithAttributes(append(attrs, attribute.String("type", "recycled"))...))
+	r.pausedNetworkNetnsTotal.Record(ctx, p.NetnsTotal, opt)
+	r.pausedNetworkMountTotal.Record(ctx, p.MountTotal, opt)
+	currentReason := safePressureReason(p.PressureState)
+	for _, reason := range []string{"idle", "slot", "kernel", "both"} {
+		value := int64(0)
+		if reason == currentReason {
+			value = 1
+		}
+		r.pausedNetworkPressure.Record(ctx, value, metric.WithAttributes(append(attrs, attribute.String("reason", reason))...))
+	}
+	if p.ReclaimedRecycle > 0 {
+		r.pausedNetworkReclaimed.Add(ctx, p.ReclaimedRecycle, metric.WithAttributes(append(attrs, attribute.String("mode", "recycle"))...))
+	}
+	if p.ReclaimedTeardown > 0 {
+		r.pausedNetworkReclaimed.Add(ctx, p.ReclaimedTeardown, metric.WithAttributes(append(attrs, attribute.String("mode", "teardown"))...))
+	}
+	if p.ReclaimedPaused > 0 {
+		r.pausedNetworkPaused.Add(ctx, p.ReclaimedPaused, opt)
+	}
+}
+
+// selfAttrs labels a series with the host that EMITTED it, for gauges that
+// describe this process's own host rather than a call's target. Kept separate
+// from attrs: the call-flavoured recorders already carry a host_id meaning
+// "the host this operation addressed", and a second key would collide.
+func (r *OTelRecorder) selfAttrs(extra ...attribute.KeyValue) []attribute.KeyValue {
+	return append([]attribute.KeyValue{
+		attribute.String("service.name", r.serviceName),
+		attribute.String("environment", r.environment),
+		attribute.String("host_id", r.hostID),
+	}, extra...)
+}
+
 func (r *OTelRecorder) attrs(extra ...attribute.KeyValue) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.String("service.name", r.serviceName),
@@ -227,10 +741,46 @@ func (r *OTelRecorder) attrs(extra ...attribute.KeyValue) []attribute.KeyValue {
 
 func safeResult(v string) string {
 	switch v {
-	case ResultSuccess, ResultError, ResultConflict, ResultTimeout:
+	case ResultSuccess, ResultError, ResultConflict, ResultTimeout, ResultClientError:
 		return v
 	default:
 		return ResultError
+	}
+}
+
+func safeTeardownPath(v string) string {
+	switch v {
+	case "delete", "sweep":
+		return v
+	default:
+		return "unknown"
+	}
+}
+
+func safeTeardownResult(v string) string {
+	switch v {
+	case "completed", "deferred", "timeout", "permanent", "skipped":
+		return v
+	default:
+		return "unknown"
+	}
+}
+
+func safeRoutingOutcome(v string) string {
+	switch v {
+	case "local", "remote", "hint_local", "hint_remote", "ownership_error", "peer_error", "not_found":
+		return v
+	default:
+		return "ownership_error"
+	}
+}
+
+func safeSettleResult(v string) string {
+	switch v {
+	case SettleResultSettled, SettleResultTimeout:
+		return v
+	default:
+		return SettleResultTimeout
 	}
 }
 
@@ -254,7 +804,25 @@ func safeMethod(v string) string {
 	}
 }
 
+func safePressureReason(v string) string {
+	switch v {
+	case "idle", "slot", "kernel", "both":
+		return v
+	default:
+		return "idle"
+	}
+}
+
 func safeRegion(v string) string {
+	if v == "" {
+		return "unknown"
+	}
+	return boundedPeerLabel(v)
+}
+
+// safeLabel bounds a metric label: empty records as "unknown" rather than an
+// empty string, keeping every series addressable in queries.
+func safeLabel(v string) string {
 	if v == "" {
 		return "unknown"
 	}
@@ -265,5 +833,100 @@ func safeHostID(v string) string {
 	if v == "" {
 		return "unknown"
 	}
-	return v
+	return boundedPeerLabel(v)
+}
+
+// Peer labels are caller-supplied identifiers; cap their size before they
+// cross the metrics boundary so malformed values cannot create oversized or
+// effectively unbounded series attributes.
+func boundedPeerLabel(v string) string {
+	const max = 64
+	r := []rune(v)
+	if len(r) > max {
+		r = r[:max]
+	}
+	return string(r)
+}
+
+// newOTLPMeterProvider builds the OTLP/HTTP exporter, resource, and
+// periodic-reader meter provider shared by every recorder in this
+// package. cfg must already have its defaults applied.
+func newOTLPMeterProvider(ctx context.Context, cfg OTelConfig) (*sdkmetric.MeterProvider, error) {
+	exporterOpts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpointURL(cfg.Endpoint)}
+	if cfg.Insecure || strings.HasPrefix(cfg.Endpoint, "http://") {
+		exporterOpts = append(exporterOpts, otlpmetrichttp.WithInsecure())
+	}
+	exporter, err := otlpmetrichttp.New(ctx, exporterOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("create otlp metric exporter: %w", err)
+	}
+
+	res, err := buildOTelResource(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create otel resource: %w", err)
+	}
+
+	return sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(cfg.ExportInterval))),
+	), nil
+}
+
+// NewInstanceID generates a random per-process identity for
+// OTelConfig.InstanceID / BackupOTelConfig.InstanceID. A process that
+// constructs more than one recorder — vmd builds both an OTelRecorder and
+// a BackupRecorder — must call this once and pass the same value to every
+// recorder it builds. Left to each constructor's own default, every
+// recorder in the process mints its own random ID, and GMP ends up
+// representing one process as several different service.instance.id
+// targets instead of one.
+func NewInstanceID() string {
+	return resolveInstanceID("")
+}
+
+// resolveInstanceID returns id unchanged if the caller supplied one, or a
+// freshly generated one otherwise. Every constructor that builds a meter
+// provider (NewOTelRecorder, NewBackupRecorder) must call this itself
+// before using cfg.InstanceID: OTelConfig is passed by value throughout
+// this package, so a default applied only inside a shared helper like
+// newOTLPMeterProvider or buildOTelResource never propagates back to the
+// caller's copy, silently leaving that caller's resource attribute empty.
+func resolveInstanceID(id string) string {
+	if id != "" {
+		return id
+	}
+	return uuid.New().String()
+}
+
+// buildOTelResource is the process-level identity attached once per
+// MeterProvider (as opposed to attrs()/selfAttrs(), which are stamped on
+// every individual data point). cfg must already have InstanceID resolved
+// via resolveInstanceID — see NewOTelRecorder and NewBackupRecorder.
+func buildOTelResource(cfg OTelConfig) (*resource.Resource, error) {
+	return resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes("",
+			attribute.String("service.name", cfg.ServiceName),
+			attribute.String("service.version", cfg.ServiceVersion),
+			attribute.String("environment", cfg.Environment),
+			// Gives GMP's prometheus_target resource mapping a real
+			// per-process instance identity to key on instead of falling
+			// back to whatever the collector's own resourcedetection fills
+			// in — see OTelConfig.InstanceID.
+			attribute.String("service.instance.id", cfg.InstanceID),
+		),
+	)
+}
+
+func (r *OTelRecorder) RecordOwnershipLookup(ctx context.Context, lookup OwnershipLookup) {
+	if r == nil {
+		return
+	}
+	result := lookup.Result
+	switch result {
+	case "success", "error", "timeout", "canceled":
+	default:
+		result = "error"
+	}
+	r.ownershipLookupDuration.Record(ctx, lookup.Duration.Seconds(), metric.WithAttributes(r.attrs(attribute.String("result", result), attribute.String("host_id", r.hostID))...))
 }

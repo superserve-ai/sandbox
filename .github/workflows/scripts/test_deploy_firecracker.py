@@ -1,0 +1,204 @@
+import hashlib
+import importlib.util
+import unittest.mock
+import os
+import tempfile
+import unittest
+
+_spec = importlib.util.spec_from_file_location(
+    "deploy_firecracker",
+    os.path.join(os.path.dirname(__file__), "deploy-firecracker.py"),
+)
+deploy_firecracker = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(deploy_firecracker)
+
+
+class InstallScriptSafetyTest(unittest.TestCase):
+    """The install script's invariants, each of which has a failure mode that
+    is silent rather than loud if it regresses."""
+
+    def setUp(self):
+        self.script = deploy_firecracker.install_script("v1.2.3", "a" * 64)
+        # Comments legitimately name the pitfalls they warn about, so
+        # command-level assertions look at executable lines only.
+        self.commands = "\n".join(
+            line for line in self.script.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+
+    def test_install_is_gated_on_a_verified_backup(self):
+        # The install must not proceed unless the backup provably holds the
+        # bytes it is about to replace: an interrupted or out-of-space copy
+        # can leave a partial file, and overwriting the live binary against it
+        # destroys the only good copy.
+        verify = self.commands.index('"$backup_digest" != "$live_digest"')
+        install = self.commands.index('mv -f "$incoming" "$live"')
+        self.assertLess(verify, install, "backup must be verified before install")
+        self.assertRegex(
+            self.commands, r'backup_digest" != "\$live_digest"[^\n]*\n[^\n]*\n\s*exit 1',
+            "a mismatched backup must abort",
+        )
+
+    def test_backup_is_written_atomically(self):
+        # A backup written straight to its final name can be left partial and
+        # then trusted by the next run, which skips an existing path.
+        self.assertRegex(self.commands, r'cp "\$live" "\$backup\.tmp"')
+        self.assertRegex(self.commands, r'mv -f "\$backup\.tmp" "\$backup"')
+
+    def test_replaces_the_live_binary_by_rename(self):
+        # Writing to the live pathname directly exposes a window where a
+        # launching sandbox execs a half-written binary, and fails with
+        # ETXTBSY while any sandbox is running from it.
+        self.assertRegex(
+            self.commands,
+            r'install -m 0755 "\$staged" "\$incoming"',
+            "install must write a temporary file, not the live path",
+        )
+        self.assertRegex(
+            self.commands,
+            r'mv -f "\$incoming" "\$live"',
+            "the temporary file must be renamed over the live path",
+        )
+        self.assertNotRegex(
+            self.commands,
+            r'install -m 0755 "\$staged" "\$live"',
+            "must never install straight onto the live path",
+        )
+
+    def test_backup_does_not_use_update_none(self):
+        # `--update=none` needs coreutils >= 9.3 and fails on the older hosts.
+        self.assertNotIn("--update=none", self.commands)
+
+    def test_the_staged_copy_is_cleared_however_the_run_exits(self):
+        # An aborted run must not leave the binary it uploaded on the host.
+        self.assertRegex(self.commands, r"""trap 'rm -f "\$staged"' EXIT""")
+
+    def test_verifies_digest_before_and_after_install(self):
+        # Before: the bytes that arrived are the bytes that were built.
+        self.assertIn("sha256sum -c -", self.script)
+        # After: the swap actually landed.
+        self.assertIn("post-install digest", self.script)
+
+    def test_checks_capability_while_still_staged(self):
+        # The loader/capability pre-check must happen against the staged copy,
+        # so a binary this host cannot run is rejected with the live one intact.
+        staged_check = self.script.index('"$staged" --version')
+        install = self.script.index("sudo install")
+        self.assertLess(staged_check, install)
+        self.assertIn(deploy_firecracker.REQUIRED_CAPABILITY, self.script)
+
+    def test_is_idempotent_when_already_at_the_target(self):
+        # Re-running must not manufacture a second backup of a binary that is
+        # already the target.
+        self.assertIn("already at $digest", self.script)
+
+
+    def test_backup_is_named_after_the_digest_it_preserves(self):
+        # A per-version name is wrong the second time a version is deployed:
+        # `cp -n` keeps the older file and the real predecessor is lost.
+        self.assertRegex(
+            self.commands,
+            r'backup="\$live\.pre-\$\{live_digest:0:12\}\.bak"',
+            "the backup name must derive from the live binary's digest",
+        )
+        self.assertNotIn("pre-v1.2.3.bak", self.commands)
+
+
+class RegionTest(unittest.TestCase):
+    def test_an_unset_region_is_refused(self):
+        # Cells share a project and a label, so no region means every cell at
+        # once rather than the one being deployed.
+        import io
+        import contextlib
+        env = {"GCP_PROJECT": "p", "VMD_LABEL": "l", "GCP_REGION": "  "}
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                unittest.mock.patch("sys.argv", ["x", "--version", "v1"]):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = deploy_firecracker.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("GCP_REGION is unset", err.getvalue())
+
+
+class PreflightStateTest(unittest.TestCase):
+    """A rollout that stopped halfway must still be completable."""
+
+    A = "a" * 64   # the verified rollback binary
+    B = "b" * 64   # the target release
+    C = "c" * 64   # anything else
+
+    def test_a_host_not_yet_updated_is_accepted(self):
+        ok, _ = deploy_firecracker.host_state(self.A, None, self.A, self.B)
+        self.assertTrue(ok)
+
+    def test_a_host_already_updated_is_accepted_when_it_can_still_roll_back(self):
+        # The retry case: the first cell installed, the second failed. Both
+        # states have to pass or the rollout can never be finished.
+        ok, _ = deploy_firecracker.host_state(self.B, self.A, self.A, self.B)
+        self.assertTrue(ok)
+
+    def test_a_host_at_the_target_passes_without_a_local_backup(self):
+        # During a ROLLBACK the untouched hosts are already at the target and
+        # never had the binary being rolled back from, so they cannot hold a
+        # backup of it. Demanding one would let them block the rollback of the
+        # hosts that were actually changed.
+        ok, why = deploy_firecracker.host_state(self.B, None, self.A, self.B)
+        self.assertTrue(ok)
+        self.assertIn("break-glass", why)
+
+    def test_a_rollback_across_a_partly_updated_cell_is_accepted(self):
+        # Rolling back from B to A: the updated host is on B (the expected
+        # binary), the untouched one is already on A (the target). Both must
+        # pass or the rollback cannot run.
+        updated, _ = deploy_firecracker.host_state(self.B, self.A, self.B, self.A)
+        untouched, _ = deploy_firecracker.host_state(self.A, None, self.B, self.A)
+        self.assertTrue(updated)
+        self.assertTrue(untouched)
+
+    def test_an_unknown_binary_is_refused(self):
+        ok, why = deploy_firecracker.host_state(self.C, self.A, self.A, self.B)
+        self.assertFalse(ok)
+        self.assertIn("neither", why)
+
+
+class ExpectedDigestTest(unittest.TestCase):
+    def test_a_malformed_expected_digest_is_refused(self):
+        # A pinned rollback digest that is not a digest would otherwise be
+        # compared against real ones and never match, or worse be empty and
+        # silently skip the binding entirely.
+        import io
+        import contextlib
+        env = {
+            "GCP_PROJECT": "p", "VMD_LABEL": "l", "GCP_REGION": "us-east4",
+            "EXPECTED_CURRENT_SHA256": "not-a-digest",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                unittest.mock.patch("sys.argv", ["x", "--version", "v1"]), \
+                unittest.mock.patch.object(
+                    deploy_firecracker, "fetch_release", return_value=("/tmp/x", "a" * 64)), \
+                unittest.mock.patch.object(
+                    deploy_firecracker, "list_instances",
+                    return_value=[{"name": "h", "zone": "us-east4-a"}]):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = deploy_firecracker.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("not a sha256 digest", err.getvalue())
+
+
+class DigestTest(unittest.TestCase):
+    def test_sha256_of_matches_hashlib(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"firecracker bytes")
+            path = f.name
+        try:
+            self.assertEqual(
+                deploy_firecracker.sha256_of(path),
+                hashlib.sha256(b"firecracker bytes").hexdigest(),
+            )
+        finally:
+            os.unlink(path)
+
+
+if __name__ == "__main__":
+    unittest.main()

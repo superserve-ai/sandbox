@@ -51,3 +51,36 @@ variable "labels" {
   type        = map(string)
   default     = {}
 }
+
+variable "runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
+  }
+}
+
+variable "runbook_ids" {
+  description = "Page IDs for the shared investigation, correlation, and containment runbooks."
+  type = object({
+    investigation = string
+    correlation   = string
+    containment   = string
+  })
+  default = {
+    investigation = "3b1743ab8733814b8525eb393089deec"
+    correlation   = "3b1743ab873381289015f1a8ccc8753e"
+    containment   = "3a4743ab87338171ab19eafdbd3808d2"
+  }
+  nullable = false
+
+  validation {
+    condition = alltrue([
+      for id in values(var.runbook_ids) : can(regex("^[A-Za-z0-9_-]+$", id))
+    ])
+    error_message = "All three runbook IDs must be nonempty page IDs containing only letters, digits, underscores, or hyphens."
+  }
+}

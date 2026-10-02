@@ -29,18 +29,44 @@ import (
 )
 
 func main() {
+	// Subcommand dispatch ahead of flag parsing: `revive`, `discrepancy`
+	// and `migrate` own their flag sets.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "revive":
+			os.Exit(runRevive(os.Args[2:]))
+		case "discrepancy":
+			os.Exit(runDiscrepancy(os.Args[2:]))
+		case "migrate":
+			os.Exit(runMigrate(os.Args[2:]))
+		}
+	}
 	bucket := flag.String("bucket", "", "backup bucket name")
 	sandbox := flag.String("sandbox", "", "sandbox id")
 	generation := flag.String("generation", "", "generation to restore; omit to list the sandbox's restorable generations")
 	dest := flag.String("dest", "", "destination directory for restored artifacts")
+	hostRestore := flag.String("host-restore", "", "bulk DR mode: restore every live sandbox the DB pins to this host id")
+	dbURL := flag.String("db-url", os.Getenv("DATABASE_URL"), "control-plane DB URL for host enumeration (default $DATABASE_URL)")
+	sandboxesFile := flag.String("sandboxes-file", "", "host enumeration from a file (one sandbox id per line) when the DB is unreachable")
+	destRoot := flag.String("dest-root", "", "bulk mode: root directory; each sandbox restores into <dest-root>/<sandbox-id>")
+	concurrency := flag.Int("concurrency", 4, "bulk mode: parallel restores")
+	execute := flag.Bool("execute", false, "bulk mode: actually materialize (default is a dry-run coverage ledger)")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: backup-restore -bucket <bucket> -sandbox <id> -generation <gen> -dest <dir>")
 		fmt.Fprintln(os.Stderr, "       backup-restore -bucket <bucket> -sandbox <id>   (list restorable generations, newest first)")
+		fmt.Fprintln(os.Stderr, "       backup-restore revive -manifest <file>          (cold-boot dead sandboxes from salvaged disks, on-host)")
+		fmt.Fprintln(os.Stderr, "       backup-restore discrepancy -bucket <bucket>     (classify paused sandboxes lacking a verified backup; read-only)")
+		fmt.Fprintln(os.Stderr, "       backup-restore migrate -from-host <id> -to-host <id> -restore-root <dir>  (re-pin and cold-boot restored sandboxes here, on-host)")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	if *bucket == "" || *sandbox == "" {
+	if *hostRestore != "" {
+		if *bucket == "" || *destRoot == "" {
+			fmt.Fprintln(os.Stderr, "-host-restore requires -bucket and -dest-root")
+			os.Exit(2)
+		}
+	} else if *bucket == "" || *sandbox == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -71,6 +97,10 @@ func main() {
 	}
 	defer client.Close()
 	reader := backup.NewGCSReader(client, *bucket)
+
+	if *hostRestore != "" {
+		os.Exit(runHostRestore(ctx, reader, reader, *hostRestore, *dbURL, *sandboxesFile, *destRoot, *concurrency, *execute))
+	}
 
 	if *generation == "" {
 		generations, err := backup.ListGenerations(ctx, reader, *sandbox)

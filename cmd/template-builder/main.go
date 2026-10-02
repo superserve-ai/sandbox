@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,7 +33,17 @@ import (
 
 const boxdPort = 49983
 
+var eventOutputClosed atomic.Bool
+
+func configureBuildEventOutput() {
+	// A builder can outlive the VMD process that owns its stdout reader.
+	// Broken event output must not terminate the build before it writes metadata.
+	signal.Ignore(syscall.SIGPIPE)
+}
+
 func main() {
+	configureBuildEventOutput()
+
 	templateID := flag.String("template-id", "", "template UUID")
 	buildID := flag.String("build-id", "", "build UUID for tracking")
 	specJSON := flag.String("spec", "", "build spec JSON")
@@ -45,6 +57,9 @@ func main() {
 	boxdBin := flag.String("boxd", "", "path to boxd binary")
 	hostIface := flag.String("host-interface", "ens4", "host network interface")
 	slotIndex := flag.Int("slot-index", 200, "network slot index (must not collide with vmd)")
+	launcherNS := flag.String("launcher-ns", "", "path to vmd's pruned launcher mount-namespace pin; empty selects the legacy `ip netns exec` launch")
+	netlinkOps := flag.Bool("netlink-slot-ops", false, "build this VM's network slot over netlink instead of forking iproute2")
+	freezeWorkload := flag.Bool("freeze-workload", false, "freeze the guest's workload for the snapshot when it proves it corrects its clock, and mark the image")
 	timeout := flag.Duration("timeout", 15*time.Minute, "build timeout")
 	flag.Parse()
 
@@ -70,19 +85,22 @@ func main() {
 	}()
 
 	err := runBuild(ctx, buildConfig{
-		templateID:  *templateID,
-		buildID:     *buildID,
-		spec:        spec,
-		vcpu:        uint32(*vcpu),
-		memoryMiB:   uint32(*memory),
-		diskMiB:     uint32(*disk),
-		runDir:      *runDir,
-		snapshotDir: *snapshotDir,
-		kernelPath:  *kernelPath,
-		fcBin:       *fcBin,
-		boxdBin:     *boxdBin,
-		hostIface:   *hostIface,
-		slotIndex:   *slotIndex,
+		templateID:     *templateID,
+		buildID:        *buildID,
+		spec:           spec,
+		vcpu:           uint32(*vcpu),
+		memoryMiB:      uint32(*memory),
+		diskMiB:        uint32(*disk),
+		runDir:         *runDir,
+		snapshotDir:    *snapshotDir,
+		kernelPath:     *kernelPath,
+		fcBin:          *fcBin,
+		boxdBin:        *boxdBin,
+		hostIface:      *hostIface,
+		slotIndex:      *slotIndex,
+		launcherNS:     *launcherNS,
+		netlinkOps:     *netlinkOps,
+		freezeWorkload: *freezeWorkload,
 	})
 	if err != nil {
 		// Emit a user-visible error (stable code + user-friendly message)
@@ -175,10 +193,23 @@ type buildConfig struct {
 	boxdBin     string
 	hostIface   string
 	slotIndex   int
+	launcherNS  string
+	netlinkOps  bool
+	// freezeWorkload builds the image with its workload freezer and, once the
+	// guest has proven it corrects its clock, snapshots it frozen. Passed by
+	// the supervisor that forks this build, from its own switch: a frozen
+	// image is only safe under one that can wake it.
+	freezeWorkload bool
 }
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
-	buildVMID := "build-" + cfg.templateID
+	// The build id names the runtime: the socket, overlay and network of
+	// this build alone, so two builds of one template can run side by side.
+	// The template-derived name remains for a caller that supplies no id.
+	buildVMID := cfg.buildID
+	if buildVMID == "" {
+		buildVMID = "build-" + cfg.templateID
+	}
 	// Per-build subdir — rebuilds don't disturb existing sandboxes.
 	rootfsDir := filepath.Join(cfg.runDir, vm.TemplatesDirName, cfg.templateID, cfg.buildID)
 	basePath := filepath.Join(rootfsDir, "base.ext4")
@@ -209,6 +240,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		BoxdBinaryPath:           cfg.boxdBin,
 		MaxUncompressedSizeBytes: int64(cfg.diskMiB) * 1024 * 1024,
 		ProxyCACertPath:          proxyCA,
+		FreezeWorkload:           cfg.freezeWorkload,
 	})
 	if err != nil {
 		return fmt.Errorf("create builder: %w", err)
@@ -227,7 +259,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 
 	// Single slot, no pool, no egress proxy — build VMs don't need them.
-	netMgr, netInfo, cleanup, err := setupNetwork(ctx, cfg.hostIface, cfg.slotIndex, buildVMID)
+	netMgr, netInfo, cleanup, err := setupNetwork(ctx, cfg.hostIface, cfg.slotIndex, buildVMID, cfg.netlinkOps)
 	if err != nil {
 		return fmt.Errorf("setup network: %w", err)
 	}
@@ -257,7 +289,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		GatewayIP:  network.VMGatewayIP,
 	}
 
-	pid, err := startFirecracker(ctx, cfg.fcBin, socketPath, fcCfg, netInfo.Namespace, cfg.runDir, perVMOverlay, basePath)
+	pid, err := startFirecracker(ctx, cfg.fcBin, socketPath, fcCfg, netInfo.Namespace, cfg.runDir, perVMOverlay, basePath, cfg.launcherNS)
 	if err != nil {
 		return fmt.Errorf("start firecracker: %w", err)
 	}
@@ -305,6 +337,43 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		return fmt.Errorf("guest sync: %w", err)
 	}
 
+	// Ask the guest, in the state the snapshot captures, whether it can correct
+	// its wall clock and freeze its workload; only then may the image be marked.
+	correctsWallClock, why := false, "template workload freezing not enabled"
+	if cfg.freezeWorkload {
+		correctsWallClock, why = boxdWallClockProven(ctx, netInfo.HostIP)
+	}
+	// The token this image's freeze carries; every wake of a sandbox created
+	// from it must present it. Minted here, kept by the guest in the snapshot.
+	freezeToken := vm.NewFreezeToken()
+	if correctsWallClock {
+		// The rollback floor rises before the first frozen artifact can exist
+		// on this host: a supervisor without the wake protocol must never be
+		// installed over one, so a floor that cannot be made durable fails
+		// the build rather than freeze anything.
+		if err := vm.RaiseWakeProtocolFloor(); err != nil {
+			return fmt.Errorf("raise wake-protocol floor: %w", err)
+		}
+	}
+	if correctsWallClock {
+		// A freeze whose answer was lost may still have frozen the guest, and
+		// an image with a stopped workload and no manifest would never be
+		// woken. So a failed freeze is followed by a thaw with the same
+		// token: released, or never frozen, means the image is unfrozen and
+		// the build goes on the older way; anything else fails the build.
+		if err := boxdFreezeWorkload(ctx, netInfo.HostIP, freezeToken); err != nil {
+			if terr := boxdThawWorkload(ctx, netInfo.HostIP, freezeToken); terr != nil && !errors.Is(terr, errNoSuchFreeze) {
+				return fmt.Errorf("workload freeze failed (%v) and the guest could not be released (%v); refusing to snapshot a workload in an unknown state", err, terr)
+			}
+			correctsWallClock, why = false, "workload freeze: "+err.Error()
+		}
+	}
+	if correctsWallClock {
+		emitInternal("system", "guest corrects its wall clock and froze its workload: marking template")
+	} else {
+		emitInternal("system", "template stays on the unfrozen restore path (%s)", why)
+	}
+
 	// block_delta_dir → emits rootfs.delta so sandboxes can be created
 	// from this template's snapshot.
 	emitUser("system", "Saving template")
@@ -316,14 +385,34 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	}
 	emitInternal("system", "snapshot captured")
 
+	// The manifest tells a supervisor this image's workload is frozen, that its
+	// guest corrects its clock, and which token the wake must present.
+	markerPath := ""
+	if correctsWallClock {
+		markerPath = vm.WallClockMarkerPath(memPath)
+		man := vm.WallClockManifest{
+			Version: vm.WallClockManifestVersion, ArtifactID: vm.NewArtifactID(),
+			WorkloadFrozen: true, GuestCorrectsClock: true, FreezeToken: freezeToken,
+		}
+		if err := vm.WriteWallClockManifest(memPath, man); err != nil {
+			return fmt.Errorf("write wall-clock manifest: %w", err)
+		}
+	}
+
 	// Flush host page cache for each artifact so a sandbox cp'ing them
 	// later doesn't see sparse holes from still-dirty pages.
-	if err := fsyncBuildArtifacts(snapDir, snapPath, memPath, basePath, deltaPath); err != nil {
+	if err := fsyncBuildArtifacts(snapDir, snapPath, memPath, basePath, deltaPath, markerPath); err != nil {
 		return fmt.Errorf("fsync build artifacts: %w", err)
 	}
 	emitInternal("system", "artifacts fsynced")
 
-	writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, br)
+	// Published last, and whole: the metadata is what tells a supervisor the
+	// directory holds a template, so it appears by rename once everything
+	// else is durable, and a build whose metadata cannot land has not been
+	// published.
+	if err := writeBuildMeta(snapDir, snapPath, memPath, basePath, deltaPath, correctsWallClock, br); err != nil {
+		return fmt.Errorf("publish build metadata: %w", err)
+	}
 
 	return nil
 }
@@ -365,12 +454,22 @@ func fsyncBuildArtifacts(snapDir string, paths ...string) error {
 // Network setup (single slot, no pool)
 // ---------------------------------------------------------------------------
 
-func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID string) (*network.Manager, *network.VMNetInfo, func(), error) {
+func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID string, netlinkOps bool) (*network.Manager, *network.VMNetInfo, func(), error) {
 	log := newLogger("network")
-	mgr, err := network.NewManager(ctx, hostIface, log,
+	// template-builder inherits HOST_ID from the VMD process that launches it.
+	opts := []network.ManagerOption{
 		network.WithExactSlot(slotIndex),
+		network.WithHostID(os.Getenv("HOST_ID")),
 		network.WithHTTPProxyPort(0), // no egress proxy for builds
-	)
+	}
+	// Mirrors the daemon's backend. Building this one slot over iproute2 forks
+	// `ip netns exec` several times, and each fork clones the host mount table
+	// under the global mount lock — stalling unrelated sandbox launches for as
+	// long as it takes. A build must not be able to do that to the fleet.
+	if netlinkOps {
+		opts = append(opts, network.WithNetlinkSlotOps())
+	}
+	mgr, err := network.NewManager(ctx, hostIface, log, opts...)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("new network manager: %w", err)
 	}
@@ -393,17 +492,34 @@ func setupNetwork(ctx context.Context, hostIface string, slotIndex int, vmID str
 // Firecracker launch
 // ---------------------------------------------------------------------------
 
-func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS, runDir, perVMOverlay, basePath string) (int, error) {
+func startFirecracker(ctx context.Context, fcBin, socketPath string, cfg vm.FirecrackerConfig, netNS, runDir, perVMOverlay, basePath, launcherNS string) (int, error) {
 	// Same magic-path setup as vmd's restore — symlinked paths must match
 	// on both sides so the snapshot's baked drive paths resolve.
 	templateDir := vm.TemplateMagicDir(runDir)
 	baseLink := vm.TemplateMagicBasePath(runDir)
 	overlayLink := vm.TemplateMagicOverlayPath(runDir)
+	// Same namespace entry as vmd's launch, from the same resolver: with a
+	// launcher pin the following `unshare -m` clones that pruned table
+	// instead of the host's full one, so a build no longer holds the global
+	// mount lock long enough to stall concurrent sandbox launches. Entry
+	// carries its own sysfs obligation — see LaunchNamespaceEntry.
+	//
+	// Re-checked HERE rather than trusted from the flag: vmd validated the
+	// pin when it spawned this process, but a build pulls and runs an image
+	// first, and across those minutes the daemon can restart and rebuild or
+	// detach the pin. Entering a path that is no longer a pin fails a
+	// perfectly healthy build, so a stale one degrades to the legacy entry.
+	if launcherNS != "" && !vm.LauncherPinUsable(launcherNS) {
+		emitInternal("stderr", "launcher pin no longer mounted; using the legacy namespace entry")
+		launcherNS = ""
+	}
+	entry := vm.LaunchNamespaceEntry(netNS, launcherNS)
 	script := fmt.Sprintf(
-		"mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q && exec %q --api-sock %q --id %q",
-		templateDir, basePath, baseLink, perVMOverlay, overlayLink, fcBin, socketPath, cfg.VMID,
+		"mount --make-rprivate / && mount -t tmpfs tmpfs %q && ln -s %q %q && ln -s %q %q%s && exec %q --api-sock %q --id %q",
+		templateDir, basePath, baseLink, perVMOverlay, overlayLink, entry.SysfsSetup, fcBin, socketPath, cfg.VMID,
 	)
-	cmd := exec.Command("ip", "netns", "exec", netNS, "unshare", "-m", "--", "sh", "-c", script)
+	argv := append(append([]string{}, entry.Argv...), "unshare", "-m", "--", "sh", "-c", script)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	// Surface shell errors from the mount/symlink prelude — without this,
 	// a failure before exec'ing firecracker shows up as an opaque
 	// wait-for-socket timeout. Inherits up to vmd's journald via the
@@ -521,6 +637,149 @@ func postBoxdInit(ctx context.Context, vmIP string, envVars map[string]string, d
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("POST /init: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// boxdWallClockProven reports whether the guest can read host time and set
+// its own clock, and why not. Any failure to ask reads as not proven.
+func boxdWallClockProven(ctx context.Context, vmIP string) (bool, string) {
+	url := fmt.Sprintf("http://%s:%d/verify-clock", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return false, err.Error()
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return false, "POST /verify-clock: " + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, "no workload freezer in this image"
+	}
+	var body struct {
+		WallClock struct {
+			Source    string `json:"source"`
+			SettimeOK bool   `json:"settime_ok"`
+			Error     string `json:"error"`
+		} `json:"wall_clock"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return false, "decode /verify-clock: " + err.Error()
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Sprintf("/verify-clock status %d: %s", resp.StatusCode, body.WallClock.Error)
+	}
+	if body.WallClock.Source != "ptp" {
+		if body.WallClock.Error != "" {
+			return false, body.WallClock.Error
+		}
+		return false, "source " + body.WallClock.Source
+	}
+	if !body.WallClock.SettimeOK {
+		if body.WallClock.Error != "" {
+			return false, body.WallClock.Error
+		}
+		return false, "clock cannot be set"
+	}
+	return true, ""
+}
+
+// boxdFreezeWorkload asks the guest to stop its workload for the snapshot. The
+// guest undoes a freeze it could not complete, so an error means it is running.
+func boxdFreezeWorkload(ctx context.Context, vmIP, token string) error {
+	url := fmt.Sprintf("http://%s:%d/freeze", vmIP, boxdPort)
+	payload, _ := json.Marshal(struct {
+		Token string `json:"token"`
+	}{token})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /freeze: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /freeze: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// The reply names the protocol the guest speaks and the token it holds;
+	// an image is only marked when both are what this builder asked for.
+	var echo struct {
+		Version int    `json:"version"`
+		Token   string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &echo); err != nil {
+		return fmt.Errorf("POST /freeze: reply: %w", err)
+	}
+	if echo.Version != vm.WakeProtocolVersion || echo.Token != token {
+		return fmt.Errorf("POST /freeze: guest speaks protocol %d and holds token %q, asked %d %q", echo.Version, echo.Token, vm.WakeProtocolVersion, token)
+	}
+	return nil
+}
+
+// errNoSuchFreeze: the guest holds no freeze under that token, so there was
+// nothing to release — the freeze never took.
+var errNoSuchFreeze = errors.New("guest holds no freeze under this token")
+
+// boxdThawWorkload releases a freeze whose outcome is unknown. 200 released;
+// 409 with the guest reporting a running workload errNoSuchFreeze; anything
+// else leaves the state unknown. A 409 alone is not proof: the guest answers
+// it both when it holds no freeze under the token and when it holds one under
+// another, and only its own report tells those apart.
+func boxdThawWorkload(ctx context.Context, vmIP, token string) error {
+	url := fmt.Sprintf("http://%s:%d/thaw", vmIP, boxdPort)
+	payload, _ := json.Marshal(struct {
+		Token string `json:"token"`
+	}{token})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /thaw: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusConflict:
+		if err := boxdWorkloadRunning(ctx, vmIP); err != nil {
+			return fmt.Errorf("POST /thaw: %s; %w", strings.TrimSpace(string(body)), err)
+		}
+		return errNoSuchFreeze
+	default:
+		return fmt.Errorf("POST /thaw: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+}
+
+// boxdWorkloadRunning asks the guest whether its workload runs. Anything but
+// a plain ok is not proof that it does.
+func boxdWorkloadRunning(ctx context.Context, vmIP string) error {
+	url := fmt.Sprintf("http://%s:%d/health", vmIP, boxdPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("GET /health: %w", err)
+	}
+	defer resp.Body.Close()
+	var health struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		return fmt.Errorf("decode /health: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || health.Status != "ok" {
+		return fmt.Errorf("guest reports %q (status %d), not a running workload", health.Status, resp.StatusCode)
 	}
 	return nil
 }
@@ -848,7 +1107,7 @@ func createBuildOverlay(runDir, vmID, basePath string) (string, error) {
 // Build metadata
 // ---------------------------------------------------------------------------
 
-func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br builder.BuildRootfsResult) {
+func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, correctsWallClock bool, br builder.BuildRootfsResult) error {
 	// rootfs_path stays in the schema for backwards compat with existing
 	// readers; supervisors that understand overlay use base_path/delta_path.
 	meta := struct {
@@ -861,22 +1120,54 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
 		SwapMode       string `json:"swap_mode"` // see builder.SwapModeGuest
+		// Same fact as the manifest beside mem.snap; kept here for provenance.
+		CorrectsWallClock bool `json:"corrects_wall_clock"`
 	}{
-		SnapshotPath:   snapPath,
-		MemPath:        memPath,
-		RootfsPath:     basePath,
-		BasePath:       basePath,
-		DeltaPath:      deltaPath,
-		ResolvedDigest: br.ResolvedDigest,
-		SizeBytes:      br.SizeBytes,
-		BuiltAt:        time.Now().UTC().Format(time.RFC3339),
-		SwapMode:       builder.SwapModeGuest,
+		SnapshotPath:      snapPath,
+		MemPath:           memPath,
+		RootfsPath:        basePath,
+		BasePath:          basePath,
+		DeltaPath:         deltaPath,
+		ResolvedDigest:    br.ResolvedDigest,
+		SizeBytes:         br.SizeBytes,
+		BuiltAt:           time.Now().UTC().Format(time.RFC3339),
+		SwapMode:          builder.SwapModeGuest,
+		CorrectsWallClock: correctsWallClock,
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(filepath.Join(dir, "build.meta.json"), data, 0o644)
+	final := filepath.Join(dir, "build.meta.json")
+	tmp := final + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // ---------------------------------------------------------------------------
@@ -895,9 +1186,15 @@ type buildEvent struct {
 }
 
 func emit(visibility, stream, format string, args ...any) {
+	if eventOutputClosed.Load() {
+		return
+	}
 	text := fmt.Sprintf(format, args...)
 	line, _ := json.Marshal(buildEvent{Visibility: visibility, Stream: stream, Text: text})
-	fmt.Println(string(line))
+	line = append(line, '\n')
+	if _, err := os.Stdout.Write(line); errors.Is(err, syscall.EPIPE) {
+		eventOutputClosed.Store(true)
+	}
 }
 
 func emitUser(stream, format string, args ...any)     { emit("user", stream, format, args...) }

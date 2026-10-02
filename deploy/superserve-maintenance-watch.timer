@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll for GCE host maintenance notices
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

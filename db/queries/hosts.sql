@@ -15,10 +15,62 @@ INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacit
 VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
--- name: UpdateHostStatus :exec
+-- name: RegisterHost :one
+-- Self-registration from a first heartbeat. Starts in 'provisioning' so the
+-- scheduler never sees the host until an operator activates it. Stamps
+-- last_heartbeat_at because capability attestation keys on it: without a
+-- heartbeat time, InsertHostCapability is a silent no-op.
+INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
+                  capacity_memory_mib, capacity_vcpus, last_heartbeat_at,
+                  identity_bound)
+VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now(), true)
+RETURNING *;
+
+-- name: GetHostForUpdate :one
+-- Row-locked read for the heartbeat's identity check, so the guard and the
+-- heartbeat update see the same row version inside one transaction.
+SELECT * FROM host WHERE id = $1 FOR UPDATE;
+
+-- name: UpdateHostAddresses :exec
+-- Re-provision path: the identity is reclaiming its row from a new address
+-- after the old holder went silent. Guarded by the handler's staleness check.
+-- The reclaim DEMOTES the row to provisioning in the same statement: an
+-- address change is a re-registration, and every holder of the vmd-internal
+-- token can trigger one after two minutes of silence — it must never leave
+-- (or make) a host schedulable without the operator credential re-approving.
+UPDATE host
+SET vmd_addr = $2, proxy_addr = $3, region = $4,
+    capacity_memory_mib = $5, capacity_vcpus = $6,
+    status = 'provisioning', identity_bound = true, updated_at = now()
+WHERE id = $1;
+
+-- name: UpdateHostProxyAddress :exec
+-- Endpoint advertisement changes for the current holder must not alter
+-- lifecycle status; unlike address reclamation, this is not re-provisioning.
+UPDATE host
+SET proxy_addr = $2, updated_at = now()
+WHERE id = $1;
+
+-- name: BindHostIdentity :exec
+-- Opt-in: an existing (legacy) row whose holder sent a complete
+-- self-description at its current address enters identity-bound mode.
+UPDATE host
+SET identity_bound = true, updated_at = now()
+WHERE id = $1;
+
+-- name: UpdateHostStatus :one
+-- Activation requires a live heartbeat: a provisioning host that died
+-- before the operator activated it must not become schedulable — the
+-- unhealthy detector only watches active rows, so it would sit exposed to
+-- placement until the detector's next pass. Non-active targets carry no
+-- freshness requirement; draining a dead host is legitimate.
 UPDATE host
 SET status = $2, updated_at = now()
-WHERE id = $1;
+WHERE id = $1
+  AND ($2 <> 'active'
+       OR (last_heartbeat_at IS NOT NULL
+           AND last_heartbeat_at > sqlc.arg(active_heartbeat_after)))
+RETURNING *;
 
 -- name: UpdateHostHeartbeat :one
 -- Returns the host row so the caller can verify the host exists. Also
@@ -40,29 +92,43 @@ FROM prev
 WHERE host.id = prev.id
 RETURNING host.*, prev.status AS prev_status;
 
--- name: DeleteHostCapabilities :exec
-DELETE FROM host_capability WHERE host_id = $1;
+-- name: SyncHostCapabilities :exec
+-- Refresh the advertised set in place and prune only capabilities omitted by
+-- this heartbeat. Empty capabilities intentionally remove the entire set.
+WITH current_host AS (
+    SELECT id, last_heartbeat_at
+    FROM host
+    WHERE id = sqlc.arg(host_id) AND last_heartbeat_at IS NOT NULL
+), advertised AS (
+    SELECT DISTINCT unnest(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])) AS capability
+), upserted AS (
+    INSERT INTO host_capability (host_id, capability, heartbeat_at)
+    SELECT h.id, a.capability, h.last_heartbeat_at
+    FROM current_host h
+    CROSS JOIN advertised a
+    ON CONFLICT (host_id, capability)
+    DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at
+    RETURNING capability
+)
+DELETE FROM host_capability hc
+WHERE hc.host_id = sqlc.arg(host_id)
+  AND NOT (hc.capability = ANY(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])));
 
--- name: InsertHostCapability :exec
-INSERT INTO host_capability (host_id, capability, heartbeat_at)
-SELECT id, sqlc.arg(capability), last_heartbeat_at
-FROM host
-WHERE id = sqlc.arg(host_id) AND last_heartbeat_at IS NOT NULL
-ON CONFLICT (host_id, capability)
-DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at;
+-- name: LockHostForCapabilities :execrows
+SELECT id FROM host WHERE id = sqlc.arg('host_id') FOR SHARE;
 
 -- name: HostHasCapabilities :one
--- Lock the one active host row whose heartbeat anchors this capability set.
--- Callers that run this in a mutation transaction keep the host stable until
--- VMD delivery and commit, while the relational division below proves that
--- every requested capability belongs to that exact heartbeat.
+-- Evaluate in a new READ COMMITTED statement after LockHostForCapabilities,
+-- in the same transaction, to avoid mixing pre-wait capability rows with a
+-- post-wait host row. Lifecycle callers use LockedHostHasCapabilities.
 WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status = ANY(sqlc.arg('allowed_statuses')::text[])
     AND last_heartbeat_at IS NOT NULL
-  FOR SHARE
+    AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
+         OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
 )
 SELECT EXISTS (
   SELECT 1
@@ -84,29 +150,36 @@ SELECT EXISTS (
 -- HostHasCapabilities without the row lock, for standalone pre-flight reads
 -- outside a mutation transaction: omitting the lock keeps concurrent checks
 -- from serializing behind the host's heartbeat writer. Transactional callers
--- that must pin the host across a commit use HostHasCapabilities.
+-- that must pin the host across a commit use LockedHostHasCapabilities.
+--
+-- Also returns the host's VMD address (empty when the host is ineligible),
+-- so the caller can record this read as the registry's address verification.
 WITH target_host AS MATERIALIZED (
-  SELECT id, last_heartbeat_at
+  SELECT id, vmd_addr, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status = ANY(sqlc.arg('allowed_statuses')::text[])
     AND last_heartbeat_at IS NOT NULL
+    AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
+         OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
 )
-SELECT EXISTS (
-  SELECT 1
-  FROM target_host h
-  WHERE NOT EXISTS (
+SELECT
+  EXISTS (
     SELECT 1
-    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    FROM target_host h
     WHERE NOT EXISTS (
       SELECT 1
-      FROM host_capability hc
-      WHERE hc.host_id = h.id
-        AND hc.capability = required.capability
-        AND hc.heartbeat_at = h.last_heartbeat_at
+      FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
     )
-  )
-);
+  ) AS has_capabilities,
+  COALESCE((SELECT vmd_addr FROM target_host), '')::text AS vmd_addr;
 
 -- name: MarkHostUnhealthy :exec
 UPDATE host
@@ -123,6 +196,9 @@ WHERE status = 'active'
 ORDER BY last_heartbeat_at ASC;
 
 -- name: ListActiveHostsByLoad :many
+-- 'migrating' rows (an operator's boots being put back to paused) are not
+-- counted: they are bounded and short-lived, and the partial index behind
+-- this JOIN is keyed to exactly this predicate.
 -- Returns active hosts sorted by current sandbox count (ascending).
 -- The scheduler picks the first row (least loaded host). One query
 -- replaces N per-host lookups.
@@ -147,3 +223,252 @@ WHERE h.status = 'active'
   )
 GROUP BY h.id
 ORDER BY COUNT(s.id) ASC;
+
+-- name: ListHostsAdmin :many
+-- Operator view (hostctl): every host regardless of status, with live
+-- sandbox counts for drain progress. transitional counts pausing/resuming
+-- sandboxes whose lifecycle RPC is still using the host, and migrating
+-- ones an operator has claimed here — a host is not drained while any
+-- exist, even when running and paused both read zero.
+SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
+       h.capacity_memory_mib, h.capacity_vcpus,
+       h.last_heartbeat_at, h.created_at, h.updated_at,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('active', 'starting')
+                                      AND s.destroyed_at IS NULL), 0)::int AS running_count,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming', 'migrating')
+                                      AND s.destroyed_at IS NULL), 0)::int AS transitional_count,
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
+                                      AND s.destroyed_at IS NULL), 0)::int AS paused_count,
+       -- Scalar subquery, not a second LEFT JOIN: joining two child tables
+       -- would cross-multiply the per-host rows and corrupt the counts.
+       COALESCE((SELECT COUNT(*) FROM template_build tb
+                 WHERE tb.vmd_host_id = h.id
+                   AND tb.status IN ('building', 'snapshotting')
+                   AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=tb.id)), 0)::int
+       + (SELECT count(*)::int FROM template_build_attempt a WHERE a.host_id=h.id AND a.incarnation_id=h.incarnation_id
+          AND (a.state IN ('claimed','admitted','uploading') OR a.cleanup_pending)) AS building_count,
+       -- Paused sandboxes whose CURRENT pause has no durable backup: the
+       -- ones whose only up-to-date copy lives on this host's local disk.
+       -- Retiring the machine destroys them outright; even
+       -- paused-with-coverage stays pinned here until cross-host restore
+       -- exists, but unbacked is the irrecoverable class an operator must
+       -- never retire past.
+       --
+       -- "Covers the current pause" reads the PERSISTED identity link the
+       -- report handler writes (MarkSandboxBackupCovered): a generation
+       -- counts only if its verified manifest matched the head snapshot's
+       -- recorded digests at report time, under the same row lock the
+       -- pause finalize takes — and the link names both the snapshot row
+       -- and its per-pause generation counter, so a re-pause (which
+       -- advances the counter even when the legacy finalize reuses the
+       -- row id) unlinks every earlier generation. Nothing here infers
+       -- identity from timestamps or manifest containment at read time:
+       -- both misidentify a previous pause's generation under delayed
+       -- outbox delivery. Errs conservative: a generation recorded before
+       -- this linkage existed (or whose report predates the current
+       -- pause) reads as unbacked until its next redelivery re-verifies
+       -- it against the current manifest.
+       COALESCE((SELECT COUNT(*) FROM sandbox s2
+                 WHERE s2.host_id = h.id
+                   AND s2.status = 'paused'
+                   AND s2.destroyed_at IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM backup_generation bg
+                     JOIN snapshot snap ON snap.id = s2.snapshot_id
+                     WHERE bg.sandbox_id = s2.id
+                       AND bg.covered_snapshot_id = snap.id
+                       AND bg.covered_snapshot_generation = snap.generation)), 0)::int AS paused_unbacked_count,
+       -- Live pressure, when the host publishes it (NULL otherwise): the
+       -- vmd-reported allocation view, alongside the DB-derived counts
+       -- above. hp is 1:1 by primary key, so it cannot multiply the
+       -- sandbox join's count rows.
+       hp.allocated_memory_mib AS pressure_allocated_memory_mib,
+       hp.allocated_vcpus AS pressure_allocated_vcpus,
+       hp.running_sandboxes AS pressure_running_sandboxes,
+       hp.provisioning_sandboxes AS pressure_provisioning_sandboxes,
+       hp.used_net_slots AS pressure_used_net_slots,
+       hp.warm_net_slots AS pressure_warm_net_slots,
+       -- Non-zero means the allocation columns above are a known
+       -- undercount, so an operator can tell an idle host from one that
+       -- cannot yet describe itself.
+       hp.unknown_allocation_vms AS pressure_unknown_allocation_vms,
+       hp.reported_at AS pressure_reported_at
+FROM host h
+LEFT JOIN sandbox s ON s.host_id = h.id
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
+-- The optional id filter exists for drain polling: `hostctl drain --wait`
+-- re-reads one host every few seconds, and the per-host counts (the
+-- backup-coverage probe especially) must not be recomputed for the whole
+-- fleet on every poll.
+WHERE sqlc.narg(id)::text IS NULL OR h.id = sqlc.narg(id)
+GROUP BY h.id, hp.host_id
+ORDER BY h.created_at ASC;
+
+-- name: GetHostCapabilityDiagnostics :many
+-- Snapshot the host heartbeat generation and every capability attestation for
+-- best-effort diagnostics when capability enforcement rejects a request.
+WITH host_snapshot AS (
+  SELECT h.id,
+         h.status,
+         h.last_heartbeat_at,
+         (
+           h.status = 'active'
+           AND h.last_heartbeat_at IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+             WHERE NOT EXISTS (
+               SELECT 1
+               FROM host_capability required_hc
+               WHERE required_hc.host_id = h.id
+                 AND required_hc.capability = required.capability
+                 AND required_hc.heartbeat_at = h.last_heartbeat_at
+             )
+           )
+         ) AS capabilities_match
+  FROM host h
+  WHERE h.id = sqlc.arg('host_id')
+)
+SELECT hs.last_heartbeat_at,
+       hs.status,
+       hs.capabilities_match,
+       hc.capability,
+       hc.heartbeat_at
+FROM host_snapshot hs
+LEFT JOIN host_capability hc ON hc.host_id = hs.id
+ORDER BY hc.capability ASC;
+
+-- name: UpsertHostPressure :execrows
+-- Records a host's live pressure report, identity-fenced: the write
+-- lands only while the report's vmd_addr matches the host row, so a
+-- daemon whose identity was reclaimed cannot overwrite the new
+-- holder's numbers (mirrors the heartbeat's reclaim semantics). 0 rows
+-- = unknown host or address mismatch; the handler disambiguates.
+-- Last-write-wins wholesale, reported_at from the DATABASE clock: this
+-- pair is the reconciliation contract (see the host_pressure table
+-- comment).
+INSERT INTO host_pressure (
+    host_id, running_sandboxes, provisioning_sandboxes, paused_sandboxes,
+    allocated_memory_mib, allocated_vcpus,
+    used_net_slots, provisioning_net_slots, warm_net_slots,
+    net_slot_ceiling, max_network_slots, max_sandboxes, unknown_allocation_vms,
+    included_build_vm_ids, included_build_slot_vm_ids,
+    reported_at
+)
+SELECT h.id, @running_sandboxes, @provisioning_sandboxes, @paused_sandboxes,
+       @allocated_memory_mib, @allocated_vcpus,
+       @used_net_slots, @provisioning_net_slots, @warm_net_slots,
+       @net_slot_ceiling, @max_network_slots, @max_sandboxes, @unknown_allocation_vms,
+       COALESCE(sqlc.arg(included_build_vm_ids)::text[], '{}'::text[]),
+       COALESCE(sqlc.arg(included_build_slot_vm_ids)::text[], '{}'::text[]),
+       now()
+FROM host h
+WHERE h.id = @host_id AND h.vmd_addr = @vmd_addr
+  AND (h.incarnation_id IS NULL OR h.incarnation_id::text = sqlc.arg(incarnation_id)::text)
+-- FOR SHARE serializes the address check against an identity reclaim
+-- (which takes the row FOR UPDATE): without it this statement could
+-- evaluate the old address from its snapshot and insert stale pressure
+-- AFTER the reclaim committed its delete. Locked, either the reclaim
+-- waits for this write (then deletes it), or this write waits and
+-- re-evaluates against the new address (then matches nothing).
+FOR SHARE
+ON CONFLICT (host_id) DO UPDATE SET
+    running_sandboxes = EXCLUDED.running_sandboxes,
+    provisioning_sandboxes = EXCLUDED.provisioning_sandboxes,
+    paused_sandboxes = EXCLUDED.paused_sandboxes,
+    allocated_memory_mib = EXCLUDED.allocated_memory_mib,
+    allocated_vcpus = EXCLUDED.allocated_vcpus,
+    used_net_slots = EXCLUDED.used_net_slots,
+    provisioning_net_slots = EXCLUDED.provisioning_net_slots,
+    warm_net_slots = EXCLUDED.warm_net_slots,
+    net_slot_ceiling = EXCLUDED.net_slot_ceiling,
+    max_network_slots = EXCLUDED.max_network_slots,
+    max_sandboxes = EXCLUDED.max_sandboxes,
+    unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
+    included_build_vm_ids = EXCLUDED.included_build_vm_ids,
+    included_build_slot_vm_ids = EXCLUDED.included_build_slot_vm_ids,
+    reported_at = EXCLUDED.reported_at;
+
+-- name: DeleteHostPressure :exec
+-- Clears stored pressure when a host identity is reclaimed by a new
+-- machine: the old machine's numbers are meaningless for the new
+-- holder, and stale pressure must not survive into its tenure.
+DELETE FROM host_pressure WHERE host_id = $1;
+
+-- name: ListCapacityCandidates :many
+-- Candidate hosts for capacity ranking, cached control-plane-side: every
+-- active host passing the capability filter, with its newest pressure
+-- report and the legacy sandbox count.
+--
+-- Read ONLY by the background shadow evaluator, never by a request. The
+-- create path does no query of its own; ranking works from whatever this
+-- last returned.
+--
+-- Freshness and eligibility policy live in the ranker; this query only
+-- distinguishes "capable" (advertised capacity_pressure_v1 on the
+-- CURRENT heartbeat, so a capability from a previous boot cannot vouch
+-- for this one) and reports raw timestamps.
+--
+-- A scalar subquery, not a second join, for the sandbox count: joining
+-- two child tables would cross-multiply the per-host rows.
+SELECT h.id, h.region, h.capacity_memory_mib, h.capacity_vcpus,
+       EXISTS (
+         SELECT 1 FROM host_capability hc
+         WHERE hc.host_id = h.id
+           AND hc.capability = sqlc.arg('pressure_capability')::text
+           AND hc.heartbeat_at = h.last_heartbeat_at
+       ) AS pressure_capable,
+       hp.reported_at,
+       -- Report AGE, computed by the database against its own clock.
+       --
+       -- reported_at is stamped by the database, so comparing it to a
+       -- control-plane time.Now() mixes two clocks: a control plane
+       -- ahead of Postgres would call every current report stale, and
+       -- one behind would keep ranking expired ones. Handing back an
+       -- age instead means only DURATIONS cross the boundary — the
+       -- caller adds its own locally-measured elapsed time since the
+       -- fetch, which needs no agreement about what time it is.
+       --
+       -- Hosts that never reported get an age no freshness window can
+       -- accept.
+       COALESCE(EXTRACT(EPOCH FROM (now() - hp.reported_at)), 1e9)::float8 AS report_age_seconds,
+       COALESCE(hp.running_sandboxes, 0)::int AS running_sandboxes,
+       COALESCE(hp.provisioning_sandboxes, 0)::int AS provisioning_sandboxes,
+       COALESCE(hp.paused_sandboxes, 0)::int AS paused_sandboxes,
+       COALESCE(hp.allocated_memory_mib, 0)::bigint AS allocated_memory_mib,
+       COALESCE(hp.allocated_vcpus, 0)::bigint AS allocated_vcpus,
+       COALESCE(hp.used_net_slots, 0)::int AS used_net_slots,
+       COALESCE(hp.provisioning_net_slots, 0)::int AS provisioning_net_slots,
+       COALESCE(hp.warm_net_slots, 0)::int AS warm_net_slots,
+       COALESCE(hp.net_slot_ceiling, 0)::int AS net_slot_ceiling,
+       COALESCE(hp.max_network_slots, 0)::int AS max_network_slots,
+       COALESCE(hp.max_sandboxes, 0)::int AS max_sandboxes,
+       -- Live VMs the host could not size. Non-zero means the allocation
+       -- columns are a known undercount, so ranking must not read the
+       -- shortfall as free memory.
+       COALESCE(hp.unknown_allocation_vms, 0)::int AS unknown_allocation_vms
+FROM host h
+LEFT JOIN host_pressure hp ON hp.host_id = h.id
+WHERE h.status = 'active'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  );
+
+-- name: PrepareHostHeartbeat :exec
+SELECT prepare_host_heartbeat(sqlc.arg(host_id)::text, sqlc.arg(incarnation_id)::text);
+
+-- name: BindHostIncarnation :exec
+UPDATE host SET incarnation_id = sqlc.arg(incarnation_id)::uuid
+WHERE id = sqlc.arg(host_id) AND incarnation_id IS NULL;
+
+-- name: RebindHostIncarnation :one
+SELECT rebind_host_incarnation(sqlc.arg(host_id)::text,
+    sqlc.arg(expected_incarnation)::uuid, sqlc.arg(new_incarnation)::uuid)::bigint AS peer_generation;

@@ -38,6 +38,7 @@ type EgressProxy struct {
 	otherPort uint16
 
 	log     zerolog.Logger
+	hostID  string
 	limiter *ConnectionLimiter
 
 	// maxConnsPerSandbox is the per-sandbox connection limit. -1 = unlimited.
@@ -79,6 +80,14 @@ func NewEgressProxy(httpPort, tlsPort, otherPort uint16, maxConns int, log zerol
 		flowSink:           NewNopFlowSink(),
 		rules:              make(map[string]*EgressRules),
 	}
+}
+
+// SetHostID records the VMD host identity for sandbox-scoped proxy logs.
+// Call before Start; the value is immutable while connections are served.
+func (p *EgressProxy) SetHostID(hostID string) { p.hostID = hostID }
+
+func (p *EgressProxy) sandboxLogger(sandboxID string) zerolog.Logger {
+	return p.log.With().Str("sandbox_id", sandboxID).Str("host_id", p.hostID).Logger()
 }
 
 // SetFlowSink installs the connection-flow logging sink. Safe to call after Start.
@@ -228,11 +237,17 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 	// Identify sandbox by source IP.
 	srcAddr := conn.RemoteAddr().String()
 	srcHost, _, _ := net.SplitHostPort(srcAddr)
+	rules := p.getRules(srcHost)
+	var sandboxID string
+	if rules != nil {
+		sandboxID = rules.SandboxID
+	}
+	sandboxLog := p.sandboxLogger(sandboxID)
 
 	// Connection limit check.
 	_, acquired := p.limiter.TryAcquire(srcHost, p.maxConnsPerSandbox)
 	if !acquired {
-		p.log.Warn().Str("src", srcHost).Msg("connection limit exceeded")
+		sandboxLog.Warn().Str("src", srcHost).Msg("connection limit exceeded")
 		return
 	}
 	defer p.limiter.Release(srcHost)
@@ -274,11 +289,6 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 
 	// Identify the sandbox up front so every block path (global blocklist,
 	// per-sandbox rule, dial-time) can attribute a flow-log row.
-	rules := p.getRules(srcHost)
-	var sandboxID string
-	if rules != nil {
-		sandboxID = rules.SandboxID
-	}
 	flow := FlowEvent{
 		SandboxID: sandboxID,
 		Protocol:  protocol,
@@ -291,7 +301,7 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 	// sandbox's own allow rules.
 	if p.blocklist != nil {
 		if blocked, dim := p.blocklist.Blocked(hostname, dstIP); blocked {
-			p.log.Warn().
+			sandboxLog.Warn().
 				Str("src", srcHost).
 				Str("dst", dstIP.String()).
 				Str("hostname", hostname).
@@ -311,7 +321,7 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 	flow.MatchRule = matchType
 
 	if !allowed {
-		p.log.Info().
+		sandboxLog.Info().
 			Str("src", srcHost).
 			Str("dst", dstIP.String()).
 			Str("hostname", hostname).
@@ -362,7 +372,7 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 
 	upstream, err := dialer.DialContext(ctx, "tcp", upstreamAddr)
 	if err != nil {
-		p.log.Debug().Err(err).Str("upstream", upstreamAddr).Msg("dial failed")
+		sandboxLog.Debug().Err(err).Str("upstream", upstreamAddr).Msg("dial failed")
 		if sandboxID != "" {
 			// A resolved-IP rejection is a policy block; anything else failed
 			// to connect.

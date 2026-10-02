@@ -138,6 +138,67 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/usage-series:
+    get:
+      operationId: getBillingUsageSeries
+      tags: [Billing]
+      summary: Get timezone-aware billing usage chart buckets
+      description: |
+        Returns zero-filled local-calendar buckets for the half-open [start,end)
+        range. `timezone` must be an IANA timezone name (for example,
+        `America/Chicago`). The response is limited to 400 buckets. Every
+        request requires the authenticated team's `billing:read` permission.
+        `billed_total_usd` is gross CPU and memory usage cost before credits,
+        taxes, or payments; storage `cost_usd` is an informational equivalent
+        while storage remains tracked-only and is excluded from that total.
+      parameters:
+        - name: start
+          in: query
+          required: true
+          description: Absolute range start (inclusive).
+          schema: {type: string, format: date-time}
+        - name: end
+          in: query
+          required: true
+          description: Absolute range end (exclusive); must be after `start`.
+          schema: {type: string, format: date-time}
+        - name: granularity
+          in: query
+          required: true
+          description: Local calendar bucket size. Weeks start Monday at 00:00.
+          schema: {type: string, enum: [hour, day, week, month]}
+        - name: timezone
+          in: query
+          required: true
+          description: IANA timezone used for calendar boundaries and DST rules.
+          schema: {type: string, example: America/Chicago}
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Usage series
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingUsageSeriesResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          description: Pricing is not available for the authenticated team's active plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /billing/pricing:
     get:
       operationId: getBillingPricing
@@ -173,6 +234,409 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /teams/{team_id}/billing/usage:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getTeamBillingUsage
+      tags: [Billing]
+      summary: Get team billing usage
+      description: |
+        Returns billing usage for the specified team and billing period.
+        Customer callers may only access their own team and must hold
+        `billing:read`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: period_start
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: period_end
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Team billing usage for the requested period
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TeamBillingUsageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /teams/{team_id}/billing/periods:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: listTeamBillingPeriods
+      tags: [Billing]
+      summary: List team billing periods
+      description: |
+        Lists persisted billing periods for the specified team. Customer
+        callers may only access their own team and must hold `billing:read`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Billing periods for the team
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [periods]
+                properties:
+                  periods:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TeamBillingPeriodResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /teams/{team_id}/billing/periods/{period_id}/export-preview:
+    parameters:
+      - name: team_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: period_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Billing period identifier in `period_start,period_end` RFC3339 form.
+    get:
+      operationId: getTeamBillingExportPreview
+      tags: [Billing]
+      summary: Preview team billing export payload
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Stripe export preview for the billing period
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingExportPreviewResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /stripe/webhook:
+    post:
+      operationId: handleStripeWebhook
+      tags: [Billing]
+      summary: Receive Stripe webhooks
+      description: |
+        Stripe webhook receiver. Requests are authenticated with the Stripe
+        signature header instead of an API key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Webhook received
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /stripe/checkout-session:
+    post:
+      operationId: createStripeCheckoutSession
+      tags: [Billing]
+      summary: Create a Stripe Checkout session
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [success_url, cancel_url]
+              properties:
+                success_url:
+                  type: string
+                  format: uri
+                cancel_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /stripe/checkout-session/publication-decision:
+    post:
+      operationId: createStripeCheckoutSessionWithPublicationDecision
+      tags: [Billing]
+      summary: Create or retry Checkout with a trusted publication decision
+      description: |
+        Requires the customer credential's authenticated actor, billing:write,
+        live billing, and a server-signed publication assertion. The assertion
+        must use EdDSA, issuer promotion-auth-adapter, audience promotion-account,
+        operation checkout, and a positive lifetime of at most five minutes.
+        Its sub and team_id must match the customer credential, and its
+        operation_id, home_region, decision, success_url and cancel_url must
+        exactly match the body. The region must match the receiving cell.
+
+        The decision is committed with the fresh generation before Stripe
+        session creation. publication_failed preserves paid access without new
+        automatic promotion credit; standard uses existing eligibility checks.
+        Retry the same operation and body with a renewed assertion after a lost
+        response. Existing generations retain their original payer and decision.
+        A changed or retired operation conflicts; do not fall back to the legacy
+        creation route on an error or an older server's missing route.
+
+        Bodies over 4096 bytes and unknown fields are rejected. Redirects must
+        match the regional API's allowed billing redirect configuration.
+      security:
+        - apiKey: []
+          promotionAccountAssertion: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [operation_id, home_region, decision, success_url, cancel_url]
+              properties:
+                operation_id:
+                  type: string
+                  format: uuid
+                  description: Stable random operation locator generated before the first request.
+                home_region:
+                  type: string
+                  enum: [use, usw]
+                decision:
+                  type: string
+                  enum: [standard, publication_failed]
+                success_url:
+                  type: string
+                  format: uri
+                cancel_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Checkout session created or original session returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: conflict — changed or closed intent, existing generation, reservation or subscription
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: bad_gateway — Stripe creation failed; retain the original intent and uncertainty fence
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: service_unavailable — required billing configuration unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /stripe/checkout-session/recover:
+    post:
+      operationId: recoverStripeCheckoutSession
+      tags: [Billing]
+      summary: Recover an existing Stripe Checkout session
+      description: |
+        Requires the original authenticated billing actor, billing:write and live
+        billing. Retrieves only the recorded open session, retaining its original
+        actor, generation and immutable identity evidence without refreshing the
+        evidence. Never creates a customer, session, subscription or replacement
+        generation. The original tuple is revalidated under database locks after
+        provider retrieval; concurrent completion, abandonment or replacement
+        makes recovery unavailable.
+
+        An empty body or {} recovers only the generation observed at the first
+        backend read. An optional timestamp restricts recovery further. Unknown
+        fields, null bodies, trailing JSON and bodies over 4 KiB are rejected.
+        A 409 does not prove an ambiguous create failed or release its fence.
+        Fresh trusted evidence must be published before attempting creation;
+        evidence failure or an older server's 404 must not trigger create fallback.
+      security:
+        - apiKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                checkout_generation:
+                  type: [string, "null"]
+                  format: date-time
+                  description: Original generation timestamp, with fractional seconds preserved; null is treated as omitted.
+      responses:
+        "200":
+          description: Original Checkout session recovered without mutation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [outcome, id, url, checkout_generation]
+                properties:
+                  outcome:
+                    type: string
+                    enum: [recovered]
+                  id:
+                    type: string
+                  url:
+                    type: string
+                    format: uri
+                  checkout_generation:
+                    type: string
+                    format: date-time
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: checkout_recovery_unavailable — no matching recoverable generation or provider session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: bad_gateway — provider transport, timeout or response failure other than 404
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: service_unavailable — recovery transport or captured identity authority unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /stripe/customer-portal-session:
+    post:
+      operationId: createStripeCustomerPortalSession
+      tags: [Billing]
+      summary: Create a Stripe customer portal session
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [return_url]
+              properties:
+                return_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Customer portal session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/InternalError"
   /teams/{team_id}/management:
@@ -441,7 +905,7 @@ paths:
           schema:
             type: string
             enum:
-              [starting, active, pausing, paused, resuming, failed, deleted]
+              [starting, active, pausing, paused, resuming, migrating, failed, deleted]
         - name: sort
           in: query
           required: false
@@ -480,8 +944,9 @@ paths:
       summary: Create a new sandbox
       description: |
         Creates a sandbox from a template (defaults to `superserve/base` when
-        `from_template` is omitted). When the request returns successfully,
-        the sandbox is ready to use — you can run commands against it
+        `from_template` is omitted), or from a saved snapshot named by
+        `from_snapshot`. When the request returns successfully, the
+        sandbox is ready to use — you can run commands against it
         immediately.
 
         New sandboxes use strict preview routing: only ports explicitly
@@ -507,6 +972,12 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: The template or snapshot named does not exist for this team.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "409":
           $ref: "#/components/responses/Conflict"
         "429":
@@ -516,6 +987,15 @@ paths:
             - `too_many_sandboxes` — team has reached its active sandbox count
               limit (paused sandboxes do not count; pause or delete a sandbox to
               free a slot, or contact support to raise the cap).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: |
+            Temporary create failure, or the snapshot's host cannot create
+            sandboxes from it right now. Retry the request after the outage
+            clears.
           content:
             application/json:
               schema:
@@ -620,6 +1100,220 @@ paths:
           $ref: "#/components/responses/Conflict"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/snapshot:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    post:
+      operationId: createSandboxSnapshot
+      tags: [Snapshots]
+      summary: Snapshot a sandbox
+      description: |
+        Captures the sandbox into a saved snapshot of its memory and disk,
+        kept until deleted. A new sandbox is created from it with
+        `from_snapshot` on `POST /sandboxes`, resuming with its processes
+        intact. The sandbox must be active or paused. A running sandbox is
+        paused for the capture: under a second for the first memory snapshot
+        of a sandbox, longer when all of memory has to be written. The call
+        returns once the snapshot is ready; if the host's answer is lost on
+        the way, it returns the snapshot still `creating` and the platform
+        settles it with the host shortly. Snapshots outlive the sandbox they
+        came from.
+
+        Pass `idempotency_key` to make a retry return the snapshot the first
+        request made instead of taking another, whatever became of it since.
+      security:
+        - apiKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSnapshotRequest"
+      responses:
+        "201":
+          description: Snapshot ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "200":
+          description: A snapshot an earlier request with the same `idempotency_key` made
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "202":
+          description: >
+            The host's answer was lost; the snapshot is still `creating` and
+            is settled with the host shortly. Poll `GET /snapshots/{snapshot_id}`.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The sandbox is not active or paused, or the host cannot capture it as it stands
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: >
+            The team's snapshot limit or its limit on snapshots being created
+            at once is reached (`too_many_snapshots`,
+            `too_many_snapshots_in_flight`), or the request rate limit
+            (`rate_limited`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          description: The snapshot an earlier request with the same `idempotency_key` made has since been deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: The host cannot take the snapshot as it stands, or does not support snapshots yet; retry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/snapshots:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    get:
+      operationId: listSandboxSnapshots
+      tags: [Snapshots]
+      summary: List a sandbox's snapshots
+      description: |
+        Snapshots of the sandbox that have not been deleted, newest first.
+        Snapshots outlive their sandbox, so this lists them for a deleted
+        sandbox too.
+      security:
+        - apiKey: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: Snapshots, newest first
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/TotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /snapshots/{snapshot_id}:
+    parameters:
+      - $ref: "#/components/parameters/SnapshotId"
+    get:
+      operationId: getSnapshot
+      tags: [Snapshots]
+      summary: Get a snapshot
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: The snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      operationId: patchSnapshot
+      tags: [Snapshots]
+      summary: Rename a snapshot
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotPatch"
+      responses:
+        "200":
+          description: The renamed snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteSnapshot
+      tags: [Snapshots]
+      summary: Delete a snapshot
+      description: |
+        Removes the snapshot. A snapshot still being created cannot be
+        deleted until it is ready, has failed, or has been creating for an
+        hour without its host settling it.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Snapshot deleted
+        "202":
+          description: >
+            The snapshot is marked for deletion and its files are removed
+            shortly; it no longer counts toward any limit.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [deleting]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -857,11 +1551,47 @@ paths:
         Snapshots the sandbox's full state (memory + disk), suspends the VM,
         and transitions to `paused`. Resume it later to continue exactly where
         it left off — same memory, same running processes, same files.
+
+        The request holds until the pause is decided; if the host has not
+        answered by then, the response is `202 Accepted` and the pause
+        continues in the background. Send `Prefer: respond-async` to get
+        `202` as soon as the pause is recorded instead. Either way
+        `GET /sandboxes/{sandbox_id}` reports `paused` once it lands (or
+        `failed` if the VM turned out to be gone).
       security:
         - apiKey: []
+      parameters:
+        - name: Prefer
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [respond-async]
+          description: >
+            Accept `202` with `{"status":"pausing"}` over a held connection.
       responses:
         "204":
           description: Sandbox paused
+        "202":
+          description: >
+            Pause recorded and in progress; poll the sandbox until it is
+            `paused`. Immediate with `Prefer: respond-async`, otherwise
+            returned when the pause is still in progress after the request's
+            wait.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds to wait before polling.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [pausing]
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -989,7 +1719,15 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: >
+            The sandbox is not active or paused, or, with `error.code`
+            `snapshot_in_progress`, a snapshot of it is being taken; retry
+            after `Retry-After` seconds, or delete a snapshot that never
+            finishes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -1022,7 +1760,15 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: >
+            The sandbox is not active or paused, or, with `error.code`
+            `snapshot_in_progress`, a snapshot of it is being taken; retry
+            after `Retry-After` seconds, or delete a snapshot that never
+            finishes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -1664,7 +2410,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
-          $ref: "#/components/responses/InternalError"
+          $ref: "#/components/responses/FilesInternalError"
 
     post:
       operationId: writeFile
@@ -1694,7 +2440,7 @@ paths:
         "507":
           $ref: "#/components/responses/StorageFull"
         "500":
-          $ref: "#/components/responses/InternalError"
+          $ref: "#/components/responses/FilesInternalError"
 
   /templates:
     get:
@@ -2025,6 +2771,11 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
+    promotionAccountAssertion:
+      type: apiKey
+      in: header
+      name: X-Promotion-Account-Assertion
+      description: Server-only Ed25519 JWT binding the authenticated actor and team to the exact Checkout intent.
     accessToken:
       type: apiKey
       in: header
@@ -2042,6 +2793,15 @@ components:
       schema:
         $ref: "#/components/schemas/PublicSandboxId"
       description: The unique identifier of the sandbox.
+
+    SnapshotId:
+      name: snapshot_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The unique identifier of the snapshot.
 
     PreviewPort:
       name: port
@@ -2169,18 +2929,242 @@ components:
         `sb-<region>-<uuid>` (e.g. `sb-use-1b4e28ba-…`). Treat as an opaque
         string; the tagged form routes the request to the sandbox's home
         region. Endpoints accept both forms interchangeably.
+
+    BillingSessionResponse:
+      type: object
+      required: [url]
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+          format: uri
+
+    BillingUsageSeriesResource:
+      type: object
+      description: Usage and backend-priced cost for one resource in a bucket. Usage units are resource-specific (vCPU-seconds, GiB-seconds, or tracked storage GiB-seconds).
+      required: [usage, cost_usd, tracked, billable]
+      properties:
+        usage:
+          type: number
+          format: double
+        cost_usd:
+          type: number
+          format: double
+        tracked:
+          type: boolean
+        billable:
+          type: boolean
+
+    BillingUsageSeriesBucket:
+      type: object
+      description: A half-open [start,end) absolute interval, clipped at the requested range edges.
+      required: [start, end, cpu, memory, storage, billed_total_usd]
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        cpu:
+          $ref: "#/components/schemas/BillingUsageSeriesResource"
+        memory:
+          $ref: "#/components/schemas/BillingUsageSeriesResource"
+        storage:
+          $ref: "#/components/schemas/BillingUsageSeriesResource"
+        billed_total_usd:
+          type: number
+          format: double
+
+    BillingUsageSeriesResponse:
+      type: object
+      description: Ordered, continuous series of at most 400 timezone-aware buckets.
+      required: [start, end, granularity, timezone, buckets]
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        granularity:
+          type: string
+          enum: [hour, day, week, month]
+        timezone:
+          type: string
+        buckets:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingUsageSeriesBucket"
+
+    BillingExportPreviewResponse:
+      type: object
+      required: [mode, period_id, team_id, status, items, attempts]
+      properties:
+        mode:
+          type: string
+          enum: [shadow, live]
+        period_id:
+          type: string
+        team_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        stripe_customer_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingExportPreviewItem"
+        attempts:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingExportAttemptRecord"
+
+    TeamBillingPeriodResponse:
+      type: object
+      required: [period_id, period_start, period_end, status]
+      properties:
+        period_id:
+          type: string
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        status:
+          type: string
+        blocked_reason:
+          type: string
+        approved_at:
+          type: string
+          format: date-time
+        exported_at:
+          type: string
+          format: date-time
+        finalized_at:
+          type: string
+          format: date-time
+        cancel_at_period_end:
+          type: boolean
+        stripe_customer_id:
+          type: string
+        stripe_subscription_id:
+          type: string
+        stripe_subscription_status:
+          type: string
+        stripe_invoice_status:
+          type: string
+        current_period_start:
+          type: string
+          format: date-time
+        current_period_end:
+          type: string
+          format: date-time
+
+    TeamBillingUsageResponse:
+      type: object
+      required:
+        - period_id
+        - team_id
+        - status
+        - period_start
+        - period_end
+        - vcpu_seconds
+        - memory_mib_seconds
+        - storage_mib_seconds
+        - cpu_vcpu_hours
+        - memory_gib_hours
+        - storage_gib_hours
+        - resources
+        - updated_at
+      properties:
+        period_id:
+          type: string
+        team_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        vcpu_seconds:
+          type: number
+          format: double
+        memory_mib_seconds:
+          type: number
+          format: double
+        storage_mib_seconds:
+          type: number
+          format: double
+        cpu_vcpu_hours:
+          type: number
+          format: double
+        memory_gib_hours:
+          type: number
+          format: double
+        storage_gib_hours:
+          type: number
+          format: double
+        resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingUsageResource"
+        resources_by_key:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/BillingUsageResource"
+        exported_at:
+          type: string
+          format: date-time
+        finalized_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
     BillingSummaryResponse:
       type: object
       required:
+        - mode
+        - billing_mode
+        - permissions
+        - checkout_available
+        - portal_available
+        - payment_setup_required
         - current_charges_usd
         - credits_applied_usd
         - credits_remaining_usd
         - expected_invoice_amount_usd
         - cost_breakdown_usd
+        - resources
         - billing_period
         - pricing_tier
+        - trial
         - calculated_at
       properties:
+        mode:
+          type: string
+          enum: [shadow, live]
+        billing_mode:
+          type: string
+          enum: [shadow, live]
+        permissions:
+          $ref: "#/components/schemas/BillingSummaryPermissions"
+        checkout_available:
+          type: boolean
+        portal_available:
+          type: boolean
+        payment_setup_required:
+          type: boolean
         current_charges_usd:
           type: number
           format: double
@@ -2188,6 +3172,7 @@ components:
         credits_applied_usd:
           type: number
           format: double
+          nullable: true
           description: Credits applied against the current period charges.
         # Phase 1 exposes float USD values for billing UI display. Invoice-grade
         # exports should use decimal/cents fields before becoming customer-visible
@@ -2195,54 +3180,261 @@ components:
         credits_remaining_usd:
           type: number
           format: double
+          nullable: true
           description: Credits still available after applying current period charges.
         expected_invoice_amount_usd:
           type: number
           format: double
+          nullable: true
           description: Expected invoice amount after credits.
+        stripe_credit_balance_usd:
+          type: number
+          format: double
+          nullable: true
+          description: Stripe-authoritative aggregate remaining credit; null when unavailable.
+        stripe_credits_applied_usd:
+          type: number
+          format: double
+          nullable: true
+        stripe_remaining_credit_usd:
+          type: number
+          format: double
+          nullable: true
+        credit_source:
+          type: string
+          enum: [local_trial, stripe]
+        credit_status:
+          type: string
+          enum: [available, unavailable]
+        credit_observed_at:
+          type: string
+          format: date-time
+          nullable: true
         cost_breakdown_usd:
+          $ref: "#/components/schemas/BillingSummaryCostBreakdown"
+        resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingSummaryResource"
+        resources_by_key:
           type: object
-          required: [compute, memory, storage]
-          properties:
-            compute:
-              type: number
-              format: double
-              description: vCPU charges for the current period.
-            memory:
-              type: number
-              format: double
-              description: memory charges for the current period.
-            storage:
-              type: number
-              format: double
-              description: storage charges for the current period.
+          additionalProperties:
+            $ref: "#/components/schemas/BillingSummaryResource"
         billing_period:
-          type: object
-          required: [start, end]
-          properties:
-            start:
-              type: string
-              format: date-time
-            end:
-              type: string
-              format: date-time
+          $ref: "#/components/schemas/BillingSummaryPeriod"
         pricing_tier:
-          type: object
-          required: [plan_key, plan_name, currency]
-          properties:
-            plan_key:
-              type: string
-              example: payg
-            plan_name:
-              type: string
-              example: Pay-as-you-go
-            currency:
-              type: string
-              example: USD
+          $ref: "#/components/schemas/BillingSummaryPricingTier"
+        trial:
+          $ref: "#/components/schemas/BillingTrialBalance"
         calculated_at:
           type: string
           format: date-time
           description: Timestamp when this live billing summary was calculated.
+
+    BillingSummaryPermissions:
+      type: object
+      required: [can_view, can_manage]
+      properties:
+        can_view:
+          type: boolean
+        can_manage:
+          type: boolean
+
+    BillingSummaryCostBreakdown:
+      type: object
+      required: [compute, memory, storage]
+      properties:
+        compute:
+          type: number
+          format: double
+          description: vCPU charges for the current period.
+        memory:
+          type: number
+          format: double
+          description: memory charges for the current period.
+        storage:
+          type: number
+          format: double
+          description: storage charges for the current period.
+
+    BillingSummaryResource:
+      type: object
+      required:
+        - resource_key
+        - resource
+        - display_name
+        - sort_order
+        - unit
+        - display_unit
+        - usage
+        - tracked
+        - billable
+        - charge_usd
+      properties:
+        resource_key:
+          type: string
+        resource:
+          type: string
+        display_name:
+          type: string
+        sort_order:
+          type: integer
+        unit:
+          type: string
+        display_unit:
+          type: string
+        usage:
+          type: number
+          format: double
+        tracked:
+          type: boolean
+        billable:
+          type: boolean
+        charge_usd:
+          type: number
+          format: double
+
+    BillingUsageResource:
+      type: object
+      required:
+        - resource_key
+        - resource
+        - display_name
+        - sort_order
+        - unit
+        - display_unit
+        - usage
+        - tracked
+        - billable
+      properties:
+        resource_key:
+          type: string
+        resource:
+          type: string
+        display_name:
+          type: string
+        sort_order:
+          type: integer
+        unit:
+          type: string
+        display_unit:
+          type: string
+        usage:
+          type: number
+          format: double
+        tracked:
+          type: boolean
+        billable:
+          type: boolean
+
+    BillingSummaryPeriod:
+      type: object
+      required: [start, end]
+      properties:
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+
+    BillingSummaryPricingTier:
+      type: object
+      required: [plan_key, plan_name, currency]
+      properties:
+        plan_key:
+          type: string
+          example: payg
+        plan_name:
+          type: string
+          example: Pay-as-you-go
+        currency:
+          type: string
+          example: USD
+
+    BillingTrialBalance:
+      type: object
+      required: [grant_usd, consumed_usd, remaining_usd, state, eligible]
+      properties:
+        grant_usd:
+          type: number
+          format: double
+        consumed_usd:
+          type: number
+          format: double
+        remaining_usd:
+          type: number
+          format: double
+        state:
+          type: string
+          enum: [no_grant, active, exhausted, expired, ended_by_billing_activation]
+        eligible:
+          type: boolean
+
+    BillingExportPreviewItem:
+      type: object
+      required:
+        - resource_type
+        - resource_key
+        - display_name
+        - sort_order
+        - display_unit
+        - stripe_event_name
+        - stripe_meter_event_identifier
+        - value
+      properties:
+        resource_type:
+          type: string
+          enum: [cpu, memory, storage]
+        resource_key:
+          type: string
+        display_name:
+          type: string
+        sort_order:
+          type: integer
+        display_unit:
+          type: string
+        stripe_event_name:
+          type: string
+        stripe_meter_event_identifier:
+          type: string
+        value:
+          type: number
+          format: double
+
+    BillingExportAttemptRecord:
+      type: object
+      required:
+        [id, resource_type, stripe_meter_event_identifier, stripe_event_name, value, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        resource_type:
+          type: string
+          enum: [cpu, memory, storage]
+        stripe_meter_event_identifier:
+          type: string
+        stripe_event_name:
+          type: string
+        value:
+          type: number
+          format: double
+        status:
+          type: string
+          enum: [pending, sent, accepted, failed, skipped_shadow,skipped_zero]
+          description: >
+            Export attempt lifecycle. `sent` means Stripe returned a
+            2xx response. `accepted` is kept for legacy rows and is
+            treated the same as `sent` when reading historical data.
+        error:
+          type: string
+        sent_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
 
     CreateSandboxRequest:
       type: object
@@ -2264,6 +3456,25 @@ components:
             vCPU, memory, and disk values are inherited by the sandbox —
             they cannot be overridden per-sandbox because the snapshot
             dictates VM shape. When omitted, defaults to `superserve/base`.
+        from_snapshot:
+          type: string
+          format: uuid
+          description: >
+            Create the sandbox from a saved snapshot instead of a template.
+            It starts with the snapshot's memory and disk, so what was
+            running when the snapshot was taken carries on, on the host
+            holding the snapshot. The snapshot must be `ready` and the
+            caller's. vCPU, memory and disk are the snapshot's;
+            `timeout_seconds` and `network` are too unless the request sets
+            them, and the network rules are in place before anything in the
+            sandbox runs. Commands run in the new sandbox see the environment
+            the source had, with `env_vars` and the secrets set on top.
+            Secrets the source was bound to are bound again with fresh proxy
+            tokens, except env keys the request sets itself. Processes that
+            were running when the snapshot was taken keep the environment
+            they started with, including the source's secret proxy
+            credentials, which do not work in the new sandbox: restart them
+            to use its secrets. Mutually exclusive with `from_template`.
         timeout_seconds:
           type: integer
           format: int32
@@ -2420,12 +3631,15 @@ components:
           type: string
         status:
           type: string
-          enum: [active, paused, resuming]
+          enum: [active, pausing, paused, resuming, migrating, failed]
           description: >
             Current state of the sandbox. `active` means running; `paused`
-            means paused and awaiting resume. `resuming` is a transient
-            state observed while the platform restores a paused sandbox
-            (e.g. via auto-resume on `/exec`); clients should retry shortly.
+            means paused and awaiting resume. `pausing`, `resuming` and
+            `migrating` are transient states observed while the platform
+            pauses, restores, or relocates a sandbox (e.g. after a `202`
+            from `/pause`, or auto-resume on `/exec`); clients should poll
+            or retry shortly. `failed` means the sandbox can no longer be
+            resumed.
         vcpu_count:
           type: integer
         memory_mib:
@@ -2434,6 +3648,10 @@ components:
           type: string
           format: uuid
           description: ID of the latest snapshot (present after a pause).
+        source_snapshot_id:
+          type: string
+          format: uuid
+          description: The saved snapshot the sandbox was created from, when it was.
         created_at:
           type: string
           format: date-time
@@ -2488,6 +3706,14 @@ components:
         - $ref: "#/components/schemas/SandboxListItem"
         - type: object
           properties:
+            routing_hint:
+              type: string
+              description: |
+                Optional signed logical-owner routing hint. Send on data-plane
+                requests as X-Superserve-Routing-Hint, or as a route.<hint>
+                WebSocket subprotocol alongside the unchanged access token.
+                Refresh after resume/activate; absent or invalid hints retain
+                ownership lookup fallback. This does not authorize access.
             access_token:
               type: string
               description: |
@@ -2513,6 +3739,85 @@ components:
                     type: boolean
                     default: false
 
+    CreateSnapshotRequest:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: ["mem+fs"]
+          default: "mem+fs"
+          description: >
+            `mem+fs` captures memory and disk. A disk-only kind is not
+            offered yet.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Optional label. Can be changed later with PATCH.
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >
+            Caller-chosen key, unique per sandbox. A retry carrying the same
+            key returns the snapshot the first request made.
+
+    SnapshotPatch:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+
+    SnapshotResponse:
+      type: object
+      required: [id, sandbox_id, kind, status, size_bytes, resources, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        sandbox_id:
+          type: string
+          format: uuid
+          description: The sandbox the snapshot was taken from. It may since have been deleted.
+        template_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: The template the captured sandbox was created from.
+        kind:
+          type: string
+          enum: ["mem+fs"]
+        status:
+          type: string
+          enum: [creating, ready, failed, deleting]
+        name:
+          type: string
+          nullable: true
+        size_bytes:
+          type: integer
+          format: int64
+          description: Bytes the snapshot holds on disk; 0 until ready.
+        resources:
+          type: object
+          required: [vcpu_count, memory_mib, disk_mib]
+          properties:
+            vcpu_count:
+              type: integer
+            memory_mib:
+              type: integer
+            disk_mib:
+              type: integer
+        created_at:
+          type: string
+          format: date-time
+        ready_at:
+          type: string
+          format: date-time
+          nullable: true
+
     ResumeResponse:
       type: object
       description: Returned by `POST /sandboxes/{id}/resume`.
@@ -2522,6 +3827,9 @@ components:
         status:
           type: string
           enum: [active]
+        routing_hint:
+          type: string
+          description: Fresh optional routing hint; replaces the hint from create.
         access_token:
           type: string
           description: Fresh access token; use this instead of the one from create.
@@ -2980,7 +4288,7 @@ components:
         disk_mib:
           type: integer
           minimum: 1024
-          maximum: 30720
+          maximum: 65536
           default: 4096
         build_spec:
           $ref: "#/components/schemas/BuildSpec"
@@ -3446,7 +4754,7 @@ components:
           description: Env-var name the secret resolves to inside the sandbox.
         status:
           type: string
-          enum: [active, paused, resuming, failed]
+          enum: [active, pausing, paused, resuming, migrating, failed]
 
     ProviderShortcut:
       type: object
@@ -3500,16 +4808,41 @@ components:
 
     BillingPricingRate:
       type: object
-      required: [resource, unit, price_usd, price_usd_hourly, effective_from]
+      required:
+        [
+          resource_key,
+          resource,
+          display_name,
+          sort_order,
+          unit,
+          display_unit,
+          price_usd,
+          price_usd_hourly,
+          effective_from,
+          tracked,
+          billable,
+        ]
       properties:
+        resource_key:
+          type: string
+          description: Stable billing resource key.
         resource:
           type: string
           enum: [memory_gib, storage_gib, vcpu]
           description: Metered resource name.
+        display_name:
+          type: string
+          description: Human-readable resource name.
+        sort_order:
+          type: integer
+          description: Display ordering for billing surfaces.
         unit:
           type: string
           enum: [second]
           description: Billing unit for `price_usd`.
+        display_unit:
+          type: string
+          description: Human-readable unit for billing surfaces.
         price_usd:
           type: number
           format: double
@@ -3523,6 +4856,12 @@ components:
         effective_from:
           type: string
           format: date-time
+        tracked:
+          type: boolean
+          description: Whether the resource is tracked in usage reporting.
+        billable:
+          type: boolean
+          description: Whether the resource contributes to billing totals.
 
     TeamMember:
       type: object
@@ -3698,6 +5037,35 @@ components:
               type: string
             message:
               type: string
+    FilesystemError:
+      description: >
+        Error envelope for a failure raised by the sandbox's own filesystem
+        rather than by the platform — typically a network or FUSE mount
+        attached inside the sandbox. `error.code` is
+        `sandbox_filesystem_error`; `errno` names the failure (for example
+        `ESTALE` or `EIO`) and `mount` identifies the mountpoint and
+        filesystem type that served the path.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            error:
+              type: object
+              required: [code, errno]
+              properties:
+                code:
+                  const: sandbox_filesystem_error
+                errno:
+                  type: string
+                path:
+                  type: string
+                mount:
+                  type: object
+                  properties:
+                    mountpoint:
+                      type: string
+                    fstype:
+                      type: string
 
   responses:
     BadRequest:
@@ -3753,6 +5121,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    FilesInternalError:
+      description: >
+        Internal server error. When `error.code` is
+        `sandbox_filesystem_error`, the sandbox's own filesystem rejected the
+        operation and the body also carries `errno`, `path`, and the `mount`
+        that served it.
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/Error"
+              - $ref: "#/components/schemas/FilesystemError"
     ServiceUnavailable:
       description: >
         The sandbox is not currently running (for example, paused) or is

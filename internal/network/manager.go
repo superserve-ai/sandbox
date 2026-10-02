@@ -9,12 +9,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
 
-	"github.com/superserve-ai/sandbox/internal/shellquote"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // ---------------------------------------------------------------------------
@@ -71,19 +72,89 @@ type VMNetInfo struct {
 // ---------------------------------------------------------------------------
 
 // MaxSlots is the maximum number of concurrent VMs. Limited by the IP scheme:
-// hostIP uses 10.11.0.0/16 (one IP per VM), veth pairs use 10.12.0.0/16 (two IPs per VM).
-// This supports up to ~32K concurrent VMs per node — hardware (RAM/CPU) is the real limit.
-const MaxSlots = 32000
+// hostIP uses 10.11.0.0/16 (one IP per VM), veth pairs use 10.12.0.0/15 (two
+// IPs per VM), so both sides top out at 65,536 and this sits just under it.
+// Running sandboxes hold a slot; paused ones may release theirs after the
+// configured grace period. The ceiling is therefore on active networked VMs,
+// not on the total paused fleet — hardware and kernel scale (namespace and
+// mount table growth) bite well before the arithmetic.
+const MaxSlots = 65000
 
 // ErrNoSlots is returned when no network slots are available.
 var ErrNoSlots = fmt.Errorf("no available network slots (max %d concurrent VMs)", MaxSlots)
 
+// reclaimCooldown bounds how often a claim at the ceiling rescans for unused
+// indexes. The scan is cheap but pointless to repeat while nothing has been
+// released, and a host at the ceiling is exactly when claims arrive fastest.
+const reclaimCooldown = 30 * time.Second
+
+// reclaimScanBarrier runs inside reclaimUnusedSlots after the unlocked
+// directory reads finish and before it re-locks to merge. No-op in
+// production; tests override it to pause one scan there so a second,
+// concurrent scan can complete its own merge first — deterministically
+// reproducing the "this call's own reclaim lost the cooldown race" path.
+var reclaimScanBarrier = func() {}
+
+// setupSlotConcurrency caps concurrent slot builds across every caller
+// (on-demand fallback and pool refill). Each build forks a dozen ip/nsenter
+// commands that serialize on the kernel's netlink lock, so unbounded
+// concurrent builds convoy each other into multi-second latencies; a small
+// window keeps every build near its uncontended cost.
+const setupSlotConcurrency = 8
+
+// poolClaimWaitBudget bounds how long a claimant waits on active producers
+// before falling back to an inline build. ClaimWait exits well before this
+// when no producer is active, and honors the caller's ctx throughout.
+const poolClaimWaitBudget = 2 * time.Second
+
+// adoptionClaimWaitBudget applies while an adoption pass is trusted (see
+// Pool.adoptionTrusted): the ramp to the pass's first delivery scales with
+// the candidate count and can span many seconds, and a claimant that gives up
+// inside it builds inline against the adoption churn — the exact stampede
+// this wait prevents. Waiters exit the moment a slot lands, and the budget
+// re-clamps to poolClaimWaitBudget if the pass loses trust mid-wait. Only
+// slot-allocating requests ever pay this.
+const adoptionClaimWaitBudget = 12 * time.Second
+
+// poolWaitLogThreshold samples the satisfied-after-wait log line: waits below
+// it are routine producer handoffs, and logging each would turn a burst into
+// its own log storm. Fallbacks are always logged — they are the alarm signal.
+const poolWaitLogThreshold = 250 * time.Millisecond
+
 type Manager struct {
 	hostInterface string
+	hostID        string
 	log           zerolog.Logger
+	// recorder receives slot claim/build latency phases; nil records nothing.
+	recorder telemetry.Recorder
 
-	mu         sync.Mutex
-	devices    map[string]*VMNetInfo
+	// setupSem bounds concurrent setupSlot builds (see setupSlotConcurrency).
+	setupSem chan struct{}
+
+	// ops issues the kernel operations for slot build, adoption, recycling,
+	// and teardown. The lifecycle logic above it is backend-agnostic.
+	ops slotNetOps
+	// useNetlinkOps selects the netlink backend at construction.
+	useNetlinkOps bool
+
+	// foregroundOps counts in-flight network operations a caller is actively
+	// waiting on — SetupVM (create) and EnsureVMSlot (resume) — so
+	// background producers can yield the RTNL lock to them. Deliberately
+	// NOT counted: reattach (only ever called by the background startup
+	// pass) and cleanup (shared with the reconciler's continuous reaping).
+	// Advisory only; nothing blocks on it.
+	foregroundOps atomic.Int64
+
+	mu      sync.Mutex
+	devices map[string]*VMNetInfo
+	// poolOwnedSlots and usedOwnedSlots partition slotOwner by owner
+	// class, maintained by the set/delete helpers so pressure never walks
+	// the map. Guarded by mu.
+	poolOwnedSlots int
+	usedOwnedSlots int
+	// Fresh build claims are sampled with Used for pressure admission.
+	buildSlotOwners map[string]int
+
 	freeSlots  []int // recycled slot indices, guaranteed absent from slotOwner
 	nextSlot   int   // next new slot (used when freeSlots is empty)
 	maxSlot    int   // new-slot ceiling; meaningful only when slotPinned (WithExactSlot)
@@ -109,6 +180,9 @@ type Manager struct {
 	// every slot path must route through them so ownership can never be dropped
 	// (leak) or duplicated (double hand-out).
 	slotOwner map[int]string
+
+	// lastReclaim is when the ceiling path last rescanned for unused indexes.
+	lastReclaim time.Time
 
 	// TCP egress proxy — receives per-sandbox rule updates and cleanup.
 	egressProxy *EgressProxy
@@ -157,6 +231,26 @@ func (m *Manager) SetEgressProxy(p *EgressProxy) {
 
 // ManagerOption configures optional Manager behavior.
 type ManagerOption func(*Manager)
+
+// WithHostID supplies the persisted VMD host identity for network-operation logs.
+func WithHostID(hostID string) ManagerOption {
+	return func(m *Manager) { m.hostID = hostID }
+}
+
+// WithNetlinkSlotOps selects the netlink backend for slot network operations
+// instead of forking iproute2. Namespace-scoped operations then join the
+// target namespace directly, without the per-invocation mount-namespace clone
+// `ip netns exec` performs.
+func WithNetlinkSlotOps() ManagerOption {
+	return func(m *Manager) { m.useNetlinkOps = true }
+}
+
+// UsesNetlinkSlotOps reports whether this Manager runs slot operations over
+// netlink. It exists so a process that spawns a helper building its own slots
+// (template-builder) can select the same backend: a helper left on the shell
+// backend keeps forking `ip netns exec` per slot operation, and those clones
+// block every concurrent launch on the host, not just its own.
+func (m *Manager) UsesNetlinkSlotOps() bool { return m.useNetlinkOps }
 
 // WithExactSlot pins the Manager to exactly slot idx: it claims that one index
 // or fails with ErrNoSlots, never advancing to idx+1. A template-builder
@@ -208,7 +302,24 @@ func WithEgressPortChainOwner() ManagerOption {
 	return func(m *Manager) { m.ownsEgressPortChain = true }
 }
 
+// SetTelemetry attaches the operational metrics recorder; slot claim and
+// build phases are emitted through it (plane "vmd", op "net").
+func (m *Manager) SetTelemetry(r telemetry.Recorder) { m.recorder = r }
+
+// recordNetPhase emits one network-phase latency sample; nil-safe.
+func (m *Manager) recordNetPhase(phase string, d time.Duration) {
+	if m.recorder == nil || d < 0 {
+		return
+	}
+	m.recorder.RecordLatencyPhase(context.Background(), telemetry.LatencyPhase{
+		Plane: "vmd", Op: "net", Phase: phase, Duration: d,
+	})
+}
+
 func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, opts ...ManagerOption) (*Manager, error) {
+	// Split pre-network config (ip_forward + option wiring) from the actual
+	// firewall install so a slow startup network_firewall phase is unambiguous.
+	tPreNet := time.Now()
 	if err := enableIPForward(ctx); err != nil {
 		return nil, err
 	}
@@ -216,6 +327,7 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 	mgr := &Manager{
 		hostInterface:  hostInterface,
 		log:            log.With().Str("component", "network").Logger(),
+		setupSem:       make(chan struct{}, setupSlotConcurrency),
 		devices:        make(map[string]*VMNetInfo),
 		slotOwner:      make(map[int]string),
 		nextSlot:       1,
@@ -226,10 +338,28 @@ func NewManager(ctx context.Context, hostInterface string, log zerolog.Logger, o
 	for _, opt := range opts {
 		opt(mgr)
 	}
+	if mgr.useNetlinkOps {
+		ops, err := newNetlinkSlotOps()
+		if err != nil {
+			return nil, err
+		}
+		mgr.ops = ops
+	} else {
+		mgr.ops = shellSlotOps{}
+	}
+	preNet := time.Since(tPreNet)
 
+	tFW := time.Now()
 	if err := installHostFirewall(hostInterface, mgr.httpProxyPort, mgr.tlsProxyPort, mgr.dnsRedirectPort, mgr.secretsProxyDst, mgr.secretsProxyPort, mgr.blockedEgressPorts, mgr.ownsEgressPortChain, log.With().Str("component", "host_fw").Logger()); err != nil {
 		return nil, fmt.Errorf("install host firewall: %w", err)
 	}
+	// Async: a backpressured log writer must not extend startup — the values
+	// are already computed.
+	fwInstall := time.Since(tFW)
+	go func() {
+		mgr.log.Info().Dur("pre_network_ms", preNet).Dur("firewall_install_ms", fwInstall).
+			Msg("network manager init breakdown")
+	}()
 
 	return mgr, nil
 }
@@ -251,7 +381,7 @@ func (m *Manager) SetProxyPorts(http, tls, other uint16) {
 //
 // Network topology:
 //
-//	Host:      veth-<idx> (10.12.x.y/31)  ←→  eth0 (10.12.x.y/31) :Namespace
+//	Host:      veth-<idx> (10.12+.x.y/31)  ←→  eth0 (10.12+.x.y/31) :Namespace
 //	Host:      route hostIP/32 via vpeerIP
 //	Namespace: tap0 (169.254.0.22/30)  ←→  VM eth0 (169.254.0.21)
 //	Namespace: nftables SNAT 169.254.0.21 → hostIP (outbound)
@@ -259,19 +389,49 @@ func (m *Manager) SetProxyPorts(http, tls, other uint16) {
 //
 // IP addressing uses /16 subnets to support thousands of concurrent VMs:
 //   - hostIP:  10.11.<idx/256>.<idx%256>  (one per VM)
-//   - vpeerIP: 10.12.<(idx*2)/256>.<(idx*2)%256>  (namespace side of veth)
-//   - vethIP:  10.12.<(idx*2+1)/256>.<(idx*2+1)%256>  (host side of veth)
+//   - vpeerIP: offset idx*2 into 10.12.0.0/15    (namespace side of veth)
+//   - vethIP:  offset idx*2+1 into 10.12.0.0/15  (host side of veth)
 //
 // The host reaches the VM at hostIP:<port>. NAT inside the namespace
 // translates to 169.254.0.21:<port>. No guest IP reconfig needed.
 func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNetInfo, error) {
+	m.foregroundOps.Add(1)
+	defer m.foregroundOps.Add(-1)
 	// Try the pre-allocated pool first; fall back to on-demand setup.
 	if m.pool != nil {
 		if info := m.pool.Claim(vmID); info != nil {
 			m.registerEgress(vmID, info)
 			return info, nil
 		}
-		m.log.Info().Str("vm_id", vmID).Msg("network pool empty, falling back to on-demand setup")
+		// Empty is usually momentary — a restart adopting the previous run's
+		// slots, or a burst outrunning refill — and the producers are already
+		// holding the kernel locks an inline build would need. Wait briefly
+		// for their output rather than building alongside them; the wait is
+		// bounded and ClaimWait exits early once no producer is active.
+		tWait := time.Now()
+		if info := m.pool.ClaimWait(ctx, vmID); info != nil {
+			m.registerEgress(vmID, info)
+			m.recordNetPhase("pool_wait", time.Since(tWait))
+			if waited := time.Since(tWait); waited >= poolWaitLogThreshold {
+				m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).
+					Int64("pool_wait_ms", waited.Milliseconds()).
+					Msg("pool: claim satisfied after waiting on refill")
+			}
+			return info, nil
+		}
+		// A nil wait result can mean cancellation, not exhaustion — a dead
+		// request must not enter the inline path, whose slot-index claim can
+		// trigger reclaim scans over the full namespace table.
+		if err := ctx.Err(); err != nil {
+			// A cancelled wait is the full-deadline tail of pool_wait during
+			// saturation — sample it before bailing.
+			m.recordNetPhase("pool_wait", time.Since(tWait))
+			return nil, err
+		}
+		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).
+			Int64("pool_wait_ms", time.Since(tWait).Milliseconds()).
+			Msg("network pool empty, falling back to on-demand setup")
+		m.recordNetPhase("pool_wait", time.Since(tWait))
 	}
 
 	idx, err := m.claimSlotIndex(vmID)
@@ -279,8 +439,12 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 		return nil, err
 	}
 
+	tBuild := time.Now()
 	info, _, err := m.setupSlot(ctx, idx)
 	if err != nil {
+		// A failed build can be the slowest sample; emit it or the histogram
+		// censors exactly the setups worth investigating.
+		m.recordNetPhase("on_demand_setup", time.Since(tBuild))
 		// Build failed — release the index (we are its sole owner) so it isn't
 		// leaked. releaseIfOwned keeps it correct even if state moved under us.
 		m.releaseIfOwned(idx, vmID)
@@ -293,10 +457,12 @@ func (m *Manager) SetupVM(ctx context.Context, vmID string, cfg *Config) (*VMNet
 	m.registerEgress(vmID, info)
 
 	m.log.Info().
-		Str("vm_id", vmID).
+		Str("vm_id", vmID).Str("host_id", m.hostID).
 		Str("namespace", info.Namespace).
 		Str("host_ip", info.HostIP).
+		Int64("on_demand_setup_ms", time.Since(tBuild).Milliseconds()).
 		Msg("network namespace created")
+	m.recordNetPhase("on_demand_setup", time.Since(tBuild))
 
 	return info, nil
 }
@@ -310,16 +476,34 @@ func hostIPForSlot(idx int) string {
 // Deterministic slot identity: everything about a slot derives from its index,
 // which is what makes namespaces left by a previous vmd lifetime adoptable —
 // the kernel objects carry all the state, nothing needs to be persisted.
-func nsNameForSlot(idx int) string    { return fmt.Sprintf("ns-%d", idx) }
-func vethNameForSlot(idx int) string  { return fmt.Sprintf("veth-%d", idx) }
-func vpeerIPForSlot(idx int) string   { return fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256) }
-func vethIPForSlot(idx int) string    { return fmt.Sprintf("10.12.%d.%d", (idx*2+1)/256, (idx*2+1)%256) }
-func macForSlot(idx int) string       { return fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256) }
+func nsNameForSlot(idx int) string   { return fmt.Sprintf("ns-%d", idx) }
+func vethNameForSlot(idx int) string { return fmt.Sprintf("veth-%d", idx) }
+func vpeerIPForSlot(idx int) string  { return vethPairIP(idx * 2) }
+func vethIPForSlot(idx int) string   { return vethPairIP(idx*2 + 1) }
+
+// vethPairIP addresses one end of a slot's veth /31 by its flat offset into
+// 10.12.0.0/15. Slots below 32,768 keep the exact addresses the old /16 scheme
+// gave them, so widening the range leaves every existing namespace untouched.
+// Offsets are even/odd pairs and the /15 boundary is even, so a pair can never
+// straddle it.
+func vethPairIP(offset int) string {
+	return fmt.Sprintf("10.%d.%d.%d", 12+offset/65536, (offset%65536)/256, offset%256)
+}
+func macForSlot(idx int) string { return fmt.Sprintf("AA:FC:00:%02X:%02X:%02X", 0, idx/256, idx%256) }
 
 // setupSlot runs the expensive network setup (namespace, veth, TAP,
 // nftables, routing) for a single slot index. Used by both SetupVM
 // (on-demand) and Pool (pre-allocation).
 func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, error) {
+	// Bounded build window: a caller whose deadline expires while queued fails
+	// fast instead of building a slot its request can no longer use.
+	select {
+	case m.setupSem <- struct{}{}:
+		defer func() { <-m.setupSem }()
+	case <-ctx.Done():
+		return nil, "", fmt.Errorf("slot build queue: %w", ctx.Err())
+	}
+
 	// Ownership of idx is NOT touched here: claimSlotIndex owns it before this
 	// runs (pool/on-demand), and record paths reserve it. On success the slot is
 	// live and stays owned; on failure the caller releases idx (freeSlot).
@@ -338,44 +522,25 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", fmt.Errorf("namespace %s already exists (slot in use)", nsName)
 	}
 
-	if err := run(ctx, "ip", "netns", "add", nsName); err != nil {
+	if err := m.ops.AddNamespace(ctx, nsName); err != nil {
 		return nil, "", fmt.Errorf("create namespace: %w", err)
 	}
 
-	if err := nsRun(ctx, nsName, "ip", "link", "add", vethName, "type", "veth", "peer", "name", vpeerName); err != nil {
+	if err := m.ops.BuildSlotVeth(ctx, nsName, vethName, vpeerName, vpeerIP+"/31"); err != nil {
 		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("create veth pair: %w", err)
+		return nil, "", err
 	}
 
-	if err := nsRun(ctx, nsName, "ip", "link", "set", vpeerName, "up"); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("bring up vpeer: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "link", "set", vpeerName, "mtu", ifaceMTU); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("set vpeer MTU: %w", err)
-	}
-	if err := nsRun(ctx, nsName, "ip", "addr", "add", vpeerIP+"/31", "dev", vpeerName); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("assign vpeer IP: %w", err)
-	}
-
-	if err := nsRun(ctx, nsName, "ip", "link", "set", vethName, "netns", "1"); err != nil {
+	if err := m.ops.MoveVethToHost(ctx, nsName, vethName); err != nil {
 		m.removeNS(nsName)
 		return nil, "", fmt.Errorf("move veth to host: %w", err)
 	}
 
-	if err := run(ctx, "ip", "link", "set", vethName, "up"); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("bring up veth: %w", err)
-	}
-	if err := run(ctx, "ip", "link", "set", vethName, "mtu", ifaceMTU); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("set veth MTU: %w", err)
-	}
-	if err := run(ctx, "ip", "addr", "add", vethIP+"/31", "dev", vethName); err != nil {
-		m.removeNS(nsName)
-		return nil, "", fmt.Errorf("assign veth IP: %w", err)
+	if err := m.ops.ConfigureHostVeth(ctx, vethName, vethIP+"/31"); err != nil {
+		// The veth now lives on the host, so it outlives the namespace:
+		// tear both down or the next build at this index collides with it.
+		m.cleanupFull(nsName, vethName)
+		return nil, "", err
 	}
 
 	// One tap-construction path for fresh and recycled slots, so their tap
@@ -385,9 +550,9 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", err
 	}
 
-	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
+	_ = m.ops.EnableLoopback(ctx, nsName)
 
-	if err := nsRun(ctx, nsName, "ip", "route", "add", "default", "via", vethIP); err != nil {
+	if err := m.ops.AddDefaultRoute(ctx, nsName, vethIP); err != nil {
 		m.cleanupFull(nsName, vethName)
 		return nil, "", fmt.Errorf("add default route in ns: %w", err)
 	}
@@ -408,7 +573,7 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 		return nil, "", fmt.Errorf("init firewall: %w", err)
 	}
 
-	if err := run(ctx, "ip", "route", "add", hostCIDR, "via", vpeerIP, "dev", vethName); err != nil {
+	if err := m.ops.AddHostRoute(ctx, hostCIDR, vpeerIP, vethName); err != nil {
 		m.log.Debug().Err(err).Str("ns", nsName).Msg("host route (may already exist)")
 	}
 
@@ -434,15 +599,8 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 // decline to recycle. nftables rules match tap0 by name, so reusing the name
 // keeps them valid. Also the tap-construction path for setupSlot (the delete
 // is a no-op on a fresh namespace), keeping fresh and recycled taps identical.
-//
-// One exec for the whole rebuild: per-command `ip netns exec` invocations fork
-// twice each and serialize on the kernel's netlink lock under concurrent
-// resets. Interpolants are shell-quoted package constants.
 func (m *Manager) resetTap(ctx context.Context, nsName string) error {
-	script := fmt.Sprintf(
-		"ip link del %[1]s 2>/dev/null; ip tuntap add dev %[1]s mode tap && ip link set %[1]s up && ip link set %[1]s mtu %[2]s && ip addr add %[3]s dev %[1]s",
-		shellquote.Single(TAPName), shellquote.Single(ifaceMTU), shellquote.Single(tapCIDR))
-	if err := nsRun(ctx, nsName, "sh", "-c", script); err != nil {
+	if err := m.ops.RebuildTap(ctx, nsName); err != nil {
 		return fmt.Errorf("reset TAP: %w", err)
 	}
 	return nil
@@ -470,6 +628,10 @@ func (m *Manager) CleanupVM(vmID string) { m.cleanupVM(vmID, true) }
 func (m *Manager) TeardownVM(vmID string) { m.cleanupVM(vmID, false) }
 
 func (m *Manager) cleanupVM(vmID string, recycle bool) {
+	// Not counted in foregroundOps: reached from request destroys AND from
+	// the reconciler's background reaping through the same entry points, and
+	// the reconciler churns continuously — counting it would keep producers
+	// yielding to background work.
 	m.mu.Lock()
 	info, ok := m.devices[vmID]
 	if ok {
@@ -483,7 +645,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 
 	idx, parsed := slotFromNamespace(info.Namespace)
 	if !parsed {
-		m.log.Warn().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("cleanup: unparseable namespace — skipping slot reclaim")
+		m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", info.Namespace).Msg("cleanup: unparseable namespace — skipping slot reclaim")
 		return
 	}
 	vethName := fmt.Sprintf("veth-%d", idx)
@@ -502,7 +664,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 		owned := m.slotOwner[idx] == vmID
 		m.mu.Unlock()
 		if !owned {
-			m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+			m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Int("slot", idx).
 				Msg("cleanup skipped — slot no longer owned by this VM")
 			return
 		}
@@ -519,7 +681,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	// concurrent claim pop the idx, see the netns still present, and discard it
 	// for good.
 	if !m.claimTeardown(idx, vmID) {
-		m.log.Warn().Str("vm_id", vmID).Int("slot", idx).
+		m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Int("slot", idx).
 			Msg("teardown skipped — slot no longer owned by this VM")
 		return
 	}
@@ -530,7 +692,7 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	}
 	if info.Firewall != nil {
 		if err := info.Firewall.Close(); err != nil {
-			m.log.Warn().Err(err).Str("vm_id", vmID).Msg("error closing namespace firewall")
+			m.log.Warn().Err(err).Str("vm_id", vmID).Str("host_id", m.hostID).Msg("error closing namespace firewall")
 		}
 	}
 
@@ -539,21 +701,21 @@ func (m *Manager) cleanupVM(vmID string, recycle bool) {
 	// owner on the teardown-not-recycle path) would keep the namespace and its
 	// tap alive but anonymous: unfindable by pidsInNs, the sweep, or the gauge.
 	if killed := killProcessesInNs(info.Namespace); killed > 0 {
-		m.log.Info().Str("namespace", info.Namespace).Int("killed", killed).
+		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", info.Namespace).Int("killed", killed).
 			Msg("cleanup: killed lingering processes before namespace teardown")
 	}
 
-	vpeerIP := fmt.Sprintf("10.12.%d.%d", (idx*2)/256, (idx*2)%256)
+	vpeerIP := vpeerIPForSlot(idx)
 	hostCIDR := fmt.Sprintf("%s/32", info.HostIP)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_ = run(ctx, "ip", "route", "del", hostCIDR, "via", vpeerIP, "dev", vethName)
-	_ = run(ctx, "ip", "link", "del", vethName)
-	_ = run(ctx, "ip", "netns", "del", info.Namespace)
+	_ = m.ops.DelHostRoute(ctx, hostCIDR, vpeerIP, vethName)
+	_ = m.ops.DelHostLink(ctx, vethName)
+	_ = m.ops.DelNamespace(ctx, info.Namespace)
 
-	m.log.Info().Str("vm_id", vmID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
+	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", info.Namespace).Msg("network namespace cleaned up")
 }
 
 // CleanupVMOrNamespace tears down a VM's network slot. When the VM is tracked
@@ -588,14 +750,43 @@ func (m *Manager) CleanupVMOrNamespace(vmID, fallbackNamespace string) {
 	// only unlinks the name, so a namespace with a live holder lingers (keeping
 	// its tap0) until that process exits. Mirrors SweepOrphanNamespaces.
 	if killed := killProcessesInNs(fallbackNamespace); killed > 0 {
-		m.log.Info().Str("namespace", fallbackNamespace).Int("killed", killed).
+		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", fallbackNamespace).Int("killed", killed).
 			Msg("cleanup: killed lingering processes before namespace teardown")
 	}
 	// Tear down both sides even if the netns is already gone: `ip netns del`
 	// only removes the in-namespace side, so the host-side veth-N can outlive it.
 	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
-	m.log.Info().Str("vm_id", vmID).Str("namespace", fallbackNamespace).Int("slot", idx).
+	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", fallbackNamespace).Int("slot", idx).
 		Msg("reclaimed network slot for untracked VM")
+}
+
+// TeardownVMOrNamespace forcefully tears down a VM's network slot without
+// recycling it into the warm pool.
+func (m *Manager) TeardownVMOrNamespace(vmID, fallbackNamespace string) {
+	m.mu.Lock()
+	_, tracked := m.devices[vmID]
+	m.mu.Unlock()
+	if tracked {
+		m.TeardownVM(vmID)
+		return
+	}
+
+	idx, ok := slotFromNamespace(fallbackNamespace)
+	if !ok {
+		return
+	}
+	if !m.claimTeardown(idx, vmID) {
+		return
+	}
+	defer m.releaseIfOwned(idx, teardownOwner)
+
+	if killed := killProcessesInNs(fallbackNamespace); killed > 0 {
+		m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", fallbackNamespace).Int("killed", killed).
+			Msg("cleanup: killed lingering processes before namespace teardown")
+	}
+	m.cleanupFull(fallbackNamespace, fmt.Sprintf("veth-%d", idx))
+	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", fallbackNamespace).Int("slot", idx).
+		Msg("forcefully tore down network slot for untracked VM")
 }
 
 // Forget reverses an in-memory reattach that raced a concurrent DestroyVM/
@@ -624,6 +815,9 @@ func (m *Manager) Forget(vmID string) {
 // customer's subsequent UpdateFirewallRules calls apply to the existing
 // kernel state.
 func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
+	// Not counted in foregroundOps: the only caller is the startup reattach
+	// pass, which is itself background work — counting it would make the
+	// producers yield to each other.
 	idx, ok := slotFromNamespace(namespace)
 	if !ok {
 		return fmt.Errorf("reattach %s: cannot parse slot from namespace %q", vmID, namespace)
@@ -647,7 +841,7 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 		fw = f
 		return nil
 	}); err != nil {
-		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("reattach: in-namespace firewall handle not restored (existing rules still enforce traffic)")
+		m.log.Warn().Err(err).Str("vm_id", vmID).Str("host_id", m.hostID).Msg("reattach: in-namespace firewall handle not restored (existing rules still enforce traffic)")
 	}
 
 	m.mu.Lock()
@@ -677,7 +871,7 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	}
 	m.registerEgress(vmID, info)
 
-	m.log.Info().Str("vm_id", vmID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
+	m.log.Info().Str("vm_id", vmID).Str("host_id", m.hostID).Int("slot", idx).Str("host_ip", hostIP).Bool("fw_attached", fw != nil).Msg("reattached VM network state")
 	return nil
 }
 
@@ -713,6 +907,8 @@ func (m *Manager) ReserveSlotsAbove(reservations map[string]string) {
 // so a rebuild preserves the VM's network identity. Per-customer egress
 // rules are NOT restored here; the caller reapplies them.
 func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, macAddress string) (*VMNetInfo, error) {
+	m.foregroundOps.Add(1)
+	defer m.foregroundOps.Add(-1)
 	idx, ok := slotFromNamespace(namespace)
 	if !ok {
 		return nil, fmt.Errorf("ensure %s: cannot parse slot from namespace %q", vmID, namespace)
@@ -736,7 +932,7 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 		// Preserve Firewall handle for future UpdateFirewallRules.
 		info = existing
 	case !nsExists(namespace):
-		m.log.Warn().Str("vm_id", vmID).Str("namespace", namespace).Int("slot", idx).Msg("netns missing — rebuilding slot at original index")
+		m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Str("namespace", namespace).Int("slot", idx).Msg("netns missing — rebuilding slot at original index")
 		// ip netns delete only tears down the inside-ns side; the host-side
 		// veth-N can survive and collide with setupSlot's fresh veth creation.
 		m.cleanupFull(namespace, fmt.Sprintf("veth-%d", idx))
@@ -745,7 +941,7 @@ func (m *Manager) EnsureVMSlot(ctx context.Context, vmID, namespace, hostIP, mac
 			return nil, fmt.Errorf("ensure %s: rebuild slot %d: %w", vmID, idx, err)
 		}
 		if macAddress != "" && built.MACAddress != macAddress {
-			m.log.Warn().Str("vm_id", vmID).Str("expected", macAddress).Str("got", built.MACAddress).Msg("rebuilt MAC differs from stored — deterministic mapping may have drifted")
+			m.log.Warn().Str("vm_id", vmID).Str("host_id", m.hostID).Str("expected", macAddress).Str("got", built.MACAddress).Msg("rebuilt MAC differs from stored — deterministic mapping may have drifted")
 		}
 		info = built
 	default:
@@ -795,15 +991,55 @@ const (
 	withheldOwner = "\x00withheld" // kernel state dirty and unremovable; parked until next boot
 )
 
+// setSlotOwnerLocked is the ONLY writer of slotOwner entries: it keeps
+// the pool/used counters exact across every ownership transition, so
+// SlotPressure reads two ints instead of walking an O(fleet) map under
+// the mutex that slot claims and network setup contend for. Caller must
+// hold m.mu.
+func (m *Manager) setSlotOwnerLocked(idx int, owner string) {
+	if prev := m.slotOwner[idx]; m.buildSlotOwners[prev] == idx {
+		delete(m.buildSlotOwners, prev)
+	}
+	m.uncountSlotOwnerLocked(idx)
+	m.slotOwner[idx] = owner
+	if owner == poolOwner {
+		m.poolOwnedSlots++
+	} else {
+		m.usedOwnedSlots++
+	}
+}
+
+// deleteSlotOwnerLocked is the ONLY deleter of slotOwner entries; caller
+// must hold m.mu.
+func (m *Manager) deleteSlotOwnerLocked(idx int) {
+	if prev := m.slotOwner[idx]; m.buildSlotOwners[prev] == idx {
+		delete(m.buildSlotOwners, prev)
+	}
+	m.uncountSlotOwnerLocked(idx)
+	delete(m.slotOwner, idx)
+}
+
+func (m *Manager) uncountSlotOwnerLocked(idx int) {
+	prev, ok := m.slotOwner[idx]
+	if !ok {
+		return
+	}
+	if prev == poolOwner {
+		m.poolOwnedSlots--
+	} else {
+		m.usedOwnedSlots--
+	}
+}
+
 // assignSlotLocked sets the owner of idx (a fresh claim or an owner transfer,
 // e.g. pool→VM on Claim). Caller must hold m.mu and must have already removed
 // idx from freeSlots (claimSlotIndex pops it; transfers keep it out).
-func (m *Manager) assignSlotLocked(idx int, owner string) { m.slotOwner[idx] = owner }
+func (m *Manager) assignSlotLocked(idx int, owner string) { m.setSlotOwnerLocked(idx, owner) }
 
 // reserveSlotLocked marks idx owned by a record and removes it from freeSlots if
 // present — the record-path acquire. Caller must hold m.mu.
 func (m *Manager) reserveSlotLocked(idx int, owner string) {
-	m.slotOwner[idx] = owner
+	m.setSlotOwnerLocked(idx, owner)
 	m.removeFromFreeSlotsLocked(idx)
 }
 
@@ -824,7 +1060,7 @@ func (m *Manager) releaseIfOwned(idx int, owner string) bool {
 	if m.slotOwner[idx] != owner {
 		return false
 	}
-	delete(m.slotOwner, idx)
+	m.deleteSlotOwnerLocked(idx)
 	m.freeSlots = append(m.freeSlots, idx)
 	return true
 }
@@ -839,7 +1075,7 @@ func (m *Manager) withholdIfOwned(idx int, owner string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.slotOwner[idx] == owner {
-		m.slotOwner[idx] = withheldOwner
+		m.setSlotOwnerLocked(idx, withheldOwner)
 	}
 }
 
@@ -852,7 +1088,7 @@ func (m *Manager) withholdIfOwned(idx int, owner string) {
 // via reserveSlotLocked (bypassing the owned/nsExists checks). Pair every
 // ClaimFreshSlot with a ReleaseSlot.
 func (m *Manager) ClaimFreshSlot(owner string) (int, error) {
-	return m.claimSlotIndex(owner)
+	return m.claimSlotIndexWithBuildEvidence(owner, true)
 }
 
 // ReleaseSlot frees a slot claimed via ClaimFreshSlot and tears down any ns/veth
@@ -882,7 +1118,7 @@ func (m *Manager) claimTeardown(idx int, owner string) bool {
 	if m.slotOwner[idx] != owner {
 		return false
 	}
-	m.slotOwner[idx] = teardownOwner
+	m.setSlotOwnerLocked(idx, teardownOwner)
 	return true
 }
 
@@ -890,8 +1126,11 @@ func (m *Manager) claimTeardown(idx int, owner string) bool {
 // assigns it to owner, and returns it. owner is poolOwner for pool pre-allocation
 // or the vmID for an on-demand SetupVM.
 func (m *Manager) claimSlotIndex(owner string) (int, error) {
+	return m.claimSlotIndexWithBuildEvidence(owner, false)
+}
+
+func (m *Manager) claimSlotIndexWithBuildEvidence(owner string, build bool) (int, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	for {
 		var idx int
@@ -907,6 +1146,44 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 				ceiling = m.maxSlot // WithExactSlot: allow only the pinned index
 			}
 			if m.nextSlot > ceiling {
+				if m.slotPinned {
+					// A reclaim scan only ever refills freeSlots, which a
+					// pinned claim never draws from (see the comment above)
+					// — so it cannot turn this failure into a success.
+					// Skip straight to failing instead of looping forever:
+					// freeSlots staying populated (nothing here ever drains
+					// it) would otherwise keep re-passing the check below.
+					m.mu.Unlock()
+					return 0, ErrNoSlots
+				}
+				// Out of fresh range, which is not the same as out of slots:
+				// indexes are discarded (never returned) whenever a namespace
+				// outlives them, so the gaps below are the only inventory left.
+				//
+				// reclaimUnusedSlots manages its own locking and must be
+				// called without m.mu held: it reads the whole netns and
+				// host-veth directories, which at the ceiling means tens of
+				// thousands of entries. Holding the single allocator lock
+				// across that scan would stall every other claim on the
+				// host — including an on-demand RestoreSnapshot setup
+				// racing its gRPC deadline — for the scan's full duration.
+				m.mu.Unlock()
+				m.reclaimUnusedSlots()
+				m.mu.Lock()
+				// Check current state, not this call's own return value: a
+				// concurrent caller's scan can win the merge (see the
+				// cooldown re-check in reclaimUnusedSlots) while this one
+				// loses it, in which case this call's own n is 0 even though
+				// the winner just refilled freeSlots. Trusting n here would
+				// fail this claim with ErrNoSlots despite slots being
+				// available right now. (Safe from the same loop risk as the
+				// pinned branch above: freeSlots is drained by the pop at
+				// the top of this loop on every non-pinned iteration, so
+				// this always terminates.)
+				if len(m.freeSlots) > 0 {
+					continue
+				}
+				m.mu.Unlock()
 				return 0, ErrNoSlots
 			}
 			idx = m.nextSlot
@@ -921,8 +1198,166 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 		}
 
 		m.assignSlotLocked(idx, owner)
+		if build {
+			if m.buildSlotOwners == nil {
+				m.buildSlotOwners = make(map[string]int)
+			}
+			m.buildSlotOwners[owner] = idx
+		}
+		m.mu.Unlock()
 		return idx, nil
 	}
+}
+
+// ReclaimUnusedSlots seeds the free list with every index below the
+// allocator's high-water mark that no owner holds and no namespace occupies.
+// Startup pins the mark above the highest record index, so on a host whose
+// records reach into the upper range, everything below it is unreachable for
+// the whole process lifetime unless it is reclaimed deliberately. Call it once
+// startup reservations are in place, when the only owners are records.
+func (m *Manager) ReclaimUnusedSlots() int {
+	m.mu.Lock()
+	m.lastReclaim = time.Time{} // startup always scans
+	m.mu.Unlock()
+	n := m.reclaimUnusedSlots()
+	// The startup orphan sweep runs after this and deletes namespaces, so
+	// indexes this pass counted as occupied can be free moments later. Leave
+	// the cooldown unarmed so the first claim at the ceiling rescans rather
+	// than failing for the cooldown's duration over stale evidence.
+	m.mu.Lock()
+	m.lastReclaim = time.Time{}
+	m.mu.Unlock()
+	return n
+}
+
+// PoolStats reports the current warm-pool depth and whether the pool exists.
+func (m *Manager) PoolStats() (fresh, recycled int, enabled bool) {
+	if m.pool == nil {
+		return 0, 0, false
+	}
+	return len(m.pool.fresh), len(m.pool.recycled), true
+}
+
+// DrainWarmPool tears down up to max warm pool slots so the host can shed
+// namespace, veth, tap, and mount pressure without waiting for a destroy path.
+func (m *Manager) DrainWarmPool(max int) int {
+	if m.pool == nil || max <= 0 {
+		return 0
+	}
+	return m.pool.drain(max)
+}
+
+// reclaimUnusedSlots refills freeSlots from the range below nextSlot:
+// every index that no owner holds and no kernel namespace occupies. Returns
+// how many it recovered.
+//
+// The allocator only ever advances nextSlot, and discards any index whose
+// namespace outlived it (returning it to freeSlots would loop). On a
+// long-lived host those discards accumulate until the fresh range is spent
+// while most of the space below it is idle — and a restart does not clear it,
+// because boot re-reserves each record's index and resumes above the highest.
+// So the ceiling has to be recoverable in place.
+//
+// One directory read rather than a stat per index: at the ceiling there are
+// tens of thousands of indexes to test, and namespace presence is the only
+// thing that makes one unusable. Caller must NOT hold m.mu: the directory
+// reads below are the expensive part of this call (tens of thousands of
+// entries at the ceiling), and every other slot claim on the host blocks on
+// m.mu for as long as it's held — this method takes the lock itself, only
+// for the cheap cooldown check and the final merge into freeSlots.
+func (m *Manager) reclaimUnusedSlots() int {
+	m.mu.Lock()
+	onCooldown := time.Since(m.lastReclaim) < reclaimCooldown
+	m.mu.Unlock()
+	if onCooldown {
+		return 0
+	}
+
+	entries, err := os.ReadDir(netnsDir)
+	if err != nil && !os.IsNotExist(err) {
+		// Fail closed: an unreadable namespace directory means every index
+		// might still be occupied, and handing one out would collide.
+		m.log.Warn().Err(err).Msg("allocator: cannot list namespaces — skipping slot reclaim")
+		return 0
+	}
+	occupied := make(map[int]bool, len(entries))
+	for _, entry := range entries {
+		if idx, ok := slotFromNamespace(entry.Name()); ok {
+			occupied[idx] = true
+		}
+	}
+	// A host-side veth can outlive its namespace, and building over one fails
+	// at the move-to-host step. A failed build releases the index onto the top
+	// of the LIFO free list, so handing out such an index doesn't just waste a
+	// build — the next claim pops the same index and retries it forever,
+	// starving every other reclaimed slot. SweepStrayHostVeths is what clears
+	// them; until it does, they are not free.
+	// A host-side veth can outlive its namespace, and building over one fails
+	// at the move-to-host step. A failed build releases the index onto the top
+	// of the LIFO free list, so handing out such an index doesn't just waste a
+	// build — the next claim pops the same index and retries it forever,
+	// starving every other reclaimed slot. SweepStrayHostVeths is what clears
+	// them; until it does, they are not free.
+	veths, err := listHostVeths()
+	if err != nil {
+		m.log.Warn().Err(err).Msg("allocator: cannot list host veths — skipping slot reclaim")
+		return 0
+	}
+	for _, veth := range veths {
+		if idxStr, ok := strings.CutPrefix(veth, "veth-"); ok {
+			if idx, convErr := strconv.Atoi(idxStr); convErr == nil {
+				occupied[idx] = true
+			}
+		}
+	}
+
+	// Test seam: no-op in production. Tests override this to pause a scan
+	// here, after the unlocked directory reads and before the merge lock, to
+	// deterministically interleave a concurrent scan that merges first.
+	reclaimScanBarrier()
+
+	// Everything from here on is cheap in-memory bookkeeping against mutable
+	// allocator state, so it takes the lock — unlike the directory reads
+	// above, which ran unlocked.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Re-check: another goroutine may have scanned and armed the cooldown
+	// while this one was reading the filesystem unlocked. Its scan is at
+	// least as fresh as this one's, so defer to it rather than redoing the
+	// merge with a stale occupied set.
+	if time.Since(m.lastReclaim) < reclaimCooldown {
+		return 0
+	}
+
+	for _, idx := range m.freeSlots {
+		occupied[idx] = true
+	}
+	// Armed only now that both reads succeeded: a scan that bailed on a
+	// transient read has learned nothing, and must not silence the next one
+	// for the cooldown while the host may have capacity to hand out.
+	m.lastReclaim = time.Now()
+
+	limit := m.nextSlot - 1
+	if limit > MaxSlots {
+		limit = MaxSlots
+	}
+	reclaimed := 0
+	for idx := 1; idx <= limit; idx++ {
+		if occupied[idx] {
+			continue
+		}
+		if _, owned := m.slotOwner[idx]; owned {
+			continue
+		}
+		m.freeSlots = append(m.freeSlots, idx)
+		reclaimed++
+	}
+	if reclaimed > 0 {
+		m.log.Warn().Int("reclaimed", reclaimed).Int("namespaces", len(entries)).
+			Msg("allocator: slot range spent — reclaimed unused indexes")
+	}
+	return reclaimed
 }
 
 // SweepOrphanNamespaces removes host namespaces and veth interfaces
@@ -974,7 +1409,7 @@ func (m *Manager) SweepOrphanNamespaces(keep map[string]bool) (swept int) {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := run(ctx, "ip", "link", "del", veth); err == nil {
+			if err := m.ops.DelHostLink(ctx, veth); err == nil {
 				m.log.Info().Str("veth", veth).Msg("swept orphan host veth")
 			}
 			cancel()
@@ -1159,15 +1594,15 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	// it, namespace side for its outbound traffic — and a crash can strand a
 	// namespace between address config and route install. Replace is
 	// idempotent, so any failure means the slot is structurally broken.
-	if err := run(ctx, "ip", "route", "replace", hostIP+"/32", "via", vpeerIPForSlot(idx), "dev", vethName); err != nil {
+	if err := m.ops.ReplaceHostRoute(ctx, hostIP+"/32", vpeerIPForSlot(idx), vethName); err != nil {
 		_ = fw.Close()
 		return nil, "", fmt.Errorf("adopt slot %d: host route: %w", idx, err)
 	}
-	if err := nsRun(ctx, nsName, "ip", "route", "replace", "default", "via", vethIPForSlot(idx)); err != nil {
+	if err := m.ops.ReplaceDefaultRoute(ctx, nsName, vethIPForSlot(idx)); err != nil {
 		_ = fw.Close()
 		return nil, "", fmt.Errorf("adopt slot %d: namespace default route: %w", idx, err)
 	}
-	_ = nsRun(ctx, nsName, "ip", "link", "set", "lo", "up")
+	_ = m.ops.EnableLoopback(ctx, nsName)
 
 	return &VMNetInfo{
 		Namespace:  nsName,
@@ -1200,7 +1635,7 @@ func (m *Manager) SweepStrayHostVeths() (swept int) {
 			// here, and the index must never become claimable — delete the
 			// stray link and move on.
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := run(ctx, "ip", "link", "del", veth); err == nil {
+			if err := m.ops.DelHostLink(ctx, veth); err == nil {
 				m.log.Info().Str("veth", veth).Msg("swept stray host veth")
 				swept++
 			}
@@ -1220,7 +1655,7 @@ func (m *Manager) SweepStrayHostVeths() (swept int) {
 		m.mu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		delErr := run(ctx, "ip", "link", "del", veth)
+		delErr := m.ops.DelHostLink(ctx, veth)
 		cancel()
 		if delErr == nil {
 			m.log.Info().Str("veth", veth).Msg("swept stray host veth")
@@ -1290,9 +1725,53 @@ func pidsInNs(name string) (pids []int, ok bool) {
 	return pids, true
 }
 
+// occupiedNamespaces reports every named network namespace (names) and which
+// of them have at least one live process (occupied), from ONE netns readdir
+// and ONE /proc pass — the per-slot pidsInNs scan costs a full /proc readdir
+// each, which is exactly the multiplier the receipt fast path exists to
+// remove. ok=false means a directory was unreadable: "don't know", never
+// "all clear".
+func occupiedNamespaces() (names, occupied map[string]bool, ok bool) {
+	entries, err := os.ReadDir(netnsDir)
+	if err != nil {
+		return nil, nil, false
+	}
+	names = make(map[string]bool, len(entries))
+	inoToName := make(map[uint64]string, len(entries))
+	for _, e := range entries {
+		names[e.Name()] = true
+		st, err := os.Stat(netnsDir + "/" + e.Name())
+		if err != nil {
+			continue
+		}
+		inoToName[st.Sys().(*syscall.Stat_t).Ino] = e.Name()
+	}
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, nil, false
+	}
+	occupied = make(map[string]bool)
+	for _, e := range procs {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		st, err := os.Stat("/proc/" + e.Name() + "/ns/net")
+		if err != nil {
+			continue
+		}
+		if name, hit := inoToName[st.Sys().(*syscall.Stat_t).Ino]; hit {
+			occupied[name] = true
+		}
+	}
+	return names, occupied, true
+}
+
 // listHostVeths returns all veth-N interfaces visible in the host namespace.
 func listHostVeths() ([]string, error) {
-	entries, err := os.ReadDir("/sys/class/net")
+	entries, err := os.ReadDir(hostNetDir)
 	if err != nil {
 		return nil, err
 	}
@@ -1326,6 +1805,39 @@ func (m *Manager) UpdateFirewallRules(vmID string, allowedCIDRs, deniedCIDRs []s
 // netnsDir is overridden by tests.
 var netnsDir = "/run/netns"
 
+// hostNetDir is where host-side interfaces appear; overridden by tests.
+var hostNetDir = "/sys/class/net"
+
+// NamespaceForPID returns the ns-N name of the network namespace that pid is
+// in, by matching /proc/<pid>/ns/net's inode against the named namespaces in
+// netnsDir. Empty when pid is 0, gone, or in no named namespace. Lets a
+// caller reclaim the slot of an untracked VM (no device record) whose only
+// remaining handle is its live process.
+func (m *Manager) NamespaceForPID(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	procNs, err := os.Stat(fmt.Sprintf("/proc/%d/ns/net", pid))
+	if err != nil {
+		return ""
+	}
+	target := procNs.Sys().(*syscall.Stat_t).Ino
+	entries, err := os.ReadDir(netnsDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		st, err := os.Stat(netnsDir + "/" + e.Name())
+		if err != nil {
+			continue
+		}
+		if st.Sys().(*syscall.Stat_t).Ino == target {
+			return e.Name()
+		}
+	}
+	return ""
+}
+
 func nsExists(nsName string) bool {
 	_, err := os.Stat(netnsDir + "/" + nsName)
 	return err == nil
@@ -1334,14 +1846,73 @@ func nsExists(nsName string) bool {
 func (m *Manager) removeNS(nsName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = run(ctx, "ip", "netns", "del", nsName)
+	_ = m.ops.DelNamespace(ctx, nsName)
 }
 
 func (m *Manager) cleanupFull(nsName, vethName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = run(ctx, "ip", "link", "del", vethName)
-	_ = run(ctx, "ip", "netns", "del", nsName)
+	_ = m.ops.DelHostLink(ctx, vethName)
+	_ = m.ops.DelNamespace(ctx, nsName)
+}
+
+// SlotPressureStats is the in-memory slot accounting the heartbeat's
+// pressure publisher reads: no filesystem or namespace inspection, just
+// counter and channel reads, so it is safe at any cadence.
+//
+//	Used:         slots owned by live VMs and builds (allocator truth)
+//	WarmReady:    pool slots fully built and claimable right now
+//	Provisioning: refill workers currently building or delivering a slot
+//	Ceiling:      the IP-scheme hard bound on total slots (not a knob)
+type SlotPressureStats struct {
+	Used            int
+	BuildSlotOwners []string
+	WarmReady       int
+	Provisioning    int
+	Ceiling         int
+}
+
+// SlotPressure returns the current in-memory slot accounting. Pure reads:
+// one mutex for the owner map, channel lengths and an atomic for the pool.
+// Used counts only slots held by real owners (VMs, builds): pool-owned
+// slots — warm inventory, slots mid-build for the pool, and adoption
+// candidates claimed at startup — are excluded here and reported through
+// WarmReady/Provisioning instead, so the same slot can never appear in
+// two pressure classes at once (Used + Warm + Provisioning is what the
+// prepared-slot ceiling bounds; double-counting would corrupt that
+// formula). The counters are maintained at every ownership transition
+// (see setSlotOwnerLocked); only the bounded fresh-build owner set is walked.
+// Provisioning is STRUCTURAL, not a worker count: every
+// pool-owned slot that is not yet claimable from a warm channel is
+// in-flight inventory — refill builds and, after a restart with pool
+// adoption on, potentially hundreds of adoption candidates that hold
+// real namespaces long before any refill worker touches them. The
+// refillActive floor covers workers that have not claimed an index yet.
+// Reads counters maintained at ownership transitions, without scanning
+// the fleet-sized slot map under the allocator lock.
+func (m *Manager) SlotPressure() SlotPressureStats {
+	st := SlotPressureStats{Ceiling: MaxSlots}
+	m.mu.Lock()
+	poolOwned := m.poolOwnedSlots
+	st.Used = m.usedOwnedSlots
+	for owner := range m.buildSlotOwners {
+		st.BuildSlotOwners = append(st.BuildSlotOwners, owner)
+	}
+	m.mu.Unlock()
+	if m.pool != nil {
+		fresh, recycled, ok := m.PoolStats()
+		if ok {
+			st.WarmReady = fresh + recycled
+		}
+		st.Provisioning = poolOwned - st.WarmReady
+		if refill := int(m.pool.refillActive.Load()); refill > st.Provisioning {
+			st.Provisioning = refill
+		}
+		if st.Provisioning < 0 {
+			st.Provisioning = 0
+		}
+	}
+	return st
 }
 
 // NetnsStats reports the ns-N namespaces on the host, the owned slot indices

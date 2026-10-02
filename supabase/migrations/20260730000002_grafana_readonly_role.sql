@@ -26,6 +26,8 @@ BEGIN
             throwaway_password
         );
     END IF;
+EXCEPTION WHEN duplicate_object THEN
+    NULL;
 END
 $$;
 

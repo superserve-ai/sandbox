@@ -35,7 +35,12 @@ on:
           - staging
           - production
       force_rebuild:
-        description: 'Re-enqueue builds even for ready templates (use after host replacement)'
+        description: 'Re-enqueue builds even for ready templates (refresh baked runtime changes)'
+        required: false
+        type: boolean
+        default: false
+      smoke_preflight:
+        description: 'Temporary read-only staging template-build preflight (does not seed)'
         required: false
         type: boolean
         default: false
@@ -62,7 +67,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  smoke-preflight:
+    if: github.event_name == 'workflow_dispatch' && inputs.smoke_preflight && inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Read staging readiness without exposing credentials
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+        run: python3 scripts/template-build-preflight.py
+
   seed-staging:
+    if: ${{ !inputs.smoke_preflight }}
     name: Seed Staging
     runs-on: ubuntu-latest
     environment: staging
@@ -138,7 +166,7 @@ jobs:
 
   seed-prod:
     name: Seed Production
-    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
+    if: ${{ !inputs.smoke_preflight && (github.event_name == 'push' || inputs.environment == 'production') }}
     runs-on: ubuntu-latest
     environment: production
     # Two blocking seeder invocations (primary, then the usw cell), each with

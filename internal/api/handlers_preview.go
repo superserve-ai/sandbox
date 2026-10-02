@@ -26,6 +26,11 @@ import (
 
 const maxPreviewTokenExpirySeconds = 7 * 24 * 60 * 60
 
+// Capability rejection diagnostics are best-effort and must not inherit the
+// request's potentially long server timeout while waiting for a DB connection
+// or a stalled query.
+const previewCapabilityDiagnosticTimeout = 250 * time.Millisecond
+
 var (
 	errPreviewPortNotPublished = errors.New("preview port is not published")
 	errPreviewPortIsPublic     = errors.New("preview port is public")
@@ -115,6 +120,19 @@ func publishedPortPolicies(ports []db.ListPublishedPortsRow) map[int32]vmdclient
 		out[port.Port] = vmdclient.PortPolicy{Access: wireAccess, TokenVersion: port.TokenVersion}
 	}
 	return out
+}
+
+// claimedPortPolicies is publishedPortPolicies over the parallel arrays the
+// resume claim aggregates its ports into.
+func claimedPortPolicies(ports []int32, accesses []string, tokenVersions []int64) map[int32]vmdclient.PortPolicy {
+	rows := make([]db.ListPublishedPortsRow, 0, len(ports))
+	for i, port := range ports {
+		if i >= len(accesses) || i >= len(tokenVersions) {
+			break
+		}
+		rows = append(rows, db.ListPublishedPortsRow{Port: port, Access: accesses[i], TokenVersion: tokenVersions[i]})
+	}
+	return publishedPortPolicies(rows)
 }
 
 // vmdPorts strips credential generations from non-tokenized modes. The
@@ -230,7 +248,7 @@ func (h *Handlers) applyPreviewMutationFinalized(ctx context.Context, sandboxID,
 	if h.Pool == nil {
 		return run(h.DB)
 	}
-	tx, err := h.Pool.Begin(ctx)
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return previewPolicySnapshot{}, nil, err
 	}
@@ -261,8 +279,14 @@ func (h *Handlers) applyPreviewMutationValidated(ctx context.Context, sandboxID,
 }
 
 func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
-	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: hostID, RequiredCapabilities: capabilities,
+	started := time.Now()
+	defer func() {
+		RecordLatencyPhases(ctx, "preview_mutation", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
+	}()
+
+	ok, err := q.LockedHostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		AllowedStatuses: []string{"active"},
+		HostID:          hostID, RequiredCapabilities: capabilities,
 	})
 	if err != nil {
 		return err
@@ -271,6 +295,103 @@ func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID 
 		return &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
 	}
 	return nil
+}
+
+// Owner resume preserves lifecycle continuity while placement and mutations
+// retain the active-only capability rule.
+func validateOwnerResumeBrowserCapabilities(ctx context.Context, q *db.Queries, hostID string) error {
+	return validateOwnerResumeCapabilities(ctx, q, hostID, previewBrowserCapabilities()...)
+}
+
+func validateOwnerResumeCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
+	started := time.Now()
+	defer func() {
+		RecordLatencyPhases(ctx, "resume", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
+	}()
+
+	ok, err := q.LockedHostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		AllowedStatuses: []string{"active", "draining"},
+		HostID:          hostID, RequiredCapabilities: capabilities,
+		HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
+	}
+	return nil
+}
+
+func validateOwnerResumePolicyCapabilities(ctx context.Context, q *db.Queries, hostID string, policy previewPolicySnapshot) error {
+	if policy.requiresBrowserCapability() {
+		return validateOwnerResumeBrowserCapabilities(ctx, q, hostID)
+	}
+	if policy.Access != preview.AccessLegacyPublic {
+		return validateOwnerResumeCapabilities(ctx, q, hostID, preview.HostCapabilityPorts)
+	}
+	return nil
+}
+
+// ownerResumeCapabilitiesFor is what validateOwnerResumePolicyCapabilities
+// asks of the host for policy: the browser chain for a private policy, the
+// ports capability for any other strict one, nothing for a legacy one.
+func ownerResumeCapabilitiesFor(policy previewPolicySnapshot) []string {
+	if policy.requiresBrowserCapability() {
+		return previewBrowserCapabilities()
+	}
+	if policy.Access != preview.AccessLegacyPublic {
+		return []string{preview.HostCapabilityPorts}
+	}
+	return nil
+}
+
+// resumePostBootCheck is the post-boot policy read and owner capability
+// check of a resume as one statement: the current policy, and a
+// capabilityErr when the host no longer meets what policy requires. When
+// policy requires anything, the statement runs under the host lock so it
+// follows a heartbeat already withdrawing a capability. A legacy policy
+// requires nothing, reads without the lock, and is never refused.
+func (h *Handlers) resumePostBootCheck(ctx context.Context, sandboxID, teamID uuid.UUID, hostID string, policy previewPolicySnapshot) (current previewPolicySnapshot, capabilityErr, err error) {
+	capabilities := ownerResumeCapabilitiesFor(policy)
+	params := db.ResumePostBootCheckParams{
+		ID: sandboxID, TeamID: teamID, HostID: hostID,
+		AllowedStatuses:      []string{"active", "draining"},
+		HeartbeatAfter:       time.Now().Add(-heartbeatTimeout),
+		RequiredCapabilities: append([]string{}, capabilities...),
+	}
+	var row db.ResumePostBootCheckRow
+	if len(capabilities) > 0 {
+		started := time.Now()
+		defer func() {
+			RecordLatencyPhases(ctx, "resume", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
+		}()
+		row, err = h.DB.LockedResumePostBootCheck(ctx, params)
+	} else {
+		row, err = h.DB.ResumePostBootCheck(ctx, params)
+	}
+	if err != nil {
+		return previewPolicySnapshot{}, nil, err
+	}
+	current = previewPolicySnapshot{Access: row.Access, WireAccess: row.WireAccess, Revision: row.Revision}
+	if len(capabilities) > 0 && !row.HostEligible {
+		capabilityErr = &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
+	}
+	return current, capabilityErr, nil
+}
+
+func (h *Handlers) requireOwnerResumeCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
+	hasCapabilities, err := h.hostHasCapabilitiesCachedForScope(c.Request.Context(), hostID, capabilities, ownerResumeCapabilities)
+	if err != nil || hasCapabilities {
+		return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
+	}
+	// Active-only diagnostics cannot explain the owner-resume eligibility rule.
+	log.Warn().Str("host_id", hostID).Str("sandbox_id", c.Param("sandbox_id")).
+		Strs("required_capabilities", capabilities).Msg("owner resume capability enforcement rejected request")
+	respondErrorMsg(c, "conflict",
+		fmt.Sprintf("The sandbox's host does not enforce all required capabilities (%s); retry after the fleet is upgraded", strings.Join(capabilities, ", ")),
+		http.StatusConflict)
+	return false
 }
 
 func previewBrowserCapabilities() []string {
@@ -338,12 +459,72 @@ func (h *Handlers) pushPreviewCredentialPolicy(ctx context.Context, sandbox db.S
 // transactional validateHostPreviewCapabilities on mutations.
 func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
 	hasCapabilities, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, capabilities)
+	return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
+}
+
+// respondHostCapabilityResult turns a pre-flight outcome into the response
+// (error → 500, rejection → 409 with diagnostics gathered off the request)
+// and returns true when the host passed.
+func (h *Handlers) respondHostCapabilityResult(c *gin.Context, hostID string, capabilities []string, hasCapabilities bool, err error) bool {
 	if err != nil {
-		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("DB HostHasCapabilities failed")
+		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("host pre-flight failed")
 		respondError(c, ErrInternal)
 		return false
 	}
 	if !hasCapabilities {
+		sandboxID := c.Param("sandbox_id")
+		requiredCapabilities := append([]string(nil), capabilities...)
+		h.asyncBookkeeping("preview-capability-diagnostics", func() {
+			diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), previewCapabilityDiagnosticTimeout)
+			defer cancel()
+			flightKey := hostID + ":" + strings.Join(requiredCapabilities, ",")
+			result, diagnosticErr, _ := h.diagnosticGroup.Do(flightKey, func() (any, error) {
+				return h.DB.GetHostCapabilityDiagnostics(diagnosticCtx, db.GetHostCapabilityDiagnosticsParams{
+					HostID:               hostID,
+					RequiredCapabilities: requiredCapabilities,
+				})
+			})
+			if diagnosticErr != nil {
+				log.Warn().Err(diagnosticErr).
+					Str("host_id", hostID).
+					Strs("required_capabilities", requiredCapabilities).
+					Str("sandbox_id", sandboxID).
+					Msg("preview capability rejection diagnostics failed")
+				return
+			}
+			snapshot, ok := result.([]db.GetHostCapabilityDiagnosticsRow)
+			if !ok {
+				log.Warn().Str("host_id", hostID).Msg("preview capability rejection diagnostics returned an unexpected result")
+				return
+			}
+			rows := make([]map[string]any, 0, len(snapshot))
+			for _, row := range snapshot {
+				if row.Capability == nil {
+					continue
+				}
+				rows = append(rows, map[string]any{
+					"capability":   *row.Capability,
+					"heartbeat_at": timestamptzString(row.HeartbeatAt),
+				})
+			}
+			var generation any
+			var hostStatus any
+			var capabilitiesMatch any
+			if len(snapshot) > 0 {
+				generation = timestamptzString(snapshot[0].LastHeartbeatAt)
+				hostStatus = snapshot[0].Status
+				capabilitiesMatch = snapshot[0].CapabilitiesMatch
+			}
+			log.Warn().
+				Str("host_id", hostID).
+				Strs("required_capabilities", requiredCapabilities).
+				Str("sandbox_id", sandboxID).
+				Interface("last_heartbeat_at", generation).
+				Interface("host_status", hostStatus).
+				Interface("capabilities_match", capabilitiesMatch).
+				Interface("host_capabilities", rows).
+				Msg("preview capability enforcement rejected request")
+		})
 		respondErrorMsg(c, "conflict",
 			fmt.Sprintf("The sandbox's host does not enforce all required capabilities (%s); retry after the fleet is upgraded", strings.Join(capabilities, ", ")),
 			http.StatusConflict)

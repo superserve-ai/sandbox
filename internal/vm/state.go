@@ -1,12 +1,20 @@
 package vm
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	bolt "go.etcd.io/bbolt"
 )
+
+var errRetainedArchiveChanged = errors.New("retained archive changed before retirement")
 
 // State provides durable local persistence for VM instance metadata.
 // It is a cache — systemd is the ground truth for liveness, the control
@@ -15,12 +23,30 @@ import (
 // control plane.
 
 var (
-	bucketName              = []byte("vms")
-	previewPolicyBucketName = []byte("vm_preview_policies")
+	bucketName = []byte("vms")
+	// Artifact references for failed owners outlive the live VM record until
+	// the control-plane sandbox is explicitly destroyed.
+	retainedRecordBucketName = []byte("retained_storage_records")
+	previewPolicyBucketName  = []byte("vm_preview_policies")
+	// Derived, safety-critical startup indexes: sparse projections of the
+	// records bucket (cgroup-supervised membership; vmID→namespace for records
+	// holding a network slot), maintained inside the same transaction as every
+	// record write and trusted at open only when the clean-close stamp proves
+	// no other writer ran since (see OpenStateStore). Fail-closed: any doubt
+	// rebuilds both from the records in one projection pass.
+	idxCgroupBucketName = []byte("idx_cgroup_vms")
+	idxSlotNSBucketName = []byte("idx_slot_ns")
+	metaBucketName      = []byte("meta")
+	metaIndexTrustKey   = []byte("index_trust")
 	// pendingBackupBucketName records pauses whose backup enqueue has not
 	// completed: the async retry goroutine is not a durable record, and a
 	// crash or deploy during its window must not lose the pause's coverage.
 	pendingBackupBucketName = []byte("pending_backups")
+	// backfillMarkBucketName is the backup backfill ledger: vm ID → the
+	// snapshot stat identity whose coverage a backfill pass already minted.
+	// Without it every pass would re-hash the whole paused fleet to learn
+	// that nothing changed, since generation keys only exist after hashing.
+	backfillMarkBucketName = []byte("backup_backfill_marks")
 )
 
 // persistedPreviewPolicy is stored separately from VMRecord so a rollback to
@@ -145,36 +171,127 @@ type VMRecord struct {
 	// success), a pause clears it (a snapshotted guest was provably live),
 	// and a resume relaunch verifies readiness synchronously before
 	// clearing it.
-	Unverified   bool   `json:"unverified,omitempty"`
-	RunDirID     string `json:"rundir_id"`
-	Namespace    string `json:"namespace"`
-	DiskPath     string `json:"disk_path"`
-	SnapshotPath string `json:"snapshot_path,omitempty"`
-	MemFilePath  string `json:"mem_file_path,omitempty"`
+	Unverified bool `json:"unverified,omitempty"`
+	// RevivalPending marks a record kept alive across a revival attempt:
+	// it is the retry's anchor (revive refuses unknown sandboxes), so
+	// startup stale cleanup must park it instead of deleting it.
+	RevivalPending bool `json:"revival_pending,omitempty"`
+	// RevivedDisk records the resolved salvage path a completed revival
+	// booted from: the idempotency witness that lets a retry of the same
+	// request (a lost RPC response, a failed post-commit injection)
+	// recognize the live VM as its own completed work. Retained inventory also
+	// uses its presence as revival provenance when legacy template anchors are
+	// unavailable.
+	RevivedDisk string `json:"revived_disk,omitempty"`
+	// BackupGeneration names the backup a backup-backed resume booted from,
+	// so a retry of that resume recognizes the live VM as its own.
+	BackupGeneration string `json:"backup_generation,omitempty"`
+	// TeardownPending mirrors VMInstance.TeardownPending: a non-empty value
+	// is an explicit, durable claim that this record's resources were
+	// deliberately retained after a failed op and the reconciler owns the
+	// residual teardown. Omitted when empty so rollback binaries read
+	// records unchanged.
+	TeardownPending string `json:"teardown_pending,omitempty"`
+	RunDirID        string `json:"rundir_id"`
+	Namespace       string `json:"namespace"`
+	DiskPath        string `json:"disk_path"`
+	SnapshotPath    string `json:"snapshot_path,omitempty"`
+	MemFilePath     string `json:"mem_file_path,omitempty"`
+	// The saved snapshot this VM was created from; see VMInstance.
+	SourceSnapshotID string `json:"source_snapshot_id,omitempty"`
 	// Persisted so a layered (diff-overlay) sandbox resumes correctly after a vmd
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
 	// base's pages as zero holes.
-	BaseMemPath string            `json:"base_mem_path,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	VCPU        uint32            `json:"vcpu"`
-	MemoryMiB   uint32            `json:"memory_mib"`
+	BaseMemPath string `json:"base_mem_path,omitempty"`
+	// Overlays a layered→Full fallback left unreferenced while the process
+	// that still served pages from them could not be confirmed stopped.
+	// Persisted so each is reclaimed once a later step proves the VM at rest,
+	// instead of leaking a guest-sized file for the sandbox's lifetime. A
+	// list: a second fallback before the first resolves must not forget it.
+	StrandedOverlays []string `json:"stranded_overlays,omitempty"`
+	// The random token the running FC's dirty tracking was armed with (guarded
+	// pause flag on). Persisted so reattach after a vmd restart can keep the
+	// next pause incremental: the pause's Diff request carries the token back
+	// and Firecracker rejects it unless the bitmap is still the armed,
+	// unconsumed baseline — that atomic check, not this field, is the
+	// correctness boundary, so a stale value costs one rejected RPC and a Full
+	// pause, never a corrupt overlay.
+	DirtyTrackingSessionID string `json:"dirty_tracking_session_id,omitempty"`
+	// How many snapshots Firecracker has taken of that session's bitmap: a
+	// capture of the running source takes one, and the next guarded pause
+	// must name the count or is rejected and degrades to Full.
+	DirtyTrackingGeneration int64 `json:"dirty_tracking_generation,omitempty"`
+	// CorrectsWallClock records whether this guest fixes its own wall clock on
+	// wake. Persisted because it is a property of the running guest, not of this
+	// daemon: without it a reattached VM would look incapable after a restart and
+	// its next pause would strip a marker that was valid, demoting every later
+	// resume.
+	//
+	// Tri-state on purpose. A binary that predates this field drops it when it
+	// rewrites a record, so after a rollback and re-upgrade the field is absent
+	// again — decoding that silence as false would ignore a marker still on disk
+	// and delete it at the next pause. Nil means "ask the disk".
+	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
+	// SnapshotWorkloadFrozen: the image this VM was last paused into holds a
+	// frozen workload. Set by every pause, so a pause that froze nothing
+	// cannot leave an older answer for the next resume to act on. Tri-state
+	// for the same reason as CorrectsWallClock; nil means "ask the disk".
+	SnapshotWorkloadFrozen *bool `json:"snapshot_workload_frozen,omitempty"`
+	// WakePending: restored, the guest not yet told to correct its clock and
+	// release its workload; written with the Running record so a crash between
+	// the two completes the wake on recovery. ClockFrozen is the policy the
+	// restore used; FreezeToken the token the image's freeze carries.
+	WakePending bool   `json:"wake_pending,omitempty"`
+	ClockFrozen bool   `json:"clock_frozen,omitempty"`
+	FreezeToken string `json:"freeze_token,omitempty"`
+	// WakeToken is the token the owed wake must present: that of the image
+	// being loaded, kept apart from FreezeToken, which describes the image the
+	// record names, until the commit. A resume from an override that dies
+	// between the two returns to Paused with its own image and token intact.
+	WakeToken string `json:"wake_token,omitempty"`
+	// WakeSnapshotPath / WakeMemPath name the image an owed wake is for when
+	// it is not the record's own: a resume from an override. A wake completed
+	// by recovery commits them as the record's image; a failed one drops them.
+	WakeSnapshotPath string `json:"wake_snapshot_path,omitempty"`
+	WakeMemPath      string `json:"wake_mem_path,omitempty"`
+	// WakeOwedFromPaused: the record owing the wake was Paused before this
+	// resume began, so its image is intact. A crash before the launch, or a
+	// wake that never completes, returns it to Paused; a create in the same
+	// state is a failed create and is reaped.
+	WakeOwedFromPaused bool `json:"wake_owed_from_paused,omitempty"`
+	// ArtifactID names the manifest beside the image this VM was last paused
+	// into; see VMInstance.
+	ArtifactID string            `json:"artifact_id,omitempty"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	VCPU       uint32            `json:"vcpu"`
+	MemoryMiB  uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
-	// dual-symlink mount namespace). DeltaDir is intentionally NOT
-	// persisted — it's only relevant at create-from-template; a resumed
-	// sandbox reuses its existing overlay file in place.
+	// dual-symlink mount namespace).
 	BasePath string `json:"base_path,omitempty"`
+	// RootfsPath retains the immutable template rootfs for full-copy sandboxes.
+	// It is metadata for storage inventory; lifecycle restore continues to use
+	// DiskPath as the VM's writable rootfs.
+	RootfsPath string `json:"rootfs_path,omitempty"`
+	// DeltaDir identifies the pinned template overlay retained by this VM.
+	// It is persisted for asynchronous physical-storage inventory; resume does
+	// not use it to mutate the VM's existing overlay.
+	DeltaDir string `json:"delta_dir,omitempty"`
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// PausedAt marks when a sandbox last entered the paused state. Zero on
+	// records written before the field existed; callers needing an ordering
+	// key fall back to CreatedAt.
+	PausedAt time.Time `json:"paused_at,omitempty"`
 	// Supervision dispatches liveness/stop/reattach for this VM's current
 	// run. Empty (SupervisionUnit) is canonical for systemd-unit VMs so
 	// records written by this binary stay readable-and-correct under a
 	// rollback binary that predates the field; never write a non-empty
 	// value for unit mode.
-	Supervision string `json:"supervision,omitempty"`
+	Supervision Supervision `json:"supervision,omitempty"`
 	// Preview publication policy must survive vmd restarts; old records decode
 	// to empty/legacy behavior for backward compatibility.
 	PreviewAccess            string           `json:"preview_access,omitempty"`
@@ -187,31 +304,160 @@ type VMRecord struct {
 	PreviewTokenPolicyRevision int64 `json:"preview_token_policy_revision,omitempty"`
 }
 
+// Supervision is how a VM's current Firecracker run is supervised. A named
+// type (like VMStatus) so the liveness/stop/reattach/reconcile paths switch on
+// a checked value, not a bare string a typo could silently break.
+type Supervision string
+
 // Supervision values for VMInstance/VMRecord.
 const (
 	// SupervisionUnit: the VM runs as firecracker@<id>.service. Canonically
 	// the empty string — legacy records predate the field.
-	SupervisionUnit = ""
+	SupervisionUnit Supervision = ""
 	// SupervisionCgroup: the VM was direct-spawned into a per-VM cgroup
 	// under vmd's delegated subtree; no systemd unit exists for it.
-	SupervisionCgroup = "cgroup"
+	SupervisionCgroup Supervision = "cgroup"
 )
+
+// String renders the mode for logs — the empty canonical value reads as "unit"
+// rather than blank.
+func (s Supervision) String() string {
+	if s == SupervisionUnit {
+		return "unit"
+	}
+	return string(s)
+}
+
+// knownSupervision reports whether s is a mode this binary can dispatch.
+// Anything else (store corruption, or a record written by a NEWER binary
+// with a mode this one predates) is unmanageable: dispatchers must refuse
+// or read inconclusive, never fall through to the unit path — its vacuous
+// probes would release a live non-unit FC's record and network.
+func knownSupervision(s Supervision) bool {
+	return s == SupervisionUnit || s == SupervisionCgroup
+}
 
 // cgroupSupervised reports whether a supervision value means the VM has no
 // systemd unit and lives in a per-VM cgroup.
-func cgroupSupervised(s string) bool { return s == SupervisionCgroup }
+func cgroupSupervised(s Supervision) bool { return s == SupervisionCgroup }
+
+// indexSchemaVersion versions the startup-index layout and trust-stamp format.
+// Bump on any change to what the index buckets contain or mean; a mismatched
+// stamp forces a projection rebuild.
+const indexSchemaVersion = 1
+
+// indexTrustStamp is the single versioned trust value written on clean close.
+// TxID is the stamp transaction's own Bolt txid — see the trust check in
+// OpenStateStore for the validity rule.
+type indexTrustStamp struct {
+	Version int `json:"version"`
+	TxID    int `json:"txid"`
+}
+
+// StateBreadcrumbPath is the fixed, non-configurable location where vmd
+// records its RESOLVED state-store path. The host-resident rollback guard
+// reads it instead of re-deriving the path from env files, so the two can
+// never disagree about grammar; ArmDirectSpawn requires the write before
+// arming OR managing cgroup records, so "cgroup records exist without a
+// current breadcrumb" is unrepresentable.
+const StateBreadcrumbPath = "/var/lib/sandbox/vmd-state-path"
+
+// WriteStateBreadcrumb records the resolved state path atomically
+// (write+rename), so the guard never reads a torn value.
+func WriteStateBreadcrumb(statePath string) error {
+	return writeStateBreadcrumbTo(StateBreadcrumbPath, statePath)
+}
+
+func writeStateBreadcrumbTo(at, statePath string) error {
+	if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+		return fmt.Errorf("state breadcrumb dir: %w", err)
+	}
+	tmp := at + ".tmp"
+	if err := os.WriteFile(tmp, []byte(statePath+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write state breadcrumb: %w", err)
+	}
+	if err := os.Rename(tmp, at); err != nil {
+		return fmt.Errorf("commit state breadcrumb: %w", err)
+	}
+	return nil
+}
 
 // StateStore wraps a BoltDB database for VM state persistence.
 type StateStore struct {
-	db *bolt.DB
+	db        *bolt.DB
+	openStats StateStoreOpenStats
 }
+
+// StateStoreOpenStats breaks OpenStateStore's cost into its sub-steps for
+// startup timing. Observability only.
+type StateStoreOpenStats struct {
+	BoltOpen       time.Duration // bolt.Open: mmap + freelist load
+	PolicyScan     time.Duration // sidecar orphan scan + deletes (untrusted boots only)
+	RecordScan     time.Duration // projection pass: index rebuild + policy seeding (untrusted boots only)
+	TxResidual     time.Duration // db.Update outside the scans: bucket creates + commit/fsync
+	Records        int
+	Policies       int
+	OrphansDeleted int
+	// IndexTrusted reports whether the startup indexes were trusted at open
+	// (clean-close stamp valid) or rebuilt; IndexTrustReason is "trusted" or
+	// why not: no-stamp, bad-stamp, version-mismatch, txid-moved.
+	IndexTrusted     bool
+	IndexTrustReason string
+}
+
+// OpenStats returns the timing/count breakdown captured while the store opened.
+func (s *StateStore) OpenStats() StateStoreOpenStats { return s.openStats }
+
+// Path returns the resolved filesystem path of the open store.
+func (s *StateStore) Path() string { return s.db.Path() }
 
 // OpenStateStore opens (or creates) the BoltDB file at path.
 func OpenStateStore(path string) (*StateStore, error) {
+	var stats StateStoreOpenStats
+	tOpen := time.Now()
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("open state store %s: %w", path, err)
 	}
+	stats.BoltOpen = time.Since(tOpen)
+
+	// Trust check in a read transaction, before the bucket-create tx below
+	// bumps the txid. The stamp is valid only while it is still the store's
+	// last write; anything since (index-unaware binary, crash that never
+	// stamped, external tool) moved the txid — fail closed and rebuild.
+	trusted, reason := false, "no-stamp"
+	if verr := db.View(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(metaBucketName)
+		if meta == nil {
+			return nil
+		}
+		raw := meta.Get(metaIndexTrustKey)
+		if raw == nil {
+			return nil
+		}
+		var stamp indexTrustStamp
+		if err := json.Unmarshal(raw, &stamp); err != nil {
+			reason = "bad-stamp"
+			return nil
+		}
+		if stamp.Version != indexSchemaVersion {
+			reason = "version-mismatch"
+			return nil
+		}
+		if tx.ID() != stamp.TxID {
+			reason = "txid-moved"
+			return nil
+		}
+		trusted, reason = true, "trusted"
+		return nil
+	}); verr != nil {
+		db.Close()
+		return nil, fmt.Errorf("read index trust: %w", verr)
+	}
+	stats.IndexTrusted = trusted
+	stats.IndexTrustReason = reason
+
+	tTx := time.Now()
 	if err := db.Update(func(tx *bolt.Tx) error {
 		records, err := tx.CreateBucketIfNotExists(bucketName)
 		if err != nil {
@@ -220,16 +466,61 @@ func OpenStateStore(path string) (*StateStore, error) {
 		if _, err := tx.CreateBucketIfNotExists(pendingBackupBucketName); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists(backfillMarkBucketName); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(retainedRecordBucketName); err != nil {
+			return err
+		}
 		policies, err := tx.CreateBucketIfNotExists(previewPolicyBucketName)
+		if err != nil {
+			return err
+		}
+		meta, err := tx.CreateBucketIfNotExists(metaBucketName)
+		if err != nil {
+			return err
+		}
+		// Consume the stamp: it is re-written only by the next clean close,
+		// so a crash mid-run can never leave a valid stamp behind.
+		if err := meta.Delete(metaIndexTrustKey); err != nil {
+			return err
+		}
+
+		if trusted {
+			// Indexes were maintained transactionally by the binary that
+			// stamped, and nothing wrote since: skip the projection rebuild
+			// AND the policy migration pass (both are repairs for
+			// index-unaware writers, which the txid check just ruled out).
+			return nil
+		}
+
+		// Projection rebuild, fail-closed: recreate both index buckets from
+		// scratch — an upsert-only rebuild would let entries stale-deleted by
+		// an old binary survive — then repopulate from the records in ONE
+		// decode pass that also runs the policy migration work.
+		for _, name := range [][]byte{idxCgroupBucketName, idxSlotNSBucketName} {
+			if tx.Bucket(name) != nil {
+				if err := tx.DeleteBucket(name); err != nil {
+					return err
+				}
+			}
+		}
+		idxCg, err := tx.CreateBucket(idxCgroupBucketName)
+		if err != nil {
+			return err
+		}
+		idxNS, err := tx.CreateBucket(idxSlotNSBucketName)
 		if err != nil {
 			return err
 		}
 
 		// An old VMD can delete the primary record without knowing about the
-		// sidecar bucket. Remove those orphans before migrating so a later VM
-		// reusing the same key cannot inherit deleted policy state.
+		// sidecar bucket. Remove those orphans so a later VM reusing the same
+		// key cannot inherit deleted policy state.
+		tPolicy := time.Now()
 		var orphanKeys [][]byte
 		if err := policies.ForEach(func(k, _ []byte) error {
+			stats.Policies++
 			if records.Get(k) == nil {
 				orphanKeys = append(orphanKeys, append([]byte(nil), k...))
 			}
@@ -242,17 +533,31 @@ func OpenStateStore(path string) (*StateStore, error) {
 				return err
 			}
 		}
+		stats.OrphansDeleted = len(orphanKeys)
+		stats.PolicyScan = time.Since(tPolicy)
 
-		// Seed the sidecar for records written by the immediately preceding
-		// schema. Once present, the sidecar is authoritative and is never
-		// replaced from the primary JSON during startup.
-		return records.ForEach(func(k, v []byte) error {
-			if policies.Get(k) != nil {
-				return nil
-			}
+		// One projection pass: decode each record once, rebuild both indexes,
+		// and seed missing policy sidecars (records written by the immediately
+		// preceding schema; once present, the sidecar is authoritative).
+		tRecord := time.Now()
+		err = records.ForEach(func(k, v []byte) error {
+			stats.Records++
 			var rec VMRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
-				return fmt.Errorf("unmarshal vm record during preview policy migration: %w", err)
+				return fmt.Errorf("unmarshal vm record during startup projection: %w", err)
+			}
+			if cgroupSupervised(rec.Supervision) {
+				if err := idxCg.Put(k, []byte{1}); err != nil {
+					return err
+				}
+			}
+			if rec.Namespace != "" {
+				if err := idxNS.Put(k, []byte(rec.Namespace)); err != nil {
+					return err
+				}
+			}
+			if policies.Get(k) != nil {
+				return nil
 			}
 			policy := previewPolicyFromRecord(rec)
 			if !policy.isSet() {
@@ -260,9 +565,27 @@ func OpenStateStore(path string) (*StateStore, error) {
 			}
 			return putPreviewPolicy(policies, k, policy)
 		})
+		stats.RecordScan = time.Since(tRecord)
+		return err
 	}); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize state store: %w", err)
+	}
+	// db.Update time outside the two scans: bucket creation plus the Bolt
+	// commit/fsync, which only happens after the callback returns.
+	stats.TxResidual = time.Since(tTx) - stats.PolicyScan - stats.RecordScan
+	return &StateStore{db: db, openStats: stats}, nil
+}
+
+// OpenStateStoreReadOnly opens the BoltDB file for reading only. Unlike
+// OpenStateStore it neither creates the file nor writes a bucket, so a missing
+// DB or a store still locked by a running vmd fails here rather than reporting
+// an empty (falsely "drained") store — the drain guard depends on that
+// fail-closed behavior.
+func OpenStateStoreReadOnly(path string) (*StateStore, error) {
+	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("open state store read-only %s: %w", path, err)
 	}
 	return &StateStore{db: db}, nil
 }
@@ -312,8 +635,221 @@ func (s *StateStore) Delete(vmID string) error {
 		if err := tx.Bucket(bucketName).Delete(key); err != nil {
 			return err
 		}
+		if err := dropIndexEntries(tx, key); err != nil {
+			return err
+		}
+		if err := tx.Bucket(previewPolicyBucketName).Delete(key); err != nil {
+			return err
+		}
+		// Live and archived metadata are one deletion unit. A failure or crash
+		// cannot expose an obsolete archive after the live record is removed.
+		if archive := tx.Bucket(retainedRecordBucketName); archive != nil {
+			if err := archive.Delete(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ReleaseRetainingStorage atomically moves the durable record out of lifecycle
+// discovery while preserving its artifact references for storage accounting.
+func (s *StateStore) ReleaseRetainingStorage(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		key := []byte(vmID)
+		live := tx.Bucket(bucketName)
+		if data := live.Get(key); data != nil {
+			archive, err := tx.CreateBucketIfNotExists(retainedRecordBucketName)
+			if err != nil {
+				return err
+			}
+			var rec VMRecord
+			if err := json.Unmarshal(data, &rec); err != nil {
+				return err
+			}
+			// Process cleanup has been confirmed. Keep artifact paths, but do not
+			// leave a lifecycle marker that only live reconciliation can resolve.
+			rec.Unverified = false
+			rec.RevivalPending = false
+			rec.TeardownPending = ""
+			rec.WakePending = false
+			rec.WakeToken = ""
+			rec.WakeSnapshotPath = ""
+			rec.WakeMemPath = ""
+			rec.WakeOwedFromPaused = false
+			settled, err := json.Marshal(rec)
+			if err != nil {
+				return err
+			}
+			if err := archive.Put(key, settled); err != nil {
+				return err
+			}
+		}
+		if err := live.Delete(key); err != nil {
+			return err
+		}
+		if err := dropIndexEntries(tx, key); err != nil {
+			return err
+		}
 		return tx.Bucket(previewPolicyBucketName).Delete(key)
 	})
+}
+
+// RetireRetainingStorage removes a confirmed orphan without preserving an
+// inventory dependency whose owner no longer exists in the control plane.
+func (s *StateStore) RetireRetainingStorage(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		key := []byte(vmID)
+		if err := tx.Bucket(bucketName).Delete(key); err != nil {
+			return err
+		}
+		if archive := tx.Bucket(retainedRecordBucketName); archive != nil {
+			if err := archive.Delete(key); err != nil {
+				return err
+			}
+		}
+		if err := dropIndexEntries(tx, key); err != nil {
+			return err
+		}
+		return tx.Bucket(previewPolicyBucketName).Delete(key)
+	})
+}
+
+// DeleteRetainedRecord removes archived metadata after an explicit destroy.
+func (s *StateStore) DeleteRetainedRecord(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(retainedRecordBucketName)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.Delete([]byte(vmID))
+	})
+}
+
+// RetireArchivedRecordIfUnchanged removes only an archived dependency after
+// the caller has confirmed authoritative owner termination. The archive is
+// compared inside the same Bolt transaction that checks for a live record, so
+// a replacement generation cannot be removed by a stale reconciliation pass.
+// Live indexes and preview policy are deliberately untouched: a live record
+// wins discovery and owns those projections.
+func (s *StateStore) RetireArchivedRecordIfUnchanged(expected VMRecord) (bool, error) {
+	retired := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		key := []byte(expected.ID)
+		if live := tx.Bucket(bucketName); live != nil && live.Get(key) != nil {
+			return errRetainedArchiveChanged
+		}
+		archive := tx.Bucket(retainedRecordBucketName)
+		if archive == nil {
+			return nil
+		}
+		data := archive.Get(key)
+		if data == nil {
+			return nil
+		}
+		var current VMRecord
+		if err := json.Unmarshal(data, &current); err != nil {
+			return err
+		}
+		if !sameRetainedGeneration(expected, current) {
+			return errRetainedArchiveChanged
+		}
+		if err := archive.Delete(key); err != nil {
+			return err
+		}
+		retired = true
+		return nil
+	})
+	if errors.Is(err, errRetainedArchiveChanged) {
+		return false, nil
+	}
+	return retired, err
+}
+
+func (s *StateStore) retainedArchivedRecords() ([]VMRecord, error) {
+	return s.retainedArchivedRecordsContext(context.Background())
+}
+
+func (s *StateStore) retainedArchivedRecordsContext(ctx context.Context) ([]VMRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	budget := retainedScanBudget{}
+	return s.retainedArchivedRecordsWithBudget(ctx, &budget)
+}
+
+func (s *StateStore) retainedArchivedRecordsWithBudget(ctx context.Context, budget *retainedScanBudget) ([]VMRecord, error) {
+	var records []VMRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(retainedRecordBucketName)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(key, value []byte) error {
+			if err := budget.accountEntry(ctx, key, value); err != nil {
+				return err
+			}
+			if _, err := uuid.Parse(string(key)); err != nil {
+				return nil
+			}
+			if err := budget.reserveOwner(); err != nil {
+				return err
+			}
+			var rec VMRecord
+			if err := json.Unmarshal(value, &rec); err != nil {
+				return err
+			}
+			if rec.ID != "" {
+				records = append(records, rec)
+			}
+			return nil
+		})
+	})
+	if err == nil {
+		err = ctx.Err()
+	}
+	return records, err
+}
+
+// maintainIndexes keeps the sparse startup indexes in sync with a record
+// write, inside the record's own transaction. Read-compare-write: only an
+// actual membership or namespace change touches a bucket, so bulk rewrites of
+// unchanged records (reattach, reconciliation) dirty no index pages. Safe
+// under Batch retry — every operation is idempotent.
+func maintainIndexes(tx *bolt.Tx, key []byte, rec VMRecord) error {
+	cg := tx.Bucket(idxCgroupBucketName)
+	if want, has := cgroupSupervised(rec.Supervision), cg.Get(key) != nil; want != has {
+		if want {
+			if err := cg.Put(key, []byte{1}); err != nil {
+				return err
+			}
+		} else if err := cg.Delete(key); err != nil {
+			return err
+		}
+	}
+	ns := tx.Bucket(idxSlotNSBucketName)
+	cur := ns.Get(key)
+	switch {
+	case rec.Namespace == "" && cur != nil:
+		return ns.Delete(key)
+	case rec.Namespace != "" && string(cur) != rec.Namespace:
+		return ns.Put(key, []byte(rec.Namespace))
+	}
+	return nil
+}
+
+// dropIndexEntries removes a key from both startup indexes — for a deleted or
+// provably absent record. Conditional for the same page-dirtying reason.
+func dropIndexEntries(tx *bolt.Tx, key []byte) error {
+	if cg := tx.Bucket(idxCgroupBucketName); cg.Get(key) != nil {
+		if err := cg.Delete(key); err != nil {
+			return err
+		}
+	}
+	if ns := tx.Bucket(idxSlotNSBucketName); ns.Get(key) != nil {
+		return ns.Delete(key)
+	}
+	return nil
 }
 
 // PutIfPresent writes rec only if its key still exists, returning false if not.
@@ -345,7 +881,8 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 			return false, err
 		}
 		if onlyIfPresent {
-			return false, nil
+			// No record will exist after this tx: leave no index residue.
+			return false, dropIndexEntries(tx, key)
 		}
 	}
 
@@ -378,6 +915,9 @@ func putRecord(tx *bolt.Tx, incoming VMRecord, onlyIfPresent bool) (bool, error)
 		return false, fmt.Errorf("marshal vm record: %w", err)
 	}
 	if err := records.Put(key, data); err != nil {
+		return false, err
+	}
+	if err := maintainIndexes(tx, key, incoming); err != nil {
 		return false, err
 	}
 	if incomingPolicy.isSet() {
@@ -498,6 +1038,55 @@ func (s *StateStore) All() ([]VMRecord, error) {
 	return records, err
 }
 
+// HasCgroupRecords reports whether any record is cgroup-supervised — a
+// first-key check on the idx_cgroup_vms projection, authoritative because the
+// projection is trusted-or-rebuilt at open.
+func (s *StateStore) HasCgroupRecords() (bool, error) {
+	var has bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(idxCgroupBucketName)
+		if b == nil {
+			return fmt.Errorf("cgroup index bucket missing (store not opened via OpenStateStore)")
+		}
+		k, _ := b.Cursor().First()
+		has = k != nil
+		return nil
+	})
+	return has, err
+}
+
+// SlotNamespaces returns vmID→namespace for every record holding a network
+// slot, from the idx_slot_ns projection — O(occupied slots), no record decode.
+func (s *StateStore) SlotNamespaces() (map[string]string, error) {
+	out := make(map[string]string)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(idxSlotNSBucketName)
+		if b == nil {
+			return fmt.Errorf("slot index bucket missing (store not opened via OpenStateStore)")
+		}
+		return b.ForEach(func(k, v []byte) error {
+			out[string(k)] = string(v)
+			return nil
+		})
+	})
+	return out, err
+}
+
+// StampIndexTrust writes the clean-close trust stamp. It must be this
+// process's last write to the store: the stamp records its own transaction id,
+// and the next open trusts the indexes only while that is still the store's
+// last transaction. Callers treat a failure as "no stamp" — the next boot
+// rebuilds.
+func (s *StateStore) StampIndexTrust() error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		stamp, err := json.Marshal(indexTrustStamp{Version: indexSchemaVersion, TxID: tx.ID()})
+		if err != nil {
+			return err
+		}
+		return tx.Bucket(metaBucketName).Put(metaIndexTrustKey, stamp)
+	})
+}
+
 // IDs returns the set of persisted VM IDs without unmarshaling records.
 func (s *StateStore) IDs() (map[string]struct{}, error) {
 	ids := make(map[string]struct{})
@@ -531,19 +1120,40 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		MACAddress:                 inst.MACAddress,
 		Status:                     inst.Status,
 		Unverified:                 inst.Unverified,
+		RevivalPending:             inst.RevivalPending,
+		RevivedDisk:                inst.RevivedDisk,
+		BackupGeneration:           inst.BackupGeneration,
+		TeardownPending:            inst.TeardownPending,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
 		DiskPath:                   inst.DiskPath,
 		SnapshotPath:               inst.SnapshotPath,
 		MemFilePath:                inst.MemFilePath,
+		SourceSnapshotID:           inst.SourceSnapshotID,
 		BaseMemPath:                inst.BaseMemPath,
+		StrandedOverlays:           append([]string(nil), inst.StrandedOverlays...),
+		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
+		DirtyTrackingGeneration:    inst.DirtyTrackingGeneration,
+		CorrectsWallClock:          inst.CorrectsWallClock,
+		ArtifactID:                 inst.ArtifactID,
+		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
+		WakePending:                inst.WakePending,
+		ClockFrozen:                inst.ClockFrozen,
+		FreezeToken:                inst.FreezeToken,
+		WakeToken:                  inst.WakeToken,
+		WakeSnapshotPath:           inst.WakeSnapshotPath,
+		WakeMemPath:                inst.WakeMemPath,
+		WakeOwedFromPaused:         inst.WakeOwedFromPaused,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
 		MemoryMiB:                  inst.Config.MemoryMiB,
 		BasePath:                   inst.Config.BasePath,
+		RootfsPath:                 inst.Config.RootfsPath,
+		DeltaDir:                   inst.Config.DeltaDir,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
+		PausedAt:                   inst.PausedAt,
 		Supervision:                inst.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
 		PreviewPorts:               previewPortsToRecord(inst.PreviewPorts),
@@ -609,34 +1219,62 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                         rec.ID,
-		PID:                        rec.PID,
-		SocketPath:                 rec.SocketPath,
-		VsockPath:                  rec.VsockPath,
-		IP:                         rec.IP,
-		TAPDevice:                  rec.TAPDevice,
-		MACAddress:                 rec.MACAddress,
-		Status:                     rec.Status,
-		Unverified:                 rec.Unverified,
-		RunDirID:                   rec.RunDirID,
-		Namespace:                  rec.Namespace,
-		DiskPath:                   rec.DiskPath,
-		SnapshotPath:               rec.SnapshotPath,
-		MemFilePath:                rec.MemFilePath,
-		BaseMemPath:                rec.BaseMemPath,
+		ID:                      rec.ID,
+		PID:                     rec.PID,
+		SocketPath:              rec.SocketPath,
+		VsockPath:               rec.VsockPath,
+		IP:                      rec.IP,
+		TAPDevice:               rec.TAPDevice,
+		MACAddress:              rec.MACAddress,
+		Status:                  rec.Status,
+		Unverified:              rec.Unverified,
+		RevivalPending:          rec.RevivalPending,
+		RevivedDisk:             rec.RevivedDisk,
+		BackupGeneration:        rec.BackupGeneration,
+		TeardownPending:         rec.TeardownPending,
+		RunDirID:                rec.RunDirID,
+		Namespace:               rec.Namespace,
+		DiskPath:                rec.DiskPath,
+		SnapshotPath:            rec.SnapshotPath,
+		MemFilePath:             rec.MemFilePath,
+		SourceSnapshotID:        rec.SourceSnapshotID,
+		BaseMemPath:             rec.BaseMemPath,
+		StrandedOverlays:        append([]string(nil), rec.StrandedOverlays...),
+		DirtyTrackingSessionID:  rec.DirtyTrackingSessionID,
+		DirtyTrackingGeneration: rec.DirtyTrackingGeneration,
+		// Optimistic re-arm for an adopted running VM: the surviving FC's
+		// bitmap is intact, and the pause-time token check is the correctness
+		// boundary — if anything consumed the bitmap since the session was
+		// armed, the guarded Diff is rejected and that pause degrades to Full.
+		// Records without a session (flag off, or armed pre-flag) stay
+		// untracked and pause Full, exactly as before.
+		DirtyTracked:               rec.Status == StatusRunning && rec.DirtyTrackingSessionID != "",
+		CorrectsWallClock:          rec.CorrectsWallClock,
+		ArtifactID:                 rec.ArtifactID,
+		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
+		WakePending:                rec.WakePending,
+		ClockFrozen:                rec.ClockFrozen,
+		FreezeToken:                rec.FreezeToken,
+		WakeToken:                  rec.WakeToken,
+		WakeSnapshotPath:           rec.WakeSnapshotPath,
+		WakeMemPath:                rec.WakeMemPath,
+		WakeOwedFromPaused:         rec.WakeOwedFromPaused,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,
 		OwnerID:                    rec.OwnerID,
+		PausedAt:                   rec.PausedAt,
 		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
 		PreviewPorts:               ports,
 		PreviewPolicyRevision:      rec.PreviewPolicyRevision,
 		PreviewTokenPolicyRevision: tokenPolicyRevision,
 		Config: VMConfig{
-			VCPU:      rec.VCPU,
-			MemoryMiB: rec.MemoryMiB,
-			BasePath:  rec.BasePath,
+			VCPU:       rec.VCPU,
+			MemoryMiB:  rec.MemoryMiB,
+			BasePath:   rec.BasePath,
+			RootfsPath: rec.RootfsPath,
+			DeltaDir:   rec.DeltaDir,
 		},
 	}
 }
@@ -657,7 +1295,59 @@ type PendingBackup struct {
 	// marker was created: the rehash must prove it is hashing the
 	// pause-time base, not a same-path replacement.
 	BaseIdentity string `json:"base_identity,omitempty"`
+	// OrigSnapshotPath and OrigDiskPath preserve the pause-time artifact
+	// locations when staging repointed the primary paths at copies: if
+	// the copies are ever lost (sweep after a very long outage), a
+	// still-paused sandbox can fall back to the at-rest flow over the
+	// originals instead of dropping coverage.
+	OrigSnapshotPath string `json:"orig_snapshot_path,omitempty"`
+	OrigDiskPath     string `json:"orig_disk_path,omitempty"`
+	// StagedDir is the pending staging directory holding immutable
+	// pause-time copies of the mutable artifacts. When set, the worker
+	// hashes those copies and needs no at-rest proof for them: a resume
+	// cannot mutate a snapshot, so an immediately-resumed pause still
+	// gets its backup.
+	StagedDir string `json:"staged_dir,omitempty"`
+	// SnapshotIdentity is SnapshotPath's stat identity captured when the
+	// marker was created. A VM's snapshot path is fixed across pauses, so
+	// a resume-then-pause reuses the exact same pathname; only identity
+	// distinguishes a genuine RPC retry (same bytes) from a distinct pause
+	// that overwrote them, and the marker-reuse check is load-bearing on it.
+	SnapshotIdentity string `json:"snapshot_identity,omitempty"`
+	// BestEffort routes the eventual journal write to the lowest upload
+	// priority. Set by the backfill sweep, whose thousands of historical
+	// pauses must never delay a live pause's generation; absent (every
+	// marker minted by a real pause) means pause priority.
+	BestEffort bool `json:"best_effort,omitempty"`
+	// PauseToken is the control plane's identity for the pause that minted
+	// this marker, threaded into the upload report so coverage can name
+	// the exact pause it verified. Empty for markers minted before the
+	// token existed, by the backfill sweep, or by an older control plane;
+	// those reports fall back to content matching.
+	PauseToken string `json:"pause_token,omitempty"`
+	// Enqueued marks a marker kept only so a later sweep can upgrade an
+	// already-queued row to staged paths. The generation is durable in the
+	// journal from then on, so discarding such a marker costs no coverage
+	// and must not count as a dropped pause.
+	Enqueued bool `json:"enqueued,omitempty"`
+	// Version is stamped by every binary that persists a marker. Zero means
+	// a binary that predates Enqueued wrote it, so whether its generation
+	// reached the journal is unknowable and it is never counted as a loss.
+	Version int `json:"version,omitempty"`
+
+	// unwritten marks a copy that may still owe the store its first
+	// write, and is deliberately not persisted: it is set when a pause
+	// mints the marker and cleared once a write lands. Only such a copy
+	// may create the record; any other worker would be resurrecting a
+	// marker some success has already retired.
+	unwritten bool
 }
+
+// PendingBackupVersion is stamped when a marker is minted, so the value a
+// worker carries in memory matches the one on disk. Never stamped on a
+// marker read back from the store: a legacy marker's coverage stays
+// unknowable rather than being promoted by the binary that loaded it.
+const PendingBackupVersion = 1
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.
 func (s *StateStore) PutPendingBackup(p PendingBackup) error {
@@ -676,27 +1366,82 @@ func (s *StateStore) PutPendingBackup(p PendingBackup) error {
 // a failed initial write, and the newest pause always wins the slot
 // while a newer record is never overwritten by an older worker.
 func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
+	return s.putPendingBackupIfOwner(p, true)
+}
+
+// RefreshPendingBackupIfOwner is PutPendingBackupIfOwner for a worker
+// holding a copy the store gave it: an empty slot means the pause was
+// retired or discarded while the worker ran, and re-creating the marker
+// would both re-hash an already-journaled pause and make its eventual
+// discard look like a loss.
+func (s *StateStore) RefreshPendingBackupIfOwner(p PendingBackup) error {
+	return s.putPendingBackupIfOwner(p, false)
+}
+
+func (s *StateStore) putPendingBackupIfOwner(p PendingBackup, create bool) error {
 	data, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(pendingBackupBucketName)
-		if v := b.Get([]byte(p.VMID)); v != nil {
+		v := b.Get([]byte(p.VMID))
+		if v == nil && !create {
+			return nil
+		}
+		if v != nil {
 			var cur PendingBackup
-			if json.Unmarshal(v, &cur) == nil && cur.Token > p.Token {
-				return nil
+			if json.Unmarshal(v, &cur) == nil {
+				if cur.Token > p.Token {
+					return nil
+				}
+				// A worker may hold a copy captured before its own
+				// enqueue landed. Rewriting the record from that copy
+				// must not unlearn coverage this token already earned.
+				if cur.Token == p.Token && cur.Enqueued && !p.Enqueued {
+					p.Enqueued = true
+					if data, err = json.Marshal(p); err != nil {
+						return err
+					}
+				}
 			}
 		}
 		return b.Put([]byte(p.VMID), data)
 	})
 }
 
+// PutPendingBackupIfAbsent writes the marker only when no marker exists
+// for the VM, reporting whether it wrote. The backfill mints through
+// this: a marker minted concurrently by a real pause owns the slot and
+// must never be replaced by backfill's view of the same sandbox.
+func (s *StateStore) PutPendingBackupIfAbsent(p PendingBackup) (bool, error) {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return false, err
+	}
+	wrote := false
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(pendingBackupBucketName)
+		if b.Get([]byte(p.VMID)) != nil {
+			return nil
+		}
+		wrote = true
+		return b.Put([]byte(p.VMID), data)
+	})
+	return wrote, err
+}
+
 // DeletePendingBackupIf clears the marker only while the given token
 // still owns it: an older pause's async worker finishing late must not
 // erase the record a newer pause has since written over the same key.
-func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+// It reports whether this call is what removed it, and returns the
+// record removed: a worker's own copy can predate its own writes, so a
+// verdict about the pause belongs on the durable one. An absent record
+// and one a newer pause owns both report false with no error.
+func (s *StateStore) DeletePendingBackupIf(vmID, token string) (PendingBackup, bool, error) {
+	var removed PendingBackup
+	deleted := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(pendingBackupBucketName)
 		v := b.Get([]byte(vmID))
 		if v == nil {
@@ -706,7 +1451,96 @@ func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
 		if json.Unmarshal(v, &cur) == nil && cur.Token != token {
 			return nil
 		}
-		return b.Delete([]byte(vmID))
+		if err := b.Delete([]byte(vmID)); err != nil {
+			return err
+		}
+		removed, deleted = cur, true
+		return nil
+	})
+	return removed, deleted, err
+}
+
+// GetPendingBackup returns a VM's pending-backup marker, if any.
+func (s *StateStore) GetPendingBackup(vmID string) (PendingBackup, bool, error) {
+	var p PendingBackup
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(pendingBackupBucketName).Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		if json.Unmarshal(v, &p) == nil && p.VMID != "" {
+			found = true
+		}
+		return nil
+	})
+	return p, found, err
+}
+
+// PutBackfillMark records that a backfill pass minted coverage for this
+// exact snapshot identity, so reruns and later boots skip it without
+// re-hashing. Marks say "a marker was minted", never "the upload
+// verified": once minted, the pending-backup machinery owns the outcome.
+func (s *StateStore) PutBackfillMark(vmID, snapshotIdentity, generation string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return fmt.Errorf("backfill ledger bucket missing")
+		}
+		// Identity NUL generation: binding the mark to the exact
+		// generation its mint enqueued lets the skip path probe the
+		// journal with a point lookup, so no other generation's fate can
+		// masquerade as this snapshot's coverage.
+		return b.Put([]byte(vmID), []byte(snapshotIdentity+"\x00"+generation))
+	})
+}
+
+// GetBackfillMark returns the snapshot identity a backfill pass last
+// covered for this VM and the generation its mint enqueued, if any.
+func (s *StateStore) GetBackfillMark(vmID string) (string, string, bool, error) {
+	var id, gen string
+	found := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return nil
+		}
+		v := b.Get([]byte(vmID))
+		if v == nil {
+			return nil
+		}
+		id, found = string(v), true
+		if i := strings.IndexByte(id, 0); i >= 0 {
+			id, gen = id[:i], id[i+1:]
+		}
+		return nil
+	})
+	return id, gen, found, err
+}
+
+// PruneBackfillMarks drops ledger entries for VMs no longer in the
+// record set, so the ledger tracks the fleet instead of growing forever.
+func (s *StateStore) PruneBackfillMarks(keep map[string]struct{}) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(backfillMarkBucketName)
+		if b == nil {
+			return nil
+		}
+		var stale [][]byte
+		if err := b.ForEach(func(k, _ []byte) error {
+			if _, ok := keep[string(k)]; !ok {
+				stale = append(stale, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range stale {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

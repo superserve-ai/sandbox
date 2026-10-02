@@ -5,11 +5,71 @@ package vmdclient
 
 import (
 	"context"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/status"
 )
+
+// ResourceLimits is a sandbox's declared allocation, passed to restore so
+// the daemon never has to discover it. Zero fields mean "not declared" —
+// accepted for compatibility, and the daemon recovers them itself.
+type ResourceLimits struct {
+	VCPU      uint32
+	MemoryMiB uint32
+	// SavedSnapshotID names the saved snapshot to create the VM from. The
+	// restore then passes no files of its own, and the sizes must be the
+	// snapshot's.
+	SavedSnapshotID string
+	// BackupGeneration is SavedSnapshotID's backup to cold boot from, once
+	// the host has refused with SavedSnapshotMissingReason.
+	BackupGeneration string
+	// Egress, when set, is installed before the guest runs; the restore
+	// reports whether it was.
+	Egress *EgressRules
+}
+
+// EgressRules are a sandbox's outbound rules, split as vmd applies them.
+type EgressRules struct {
+	AllowedCIDRs, DeniedCIDRs, AllowedDomains []string
+}
+
+// SavedSnapshot is what a host reports for a committed saved snapshot: the
+// files it owns, their base references, and the sizes a fork inherits.
+type SavedSnapshot struct {
+	Kind         string
+	BasePath     string
+	DiskPath     string
+	SnapshotPath string
+	MemPath      string
+	BaseMemPath  string
+	VCPU         uint32
+	MemoryMiB    uint32
+	DiskSizeMiB  uint32
+	SizeBytes    int64
+	// FirecrackerSHA256 names the Firecracker that wrote the memory image;
+	// empty when the host could not tell.
+	FirecrackerSHA256 string
+}
 
 // PortPolicy is the control-plane representation of one published preview
 // port. Tokenized wire modes require a positive TokenVersion; raw private and
 // public policies leave TokenVersion at zero.
+// ResumeAttestation is what a resume response proves the daemon applied.
+// PreviewProtocol is the value RestoreSnapshot echoes, empty for a daemon
+// from before the resume request carried the policy. NetworkRulesApplied is
+// true when the request's egress rules are fully in place, including on a VM
+// the daemon adopted from an earlier attempt.
+type ResumeAttestation struct {
+	PreviewProtocol string
+	// PreviewPolicyRevision is the revision the daemon's record holds after
+	// the stamp; higher than the request's when the record already held a
+	// newer policy and kept it.
+	PreviewPolicyRevision int64
+	NetworkRulesApplied   bool
+	// ColdBoot reports a guest booted from a backup of its disk: nothing
+	// injected at create survived, and the caller must apply it again.
+	ColdBoot bool
+}
+
 type PortPolicy struct {
 	Access       string
 	TokenVersion int64
@@ -22,8 +82,10 @@ type ManifestEntry struct {
 	FileName  string
 	Path      string
 	SizeBytes int64
-	SHA256    string
-	BasePath  string
+	// -1 means the host could not read allocation metadata; zero is valid.
+	AllocatedBytes int64
+	SHA256         string
+	BasePath       string
 }
 
 // Client defines the subset of the VM daemon gRPC interface used by the
@@ -33,10 +95,18 @@ type Client interface {
 	DestroyInstance(ctx context.Context, instanceID string, force bool) error
 	// PauseInstance pauses the VM and returns its snapshot artifacts plus a
 	// per-file integrity manifest (disk state + vmstate; mem files are
-	// host-local only and not manifested).
-	PauseInstance(ctx context.Context, instanceID, snapshotDir string) (snapshotPath, memPath string, manifest []ManifestEntry, err error)
-	// ResumeInstance restores a paused VM.
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string) (ipAddress string, actualVcpu, actualMemMiB uint32, err error)
+	// host-local only and not manifested). pauseToken is the caller-minted
+	// identity for this pause; the daemon threads it into the eventual
+	// backup report so coverage can name the exact pause it verified.
+	// ackedToken echoes pauseToken ONLY when the daemon threaded it ("" from
+	// an older daemon): the caller must store on the snapshot row exactly
+	// what came back, or it would demand of reports an identity the host
+	// can never produce.
+	PauseInstance(ctx context.Context, instanceID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []ManifestEntry, ackedToken string, err error)
+	// ResumeInstance restores a paused VM. The preview policy rides along so
+	// the daemon stamps it before the guest runs; the attestation reports
+	// what the daemon applied, with empty fields for a daemon from before it.
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, backupGeneration string) (ipAddress string, actualVcpu, actualMemMiB uint32, attested ResumeAttestation, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +
@@ -46,7 +116,14 @@ type Client interface {
 	// previewProtocol echoes the vmd's preview-policy attestation from the
 	// response; empty means the vmd predates preview publication and ignored
 	// the request's policy fields.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
+	//
+	// limits declares the sandbox's allocation. The caller knows it (the
+	// sandbox row, or the template it was built from) and a restore does
+	// NOT otherwise reveal it: the snapshot carries the sizes inside
+	// Firecracker, so a daemon told nothing has to ask Firecracker
+	// afterwards to describe its own host honestly. Declaring it here
+	// keeps that probe off the create path entirely.
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits ResourceLimits) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, rulesApplied bool, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
@@ -55,6 +132,12 @@ type Client interface {
 	// control plane to garbage-collect the previous snapshot after a new
 	// pause writes a fresh one.
 	DeleteSnapshot(ctx context.Context, instanceID, snapshotPath, memPath string) error
+	// CreateSavedSnapshot captures a running or paused sandbox into a saved
+	// snapshot the caller keyed by snapshotID; a retry with the same id
+	// returns the committed snapshot. kind is "fs" or "mem+fs".
+	CreateSavedSnapshot(ctx context.Context, instanceID, snapshotID, kind string) (SavedSnapshot, error)
+	// DeleteSavedSnapshot removes a saved snapshot's files. Idempotent.
+	DeleteSavedSnapshot(ctx context.Context, snapshotID string) error
 	// DeleteSandboxSnapshots removes a sandbox's entire on-disk snapshot
 	// directory. Path-based and idempotent — reclaims pause artifacts even
 	// when no snapshot row exists. Only for a sandbox being deleted.
@@ -167,6 +250,7 @@ type DirEntry struct {
 // BuildLogEvent is one decoded event from StreamBuildLogs. Finished=true
 // signals the build reached a terminal status and the stream has closed.
 type BuildLogEvent struct {
+	Sequence           uint64
 	TimestampUnixNanos int64
 	Stream             string // "stdout" | "stderr" | "system"
 	Text               string
@@ -177,16 +261,49 @@ type BuildLogEvent struct {
 // BuildStatusResult is the decoded form of vmdpb.GetBuildStatusResponse.
 // Status values: "running", "snapshotting", "ready", "failed", "cancelled".
 type BuildStatusResult struct {
-	NotFound       bool
-	Status         string
-	SnapshotPath   string // populated on ready
-	MemFilePath    string // populated on ready
-	RootfsPath     string // populated on ready
-	BasePath       string // populated on ready, overlay-mode templates only
-	DeltaPath      string // populated on ready, overlay-mode templates only
-	ResolvedDigest string // populated on ready
-	SizeBytes      int64  // populated on ready
-	ErrorMessage   string // populated on failed/cancelled
-	StartedAtUnix  int64
-	EndedAtUnix    int64
+	NotFound                bool
+	Status                  string
+	SnapshotPath            string // populated on ready
+	MemFilePath             string // populated on ready
+	RootfsPath              string // populated on ready
+	BasePath                string // populated on ready, overlay-mode templates only
+	DeltaPath               string // populated on ready, overlay-mode templates only
+	ResolvedDigest          string // populated on ready
+	SizeBytes               int64  // populated on ready
+	RootfsAllocatedBytes    int64  // populated on ready
+	BaseAllocatedBytes      int64  // populated on ready
+	DeltaAllocatedBytes     int64  // populated on ready
+	AllocatedBytesSupported bool   // true when the daemon populated allocation fields
+	ErrorMessage            string // populated on failed/cancelled
+	StartedAtUnix           int64
+	EndedAtUnix             int64
+}
+
+// PauseArtifactsMissingReason marks a resume the host refused because the
+// pause artifacts are gone from it; the caller may retry naming the backup
+// generation recorded as covering the pause.
+const PauseArtifactsMissingReason = "PAUSE_ARTIFACTS_MISSING"
+
+// SavedSnapshotMissingReason marks a fork the host refused because the saved
+// snapshot's files are gone from it; the caller may retry naming the
+// snapshot's backup generation.
+const SavedSnapshotMissingReason = "SAVED_SNAPSHOT_MISSING"
+
+// IsPauseArtifactsMissing reports whether err carries that mark.
+func IsPauseArtifactsMissing(err error) bool { return hasReason(err, PauseArtifactsMissingReason) }
+
+// IsSavedSnapshotMissing reports whether err carries SavedSnapshotMissingReason.
+func IsSavedSnapshotMissing(err error) bool { return hasReason(err, SavedSnapshotMissingReason) }
+
+func hasReason(err error, reason string) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == reason {
+			return true
+		}
+	}
+	return false
 }

@@ -115,11 +115,11 @@ func TestValidateBuildSpec_EnvRequiresKey(t *testing.T) {
 	}
 }
 
-// canonicalSpecHash must produce the same hash for equivalent specs
+// canonicalInputHash must produce the same hash for equivalent specs
 // regardless of JSON field ordering. Go's encoding/json writes map keys
 // in sorted order, but struct fields follow declaration order — we rely
 // on that, so test it explicitly so a future struct reorder breaks loudly.
-func TestCanonicalSpecHash_StableAcrossFieldReorder(t *testing.T) {
+func TestCanonicalInputHash_StableAcrossFieldReorder(t *testing.T) {
 	run := "pip install requests"
 	a := &buildSpec{
 		From: "python:3.11",
@@ -128,7 +128,7 @@ func TestCanonicalSpecHash_StableAcrossFieldReorder(t *testing.T) {
 		},
 		StartCmd: "python server.py",
 	}
-	h1, err := canonicalSpecHash(a)
+	h1, err := canonicalInputHash(a, 1, 1024, 4096)
 	if err != nil {
 		t.Fatalf("hash a: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestCanonicalSpecHash_StableAcrossFieldReorder(t *testing.T) {
 	if err := json.Unmarshal(raw, &b); err != nil {
 		t.Fatalf("unmarshal a: %v", err)
 	}
-	h2, err := canonicalSpecHash(&b)
+	h2, err := canonicalInputHash(&b, 1, 1024, 4096)
 	if err != nil {
 		t.Fatalf("hash b: %v", err)
 	}
@@ -153,13 +153,13 @@ func TestCanonicalSpecHash_StableAcrossFieldReorder(t *testing.T) {
 	}
 }
 
-// canonicalSpecHash must differ when a meaningful field changes, so the
+// canonicalInputHash must differ when a meaningful field changes, so the
 // idempotency key doesn't collide across distinct specs.
-func TestCanonicalSpecHash_DistinctForDifferentSpecs(t *testing.T) {
+func TestCanonicalInputHash_DistinctForDifferentSpecs(t *testing.T) {
 	a := &buildSpec{From: "python:3.11"}
 	b := &buildSpec{From: "python:3.12"}
-	ha, _ := canonicalSpecHash(a)
-	hb, _ := canonicalSpecHash(b)
+	ha, _ := canonicalInputHash(a, 1, 1024, 4096)
+	hb, _ := canonicalInputHash(b, 1, 1024, 4096)
 	if ha == hb {
 		t.Fatalf("different specs produced same hash: %s", ha)
 	}

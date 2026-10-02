@@ -14,7 +14,7 @@ import (
 const createSnapshot = `-- name: CreateSnapshot :one
 INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name
+RETURNING id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name, pause_token
 `
 
 type CreateSnapshotParams struct {
@@ -47,6 +47,7 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 		&i.MemPath,
 		&i.Generation,
 		&i.Name,
+		&i.PauseToken,
 	)
 	return i, err
 }
@@ -85,7 +86,7 @@ func (q *Queries) DeleteSnapshotsOfDestroyedSandboxes(ctx context.Context) (int6
 }
 
 const getSnapshot = `-- name: GetSnapshot :one
-SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name, pause_token FROM snapshot
 WHERE id = $1 AND team_id = $2
 `
 
@@ -112,12 +113,13 @@ func (q *Queries) GetSnapshot(ctx context.Context, arg GetSnapshotParams) (Snaps
 		&i.MemPath,
 		&i.Generation,
 		&i.Name,
+		&i.PauseToken,
 	)
 	return i, err
 }
 
 const getSnapshotByID = `-- name: GetSnapshotByID :one
-SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name, pause_token FROM snapshot
 WHERE id = $1
 `
 
@@ -137,12 +139,13 @@ func (q *Queries) GetSnapshotByID(ctx context.Context, id uuid.UUID) (Snapshot, 
 		&i.MemPath,
 		&i.Generation,
 		&i.Name,
+		&i.PauseToken,
 	)
 	return i, err
 }
 
 const listSnapshotsBySandbox = `-- name: ListSnapshotsBySandbox :many
-SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name, pause_token FROM snapshot
 WHERE sandbox_id = $1
 ORDER BY created_at DESC
 `
@@ -167,6 +170,7 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 			&i.MemPath,
 			&i.Generation,
 			&i.Name,
+			&i.PauseToken,
 		); err != nil {
 			return nil, err
 		}
@@ -179,7 +183,7 @@ func (q *Queries) ListSnapshotsBySandbox(ctx context.Context, sandboxID uuid.UUI
 }
 
 const listSnapshotsByTeam = `-- name: ListSnapshotsByTeam :many
-SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name FROM snapshot
+SELECT id, sandbox_id, team_id, path, size_bytes, trigger, created_at, mem_path, generation, name, pause_token FROM snapshot
 WHERE team_id = $1
 ORDER BY created_at DESC
 `
@@ -204,6 +208,7 @@ func (q *Queries) ListSnapshotsByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.MemPath,
 			&i.Generation,
 			&i.Name,
+			&i.PauseToken,
 		); err != nil {
 			return nil, err
 		}

@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/rs/zerolog/log"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -67,6 +67,16 @@ func isVMDDeadline(err error) bool {
 // isVMDUnavailable returns true when the daemon was unreachable for the
 // whole of the dial-site interceptor's retry window — the shape a vmd
 // restart longer than that window surfaces as.
+// isVMDFailedPrecondition: the host can never pause this VM as it stands
+// (a paused VM whose artifacts are gone, or one parked in an error state).
+// Terminal, like NotFound, unlike a timeout.
+func isVMDFailedPrecondition(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.FailedPrecondition
+}
+
 func isVMDUnavailable(err error) bool {
 	if err == nil {
 		return false
@@ -122,35 +132,152 @@ func isDirNotFound(err error) bool {
 // vmdErrorMessage returns the gRPC message from a vmd error, stripping
 // gRPC/transport framing so the string is safe to surface to API callers.
 func vmdErrorMessage(err error) string {
-	if s, ok := status.FromError(err); ok {
-		return s.Message()
+	// The daemon's own words: the client wraps them with the RPC name, which
+	// is not for the caller.
+	var st interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &st) {
+		return st.GRPCStatus().Message()
 	}
 	return err.Error()
 }
 
+const sandboxCreateTransientResponseMessage = "Sandbox create is temporarily unavailable."
+const sandboxCreateAbsentRowRetryWindow = 500 * time.Millisecond
+
 // markSandboxFailedAsync writes status=failed in a detached goroutine. The
 // underlying MarkSandboxFailedInTeam query is a CTE that also closes any
 // open sandbox_active_interval row atomically, so a crash/timeout between
-// the two writes is unreachable. Detaches cancellation so the state
-// transition survives client disconnect, but keeps the request's trace
-// context so the write appears in the same span.
-func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID, hostID string) {
+// the two writes is unreachable. When the create path got a transient insert
+// error, the caller asks this helper to first confirm the row exists so a
+// missing insert becomes a no-op instead of noisy retries.
+func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, teamID uuid.UUID, hostID string, verifyRow bool) <-chan bool {
 	asyncCtx := context.WithoutCancel(reqCtx)
+	done := make(chan bool, 1)
+	complete := func(ok bool) {
+		select {
+		case done <- ok:
+		default:
+		}
+	}
+	// Tracked like other background writes, so a caller that waits for them
+	// (tests) sees this one land too.
+	h.asyncBegin()
 	go func() {
+		defer h.asyncEnd()
+		defer close(done)
 		defer sentrylog.Recover("mark-failed-async")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)
 		defer cancel()
 		started := time.Now()
-		if err := h.DB.MarkSandboxFailedInTeam(ctx, db.MarkSandboxFailedInTeamParams{
-			ID:     sandboxID,
-			TeamID: teamID,
-		}); err != nil {
-			RecordSandboxTransition(ctx, "fail", telemetry.ResultError, hostID, time.Since(started))
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("async mark-failed write failed")
-			return
+		l := sandboxLogger(sandboxID.String(), hostID)
+		if verifyRow {
+			verifyDeadline := time.Now().Add(sandboxCreateAbsentRowRetryWindow)
+			backoff := 100 * time.Millisecond
+			for {
+				exists, err := h.sandboxExists(ctx, sandboxID, teamID)
+				if err == nil && exists {
+					break
+				}
+				if err == nil && !exists {
+					if time.Now().Before(verifyDeadline) && ctx.Err() == nil {
+						timer := time.NewTimer(backoff)
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							complete(true)
+							return
+						case <-timer.C:
+						}
+						if backoff < 250*time.Millisecond {
+							backoff *= 2
+						}
+						continue
+					}
+					complete(true)
+					return
+				}
+				if !isTransientCreateDBErr(err) || ctx.Err() != nil {
+					l.Error().Err(err).Msg("async verify sandbox before failed-state write failed")
+					RecordSandboxTransition(ctx, "fail", telemetry.ResultError, hostID, time.Since(started))
+					complete(false)
+					return
+				}
+				l.Warn().
+					Err(err).
+					Dur("retry_in", backoff).
+					Msg("async verify sandbox before failed-state write hit a transient DB error; retrying")
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					RecordSandboxTransition(ctx, "fail", telemetry.ResultError, hostID, time.Since(started))
+					complete(false)
+					return
+				case <-timer.C:
+				}
+				if backoff < 2*time.Second {
+					backoff *= 2
+				}
+			}
 		}
-		RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, hostID, time.Since(started))
+		backoff := 100 * time.Millisecond
+		for {
+			err := h.DB.MarkSandboxFailedInTeam(ctx, db.MarkSandboxFailedInTeamParams{
+				ID:     sandboxID,
+				TeamID: teamID,
+			})
+			if err == nil {
+				if secErr := h.DB.DeleteSandboxSecrets(ctx, sandboxID); secErr != nil {
+					l.Warn().Err(secErr).Msg("async clear secret bindings after failed state failed")
+				}
+				RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, hostID, time.Since(started))
+				complete(true)
+				return
+			}
+			if errors.Is(err, pgx.ErrNoRows) {
+				RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, hostID, time.Since(started))
+				complete(true)
+				return
+			}
+			if !isTransientCreateDBErr(err) || ctx.Err() != nil {
+				RecordSandboxTransition(ctx, "fail", telemetry.ResultError, hostID, time.Since(started))
+				l.Error().Err(err).Msg("async mark-failed write failed")
+				complete(false)
+				return
+			}
+			l.Warn().
+				Err(err).
+				Dur("retry_in", backoff).
+				Msg("async mark-failed write hit a transient DB error; retrying")
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				RecordSandboxTransition(ctx, "fail", telemetry.ResultError, hostID, time.Since(started))
+				complete(false)
+				return
+			case <-timer.C:
+			}
+			if backoff < 2*time.Second {
+				backoff *= 2
+			}
+		}
 	}()
+	return done
+}
+
+func (h *Handlers) sandboxExists(ctx context.Context, sandboxID, teamID uuid.UUID) (bool, error) {
+	_, err := h.DB.GetSandbox(ctx, db.GetSandboxParams{
+		ID:     sandboxID,
+		TeamID: teamID,
+	})
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
 }
 
 // failSandboxAfterBoot destroys a running VM and marks the sandbox row as failed.
@@ -160,13 +287,14 @@ func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, tea
 // on a non-default host. Request middleware records the create failure metric
 // from the HTTP response, so this helper only updates state and logs.
 func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sandboxID, teamID uuid.UUID, instanceID, hostID string) {
+	l := sandboxLogger(sandboxID.String(), hostID)
 	// The post-restore operation that brought us here may have exhausted or
 	// cancelled its context. Cleanup owns fresh detached deadlines so a timed-out
 	// policy/env RPC cannot strand a running VM or prevent the failed-row write.
 	cleanupBase := context.WithoutCancel(ctx)
 	destroyCtx, destroyCancel := context.WithTimeout(cleanupBase, vmdTimeout)
 	if err := vmd.DestroyInstance(destroyCtx, instanceID, true); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("destroy after failed boot")
+		l.Error().Err(err).Msg("destroy after failed boot")
 	}
 	destroyCancel()
 
@@ -177,12 +305,12 @@ func (h *Handlers) failSandboxAfterBoot(ctx context.Context, vmd VMDClient, sand
 		Status: db.SandboxStatusFailed,
 		TeamID: teamID,
 	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("mark-failed after destroy")
+		l.Error().Err(err).Msg("mark-failed after destroy")
 	}
 	// A failed sandbox keeps status=failed with destroyed_at NULL, and the
 	// secret-binding queries filter only on destroyed_at, so clear the bindings
 	// here or a never-usable sandbox would still report as bound to its secrets.
 	if err := h.DB.DeleteSandboxSecrets(dbCtx, sandboxID); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("clear secret bindings after failed boot")
+		l.Error().Err(err).Msg("clear secret bindings after failed boot")
 	}
 }

@@ -3,16 +3,19 @@ package main
 import (
 	"cloud.google.com/go/storage"
 	"context"
+	"errors"
 	"fmt"
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/time/rate"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -29,8 +32,12 @@ import (
 	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostidentity"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/proxy"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vm"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
@@ -41,6 +48,7 @@ const localHTTPPort = 9090
 
 // Config holds the daemon configuration sourced from environment variables.
 type Config struct {
+	IncarnationID      string
 	FirecrackerBin     string
 	JailerBin          string
 	KernelPath         string
@@ -67,6 +75,13 @@ type Config struct {
 	// heartbeat is disabled.
 	ControlPlaneURL string
 
+	// Heartbeat self-description overrides. When unset, the daemon infers
+	// addresses and region from the local interface and deployment defaults.
+	VMDAdvertiseAddr    string
+	ProxyAdvertiseAddr  string
+	PeerProxyListenAddr string
+	HostRegion          string
+
 	// SecretsProxySocket is the local secretsproxy daemon's control-RPC unix-socket path.
 	// When empty, broker registration is skipped.
 	SecretsProxySocket string
@@ -81,6 +96,10 @@ type Config struct {
 }
 
 func loadConfig() (Config, error) {
+	return loadConfigWithStartupTimer(nil)
+}
+
+func loadConfigWithStartupTimer(st *startupTimer) (Config, error) {
 	port, err := strconv.Atoi(envOrDefault("GRPC_PORT", "50051"))
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid GRPC_PORT: %w", err)
@@ -94,12 +113,16 @@ func loadConfig() (Config, error) {
 		SnapshotDir:             envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
 		RunDir:                  envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
 		GRPCPort:                port,
-		HostInterface:           envOrDefault("HOST_INTERFACE", "eth0"),
+		HostInterface:           os.Getenv("HOST_INTERFACE"),
 		TemplateBuilderBin:      envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
 		BoxdBinaryPath:          envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
-		HostID:                  envOrDefault("HOST_ID", "default"),
+		HostID:                  requireEnv("HOST_ID"),
 		DatabaseURL:             os.Getenv("DATABASE_URL"),
 		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
+		VMDAdvertiseAddr:        os.Getenv("VMD_ADVERTISE_ADDR"),
+		ProxyAdvertiseAddr:      os.Getenv("PROXY_ADVERTISE_ADDR"),
+		PeerProxyListenAddr:     os.Getenv("PEER_PROXY_LISTEN_ADDR"),
+		HostRegion:              envOrDefault("HOST_REGION", os.Getenv("SANDBOX_ID_REGION")),
 		SecretsProxySocket:      os.Getenv("SECRETSPROXY_SOCKET"),
 		SecretsProxySandboxAddr: os.Getenv("SECRETSPROXY_SANDBOX_ADDR"),
 	}
@@ -110,7 +133,33 @@ func loadConfig() (Config, error) {
 	if cfg.BaseRootfsPath == "" {
 		return Config{}, fmt.Errorf("BASE_ROOTFS_PATH environment variable is required")
 	}
+	// HOST_ID scopes heartbeats and reconciler state; two daemons sharing an
+	// identity reap each other's sandboxes, so refuse to start rather than
+	// fall back to a shared placeholder. The literal "default" stays allowed:
+	// one production host's row predates instance-named identities and still
+	// keys on it, so it can only be banned once that identity is migrated.
+	if cfg.HostID == "" {
+		return Config{}, fmt.Errorf("HOST_ID environment variable is required and must be this host's unique identity")
+	}
 
+	identityPath := os.Getenv("HOST_IDENTITY_FILE")
+	if os.Getenv("HOST_IDENTITY_REQUIRED") == "1" && identityPath == "" {
+		return Config{}, fmt.Errorf("HOST_IDENTITY_FILE is required; install host identity before starting VMD")
+	}
+	if identityPath != "" {
+		if err := validateIdentityHeartbeatConfig(cfg); err != nil {
+			return Config{}, err
+		}
+		started := time.Now()
+		identity, err := hostidentity.Load(identityPath, cfg.HostID, hostidentity.Metadata)
+		if st != nil {
+			st.identityVerification(time.Since(started), err)
+		}
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.IncarnationID = identity.IncarnationID
+	}
 	if cfg.SecretsProxySandboxAddr != "" {
 		host, port, err := parseSecretsProxyAddr(cfg.SecretsProxySandboxAddr)
 		if err != nil {
@@ -121,6 +170,20 @@ func loadConfig() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// Bound heartbeats require a complete description even for previously registered hosts.
+func validateIdentityHeartbeatConfig(cfg Config) error {
+	if strings.TrimSpace(cfg.HostRegion) == "" || len(cfg.HostRegion) > 256 {
+		return fmt.Errorf("identity-bound VMD requires HOST_REGION to be nonempty and at most 256 bytes")
+	}
+	for _, key := range []string{"VMD_SCHEDULABLE_MEMORY_MIB", "VMD_SCHEDULABLE_VCPUS"} {
+		value, err := strconv.ParseInt(os.Getenv(key), 10, 32)
+		if err != nil || value <= 0 {
+			return fmt.Errorf("identity-bound VMD requires %s to be a positive int32 schedulable capacity", key)
+		}
+	}
+	return nil
 }
 
 // parseSecretsProxyAddr parses host:port; host must be an IPv4 literal because
@@ -151,6 +214,143 @@ func requireEnv(key string) string {
 	return os.Getenv(key)
 }
 
+func hostInterfaceAddress(interfaceName string) (string, error) {
+	iface, err := net.InterfaceByName(interfaceName)
+	if err != nil {
+		return "", err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", err
+	}
+	if iface.Flags&net.FlagUp == 0 {
+		return "", fmt.Errorf("host interface %q is down", interfaceName)
+	}
+	return uniquePrivateHostAddress(addrs)
+}
+
+// publishesCapacityPressure reports whether this daemon should publish
+// capacity pressure — and therefore whether the manager should do the
+// pressure-only startup accounting at all.
+//
+// Both halves are required. The advertise address must be the EXPLICIT
+// operator setting rather than the address the heartbeat resolves: that
+// one falls back to the host interface, so every host has one, and
+// publication must stay opt-in per host. The control-plane URL matters
+// because without it the heartbeat never starts, so nothing would ever
+// read the accounting — a host configured that way would pay for the
+// startup scan and publish to no one.
+func publishesCapacityPressure(advertiseAddr, controlPlaneURL string) bool {
+	return advertiseAddr != "" && controlPlaneURL != ""
+}
+
+// hostIPOnce memoizes a host-address resolver. Both advertised endpoints
+// derive from the same interface, and the lookup dumps the host's interface
+// and address tables — tables that grow with every VM and pooled slot on the
+// box — so it runs at most once per resolution attempt, and not at all when both
+// endpoints are configured explicitly.
+func hostIPOnce(resolve func() (string, error)) func() (string, error) {
+	var (
+		once sync.Once
+		ip   string
+		err  error
+	)
+	return func() (string, error) {
+		once.Do(func() { ip, err = resolve() })
+		return ip, err
+	}
+}
+
+// resolveHeartbeatAddresses keeps incarnation-bearing heartbeats from starting
+// with an incomplete description after a transient address lookup failure.
+func resolveHeartbeatAddresses(ctx context.Context, interval time.Duration, resolve func() (string, string, error), log zerolog.Logger) (string, string, error) {
+	for {
+		vmdAddr, proxyAddr, err := resolve()
+		if err == nil {
+			return vmdAddr, proxyAddr, nil
+		}
+		log.Warn().Err(err).Msg("unable to resolve heartbeat addresses; retrying before advertising host")
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func advertisedVMDAddr(hostIP func() (string, error), grpcPort int, explicit string) (string, error) {
+	if explicit != "" {
+		if _, _, err := net.SplitHostPort(explicit); err != nil {
+			return "", err
+		}
+		return explicit, nil
+	}
+	ip, err := hostIP()
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(ip, strconv.Itoa(grpcPort)), nil
+}
+
+func advertisedProxyAddr(hostIP func() (string, error), proxyHealthURL, explicit string) (string, error) {
+	if explicit != "" {
+		if _, _, err := net.SplitHostPort(explicit); err != nil {
+			return "", err
+		}
+		return explicit, nil
+	}
+	u, err := url.Parse(proxyHealthURL)
+	if err != nil {
+		return "", err
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("proxy health URL %q has no host", proxyHealthURL)
+	}
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		return "", err
+	}
+	if host == "localhost" || net.ParseIP(host).IsLoopback() || net.ParseIP(host).IsUnspecified() {
+		ip, err := hostIP()
+		if err != nil {
+			return "", err
+		}
+		return net.JoinHostPort(ip, port), nil
+	}
+	if !privateHostIPv4(net.ParseIP(host)) {
+		return "", fmt.Errorf("proxy health address must resolve to a private host IPv4 address")
+	}
+	return u.Host, nil
+}
+
+func advertisedHeartbeatProxyAddr(hostIP func() (string, error), proxyHealthURL, configured, peerListen string) (string, error) {
+	if peerListen != "" {
+		if err := proxy.ValidatePeerEndpoint(peerListen); err != nil {
+			return "", err
+		}
+		return peerListen, nil
+	}
+	return advertisedProxyAddr(hostIP, proxyHealthURL, configured)
+}
+
+// envInt32Fatal parses an optional non-negative int32 env var. Unset or
+// empty is 0 (feature stays off); a set-but-unparseable value is a
+// misconfiguration and must stop the process, not silently disable or
+// distort what it configures.
+func envInt32Fatal(log zerolog.Logger, key string) int32 {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 32)
+	if err != nil || n < 0 {
+		log.Fatal().Str(key, v).Msg("must be a non-negative integer")
+	}
+	return int32(n)
+}
+
 // ---------------------------------------------------------------------------
 // Service lifecycle
 // ---------------------------------------------------------------------------
@@ -176,6 +376,17 @@ type lifecycle struct {
 	closers  []serviceCloser
 	firstErr error
 	errName  string
+	// signalInitiated records that shutdown was requested by an operator
+	// signal (deploy, systemctl stop) rather than a service exiting on its
+	// own — even a nil-error service return is NOT an intentional shutdown.
+	// closerErr records the first closer failure. Both gate the pool
+	// receipt: only a deliberate, fully clean shutdown may vouch.
+	signalInitiated bool
+	closerErr       error
+	// forcedRPCStop is set when the gRPC drain overran its budget and active
+	// RPCs were force-cancelled — a possibly-inconsistent state the next boot
+	// must reconcile, so it bars the pool receipt.
+	forcedRPCStop bool
 
 	done   chan struct{}
 	doneCh sync.Once
@@ -224,6 +435,31 @@ func (lc *lifecycle) signalShutdown() {
 	lc.doneCh.Do(func() { close(lc.done) })
 }
 
+// noteSignalInitiated marks this shutdown as operator-requested. Call before
+// signalShutdown from the signal handler only.
+func (lc *lifecycle) noteSignalInitiated() {
+	lc.mu.Lock()
+	lc.signalInitiated = true
+	lc.mu.Unlock()
+}
+
+// noteForcedRPCStop marks that the gRPC drain overran its budget and active
+// RPCs were force-cancelled, so this shutdown can never be treated as clean.
+func (lc *lifecycle) noteForcedRPCStop() {
+	lc.mu.Lock()
+	lc.forcedRPCStop = true
+	lc.mu.Unlock()
+}
+
+// cleanIntentionalShutdown reports whether this was a signal-initiated
+// shutdown in which no service errored and every closer succeeded — the
+// only condition under which state may be vouched for.
+func (lc *lifecycle) cleanIntentionalShutdown() bool {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.signalInitiated && lc.firstErr == nil && lc.closerErr == nil && !lc.forcedRPCStop
+}
+
 // wait blocks until shutdown is signaled (by a service exit, context
 // cancellation, or an external caller).
 func (lc *lifecycle) wait(ctx context.Context) {
@@ -234,9 +470,30 @@ func (lc *lifecycle) wait(ctx context.Context) {
 	}
 }
 
-// shutdown runs every registered closer in reverse order, collecting
-// errors but never stopping on the first failure — we want every
-// resource to get a chance to clean up.
+// perCloserShutdownTimeout bounds each closer independently during shutdown.
+// A closer that ignores cancellation must not stall the closers after it or
+// hang the process — the loop aborts the graceful sequence if one overruns,
+// so total shutdown stays bounded. Bounding the gRPC drain, a hit budget
+// force-cancels active RPCs, aborts the remaining closers, and marks the
+// shutdown unclean — a circuit breaker (overrun costs a reconcile), not a
+// proven-safe cancellation bound. Chosen to sit under the 30s overall shutdown
+// budget and the unit's TimeoutStopSec backstop, leaving room for the closers
+// after it.
+var perCloserShutdownTimeout = 15 * time.Second
+
+// shutdown runs registered closers in reverse (dependency) order, each under
+// its own deadline and off the main goroutine. Any non-nil outcome — a returned
+// error OR an overrun deadline — aborts the sequence rather than continuing.
+// The two are indistinguishable and both unsafe to continue past: a closer that
+// returns ctx.Err() at its deadline (the uploader and flow sink do) may still
+// have a worker touching the resources its dependencies own, and at the
+// deadline the select can receive that error from done instead of selecting
+// closerCtx.Done(). Because closers run in dependency order, continuing would
+// close BoltDB/GCS/DB out from under a live worker — a use-after-close. On
+// abort the remaining descriptors are reclaimed by process exit (systemd
+// TimeoutStopSec is the final backstop), and the recorded closerErr bars this
+// shutdown from vouching for inventory it may have left inconsistent. A clean
+// shutdown returns nil from every closer and closes the whole chain.
 func (lc *lifecycle) shutdown(ctx context.Context) {
 	lc.mu.Lock()
 	closers := slices.Clone(lc.closers)
@@ -245,22 +502,175 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 
 	for _, c := range closers {
 		lc.log.Info().Str("service", c.name).Msg("closing")
-		if err := c.close(ctx); err != nil {
-			lc.log.Error().Err(err).Str("service", c.name).Msg("close returned error")
+		closerCtx, cancel := context.WithTimeout(ctx, perCloserShutdownTimeout)
+		// Buffered so a closer that overruns can still send and exit (or leak
+		// harmlessly — the process is on its way down) rather than block
+		// forever on a receiver that has moved on.
+		done := make(chan error, 1)
+		go func() { done <- c.close(closerCtx) }()
+		var err error
+		select {
+		case err = <-done:
+		case <-closerCtx.Done():
+			err = fmt.Errorf("shutdown deadline exceeded")
+		}
+		cancel()
+		if err != nil {
+			lc.log.Error().Err(err).Str("service", c.name).
+				Msg("closer failed or overran; aborting graceful shutdown")
+			lc.recordCloserErr(fmt.Errorf("%s: %w", c.name, err))
+			return
 		}
 	}
+}
+
+func (lc *lifecycle) recordCloserErr(err error) {
+	lc.mu.Lock()
+	if lc.closerErr == nil {
+		lc.closerErr = err
+	}
+	lc.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
+// runDrainCheck reports whether this host still holds direct-spawn state,
+// gating a rollback to a pre-direct-spawn binary. Exit 0 = drained (safe to
+// downgrade); 3 = residual state remains; 2 = the check itself failed. Callers
+// treat any non-zero as "do not downgrade". Run with vmd stopped — the store
+// read lock and the cgroup scan both need the daemon quiescent.
+func runDrainCheck() int {
+	statePath := envOrDefault("VMD_STATE_PATH",
+		filepath.Join(filepath.Dir(envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir")), "vmd.db"))
+	rep, err := vm.CheckDrained(context.Background(), statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drain-check: %v\n", err)
+		return 2
+	}
+	fmt.Printf("drain-check: cgroup_records=%d per_vm_dirs=%d populated_groups=%d scope=%q\n",
+		rep.CgroupRecords, rep.PerVMDirs, rep.PopulatedGroups, rep.ScopePath)
+	if rep.Drained() {
+		fmt.Println("drain-check: DRAINED — safe to install a pre-direct-spawn binary")
+		return 0
+	}
+	fmt.Fprintln(os.Stderr, "drain-check: NOT DRAINED — direct-spawn state remains; do not downgrade vmd")
+	return 3
+}
+
+// startupTimer partitions startup into contiguous phases: each mark logs the
+// interval since the previous mark, so the segments tile the whole start→ready
+// timeline with no gap. Observability only — no control flow, startup path only.
+type startupTimer struct {
+	log   zerolog.Logger
+	start time.Time
+	last  time.Time
+	// Marks and breakdown records are timestamped on the startup goroutine but
+	// written from a dedicated one, so a backpressured stdout can't delay the
+	// readiness being measured. Buffered above the record count: sends never
+	// block, overflow drops the record rather than stalling startup.
+	ch chan func()
+}
+
+func newStartupTimer(log zerolog.Logger) *startupTimer {
+	now := time.Now()
+	s := &startupTimer{log: log, start: now, last: now, ch: make(chan func(), 64)}
+	go func() {
+		for fn := range s.ch {
+			fn()
+		}
+	}()
+	return s
+}
+
+// emit queues a log write on the timer's writer goroutine — for startup
+// breakdown records whose values are already computed; never blocks.
+func (s *startupTimer) emit(fn func()) {
+	select {
+	case s.ch <- fn:
+	default:
+	}
+}
+
+// mark records the segment ending here (duration since the previous mark, plus
+// cumulative since start); the log write happens off this goroutine. Every
+// phase boundary is emitted even when its optional work is skipped
+// (enabled=false, ~0 duration) so phase labels stay comparable across host
+// configs and the partition stays attributable. Main-goroutine only — it
+// mutates last; background work logs its own duration.
+// count >= 0 attaches an aggregate, -1 omits it.
+func (s *startupTimer) mark(phase string, enabled bool, count int) {
+	now := time.Now()
+	phaseDur, sinceStart := now.Sub(s.last), now.Sub(s.start)
+	s.emit(func() {
+		e := s.log.Info().
+			Str("startup_phase", phase).
+			Bool("enabled", enabled).
+			Dur("phase_ms", phaseDur).
+			Dur("since_start_ms", sinceStart)
+		if count >= 0 {
+			e = e.Int("count", count)
+		}
+		e.Msg("startup phase timing")
+	})
+	s.last = now
+}
+
+// Identity verification is a breakdown of preliminary, not a phase boundary.
+func (s *startupTimer) identityVerification(elapsed time.Duration, err error) {
+	if err != nil {
+		// Configuration failure exits immediately, so carry timing on its fatal record.
+		s.log = s.log.With().Str("startup_component", "identity_verification").
+			Dur("duration_ms", elapsed).
+			Dur("budget_ms", hostidentity.VerificationTimeout).
+			Bool("success", false).Logger()
+		return
+	}
+	s.emit(func() {
+		s.log.Info().Str("startup_component", "identity_verification").
+			Dur("duration_ms", elapsed).
+			Dur("budget_ms", hostidentity.VerificationTimeout).
+			Bool("success", err == nil).Err(err).
+			Msg("startup identity verification timing")
+	})
+}
+
 func main() {
-	// Hidden re-exec entry: the launcher-namespace build re-execs vmd under
-	// unshare so the detach syscalls run inside the freshly cloned
-	// namespace. Must dispatch before any daemon setup.
-	if len(os.Args) > 1 && os.Args[1] == "launcher-prune" {
-		os.Exit(vm.LauncherPruneMain())
+	// Maintenance subcommands run before any daemon setup and exit. They must
+	// not open the state store in write mode or start services.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "capabilities":
+			// Advertised so rollback tooling can detect a downgrade to a binary
+			// that lacks cgroup supervision, the wake protocol frozen images
+			// depend on, the staged intents a capture journals, or the saved
+			// snapshot backups it queues. Env-free by design; the literals are
+			// what the deploy guards grep the binary for, so they must stay
+			// verbatim.
+			fmt.Println("cgroup-supervision")
+			fmt.Println(vm.WakeProtocolCapability)
+			fmt.Println(vm.StagedIntentCapability)
+			fmt.Println(vm.SnapshotBackupCapability)
+			return
+		case "raise-wake-floor":
+			// Operator step before the first frozen image can exist anywhere:
+			// with the floor up on every host, no vmd without the wake protocol
+			// can start on one, so a later rollback cannot strand a frozen
+			// guest. Durable before it returns; idempotent.
+			if err := vm.RaiseWakeProtocolFloor(); err != nil {
+				fmt.Fprintln(os.Stderr, "raise-wake-floor:", err)
+				os.Exit(1)
+			}
+			return
+		case "drain-check":
+			os.Exit(runDrainCheck())
+		case "launcher-prune":
+			// Hidden re-exec entry: the launcher-namespace build re-execs vmd
+			// under unshare so the detach syscalls run inside the freshly
+			// cloned namespace. Must dispatch before any daemon setup.
+			os.Exit(vm.LauncherPruneMain())
+		}
 	}
 
 	// Structured logging with zerolog — unix timestamp, caller info enabled.
@@ -271,6 +681,10 @@ func main() {
 		Str("service", "vmd").
 		Logger()
 
+	// Startup phase timing (observability only) — created at the earliest point
+	// the logger is up, so since_start_ms covers all daemon-start work.
+	st := newStartupTimer(log)
+
 	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
 		if err := sentry.Init(sentry.ClientOptions{Dsn: dsn, EnableLogs: true}); err != nil {
 			log.Warn().Err(err).Msg("sentry.Init failed")
@@ -279,9 +693,9 @@ func main() {
 		}
 	}
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfigWithStartupTimer(st)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to load configuration")
+		st.log.Fatal().Err(err).Msg("failed to load configuration")
 	}
 
 	log.Info().
@@ -327,6 +741,9 @@ func main() {
 	// chain even when no ports are configured (so disabling the feature
 	// clears stale drops). template-builder must not pass this.
 	netMgrOpts := []network.ManagerOption{network.WithEgressPortChainOwner()}
+	if envOrDefault("VMD_NETLINK_SLOT_OPS", "false") == "true" {
+		netMgrOpts = append(netMgrOpts, network.WithNetlinkSlotOps())
+	}
 	if blocklistPath != "" {
 		blCfg, err := blocklist.LoadConfig(blocklistPath)
 		if err != nil {
@@ -359,13 +776,29 @@ func main() {
 		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
 	}
 
+	// An unset override uses the host route for both networking and advertisement.
+	// Two bounded local queries avoid a fleet-sized interface/address table scan.
+	var automaticHostIP string
+	if cfg.HostInterface == "" {
+		cfg.HostInterface, automaticHostIP, err = discoverHostRoute(ctx)
+		if err != nil {
+			log.Fatal().Err(err).Msg("cannot determine private host interface from default route; configure HOST_INTERFACE")
+		}
+		log.Info().Str("host_interface", cfg.HostInterface).Str("host_ip", automaticHostIP).Msg("resolved host default route")
+	}
+
 	// ---- Network manager + host firewall ----
+	// preliminary: sentry init, config parse, tool lookups, dir creation, and
+	// egress/DNS option wiring — everything before the network manager builds.
+	st.mark("preliminary", true, -1)
 	netMgrOpts = append(netMgrOpts,
+		network.WithHostID(cfg.HostID),
 		network.WithSecretsProxyAddr(cfg.SecretsProxySandboxDst, cfg.SecretsProxySandboxPort))
 	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
 	}
+	st.mark("network_firewall", true, -1)
 	lc.addCloser("network manager", func(_ context.Context) error { return netMgr.Close() })
 
 	// ---- VM manager ----
@@ -376,7 +809,29 @@ func main() {
 	resumeUffdEnabled := envOrDefault("VMD_RESUME_UFFD", "false") == "true"
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
+	// Safe to enable ahead of the Firecracker rollout: sessions are armed only
+	// once the binary advertises the capability, and a rollback degrades to
+	// the unguarded behavior. Off is exactly today's behavior.
+	dirtyTrackingSessionEnabled := envOrDefault("VMD_DIRTY_TRACKING_SESSION", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
+	// Off by default: it only does anything for a snapshot whose guest corrects
+	// its own wall clock, and forcing legacy is the way back if one misbehaves.
+	guestClockFreezeEnabled := envOrDefault("VMD_GUEST_CLOCK_FREEZE", "false") == "true"
+	// Off by default: a frozen template is only safe under a supervisor that
+	// wakes it, so this follows the binary, never precedes it.
+	templateFreezeWorkload := envOrDefault("VMD_TEMPLATE_FREEZE_WORKLOAD", "false") == "true"
+	// Pause-side wait for the guest to stop its workload before a frozen-clock
+	// snapshot; only paid when the restore would freeze the clock.
+	savedSnapshotConcurrency := 0
+	if n, err := strconv.Atoi(envOrDefault("VMD_SAVED_SNAPSHOT_CONCURRENCY", "0")); err == nil {
+		savedSnapshotConcurrency = n
+	}
+	guestFreezeBudget := 500 * time.Millisecond
+	if v := envOrDefault("VMD_GUEST_FREEZE_BUDGET_MS", ""); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			guestFreezeBudget = time.Duration(ms) * time.Millisecond
+		}
+	}
 	// Tri-state: "auto" (default) lets vmd enforce only after its convergence
 	// sweep proves every layered overlay has a presence side-car; "always"
 	// forces enforcement (fresh migration-target hosts); "never" is the
@@ -393,6 +848,124 @@ func main() {
 		requirePresenceSidecar = "auto"
 	}
 	launchViaLauncherNS := envOrDefault("VMD_LAUNCH_VIA_LAUNCHER_NS", "false") == "true"
+	pausedNetworkReclaimEnabled := envOrDefault("VMD_PAUSED_NETWORK_RECLAIM", "false") == "true"
+	requirePausedNetworkEnv := func(key, fallback string) string {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+		if pausedNetworkReclaimEnabled {
+			log.Fatal().Str("key", key).Msg("paused network reclaim is enabled but required configuration is missing")
+		}
+		return fallback
+	}
+	pausedNetworkSlotHeadroomPercent, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT", "0"))
+	if err != nil || pausedNetworkSlotHeadroomPercent < 0 || pausedNetworkSlotHeadroomPercent > 100 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT must be an integer between 0 and 100")
+	}
+	pausedNetworkSlotHeadroomReserve, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE", "0"))
+	if err != nil || pausedNetworkSlotHeadroomReserve < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE must be a non-negative integer")
+	}
+	pausedNetworkSlotHeadroomHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkSlotHeadroomHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_SLOT_HEADROOM_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkNetnsThreshold, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_NETNS_THRESHOLD", "0"))
+	if err != nil || pausedNetworkNetnsThreshold < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_NETNS_THRESHOLD")).Msg("VMD_PAUSED_NETWORK_NETNS_THRESHOLD must be a non-negative integer")
+	}
+	pausedNetworkNetnsHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkNetnsHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_NETNS_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkMountThreshold, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD", "0"))
+	if err != nil || pausedNetworkMountThreshold < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD")).Msg("VMD_PAUSED_NETWORK_MOUNT_THRESHOLD must be a non-negative integer")
+	}
+	pausedNetworkMountHysteresis, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS", "1"))
+	if err != nil || pausedNetworkMountHysteresis < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS")).Msg("VMD_PAUSED_NETWORK_MOUNT_HYSTERESIS must be a non-negative integer")
+	}
+	pausedNetworkMinWarmAge, err := time.ParseDuration(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MIN_WARM_AGE", "0s"))
+	if err != nil || pausedNetworkMinWarmAge < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MIN_WARM_AGE")).Msg("VMD_PAUSED_NETWORK_MIN_WARM_AGE must be a non-negative duration")
+	}
+	pausedNetworkMaxReclaims, err := strconv.Atoi(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_MAX_RECLAIMS", "2"))
+	if err != nil || pausedNetworkMaxReclaims < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_MAX_RECLAIMS")).Msg("VMD_PAUSED_NETWORK_MAX_RECLAIMS must be a non-negative integer")
+	}
+	pausedNetworkReclaimCooldown, err := time.ParseDuration(requirePausedNetworkEnv("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN", "30s"))
+	if err != nil || pausedNetworkReclaimCooldown < 0 {
+		log.Fatal().Str("value", os.Getenv("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN")).Msg("VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN must be a non-negative duration")
+	}
+	if pausedNetworkReclaimEnabled {
+		log.Info().
+			Int("paused_network_max_reclaims", pausedNetworkMaxReclaims).
+			Dur("paused_network_reclaim_cooldown", pausedNetworkReclaimCooldown).
+			Int("paused_network_slot_headroom_percent", pausedNetworkSlotHeadroomPercent).
+			Int("paused_network_slot_headroom_reserve", pausedNetworkSlotHeadroomReserve).
+			Int("paused_network_netns_threshold", pausedNetworkNetnsThreshold).
+			Int("paused_network_mount_threshold", pausedNetworkMountThreshold).
+			Msg("paused network reclaim enabled")
+		if !pausedNetworkReclaimTriggersConfigured(
+			pausedNetworkSlotHeadroomPercent,
+			pausedNetworkSlotHeadroomReserve,
+			pausedNetworkNetnsThreshold,
+			pausedNetworkMountThreshold,
+		) {
+			log.Warn().
+				Msg("paused network reclaim is enabled but no pressure trigger is configured; reclamation will remain inert until at least one threshold is raised")
+		}
+	}
+	// One instance ID for the whole process: vmd builds both an
+	// OTelRecorder (below) and a BackupRecorder (further down) under the
+	// same service.name, and each defaults its own random ID independently
+	// if not told otherwise — which would misrepresent this single vmd
+	// process as two separate GMP targets.
+	otelInstanceID := telemetry.NewInstanceID()
+	recorder := telemetry.NewNoopRecorder()
+	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
+		otelExportInterval, err := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("invalid OTEL_EXPORT_INTERVAL")
+		}
+		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
+			HostID:         cfg.HostID,
+			InstanceID:     otelInstanceID,
+			ServiceName:    envOrDefault("OTEL_SERVICE_NAME", "sandbox-vmd"),
+			ServiceVersion: os.Getenv("OTEL_SERVICE_VERSION"),
+			Environment:    envOrDefault("OTEL_ENVIRONMENT", "dev"),
+			Endpoint:       envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+			Insecure: func() bool {
+				v, err := strconv.ParseBool(envOrDefault("OTEL_EXPORTER_OTLP_INSECURE", "false"))
+				if err != nil {
+					log.Warn().Err(err).Msg("invalid OTEL_EXPORTER_OTLP_INSECURE; using false")
+					return false
+				}
+				return v
+			}(),
+			ExportInterval: otelExportInterval,
+		})
+		if err != nil {
+			log.Warn().Err(err).Msg("otel metrics init failed; continuing without network-pressure export")
+		} else {
+			recorder = otelRecorder
+			defer func() {
+				flushCtx, flushCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer flushCancel()
+				if err := otelRecorder.Shutdown(flushCtx); err != nil {
+					log.Warn().Err(err).Msg("otel metrics shutdown failed")
+				}
+			}()
+			log.Info().
+				Str("endpoint", envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")).
+				Dur("interval", otelExportInterval).
+				Msg("otel metrics initialized")
+		}
+	}
+	// Network slot claim/build phases ride the same recorder — assigned
+	// unconditionally like vm.NewManager's, noop when metrics are disabled.
+	netMgr.SetTelemetry(recorder)
 
 	// Persistent systemd D-Bus connection for unit operations (vs forking
 	// systemctl per call). Falls back to systemctl per call when unavailable.
@@ -400,31 +973,65 @@ func main() {
 	vm.SetSystemdDBusEnabled(systemdDBus)
 	log.Info().Bool("systemd_dbus", systemdDBus).Msg("systemd unit-operations transport")
 
+	// Capacity pressure is published only by a host whose advertise
+	// address was set EXPLICITLY by an operator AND that has somewhere
+	// to publish to. Deliberately not the resolved address the heartbeat
+	// sends: that one falls back to the host interface, so every host
+	// has one, and publication must stay opt-in per host. The
+	// control-plane URL belongs in the same condition because without it
+	// the heartbeat never starts, so nothing would ever read the
+	// accounting this flag turns on. Named once here because it also
+	// decides whether the manager does pressure-only startup accounting
+	// at all — on a host that never publishes, none of that work should
+	// run.
+	publishesPressure := publishesCapacityPressure(cfg.VMDAdvertiseAddr, cfg.ControlPlaneURL)
+
 	mgr, err := vm.NewManager(vm.ManagerConfig{
-		FirecrackerBin:             cfg.FirecrackerBin,
-		JailerBin:                  cfg.JailerBin,
-		KernelPath:                 cfg.KernelPath,
-		BaseRootfsPath:             cfg.BaseRootfsPath,
-		SnapshotDir:                cfg.SnapshotDir,
-		RunDir:                     cfg.RunDir,
-		TemplateBuilderBin:         cfg.TemplateBuilderBin,
-		BoxdBinaryPath:             cfg.BoxdBinaryPath,
-		HostInterface:              cfg.HostInterface,
-		MaxConcurrentRestores:      maxRestores,
-		UffdEnabled:                uffdEnabled,
-		UffdPrefetchEnabled:        uffdPrefetchEnabled,
-		UffdRecordMaxSeconds:       uffdRecordMaxSeconds,
-		ResumeUffdEnabled:          resumeUffdEnabled,
-		VerifySnapshotEnabled:      verifySnapshotEnabled,
-		IncrementalSnapshotEnabled: incrementalSnapshotEnabled,
-		HandlerDeathAbortEnabled:   handlerDeathAbortEnabled,
-		RequirePresenceSidecar:     requirePresenceSidecar,
-		LaunchViaLauncherNS:        launchViaLauncherNS,
-		LauncherNSPath:             os.Getenv("VMD_LAUNCHER_NS_PATH"),
+		FirecrackerBin:                      cfg.FirecrackerBin,
+		JailerBin:                           cfg.JailerBin,
+		KernelPath:                          cfg.KernelPath,
+		BaseRootfsPath:                      cfg.BaseRootfsPath,
+		SnapshotDir:                         cfg.SnapshotDir,
+		RunDir:                              cfg.RunDir,
+		TemplateBuilderBin:                  cfg.TemplateBuilderBin,
+		BoxdBinaryPath:                      cfg.BoxdBinaryPath,
+		HostInterface:                       cfg.HostInterface,
+		MaxConcurrentRestores:               maxRestores,
+		UffdEnabled:                         uffdEnabled,
+		UffdPrefetchEnabled:                 uffdPrefetchEnabled,
+		UffdRecordMaxSeconds:                uffdRecordMaxSeconds,
+		ResumeUffdEnabled:                   resumeUffdEnabled,
+		VerifySnapshotEnabled:               verifySnapshotEnabled,
+		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
+		DirtyTrackingSessionEnabled:         dirtyTrackingSessionEnabled,
+		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
+		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
+		TemplateFreezeWorkload:              templateFreezeWorkload,
+		GuestFreezeBudget:                   guestFreezeBudget,
+		SavedSnapshotConcurrency:            savedSnapshotConcurrency,
+		RequirePresenceSidecar:              requirePresenceSidecar,
+		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
+		PausedNetworkSlotHeadroomPercent:    pausedNetworkSlotHeadroomPercent,
+		PausedNetworkSlotHeadroomReserve:    pausedNetworkSlotHeadroomReserve,
+		PausedNetworkSlotHeadroomHysteresis: pausedNetworkSlotHeadroomHysteresis,
+		PausedNetworkNetnsThreshold:         pausedNetworkNetnsThreshold,
+		PausedNetworkNetnsHysteresis:        pausedNetworkNetnsHysteresis,
+		PausedNetworkMountThreshold:         pausedNetworkMountThreshold,
+		PausedNetworkMountHysteresis:        pausedNetworkMountHysteresis,
+		PausedNetworkMinWarmAge:             pausedNetworkMinWarmAge,
+		PausedNetworkMaxReclaims:            pausedNetworkMaxReclaims,
+		PausedNetworkReclaimCooldown:        pausedNetworkReclaimCooldown,
+		TelemetryRecorder:                   recorder,
+		LaunchViaLauncherNS:                 launchViaLauncherNS,
+		LauncherNSPath:                      os.Getenv("VMD_LAUNCHER_NS_PATH"),
+		DirectSpawn:                         envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
+		PressureAccounting:                  publishesPressure,
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
+	mgr.SweepSavedSnapshotStaging(log)
+	mgr.RunSavedTombstoneReaper(ctx)
 
 	// ---- TCP egress proxy ----
 	// Must be set before ReattachAll or any VM operations so domain
@@ -437,8 +1044,11 @@ func main() {
 		maxConnsPerSandbox,
 		log,
 	)
+	egressProxy.SetHostID(cfg.HostID)
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
+	st.mark("vm_manager_init", true, -1)
+	hostEgressCIDRs := 0
 	if blockList != nil {
 		egressProxy.SetBlocklist(blockList)
 		// Mirror IP/CIDR entries into a host-level nftables drop set so they
@@ -452,10 +1062,13 @@ func main() {
 		// the first feed fetch (which may block up to feedFetchTimeout per
 		// feed). Otherwise seeded CIDRs go unenforced on non-proxied ports
 		// during the startup window.
-		hostBlock.UpdateCIDRs(blockList.CIDRs())
+		seedCIDRs := blockList.CIDRs()
+		hostBlock.UpdateCIDRs(seedCIDRs)
+		hostEgressCIDRs = len(seedCIDRs)
 		lc.addCloser("host egress block", func(_ context.Context) error { return hostBlock.Close() })
 		lc.start("egress blocklist", func() error { return blockList.Start(ctx) })
 	}
+	st.mark("host_egress_block", blockList != nil, hostEgressCIDRs)
 	lc.start("egress proxy", func() error { return egressProxy.Start(ctx) })
 
 	// ---- BoltDB state store ----
@@ -464,8 +1077,90 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")
 	}
+	st.mark("state_store_open", true, -1)
+	oss := stateStore.OpenStats()
+	st.emit(func() {
+		log.Info().Dur("bolt_open_ms", oss.BoltOpen).Dur("policy_scan_ms", oss.PolicyScan).
+			Dur("record_scan_ms", oss.RecordScan).Dur("tx_residual_ms", oss.TxResidual).
+			Int("records", oss.Records).Int("policies", oss.Policies).
+			Int("orphans_deleted", oss.OrphansDeleted).Msg("state store open breakdown")
+		// Dedicated, alertable line: a host that rebuild-loops (trusted=false
+		// on every boot) has a writer defeating the clean-close stamp.
+		log.Info().Bool("trusted", oss.IndexTrusted).Str("reason", oss.IndexTrustReason).
+			Msg("startup index trust")
+	})
 	mgr.SetStateStore(stateStore)
-	lc.addCloser("state store", func(_ context.Context) error { return stateStore.Close() })
+	lc.addCloser("state store", func(_ context.Context) error {
+		// Clean-close trust stamp: written only when shutdown reaches this
+		// closer (an aborted closer chain skips it → next boot rebuilds the
+		// startup indexes). One durable write inside the deploy gap — logged
+		// with its own duration so disk-pressure cost is visible.
+		tStamp := time.Now()
+		if err := stateStore.StampIndexTrust(); err != nil {
+			log.Warn().Err(err).Msg("index trust stamp failed — next boot rebuilds startup indexes")
+		} else {
+			log.Info().Dur("stamp_ms", time.Since(tStamp)).Msg("startup index trust stamped")
+		}
+		return stateStore.Close()
+	})
+
+	// Arm direct spawn AFTER the state store is attached (hasCgroupRecords
+	// reads it to decide rollback-management; the rollback-guard breadcrumb
+	// is written from its resolved path) and BEFORE ReattachAll (its
+	// cgroup-orphan scan needs the delegated subtree). Arms only when the
+	// unit's config proves the survival property (Delegate + KillMode=
+	// process); a refusal degrades new launches to the unit path but still
+	// initializes the subtree for managing any existing cgroup VMs.
+	if arms, err := mgr.ArmDirectSpawn(ctx); err != nil {
+		if errors.Is(err, vm.ErrCgroupVMsUnmanageable) {
+			// Existing cgroup VMs can't be adopted — refuse to come up "ready"
+			// while they run unmanaged. Crashloop surfaces the broken scope for
+			// an operator to repair; the VMs themselves keep running meanwhile.
+			log.Fatal().Err(err).Msg("existing cgroup-mode VMs cannot be managed — refusing to start")
+		}
+		log.Error().Err(err).Msg("direct spawn not armed — launches use the unit path")
+	} else if arms {
+		log.Info().Msg("direct spawn armed: new VMs launch into the delegated cgroup subtree")
+	}
+	st.mark("cgroup_arm", true, -1)
+
+	// ---- Backup metrics recorder ----
+	// Optional OTLP recorder for the backup pipeline, exporting to the
+	// host-local collector under the same env contract as the control
+	// plane's recorder but with the vmd service name. Constructed OUTSIDE
+	// the BACKUP_BUCKET gate on purpose: a production host running with
+	// backup silently disabled must still emit backup_enabled=0 rather
+	// than nothing. Nil when metrics are off; every call site is nil-safe.
+	var backupMetrics *telemetry.BackupRecorder
+	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
+		exportInterval, perr := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
+		if perr != nil {
+			log.Warn().Err(perr).Msg("invalid OTEL_EXPORT_INTERVAL; using 15s")
+			exportInterval = 15 * time.Second
+		}
+		rec, err := telemetry.NewBackupRecorder(ctx, telemetry.BackupOTelConfig{
+			OTelConfig: telemetry.OTelConfig{
+				ServiceName:    envOrDefault("OTEL_SERVICE_NAME", "sandbox-vmd"),
+				ServiceVersion: os.Getenv("OTEL_SERVICE_VERSION"),
+				Environment:    envOrDefault("OTEL_ENVIRONMENT", "dev"),
+				Endpoint:       envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+				Insecure:       os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true",
+				ExportInterval: exportInterval,
+				InstanceID:     otelInstanceID,
+			},
+			HostID: cfg.HostID,
+		})
+		if err != nil {
+			log.Warn().Err(err).Msg("backup metrics init failed; continuing without metrics")
+		} else {
+			backupMetrics = rec
+			lc.addCloser("backup metrics", func(sctx context.Context) error {
+				return rec.Shutdown(sctx)
+			})
+			log.Info().Msg("backup metrics recorder enabled")
+		}
+	}
+	mgr.SetBackupMetrics(backupMetrics)
 
 	// ---- Backup uploader ----
 	// Ships each pause's durable artifacts (disk overlay + vmstate) to the
@@ -473,7 +1168,10 @@ func main() {
 	// unless BACKUP_BUCKET is set; the journal makes uploads crash-safe
 	// across vmd restarts, and the bandwidth cap keeps backups from
 	// competing with guest traffic.
-	if bucket := os.Getenv("BACKUP_BUCKET"); bucket != "" {
+	backupBucket := os.Getenv("BACKUP_BUCKET")
+	var probeBackupRestore func()
+	var backupJournal *backup.Journal
+	if bucket := backupBucket; bucket != "" {
 		journalPath := envOrDefault("BACKUP_JOURNAL_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "backup.db"))
 		bdb, err := bolt.Open(journalPath, 0o600, &bolt.Options{Timeout: 1 * time.Second})
 		if err != nil {
@@ -484,6 +1182,7 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to init backup journal")
 		}
+		backupJournal = journal
 		gcsClient, err := storage.NewClient(ctx)
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to create GCS client for backup")
@@ -495,29 +1194,213 @@ func main() {
 		}
 		// Megabits per second, as the name says: 1 Mbit/s = 125000 B/s.
 		bytesPerSec := rate.Limit(mbps) * 125000
-		uploader := &backup.Uploader{
-			Journal:    journal,
-			Store:      backup.NewGCSStore(gcsClient, bucket),
-			Limiter:    rate.NewLimiter(bytesPerSec, 32<<20),
-			Log:        log.With().Str("component", "backup").Logger(),
-			VMDVersion: os.Getenv("SENTRY_RELEASE"),
+		// Drain workers, not a bandwidth knob: per-task overhead is what
+		// bounds throughput once the pause rate outruns one serial loop.
+		// All workers share the single limiter above, so raising this
+		// never raises total egress past the bandwidth cap.
+		workers, _ := strconv.Atoi(envOrDefault("BACKUP_UPLOAD_CONCURRENCY", "1"))
+		if workers < 1 {
+			workers = 1
 		}
-		// Staging pins enqueued artifacts via hard links so sandbox
-		// teardown cannot erase a queued generation; the sweep clears
-		// residue from crashes between staging and enqueue.
-		stagingRoot := filepath.Join(filepath.Dir(cfg.RunDir), "backup-staging")
+		uploader := &backup.Uploader{
+			Journal:     journal,
+			Store:       backup.NewGCSStore(gcsClient, bucket),
+			Limiter:     rate.NewLimiter(bytesPerSec, 32<<20),
+			Concurrency: workers,
+			Log:         log.With().Str("component", "backup").Logger(),
+			VMDVersion:  os.Getenv("SENTRY_RELEASE"),
+			Metrics:     backupMetrics,
+		}
+		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
+		if envOrDefault("BACKUP_RESTORE_ON_RESUME", "false") == "true" {
+			// On from the first resume: wiring is local. The bucket probe
+			// runs after readiness and only ever withdraws the fallback, so
+			// startup never waits on the network and no resume lands in a
+			// window where a recoverable sandbox is refused.
+			gcsReader := backup.NewGCSReader(gcsClient, bucket)
+			restoreMbps, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_BANDWIDTH_MBPS", "200"))
+			if restoreMbps <= 0 {
+				restoreMbps = 200
+			}
+			restoreWorkers, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CONCURRENCY", "2"))
+			cacheGiB, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CACHE_GIB", "100"))
+			if cacheGiB <= 0 {
+				log.Warn().Str("value", os.Getenv("BACKUP_RESTORE_CACHE_GIB")).Msg("BACKUP_RESTORE_CACHE_GIB is not a positive integer; using 100")
+				cacheGiB = 100
+			}
+			mgr.SetBackupRestore(gcsReader, gcsReader, envOrDefault("BACKUP_RESTORE_ROOT", filepath.Join(cfg.SnapshotDir, ".restore")), vm.BackupRestoreOptions{
+				Concurrency: restoreWorkers,
+				Limiter:     rate.NewLimiter(rate.Limit(restoreMbps)*125000, 32<<20),
+				CacheBytes:  int64(cacheGiB) << 30,
+			})
+			probeBackupRestore = func() {
+				mgr.BackupRestoreMaintenance()
+				probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
+				_, perr := gcsReader.List(probeCtx, "sandboxes/.probe/")
+				probeCancel()
+				if perr != nil {
+					mgr.DisableBackupRestore()
+					log.Error().Err(perr).Str("bucket", bucket).Msg("backup restore on resume disabled: this host cannot read the backup bucket")
+					return
+				}
+				log.Info().Str("bucket", bucket).Msg("backup restore on resume verified against the bucket")
+			}
+		}
+		st.mark("backup_setup", true, -1)
+		// Staging pins enqueued artifacts so sandbox teardown cannot
+		// erase a queued generation; the sweep clears residue from
+		// crashes between staging and enqueue. Two roots, not one:
+		//
+		//   - pauseStagingRoot is where the pause RPC path stages inline
+		//     (see vm.Manager.pauseStagingRoot / SetPauseStagingRoot),
+		//     always inside SNAPSHOT_DIR so it shares a filesystem with
+		//     the artifacts it clones — reflink works, and the base pin
+		//     it hard-links never crosses filesystems. This is fixed,
+		//     never affected by BACKUP_STAGING_DIR: moving it would turn
+		//     every pause's inline copy into real cross-filesystem I/O
+		//     on the pause RPC path, and the pin into a broken cross-
+		//     device link.
+		//   - stagingRoot is where a finished generation ends up for the
+		//     uploader to hash and stream from (BACKUP_STAGING_DIR
+		//     overrides it). Every staged file is read twice before it
+		//     leaves the host (digest pre-check, then the upload
+		//     stream), and on a host serving live VM disk I/O off the
+		//     same array that read traffic is direct contention with
+		//     tenant workloads — the reason to move it. The detached
+		//     worker promotes a finished generation from
+		//     pauseStagingRoot into stagingRoot once hashed (off the RPC
+		//     path), at the cost of reflink there, which never crosses
+		//     filesystems.
+		pauseStagingRoot, _ := backup.ResolveStagingRoot("", cfg.SnapshotDir, cfg.RunDir)
+		if err := os.MkdirAll(pauseStagingRoot, 0o700); err != nil {
+			log.Fatal().Err(err).Str("path", pauseStagingRoot).Msg("failed to create pause staging dir")
+		}
+		stagingRoot, legacyStaging := backup.ResolveStagingRoot(
+			os.Getenv("BACKUP_STAGING_DIR"), cfg.SnapshotDir, cfg.RunDir)
 		if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
 			log.Fatal().Err(err).Str("path", stagingRoot).Msg("failed to create backup staging dir")
 		}
-		backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		// Relocation drains, never deletes: journal rows enqueued before
+		// the move still reference staged copies in the retired tree, so
+		// it is swept under the same journal authority as the live root
+		// until it empties, and only then removed (in the uploader's
+		// periodic sweep). Markers renewed above keep their directories
+		// alive wherever they point.
+		uploader.LegacyStagingRoot = legacyStaging
+		// Renew every durable marker's staged directory before the sweep
+		// runs: the sweep is synchronous and ordered ahead of reattach (and
+		// so ahead of RecoverPendingBackups), so a marker that survived an
+		// outage longer than the sweep's orphan horizon needs this renewal
+		// or it reads as an abandoned directory and gets deleted out from
+		// under a still-durable pause.
+		renewedMarkers := mgr.RenewPendingStaging(log.With().Str("component", "backup").Logger())
+		ss := backup.SweepStaging(stagingRoot, journal, log.With().Str("component", "backup").Logger())
+		if legacyStaging != "" {
+			ls := backup.SweepStaging(legacyStaging, journal, log.With().Str("component", "backup").Logger())
+			ss.Sandboxes += ls.Sandboxes
+			ss.Generations += ls.Generations
+			ss.Bases += ls.Bases
+			ss.Pending += ls.Pending
+		}
+		// Every recorded root that differs from both today's resolution and
+		// the hardcoded pre-split legacy path is a retired CUSTOM root —
+		// most often a rollback that cleared BACKUP_STAGING_DIR after it
+		// had pointed at a dedicated disk, though more than one can be
+		// outstanding at once if a drain hasn't finished across several
+		// config changes. ResolveStagingRoot only ever knows about the one
+		// fixed pre-split default, not whatever custom root(s) an operator
+		// had actually configured, so without this the abandoned trees'
+		// successfully-uploaded files would never be reclaimed. Handed to
+		// the uploader's periodic sweep rather than drained here: the
+		// trees can be fleet-sized, and startup readiness (pause/resume/
+		// create all wait on it) must not block on an unbounded filesystem
+		// walk. sweepRetiredStaging is what drops a retired root from the set,
+		// and only once removal actually confirms empty, so an
+		// interrupted drain resumes on a later boot instead of losing
+		// track of the config change.
+		allRoots, rootsErr := journal.StagingRoots()
+		if rootsErr != nil {
+			log.Warn().Err(rootsErr).Msg("read staging roots failed; retired custom roots (if any) not tracked this boot")
+		}
+		// A durable write (BoltDB transaction, fsync included) on every
+		// startup would tax the common case — an unchanged root, by far
+		// most boots — on a path pause/resume/create readiness waits on.
+		// Skip it whenever the read above already found this root present.
+		if rootsErr == nil && !slices.Contains(allRoots, stagingRoot) {
+			if err := journal.RecordStagingRoot(stagingRoot); err != nil {
+				log.Warn().Err(err).Msg("record staging root failed; a future root change may not be detected")
+			}
+		}
+		if rootsErr == nil {
+			for _, root := range allRoots {
+				// Plain inequality is not enough here: a change between an
+				// ancestor and descendant path (or the same directory under
+				// an aliased spelling) is not a retirement —
+				// sweepRetiredStaging would walk live, referenced entries
+				// reachable through the active root's own tree and delete
+				// them as apparent orphans past the grace period.
+				//
+				// pauseStagingRoot must be excluded too, not just
+				// stagingRoot: it is fixed at the SNAPSHOT_DIR default
+				// regardless of BACKUP_STAGING_DIR (see its own comment
+				// above), so a host's first boot with the override unset
+				// records that default, and enabling the override on a
+				// LATER boot must not then treat the still-live pause-path
+				// tree as retired just because it stopped being the
+				// uploader's own root.
+				if root == stagingRoot ||
+					backup.StagingRootsOverlap(root, stagingRoot) ||
+					backup.StagingRootsOverlap(root, legacyStaging) ||
+					backup.StagingRootsOverlap(root, pauseStagingRoot) {
+					continue
+				}
+				uploader.RetiredStagingRoots = append(uploader.RetiredStagingRoots, root)
+				log.Info().Str("path", root).Msg("staging root changed since a previous boot; retired custom root queued for background drain")
+			}
+		}
+		// pauseStagingRoot gets no startup sweep of its own here: on a
+		// host with no BACKUP_STAGING_DIR override it IS stagingRoot
+		// (already covered above), and on a host with one configured, a
+		// promotion's rare crash-or-fail residue there is not required
+		// for serving reattach-ready — the periodic sweep in the
+		// uploader's drain loop (see PauseStagingRoot on Uploader)
+		// reaches it soon enough without extending this synchronous
+		// startup scan.
+		st.emit(func() {
+			log.Info().Int("renewed_markers", renewedMarkers).Int("sandboxes", ss.Sandboxes).
+				Int("generations", ss.Generations).Int("bases", ss.Bases).Int("pending", ss.Pending).
+				Msg("backup staging scan breakdown")
+		})
+		st.mark("backup_staging_scan", true, -1)
 		uploader.StagingRoot = stagingRoot
+		uploader.PauseStagingRoot = pauseStagingRoot
 		mgr.SetBackupStaging(stagingRoot)
+		mgr.SetPauseStagingRoot(pauseStagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
+		mgr.SetBackupLoad(journal.Load)
 		mgr.SetBackupCovered(func(t backup.Task) (bool, error) {
 			// Coverage is per bucket: a completed generation elsewhere
 			// must not suppress uploading into this one.
 			return journal.Covered(bucket, t)
 		})
+		// Verified generations report back to the control plane so backup
+		// coverage is a DB query. Rides the uploader's durable outbox:
+		// failed deliveries stay outboxed and retry on ack-time and idle
+		// flushes. Requires the same wiring the heartbeat uses; without
+		// it, uploads still run and only the write-back is off.
+		if cfg.ControlPlaneURL != "" && os.Getenv("INTERNAL_API_TOKEN") != "" {
+			reporter := &vm.BackupReporter{
+				ControlPlaneURL: cfg.ControlPlaneURL,
+				HostID:          cfg.HostID,
+				Token:           os.Getenv("INTERNAL_API_TOKEN"),
+				Bucket:          bucket,
+				Log:             log.With().Str("component", "backup").Logger(),
+			}
+			uploader.OnVerified = reporter.Deliver
+			log.Info().Msg("backup coverage write-back enabled")
+		} else {
+			log.Warn().Msg("backup coverage write-back disabled: control plane URL or internal token unset")
+		}
 		// The uploader must fully stop before the journal and GCS client
 		// close under it: a verification or Nack cut off mid-write leaves
 		// a finalized object the journal never recorded, which the
@@ -540,13 +1423,82 @@ func main() {
 			defer close(upDone)
 			return uploader.Run(upCtx)
 		})
-		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Msg("backup uploader enabled")
+		log.Info().Str("bucket", bucket).Int("bandwidth_mbps", mbps).Int("workers", workers).Msg("backup uploader enabled")
+	} else {
+		// Backups disabled: emit the phase boundaries anyway so the partition
+		// stays comparable across hosts (skipped => ~0 duration).
+		st.mark("backup_setup", false, -1)
+		st.mark("backup_staging_scan", false, -1)
+	}
+
+	// ---- Backup metrics sampler ----
+	// Periodic gauges every 30s: the enabled flag, journal depth and
+	// backlog age, pending-marker count, and outbox depth. All reads are
+	// read-only BoltDB views off the hot path; a failed read drops that
+	// gauge from the sample instead of publishing a false zero, and can
+	// never affect backup behavior.
+	if backupMetrics != nil {
+		sample := func() {
+			s := telemetry.BackupSample{Enabled: backupBucket != ""}
+			if backupJournal != nil {
+				if pending, err := backupJournal.Pending(); err == nil {
+					s.PendingPause = pending[backup.PriorityPause]
+					s.PendingCheckpoint = pending[backup.PriorityCheckpoint]
+					s.PendingBestEffort = pending[backup.PriorityBestEffort]
+					s.PendingOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: journal pending read failed, dropping gauge from sample")
+				}
+				if oldest, err := backupJournal.OldestEnqueuedAtByPriority(); err == nil {
+					if t, ok := oldest[backup.PriorityPause]; ok {
+						s.OldestPauseAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityCheckpoint]; ok {
+						s.OldestCheckpointAge = time.Since(t)
+					}
+					if t, ok := oldest[backup.PriorityBestEffort]; ok {
+						s.OldestBestEffortAge = time.Since(t)
+					}
+					s.OldestPendingAgeOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: oldest-pending read failed, dropping gauge from sample")
+				}
+				if depth, err := backupJournal.OutboxDepth(); err == nil {
+					s.OutboxPending = depth
+					s.OutboxPendingOK = true
+				} else {
+					log.Warn().Err(err).Msg("backup metrics: outbox depth read failed, dropping gauge from sample")
+				}
+			}
+			if markers, err := stateStore.ListPendingBackups(); err == nil {
+				s.PendingMarkers = len(markers)
+				s.PendingMarkersOK = true
+			} else {
+				log.Warn().Err(err).Msg("backup metrics: pending markers read failed, dropping gauge from sample")
+			}
+			backupMetrics.RecordSample(ctx, s)
+		}
+		go func() {
+			defer sentrylog.Recover("backup metrics sampler")
+			t := time.NewTicker(30 * time.Second)
+			defer t.Stop()
+			sample()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					sample()
+				}
+			}
+		}()
 	}
 
 	// ---- gRPC server ----
 	// Bind and serve BEFORE the reattach so a restart doesn't refuse connections
 	// during it; requests are gated Unavailable until startupReady flips.
 	startupReady := &atomic.Bool{}
+	localHTTPReady := &atomic.Bool{}
 	notReady := func() error {
 		return status.Error(codes.Unavailable, "vmd is starting up (reattaching VMs), retry shortly")
 	}
@@ -628,8 +1580,17 @@ func main() {
 			return handler(srv, ss)
 		}),
 	)
+	buildRuntimeInstalled := true
+	for _, binary := range []string{cfg.TemplateBuilderBin, cfg.FirecrackerBin} {
+		info, err := os.Stat(binary)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+			buildRuntimeInstalled = false
+			break
+		}
+	}
 	adapter := vm.NewGRPCAdapter(mgr).
-		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr)
+		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr).
+		WithBuildAdmission(vm.BuildAdmission{ControlPlaneURL: cfg.ControlPlaneURL, Token: os.Getenv("INTERNAL_API_TOKEN"), HostID: cfg.HostID, IncarnationID: cfg.IncarnationID})
 	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
 	if cfg.SecretsProxySocket != "" {
 		log.Info().
@@ -647,17 +1608,58 @@ func main() {
 	// Closer is registered later (after the manager/pool closers) so it runs
 	// first on shutdown — stop accepting before those are torn down.
 
+	// grpc_setup: server construction, listener bind, adapter registration.
+	st.mark("grpc_setup", true, -1)
+
 	// ---- Startup network prep (fast; must precede StartPool) ----
 	// Reserve slots held by existing VMs (so the pool can't hand out a colliding
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
 	slotsReserved := mgr.ReserveStartupSlots(ctx)
+	st.mark("slot_reserve", true, -1)
+	// Builder subprocesses survive a same-incarnation daemon restart without
+	// VM records. Discover them before the cgroup reap can stop their VMs.
+	buildNs, err := mgr.ProtectSurvivingBuildSlots()
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot protect surviving template build network slots")
+	}
+	st.mark("build_survivor_protect", true, len(buildNs))
+	// Reap direct-spawn VMs whose record never persisted (crash between spawn
+	// and first write). They have no record to reserve their slot, so the
+	// sweep/adoption below would tear their netns down under a live FC or
+	// treat it as pool inventory. Safe here — synchronous, before the request
+	// gate opens, so no in-flight create can be mistaken for a survivor
+	// (that racy post-gate case is the reconciler's job). No-op unless armed.
+	// The reap reserves the slots of survivors it couldn't confirm dead, so
+	// the pool and the adoption pass skip them; protectedNs carries their
+	// namespaces so the non-adoption sweep keeps them too. sweepSafe=false
+	// means a survivor could NOT be protected — every reclaim path below
+	// (sweep AND adoption) must stand down for this boot.
+	protectedNs, sweepSafe := mgr.ReapRecordlessCgroupVMs(ctx)
+	st.mark("cgroup_reap", true, -1)
+	protectedNs = append(protectedNs, buildNs...)
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
+	sweepRan := false
 	if !adoptNetPool {
 		// Under adoption, orphan namespaces are warm-pool candidates instead
 		// of garbage; the adoption pass below validates or sweeps each one.
-		mgr.SweepStartupOrphanNamespaces()
+		// Skip the sweep when the reap couldn't guarantee a live survivor's
+		// ns is spared (see ReapRecordlessCgroupVMs).
+		if sweepSafe {
+			mgr.SweepStartupOrphanNamespaces(protectedNs...)
+			// The reservation-time reclaim ran before this sweep and counted
+			// these namespaces as occupied. Nothing revisits them below the
+			// ceiling — claims just take fresh indexes — so rescan now or the
+			// indexes the sweep freed stay stranded until the next restart.
+			if n := netMgr.ReclaimUnusedSlots(); n > 0 {
+				log.Info().Int("slots", n).Msg("reclaimed slot indexes freed by the startup orphan sweep")
+			}
+			sweepRan = true // sweep + the slot reclaim it feeds
+		} else {
+			log.Warn().Msg("skipping startup orphan namespace sweep: an unresolved live cgroup survivor could be reclaimed")
+		}
 	}
+	st.mark("namespace_sweep", sweepRan, -1)
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
 	if launchViaLauncherNS {
@@ -675,38 +1677,77 @@ func main() {
 		mgr.StartMountCountSampler(ctx, time.Minute)
 	}
 
+	// ---- Fleet-sized background work ----
+	// Slot refill, slot adoption, and the full reattach each walk the whole
+	// inventory: their cost grows with records, slots, and interfaces, while
+	// everything before readiness is bounded. Run concurrently with startup
+	// they compete for the kernel's single global RTNL lock and delay the
+	// readiness the daemon is trying to announce, and their per-record logs
+	// can bury the readiness line under journald's rate limit. Holding them
+	// behind readiness keeps startup proportional to nothing but itself.
+	//
+	// Requests cannot be served during the wait — the gRPC interceptors
+	// reject everything with Unavailable until startupReady flips — so the
+	// deferral delays no caller. A daemon that shuts down before readiness
+	// never opens it; every waiter also selects on context cancellation, so
+	// none of them are left parked.
+	postReady := make(chan struct{})
+
 	// ---- Pre-allocate network slots ----
 	// Warm buffer of network namespaces so creation claims off the hot path.
 	// StartPool returns immediately and fills in the background, so the gate
 	// below isn't held for the fill; creates fall back to on-demand until warm.
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
+	// One predicate decides both the plan and the call: PlanStartupAdoption
+	// parks refill behind a pass the caller promises to start, so the two
+	// must never diverge.
+	adoptionPlanned := adoptNetPool && slotsReserved && sweepSafe
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize:           netPoolFresh,
-		RecycleSize:       netPoolRecycle,
-		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
-		AbandonOnStop:     adoptNetPool,
+		NewSize:             netPoolFresh,
+		RecycleSize:         netPoolRecycle,
+		StartGate:           postReady,
+		PlanStartupAdoption: adoptionPlanned,
+		ResetTapOnRecycle:   envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
+		AbandonOnStop:       adoptNetPool,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
-	case adoptNetPool && slotsReserved:
-		// Adopt the slots the previous run abandoned (or crashed out of) in
-		// the background: the pool starts warm within seconds instead of
-		// refilling from scratch, and boot never blocks on the pass.
-		go func() {
-			defer sentrylog.Recover("netpool adoption")
-			netPool.AdoptOrphanSlots(ctx)
-		}()
+	case adoptionPlanned:
+		// Adopt the slots the previous run abandoned (or crashed out of):
+		// the pool starts warm within seconds instead of refilling from
+		// scratch. StartAdoption marks the pass underway before returning,
+		// so requests racing boot wait on it instead of building inline;
+		// the pass itself runs in the background and never blocks boot.
+		netPool.StartAdoption(ctx)
 	case adoptNetPool:
-		// Without a completed reservation pass, adoption cannot tell live VM
-		// namespaces from orphans — leave everything in place; the pool
-		// refills fresh and the next healthy boot adopts.
-		log.Error().Msg("skipping network pool adoption: startup slot reservation did not complete")
+		// Without a completed reservation pass — or with an unprotected
+		// recordless survivor — adoption cannot tell live VM namespaces from
+		// orphans; leave everything in place; the pool refills fresh and the
+		// next healthy boot adopts.
+		log.Error().Bool("slots_reserved", slotsReserved).Bool("survivors_protected", sweepSafe).
+			Msg("skipping network pool adoption: live namespaces not provably protected")
 	}
 
-	// Leak gauge for network namespaces — independent of the launcher path, and
-	// started after StartPool so its first read observes an initialized pool.
-	mgr.StartNetnsLeakSampler(ctx, time.Minute)
+	// pool_start: StartPool (async fill), adoption wiring, launcher-ns setup.
+	st.mark("pool_start", true, -1)
+
+	// Keeps the Firecracker clock-option capability in step with the binary on
+	// disk: the deploy replaces it in place without restarting this daemon, so an
+	// answer read once would go stale on the next rollout in either direction.
+	//
+	// One exec, then one every few minutes — bounded, touches no fleet-sized
+	// collection and no allocator lock, so it does not belong behind the
+	// readiness barrier below. Started early so it has normally answered long
+	// before the first request, but nothing orders the two: a restore that beats
+	// the first probe reads false and takes legacy behaviour — slower, never
+	// wrong, and corrected by the next probe. Blocking readiness on an exec to
+	// close that window would cost every restart more than it saves.
+	mgr.WatchFirecrackerCapability(ctx, log)
+	// Evidence a previous process made durable is recognised; starting a vmd
+	// creates none.
+	vm.RecognizeWakeProtocolFloor()
+	vm.PrimeWakeProtocolFloor(log)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively
@@ -714,7 +1755,28 @@ func main() {
 	// service — a completing lc service trips lifecycle shutdown.
 	go func() {
 		defer sentrylog.Recover("startup reattach")
+		// Held until readiness: requests load their VM on demand, so nothing
+		// waits on this pass (see the fleet-sized background work comment
+		// above for why it must not run during startup).
+		select {
+		case <-postReady:
+		case <-ctx.Done():
+			return
+		}
+		// The template watch is fleet-sized filesystem work as well: two
+		// globs and a manifest read per template, so it starts here, after
+		// readiness. A frozen restore that arrives first raises the floor
+		// itself.
+		mgr.WatchTemplateManifests(ctx, log)
+		// O(N) reattach, off the critical path — timed here (not via the
+		// single-goroutine marks) and flagged concurrent, distinct message, so
+		// its phase_ms is never summed into the partition. count sizes a
+		// synchronous adopt-in-cutover.
+		reattachStart := time.Now()
 		reattached, stale := mgr.ReattachAll(ctx)
+		log.Info().Str("startup_phase", "reattach_background").Bool("concurrent", true).
+			Dur("phase_ms", time.Since(reattachStart)).Int("count", reattached+stale).
+			Msg("startup background phase timing")
 		if reattached > 0 || stale > 0 {
 			log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 		}
@@ -725,6 +1787,45 @@ func main() {
 		// meta (both no-ops when backup is disabled).
 		mgr.RecoverPendingBackups(ctx, log)
 		mgr.RecoverTemplateBackups(ctx, log)
+		go func() {
+			defer sentrylog.Recover("saved snapshot backup sweep")
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(vm.SavedSnapshotBackupSweep):
+				}
+				mgr.RecoverSavedSnapshotBackups(ctx, log)
+			}
+		}()
+		// One-time coverage for sandboxes that paused before the uploader
+		// existed and will never pause again on their own. Off by default:
+		// the pass reads every paused snapshot once, so it's enabled per
+		// host, run to completion, and turned back off. The ledger makes
+		// reruns cheap (only changed or previously unreadable snapshots
+		// are revisited).
+		if os.Getenv("BACKUP_BACKFILL") == "1" {
+			go func() {
+				defer sentrylog.Recover("backup backfill")
+				blog := log.With().Str("component", "backup").Logger()
+				// Re-sweep periodically while the flag is on, not once per
+				// boot: the uploader's retry ceiling can abandon a minted
+				// upload long after the startup pass returned, and these
+				// sandboxes may never pause again to self-heal. Converged
+				// passes are cheap (ledger marks plus coverage probes skip
+				// everything covered), so the cadence buys convergence
+				// without re-hashing. Turn the flag off only once coverage
+				// is verified, not merely once a pass has run.
+				for {
+					mgr.BackfillPausedBackups(ctx, blog)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(6 * time.Hour):
+					}
+				}
+			}()
+		}
 	}()
 
 	// ---- Optional DB connection for the reconciler ----
@@ -734,13 +1835,42 @@ func main() {
 	// BoltDB ↔ systemd comparison only.
 	var reconcilerDB *dbq.Queries
 	if cfg.DatabaseURL != "" {
-		dbPool, dbErr := pgxpool.New(ctx, cfg.DatabaseURL)
+		dbCfg, dbErr := pgxpool.ParseConfig(cfg.DatabaseURL)
+		if dbErr != nil {
+			log.Fatal().Err(dbErr).Msg("failed to parse database URL for reconciler")
+		}
+		// The pgxpool default is max(4, NumCPU), which scales with host cores
+		// and silently consumes the cell pooler's client-connection budget on
+		// large hosts. This pool serves serial reconciler passes and the
+		// batched flow sink (low concurrency by construction), so a small
+		// cap is enough. A ceiling, not a floor: an explicitly lower
+		// pool_max_conns in the URL stays in effect.
+		dbCfg.MaxConns = min(dbCfg.MaxConns, 8)
+		// URL-configured minima above the cap would make the config
+		// invalid and fail startup; lower them with it.
+		dbCfg.MinConns = min(dbCfg.MinConns, dbCfg.MaxConns)
+		dbCfg.MinIdleConns = min(dbCfg.MinIdleConns, dbCfg.MaxConns)
+		// Without an explicit lifetime, pgxpool defaults to an unjittered
+		// 1-hour MaxConnLifetime. Every host in a fleet booted around the
+		// same time then expires its reconciler connections in lockstep,
+		// which the pooler sees as a synchronized mass-reconnect storm.
+		// Same tuning as the controlplane pool (cmd/controlplane/main.go),
+		// which sets these unconditionally rather than trying to detect a
+		// DATABASE_URL override — pgxpool.ParseConfig can't tell "operator
+		// set this to the default value" apart from "left it unset," and
+		// nothing in this repo's deployments configures these via DSN.
+		dbCfg.MaxConnLifetime = 30 * time.Minute
+		dbCfg.MaxConnLifetimeJitter = 5 * time.Minute
+		dbCfg.MaxConnIdleTime = 5 * time.Minute
+		dbCfg.HealthCheckPeriod = 30 * time.Second
+		dbPool, dbErr := pgxpool.NewWithConfig(ctx, dbCfg)
 		if dbErr != nil {
 			log.Fatal().Err(dbErr).Msg("failed to connect to database for reconciler")
 		}
 		if err := dbPool.Ping(ctx); err != nil {
 			log.Fatal().Err(err).Msg("failed to ping database for reconciler")
 		}
+		st.mark("db_connect", true, -1)
 		reconcilerDB = dbq.New(dbPool)
 		lc.addCloser("reconciler db pool", func(_ context.Context) error {
 			dbPool.Close()
@@ -758,6 +1888,7 @@ func main() {
 		log.Info().Msg("egress flow logging enabled")
 	} else {
 		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
+		st.mark("db_connect", false, -1)
 	}
 
 	// ---- Continuous reconciler ----
@@ -773,12 +1904,102 @@ func main() {
 
 	// ---- Heartbeat to control plane ----
 	if cfg.ControlPlaneURL != "" {
+		// Self-description is opt-in per host: set only after the control
+		// plane understands the fields (older ones reject unknown keys).
+		//
+		// Capacity is EXPLICITLY CONFIGURED schedulable capacity, never
+		// detected physical totals: these values become admission limits
+		// for placement, and raw machine totals include everything the OS,
+		// the daemons, and the deliberate cgroup headroom already spend —
+		// publishing them would over-admit until the kernel OOM-kills a
+		// customer VM. Unset capacity keeps the host un-advertised.
+		memoryMib := envInt32Fatal(log, "VMD_SCHEDULABLE_MEMORY_MIB")
+		vcpus := envInt32Fatal(log, "VMD_SCHEDULABLE_VCPUS")
+		if physMib, physCPU := vm.DetectHostCapacity(); (physMib > 0 && memoryMib > physMib) || vcpus > physCPU {
+			log.Warn().
+				Int32("configured_memory_mib", memoryMib).Int32("physical_memory_mib", physMib).
+				Int32("configured_vcpus", vcpus).Int32("physical_vcpus", physCPU).
+				Msg("configured schedulable capacity exceeds physical capacity — check for a units mistake")
+		}
+		proxyHealthURL := os.Getenv("PROXY_HEALTH_URL")
+		if proxyHealthURL == "" {
+			proxyHealthURL = "http://127.0.0.1:5007/health"
+		}
+		// Pressure publication is wired ONLY on the explicit advertise
+		// setting — never on the resolved vmdAddr, which now falls back
+		// to deriving an address from the host interface. Keying on the
+		// resolved address would turn publication on for every host in
+		// the fleet the moment this lands, when it must stay opt-in per
+		// host. Left nil, the publisher sends nothing.
+		var pressureSample func() vm.HostPressure
+		var pressureReady func() bool
+		if publishesPressure {
+			pressureSample = mgr.CapacityPressure
+			pressureReady = mgr.PressureReady
+		}
 		lc.start("heartbeat", func() error {
+			// Address enumeration and retries stay off the startup goroutine.
+			resolve := func() (string, string, error) {
+				// Share one lookup per attempt, including its error. A later
+				// attempt must retry rather than retain a transient failure.
+				hostIP := hostIPOnce(func() (string, error) {
+					if automaticHostIP != "" {
+						return automaticHostIP, nil
+					}
+					return hostInterfaceAddress(cfg.HostInterface)
+				})
+				vmdAddr, err := advertisedVMDAddr(hostIP, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
+				if err != nil {
+					return "", "", err
+				}
+				// Private peer ingress takes precedence over the public proxy override.
+				proxyAddr, err := advertisedHeartbeatProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr, cfg.PeerProxyListenAddr)
+				return vmdAddr, proxyAddr, err
+			}
+			var vmdAddr, proxyAddr string
+			var err error
+			if cfg.IncarnationID != "" {
+				vmdAddr, proxyAddr, err = resolveHeartbeatAddresses(ctx, 5*time.Second, resolve, log)
+				if err != nil {
+					return nil
+				}
+			} else {
+				vmdAddr, proxyAddr, err = resolve()
+				if err != nil {
+					log.Warn().Err(err).Msg("unable to resolve heartbeat addresses; heartbeat will omit host self-description")
+				}
+			}
+			var retainedStorage func(context.Context) (*retainedstorage.Inventory, error)
+			if os.Getenv("VMD_RETAINED_STORAGE_REPORTS") == "true" {
+				retainedStorage = mgr.RetainedStorageInventory
+			}
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
-				ControlPlaneURL: cfg.ControlPlaneURL,
-				HostID:          cfg.HostID,
-				Token:           os.Getenv("INTERNAL_API_TOKEN"),
-				ProxyHealthURL:  os.Getenv("PROXY_HEALTH_URL"),
+				RetainedStorage: retainedStorage,
+				TemplateBuildReady: func() bool {
+					return startupReady.Load() && backupBucket != "" && buildRuntimeInstalled && cfg.IncarnationID != "" && publishesPressure
+				},
+				IncarnationID:     cfg.IncarnationID,
+				ControlPlaneURL:   cfg.ControlPlaneURL,
+				HostID:            cfg.HostID,
+				Token:             os.Getenv("INTERNAL_API_TOKEN"),
+				ProxyHealthURL:    proxyHealthURL,
+				RunDir:            cfg.RunDir,
+				SnapshotDir:       cfg.SnapshotDir,
+				VMDAddr:           vmdAddr,
+				ProxyAddr:         proxyAddr,
+				Region:            cfg.HostRegion,
+				CapacityMemoryMib: memoryMib,
+				CapacityVcpus:     vcpus,
+				// Live capacity pressure, published to its own best-effort
+				// endpoint after each successful heartbeat; in-memory
+				// counters only. The limits are operator admission knobs;
+				// 0 (unset) means no cap.
+				Pressure:        pressureSample,
+				PressureReady:   pressureReady,
+				MaxSandboxes:    envInt32Fatal(log, "VMD_MAX_SANDBOXES"),
+				MaxNetworkSlots: envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"),
+				LifecycleReady:  startupReady.Load,
+				ResolverReady:   func() bool { return startupReady.Load() && localHTTPReady.Load() },
 			}, log)
 			return nil
 		})
@@ -802,6 +2023,7 @@ func main() {
 	// Listens on localhost:9090. The edge proxy queries this to resolve
 	// instanceID → vmIP before forwarding data-plane traffic.
 	localHTTP := vm.NewLocalHTTPServer(mgr, log)
+	localHTTP.SetReadySignal(localHTTPReady)
 	lc.start("local http server", func() error {
 		if localLis != nil {
 			return localHTTP.Serve(ctx, localLis)
@@ -823,18 +2045,57 @@ func main() {
 		select {
 		case <-done:
 			log.Info().Msg("gRPC server stopped gracefully")
+			return nil
 		case <-shutdownCtx.Done():
-			log.Warn().Msg("graceful shutdown timed out, forcing stop")
+			// Stop() force-cancels transports but does not wait for handlers (no
+			// WaitForHandlers — that would let a WithoutCancel handler defeat the
+			// bound), so they may still be using the store/pool/DB. Return an
+			// error to abort the remaining closers rather than close those under
+			// a live handler; process exit reclaims the rest.
+			log.Warn().Msg("graceful shutdown timed out — forcing gRPC stop; aborting remaining cleanup")
+			lc.noteForcedRPCStop()
 			grpcServer.Stop()
+			return fmt.Errorf("forced gRPC stop; handlers may still be running")
 		}
-		return nil
 	})
 
 	// Fast pre-serve init is done (slots reserved, namespaces swept, pool fill
 	// backgrounded). Open the gate; pool warm-up and full reattach continue in
 	// the background, and requests load any not-yet-reattached VM on demand.
+	// Boot-time pool patience lives in SetupVM's bounded ClaimWait (with a
+	// longer budget while adoption runs), deliberately NOT here: only
+	// slot-allocating requests should ever wait on the pool. Pause and
+	// destroy never allocate; resume usually reuses its saved namespace and
+	// pays nothing, but a resume whose namespace is gone (or a stateless
+	// restore) allocates like a create and shares its bounded wait. A gate
+	// at this level would hold even the non-allocating paths behind
+	// inventory they never use.
+	// pre_ready: reconciler, heartbeat, local HTTP — the tail before serving.
+	st.mark("pre_ready", true, -1)
 	startupReady.Store(true)
+	st.mark("ready", true, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
+	// Released only after the readiness line is emitted: the deploy
+	// readiness check reads that line from the journal, so nothing the
+	// background work logs may come ahead of it.
+	close(postReady)
+	if probeBackupRestore != nil {
+		go func() {
+			defer sentrylog.Recover("backup-restore-probe")
+			probeBackupRestore()
+		}()
+	}
+
+	if neighCap, err := readNeighTableCap(); err == nil && neighCap <= kernelDefaultNeighTableCap {
+		log.Error().Int("gc_thresh3", neighCap).
+			Msg("kernel neighbour table cap is at the default; raise net.ipv4.neigh.default.gc_thresh3 or guests drop off the host under bursts")
+	}
+
+	// Leak gauge for network namespaces — independent of the launcher path.
+	// Started AFTER readiness (and so after StartPool): its immediate first
+	// sample walks the fleet under the allocator lock, which must not contend
+	// with pool fill, reattach, or a first slot-allocating request pre-ready.
+	mgr.StartNetnsLeakSampler(ctx, time.Minute)
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)
@@ -844,6 +2105,7 @@ func main() {
 		select {
 		case sig := <-sigCh:
 			log.Info().Str("signal", sig.String()).Msg("received shutdown signal")
+			lc.noteSignalInitiated()
 			lc.signalShutdown()
 		case <-ctx.Done():
 		}
@@ -879,5 +2141,21 @@ func main() {
 		log.Error().Err(lc.firstErr).Str("service", lc.errName).Msg("VM daemon shutdown after service error")
 		os.Exit(1)
 	}
+	// The final act of a fully clean, operator-initiated shutdown: vouch for
+	// the pool inventory the stopped-and-quiesced pool snapshotted, so the
+	// next boot can adopt it without the paranoid per-slot rebuild. Every
+	// other ending vouches for nothing: a service error exits above, an
+	// unexpected service return (even error-free) is not intentional, a
+	// failed closer means teardown is suspect, and CommitReceipt itself
+	// refuses unless the pool fully quiesced.
+	if lc.cleanIntentionalShutdown() {
+		netPool.CommitReceipt()
+	} else {
+		log.Info().Msg("shutdown not clean-and-intentional — no pool receipt written")
+	}
 	log.Info().Msg("VM daemon shutdown complete")
+}
+
+func pausedNetworkReclaimTriggersConfigured(slotHeadroomPercent, slotHeadroomReserve, netnsThreshold, mountThreshold int) bool {
+	return slotHeadroomPercent > 0 || slotHeadroomReserve > 0 || netnsThreshold > 0 || mountThreshold > 0
 }

@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // File bridge constants. The /files path lives on the same boxd port that
@@ -33,6 +36,19 @@ const (
 	// this prevents a caller from streaming an absurdly large payload
 	// that ties up proxy resources before the VM disk fills.
 	maxUploadBytes = 4 << 30 // 4 GB
+
+	// maxErrorBodySnippet bounds how much of a boxd error response body
+	// we log. boxd's own errors are short JSON (`{"error":"..."}`), so
+	// this comfortably covers the whole thing without risking a large
+	// or malformed body bloating the log line.
+	maxErrorBodySnippet = 200
+
+	// maxLoggedPathLen bounds how much of the caller-controlled ?path=
+	// we log on an error response. The proxy's HTTP parser allows
+	// request targets up to ~1 MiB, so an unbounded log field here lets
+	// cheap repeated 4xx/5xx requests with a huge path balloon log size
+	// despite the response-body snippet already being capped.
+	maxLoggedPathLen = 200
 )
 
 // serveBoxdPort is the entry point for any request addressed at the
@@ -52,6 +68,7 @@ const (
 // to the switch below or it will 404 here while working in direct-to-boxd
 // testing.
 func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instanceID string) {
+	scrubRoutingHint(r)
 	if !h.sandboxConns.acquire(instanceID) {
 		http.Error(w, "too many connections to sandbox", http.StatusTooManyRequests)
 		return
@@ -59,11 +76,15 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 	defer h.sandboxConns.release(instanceID)
 
 	clientIP := clientAddr(r)
-	if !h.ipConns.acquire(clientIP) {
+	limiter := h.ipConns
+	if h.canRouteBoxdRequest(r, instanceID) {
+		limiter = h.authenticatedConns
+	}
+	if !limiter.acquire(clientIP) {
 		http.Error(w, "too many connections from this IP", http.StatusTooManyRequests)
 		return
 	}
-	defer h.ipConns.release(clientIP)
+	defer limiter.release(clientIP)
 
 	switch r.URL.Path {
 	case filesPath:
@@ -118,7 +139,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		if h.originAllowed(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, X-Superserve-Routing-Hint, Content-Type")
 			w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 			w.Header().Set("Access-Control-Max-Age", "3600")
 		}
@@ -178,5 +199,41 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	// From here on it's a transparent reverse proxy to boxd, on the
 	// lifecycle-keyed transport cache: one pooled set of TCP connections
 	// per sandbox incarnation, reset on pause/resume.
-	h.newBoxdReverseProxy(r, instanceID, info, "files").ServeHTTP(w, r)
+	rp := h.newBoxdReverseProxy(r, instanceID, info, "files")
+	start := time.Now()
+	// boxd's own error responses (ENOSPC, ESTALE, etc.) are
+	// well-formed HTTP from vmd's point of view — the proxy's ErrorHandler
+	// only fires on connection-level failures, so without this a
+	// well-formed 4xx/5xx from inside the guest is invisible to any
+	// central log. Peel off a bounded snippet of the body for the
+	// log line, then put it back so the client still gets the full
+	// response unchanged.
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if resp.StatusCode < 400 {
+			return nil
+		}
+		buf := make([]byte, maxErrorBodySnippet)
+		n, _ := io.ReadFull(resp.Body, buf)
+		snippet := buf[:n]
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{
+			Reader: io.MultiReader(bytes.NewReader(snippet), resp.Body),
+			Closer: resp.Body,
+		}
+		loggedPath := requestedPath
+		if len(loggedPath) > maxLoggedPathLen {
+			loggedPath = loggedPath[:maxLoggedPathLen]
+		}
+		h.log.Warn().
+			Str("sandbox_id", instanceID).
+			Str("path", loggedPath).
+			Int("status", resp.StatusCode).
+			Dur("duration", time.Since(start)).
+			Str("body_snippet", strings.ToValidUTF8(string(snippet), "�")).
+			Msg("files: boxd error response")
+		return nil
+	}
+	rp.ServeHTTP(w, r)
 }

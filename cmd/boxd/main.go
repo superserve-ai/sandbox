@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -118,11 +119,13 @@ func main() {
 	mux := http.NewServeMux()
 
 	ctx := &sandboxContext{}
+	fz := freezerFromEnv()
 
 	// Connect RPC services.
 	procService := &processService{
 		processes: &sync.Map{},
 		ctx:       ctx,
+		freezer:   fz,
 	}
 	mux.Handle(boxdpbconnect.NewProcessServiceHandler(procService))
 	mux.Handle(boxdpbconnect.NewFilesystemServiceHandler(&filesystemService{}))
@@ -131,7 +134,21 @@ func main() {
 	// Raw HTTP endpoints (file content transfer + health + init + exec).
 	mux.HandleFunc("/files", handleFiles)
 	mux.HandleFunc("/init", handleInit(ctx))
-	mux.HandleFunc("/health", handleHealth)
+	clock := newWallClock(newWallClockSource())
+	mux.HandleFunc("/health", handleHealth(clock, fz))
+	gate := newHostGate()
+	if fz.available() {
+		// Read at boot, before the listener exists, so no lifecycle request
+		// enumerates interfaces or waits on the read. Synchronous on purpose:
+		// one netlink dump, microseconds, and only when an image with the
+		// freezer boots, which happens at its build; a restore never boots.
+		// A failed read is retried by the request.
+		gate.guestIPs()
+	}
+	mux.HandleFunc("/verify-clock", gate.only(handleVerifyClock(clock, fz)))
+	mux.HandleFunc("/freeze", gate.only(fz.handleFreeze))
+	mux.HandleFunc("/thaw", gate.only(fz.handleThaw))
+	mux.HandleFunc("/wake", gate.only(handleWake(clock, fz)))
 	mux.HandleFunc("/exec", procService.handleExec)
 	mux.HandleFunc("/exec/stream", procService.handleExecStream)
 
@@ -150,9 +167,64 @@ func main() {
 	}
 }
 
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"status":"ok"}`)
+// handleHealth is what the supervisor polls for readiness, so it is where the
+// wall clock is corrected and the workload thawed once the clock is right.
+// /health never releases the workload — only /wake does — and reports 503
+// while it is stopped, so no supervisor can take a frozen guest for a ready
+// one. ?verify=settime proves the clock can be set.
+func handleHealth(clock *wallClock, fz *freezer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !fz.available() {
+			// No freezer: the answer this endpoint has always given, with
+			// nothing new on the path — no lock, no clock, no encoder.
+			fmt.Fprintf(w, `{"status":"ok"}`)
+			return
+		}
+		status := "ok"
+		if fz.isFrozen() {
+			// Not ready: a stopped workload must never read as a ready sandbox,
+			// least of all to a supervisor that does not know to send /wake.
+			status = "frozen"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(struct {
+			Status    string          `json:"status"`
+			WallClock wallClockStatus `json:"wall_clock"`
+		}{Status: status, WallClock: clock.status()})
+	}
+}
+
+// handleVerifyClock proves, for the template builder, that the host clock is
+// readable and the guest may set its own. Supervisor-only, and absent without
+// a freezer: proving the clock is only ever the first half of proving an image
+// can be frozen, and a guest without the cgroup must never be able to have
+// its clock set through this route.
+func handleVerifyClock(clock *wallClock, fz *freezer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !fz.available() {
+			http.Error(w, "no workload freezer in this image", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		wc := clock.verifySet()
+		status := "ok"
+		if !wc.SettimeOK {
+			// Not proven is a failure, in the status code too: a caller that
+			// reads only the code must not mark this guest as correcting.
+			status = "clock"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(struct {
+			Status    string          `json:"status"`
+			WallClock wallClockStatus `json:"wall_clock"`
+		}{Status: status, WallClock: wc})
+	}
 }
 
 // handleInit updates boxd's in-memory sandbox context. Called at least
@@ -264,6 +336,8 @@ func (c *sandboxContext) snapshot() (map[string]string, string, string) {
 }
 
 type processService struct {
+	// freezer holds the workload cgroup every spawned process is placed in.
+	freezer *freezer
 	boxdpbconnect.UnimplementedProcessServiceHandler
 	processes *sync.Map // pid → *runningProcess
 	ctx       *sandboxContext
@@ -434,7 +508,9 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 		resolvedCmd = p
 	}
 
-	cmd := exec.CommandContext(cmdCtx, resolvedCmd, args...)
+	launch, launchArgs, placed := s.freezer.wrap(resolvedCmd, args)
+	cmd := exec.CommandContext(cmdCtx, launch, launchArgs...)
+	placed.attach(cmd)
 	cmd.Dir = cwd
 	cmd.Env = childEnv
 	if cred != nil {
@@ -456,9 +532,17 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		cmd.WaitDelay = time.Second
-		return s.startPipes(ctx, cmd, emit, &timedOut, wantStdin)
+		return s.startPipes(ctx, cmd, placed, emit, &timedOut, wantStdin)
 	}
-	return s.startPTY(ctx, cmd, msg, emit, &timedOut)
+	return s.startPTY(ctx, cmd, placed, msg, emit, &timedOut)
+}
+
+// reapKilled waits for a child the placement check killed, so it does not
+// linger as a zombie; a child that never started has nothing to reap.
+func reapKilled(cmd *exec.Cmd) {
+	if cmd.Process != nil {
+		_ = cmd.Wait()
+	}
 }
 
 // timeoutExitCode matches GNU coreutils `timeout(1)`.
@@ -484,7 +568,7 @@ func finalExitCode(ps *os.ProcessState, timedOut bool) int32 {
 	return 137
 }
 
-func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.StartRequest, emit eventEmitter, timedOut *atomic.Bool) error {
+func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, placed *placement, msg *pb.StartRequest, emit eventEmitter, timedOut *atomic.Bool) error {
 	cols := uint16(msg.GetPty().GetSize().GetCols())
 	rows := uint16(msg.GetPty().GetSize().GetRows())
 	if cols == 0 {
@@ -496,8 +580,20 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 
 	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
 
+	if err := s.freezer.beginSpawn(); err != nil {
+		placed.close()
+		return connect.NewError(connect.CodeUnavailable, err)
+	}
 	tty, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
+	if perr := s.freezer.confirmPlacement(cmd, placed); err == nil {
+		err = perr
+	}
+	s.freezer.endSpawn()
 	if err != nil {
+		if tty != nil {
+			tty.Close()
+		}
+		reapKilled(cmd)
 		return connect.NewError(connect.CodeInternal, fmt.Errorf("start pty: %w", err))
 	}
 	defer tty.Close()
@@ -551,14 +647,26 @@ func (s *processService) startPTY(ctx context.Context, cmd *exec.Cmd, msg *pb.St
 	})
 }
 
-func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eventEmitter, timedOut *atomic.Bool, wantStdin bool) error {
+func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, placed *placement, emit eventEmitter, timedOut *atomic.Bool, wantStdin bool) error {
+	// Spawn guard taken before anything is opened and held across Start()
+	// and the wrapper's placement report, so a refusal leaks nothing and a
+	// freeze cannot miss the child.
+	if err := s.freezer.beginSpawn(); err != nil {
+		placed.close()
+		return connect.NewError(connect.CodeUnavailable, err)
+	}
+	abandon := func(err error) error {
+		s.freezer.endSpawn()
+		placed.close()
+		return connect.NewError(connect.CodeInternal, err)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return connect.NewError(connect.CodeInternal, err)
+		return abandon(err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return connect.NewError(connect.CodeInternal, err)
+		return abandon(err)
 	}
 
 	// Only open a stdin pipe when the caller can feed it (the streaming RPC).
@@ -568,11 +676,17 @@ func (s *processService) startPipes(ctx context.Context, cmd *exec.Cmd, emit eve
 	if wantStdin {
 		stdin, err = cmd.StdinPipe()
 		if err != nil {
-			return connect.NewError(connect.CodeInternal, err)
+			return abandon(err)
 		}
 	}
 
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	if perr := s.freezer.confirmPlacement(cmd, placed); err == nil {
+		err = perr
+	}
+	s.freezer.endSpawn()
+	if err != nil {
+		reapKilled(cmd)
 		return connect.NewError(connect.CodeInternal, err)
 	}
 
@@ -901,8 +1015,7 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		if os.IsNotExist(err) {
 			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
 		} else {
-			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-			http.Error(w, string(errJSON), http.StatusInternalServerError)
+			writeFSError(w, path, err)
 		}
 		return
 	}
@@ -934,9 +1047,13 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 	// TOCTOU swap, and the FIFO/device block-or-stream-forever holes.
 	realPath, err := resolveWithinBlocklist(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		_, fsErr := fsErrno(err)
+		switch {
+		case os.IsNotExist(err):
 			http.Error(w, `{"error":"file not found"}`, http.StatusNotFound)
-		} else {
+		case fsErr:
+			writeFSError(w, path, err)
+		default:
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 		}
 		return
@@ -949,7 +1066,7 @@ func handleFileDownload(w http.ResponseWriter, r *http.Request, path string) {
 		case errors.Is(err, errNotRegularFile):
 			writeJSONError(w, http.StatusBadRequest, "not a regular file")
 		default:
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeFSError(w, realPath, err)
 		}
 		return
 	}
@@ -1004,9 +1121,13 @@ func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
 	// (export -> /proc, /sys, /dev) would otherwise be listed wholesale.
 	realPath, err := resolveWithinBlocklist(dirPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		_, fsErr := fsErrno(err)
+		switch {
+		case os.IsNotExist(err):
 			writeJSONError(w, http.StatusNotFound, "file not found")
-		} else {
+		case fsErr:
+			writeFSError(w, dirPath, err)
+		default:
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 		}
 		return
@@ -1016,7 +1137,7 @@ func serveDirAsJSON(w http.ResponseWriter, dirPath string) {
 		if os.IsNotExist(err) {
 			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeFSError(w, realPath, err)
 		}
 		return
 	}
@@ -1197,7 +1318,7 @@ func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 		if os.IsNotExist(err) {
 			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeFSError(w, dirPath, err)
 		}
 		return
 	}
@@ -1212,7 +1333,7 @@ func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 
 	parent, err := os.OpenRoot(realParent)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeFSError(w, realParent, err)
 		return
 	}
 	defer parent.Close()
@@ -1221,7 +1342,7 @@ func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 		if os.IsNotExist(err) {
 			writeJSONError(w, http.StatusNotFound, "file not found")
 		} else {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeFSError(w, realDir, err)
 		}
 		return
 	} else if li.Mode()&fs.ModeSymlink != 0 {
@@ -1233,7 +1354,7 @@ func serveDirAsZip(ctx context.Context, w http.ResponseWriter, dirPath string) {
 	// validates it before we commit a 200 + headers and confines the walk.
 	root, err := parent.OpenRoot(base)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeFSError(w, realDir, err)
 		return
 	}
 	defer root.Close()
@@ -1392,48 +1513,140 @@ func writeStorageFull(w http.ResponseWriter, partialPath string) {
 	_, _ = w.Write([]byte(storageFullResponse))
 }
 
-func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		// mkdir itself can hit ENOSPC if the sandbox is already
-		// brimming — inodes exhausted, no room for a new directory
-		// entry. Surface it as the same storage-full error so users
-		// get one consistent code for "you're out of disk" regardless
-		// of which syscall tripped it.
-		if errors.Is(err, syscall.ENOSPC) {
-			writeStorageFull(w, "")
-			return
+// staleHandleRetryBudget bounds total wall-clock time spent retrying a
+// write that fails with ESTALE, not attempt count. Observed ESTALE
+// failures aren't a cheap instant syscall error — the write() call
+// itself has been seen blocking for several seconds (up to ~18s) before
+// returning ESTALE, so a fixed attempt count could multiply an already
+// slow failure by 4x and blow well past any caller's timeout. Bounding
+// by elapsed time means a single slow attempt already exhausts the
+// budget and we fail fast with roughly the same latency as before,
+// while a fast-resolving stale handle still gets a few quick retries
+// within the window.
+const staleHandleRetryBudget = 5 * time.Second
+
+// staleHandleRetryDelay is the pause between retry attempts. It's small
+// and fixed rather than exponential: staleHandleRetryBudget is what
+// actually bounds total latency, so growing the backoff on top of that
+// would just eat into the retry budget without a compensating benefit.
+const staleHandleRetryDelay = 150 * time.Millisecond
+
+// staleHandleRetryBodyLimit caps how large a request body we'll buffer
+// in memory to make it replayable across ESTALE retries. Retrying means
+// replaying the same bytes into a fresh open(), which needs the body
+// in memory, but buffering an arbitrarily large upload risks OOMing the
+// guest -- the proxy allows uploads up to 4 GiB (internal/proxy/files.go),
+// far larger than typical guest memory. Bodies at or under the limit get
+// buffered and retried; anything larger streams straight through with a
+// single attempt and no retry, the same behavior as before this logic
+// existed.
+const staleHandleRetryBodyLimit = 32 << 20 // 32 MiB
+
+// staleHandleRetryTotalBudget bounds the AGGREGATE bytes buffered for
+// ESTALE retry across all concurrent uploads, not just one request. The
+// per-request cap alone isn't enough: the proxy allows up to 200
+// concurrent connections to a single sandbox (internal/proxy/proxy.go),
+// and the smallest supported sandbox has only 256 MiB of RAM total
+// (internal/api/handlers_template.go) -- eight simultaneous near-cap
+// uploads could otherwise buffer the guest's entire memory allocation
+// between them, before boxd's own overhead or the guest OS. A request
+// that can't get a reservation falls back to the streamed, non-retrying
+// path, the same degradation an oversized single body already gets.
+const staleHandleRetryTotalBudget = 32 << 20 // 32 MiB
+
+var staleHandleRetryBytesInFlight atomic.Int64
+
+// reserveRetryBudget attempts to claim n bytes from the shared retry
+// buffering budget, returning false if that would exceed it.
+func reserveRetryBudget(n int64) bool {
+	for {
+		cur := staleHandleRetryBytesInFlight.Load()
+		if cur+n > staleHandleRetryTotalBudget {
+			return false
 		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "mkdir: " + err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
-		return
+		if staleHandleRetryBytesInFlight.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
+}
+
+func releaseRetryBudget(n int64) {
+	staleHandleRetryBytesInFlight.Add(-n)
+}
+
+func isStaleHandle(err error) bool {
+	return errors.Is(err, syscall.ESTALE)
+}
+
+// writeFileAttempt performs one parent-check+open+write+close cycle,
+// copying body into the file. It's split out so handleFileUpload can retry
+// the whole sequence on ESTALE — the parent lookup and the open can each
+// independently observe a stale handle on the same mount. body is an
+// io.Reader rather than a []byte so the same function serves both the
+// buffered (retryable) and streamed (large-upload) paths.
+func writeFileAttempt(path string, body io.Reader) (int64, error) {
+	if err := ensureParentDir(path); err != nil {
+		return 0, fmt.Errorf("parent dir: %w", err)
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		if errors.Is(err, syscall.ENOSPC) {
-			writeStorageFull(w, "")
-			return
-		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "create file: " + err.Error()})
+		return 0, fmt.Errorf("create file: %w", err)
+	}
+
+	written, werr := io.Copy(f, body)
+	cerr := f.Close()
+	if werr != nil {
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("write: %w", werr)
+	}
+	if cerr != nil {
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("write: %w", cerr)
+	}
+	return written, nil
+}
+
+func handleFileUpload(w http.ResponseWriter, r *http.Request, path string) {
+	// Peek up to the retry-buffer limit rather than reading the whole
+	// body blindly. If the body is larger than the limit, len(peeked)
+	// comes back as limit+1 without hitting EOF, and we fall through to
+	// the streamed, non-retrying path with those bytes stitched back
+	// onto the front of the body.
+	peeked, err := io.ReadAll(io.LimitReader(r.Body, staleHandleRetryBodyLimit+1))
+	if err != nil {
+		errJSON, _ := json.Marshal(map[string]string{"error": "read body: " + err.Error()})
 		http.Error(w, string(errJSON), http.StatusInternalServerError)
 		return
 	}
 
-	written, err := io.Copy(f, r.Body)
-	f.Close()
+	var written int64
+	peekedLen := int64(len(peeked))
+	if peekedLen > staleHandleRetryBodyLimit || !reserveRetryBudget(peekedLen) {
+		// Too large to buffer at all, or the aggregate budget is
+		// currently claimed by other concurrent uploads -- stream
+		// through once with no retry rather than risk an OOM.
+		written, err = writeFileAttempt(path, io.MultiReader(bytes.NewReader(peeked), r.Body))
+	} else {
+		defer releaseRetryBudget(peekedLen)
+		deadline := time.Now().Add(staleHandleRetryBudget)
+		for {
+			written, err = writeFileAttempt(path, bytes.NewReader(peeked))
+			if err == nil || !isStaleHandle(err) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(staleHandleRetryDelay)
+			if time.Now().After(deadline) {
+				break
+			}
+		}
+	}
 	if err != nil {
-		// Remove the partial file — a truncated upload is never useful
-		// to the caller. This handles both ENOSPC (disk full) and
-		// client disconnect (network drop, cancel) so interrupted
-		// uploads don't leave orphaned files eating disk space.
-		_ = os.Remove(path)
-
 		if errors.Is(err, syscall.ENOSPC) {
 			writeStorageFull(w, "")
 			return
 		}
-		errJSON, _ := json.Marshal(map[string]string{"error": "write: " + err.Error()})
-		http.Error(w, string(errJSON), http.StatusInternalServerError)
+		writeFSError(w, path, err)
 		return
 	}
 

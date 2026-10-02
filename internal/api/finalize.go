@@ -47,16 +47,20 @@ func (h *Handlers) finalizePause(ctx context.Context, params db.FinalizePausePar
 		// The index dropped between the probe and the statement.
 	}
 	return h.DB.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
-		ID:                params.ID,
-		TeamID:            params.TeamID,
-		Path:              params.Path,
-		MemPath:           params.MemPath,
-		SizeBytes:         params.SizeBytes,
-		Trigger:           params.Trigger,
-		ManifestFileNames: params.ManifestFileNames,
-		ManifestPaths:     params.ManifestPaths,
-		ManifestSizes:     params.ManifestSizes,
-		ManifestDigests:   params.ManifestDigests,
-		ManifestBasePaths: params.ManifestBasePaths,
+		ID:                     params.ID,
+		TeamID:                 params.TeamID,
+		PauseOpID:              params.PauseOpID,
+		PauseOpLeaseVersion:    params.PauseOpLeaseVersion,
+		Path:                   params.Path,
+		MemPath:                params.MemPath,
+		SizeBytes:              params.SizeBytes,
+		Trigger:                params.Trigger,
+		PauseToken:             params.PauseToken,
+		ManifestFileNames:      params.ManifestFileNames,
+		ManifestPaths:          params.ManifestPaths,
+		ManifestSizes:          params.ManifestSizes,
+		ManifestAllocatedBytes: params.ManifestAllocatedBytes,
+		ManifestDigests:        params.ManifestDigests,
+		ManifestBasePaths:      params.ManifestBasePaths,
 	})
 }

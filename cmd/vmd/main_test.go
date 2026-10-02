@@ -1,6 +1,305 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/superserve-ai/sandbox/internal/vm"
+)
+
+func TestLoadConfigRequiresExplicitHostID(t *testing.T) {
+	cases := []struct {
+		name    string
+		hostID  string
+		wantErr bool
+	}{
+		{"unset", "", true},
+		{"legacy default identity", "default", false},
+		{"real identity", "host-a", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KERNEL_PATH", "/tmp/kernel")
+			t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+			t.Setenv("HOST_ID", tc.hostID)
+
+			cfg, err := loadConfig()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("loadConfig() = %+v, want error for HOST_ID=%q", cfg, tc.hostID)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig() error: %v", err)
+			}
+			if cfg.HostID != tc.hostID {
+				t.Fatalf("cfg.HostID = %q, want %q", cfg.HostID, tc.hostID)
+			}
+		})
+	}
+}
+
+func TestLoadConfigIdentityPrerequisite(t *testing.T) {
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "example-region-2")
+	t.Setenv("GRPC_PORT", "50051")
+	t.Setenv("HOST_REGION", "example-region")
+	t.Setenv("VMD_SCHEDULABLE_MEMORY_MIB", "1024")
+	t.Setenv("VMD_SCHEDULABLE_VCPUS", "2")
+	t.Setenv("SECRETSPROXY_SANDBOX_ADDR", "")
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	corrupt := filepath.Join(t.TempDir(), "corrupt.json")
+	if err := os.WriteFile(corrupt, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		required string
+		path     string
+		wantErr  string
+	}{
+		{"legacy unbound host", "", "", ""},
+		{"new host without identity path", "1", "", "HOST_IDENTITY_FILE is required"},
+		{"new host with missing identity", "1", missing, "host identity missing"},
+		{"new host with corrupt identity", "1", corrupt, "invalid or mismatched host identity"},
+		{"installed legacy host with missing identity", "", missing, "host identity missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOST_IDENTITY_REQUIRED", tc.required)
+			t.Setenv("HOST_IDENTITY_FILE", tc.path)
+			cfg, err := loadConfig()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("loadConfig() error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || cfg.HostID != "example-region-2" || cfg.IncarnationID != "" {
+				t.Fatalf("legacy config = %+v, %v", cfg, err)
+			}
+		})
+	}
+}
+
+func TestIdentityRequiresHeartbeatDescriptionBeforeStartup(t *testing.T) {
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "default")
+	t.Setenv("HOST_IDENTITY_FILE", filepath.Join(t.TempDir(), "missing.json"))
+	t.Setenv("SANDBOX_ID_REGION", "")
+	for _, tc := range []struct {
+		key, value string
+	}{
+		{"HOST_REGION", ""}, {"HOST_REGION", " "}, {"HOST_REGION", strings.Repeat("x", 257)},
+		{"VMD_SCHEDULABLE_MEMORY_MIB", ""}, {"VMD_SCHEDULABLE_MEMORY_MIB", "0"},
+		{"VMD_SCHEDULABLE_MEMORY_MIB", "-1"}, {"VMD_SCHEDULABLE_MEMORY_MIB", "2147483648"},
+		{"VMD_SCHEDULABLE_VCPUS", ""}, {"VMD_SCHEDULABLE_VCPUS", "0"},
+		{"VMD_SCHEDULABLE_VCPUS", "-1"}, {"VMD_SCHEDULABLE_VCPUS", "invalid"},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			t.Setenv("HOST_REGION", "example-region")
+			t.Setenv("VMD_SCHEDULABLE_MEMORY_MIB", "1024")
+			t.Setenv("VMD_SCHEDULABLE_VCPUS", "2")
+			t.Setenv(tc.key, tc.value)
+			_, err := loadConfig()
+			if err == nil || !strings.Contains(err.Error(), "identity-bound VMD requires "+tc.key) {
+				t.Fatalf("loadConfig error = %v; want explicit %s prerequisite before identity verification", err, tc.key)
+			}
+		})
+	}
+}
+
+func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "host-a")
+	t.Setenv("VMD_ADVERTISE_ADDR", "10.0.0.2:50051")
+	t.Setenv("PROXY_ADVERTISE_ADDR", "10.0.0.2:5007")
+	t.Setenv("PEER_PROXY_LISTEN_ADDR", "10.0.0.2:5009")
+	t.Setenv("HOST_REGION", "region-explicit")
+	t.Setenv("SANDBOX_ID_REGION", "region-fallback")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	if cfg.VMDAdvertiseAddr != "10.0.0.2:50051" {
+		t.Fatalf("cfg.VMDAdvertiseAddr = %q, want explicit override", cfg.VMDAdvertiseAddr)
+	}
+	if cfg.ProxyAdvertiseAddr != "10.0.0.2:5007" {
+		t.Fatalf("cfg.ProxyAdvertiseAddr = %q, want explicit override", cfg.ProxyAdvertiseAddr)
+	}
+	if cfg.PeerProxyListenAddr != "10.0.0.2:5009" {
+		t.Fatalf("cfg.PeerProxyListenAddr = %q, want private peer endpoint", cfg.PeerProxyListenAddr)
+	}
+	if cfg.HostRegion != "region-explicit" {
+		t.Fatalf("cfg.HostRegion = %q, want explicit override", cfg.HostRegion)
+	}
+}
+
+func TestAdvertisedAddrsPreferExplicitOverrides(t *testing.T) {
+	// The host lookup dumps fleet-sized kernel tables, so explicit settings
+	// must satisfy both endpoints without it ever running.
+	resolved := 0
+	hostIP := func() (string, error) {
+		resolved++
+		return "", fmt.Errorf("host lookup must not run when both addresses are explicit")
+	}
+
+	vmdAddr, err := advertisedVMDAddr(hostIP, 50051, "10.0.0.2:50051")
+	if err != nil {
+		t.Fatalf("advertisedVMDAddr: %v", err)
+	}
+	if vmdAddr != "10.0.0.2:50051" {
+		t.Fatalf("advertisedVMDAddr = %q, want explicit override", vmdAddr)
+	}
+
+	proxyAddr, err := advertisedProxyAddr(hostIP, "http://127.0.0.1:5007/health", "10.0.0.2:5007")
+	if err != nil {
+		t.Fatalf("advertisedProxyAddr: %v", err)
+	}
+	if proxyAddr != "10.0.0.2:5007" {
+		t.Fatalf("advertisedProxyAddr = %q, want explicit override", proxyAddr)
+	}
+	if resolved != 0 {
+		t.Fatalf("host interface resolved %d times, want 0", resolved)
+	}
+}
+
+func TestHeartbeatProxyAdvertiseOverrideUsesPeerEndpoint(t *testing.T) {
+	// The peer endpoint is the value that must flow into HeartbeatConfig.ProxyAddr;
+	// the historical public override is intentionally ignored while peer ingress
+	// is enabled.
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "host-a")
+	t.Setenv("PROXY_ADVERTISE_ADDR", "10.0.0.2:5007")
+	t.Setenv("PEER_PROXY_LISTEN_ADDR", "10.0.0.2:5009")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	advertised, err := advertisedHeartbeatProxyAddr(func() (string, error) {
+		t.Fatal("host lookup must not run for an explicit peer endpoint")
+		return "", nil
+	}, "http://127.0.0.1:5007/health", cfg.ProxyAdvertiseAddr, cfg.PeerProxyListenAddr)
+	if err != nil || advertised != cfg.PeerProxyListenAddr {
+		t.Fatalf("advertised proxy address = %q, %v, want peer endpoint", advertised, err)
+	}
+}
+
+func TestAdvertisedHeartbeatProxyAddrValidatesPeerEndpoint(t *testing.T) {
+	for _, peer := range []string{
+		"10.0.0.2:0", "10.0.0.2:5010", "10.0.0.2:5008", "203.0.113.2:5009", "0.0.0.0:5009",
+		"127.0.0.1:5009", "[::]:5009", "[::1]:5009",
+		"[fe80::1]:5009", "peer.example:5009", "10.0.0.2", "10.0.0.2:65536",
+	} {
+		t.Run(peer, func(t *testing.T) {
+			for _, configured := range []string{"", "10.0.0.2:5007"} {
+				got, err := advertisedHeartbeatProxyAddr(func() (string, error) {
+					t.Fatal("invalid peer endpoint must not fall back to host lookup")
+					return "10.0.0.2", nil
+				}, "http://127.0.0.1:5007/health", configured, peer)
+				if err == nil || got != "" {
+					t.Fatalf("advertised endpoint = %q, %v; want empty address and error", got, err)
+				}
+			}
+		})
+	}
+	for _, peer := range []string{"", "10.0.0.2:5009", "[fd00::2]:5009"} {
+		got, err := advertisedHeartbeatProxyAddr(func() (string, error) {
+			t.Fatal("explicit endpoint must not require host lookup")
+			return "", nil
+		}, "http://127.0.0.1:5007/health", "10.0.0.2:5007", peer)
+		want := peer
+		if want == "" {
+			want = "10.0.0.2:5007"
+		}
+		if err != nil || got != want {
+			t.Fatalf("advertised endpoint = %q, %v; want %q", got, err, want)
+		}
+	}
+}
+
+// Both endpoints derive from the same interface; the lookup behind them must
+// run once no matter how many callers need it.
+func TestAdvertisedAddrsShareOneHostLookup(t *testing.T) {
+	resolved := 0
+	hostIP := func() (string, error) {
+		resolved++
+		return "10.0.0.3", nil
+	}
+	memo := hostIPOnce(hostIP)
+
+	vmdAddr, err := advertisedVMDAddr(memo, 50051, "")
+	if err != nil {
+		t.Fatalf("advertisedVMDAddr: %v", err)
+	}
+	proxyAddr, err := advertisedProxyAddr(memo, "http://127.0.0.1:5007/health", "")
+	if err != nil {
+		t.Fatalf("advertisedProxyAddr: %v", err)
+	}
+	if vmdAddr != "10.0.0.3:50051" {
+		t.Fatalf("advertisedVMDAddr = %q, want derived host address", vmdAddr)
+	}
+	if proxyAddr != "10.0.0.3:5007" {
+		t.Fatalf("advertisedProxyAddr = %q, want derived host address", proxyAddr)
+	}
+	if resolved != 1 {
+		t.Fatalf("host interface resolved %d times, want 1", resolved)
+	}
+}
+
+func TestResolveHeartbeatAddressesRecovers(t *testing.T) {
+	for _, failedEndpoint := range []string{"vmd", "proxy"} {
+		t.Run(failedEndpoint, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			attempts := 0
+			resolve := func() (string, string, error) {
+				attempts++
+				if attempts == 1 {
+					if failedEndpoint == "proxy" {
+						return "192.0.2.3:50051", "", fmt.Errorf("temporary proxy address failure")
+					}
+					return "", "", fmt.Errorf("temporary interface failure")
+				}
+				return "192.0.2.3:50051", "192.0.2.3:5009", nil
+			}
+			vmdAddr, proxyAddr, err := resolveHeartbeatAddresses(ctx, time.Millisecond, resolve, zerolog.Nop())
+			if err != nil || vmdAddr != "192.0.2.3:50051" || proxyAddr != "192.0.2.3:5009" || attempts != 2 {
+				t.Fatalf("resolution = %q, %q, %v after %d attempts", vmdAddr, proxyAddr, err, attempts)
+			}
+		})
+	}
+}
+
+func TestResolveHeartbeatAddressesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempts := 0
+	vmdAddr, proxyAddr, err := resolveHeartbeatAddresses(ctx, time.Hour, func() (string, string, error) {
+		attempts++
+		cancel()
+		return "192.0.2.3:50051", "", fmt.Errorf("address unavailable")
+	}, zerolog.Nop())
+	if err != context.Canceled || vmdAddr != "" || proxyAddr != "" || attempts != 1 {
+		t.Fatalf("canceled resolution = %q, %q, %v after %d attempts", vmdAddr, proxyAddr, err, attempts)
+	}
+}
 
 func TestParseSecretsProxyAddr(t *testing.T) {
 	t.Parallel()
@@ -38,5 +337,245 @@ func TestParseSecretsProxyAddr(t *testing.T) {
 				t.Fatalf("got (%q, %d), want (%q, %d)", host, port, tc.wantHost, tc.wantPort)
 			}
 		})
+	}
+}
+
+func TestPausedNetworkReclaimTriggersConfigured(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name           string
+		slotPercent    int
+		slotReserve    int
+		netnsThreshold int
+		mountThreshold int
+		wantConfigured bool
+	}{
+		{name: "all disabled", wantConfigured: false},
+		{name: "slot percent", slotPercent: 5, wantConfigured: true},
+		{name: "slot reserve", slotReserve: 1, wantConfigured: true},
+		{name: "netns threshold", netnsThreshold: 1, wantConfigured: true},
+		{name: "mount threshold", mountThreshold: 1, wantConfigured: true},
+		{name: "mixed disabled", slotPercent: 0, slotReserve: 0, netnsThreshold: 0, mountThreshold: 0, wantConfigured: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pausedNetworkReclaimTriggersConfigured(tc.slotPercent, tc.slotReserve, tc.netnsThreshold, tc.mountThreshold); got != tc.wantConfigured {
+				t.Fatalf("pausedNetworkReclaimTriggersConfigured() = %v, want %v", got, tc.wantConfigured)
+			}
+		})
+	}
+}
+
+// TestLifecycle_CleanIntentionalShutdownGate pins the receipt-minting
+// invariant: only a signal-initiated shutdown with no service error and no
+// closer failure qualifies. An unexpected service return — even error-free —
+// and a failing closer must both disqualify.
+func TestLifecycle_CleanIntentionalShutdownGate(t *testing.T) {
+	log := zerolog.Nop()
+
+	t.Run("signal initiated and clean", func(t *testing.T) {
+		lc := newLifecycle(log)
+		lc.noteSignalInitiated()
+		lc.shutdown(context.Background())
+		if !lc.cleanIntentionalShutdown() {
+			t.Fatal("clean signal-initiated shutdown must qualify")
+		}
+	})
+
+	t.Run("unexpected error-free service return", func(t *testing.T) {
+		lc := newLifecycle(log)
+		lc.start("svc", func() error { return nil })
+		lc.wait(context.Background())
+		lc.shutdown(context.Background())
+		if lc.cleanIntentionalShutdown() {
+			t.Fatal("a service returning on its own is not intentional, even without error")
+		}
+	})
+
+	t.Run("service error", func(t *testing.T) {
+		lc := newLifecycle(log)
+		lc.noteSignalInitiated()
+		lc.start("svc", func() error { return fmt.Errorf("boom") })
+		lc.wait(context.Background())
+		lc.shutdown(context.Background())
+		if lc.cleanIntentionalShutdown() {
+			t.Fatal("a service error must disqualify")
+		}
+	})
+
+	t.Run("closer failure", func(t *testing.T) {
+		lc := newLifecycle(log)
+		lc.noteSignalInitiated()
+		lc.addCloser("bad", func(context.Context) error { return fmt.Errorf("close failed") })
+		lc.shutdown(context.Background())
+		if lc.cleanIntentionalShutdown() {
+			t.Fatal("a failing closer must disqualify")
+		}
+	})
+
+	t.Run("forced gRPC stop", func(t *testing.T) {
+		// A drain that overran its budget and force-cancelled active RPCs may
+		// have left state the next boot must reconcile — never a clean handoff.
+		lc := newLifecycle(log)
+		lc.noteSignalInitiated()
+		lc.noteForcedRPCStop()
+		lc.shutdown(context.Background())
+		if lc.cleanIntentionalShutdown() {
+			t.Fatal("a forced gRPC stop must disqualify")
+		}
+	})
+}
+
+// A closer that fails or overruns may still have a worker touching its
+// dependencies' resources, so shutdown must abort rather than close those
+// dependencies out from under it. Covers all three failure shapes; each must
+// leave the dependency unclosed, stay bounded, and record the error.
+func TestShutdownAbortsOnCloserFailure(t *testing.T) {
+	prev := perCloserShutdownTimeout
+	perCloserShutdownTimeout = 50 * time.Millisecond
+	defer func() { perCloserShutdownTimeout = prev }()
+
+	run := func(t *testing.T, failing func(context.Context) error) {
+		lc := newLifecycle(zerolog.Nop())
+		var depClosed atomic.Bool
+		// LIFO shutdown: registered dep, failing, latest runs as latest,
+		// failing, dep. dep (registered first, run last) is the failing
+		// closer's dependency and must NOT be closed after the abort.
+		lc.addCloser("dep", func(context.Context) error { depClosed.Store(true); return nil })
+		lc.addCloser("failing", failing)
+		lc.addCloser("latest", func(context.Context) error { return nil })
+
+		start := time.Now()
+		lc.shutdown(context.Background())
+		if d := time.Since(start); d > 2*time.Second {
+			t.Fatalf("shutdown not bounded: took %v", d)
+		}
+		if depClosed.Load() {
+			t.Fatal("dependency closed after a failed/overrun closer — must abort instead")
+		}
+		if lc.closerErr == nil {
+			t.Fatal("failed closer must record closerErr (bars vouching)")
+		}
+	}
+
+	// Respects ctx and returns ctx.Err() at its deadline — its worker may still
+	// be live, and the outer select can receive this from done instead of
+	// selecting closerCtx.Done(). Must still abort.
+	t.Run("returns ctx.Err at deadline", func(t *testing.T) {
+		run(t, func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() })
+	})
+	// Returns a plain error promptly — the done branch must also abort.
+	t.Run("returns error", func(t *testing.T) {
+		run(t, func(context.Context) error { return fmt.Errorf("boom") })
+	})
+	// Ignores ctx entirely and never returns — the deadline branch aborts.
+	t.Run("wedged, ignores ctx", func(t *testing.T) {
+		run(t, func(context.Context) error { select {} }) // ponytail: never returns
+	})
+}
+
+// Pressure accounting is opt-in on BOTH halves: an operator-set
+// advertise address and a control plane to publish to. A host with an
+// address but no control-plane URL never starts a heartbeat, so turning
+// the accounting on would buy a startup scan whose results nothing
+// reads.
+func TestPublishesCapacityPressureRequiresBothHalves(t *testing.T) {
+	cases := []struct {
+		name            string
+		advertiseAddr   string
+		controlPlaneURL string
+		want            bool
+	}{
+		{"both set", "10.0.0.2:50051", "http://cp:8080", true},
+		{"no advertise address", "", "http://cp:8080", false},
+		{"no control plane", "10.0.0.2:50051", "", false},
+		{"neither", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := publishesCapacityPressure(tc.advertiseAddr, tc.controlPlaneURL); got != tc.want {
+				t.Fatalf("publishesCapacityPressure(%q, %q) = %v, want %v",
+					tc.advertiseAddr, tc.controlPlaneURL, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIdentityVerificationTiming(t *testing.T) {
+	for _, verificationErr := range []error{nil, context.DeadlineExceeded} {
+		var output bytes.Buffer
+		st := &startupTimer{log: zerolog.New(&output), ch: make(chan func(), 1)}
+		st.identityVerification(25*time.Millisecond, verificationErr)
+		if output.Len() != 0 {
+			t.Fatal("identity timing wrote synchronously")
+		}
+		if verificationErr != nil {
+			if len(st.ch) != 0 {
+				t.Fatal("failure timing depends on the asynchronous queue")
+			}
+			// Use the configuration-failure logger without exiting this test process.
+			st.log.Error().Err(verificationErr).Msg("failed to load configuration")
+		} else {
+			select {
+			case write := <-st.ch:
+				write()
+			default:
+				t.Fatal("identity timing was not queued")
+			}
+		}
+		var record struct {
+			Component string  `json:"startup_component"`
+			Duration  float64 `json:"duration_ms"`
+			Budget    float64 `json:"budget_ms"`
+			Success   bool    `json:"success"`
+		}
+		if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Component != "identity_verification" || record.Duration != 25 || record.Budget != 3000 || record.Success != (verificationErr == nil) {
+			t.Fatalf("unexpected timing: %s", output.String())
+		}
+	}
+}
+
+// The host guard greps the vmd binary for the wake-protocol capability. A
+// fabricated binary can only show the shell logic works; this shows a binary
+// linked from this package carries the literal the guard looks for. The test
+// binary links the same code that prints it, so it stands in for the build.
+func TestWakeFloorGuardAdmitsThisBinary(t *testing.T) {
+	const evidencePath = "/var/lib/sandbox/wake-protocol-evidence"
+	src, err := os.ReadFile(filepath.Join("..", "..", "deploy", "vmd-wake-floor-guard"))
+	if err != nil {
+		t.Fatalf("read guard script: %v", err)
+	}
+	if !strings.Contains(string(src), vm.WakeProtocolCapability) || !strings.Contains(string(src), evidencePath) {
+		t.Fatalf("guard script no longer greps for %q beside %q; update this test", vm.WakeProtocolCapability, evidencePath)
+	}
+	dir := t.TempDir()
+	evidence := filepath.Join(dir, "evidence")
+	if err := os.WriteFile(evidence, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	guard := filepath.Join(dir, "guard.sh")
+	if err := os.WriteFile(guard, []byte(strings.ReplaceAll(string(src), evidencePath, evidence)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sh", guard, self).CombinedOutput(); err != nil {
+		t.Fatalf("the guard refused a binary built from this package with the floor up: %v\n%s", err, out)
+	}
+	// The same guard must still refuse a binary without the literal, or the
+	// admission above proves nothing.
+	other := filepath.Join(dir, "older-vmd")
+	if err := os.WriteFile(other, []byte("not a wake-capable vmd\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("sh", guard, other).Run(); err == nil {
+		t.Fatal("the guard admitted a binary without the capability while the floor was up")
 	}
 }

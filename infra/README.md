@@ -10,8 +10,8 @@ The current Terraform-managed Compute Engine inventory for Vanta is:
 | Environment | Region | Instance | Status |
 | --- | --- | --- | --- |
 | staging | us-central1 | `superserve-vmd-staging` | Managed by Terraform |
-| production | us-west2 | `superserve-vmd-usw2` | Managed by Terraform |
-| production | us-east4 | `superserve-vmd-use4` | Managed by Terraform |
+| production | us-west2 | `superserve-vmd-usw2-2` | Managed by Terraform (serving host) |
+| production | us-east4 | `superserve-vmd-use4-3` | Managed by Terraform (serving host) |
 | production | us-central1 | none | Decommissioned, no Terraform-managed instance remains |
 
 Each live instance is managed through the shared `sandbox-host` module and
@@ -50,8 +50,10 @@ because the instance-ID filter keeps each host's evidence and response path
 unambiguous.
 
 For an existing matching policy, use its full Monitoring policy name with
-`terraform import module.observability.google_monitoring_alert_policy.compute_instance_cpu[\"sandbox_host\"] POLICY_NAME`
-before planning. If the policy is not a match, update it in place or remove it
+`terraform import module.observability.google_monitoring_alert_policy.compute_instance_cpu[\"HOST_KEY\"] POLICY_NAME`
+before planning, where `HOST_KEY` is that host's key in the environment's
+`compute_instance_cpu_alerts` map (`sandbox_host` for a cell's primary host,
+`sandbox_host_b` for us-west2's serving host, `sandbox_host_c` for us-east4's). If the policy is not a match, update it in place or remove it
 from the state/configuration deliberately before creating the managed policy.
 
 For a review-only plan, supply the same variable as a Terraform list literal,
@@ -72,3 +74,16 @@ needed. After deployment, recheck the Vanta control for every production host
 and retain the sanitized plan as evidence. The plan command documented here is
 review-only; the repository's explicitly authorized production workflows can
 apply Terraform changes after their normal approval gates.
+
+## Compute restriction configuration
+
+Both production API roots require `TF_VAR_compute_restrictions_secret_name` to
+identify an existing Secret Manager secret with an enabled `latest` version.
+Set the `COMPUTE_RESTRICTIONS_SECRET_NAME` GitHub Actions repository secret for
+CI and deployment workflows; export the Terraform variable for local plans.
+Missing or empty configuration fails the production plan rather than removing
+the enforcement mount. Staging does not use this input.
+
+Operators manage the JSON versions separately. Terraform manages the runtime
+access grants, read-only file mount, and `COMPUTE_RESTRICTIONS_FILE` path without
+reading or storing the restriction contents.

@@ -23,6 +23,8 @@ const profileScope = `id IN (
 	UNION SELECT assigned_by FROM team_pricing_plan WHERE team_id = $1 AND assigned_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_grant WHERE team_id = $1 AND created_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_ledger WHERE team_id = $1 AND created_by IS NOT NULL
+	UNION SELECT user_id FROM stripe_checkout_publication_decision WHERE team_id = $1
+	UNION SELECT user_id FROM stripe_checkout_generation_authority WHERE team_id = $1
 )`
 
 // sandboxScope covers tables keyed by sandbox_id without a team_id column.
@@ -31,6 +33,11 @@ const sandboxScope = `sandbox_id IN (SELECT id FROM sandbox WHERE team_id = $1)`
 // manifestScope covers artifact_manifest, whose rows hang off exactly one of
 // snapshot or template (no team_id column of their own).
 const manifestScope = `(snapshot_id IN (SELECT id FROM snapshot WHERE team_id = $1)
+	OR template_id IN (SELECT id FROM template WHERE team_id = $1))`
+
+// backupGenerationScope covers backup_generation, whose rows hang off
+// exactly one of sandbox or template (no team_id column of their own).
+const backupGenerationScope = `(sandbox_id IN (SELECT id FROM sandbox WHERE team_id = $1)
 	OR template_id IN (SELECT id FROM template WHERE team_id = $1))`
 
 type tableSpec struct {
@@ -69,6 +76,19 @@ var migratedTables = []tableSpec{
 	{"profile", profileScope},
 	{"team", "id = $1"},
 	{"team_feature_flag", "team_id = $1"},
+	// Checkout publication decisions and subscription associations are
+	// immutable financial authority. Copy and verify them before the account
+	// exposes customer routing to destination webhooks.
+	{"stripe_checkout_generation_authority", "team_id = $1"},
+	{"stripe_checkout_publication_decision", "team_id = $1"},
+	{"stripe_checkout_publication_subscription", "team_id = $1"},
+	{"team_billing_account", "team_id = $1"},
+	// The cutoff is the authoritative, immutable activation boundary. It must
+	// move with the team so a cell migration cannot silently re-enable storage
+	// at a later timestamp.
+	{"team_storage_billing_activation", "team_id = $1"},
+	{"stripe_checkout_expiration_evidence", "team_id = $1"},
+	{"team_trial_eligibility_cache", "team_id = $1"},
 	{"team_member", "team_id = $1"},
 	// team_memberships before user_role_assignments: a dest-side trigger
 	// requires an active membership before accepting an active team-scoped
@@ -94,10 +114,19 @@ var migratedTables = []tableSpec{
 	// Integrity manifests hang off snapshots and templates; both parents
 	// are in scope by this point in the FK order.
 	{"artifact_manifest", manifestScope},
+	// Backup coverage rows hang off sandboxes and templates; the source
+	// cell's bucket names stay meaningful because buckets are recorded
+	// per row, so the destination knows which cell bucket holds the bytes.
+	{"backup_generation", backupGenerationScope},
 	{"sandbox_secret", sandboxScope},
+	{"sandbox_secret_detached", sandboxScope},
 	{"sandbox_active_interval", "team_id = $1"},
 	{"sandbox_compute_billing_interval", "team_id = $1"},
 	{"sandbox_storage_interval", "team_id = $1"},
+	{"sandbox_storage_baseline", "team_id = $1"},
+	{"retained_storage_cutover", "team_id = $1"},
+	{"retained_storage_interval", "team_id = $1"},
+	{"retained_storage_measurement_obligation", "team_id = $1"},
 	{"team_billing_usage", "team_id = $1"},
 	{"team_billing_usage_hourly", "team_id = $1"},
 	{"team_billing_period", "team_id = $1"},
@@ -108,6 +137,8 @@ var migratedTables = []tableSpec{
 	{"team_credit_grant", "team_id = $1"},
 	{"team_credit_ledger", "team_id = $1"},
 	{"quota_alert_state", "team_id = $1"},
+	{"trial_credit_warning_state", "team_id = $1"},
+	{"trial_credit_warning_delivery", "team_id = $1"},
 	{"activity", "team_id = $1"},
 	// Live revocations move with the team so a stale sandbox JWT can't be
 	// replayed against the dest cell's proxy. Rows self-expire.
@@ -125,6 +156,7 @@ var skippedTables = []struct{ name, reason string }{
 	{"reconciler_log", "audit of the source cell's hosts; meaningless in the dest cell"},
 	{"device_code", "ephemeral per-user login flow; global Auth re-issues on next login"},
 	{"host", "cell-local infrastructure"},
+	{"sandbox_routing_revocation", "cell-local ownership fences; retained by each cell independently"},
 	{"roles, permissions, role_permissions", "migration-seeded per cell; assignments are remapped by role name"},
 	{"feature_flag, pricing_plan, pricing_rate", "migration-seeded per cell"},
 	{"billing_rollup_scheduler_lease, billing_rollup_backfill_state", "global scheduler state, not team-scoped"},
@@ -133,6 +165,7 @@ var skippedTables = []struct{ name, reason string }{
 	// triggers record as sandboxes resume there; the source's rows cascade
 	// away when the team row is purged.
 	{"team_sandbox_counter", "dest quota triggers rebuild it as sandboxes resume; copying would double-count"},
+	{"sandbox_snapshot", "a live row, or a deleted one a sandbox refers to, refuses the copy; deleted rows nothing refers to are purged with the team"},
 }
 
 // tableByName finds a migrated table's spec.

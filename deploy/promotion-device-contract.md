@@ -1,0 +1,862 @@
+# Signup device evidence and regional promotion authority
+
+This is an additive server contract. Regional device enforcement ships off. The
+existing canonical identity rollout and Stripe reservation requirements in
+[promotion identity authority](promotion-identity-authority.md) still apply.
+The grant integration routes the existing signup and Stripe writers through
+the regional device authority. Keep the policy off until the selected region's
+Console producer and all grant paths are ready.
+
+## Original evidence source
+
+The shared Auth PostgreSQL project owns `signup_device_attempt` and
+`signup_device_account_evidence`. Apply the scripts in
+`supabase/shared-auth-migrations/` in timestamp order **once to that project**,
+separately from each regional migration chain. The immutability script revokes
+Supabase's direct application-role table grants and guards accepted facts.
+This store is server only and has separate authority from regional promotion
+state, even when it shares East's PostgreSQL project. Subsequent regional
+migrations must use the [database-specific migration inputs](regional-migrations.md)
+so that this completed Auth setup is recognized without replaying it.
+Verified attempts and account bindings are retained indefinitely, including after
+account deletion;
+unverified attempts may be purged only after their verification window closes.
+Database backups and migration rollback protection must retain the tables.
+
+Console's server calls the following scoped control-plane routes, which execute
+the corresponding shared Auth RPCs:
+
+The control plane exposes these operations to Console through dedicated
+credentials. Configure `PROMOTION_AUTH_DATABASE_URL` with access to the shared
+Auth project, `PROMOTION_CAPTURE_TOKEN` for attempt creation and provider
+attestation, and a distinct `PROMOTION_ACCOUNT_TOKEN` for binding, retrieval,
+and selected-region registration. Missing or identical tokens deny requests;
+an unavailable shared Auth database returns `authority_unavailable` and must
+withhold credit. The regional database remains `DATABASE_URL`. Keep these
+credentials server side; the VMD internal token and tenant API keys grant no
+access. Every account operation also requires a signed
+`X-Promotion-Account-Assertion`; `X-Actor-User-Id` does not establish identity.
+Configure `PROMOTION_ACCOUNT_PUBLIC_KEY` with the standard base64 encoding of
+its 32-byte Ed25519 public key. Missing or invalid keys reject account operations.
+The private key belongs only to Console's trusted Auth adapter, separately from
+the capture/account transport credentials; it is never deployed to the control
+plane or provided to a browser. The adapter must derive identity from the Auth
+signup result or a verified server-side session, never request fields. It must
+not offer arbitrary subject signing to holders of a promotion transport token.
+Console configures `PROMOTION_ACCOUNT_PRIVATE_KEY` as an Ed25519 PKCS#8 PEM
+private key, with actual newlines. Its corresponding raw 32-byte public key,
+standard-base64 encoded, supplies `PROMOTION_ACCOUNT_PUBLIC_KEY` in every
+selected backend cell. Neither variable uses a `NEXT_PUBLIC_` prefix. Missing,
+malformed or non-Ed25519 private keys withhold account requests before transport.
+
+The adapter signs an EdDSA JWT with `iss: promotion-auth-adapter`,
+`aud: promotion-account`, `sub: <Auth user UUID>`, `iat`, `exp`, and
+`operation: bind|evidence|register|register-signup|signup-eligibility|create-team`. Both times are required, expiry must be
+later than issue time and at most five minutes after it, and future-issued or
+expired assertions reject. For `bind`, also sign `attempt_id` from the
+server-owned signup flow; `register-signup` also signs that original attempt
+and fixed `home_region: "use"`; `create-team` uses the separate creation
+binding described below. For evidence, later registration and eligibility
+snapshots omit it. The control plane
+verifies the signature, issuer, audience, time bounds, operation and exact
+subject/body match, plus the attempt/body match for binding, before database
+access. `X-Actor-User-Id` is required and must equal that verified subject and
+the body's `user_id`; this is a consistency check, never login verification.
+The account bearer credential remains required, so an assertion alone
+never exposes evidence to tenants. The same assertion may retry its idempotent
+operation during its lifetime; the adapter issues a new assertion for later
+requests. This does not expire previously accepted device evidence.
+
+A binding assertion can be issued from the trusted signup response before email
+confirmation, without requiring a user session. Later retrieval and regional
+entry use fresh assertions derived from the current verified session. An
+assertion for one account or operation cannot authorize another.
+
+### Console login verification and consumer handoff
+
+For `/evidence` and `/register`, Console must use its existing request-scoped
+Auth client and call `auth.getUser()` with the current login credential. An
+Auth error, missing user, missing credential or invalid credential must stop
+the operation before signing or calling the promotion backend. Derive the JWT
+subject, actor header and body user ID only from the returned `user.id`. If a
+caller supplies a target user ID, reject a mismatch with that verified ID.
+Matching request fields, decoded JWT claims without verification, `getSession()`
+alone and user-editable metadata do not establish the principal. Reuse the
+existing login flow and Auth verification; this requires no additional database
+connection or regional identity authority.
+
+Keep the assertion signer server-only. It must not be exposed as a browser
+action accepting an arbitrary subject, operation or attempt. Browser headers
+and assertions must never be forwarded as promotion credentials. Console creates
+the outgoing bearer credential, signed assertion, actor header and body itself.
+Raw evidence responses remain inside the server and must not be returned to
+the browser.
+
+`/bind` has a separate provenance rule: retain the server-owned attempt and
+bind it only to the actual account created by the trusted email signup result
+or verified Google signup callback. Email signup can lack a session before
+confirmation; do not require a login for this initial bind or defer persistence
+until confirmation. A normal login is not authority to attach an arbitrary
+attempt to an existing account. Later evidence reuse requires verified login
+and uses the persisted binding without another capture or freshness check.
+
+Console's server-only `promotion-device-evidence` adapter verifies the existing
+login before retrieval and registration and signs each account request. Its
+optional target user ID is only a consistency constraint; the verified Auth
+result supplies the subject, actor header and body. The separate binding caller
+retains trusted signup provenance before confirmation. Backend assertion tests
+alone do not prove this consumer behavior. Deploy the matching consumer and
+public key together, and keep device enforcement off until the consumer's tests
+establish:
+
+| Case | Required result |
+| --- | --- |
+| Missing, invalid or expired login; Auth verification error | No assertion, evidence request or regional registration |
+| Verified user A with browser actor/body IDs for B, including matching forged IDs | Reject before signing or backend access |
+| Valid login for A with no browser identity fields | Derive all outgoing identity fields from verified A |
+| Browser-supplied promotion bearer token or assertion | Never use it for an outgoing promotion call |
+| Trusted email signup before confirmation, without a session | Bind the server-owned attempt to the actual new account |
+| Google signup callback | Bind only the attempt associated with that verified signup |
+| Existing login months later in another browser, including West entry | Reuse A's original evidence and register in the selected region |
+
+For signer interoperability, the Console producer test can write fresh request
+fixtures to `PROMOTION_ASSERTION_FIXTURE_OUT`. Run
+`TestPromotionAccountConsoleInterop` with `PROMOTION_ASSERTION_FIXTURE_IN` pointing
+to that file within five minutes. It passes the actual Console assertions through
+the backend middleware and handler identity checks for all four operations:
+bind, evidence, register, and create-team. Three-operation fixtures are rejected.
+Checks include forged actor headers and matching forged actor/body IDs, plus
+mutated creation attempt, team, region, and decision fields. The fixture contains a generated test
+public key and assertions, never a private key or real account evidence. This
+test skips without the fixture; an ordinary backend suite pass is not evidence
+that the cross-runtime check ran. Record both producer and verifier execution.
+
+The fixture JSON has `public_key` (base64 Ed25519 public key) and `requests`
+(exactly one entry per operation). Each entry has `operation`, `assertion`
+(fresh EdDSA JWT), `actor` (the verified user UUID), and `body` (the exact JSON
+request). The create-team entry uses this shape with generated test UUIDs:
+
+```json
+{
+  "operation": "create-team",
+  "assertion": "<fresh signed JWT>",
+  "actor": "6a70c7ad-9304-4517-a125-9b633502df08",
+  "body": {
+    "user_id": "6a70c7ad-9304-4517-a125-9b633502df08",
+    "attempt_id": "f9ff68c6-43cc-4fab-97fb-c23481ec3058",
+    "team_id": "958253b4-558f-4ce4-89b7-c752ff4fb748",
+    "name": "example-team",
+    "home_region": "use",
+    "authority_unavailable": true
+  }
+}
+```
+
+Sign `sub=actor`, `operation=create-team`, `attempt_id`, `team_id`,
+`home_region`, and `authority_unavailable`, with the issuer/audience above,
+current `iat`, and `exp` no more than 300 seconds later. The legacy create-team
+operation does not sign `name`; durable prepare/complete operations bind it as
+documented below. The verifier selects the creation fixture's `use` or `usw`
+region and corresponding existing account test bearer. All four assertions must
+use the same generated test key. Generate assertions with the real Console
+signer immediately before verification; stored assertions are not reusable
+validation evidence. The valid request reaches the unavailable database (503);
+each signed-field mutation must fail authentication or provenance checks (403).
+
+The staging, production East, and production West Terraform roots each create
+four cell-specific Secret Manager secrets. `promotion_evidence_enabled` defaults
+to `false` in each root: a normal full apply creates the empty resources without
+attaching them to Cloud Run or requiring secret versions. Apply the shared Auth
+migrations first, then set a password on the `promotion_evidence_proxy` database
+role. Its URL secret must
+connect as that role; the role has only `USAGE` on `public` and `EXECUTE` on the
+four signup-evidence RPCs, with no direct evidence-table privileges. Create
+the empty secret resources with a normal full Terraform apply, then publish an
+enabled version of each through the operator secret workflow. Only after all
+four versions are available, persist `promotion_evidence_enabled = true` in that
+cell's Terraform configuration and apply again to bind their latest versions
+and grant the control-plane runtime access. This integration switch does not
+enable device enforcement. Terraform never stores those values. Keep the capture
+and account tokens different from each other and from `INTERNAL_API_TOKEN`; a
+missing or reused token rejects producer requests. A missing shared Auth
+connection or failed RPC returns `authority_unavailable` and withholds credit.
+
+In production, Terraform also writes the resolved switch to the Cloud Run
+template as `PROMOTION_EVIDENCE_ENABLED`. Both API deployment workflows read
+this explicit value when checking the deployed template: `true` requires all
+four cell-specific secret mappings; `false` permits their omission. Operator
+identity and token checks always apply, and any present promotion mappings must
+still reference the correct cell secrets. Missing or malformed rollout state
+blocks deployment until Terraform is applied; missing secrets never imply a
+disabled rollout. This template value is deployment metadata, not a device
+policy gate.
+
+Before enabling device enforcement in either production region, verify that
+each cell's serving revision has all four secret-backed environment variables,
+that both scoped credentials work only on their own routes, account assertions
+reject unsigned or mismatched actors, and that original evidence can be
+retrieved and published to the selected region. Check both
+regions independently, including delayed West entry. Keep the device policy
+off until these checks and the inherited canonical activation prerequisites
+have passed.
+
+| Operation | Route | JSON input | Result |
+| --- | --- | --- | --- |
+| Create attempt | `POST /internal/promotion/signup/attempts` | Empty body | `attempt_id`, `challenge` |
+| Verify | `POST /internal/promotion/signup/attempts/verify` | `attempt_id`, `challenge`, `event_id`, `fingerprint`, `event_at` | `verified` or `replayed` |
+| Bind | `POST /internal/promotion/account/bind` | `user_id`, `attempt_id` | `bound`, `replayed`, or `first_evidence_retained` |
+| Retrieve | `POST /internal/promotion/account/evidence` | `user_id` | Original bound evidence; `evidence_missing` if absent |
+| Register locally | `POST /internal/promotion/account/register` | `user_id` | `owner` or `owner_conflict` |
+| Register signup | `POST /internal/promotion/account/register-signup` | `user_id`, `attempt_id`, `home_region: "use"` | `owner` or `owner_conflict` |
+
+The registration routes read the original binding from shared Auth itself and
+pass that exact evidence to the regional SQL function. A regional registration
+request cannot provide a new event or Fingerprint. `register-signup` is a
+separate East-only route for the server-owned actual-signup continuation and
+must be called before confirmation; later authenticated regional entry keeps
+using `register`, including delayed West entry. Requests are limited to 4 KiB
+and database work to three seconds; SQL errors are not interpreted as
+eligibility.
+
+### Register-signup provenance, errors, and recovery
+
+The `register-signup` caller may sign only the account and attempt returned by
+the actual newly created Auth account while the original trusted signup
+context remains available. A browser cookie, attempt ID, user ID, or other
+client locator is untrusted input. Ordinary login and a shared-Auth evidence
+lookup can validate a retained `(user, attempt)` pair, but neither can create
+signup provenance or authorize a new assertion. If the trusted signup context
+is unavailable, stop publication rather than minting an assertion from a
+replacement attempt or a later login. An uncertain bind must first recover
+the original bind; after that, retries may use only the original
+account/attempt tuple. If association fails or its outcome cannot be safely
+established after context loss, preserve the account and normal paid access
+and withhold promotional credit; no durable continuation or recovery workflow
+is required.
+
+The route returns `200 {"outcome":"owner"}` or
+`200 {"outcome":"owner_conflict"}` only after the East regional commit.
+It uses the shared error envelope: `400 invalid_request` or
+`400 invalid_evidence` for malformed input, `401` for scoped
+producer-credential failure, `403 forbidden` for signed/body/actor/region/
+provenance mismatch, `404 evidence_missing` when the retained binding is
+absent, `409 evidence_conflict` for immutable regional evidence conflict, and
+`503 authority_unavailable` for unavailable pools, timeouts, or database
+failure.
+Malformed requests, mismatches, and immutable conflicts are terminal for that
+tuple. A transport or `503` result may be retried only with the same trusted
+tuple; a successful commit whose response was lost is replayed idempotently.
+The route never creates a team, grant, entitlement, balance, or redemption.
+
+Deploy the additive backend and its public-key configuration before deploying
+the matching signup consumer. Before exposing the flow, consumer tests and
+separately authorized staging verification must demonstrate actual-new-account
+provenance, exact-tuple retry while trusted context remains, response-loss
+handling, rejection of ordinary-login substitution, fail-closed behavior after
+context loss, and independent East/West behavior. No durable continuation or
+recovery workflow is required. Keep publication stopped until those checks
+pass.
+
+The control-plane routes above invoke the following shared Auth operations:
+
+1. `create_signup_device_attempt()` before Fingerprint capture. It returns an
+   unpredictable attempt UUID and challenge UUID. Only the challenge is sent to
+   the browser as Fingerprint event metadata.
+2. Console looks up the provider event on its server, verifies that the event
+   belongs to this challenge, and calls
+   `verify_signup_device_attempt(attempt, challenge, event_id, fingerprint,
+   event_at)`. The database additionally checks challenge equality, a 30 minute
+   attempt window, a five minute event freshness window and unique event ID.
+   An event ID or browser supplied metadata alone is never acceptable input.
+   Identical verification replays; a changed event or reused event fails.
+3. After the Auth signup call returns the new Auth user's ID, Console calls
+   `bind_signup_device_account(attempt, user_id)`. The caller must bind the ID
+   from that trusted server result, never an email lookup or browser parameter,
+   and sign the matching account/attempt assertion for the bind route.
+   The function checks `auth.users` creation time against the attempt and
+   serializes same account attempts. The first verified attempt bound to the
+   account wins. A missing observation leaves the account unbound so a later
+   valid attempt can win. Binding may occur before email confirmation.
+4. Console retrieves durable evidence via
+   `get_signup_device_account_evidence(user_id)` using the authenticated
+   server side Auth principal. It must check that the requested ID is the
+   current authenticated principal. This works after cookie loss, delayed
+   confirmation, and later West team creation from another browser. The source
+   returns one original attempt ID, event ID, exact case sensitive Fingerprint,
+   original event time and binding time. Initial event freshness is checked
+   only at verification. Retrieval has no event age limit.
+
+The shared Auth database credential is kept by the control plane. These RPCs
+and tables grant no access to `anon` or `authenticated`.
+A missing shared source, failed provider lookup, failed actor check, or ambiguous
+binding withholds promotional credit; it does not block signup, team creation or
+normal paid access. Console must not infer evidence from cookies, visitor IDs,
+editable Auth user metadata or telemetry. Provider attestation field details
+belong to the Console integration; it must compare the provider's event metadata
+with the issued challenge and use the provider's server result.
+
+## Regional publication and claims
+
+Apply `20260927003551_regional_promotion_device_authority.sql` in **each**
+regional database. Console first publishes the existing canonical Auth identity
+observation, then obtains the shared original device evidence and calls
+`register_promotion_signup_device(user_id, source_attempt_id, source_event_id,
+fingerprint)` in the selected region. All inputs come from the server's durable
+shared source and authenticated principal. This is also required before an
+explicit West team creation months later. No East promotion result or owner is
+sent to West; there is no East backend lookup from West. Publication is safe to
+retry: `owner` means this account owns the regional Fingerprint,
+`owner_conflict` means another account committed first, and conflicting account
+or event evidence raises an error. Both owners and losers retain their original
+account evidence locally. Registration grants no money and consumes no bonus.
+The first regional insert commits independently of any later grant attempt, so
+an abandoned signup, failed award or account deletion cannot transfer ownership.
+
+`promotion_device_decision(user_id, promotion)` returns `eligible`,
+`evidence_missing`, `owner_conflict`, `device_already_redeemed` or
+`device_reservation_pending` for promotion
+`signup` or `stripe`. SQL errors mean authority unavailable or invalid
+configuration and must withhold credit. The caller must not substitute its own
+Fingerprint, and must always consult this durable lookup even when its input
+omits evidence. Tenant responses may use these reason codes but must never
+include a Fingerprint, another user ID, event ID or raw identity.
+
+`claim_team_signup_trial_with_device(team_id, user_id)` calls the existing local
+claim transaction and records a device grant only when the existing claim
+actually awards money. Its no-grant outcome leaves the device entitlement
+unconsumed. The caller must invoke it inside initial regional team creation
+before award. `reserve_stripe_promotion_with_device(team_id, user_id, event_id,
+subscription_id, checkout_generation, has_checkout_generation)` checks device
+eligibility before the existing durable local reservation. An existing pending
+reservation replays through the original reservation function without applying
+a newly changed policy. `device_reservation_pending` withholds a new reservation
+while another account's grant on the same device remains unresolved. The reservation
+pins the original Fingerprint in the regional entitlement row; release
+allows a later retry. Finalization records actual Stripe issuance in
+`promotion_device_grant` in the same regional transaction by calling
+`record_stripe_promotion_device_grant(team_id, user_id)` and retains
+the existing actor, evidence and checkout-generation pins. It must
+not contact Stripe before a durable reservation or release an uncertain attempt.
+
+The existing `claim_team_signup_trial` entry point now routes through the device
+claim. Explicit team creation and legacy completion triggers use the same
+decision. A promotion authority error completes an initial claim with
+`promotion_ineligible` and `authority_unavailable` without awarding credit or
+aborting team creation. Existing Stripe reservation signatures also route
+through the device reservation before external credit. A promotion authority
+error skips the credit while paid activation continues. Finalization records
+the device grant with the settled Stripe grant in one regional transaction.
+Recoverable or uncertain external attempts retain their reservation.
+An ambiguous database transport failure during reservation is retried because
+its commit state cannot be inferred from the lost response.
+For a completed paid activation with a promotion reservation denial, the webhook writes
+`stripe_promotion_outcome` in the same transaction as activation and webhook
+completion. The row is keyed by Stripe event ID and contains the team, actor,
+`promotion_ineligible`, and a safe reason: `ineligible`, `user_already_redeemed`, `owner_conflict`,
+`device_already_redeemed`, `evidence_missing`, `device_reservation_pending`, or
+`authority_unavailable`. A contended `blocked` reservation retries the webhook
+and has no completed outcome. `user_already_redeemed` comes from the atomic
+reservation check of the actor's settled entitlement. Missing canonical evidence
+and migration fences remain `ineligible`; they do not confirm prior redemption.
+
+`POST /internal/promotion/account/signup-eligibility` accepts `user_id` under
+the account credential and matching `X-Actor-User-Id` header. Call it in East
+after trusted account binding and regional registration, before the original
+signup notification. It returns `ownership` (`owner`, `another_owner`, or
+`evidence_missing`), a policy-aware `device_decision`, and `eligibility` with
+a safe `reason`. `eligibility=unknown` covers pending team checks and unresolved
+canonical evidence, including pre-confirmation identity. This snapshot creates
+no grant, claim, or reservation. The $5 claim rechecks authority atomically.
+The response contains no Fingerprint or other account identifier.
+
+The `promotion_device_policy` row starts with D=off and E=off. The canonical C
+gate remains the existing `promotion_identity_enforcement` authority. A
+configuration with C=off and either D or E on is invalid. Once C is on,
+`set_promotion_device_policy(D)` defaults E to the same value, while the
+two-argument form permits all four D/E combinations. D=off bypasses device
+denial only; registration and actual-grant recording continue. Missing evidence
+creates no owner. Policy changes never delete ownership, grants or pending
+reservations. Existing balances, claims and reservations are untouched, with
+no historical device reconstruction or cross-region financial reconciliation.
+
+Deploy the shared source and each regional schema before its Console producer
+and grant path integration. Verify initial East publication and later West
+publication independently. Keep enforcement off in a region until its canonical
+readiness, producer coverage, and every local grant writer have been verified.
+
+## Atomic team creation after registration failure
+
+`POST /internal/promotion/account/create-team` is the trusted Console boundary
+for initial regional team creation. Call it after the registration attempt,
+including when registration or its authority evaluation fails. Do not create the
+team through a separate insert in that failure case: previously accepted regional
+evidence could otherwise authorize a grant.
+
+The route requires the account bearer credential, matching `X-Actor-User-Id`,
+and an EdDSA account assertion as specified above, with `operation=create-team`.
+In addition to `sub`, sign `attempt_id`, `team_id`, `home_region`, and the required
+boolean `authority_unavailable`. The selected backend verifies every signed field
+against the request and requires `home_region` to equal its `SANDBOX_ID_REGION`,
+with the existing East (`use`) default where tagged sandbox IDs are not enabled.
+Production home regions are `use` and `usw`. `attempt_id` is a new server-generated creation attempt UUID,
+separate from the original signup-evidence attempt; `team_id` is a new
+server-generated team UUID. Neither UUID can be repurposed after acceptance.
+
+Request body:
+
+```json
+{
+  "user_id": "<verified Auth user UUID>",
+  "attempt_id": "<server-generated creation attempt UUID>",
+  "team_id": "<server-generated team UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true
+}
+```
+
+Console derives the actor from its trusted signup result or verified login,
+retains the attempt and team IDs across retries, and derives the boolean only
+from its server-side registration/authority result. Never accept a browser
+eligibility flag or forward browser promotion credentials. Sign `true` for an
+unavailable or ambiguous authority result, even if a previous registration
+succeeded. Missing evidence alone follows the evidence-required policy; confirmed
+ownership denial follows the ordinary regional claim checks. Sign `false` after
+successful registration, including `owner_conflict`; the claim still checks all
+canonical, user, team and device rules. The signed boolean can only withhold
+credit; `false` never authorizes a grant by itself.
+
+The backend calls the service-role-only SQL function:
+
+```sql
+create_team_with_promotion_attempt(
+  p_attempt_id uuid, p_team_id uuid, p_user_id uuid,
+  p_name text, p_home_region text, p_authority_unavailable boolean
+) RETURNS TABLE(team_id uuid, outcome text, reason text)
+```
+
+The binding, team insert, existing signup claim, and result commit in one regional
+transaction. A signed unavailable decision records `promotion_ineligible` /
+`authority_unavailable` before saved evidence can grant credit. It consumes no
+user, canonical or device entitlement. Success returns HTTP 200 with `team_id`,
+`outcome`, and `reason`; Console then continues its existing membership/owner
+provisioning using that team ID. This endpoint does not grant membership, bypass
+independent signup restrictions, or activate billing.
+
+Exact retries return the original result, including the original `granted`
+outcome, without another grant. Renew an expired assertion with the same binding
+and boolean. A changed actor, team, attempt, region, name or decision is rejected;
+a new attempt cannot adopt an existing team. Bindings and results have no expiry
+and survive account/team deletion; replay never recreates a deleted team. A
+previously unavailable attempt stays at zero credit after authority recovers.
+Unrelated database/provisioning failures abort the transaction and retain normal
+retry behavior; a lost response requires retrying the exact request. Do not
+switch to an ordinary team insert or generate a replacement attempt on error.
+
+`signup-eligibility` also requires a signed account assertion, with that exact
+operation and no attempt ID. It remains a non-issuing snapshot and does not
+replace the atomic creation boundary.
+
+### Integration reference and validation handoff
+
+The authentication and migration prerequisite consumed locally is
+`cc02819176cbd22941303d3a5a2520caea113805` from public PR #579, based on
+`c3b138e85abd6b26fab9e441d1de31b5fe6072d5`. Its promotion changes are integrated
+as a local content delta from the previously consumed revision, preserving the
+enforcement changes; the historical and squashed series are not both merged.
+The regional migration names follow that revision; the grant integration migrations follow the entire
+prerequisite chain. Do not apply both the superseded migration IDs and their
+renamed replacements. This is a pre-activation integration, not a deployed
+migration-history repair.
+
+The creation regression is `TestIntegration_TrustedTeamPromotionAttempt`, covering
+prior regional evidence plus a failed registration HTTP call, exact no-credit
+replay after registration recovers, successful registration/grant, forged or
+mismatched inputs, and retained results after team/account deletion.
+`TestPromotionAccountAssertions` covers signed creation bindings and rejects
+missing, expired, forged, or mismatched assertions before database access.
+`TestIntegration_PromotionPolicyContentionPreservesProvisioning` holds a real
+policy-row lock across explicit team creation and legacy owner assignment.
+`TestIntegration_TrustedTeamPromotionAttemptPrivilegesAndGrantFailure` checks
+RPC/table access and preservation of unrelated grant-error retries.
+
+Run these tests against the resulting backend revision before rollout. The
+historical bind/evidence/register-only fixtures do not prove the creation
+boundary works end to end. The interoperability verifier now requires the
+signed create-team fixture above. Console must also implement and
+verify the creation call sequence and signed fields above, including failure
+with prior evidence and replay after authority recovers. Enforcement stays off
+until that selected region's consumer and backend validation are recorded.
+
+## Durable preparation and recovery of team creation
+
+New consumers use four POST routes under `/internal/promotion/account/`:
+`prepare-team`, `recover-team`, `complete-team`, and `discover-team-creations`.
+All require the existing account bearer token, `X-Actor-User-Id`, and
+`X-Promotion-Account-Assertion`. Sign with Ed25519 using the existing adapter
+key; issuer is `promotion-auth-adapter`, audience is `promotion-account`, subject
+is the verified actor UUID, and `iat`/`exp` must define a positive lifetime of at
+most five minutes. The actor header and body `user_id` must match the subject.
+Do not expose signing or bearer credentials to the browser. The local region
+must match `home_region` (`use` or `usw`, with the existing East fallback).
+
+The browser or trusted caller generates a random nonzero UUID `operation_id`
+**before sending prepare**. It is only an opaque locator, never eligibility or
+actor authority. Retain it in the initiating navigation/form state before
+sending the request; it need not live in a Console database or a response cookie.
+Initial signup creation and each explicit intentional creation get distinct
+locators, even for the same actor/name. Retries reuse the original locator.
+Never allocate a new one automatically because of timeout, restart, or conflict.
+The creation `attempt_id` is distinct from the original Fingerprint attempt.
+
+### Prepare
+
+`POST /internal/promotion/account/prepare-team` accepts exactly:
+
+```json
+{
+  "user_id": "<verified actor UUID>",
+  "operation_id": "<pre-request random UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true
+}
+```
+
+The signed payload contains the standard claims above plus:
+
+```json
+{
+  "operation": "prepare-team",
+  "operation_id": "<same pre-request random UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true
+}
+```
+
+The trusted server derives the decision from its registration/authority result
+using the rules in the atomic-creation section above. In particular, failed or
+ambiguous publication signs `true` even with prior accepted regional evidence;
+`false` does not authorize a grant. No new Fingerprint capture is involved.
+Name must be nonblank and at most 256 UTF-8 bytes. Prepare commits a regional
+private attempt row with new backend-generated attempt and team UUIDs, the
+actor, locator, exact name, region, and boolean. It creates no team or credit.
+An exact retry returns that same row; any changed durable binding conflicts.
+
+Prepare, recover, and complete return HTTP 200 with this common shape:
+
+```json
+{
+  "operation_id": "<original locator>",
+  "attempt_id": "<backend creation attempt UUID>",
+  "team_id": "<backend team UUID>",
+  "user_id": "<original actor UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true,
+  "created_at": "<original database timestamp>",
+  "state": "prepared",
+  "outcome": null,
+  "reason": null
+}
+```
+
+`state` is `prepared` before dispatch, `completed` after committed creation,
+and `deleted` when a completed operation's team no longer exists. Completed and
+deleted responses retain the original `outcome`/`reason`, including `granted`
+where applicable; that is historical evidence, not a new grant. Rows have no
+expiry or deletion cascade. Recovery does not restore a deleted team.
+
+### Recover and dispatch
+
+`POST /internal/promotion/account/recover-team` accepts `user_id`, `operation_id`,
+and `home_region`. Sign `operation=recover-team`, `operation_id`, and
+`home_region` alongside the standard claims. It needs neither the original
+boolean nor any cookie/IDs from the prepare response. After an uncertain
+prepare response or process restart, recover first and use the stored decision.
+If no row exists, retry prepare with the original locator; do not dispatch until
+preparation succeeds. Repeating publication is not needed for a recovered row
+and must never replace its pinned decision.
+
+`POST /internal/promotion/account/complete-team` accepts `user_id`,
+`operation_id`, `attempt_id`, `team_id`, `name`, `home_region`, and
+`authority_unavailable`, exactly as recovered. Sign `operation=complete-team`
+and every listed field except `user_id` (which is bound by `sub`). The existing
+atomic creation RPC consumes the prepared row. All tuple changes conflict,
+including changes made with a freshly signed assertion. On `completed`, continue
+existing membership/owner provisioning with the recovered team ID. On `deleted`,
+report the retained deletion; do not provision or recreate that team.
+
+Prepare and dispatch are separate committed transactions. A failed dispatch
+rolls back its team/grant work but keeps preparation. A lost completion response
+is recovered or retried with the same tuple and renewed short-lived assertion.
+Authentication is renewable; durable identity and the decision are immutable.
+Concurrent calls for one locator share the same row lock and outcome. Distinct
+locators do not coalesce or introduce global actor locks beyond existing grant
+checks. No Stripe calls or sandbox startup/resume work are added.
+
+### Lost-locator discovery
+
+If all initiating state is lost, use
+`POST /internal/promotion/account/discover-team-creations` with `user_id` and
+`home_region`; optionally include `after` with the last response's `next_cursor`.
+Sign `operation=discover-team-creations`, `home_region`, and `after` if supplied.
+Do not send attempt/team IDs, a name, or a decision. Response:
+
+```json
+{
+  "state": "selection_required",
+  "operations": ["<up to 50 objects in the common response shape>"],
+  "next_cursor": "<UUID for the next page, or null>"
+}
+```
+
+Results are indexed by actor, region, and locator and ordered by locator UUID,
+not recency. Always require explicit operation selection; never infer identity
+from name or select the newest record. `selection_required` is returned even
+for zero or one candidate. Concurrent insertions before a pagination cursor may
+require restarting discovery from the first page. Discovery includes completed
+and deleted operations and excludes legacy rows without a locator. It cannot
+recover pre-migration legacy IDs; those callers retain their existing retry
+contract. It never dispatches a team or changes a credit decision.
+
+### Errors, RPC boundary, and rollout
+
+Malformed, unknown-field, or over-4096-byte bodies receive HTTP 400
+`invalid_request`. Missing/wrong bearer credentials receive 401. Invalid,
+expired, mismatched, or wrong-region signed provenance receives 403 `forbidden`.
+A missing locator on recover/complete receives 404 `creation_missing` (an
+operation UUID is still required in the request). A durable binding conflict
+receives 409 `creation_conflict`; the response reveals no stored tuple. A team
+name collision also receives 409 `creation_conflict`, with message
+`team name already exists` instead of `team creation binding conflict`; the
+operation retains its prepared tuple. An unavailable database or retryable
+transaction failure receives 503
+`authority_unavailable`. Do not interpret that transport error as permission to
+change a persisted boolean. Existing legacy route error semantics are unchanged.
+
+The API invokes these service-role-only security-definer RPCs:
+
+```sql
+prepare_team_promotion_creation(uuid, uuid, text, text, boolean) RETURNS jsonb
+-- operation_id, user_id, name, home_region, authority_unavailable
+recover_team_promotion_creation(uuid, uuid, text) RETURNS jsonb
+-- operation_id, user_id, home_region
+complete_team_promotion_creation(uuid, uuid, uuid, uuid, text, text, boolean) RETURNS jsonb
+-- operation_id, attempt_id, team_id, user_id, name, home_region, authority_unavailable
+discover_team_promotion_creations(uuid, text, uuid) RETURNS jsonb
+-- user_id, home_region, nullable after
+```
+
+RPC access is trusted server authority, not a substitute for the HTTP assertion
+boundary. Direct access to the private attempt table remains revoked for
+`anon`, `authenticated`, and `service_role`. Recover/complete return SQL NULL for
+an unknown locator; binding conflicts use SQLSTATE `23505`. Preparation input
+validation uses `22023`. Discovery returns only the requested actor/region.
+
+Apply `20260930000002_durable_team_creation_recovery.sql` in each regional
+schema before deploying the new API, then adopt the new consumer sequence. No
+shared Auth schema or new secret is required. The migration only adds a nullable
+unique locator, an indexed discovery path, and RPCs. It performs no historical
+reconstruction and changes no policy flags, grants, balances, evidence,
+reservations, Checkout generations, or old RPC signatures. Old API instances can
+still complete an exact prepared tuple through the existing creation RPC; new
+recovery reads its original result. New consumers must not silently fall back
+to allocating a legacy attempt when these routes are unavailable.
+
+The focused coverage is `TestPromotionAccountAssertions`,
+`TestIntegration_DurableTeamCreationRecovery`,
+`TestIntegration_DurableTeamCreationConcurrency`, and
+`TestIntegration_DurableTeamCreationRollbackAndPrivileges`, together with the
+existing trusted-attempt and promotion integration suites. Validation and an
+exact published backend revision must be recorded at release handoff before
+consumer adoption; this contract does not claim those tests ran or certify
+consumer readiness. Enforcement remains off. Checkout publication-failure
+fencing is a separate contract and is not supplied by these routes.
+
+## Checkout publication decisions
+
+`POST /stripe/checkout-session/publication-decision` creates or retries a Checkout
+with a trusted publication decision. It requires the existing customer
+credential in `X-API-Key`, its authenticated actor, and `billing:write` permission on the
+credential's team. It also requires `X-Promotion-Account-Assertion`, signed by
+the server-only account adapter using the existing Ed25519 key whose public
+half is configured as `PROMOTION_ACCOUNT_PUBLIC_KEY`. The customer credential
+does not authorize choosing a credit decision. `X-Actor-User-Id` cannot override
+its actor. No new shared secret or direct private-table access is needed.
+
+The trusted adapter determines publication success or failure from its own
+backend publication result, never a browser eligibility flag. Choose
+`publication_failed` when publication failed or its authority is unavailable.
+Choose `standard` to retain the ordinary backend eligibility checks; this value
+is not a credit grant or an eligibility assertion. Neither choice requires a
+new Fingerprint capture.
+
+Generate a random UUID `operation_id` before sending the first request, and
+retain that locator in the initiating flow so retries after a lost response can
+reuse it. It is not a credential. Do not generate a replacement locator merely
+because a request timed out. A renewed assertion must carry the same intent,
+actor, team, region, decision, and request parameters.
+
+Example request body (maximum 4096 bytes; unknown fields are rejected):
+
+```json
+{
+  "operation_id": "a85c8c2c-4d61-4b41-9fb8-e83c66b0df3c",
+  "home_region": "use",
+  "decision": "publication_failed",
+  "success_url": "https://example.com/billing/success",
+  "cancel_url": "https://example.com/billing/cancel"
+}
+```
+
+The redirects must be allowed by the regional API's existing billing redirect
+configuration. The signed JWT has algorithm `EdDSA` and these claims:
+
+```json
+{
+  "iss": "promotion-auth-adapter",
+  "aud": "promotion-account",
+  "sub": "48c66f8c-824e-4cfb-9f61-0ca3b2790631",
+  "iat": 1790769600,
+  "exp": 1790769900,
+  "operation": "checkout",
+  "team_id": "8107b213-41c3-4779-8e8f-701ecb0e57f9",
+  "operation_id": "a85c8c2c-4d61-4b41-9fb8-e83c66b0df3c",
+  "home_region": "use",
+  "decision": "publication_failed",
+  "success_url": "https://example.com/billing/success",
+  "cancel_url": "https://example.com/billing/cancel"
+}
+```
+
+Use current `iat` and `exp` values, with a positive lifetime no longer than five
+minutes. `sub` and `team_id` must exactly match the customer credential's actor
+and team. All five body fields must match the signed claims. `home_region` must
+match the receiving cell (`use` or `usw`; untagged East uses `use`). Do not include
+team-creation `attempt_id` or `authority_unavailable` claims.
+
+HTTP 200 returns the existing Checkout response shape:
+
+```json
+{"id":"cs_example","url":"https://checkout.stripe.com/example"}
+```
+
+The database commits the original payer, operation ID, local region, normalized
+request key, generation timestamp, and decision atomically before session
+creation. The request key includes the operation ID and the existing customer,
+redirect, and price inputs. Concurrent identical retries use one generation and
+one Stripe idempotency key. Different intents cannot replace an open generation,
+including when Stripe created a session but the response was lost. A request
+cannot retrofit a decision onto a legacy generation or change an existing
+trusted generation's decision. No-credit generations do not require a captured
+promotion identity pin, even if previous valid evidence remains stored.
+
+Retries after a lost Stripe response or failed local session write use this same
+route, body, credential, and a renewed assertion. They retain the original
+expiration and financial decision. The existing
+`POST /stripe/checkout-session/recover` accepts `{}` or the original
+`checkout_generation` timestamp with the customer credential. It retrieves an
+already-recorded session without creating one, and can recover a no-credit
+session with no evidence pin. If no session was recorded, repeat the original
+signed creation request. Recovery does not choose or change a decision.
+
+The existing 23-hour create-retry window, session expiration, pending attempts,
+ambiguous outcomes, and confirmed-expiration cleanup rules still apply. Once a
+generation is retired (including a definitive create failure), its operation ID
+is permanently closed and cannot allocate another session. An explicitly new
+operation may proceed only when the existing subscription and reservation fences
+permit it. The record is retained after lease cleanup and team deletion.
+
+Errors use the existing JSON error envelope:
+
+| HTTP | Code | Meaning / next action |
+| --- | --- | --- |
+| 400 | `invalid_request` | Malformed, oversized, or unknown-field body; correct the input. |
+| 400 | `bad_request` | Missing/invalid redirect; use an allowed redirect. |
+| 401 | existing customer-auth error | Renew the customer credential. |
+| 403 | `forbidden` | Invalid/expired assertion, mismatched signed binding, missing billing permission, or shadow billing; do not dispatch through a legacy route. |
+| 409 | `conflict` | Different/closed intent, changed decision/parameters/payer, existing generation, reservation, or established subscription; recover the original operation. |
+| 500 | `internal_error` | Database/persistence failure; retry the identical operation, since commit or Stripe creation may already have succeeded. |
+| 502 | `bad_gateway` | Stripe create failed; retain the original intent and uncertainty fence. |
+| 503 | `service_unavailable` | Required billing configuration unavailable. |
+
+An unavailable route on an old API is not permission to fall back to legacy
+creation. The legacy route rejects these decision fields on upgraded servers;
+its ordinary existing requests remain compatible.
+
+### Reservation, callbacks, and rollout
+
+The regional `stripe_checkout_publication_decision` table is immutable, keyed by
+team/generation with a unique operation locator. A separate append-only
+`stripe_checkout_publication_subscription` association survives lease cleanup.
+Reservation checks consult these records under the existing user reservation
+lock, before identity/device lookup. A `publication_failed` decision returns the
+existing `authority_unavailable` reservation denial and records that reason in
+`stripe_promotion_outcome`. Paid activation proceeds without a credit reservation
+or Stripe grant. Restored evidence, duplicate/out-of-order webhooks, callbacks
+without repeated generation metadata, and old event-only reservation calls
+cannot upgrade that generation. The retained decision table distinguishes
+publication failure from other authority failures for trusted database operators.
+Existing matching reservations replay before the new denial check; other pending
+financial obligations remain retryable and are never released by this decision.
+An invoice or subscription-ID projection does not establish generation ownership.
+Only verified Checkout association writes populate the retained subscription
+table. For teams with publication decisions, subscription callbacks without
+generation metadata or a retained association defer credit with
+`authority_unavailable` while preserving paid activation and existing obligations.
+Server-created generations retain their actor and captured identity evidence in
+`stripe_checkout_generation_authority`, including generations created by older
+API writers. Legacy callbacks remain eligible through this retained generation
+and verified subscription association; mutable invoice projections cannot prove
+ownership. Existing generation facts are preserved at migration time without
+reconstructing promotion decisions. Unmatched callbacks remain fenced. Migration
+copies and verifies all three immutable tables before exposing the billing account's customer routing,
+including during interrupted copies and retries, and rejects an unresolved
+Checkout lease before committing the source migration fence. Checkout
+admission and retry also check that fence after acquiring the billing-account lock,
+including writes from older API instances.
+
+Retry bookkeeping holds at most 32 attempt IDs. Compaction permanently records
+that an older request may have reached Stripe; a later definitive failure cannot
+release that uncertainty. Replays retain the original generation, actor, decision,
+and Stripe idempotency key within the existing 23-hour replay deadline.
+
+Trusted service-role RPCs are:
+
+```text
+begin_stripe_checkout_with_publication_decision(uuid, uuid, uuid, text, text, text, uuid) RETURNS void
+-- team_id, user_id, operation_id, home_region, backend request_key, decision, attempt_id
+stripe_checkout_publication_failed(uuid, timestamptz, uuid) RETURNS boolean
+-- team_id, generation, original user_id
+```
+
+The API calls the begin RPC and reads the account in one transaction, committing
+before Stripe session creation. The RPC reports binding/closed-generation
+conflicts as SQLSTATE `23505`, invalid inputs as `22023`, and retries a live exact
+intent without recapturing evidence. Direct table privileges are revoked for
+`anon`, `authenticated`, and `service_role`; no browser RPC access is granted.
+
+Apply `20261002000132_checkout_publication_decision.sql` and then
+`20261002000201_checkout_publication_reservation_fence.sql` in both regional
+schemas before deploying the API; only then adopt the signed consumer route. The
+first migration stores the immutable generation decision and subscription
+association, while the second installs the locked reservation recheck that
+enforces those records for webhook and recovery paths. Together they add no
+historical decisions and change no balances, evidence, ownership, consumption,
+existing reservations, policy switches, or old RPC signatures. Legacy generations
+have no decision row and retain their behavior when their server-side account
+association proves the callback. Database reservation enforcement
+and subscription retention also protect new generations processed by old webhook
+readers, using their existing denial vocabulary. Old API recovery may reject a
+no-credit generation's missing evidence pin; route those recoveries to an upgraded
+API. Keep enforcement OFF; no deployment or activation is part of this change.
+
+Coverage is authored in `TestPromotionCheckoutAssertion` and
+`TestIntegration_BillingCheckoutPublication*`, alongside the existing Checkout
+retry/recovery, activation, revocation, and promotion reservation suites. These
+are test targets, not execution claims. The release handoff must include the
+exact published backend revision and canonical validation evidence before this
+consumer dependency is declared ready. Backend readiness does not certify the
+consumer integration.

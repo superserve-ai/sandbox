@@ -49,6 +49,22 @@ func restartUnit(ctx context.Context, unit string) error {
 	return nil
 }
 
+// setUnitWeight sets a unit's CPU and IO scheduling weight at runtime.
+// --runtime applies to the live unit and persists until restart, so it
+// survives daemon-reloads without the never-restarted keeper dropping back to
+// the unit file's boot default. Both controllers share one weight — the two
+// populations contend for CPU and IO the same way. A var for the test seam.
+var setUnitWeight = func(ctx context.Context, unit string, weight int) error {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "systemctl", "set-property", "--runtime", unit,
+		fmt.Sprintf("CPUWeight=%d", weight), fmt.Sprintf("IOWeight=%d", weight))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("set-property %s weight=%d: %s: %w", unit, weight, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // stopJobWaitCap bounds the wait for a stop job's completion signal when the
 // caller's ctx allows more. A legitimate stop can take two full TimeoutStopSec
 // windows (SIGTERM phase, then a second window after SIGKILL) plus ExecStopPost,
@@ -332,7 +348,7 @@ func stopUnitWithBudget(ctx context.Context, unit string) error {
 // Detached and bounded. Confirmation requires the unit FULLY down, not
 // merely deactivating: the caller releases the record and namespace on
 // true, and a D-state process can survive the SIGKILL inside a
-// deactivating unit. A var for the same test seam vmUnitDead uses.
+// deactivating unit. A var for the same test seam vmDeadForRetry uses.
 var killUnitSIGKILL = func(ctx context.Context, unit string) bool {
 	kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -411,17 +427,42 @@ func unitDefinitelyDead(ctx context.Context, unit string) bool {
 	return errors.As(err, &exitErr)
 }
 
+// listActiveFCUnits is ReattachAll's seam over the systemd unit lister:
+// tests stub it (real systemd is unavailable there), and the
+// conclusiveness gate on pressure publication depends on its outcome.
+// Defaults to the LIVE-state lister — the gate must see transitional
+// units, not only active ones.
+var listActiveFCUnits = listLiveFirecrackerUnits
+
 // listActiveFirecrackerUnits returns the sandbox IDs of all running
-// firecracker@ units. Used during startup reattach. It lists
+// firecracker@ units. Used by the reconciler's orphan sweep. It lists
 // ActiveState=active only — a unit mid-deactivating is invisible here, which
 // is why processSettleWindow independently blankets the post-start period:
 // the scan catches indefinitely-alive orphans, the clock covers wind-downs
 // the scan can't see.
 func listActiveFirecrackerUnits(ctx context.Context) ([]string, error) {
+	return listFirecrackerUnitsByState(ctx, []string{"active"})
+}
+
+// fcLiveUnitStates are every unit state that can still contain a live
+// Firecracker process. The pressure gate's orphan scan uses this set, not
+// plain "active": a recordless unit caught mid-activation or
+// mid-deactivation across a vmd restart still holds memory and CPU, and
+// a scan that cannot see it would open publication over an unrepresented
+// VM.
+var fcLiveUnitStates = []string{"active", "activating", "deactivating", "reloading"}
+
+// listLiveFirecrackerUnits lists firecracker@ units in ANY state that can
+// contain a live process; the pressure gate's scan.
+func listLiveFirecrackerUnits(ctx context.Context) ([]string, error) {
+	return listFirecrackerUnitsByState(ctx, fcLiveUnitStates)
+}
+
+func listFirecrackerUnitsByState(ctx context.Context, states []string) ([]string, error) {
 	var units []sddbus.UnitStatus
 	if err, ok := sdbusDo(func(c *sddbus.Conn) error {
 		var e error
-		units, e = c.ListUnitsByPatternsContext(ctx, []string{"active"}, []string{"firecracker@*.service"})
+		units, e = c.ListUnitsByPatternsContext(ctx, states, []string{"firecracker@*.service"})
 		return e
 	}); ok {
 		if err != nil {
@@ -438,7 +479,7 @@ func listActiveFirecrackerUnits(ctx context.Context) ([]string, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, "systemctl", "list-units",
-		"firecracker@*.service", "--state=active", "--no-legend", "--plain")
+		"firecracker@*.service", "--state="+strings.Join(states, ","), "--no-legend", "--plain")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("list firecracker units: %w", err)

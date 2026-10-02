@@ -7,11 +7,26 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 const telemetryHostIDKey = "telemetry_host_id"
+
+// telemetryResultKey carries a handler's own verdict on the request when the
+// status code alone would misreport it.
+const telemetryResultKey = "telemetry_result"
+
+// telemetryDeferredKey marks a request whose lifecycle transition the handler
+// records itself, once the work it detached has decided: the answer it sent
+// only accepted the operation.
+const telemetryDeferredKey = "telemetry_deferred"
+
+// phaseSeriesOwnedKey marks that a handler's deferred phase emission owns
+// this request's samples (set by PhaseStart, read by APIKeyAuth's fallback).
+const phaseSeriesOwnedKey = "phase_series_owned"
 
 type telemetryRecorderHolder struct {
 	recorder telemetry.Recorder
@@ -54,6 +69,39 @@ func SetTelemetryHostID(c *gin.Context, hostID string) {
 	}
 }
 
+// SetTelemetryResult overrides the result the route-level lifecycle metric
+// derives from the status code, for an answer whose code does not say how
+// the operation went (a 202 for a pause the host never answered).
+func SetTelemetryResult(c *gin.Context, result string) {
+	if c != nil && result != "" {
+		c.Set(telemetryResultKey, result)
+	}
+}
+
+// DeferTelemetry keeps the route-level lifecycle metric from scoring this
+// request: the handler records the transition itself when its detached work
+// has an outcome and a duration worth the name.
+func DeferTelemetry(c *gin.Context) {
+	if c != nil {
+		c.Set(telemetryDeferredKey, true)
+	}
+}
+
+func telemetryDeferred(c *gin.Context) bool {
+	v, ok := c.Get(telemetryDeferredKey)
+	deferred, _ := v.(bool)
+	return ok && deferred
+}
+
+func telemetryResult(c *gin.Context) string {
+	if v, ok := c.Get(telemetryResultKey); ok {
+		if result, _ := v.(string); result != "" {
+			return result
+		}
+	}
+	return lifecycleResult(c.Writer.Status())
+}
+
 func telemetryHostID(c *gin.Context) string {
 	if c == nil {
 		return ""
@@ -66,6 +114,32 @@ func telemetryHostID(c *gin.Context) string {
 	return hostID
 }
 
+func sandboxLogger(sandboxID, hostID string) zerolog.Logger {
+	return sandboxLoggerFrom(log.Logger, sandboxID, hostID)
+}
+
+func sandboxLoggerFrom(base zerolog.Logger, sandboxID, hostID string) zerolog.Logger {
+	return base.With().
+		Str("sandbox_id", sandboxID).
+		Str("host_id", hostID).
+		Logger()
+}
+
+// PhaseStart returns the auth middleware's start stamp when present, so
+// handler phase totals cover a slow auth cache miss (the auth phase must
+// never exceed its own request's total). Falls back to now.
+func PhaseStart(c *gin.Context) time.Time {
+	// Mark the phase series as handler-owned so the auth middleware's
+	// abort-path emission stays silent — only one of the two ever emits.
+	c.Set(phaseSeriesOwnedKey, true)
+	if v, ok := c.Get("auth_start"); ok {
+		if t, ok := v.(time.Time); ok {
+			return t
+		}
+	}
+	return time.Now()
+}
+
 func RecordSandboxTransition(ctx context.Context, operation, result, hostID string, duration time.Duration) {
 	currentTelemetryRecorder().RecordSandboxTransition(ctx, telemetry.SandboxTransition{
 		Operation: operation,
@@ -73,6 +147,41 @@ func RecordSandboxTransition(ctx context.Context, operation, result, hostID stri
 		Region:    SandboxIDRegion(),
 		HostID:    hostID,
 		Duration:  duration,
+	})
+}
+
+// RecordLatencyPhases emits one histogram sample per named phase of a
+// control-plane operation. Phases with negative durations (clock skew across
+// the async insert join) are dropped rather than recorded as zero.
+func RecordLatencyPhases(ctx context.Context, op, hostID string, phases map[string]time.Duration) {
+	rec := currentTelemetryRecorder()
+	for phase, d := range phases {
+		if d < 0 {
+			continue
+		}
+		rec.RecordLatencyPhase(ctx, telemetry.LatencyPhase{
+			Plane:    "controlplane",
+			Op:       op,
+			Phase:    phase,
+			Region:   SandboxIDRegion(),
+			HostID:   hostID,
+			Duration: d,
+		})
+	}
+}
+
+// RecordResumeSettleWait records ResumeSandbox waiting through a racing
+// finalize-pause write; result is one of the telemetry.SettleResult*
+// constants. Callers should only invoke this when the loop actually waited
+// (more than one read) — it is meant to run once per affected resume, not
+// once per poll iteration.
+func RecordResumeSettleWait(ctx context.Context, result, hostID string, waited time.Duration, reads int) {
+	currentTelemetryRecorder().RecordSandboxResumeSettleWait(ctx, telemetry.SandboxResumeSettleWait{
+		Result:   result,
+		Region:   SandboxIDRegion(),
+		HostID:   hostID,
+		Duration: waited,
+		Reads:    int64(reads),
 	})
 }
 
@@ -91,10 +200,13 @@ func SandboxLifecycleTelemetry() gin.HandlerFunc {
 		started := time.Now()
 		c.Next()
 
+		if telemetryDeferred(c) {
+			return
+		}
 		RecordSandboxTransition(
 			c.Request.Context(),
 			operation,
-			lifecycleResult(c.Writer.Status()),
+			telemetryResult(c),
 			telemetryHostID(c),
 			time.Since(started),
 		)
@@ -124,7 +236,16 @@ func lifecycleResult(status int) string {
 		return telemetry.ResultConflict
 	case status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout:
 		return telemetry.ResultTimeout
+	case status >= 400 && status < 500:
+		return telemetry.ResultClientError
 	default:
 		return telemetry.ResultError
 	}
+}
+
+func currentBillingRecorder() telemetry.BillingRecorder {
+	if recorder, ok := currentTelemetryRecorder().(telemetry.BillingRecorder); ok {
+		return recorder
+	}
+	return telemetry.NoopBillingRecorder{}
 }

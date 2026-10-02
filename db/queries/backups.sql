@@ -1,0 +1,291 @@
+-- name: RecordSandboxBackupGeneration :execrows
+-- Idempotent by construction: reports are delivered at least once from
+-- the host's outbox. A conflict refreshes completed_at only when the
+-- report carries a strictly newer verification (an unchanged re-pause
+-- re-verifies the same content-addressed generation later, and
+-- freshness checks must see the current pause as covered), so an exact
+-- redelivery affects zero rows. The second refresh arm lets a corrected
+-- clock repair its own damage: a stored future value (provably bogus,
+-- it exceeds now()) yields to ANY smaller incoming one, sane or merely
+-- less skewed, so repair is monotone even when the correction lands
+-- while some skew remains; redelivery of either report matches neither
+-- arm and stays a no-op. The third arm lets a report carrying object
+-- paths enrich a row that lacks them regardless of freshness: a
+-- rollout-window fallback can land a pathless copy of the same
+-- verification first (same pinned instant, so the freshness arms never
+-- fire for the redelivery), and the paths are what a lifecycle GC
+-- reasons from. Enrichment leaves completed_at where it stands (the
+-- CASE below): an older rich redelivery must not regress freshness.
+INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
+DO UPDATE SET
+  -- A generation uploaded again after its purge (a host's queued upload
+  -- landing late) is purged again.
+  purged_at = NULL,
+  purge_claimed_at = NULL,
+  -- reported_at is the receive-instant freshness cap for skew-bounded
+  -- reads, so it moves only when a freshness arm fires: an
+  -- enrichment-only update re-describes the same verification and must
+  -- not advance when the control plane first learned of it.
+  reported_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+         OR (backup_generation.completed_at > now()
+             AND excluded.completed_at < backup_generation.completed_at)
+      THEN now()
+    ELSE backup_generation.reported_at END,
+  completed_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+      THEN excluded.completed_at
+    WHEN backup_generation.completed_at > now()
+         AND excluded.completed_at < backup_generation.completed_at
+      THEN excluded.completed_at
+    ELSE backup_generation.completed_at END,
+  -- files, in order: a coverage-only report (empty files: the outbox
+  -- seed reconstructs no manifest) must never erase a recorded
+  -- manifest; a manifest that carries object paths is frozen (the
+  -- bucket manifest it mirrors is immutable, redeliveries carry the
+  -- identical set, and nothing conforming can legitimately rename a
+  -- generation's objects, so first-writer-wins is what keeps the paths
+  -- deletion-trustworthy for GC); anything richer refreshes.
+  files = CASE
+    WHEN jsonb_array_length(excluded.files) = 0
+      THEN backup_generation.files
+    WHEN jsonb_path_exists(backup_generation.files, '$[*].object')
+      THEN backup_generation.files
+    ELSE excluded.files END
+WHERE excluded.completed_at > backup_generation.completed_at
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
+   OR (jsonb_path_exists(excluded.files, '$[*].object')
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'))
+   -- Any report for a purged or purge-claimed generation, an exact
+   -- redelivery included, comes from a host that holds its objects: the
+   -- purge must run again.
+   OR backup_generation.purged_at IS NOT NULL
+   OR backup_generation.purge_claimed_at IS NOT NULL;
+
+-- name: RecordSnapshotBackupGeneration :execrows
+-- Saved-snapshot variant of RecordSandboxBackupGeneration, purge-reopen
+-- included: an upload can finish after its snapshot was deleted and purged.
+INSERT INTO backup_generation (snapshot_id, generation, bucket, completed_at, files)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (snapshot_id, bucket, generation) WHERE snapshot_id IS NOT NULL
+DO UPDATE SET
+  purged_at = NULL,
+  purge_claimed_at = NULL,
+  reported_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+         OR (backup_generation.completed_at > now()
+             AND excluded.completed_at < backup_generation.completed_at)
+      THEN now()
+    ELSE backup_generation.reported_at END,
+  completed_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+      THEN excluded.completed_at
+    WHEN backup_generation.completed_at > now()
+         AND excluded.completed_at < backup_generation.completed_at
+      THEN excluded.completed_at
+    ELSE backup_generation.completed_at END,
+  files = CASE
+    WHEN jsonb_array_length(excluded.files) = 0
+      THEN backup_generation.files
+    WHEN jsonb_path_exists(backup_generation.files, '$[*].object')
+      THEN backup_generation.files
+    ELSE excluded.files END
+WHERE excluded.completed_at > backup_generation.completed_at
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
+   OR (jsonb_path_exists(excluded.files, '$[*].object')
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'))
+   OR backup_generation.purged_at IS NOT NULL
+   OR backup_generation.purge_claimed_at IS NOT NULL;
+
+-- name: RecordTemplateBackupGeneration :execrows
+-- Template variant of RecordSandboxBackupGeneration; the two exist
+-- because each conflict target must name its own partial unique index.
+INSERT INTO backup_generation (template_id, build_id, generation, bucket, completed_at, files)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (template_id, build_id, bucket, generation) WHERE template_id IS NOT NULL
+DO UPDATE SET
+  reported_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+         OR (backup_generation.completed_at > now()
+             AND excluded.completed_at < backup_generation.completed_at)
+      THEN now()
+    ELSE backup_generation.reported_at END,
+  completed_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+      THEN excluded.completed_at
+    WHEN backup_generation.completed_at > now()
+         AND excluded.completed_at < backup_generation.completed_at
+      THEN excluded.completed_at
+    ELSE backup_generation.completed_at END,
+  files = CASE
+    WHEN jsonb_array_length(excluded.files) = 0
+      THEN backup_generation.files
+    WHEN jsonb_path_exists(backup_generation.files, '$[*].object')
+      THEN backup_generation.files
+    ELSE excluded.files END
+WHERE excluded.completed_at > backup_generation.completed_at
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
+   OR (jsonb_path_exists(excluded.files, '$[*].object')
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'));
+
+-- name: LatestSandboxBackup :one
+-- Freshness bounds future timestamps at read instead of rewriting them
+-- at insert: completed_at is stored exactly as the host verified it, so
+-- redeliveries stay idempotent under the strictly-newer upsert guard.
+-- The cap is reported_at, the server-side receive instant fixed at
+-- insert: a skewed-ahead row ranks no later than when the control plane
+-- actually learned of it, so any subsequently completed legitimate
+-- generation outranks it (a now() cap would keep tying the skewed row
+-- to the query clock and it would win every read until wall time passed
+-- the stamp). The returned completed_at is bounded the same way so
+-- freshness consumers never see an unbounded future value; the raw
+-- column breaks ranking ties, preserving the host's own order.
+-- Future-stamped rows (completed_at > reported_at) all rank at the
+-- sandbox's EARLIEST future receive instant rather than each at its
+-- own, so their order among themselves comes from the raw tie-break
+-- (the host's own clock) instead of delivery order, while the class
+-- still cannot outrank any legitimately later completion.
+SELECT generation, bucket, LEAST(completed_at, reported_at)::timestamptz AS completed_at
+FROM (
+  SELECT generation, bucket, completed_at, reported_at,
+    CASE WHEN completed_at > reported_at
+      THEN MIN(reported_at) FILTER (WHERE completed_at > reported_at) OVER ()
+      ELSE completed_at END AS effective_at
+  FROM backup_generation
+  WHERE sandbox_id = $1 AND purged_at IS NULL
+) ranked
+ORDER BY effective_at DESC, completed_at DESC
+LIMIT 1;
+
+-- name: LockSandboxRow :one
+-- Serializes the backup report's snapshot-size sync against FinalizePause,
+-- which takes the same row lock: the vmstate match below stays true for
+-- the duration of the transaction or the sync is skipped. Status rides
+-- along because 'pausing' marks a finalize that has not committed yet:
+-- a fast upload's report arriving in that window must retry rather than
+-- silently miss its size sync. A pause operation on the row says the
+-- transition is still being worked (see finalizeInFlight).
+SELECT id, status, updated_at, pause_op_id
+FROM sandbox WHERE id = $1 FOR UPDATE;
+
+-- name: LatestSnapshotManifest :many
+-- The sandbox's newest snapshot row with every digest its pause-time
+-- manifest recorded. The full recorded set is the join point between a
+-- backup report and the snapshot row it describes: vmstate alone is not
+-- a unique pause identity (identical vmstate bytes with different disk
+-- contents are possible), so the report must match EVERY recorded row.
+-- Pause-time manifests are vmstate-only today; rows tighten the match
+-- automatically as richer manifests appear.
+SELECT s.id AS snapshot_id, s.generation AS snapshot_generation,
+       COALESCE(s.pause_token, '') AS pause_token, am.file_name, am.sha256
+FROM snapshot s
+JOIN artifact_manifest am ON am.snapshot_id = s.id
+WHERE s.sandbox_id = $1
+  AND s.generation = (SELECT MAX(generation) FROM snapshot WHERE sandbox_id = $1)
+ORDER BY am.file_name;
+
+-- name: MarkSandboxBackupCovered :exec
+-- Persists the report handler's identity verdict, verified under the
+-- sandbox row lock: either the report's pause_token equals the head
+-- snapshot's (STRONG — names the exact pause), or a tokenless report's
+-- manifest matched every recorded digest (legacy fallback).
+-- (snapshot_id, snapshot_generation) names the exact pause — the
+-- generation counter distinguishes pauses even while the legacy
+-- finalize reuses one snapshot row id. Written in the report's
+-- transaction, so the coverage row and its identity link commit
+-- together.
+UPDATE backup_generation
+SET covered_snapshot_id = sqlc.arg(snapshot_id),
+    covered_snapshot_generation = sqlc.arg(snapshot_generation)
+WHERE sandbox_id = sqlc.arg(sandbox_id)
+  AND bucket = sqlc.arg(bucket)
+  AND generation = sqlc.arg(generation);
+
+-- name: SetSnapshotSizeBytes :exec
+UPDATE snapshot SET size_bytes = $2 WHERE id = $1;
+
+-- name: LatestSnapshotBackupGeneration :one
+-- A saved snapshot never changes, so its newest unpurged generation restores
+-- it.
+SELECT generation FROM backup_generation
+WHERE snapshot_id = $1 AND purged_at IS NULL AND purge_claimed_at IS NULL
+ORDER BY completed_at DESC LIMIT 1;
+
+-- name: CoveredBackupGeneration :one
+-- The backup generation recorded as covering the sandbox's current pause,
+-- exactly: the snapshot row and its generation counter, since the row is
+-- reused across pauses. Empty when the pause has no completed backup.
+SELECT COALESCE(bg.generation, '')::text AS generation
+FROM sandbox sb
+JOIN snapshot s ON s.id = sb.snapshot_id
+LEFT JOIN LATERAL (
+  SELECT generation FROM backup_generation
+  WHERE covered_snapshot_id = s.id AND covered_snapshot_generation = s.generation
+    AND purged_at IS NULL
+  ORDER BY completed_at DESC LIMIT 1
+) bg ON true
+WHERE sb.id = $1;
+
+-- name: ClaimBackupGenerationsToPurge :many
+-- Leases this bucket's generations of deleted sandboxes to one purge worker
+-- at a time. A claim older than the lease belongs to a worker that died and
+-- may be taken over. The claim time is the worker's token: finishing the
+-- purge requires it unchanged, and a report landing meanwhile clears it.
+WITH due AS (
+  SELECT bg.id
+  FROM backup_generation bg
+  JOIN sandbox s ON s.id = bg.sandbox_id
+  WHERE bg.bucket = sqlc.arg(bucket)::text
+    AND s.status = 'deleted'
+    AND bg.purged_at IS NULL
+    AND (bg.purge_claimed_at IS NULL
+         OR bg.purge_claimed_at < now() - make_interval(secs => sqlc.arg(lease_seconds)::float8))
+  ORDER BY s.destroyed_at ASC
+  LIMIT sqlc.arg(batch_size)
+  FOR UPDATE OF bg SKIP LOCKED
+)
+UPDATE backup_generation bg
+SET purge_claimed_at = clock_timestamp()
+FROM due
+WHERE bg.id = due.id
+RETURNING bg.id, bg.sandbox_id, bg.generation, bg.purge_claimed_at AS claimed_at;
+
+-- name: ClaimSnapshotBackupGenerationsToPurge :many
+-- ClaimBackupGenerationsToPurge for the generations of deleted saved
+-- snapshots. A snapshot counts as deleted once its host has removed it.
+WITH due AS (
+  SELECT bg.id
+  FROM backup_generation bg
+  JOIN sandbox_snapshot ss ON ss.id = bg.snapshot_id
+  WHERE bg.bucket = sqlc.arg(bucket)::text
+    AND ss.deleted_at IS NOT NULL
+    AND bg.purged_at IS NULL
+    AND (bg.purge_claimed_at IS NULL
+         OR bg.purge_claimed_at < now() - make_interval(secs => sqlc.arg(lease_seconds)::float8))
+  ORDER BY ss.deleted_at ASC
+  LIMIT sqlc.arg(batch_size)
+  FOR UPDATE OF bg SKIP LOCKED
+)
+UPDATE backup_generation bg
+SET purge_claimed_at = clock_timestamp()
+FROM due
+WHERE bg.id = due.id
+RETURNING bg.id, bg.snapshot_id, bg.generation, bg.purge_claimed_at AS claimed_at;
+
+-- name: MarkBackupGenerationPurged :execrows
+-- Zero rows means the claim was cleared by a report that landed during the
+-- purge: the generation was uploaded again and is left for the next pass.
+UPDATE backup_generation
+SET purged_at = now(), purge_claimed_at = NULL
+WHERE id = $1 AND purge_claimed_at = sqlc.arg(claimed_at);
+
+-- name: ClaimBackupWalk :execrows
+-- Takes the bucket's walk for this interval; zero rows means another
+-- replica started one within the interval. A walk that died keeps its claim
+-- until the interval passes and is simply taken next time.
+INSERT INTO backup_walk (bucket, started_at)
+VALUES (sqlc.arg(bucket), now())
+ON CONFLICT (bucket) DO UPDATE SET started_at = now()
+WHERE backup_walk.started_at < now() - make_interval(secs => sqlc.arg(interval_seconds)::float8);

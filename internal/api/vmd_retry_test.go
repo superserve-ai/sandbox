@@ -6,9 +6,15 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+type retryableCreateErr struct{}
+
+func (retryableCreateErr) Error() string     { return "retryable create error" }
+func (retryableCreateErr) SafeToRetry() bool { return true }
 
 func TestRetryBootOnDeadline(t *testing.T) {
 	grpcDeadline := status.Error(codes.DeadlineExceeded, "context deadline exceeded")
@@ -30,7 +36,7 @@ func TestRetryBootOnDeadline(t *testing.T) {
 
 	t.Run("success first try", func(t *testing.T) {
 		calls := 0
-		ip, vcpu, mem, retried, err := retryTransientBoot(context.Background(), "sb", boot([]error{nil}, &calls))
+		ip, vcpu, mem, retried, err := retryTransientBoot(context.Background(), "sb", "host-1", boot([]error{nil}, &calls))
 		if err != nil || retried || calls != 1 || ip != "10.0.0.9" || vcpu != 2 || mem != 512 {
 			t.Fatalf("got ip=%q vcpu=%d mem=%d retried=%v err=%v calls=%d", ip, vcpu, mem, retried, err, calls)
 		}
@@ -38,7 +44,7 @@ func TestRetryBootOnDeadline(t *testing.T) {
 
 	t.Run("non-deadline error is not retried", func(t *testing.T) {
 		calls := 0
-		_, _, _, retried, err := retryTransientBoot(context.Background(), "sb", boot([]error{other}, &calls))
+		_, _, _, retried, err := retryTransientBoot(context.Background(), "sb", "host-1", boot([]error{other}, &calls))
 		if !errors.Is(err, other) || retried || calls != 1 {
 			t.Fatalf("err=%v retried=%v calls=%d, want boom/false/1", err, retried, calls)
 		}
@@ -46,7 +52,7 @@ func TestRetryBootOnDeadline(t *testing.T) {
 
 	t.Run("grpc deadline retried once then succeeds with attempt-2 outputs", func(t *testing.T) {
 		calls := 0
-		ip, _, _, retried, err := retryTransientBoot(context.Background(), "sb", boot([]error{grpcDeadline, nil}, &calls))
+		ip, _, _, retried, err := retryTransientBoot(context.Background(), "sb", "host-1", boot([]error{grpcDeadline, nil}, &calls))
 		if err != nil || !retried || calls != 2 || ip != "10.0.0.9" {
 			t.Fatalf("got ip=%q retried=%v err=%v calls=%d", ip, retried, err, calls)
 		}
@@ -54,7 +60,7 @@ func TestRetryBootOnDeadline(t *testing.T) {
 
 	t.Run("wrapped context deadline from the interceptor is retried", func(t *testing.T) {
 		calls := 0
-		_, _, _, retried, err := retryTransientBoot(context.Background(), "sb", boot([]error{wrappedCtxDeadline, nil}, &calls))
+		_, _, _, retried, err := retryTransientBoot(context.Background(), "sb", "host-1", boot([]error{wrappedCtxDeadline, nil}, &calls))
 		if err != nil || !retried || calls != 2 {
 			t.Fatalf("err=%v retried=%v calls=%d, want nil/true/2", err, retried, calls)
 		}
@@ -62,7 +68,7 @@ func TestRetryBootOnDeadline(t *testing.T) {
 
 	t.Run("unavailable that outlived the interceptor window is retried", func(t *testing.T) {
 		calls := 0
-		_, _, _, retried, err := retryTransientBoot(context.Background(), "sb", boot([]error{status.Error(codes.Unavailable, "connection refused"), nil}, &calls))
+		_, _, _, retried, err := retryTransientBoot(context.Background(), "sb", "host-1", boot([]error{status.Error(codes.Unavailable, "connection refused"), nil}, &calls))
 		if err != nil || !retried || calls != 2 {
 			t.Fatalf("err=%v retried=%v calls=%d, want nil/true/2", err, retried, calls)
 		}
@@ -70,7 +76,7 @@ func TestRetryBootOnDeadline(t *testing.T) {
 
 	t.Run("deadline twice returns the second error", func(t *testing.T) {
 		calls := 0
-		_, _, _, retried, err := retryTransientBoot(context.Background(), "sb", boot([]error{grpcDeadline, grpcDeadline}, &calls))
+		_, _, _, retried, err := retryTransientBoot(context.Background(), "sb", "host-1", boot([]error{grpcDeadline, grpcDeadline}, &calls))
 		if !isVMDDeadline(err) || !retried || calls != 2 {
 			t.Fatalf("err=%v retried=%v calls=%d, want deadline/true/2", err, retried, calls)
 		}
@@ -80,7 +86,7 @@ func TestRetryBootOnDeadline(t *testing.T) {
 		parent, cancel := context.WithCancel(context.Background())
 		cancel()
 		calls := 0
-		_, _, _, retried, err := retryTransientBoot(parent, "sb", boot([]error{grpcDeadline, nil}, &calls))
+		_, _, _, retried, err := retryTransientBoot(parent, "sb", "host-1", boot([]error{grpcDeadline, nil}, &calls))
 		if !isVMDDeadline(err) || retried || calls != 1 {
 			t.Fatalf("err=%v retried=%v calls=%d, want deadline/false/1", err, retried, calls)
 		}
@@ -97,5 +103,17 @@ func TestIsVMDDeadline(t *testing.T) {
 	if isVMDDeadline(nil) || isVMDDeadline(errors.New("boom")) ||
 		isVMDDeadline(status.Error(codes.Unavailable, "x")) || isVMDDeadline(context.Canceled) {
 		t.Error("nil, plain, Unavailable, and Canceled must not classify")
+	}
+}
+
+func TestIsTransientCreateDBErr(t *testing.T) {
+	if !isTransientCreateDBErr(retryableCreateErr{}) {
+		t.Error("SafeToRetry errors should classify as transient create DB failures")
+	}
+	if !isTransientCreateDBErr(&pgconn.PgError{Code: "57P01", Message: "shutdown"}) {
+		t.Error("postgres restart SQLSTATE should classify as transient")
+	}
+	if isTransientCreateDBErr(errors.New("boom")) {
+		t.Error("plain errors must not classify as transient create DB failures")
 	}
 }

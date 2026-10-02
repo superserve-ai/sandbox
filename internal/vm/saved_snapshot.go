@@ -1,0 +1,1570 @@
+package vm
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/superserve-ai/sandbox/internal/presence"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
+)
+
+// Saved snapshots are the customer captures a new sandbox can be created from.
+// They live under <SnapshotDir>/saved/<snapshot_id>/, outside the source's own
+// directory, so they outlive it. Files are staged beside it and the rename commits.
+const (
+	SavedSnapshotsDirName     = "saved"
+	savedSnapshotManifestName = "manifest.json"
+	// Deleted ids, one empty file each, kept for a day: a capture for one is
+	// refused while its file is there, and a retry of the capture can arrive
+	// no later than its own deadline after the delete, minutes.
+	savedTombstonesDirName     = ".deleted"
+	savedTombstoneTTL          = 24 * time.Hour
+	savedTombstoneReapInterval = time.Hour
+	savedSnapshotVersion       = 1
+	// What bounds captures on the fleet's local NVMe is not the disk but the
+	// memory each running capture reserves and the page cache its writes
+	// churn, which resumes depend on; 16 keeps both small against a host.
+	defaultSavedCaptures = 16
+	savedCaptureHeadroom = 256 << 20
+	savedUnpauseAttempts = 3
+	// A capture's budget: a base for the request itself, plus the time a
+	// full memory image takes at the slowest write rate the capture waits
+	// for before it treats Firecracker as stuck.
+	savedCaptureBaseBudget     = 60 * time.Second
+	savedCaptureFloorMiBPerSec = 64
+)
+
+// savedCaptureBudget bounds the Firecracker snapshot request. A memory
+// capture may write all of guest memory, so its budget grows with the memory
+// size; an fs capture writes none.
+func savedCaptureBudget(kind SavedSnapshotKind, memoryMiB uint32) time.Duration {
+	if kind != SavedSnapshotMemFS {
+		return savedCaptureBaseBudget
+	}
+	return savedCaptureBaseBudget + time.Duration(memoryMiB/savedCaptureFloorMiBPerSec)*time.Second
+}
+
+// awaitFirecracker waits for a Firecracker whose last request was abandoned
+// mid-way to answer its API again, in short bounded probes: an image it was
+// asked for keeps being written after the request is gone, and the vCPUs
+// stay paused until it is done.
+func awaitFirecracker(ctx context.Context, socketPath string, wait time.Duration) error {
+	base := context.WithoutCancel(ctx)
+	deadline := time.Now().Add(wait)
+	for {
+		pctx, cancel := context.WithTimeout(base, 5*time.Second)
+		_, err := VMState(pctx, socketPath)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("firecracker api not answering %s after the capture budget: %w", wait, err)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// SavedSnapshotKind is what a saved snapshot holds: the disk alone, or the
+// disk with the memory image a warm restore needs.
+type SavedSnapshotKind string
+
+const (
+	SavedSnapshotFS    SavedSnapshotKind = "fs"
+	SavedSnapshotMemFS SavedSnapshotKind = "mem+fs"
+)
+
+// SavedSnapshotManifest is the commit record of one saved snapshot. Every
+// path it owns lies inside its directory; base paths belong to the template.
+type SavedSnapshotManifest struct {
+	Version      int               `json:"version"`
+	SnapshotID   string            `json:"snapshot_id"`
+	SourceVMID   string            `json:"source_vm_id"`
+	Kind         SavedSnapshotKind `json:"kind"`
+	CreatedAt    time.Time         `json:"created_at"`
+	VCPU         uint32            `json:"vcpu"`
+	MemoryMiB    uint32            `json:"memory_mib"`
+	DiskSizeMiB  uint32            `json:"disk_size_mib"`
+	BasePath     string            `json:"base_path,omitempty"`
+	DiskPath     string            `json:"disk_path"`
+	SnapshotPath string            `json:"snapshot_path,omitempty"`
+	MemPath      string            `json:"mem_path,omitempty"`
+	BaseMemPath  string            `json:"base_mem_path,omitempty"`
+	// FirecrackerSHA256 identifies the process that wrote the memory image;
+	// empty when unknown, as for a paused source.
+	FirecrackerSHA256 string `json:"firecracker_sha256,omitempty"`
+	// SizeBytes is the allocated size of the files this snapshot owns.
+	SizeBytes int64 `json:"size_bytes"`
+}
+
+// savedCaptureAdmissible answers a retry for a committed id and refuses a
+// source that cannot be captured, under the source's lock and the id's, in
+// that order. It holds neither afterwards.
+func (m *Manager) savedCaptureAdmissible(ctx context.Context, vmID, snapshotID string, kind SavedSnapshotKind, dir string) (*SavedSnapshotManifest, error) {
+	unlock, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	unlockID, err := m.lockSavedSnapshot(ctx, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockID()
+	if man, err := m.committedSavedSnapshot(dir, vmID, kind); man != nil || err != nil {
+		return man, err
+	}
+	_, _, _, err = m.savedCaptureSource(vmID, kind)
+	return nil, err
+}
+
+// savedCaptureSource loads the source and requires it running or paused. A
+// paused source holds what its workload had not flushed in its memory
+// image, which a disk alone would lack, so an fs capture needs it running.
+func (m *Manager) savedCaptureSource(vmID string, kind SavedSnapshotKind) (*VMInstance, VMStatus, VMConfig, error) {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return nil, 0, VMConfig{}, err
+	}
+	inst.mu.RLock()
+	st, cfg := inst.Status, inst.Config
+	inst.mu.RUnlock()
+	if st != StatusRunning && st != StatusPaused {
+		return nil, 0, VMConfig{}, status.Errorf(codes.FailedPrecondition, "vm %s is %v; a saved snapshot needs a running or paused VM", vmID, st)
+	}
+	if kind == SavedSnapshotFS && st == StatusPaused {
+		return nil, 0, VMConfig{}, status.Errorf(codes.FailedPrecondition, "vm %s is paused and its unflushed writes are in its memory image; a disk snapshot needs it running, or take a mem+fs snapshot", vmID)
+	}
+	return inst, st, cfg, nil
+}
+
+func (m *Manager) savedSnapshotDir(snapshotID string) (string, error) {
+	if m.cfg.SnapshotDir == "" || !filepath.IsAbs(m.cfg.SnapshotDir) {
+		return "", status.Error(codes.FailedPrecondition, "snapshot_dir must be configured as an absolute path")
+	}
+	if id, err := uuid.Parse(snapshotID); err != nil || id.String() != snapshotID {
+		return "", status.Error(codes.InvalidArgument, "snapshot_id must be a canonical UUID")
+	}
+	return filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, snapshotID), nil
+}
+
+// CreateSavedSnapshot captures vmID into a saved snapshot. Idempotent on
+// snapshotID: a retry waits on the source's lifecycle lock, then returns the
+// committed manifest. A running source is paused only while its image is
+// written and always released; a paused one is copied where it lies. Nothing
+// here flushes the guest's file cache: the caller syncs a running guest first.
+func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID string, kind SavedSnapshotKind) (*SavedSnapshotManifest, error) {
+	if kind != SavedSnapshotFS && kind != SavedSnapshotMemFS {
+		return nil, status.Errorf(codes.InvalidArgument, "kind must be %q or %q", SavedSnapshotFS, SavedSnapshotMemFS)
+	}
+	dir, err := m.savedSnapshotDir(snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
+		return nil, status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
+	}
+	log := m.log.With().Str("vm_id", vmID).Str("snapshot_id", snapshotID).Logger()
+
+	// Admission first, under the source's lock: a request for a busy source
+	// waits there holding nothing, and a retry or a bad request is answered
+	// without a slot. The slot is then waited for with no lock held, so a
+	// resume of this sandbox never queues behind another sandbox's capture.
+	// The locks are taken again for the capture itself, and the source
+	// checked again, since it may have moved meanwhile.
+	if man, err := m.savedCaptureAdmissible(ctx, vmID, snapshotID, kind, dir); man != nil || err != nil {
+		return man, err
+	}
+	release, err := m.acquireSavedCapture(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	// The VM lock comes first, as it does for a restore that creates a VM
+	// from a snapshot, so the two never wait on each other's locks in
+	// opposite orders. The id lock then serializes this call with a delete
+	// or a retry for the same id, the committed check included.
+	unlock, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	unlockID, err := m.lockSavedSnapshot(ctx, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockID()
+	if man, err := m.committedSavedSnapshot(dir, vmID, kind); man != nil || err != nil {
+		return man, err
+	}
+	inst, st, cfg, err := m.savedCaptureSource(vmID, kind)
+	if err != nil {
+		return nil, err
+	}
+	diskPath := m.instanceDiskPath(inst)
+	unreserve, err := m.savedCaptureHeadroom(kind, st, inst)
+	if err != nil {
+		return nil, err
+	}
+	defer unreserve()
+
+	parent := filepath.Dir(dir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return nil, fmt.Errorf("create saved snapshot root: %w", err)
+	}
+	// A crash leaves staging behind; the lock held here makes it nobody's.
+	removeSavedStaging(parent, snapshotID)
+	tmp := filepath.Join(parent, "."+snapshotID+".tmp-"+uuid.NewString())
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		return nil, fmt.Errorf("create saved snapshot staging: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(tmp)
+		}
+	}()
+
+	// The block device is the file, and a reattached VM's config no longer
+	// says how big it was asked to be.
+	diskMiB, err := diskSizeMiB(diskPath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "source disk: %v", err)
+	}
+	man := &SavedSnapshotManifest{
+		Version:     savedSnapshotVersion,
+		SnapshotID:  snapshotID,
+		SourceVMID:  vmID,
+		Kind:        kind,
+		CreatedAt:   time.Now().UTC(),
+		VCPU:        cfg.VCPU,
+		MemoryMiB:   cfg.MemoryMiB,
+		DiskSizeMiB: diskMiB,
+		BasePath:    cfg.BasePath,
+	}
+	if st == StatusRunning {
+		// The image is written by the live process, which may predate the
+		// binary on disk; a paused image's producer went unrecorded.
+		man.FirecrackerSHA256 = firecrackerExeSHA(inst)
+		err = m.captureRunningSaved(ctx, inst, tmp, dir, diskPath, kind, man, log)
+	} else {
+		err = m.capturePausedSaved(ctx, inst, tmp, dir, diskPath, kind, man)
+	}
+	if err != nil {
+		return nil, err
+	}
+	man.SizeBytes = allocatedTreeBytes(tmp)
+	if err := writeSavedSnapshotManifest(tmp, man); err != nil {
+		return nil, err
+	}
+	if err := fsyncTree(tmp); err != nil {
+		return nil, fmt.Errorf("fsync saved snapshot: %w", err)
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		return nil, fmt.Errorf("commit saved snapshot: %w", err)
+	}
+	committed = true
+	if err := fsyncDir(parent); err != nil {
+		return nil, fmt.Errorf("fsync saved snapshot root: %w", err)
+	}
+	log.Info().Str("kind", string(kind)).Int64("size_bytes", man.SizeBytes).Msg("saved snapshot committed")
+	if m.backupEnqueue != nil {
+		// Hashing the disk takes seconds per GiB: never on the capture's path.
+		go func() {
+			defer sentrylog.Recover("saved-snapshot-backup")
+			m.backupSavedSnapshot(context.Background(), man, log)
+		}()
+	}
+	return man, nil
+}
+
+// DeleteSavedSnapshot removes a saved snapshot and any staging left for it.
+// Idempotent. Forks hold private copies, so nothing depends on the files.
+func (m *Manager) DeleteSavedSnapshot(ctx context.Context, snapshotID string) error {
+	dir, err := m.savedSnapshotDir(snapshotID)
+	if err != nil {
+		return err
+	}
+	unlock, err := m.lockSavedSnapshot(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// The tombstone is durable before the files go, so a crash between the
+	// two leaves the id refused, never a delete that a later capture undoes.
+	if err := writeSavedTombstone(dir); err != nil {
+		return fmt.Errorf("record saved snapshot deletion: %w", err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("remove saved snapshot: %w", err)
+	}
+	removeSavedStaging(filepath.Dir(dir), snapshotID)
+	if err := fsyncDir(filepath.Dir(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("fsync saved snapshot root: %w", err)
+	}
+	return nil
+}
+
+// captureRunningSaved images a running source the way a pause does, then
+// releases it. Past the freeze, the source is always released or, when it
+// cannot be, recorded as unservable.
+func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp, final, diskPath string, kind SavedSnapshotKind, man *SavedSnapshotManifest, log zerolog.Logger) error {
+	vmID := inst.ID
+	inst.mu.RLock()
+	socket, ip := inst.SocketPath, inst.IP
+	memFile, baseMem := inst.MemFilePath, inst.BaseMemPath
+	dirtyTracked, sessionID, generation := inst.DirtyTracked, inst.DirtyTrackingSessionID, inst.DirtyTrackingGeneration
+	recordedCorrects, recordedArtifact := inst.CorrectsWallClock, inst.ArtifactID
+	inst.mu.RUnlock()
+
+	if err := m.resolveOutstandingFreeze(ctx, vmID, socket, ip, recordedArtifact, log); err != nil {
+		return err
+	}
+	corrects := recordedCorrects != nil && *recordedCorrects
+	if recordedCorrects == nil {
+		corrects = guestCorrectsWallClock(memFile, baseMem)
+	}
+	// The disk alone must hold everything the workload was given, so an fs
+	// capture stops the workload and has the guest flush while it is
+	// stopped, whatever the clock policy says; a guest that cannot is
+	// refused rather than imaged with writes still in its page cache. A
+	// memory image carries the page cache itself and freezes for the clock.
+	if kind == SavedSnapshotFS && (ip == "" || !corrects) {
+		return status.Error(codes.FailedPrecondition, "the sandbox's image cannot stop its workload for a disk snapshot; take a mem+fs snapshot, or create the sandbox from a current template")
+	}
+	if kind == SavedSnapshotFS {
+		// Most of it flushed here, while the workload still runs, so the
+		// stop below is short.
+		if err := syncGuestFilesystems(ctx, ip); err != nil {
+			return status.Errorf(codes.FailedPrecondition, "guest did not flush its filesystems before the capture: %v", err)
+		}
+	}
+	willFreeze := kind == SavedSnapshotFS || (corrects && m.cfg.GuestClockFreezeEnabled &&
+		m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load())
+	token, artifact := "", NewArtifactID()
+	if willFreeze {
+		token = NewFreezeToken()
+	}
+	// Every running capture pauses the vCPUs, so every one is journalled
+	// first: a vmd that dies before the release finds the intent on reattach
+	// and resumes the guest, with the token when it was frozen. The floor is
+	// what makes reattach look for intents at all. A memory write into the
+	// chain rewrites the images beside the intent and is journalled as a
+	// pause's is, so an interruption is recovered as one; a write to
+	// staging leaves them as they were, and the journal says so.
+	sourceDir := filepath.Join(m.cfg.SnapshotDir, vmID)
+	if err := m.ensureWakeFloorTimed("saved-snapshot"); err != nil {
+		return fmt.Errorf("record the rollback floor before pausing: %w", err)
+	}
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		return fmt.Errorf("create source snapshot dir: %w", err)
+	}
+	chainMem, layered, firstPass := "", false, false
+	if kind == SavedSnapshotMemFS {
+		chainMem, layered, firstPass = m.chainTarget(vmID, memFile, baseMem, dirtyTracked)
+	}
+	intent := pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact}
+	var jerr error
+	if chainMem != "" {
+		jerr = writePauseIntent(sourceDir, intent)
+	} else {
+		jerr = writeStagedIntent(sourceDir, intent)
+	}
+	if jerr != nil {
+		return fmt.Errorf("record capture intent: %w", jerr)
+	}
+	// The source is unavailable from the freeze on: the stop and the flush
+	// count as its frozen time, and are measured on their own as well.
+	tFreeze := time.Now()
+	frozen, synced := false, false
+	if willFreeze {
+		var ferr error
+		frozen, synced, ferr = m.freezeGuest(ctx, ip, token, kind == SavedSnapshotFS, log)
+		if ferr != nil {
+			m.markUnservable(inst, ferr, log)
+			return ferr
+		}
+		if kind == SavedSnapshotFS && !(frozen && synced) {
+			// Not stopped, or stopped by an agent that cannot flush: the
+			// disk would not be whole, so the source is let go and the
+			// capture refused.
+			if frozen {
+				if err := m.releaseOrConfirmRunning(ctx, "", ip, token); err != nil {
+					m.markUnservable(inst, err, log)
+					return status.Errorf(codes.Unavailable, "source could not be released after a refused capture: %v", err)
+				}
+			}
+			if err := clearPauseIntent(sourceDir); err != nil {
+				return fmt.Errorf("clear capture intent: %w", err)
+			}
+			return status.Error(codes.FailedPrecondition, "the sandbox's guest agent cannot flush its filesystems while stopped; take a mem+fs snapshot, or create the sandbox from a current template")
+		}
+	}
+
+	freezeFor := time.Since(tFreeze)
+	// Bounded on its own: the RPC deadline may be long, and a Firecracker that
+	// stops answering must not hold the source paused past this.
+	budget := savedCaptureBudget(kind, man.MemoryMiB)
+	cctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	var captureErr error
+	// What the image says of its guest and workload, for the chain, the
+	// record and the snapshot alike; nothing for a guest that cannot
+	// correct its clock.
+	var wake *WallClockManifest
+	if corrects {
+		wake = &WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifact, WorkloadFrozen: frozen, GuestCorrectsClock: true}
+		if frozen {
+			wake.FreezeToken = token
+		}
+	}
+	if kind == SavedSnapshotMemFS {
+		chainMem, captureErr = m.captureRunningMemory(cctx, inst, tmp, final, socket, chainMem, layered, firstPass, baseMem, sessionID, generation, wake, intent, man, log)
+	} else {
+		captureErr = fcPauseVMContext(cctx, socket)
+	}
+	if captureErr == nil {
+		captureErr = m.captureSavedDisk(cctx, diskPath, man.BasePath, tmp, final, man)
+	}
+	if captureErr == nil && kind == SavedSnapshotMemFS && wake != nil {
+		captureErr = WriteWallClockManifest(filepath.Join(tmp, filepath.Base(man.MemPath)), *wake)
+	}
+	frozenFor := time.Since(tFreeze)
+
+	// Releasing the guest while Firecracker still writes the abandoned image
+	// would only time out and write the source off; wait for the API first.
+	if captureErr != nil && cctx.Err() != nil {
+		log.Warn().Dur("budget", budget).Msg("saved snapshot: capture exceeded its budget; waiting for Firecracker before releasing the source")
+		if werr := awaitFirecracker(ctx, socket, budget); werr != nil {
+			log.Error().Err(werr).Msg("saved snapshot: Firecracker did not come back")
+		}
+	}
+	var releaseErr error
+	tRelease := time.Now()
+	if frozen {
+		releaseErr = m.releaseOrConfirmRunning(ctx, socket, ip, token)
+	} else {
+		releaseErr = unpauseSourceWithProbe(ctx, socket)
+	}
+	// Emitted whatever follows: a release that waited on the guest, or
+	// failed, is exactly what these phases must show.
+	releaseFor := time.Since(tRelease)
+	m.recordPhases("saved_snapshot", string(kind), map[string]time.Duration{"freeze": freezeFor, "frozen": frozenFor, "release": releaseFor})
+	// What a memory capture did to the record is made durable only now,
+	// with the guest released: a store write must not hold it paused. The
+	// chain advanced, or the baseline was spent by a full image or a write
+	// whose outcome is unknown; a restart must find neither re-armed. Until
+	// then the record is a step behind, which a crash turns into a
+	// recovered rewrite: the intent below outlives a crash, and outlives a
+	// record that could not be written, so the chain is never named by a
+	// record that does not know it.
+	var persistErr error
+	if kind == SavedSnapshotMemFS {
+		persistErr = m.persistChainAdvance(inst, log)
+	}
+	if releaseErr != nil {
+		// The intent, if any, keeps the token for recovery.
+		m.markUnservable(inst, errors.Join(captureErr, releaseErr), log)
+		return status.Errorf(codes.Unavailable, "source could not be resumed after capture: %v", errors.Join(captureErr, releaseErr))
+	}
+	if persistErr != nil {
+		return status.Errorf(codes.Unavailable, "source's record could not be written after the capture; the intent stays for recovery: %v", errors.Join(captureErr, persistErr))
+	}
+	if err := clearPauseIntent(sourceDir); err != nil {
+		return fmt.Errorf("clear capture intent: %w", err)
+	}
+	if captureErr != nil {
+		return captureErr
+	}
+	log.Info().Dur("freeze", freezeFor).Dur("frozen", frozenFor).Dur("release", releaseFor).Bool("workload_frozen", frozen).Bool("guest_flushed_stopped", synced).Msg("saved snapshot: source captured and released")
+	return nil
+}
+
+// captureRunningMemory writes the source's memory the way a pause does, into
+// the sandbox's own chain, and gives the snapshot reflinks of the chain's
+// files. With the dirty baseline armed the write is a guarded diff into the
+// image the source resumed from, so the chain moves on and the source's next
+// pause is a diff again: the record names the chain and the generation
+// Firecracker moved to once the write is in, whatever the reflinks do after.
+// A rejected guard or an unarmed source gets a full image of its own, and
+// the baseline is spent. Returns the chain image the snapshot was taken
+// from, or "" for a full image.
+// chainTarget is where a capture of a running source writes its memory, on
+// the same terms as a pause: the overlay when the source runs on a template
+// base, first pass or accumulating; its own full image in place; or "", a
+// full image of the snapshot's own.
+func (m *Manager) chainTarget(vmID, memFile, baseMem string, dirtyTracked bool) (chainMem string, layered, firstPass bool) {
+	chainDir := filepath.Join(m.cfg.SnapshotDir, vmID)
+	overlay := filepath.Join(chainDir, "mem.diff")
+	full := filepath.Join(chainDir, "mem.snap")
+	layered = m.cfg.IncrementalSnapshotEnabled && dirtyTracked && baseMem != "" && (memFile == baseMem || memFile == overlay)
+	switch {
+	case layered:
+		chainMem = overlay
+	case m.cfg.IncrementalSnapshotEnabled && dirtyTracked && memFile == full && fileExists(full):
+		chainMem = full
+	}
+	return chainMem, layered, layered && memFile == baseMem
+}
+
+func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tmp, final, socket, chainMem string, layered, firstPass bool, baseMem, sessionID string, generation int64, wake *WallClockManifest, intent pauseIntent, man *SavedSnapshotManifest, log zerolog.Logger) (string, error) {
+	chainDir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
+	overlay := filepath.Join(chainDir, "mem.diff")
+	vmstate := filepath.Join(chainDir, "vmstate.snap")
+	// A full image of the snapshot's own instead of the chain write the
+	// journal announced: the chain's images stay as they were, so the
+	// journal is told before anything else happens.
+	fullInstead := func(why string, err error) error {
+		log.Warn().Err(err).Msg("saved snapshot: " + why + "; taking a full image")
+		chainMem = ""
+		if jerr := writeStagedIntent(chainDir, intent); jerr != nil {
+			return fmt.Errorf("record capture intent: %w", jerr)
+		}
+		return nil
+	}
+	if chainMem != "" && firstPass {
+		// A leftover overlay would keep stale pages under the diff, and
+		// the base record must exist before the overlay does.
+		if err := freshenFirstPassOverlay(overlay); err != nil {
+			if ferr := fullInstead("stale overlay could not be removed", err); ferr != nil {
+				return "", ferr
+			}
+		} else if err := os.WriteFile(layeredBaseSidecarPath(overlay), []byte(baseMem), 0o644); err != nil {
+			if ferr := fullInstead("base record could not be written", err); ferr != nil {
+				return "", ferr
+			}
+		}
+	}
+	var sidecarMark time.Time
+	if chainMem != "" && layered {
+		// A map that cannot be marked cannot be proven this save's
+		// afterwards.
+		mark, err := markPresenceForSave(chainMem)
+		if err != nil {
+			if ferr := fullInstead("presence map could not be marked", err); ferr != nil {
+				return "", ferr
+			}
+		}
+		sidecarMark = mark
+	}
+	if chainMem != "" {
+		// Firecracker rewrites the disk block map beside the vmstate with
+		// every snapshot it saves one for; one it saves none for must not
+		// leave an earlier capture's beside the chain, or the snapshot takes
+		// it as its own. Set aside rather than dropped: a write that never
+		// happens leaves the chain as it was, map included.
+		blockMap := overlayBlockMapPath(vmstate)
+		staged := blockMap + ".prev"
+		if err := os.Rename(blockMap, staged); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("set aside previous block map: %w", err)
+		}
+		err := CreateDiffSnapshotContext(ctx, socket, vmstate, chainMem, sessionID, generation)
+		switch {
+		case err == nil:
+			_ = os.Remove(staged)
+			recordBase := ""
+			if layered {
+				recordBase = baseMem
+			}
+			// The chain holds this image now: its manifest goes beside it
+			// before the record names it, or the image is one nothing may
+			// restore, the same as a torn write.
+			var werr error
+			if wake != nil {
+				werr = WriteWallClockManifest(chainMem, *wake)
+			} else if _, rerr := removeWallClockManifest(chainMem); rerr != nil {
+				werr = rerr
+			}
+			if werr != nil {
+				m.abandonDirtyBaseline(inst)
+				_ = os.Remove(vmstate)
+				return "", fmt.Errorf("write the chain image's wall-clock manifest: %w", werr)
+			}
+			advanceChain(inst, vmstate, chainMem, recordBase, wake)
+			if layered {
+				// A map not proven this save's, absent or left as marked by
+				// a Firecracker that predates it, makes the overlay one
+				// nothing may restore: the source's next pause must be a
+				// full one, which strands it. The chain still moved on, and
+				// the record says so.
+				if err := m.verifyPresenceRefreshed(chainMem, sidecarMark); err != nil {
+					m.abandonDirtyBaseline(inst)
+					return chainMem, status.Errorf(codes.DataLoss, "chain overlay's presence map is not this capture's; the source's next pause is a full one: %v", err)
+				}
+			}
+			if err := m.cloneChainIntoSnapshot(ctx, tmp, final, vmstate, chainMem, recordBase, man); err != nil {
+				return chainMem, err
+			}
+			return chainMem, nil
+		case errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err):
+			// Rejected before the bitmap or the chain was touched; the vCPUs
+			// are paused and the full image's pause is idempotent. The chain
+			// stays as it was, its block map back in place.
+			if rerr := os.Rename(staged, blockMap); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				log.Warn().Err(rerr).Msg("saved snapshot: previous block map could not be put back")
+			}
+			if firstPass {
+				_ = os.Remove(layeredBaseSidecarPath(overlay))
+			}
+			if ferr := fullInstead("guarded diff rejected", err); ferr != nil {
+				return "", ferr
+			}
+		default:
+			// Failed, or timed out with the outcome unknown: the chain may be
+			// torn. The vmstate it was written with goes, so nothing can be
+			// restored from it, and an overlay's sidecars with it; the image
+			// the running source is served from is left alone. The baseline
+			// goes too: the source's next pause is a full one, which strands
+			// and reclaims the overlay.
+			m.abandonDirtyBaseline(inst)
+			_ = os.Remove(vmstate)
+			_ = os.Remove(staged)
+			if layered {
+				_ = os.Remove(layeredBaseSidecarPath(overlay))
+				_ = os.Remove(presence.SidecarPath(overlay))
+				_ = os.Remove(clockFreezeMarkerPath(overlay))
+				if firstPass {
+					_ = os.Remove(overlay)
+				}
+			}
+			return "", fmt.Errorf("create diff snapshot: %w", err)
+		}
+	}
+	m.abandonDirtyBaseline(inst)
+	if err := CreateSnapshotContext(ctx, socket, filepath.Join(tmp, "vmstate.snap"), filepath.Join(tmp, "mem.snap"), "", SnapshotNormal); err != nil {
+		return "", fmt.Errorf("create snapshot: %w", err)
+	}
+	man.SnapshotPath = filepath.Join(final, "vmstate.snap")
+	man.MemPath = filepath.Join(final, "mem.snap")
+	return "", nil
+}
+
+// advanceChain records, in memory, that the source's chain now holds the
+// image just written: a first-pass source becomes an accumulating one, the
+// next guarded diff names the generation Firecracker moved to, and the
+// image's wake facts are the record's, as a pause leaves them, so a relaunch
+// from the chain wakes it under the right token. Made durable by
+// persistChainAdvance once the guest is released.
+func advanceChain(inst *VMInstance, vmstate, memPath, baseMem string, wake *WallClockManifest) {
+	// A manifest is written only for a guest that corrects its clock, so
+	// its presence is that fact, resolved here from the image if the record
+	// had it unresolved.
+	corrects := wake != nil
+	frozen, token, artifact := false, "", ""
+	if wake != nil {
+		frozen, token, artifact = wake.WorkloadFrozen, wake.FreezeToken, wake.ArtifactID
+	}
+	inst.mu.Lock()
+	inst.SnapshotPath = vmstate
+	inst.MemFilePath = memPath
+	inst.BaseMemPath = baseMem
+	inst.DirtyTrackingGeneration++
+	inst.CorrectsWallClock = &corrects
+	inst.SnapshotWorkloadFrozen = &frozen
+	inst.FreezeToken = token
+	inst.ArtifactID = artifact
+	inst.mu.Unlock()
+}
+
+// persistChainAdvance writes the record as the capture left it, so a vmd
+// restart before the next pause finds the chain, or the baseline spent; a
+// record a destroy removed meanwhile is not brought back. A write that
+// fails is the caller's to answer for.
+func (m *Manager) persistChainAdvance(inst *VMInstance, log zerolog.Logger) error {
+	wrote, err := m.persistStateIfPresent(inst)
+	if err != nil {
+		return err
+	}
+	if !wrote {
+		log.Warn().Msg("saved snapshot: source destroyed during the capture; its record stays gone")
+	}
+	return nil
+}
+
+// cloneChainIntoSnapshot gives the snapshot its own reflinks of the chain's
+// vmstate, with the disk block map Firecracker saved beside it, and memory
+// image, with the overlay's presence map and base record.
+func (m *Manager) cloneChainIntoSnapshot(ctx context.Context, tmp, final, vmstate, memPath, baseMem string, man *SavedSnapshotManifest) error {
+	if err := m.cloneSavedFile(ctx, vmstate, filepath.Join(tmp, "vmstate.snap")); err != nil {
+		return err
+	}
+	if blockMap := overlayBlockMapPath(vmstate); fileExists(blockMap) {
+		if err := cloneOrCopyFile(ctx, blockMap, overlayBlockMapPath(filepath.Join(tmp, "vmstate.snap"))); err != nil {
+			return fmt.Errorf("copy block overlay sidecar: %w", err)
+		}
+	}
+	name := "mem.snap"
+	if baseMem != "" {
+		name = "mem.diff"
+	}
+	target := filepath.Join(tmp, name)
+	if err := m.cloneSavedFile(ctx, memPath, target); err != nil {
+		return err
+	}
+	if baseMem != "" {
+		p := presence.SidecarPath(memPath)
+		if !fileExists(p) {
+			return status.Error(codes.DataLoss, "chain overlay has no presence map")
+		}
+		if err := cloneOrCopyFile(ctx, p, presence.SidecarPath(target)); err != nil {
+			return fmt.Errorf("copy memory presence map: %w", err)
+		}
+		if err := os.WriteFile(layeredBaseSidecarPath(target), []byte(baseMem), 0o644); err != nil {
+			return fmt.Errorf("write memory base record: %w", err)
+		}
+	}
+	man.SnapshotPath = filepath.Join(final, "vmstate.snap")
+	man.MemPath = filepath.Join(final, name)
+	man.BaseMemPath = baseMem
+	return nil
+}
+
+// capturePausedSaved copies a paused source's resume image and disk once its
+// Firecracker is proven gone.
+func (m *Manager) capturePausedSaved(ctx context.Context, inst *VMInstance, tmp, final, diskPath string, kind SavedSnapshotKind, man *SavedSnapshotManifest) error {
+	inst.mu.RLock()
+	snapshotPath, memFile, baseMem := inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath
+	inst.mu.RUnlock()
+	// The same at-rest proof backups gate on: Paused alone does not say the
+	// process is gone, and a deactivating one may still flush guest writes.
+	if !m.vmConfirmedAtRest(ctx, inst.ID) {
+		return status.Error(codes.Unavailable, "paused source is not confirmed at rest; retry once its stop completes")
+	}
+	if kind == SavedSnapshotMemFS {
+		if snapshotPath == "" || memFile == "" {
+			return status.Error(codes.FailedPrecondition, "paused source has no resume image")
+		}
+		if err := m.cloneSavedFile(ctx, snapshotPath, filepath.Join(tmp, "vmstate.snap")); err != nil {
+			return err
+		}
+		if sidecar := snapshotPath + ".overlay"; fileExists(sidecar) {
+			if err := cloneOrCopyFile(ctx, sidecar, filepath.Join(tmp, "vmstate.snap.overlay")); err != nil {
+				return fmt.Errorf("copy block overlay sidecar: %w", err)
+			}
+		}
+		name := "mem.snap"
+		if isOverlayMemFile(memFile) {
+			name = "mem.diff"
+			if baseMem == "" {
+				if recorded, ok := readLayeredBase(memFile); ok {
+					baseMem = recorded
+				}
+			}
+			if baseMem == "" {
+				return status.Error(codes.FailedPrecondition, "paused source memory overlay has no base")
+			}
+		} else {
+			baseMem = ""
+		}
+		target := filepath.Join(tmp, name)
+		if err := m.cloneSavedFile(ctx, memFile, target); err != nil {
+			return err
+		}
+		if p := presence.SidecarPath(memFile); fileExists(p) {
+			if err := cloneOrCopyFile(ctx, p, presence.SidecarPath(target)); err != nil {
+				return fmt.Errorf("copy memory presence map: %w", err)
+			}
+		} else if baseMem != "" {
+			return status.Error(codes.DataLoss, "paused source memory overlay has no presence map")
+		}
+		if baseMem != "" {
+			if err := os.WriteFile(layeredBaseSidecarPath(target), []byte(baseMem), 0o644); err != nil {
+				return fmt.Errorf("write memory base record: %w", err)
+			}
+		}
+		// The image's wake contract travels with it: a fork restored from a
+		// frozen image must wake under the same token.
+		if wm := WallClockMarkerPath(memFile); fileExists(wm) {
+			if err := cloneOrCopyFile(ctx, wm, WallClockMarkerPath(target)); err != nil {
+				return fmt.Errorf("copy wall-clock manifest: %w", err)
+			}
+		}
+		man.SnapshotPath = filepath.Join(final, "vmstate.snap")
+		man.MemPath = filepath.Join(final, name)
+		man.BaseMemPath = baseMem
+	}
+	return m.captureSavedDisk(ctx, diskPath, man.BasePath, tmp, final, man)
+}
+
+// captureSavedDisk clones the source's disk, reflinked or refused: an
+// overlay's holes mean "read the base" and a copy may not keep them, and a
+// restore reflinks the saved disk back the same way, so a disk that could
+// only be copied here would publish a snapshot this host cannot restore.
+func (m *Manager) captureSavedDisk(ctx context.Context, diskPath, basePath, tmp, final string, man *SavedSnapshotManifest) error {
+	name := "rootfs.ext4"
+	if basePath != "" {
+		name = "overlay.ext4"
+	}
+	clone := reflinkFileExact
+	if m.reflinkFile != nil {
+		clone = m.reflinkFile
+	}
+	if err := clone(ctx, diskPath, filepath.Join(tmp, name)); err != nil {
+		if errors.Is(err, errNoReflink) {
+			return status.Errorf(codes.FailedPrecondition, "saved disks need a reflink filesystem under %s: %v", m.cfg.SnapshotDir, err)
+		}
+		return fmt.Errorf("clone disk: %w", err)
+	}
+	man.DiskPath = filepath.Join(final, name)
+	man.BasePath = basePath
+	return nil
+}
+
+var errNoReflink = errors.New("filesystem cannot reflink")
+
+// reflinkFileExact clones src into dst with no fallback.
+func reflinkFileExact(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if err := cloneFileFD(out, in); err != nil {
+		out.Close()
+		_ = os.Remove(dst)
+		return fmt.Errorf("%w: %v", errNoReflink, err)
+	}
+	return out.Close()
+}
+
+// instanceDiskPath resolves the VM's writable disk the way resume does.
+func (m *Manager) instanceDiskPath(inst *VMInstance) string {
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	if inst.DiskPath != "" {
+		return inst.DiskPath
+	}
+	key := inst.RunDirID
+	if key == "" {
+		key = inst.ID
+	}
+	name := "rootfs.ext4"
+	if inst.Config.BasePath != "" {
+		name = "overlay.ext4"
+	}
+	return filepath.Join(m.cfg.RunDir, key, name)
+}
+
+func (m *Manager) committedSavedSnapshot(dir, vmID string, kind SavedSnapshotKind) (*SavedSnapshotManifest, error) {
+	// Closed on any doubt: an unreadable tombstone is not an absent one.
+	if _, err := os.Stat(savedTombstonePath(dir)); err == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "saved snapshot %s was deleted", filepath.Base(dir))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, status.Errorf(codes.Unavailable, "saved snapshot %s: deletion record unreadable: %v", filepath.Base(dir), err)
+	}
+	man, err := readSavedSnapshotManifest(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.DataLoss, "saved snapshot %s: %v", filepath.Base(dir), err)
+	}
+	if man.SourceVMID != vmID || man.Kind != kind {
+		return nil, status.Errorf(codes.AlreadyExists, "saved snapshot %s is a %s snapshot of vm %s", man.SnapshotID, man.Kind, man.SourceVMID)
+	}
+	return man, nil
+}
+
+func savedTombstonePath(dir string) string {
+	return filepath.Join(filepath.Dir(dir), savedTombstonesDirName, filepath.Base(dir))
+}
+
+func writeSavedTombstone(dir string) error {
+	path := savedTombstonePath(dir)
+	tombs := filepath.Dir(path)
+	// The directory's own entry is made durable too: on its first delete a
+	// host must not lose the directory and keep the deletion.
+	if err := os.MkdirAll(tombs, 0o755); err != nil {
+		return err
+	}
+	if err := fsyncDir(filepath.Dir(tombs)); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+	return fsyncDir(tombs)
+}
+
+// RunSavedTombstoneReaper drops tombstones past their day, once now and then
+// hourly, until ctx ends. Off every request: the collection grows with the
+// host's churn, not with what is live, so no delete pays to walk it.
+func (m *Manager) RunSavedTombstoneReaper(ctx context.Context) {
+	if m.cfg.SnapshotDir == "" {
+		return
+	}
+	tombs := filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, savedTombstonesDirName)
+	go func() {
+		ticker := time.NewTicker(savedTombstoneReapInterval)
+		defer ticker.Stop()
+		for {
+			reapSavedTombstones(tombs, time.Now().Add(-savedTombstoneTTL))
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func reapSavedTombstones(tombs string, before time.Time) {
+	entries, err := os.ReadDir(tombs)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && info.ModTime().Before(before) {
+			_ = os.Remove(filepath.Join(tombs, e.Name()))
+		}
+	}
+}
+
+func readSavedSnapshotManifest(dir string) (*SavedSnapshotManifest, error) {
+	b, err := os.ReadFile(filepath.Join(dir, savedSnapshotManifestName))
+	if err != nil {
+		return nil, err
+	}
+	var man SavedSnapshotManifest
+	if err := json.Unmarshal(b, &man); err != nil {
+		return nil, fmt.Errorf("parse manifest: %w", err)
+	}
+	if man.Version != savedSnapshotVersion || man.SnapshotID == "" {
+		return nil, fmt.Errorf("manifest version %d is not %d", man.Version, savedSnapshotVersion)
+	}
+	return &man, nil
+}
+
+func writeSavedSnapshotManifest(dir string, man *SavedSnapshotManifest) error {
+	b, err := json.MarshalIndent(man, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, savedSnapshotManifestName)
+	f, err := os.OpenFile(path+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(path+".tmp", path)
+}
+
+// SweepSavedSnapshotStaging reclaims staging directories a previous process
+// died in. The saved directory grows with the snapshots on the host, so the
+// listing runs in the background along with the removals. Each candidate is
+// removed under its snapshot id lock, which a live capture holds for its whole
+// duration, so an in-flight staging dir is never touched. The returned channel
+// closes when the sweep is done.
+func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if m.cfg.SnapshotDir == "" {
+			return
+		}
+		start := time.Now()
+		stale, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, ".*.tmp-*"))
+		n := 0
+		for _, d := range stale {
+			id, _, _ := strings.Cut(strings.TrimPrefix(filepath.Base(d), "."), ".tmp-")
+			unlock, err := m.lockSavedSnapshot(context.Background(), id)
+			if err != nil {
+				return
+			}
+			err = os.RemoveAll(d)
+			unlock()
+			if err != nil {
+				log.Warn().Err(err).Str("dir", d).Msg("saved snapshot staging could not be removed")
+				continue
+			}
+			n++
+		}
+		if n > 0 {
+			log.Info().Int("removed", n).Dur("took", time.Since(start)).Msg("swept abandoned saved snapshot staging")
+		}
+	}()
+	return done
+}
+
+// forkSource resolves the snapshot a VM is created from and fixes the paths
+// the VM will own, before any lock: a retried request then names the same
+// files as the attempt it repeats.
+func (m *Manager) forkSource(childID string, cfg *VMConfig, snapshotPath, memPath string) (*SavedSnapshotManifest, string, string, error) {
+	if snapshotPath != "" || memPath != "" {
+		return nil, "", "", status.Error(codes.InvalidArgument, "a saved snapshot names its own files; snapshot_path and mem_file_path must be empty")
+	}
+	dir, err := m.savedSnapshotDir(cfg.SavedSnapshotID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	man, err := readSavedSnapshotManifest(dir)
+	// A host that can boot the snapshot's backup, or already booted it as
+	// this VM, says so, and the control plane retries naming it.
+	if (m.BackupRestoreEnabled() || m.backupForkTracked(childID, cfg.SavedSnapshotID)) &&
+		(errors.Is(err, os.ErrNotExist) || err == nil && savedSnapshotFilesMissing(man)) {
+		return nil, "", "", savedSnapshotMissingErr(cfg.SavedSnapshotID)
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, "", "", status.Errorf(codes.NotFound, "saved snapshot %s does not exist", cfg.SavedSnapshotID)
+	}
+	if err != nil {
+		return nil, "", "", status.Errorf(codes.DataLoss, "saved snapshot %s: %v", cfg.SavedSnapshotID, err)
+	}
+	if man.SnapshotPath == "" {
+		return nil, "", "", status.Errorf(codes.FailedPrecondition, "saved snapshot %s holds no memory image; a VM is created from it by cold boot", cfg.SavedSnapshotID)
+	}
+	if cfg.BasePath != "" && cfg.BasePath != man.BasePath {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "base_path %q is not saved snapshot %s's base %q", cfg.BasePath, cfg.SavedSnapshotID, man.BasePath)
+	}
+	// The image fixes the machine's shape, and the host's capacity accounting
+	// charges what the config says, so the two must agree.
+	if cfg.VCPU != 0 && cfg.VCPU != man.VCPU {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "vcpu %d is not saved snapshot %s's %d", cfg.VCPU, cfg.SavedSnapshotID, man.VCPU)
+	}
+	if cfg.MemoryMiB != 0 && cfg.MemoryMiB != man.MemoryMiB {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "memory %d MiB is not saved snapshot %s's %d", cfg.MemoryMiB, cfg.SavedSnapshotID, man.MemoryMiB)
+	}
+	cfg.BasePath = man.BasePath
+	cfg.VCPU, cfg.MemoryMiB, cfg.DiskSizeMiB = man.VCPU, man.MemoryMiB, man.DiskSizeMiB
+	own := filepath.Join(m.cfg.SnapshotDir, childID)
+	return man, filepath.Join(own, "vmstate.snap"), filepath.Join(own, filepath.Base(man.MemPath)), nil
+}
+
+// retriedForkTarget is retriedLaunchTarget for a create from a snapshot: the
+// request names no files, so the child is matched by the snapshot it came
+// from and by owning its artifacts, never by files that may since be gone.
+func (m *Manager) retriedForkTarget(vmID, snapshotID string) (*VMInstance, bool) {
+	m.mu.RLock()
+	existing := m.vms[vmID]
+	m.mu.RUnlock()
+	if existing == nil {
+		return nil, false
+	}
+	existing.mu.RLock()
+	source, snap, mem := existing.SourceSnapshotID, existing.SnapshotPath, existing.MemFilePath
+	existing.mu.RUnlock()
+	own := filepath.Join(m.cfg.SnapshotDir, vmID)
+	if source != snapshotID || snap != filepath.Join(own, "vmstate.snap") || filepath.Dir(mem) != own {
+		return nil, false
+	}
+	return m.retriedLaunchTarget(vmID, snap, mem)
+}
+
+// savedSnapshotCommitted reports whether the snapshot man describes is still
+// on disk. man was read before the caller took the snapshot's lock, and the
+// id could have been deleted and captured again meanwhile, so the manifest
+// is read again under the lock and must be the same snapshot; the answer
+// then holds until the lock is released.
+func savedSnapshotCommitted(man *SavedSnapshotManifest) error {
+	now, err := readSavedSnapshotManifest(filepath.Dir(man.DiskPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return status.Errorf(codes.NotFound, "saved snapshot %s was deleted", man.SnapshotID)
+	}
+	if err != nil {
+		return fmt.Errorf("read saved snapshot: %w", err)
+	}
+	if !now.sameSnapshot(man) {
+		return status.Errorf(codes.NotFound, "saved snapshot %s was replaced since it was read", man.SnapshotID)
+	}
+	return nil
+}
+
+// sameSnapshot reports whether two manifests describe one capture: the
+// same source, kind, files and moment.
+func (a *SavedSnapshotManifest) sameSnapshot(b *SavedSnapshotManifest) bool {
+	return a.SnapshotID == b.SnapshotID && a.SourceVMID == b.SourceVMID && a.Kind == b.Kind &&
+		a.BasePath == b.BasePath && a.DiskPath == b.DiskPath && a.SnapshotPath == b.SnapshotPath &&
+		a.MemPath == b.MemPath && a.BaseMemPath == b.BaseMemPath &&
+		a.VCPU == b.VCPU && a.MemoryMiB == b.MemoryMiB && a.DiskSizeMiB == b.DiskSizeMiB &&
+		a.CreatedAt.Equal(b.CreatedAt)
+}
+
+// materializeFork gives the VM its own copy of every file the snapshot owns,
+// under the snapshot id lock: a delete either finishes first and is answered
+// not-found, or waits until the VM holds everything it needs. Returns the
+// VM's disk.
+func (m *Manager) materializeFork(ctx context.Context, childID string, man *SavedSnapshotManifest) (string, error) {
+	unlock, err := m.lockSavedSnapshot(ctx, man.SnapshotID)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	if err := savedSnapshotCommitted(man); err != nil {
+		return "", err
+	}
+	return m.materializeForkLocked(ctx, childID, man)
+}
+
+// materializeForkLocked is materializeFork for a caller that holds the
+// snapshot's lock and has checked it is committed.
+func (m *Manager) materializeForkLocked(ctx context.Context, childID string, man *SavedSnapshotManifest) (string, error) {
+	own := filepath.Join(m.cfg.SnapshotDir, childID)
+	if err := os.MkdirAll(own, 0o755); err != nil {
+		return "", fmt.Errorf("create vm snapshot dir: %w", err)
+	}
+	vmstate := filepath.Join(own, "vmstate.snap")
+	memDst := filepath.Join(own, filepath.Base(man.MemPath))
+	files := [][2]string{{man.SnapshotPath, vmstate}, {man.MemPath, memDst}}
+	for _, side := range [][2]string{
+		{man.SnapshotPath + ".overlay", vmstate + ".overlay"},
+		{presence.SidecarPath(man.MemPath), presence.SidecarPath(memDst)},
+		{layeredBaseSidecarPath(man.MemPath), layeredBaseSidecarPath(memDst)},
+		{WallClockMarkerPath(man.MemPath), WallClockMarkerPath(memDst)},
+	} {
+		if _, err := os.Stat(side[0]); err == nil {
+			files = append(files, side)
+		}
+	}
+	clone := m.fileClone()
+	for _, f := range files {
+		if err := clone(ctx, f[0], f[1]); err != nil {
+			if errors.Is(err, errNoReflink) {
+				return "", status.Errorf(codes.FailedPrecondition, "saved snapshot %s needs a reflink filesystem shared with %s: %v", man.SnapshotID, m.cfg.SnapshotDir, err)
+			}
+			return "", fmt.Errorf("clone %s: %w", filepath.Base(f[0]), err)
+		}
+	}
+	return m.cloneSavedDisk(ctx, childID, man.DiskPath, man.BasePath)
+}
+
+// stopLeftoverLife stops whatever may still run for an id that has a run
+// dir but no record, under either supervision; each stop is a no-op when
+// nothing is there.
+func (m *Manager) stopLeftoverLife(ctx context.Context, vmID string) error {
+	if err := m.stopVM(ctx, vmID, SupervisionUnit); err != nil {
+		return err
+	}
+	if m.cgroups != nil {
+		return m.stopVM(ctx, vmID, SupervisionCgroup)
+	}
+	return nil
+}
+
+// cleanupForkCopies removes the snapshot-dir copies a failed fork made.
+func (m *Manager) cleanupForkCopies(childID string) {
+	if !isLeafName(childID) || isReservedRunDirName(childID) {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(m.cfg.SnapshotDir, childID))
+}
+
+// fileClone is the exact clone for every file a VM takes from a saved
+// snapshot; tests stand in for it on filesystems that cannot reflink.
+func (m *Manager) fileClone() func(context.Context, string, string) error {
+	if m.reflinkFile != nil {
+		return m.reflinkFile
+	}
+	return reflinkFileExact
+}
+
+// syncGuestFilesystems runs sync inside the guest through boxd, bounded.
+// Only a whole reply that says sync exited 0 counts: a reply cut short, or
+// one with no exit code, is not a flush.
+func syncGuestFilesystems(ctx context.Context, vmIP string) error {
+	body, _ := json.Marshal(struct {
+		Command  string `json:"command"`
+		TimeoutS int    `json:"timeout_s"`
+	}{Command: "sync", TimeoutS: 20})
+	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	reply, err := postBoxd(sctx, vmIP, "/exec", body)
+	if err != nil {
+		return err
+	}
+	var res struct {
+		ExitCode *int32 `json:"exit_code"`
+		Stderr   string `json:"stderr"`
+	}
+	if err := json.Unmarshal(reply, &res); err != nil {
+		return fmt.Errorf("sync: reply: %w", err)
+	}
+	if res.ExitCode == nil {
+		return errors.New("sync: reply carries no exit code")
+	}
+	if *res.ExitCode != 0 {
+		return fmt.Errorf("sync exited %d: %s", *res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	return nil
+}
+
+func diskSizeMiB(path string) (uint32, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return uint32((fi.Size() + (1 << 20) - 1) >> 20), nil
+}
+
+func removeSavedStaging(parent, snapshotID string) {
+	stale, _ := filepath.Glob(filepath.Join(parent, "."+snapshotID+".tmp-*"))
+	for _, d := range stale {
+		_ = os.RemoveAll(d)
+	}
+}
+
+// savedIDLock is one snapshot id's lock; the entry lives while a holder or a
+// waiter references it, so the map does not grow with every id ever seen.
+type savedIDLock struct {
+	ch   chan struct{}
+	refs int
+}
+
+// lockSavedSnapshot serializes create and delete for one snapshot id.
+func (m *Manager) lockSavedSnapshot(ctx context.Context, snapshotID string) (func(), error) {
+	m.savedIDMu.Lock()
+	if m.savedIDLocks == nil {
+		m.savedIDLocks = map[string]*savedIDLock{}
+	}
+	l := m.savedIDLocks[snapshotID]
+	if l == nil {
+		l = &savedIDLock{ch: make(chan struct{}, 1)}
+		m.savedIDLocks[snapshotID] = l
+	}
+	l.refs++
+	m.savedIDMu.Unlock()
+	release := func() {
+		m.savedIDMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(m.savedIDLocks, snapshotID)
+		}
+		m.savedIDMu.Unlock()
+	}
+	select {
+	case l.ch <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-l.ch
+			release()
+			return nil, err
+		}
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-l.ch; release() }, nil
+	case <-ctx.Done():
+		release()
+		return nil, ctx.Err()
+	}
+}
+
+// acquireSavedCapture bounds concurrent captures per host: each one holds a
+// source frozen and copies a disk, and a burst must not stall the host.
+func (m *Manager) acquireSavedCapture(ctx context.Context) (func(), error) {
+	m.savedCapturesOnce.Do(func() {
+		n := m.cfg.SavedSnapshotConcurrency
+		if n <= 0 {
+			n = defaultSavedCaptures
+		}
+		m.savedCaptures = make(chan struct{}, n)
+	})
+	select {
+	case m.savedCaptures <- struct{}{}:
+		return func() { <-m.savedCaptures }, nil
+	case <-ctx.Done():
+		return nil, status.Errorf(codes.Unavailable, "waiting for a capture slot: %v", ctx.Err())
+	}
+}
+
+// savedFreeBytes reports the snapshot filesystem's free space.
+var savedFreeBytes = func(dir string) (int64, error) {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(dir, &fs); err != nil {
+		return 0, err
+	}
+	return int64(fs.Bavail) * int64(fs.Bsize), nil
+}
+
+// cloneSavedFile reflinks a paused source's image into the staging
+// directory or refuses: the image is taken as it is, never copied, so the
+// space check reserves nothing for it.
+func (m *Manager) cloneSavedFile(ctx context.Context, src, dst string) error {
+	if err := m.fileClone()(ctx, src, dst); err != nil {
+		if errors.Is(err, errNoReflink) {
+			return status.Errorf(codes.FailedPrecondition, "saved images need a reflink filesystem under %s: %v", m.cfg.SnapshotDir, err)
+		}
+		return fmt.Errorf("clone %s: %w", filepath.Base(src), err)
+	}
+	return nil
+}
+
+// savedCaptureHeadroom refuses a capture the snapshot filesystem cannot hold.
+// Disk and paused images are reflinked, never copied, so the fixed headroom
+// covers them; only a running memory capture writes bytes. The need stays
+// reserved until the returned release runs, so concurrent captures cannot
+// each be admitted against the same free space.
+func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst *VMInstance) (func(), error) {
+	need := int64(savedCaptureHeadroom)
+	if kind == SavedSnapshotMemFS && st == StatusRunning {
+		inst.mu.RLock()
+		memoryMiB := inst.Config.MemoryMiB
+		inst.mu.RUnlock()
+		// A diff joins the chain in place and a full image is one file:
+		// at most a guest's worth of new bytes either way.
+		need += int64(memoryMiB) << 20
+	}
+	free, err := savedFreeBytes(m.cfg.SnapshotDir)
+	if err != nil {
+		return nil, fmt.Errorf("statfs snapshot dir: %w", err)
+	}
+	release := func() { m.savedReserved.Add(-need) }
+	if reserved := m.savedReserved.Add(need); free < reserved {
+		release()
+		return nil, status.Errorf(codes.ResourceExhausted, "snapshot filesystem has %d bytes free and captures in flight hold %d; this one needs %d", free, reserved-need, need)
+	}
+	return release, nil
+}
+
+// firecrackerExeSHA hashes the running VM's Firecracker through its exe
+// link, which names the binary the process runs even after the file on disk
+// was replaced. Empty when it cannot be read.
+func firecrackerExeSHA(inst *VMInstance) string {
+	inst.mu.RLock()
+	pid := inst.PID
+	inst.mu.RUnlock()
+	if pid <= 0 {
+		return ""
+	}
+	f, err := os.Open(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// fcPauseVMContext pauses the vCPUs over a bare request, like UnpauseVMContext.
+func fcPauseVMContext(ctx context.Context, socketPath string) error {
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socketPath)
+		},
+		DisableKeepAlives: true,
+	}
+	defer tr.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, "http://localhost/vm", strings.NewReader(`{"state":"Paused"}`))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		return fmt.Errorf("pause VM: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("pause VM: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// unpauseSourceWithProbe resumes the vCPUs, reading the VM state when the
+// response is lost: PATCH /vm is not a receipt.
+func unpauseSourceWithProbe(ctx context.Context, socketPath string) error {
+	base := context.WithoutCancel(ctx)
+	var errs []error
+	for attempt := 0; attempt < savedUnpauseAttempts; attempt++ {
+		uctx, cancel := context.WithTimeout(base, 5*time.Second)
+		err := UnpauseVMContext(uctx, socketPath)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, err)
+		pctx, pcancel := context.WithTimeout(base, 5*time.Second)
+		state, perr := VMState(pctx, socketPath)
+		pcancel()
+		if perr == nil && state == "Running" {
+			return nil
+		}
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	return errors.Join(errs...)
+}
+
+// cloneOrCopyFile makes dst an independent copy of src: a reflink where the
+// filesystem offers one, else a copy that keeps holes.
+func cloneOrCopyFile(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if err := cloneFileFD(out, in); err == nil {
+		return out.Close()
+	}
+	if err := out.Truncate(info.Size()); err != nil {
+		out.Close()
+		return err
+	}
+	if err := copyDataExtents(ctx, in, out, info.Size()); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// copyDataExtents copies in's data extents into out at their offsets, or the
+// whole file where the filesystem cannot report holes.
+func copyDataExtents(ctx context.Context, in, out *os.File, size int64) error {
+	fd := int(in.Fd())
+	for off := int64(0); off < size; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		data, err := unix.Seek(fd, off, unix.SEEK_DATA)
+		if errors.Is(err, syscall.ENXIO) {
+			return nil
+		}
+		if err != nil {
+			if off == 0 {
+				return copyRange(ctx, out, in, 0, size)
+			}
+			return err
+		}
+		hole, err := unix.Seek(fd, data, unix.SEEK_HOLE)
+		if err != nil {
+			return err
+		}
+		if hole > size {
+			hole = size
+		}
+		if hole <= data {
+			return fmt.Errorf("invalid extent [%d,%d)", data, hole)
+		}
+		if err := copyRange(ctx, out, in, data, hole-data); err != nil {
+			return err
+		}
+		off = hole
+	}
+	return nil
+}
+
+// copyRange copies n bytes at off from in to out in bounded pieces, honoring
+// ctx between them: a large extent must not outlive the caller's budget.
+func copyRange(ctx context.Context, out, in *os.File, off, n int64) error {
+	const piece = 32 << 20
+	for done := int64(0); done < n; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := min(int64(piece), n-done)
+		if _, err := out.Seek(off+done, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(out, io.NewSectionReader(in, off+done, chunk), chunk); err != nil {
+			return err
+		}
+		done += chunk
+	}
+	return nil
+}
+
+func createSparseFile(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func allocatedTreeBytes(dir string) int64 {
+	var total int64
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			n, _ := allocatedBytes(p)
+			total += n
+		}
+		return nil
+	})
+	return total
+}
+
+func fsyncTree(dir string) error {
+	return filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		serr := f.Sync()
+		f.Close()
+		return serr
+	})
+}
+
+func fsyncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}

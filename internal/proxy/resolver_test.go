@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,7 +20,7 @@ func attestPreviewProtocol(w http.ResponseWriter) {
 
 func TestVMDResolverRejectsOldVMDResponseWithoutProtocolAttestation(t *testing.T) {
 	var gotHeader, gotCapabilities, gotPath string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get(preview.ProxyProtocolHeader)
 		gotCapabilities = r.Header.Get(preview.ProxyCapabilitiesHeader)
 		gotPath = r.URL.Path
@@ -54,7 +53,7 @@ func TestVMDResolverRejectsOldVMDResponseWithoutProtocolAttestation(t *testing.T
 }
 
 func TestVMDResolverAcceptsAttestedLegacyResponse(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attestPreviewProtocol(w)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -76,7 +75,7 @@ func TestVMDResolverAcceptsAttestedLegacyResponse(t *testing.T) {
 
 func TestVMDResolverAttestsPreviewTokensOnlyWhenConfigured(t *testing.T) {
 	var gotCapabilities string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotCapabilities = r.Header.Get(preview.ProxyCapabilitiesHeader)
 		attestPreviewProtocol(w)
 		w.Header().Set("Content-Type", "application/json")
@@ -98,7 +97,7 @@ func TestVMDResolverAttestsPreviewTokensOnlyWhenConfigured(t *testing.T) {
 
 func TestVMDResolverAttestsBrowserAuthOnlyWhenConfigured(t *testing.T) {
 	var gotCapabilities string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotCapabilities = r.Header.Get(preview.ProxyCapabilitiesHeader)
 		attestPreviewProtocol(w)
 		w.Header().Set("Content-Type", "application/json")
@@ -123,7 +122,7 @@ func TestVMDResolverAttestsBrowserAuthOnlyWhenConfigured(t *testing.T) {
 }
 
 func TestVMDResolverDecodesParallelPortAccess(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attestPreviewProtocol(w)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -154,7 +153,7 @@ func TestVMDResolverDecodesParallelPortAccess(t *testing.T) {
 
 func TestVMDResolverDoesNotCacheSuccessfulPolicy(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attestPreviewProtocol(w)
 		call := calls.Add(1)
 		ports := map[string]bool{"3000": true}
@@ -206,7 +205,7 @@ func TestVMDResolverInvalidateStartsFreshLookupDuringInflightSuccess(t *testing.
 	var calls atomic.Int32
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attestPreviewProtocol(w)
 		call := calls.Add(1)
 		port := "8080"
@@ -286,7 +285,7 @@ func TestVMDResolverInvalidateStartsFreshLookupDuringInflightSuccess(t *testing.
 
 func TestVMDResolverCachesOnlyNegativeLookups(t *testing.T) {
 	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		http.Error(w, "instance not found", http.StatusNotFound)
 	}))
@@ -317,7 +316,7 @@ func TestVMDResolverInflightMissCannotReinsertAfterInvalidate(t *testing.T) {
 	var calls atomic.Int32
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		call := calls.Add(1)
 		if call == 1 {
 			close(firstStarted)

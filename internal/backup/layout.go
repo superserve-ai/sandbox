@@ -74,9 +74,13 @@ func hashKeyLines(lines []string) string {
 const (
 	sandboxPrefix  = "sandboxes"
 	templatePrefix = "templates"
+	snapshotPrefix = "snapshots"
 	// ManifestObject is the per-generation metadata object, written last:
 	// its presence marks the generation complete and restorable.
 	ManifestObject = "manifest.json"
+	// BlockMapName is the overlay block map Firecracker saves beside a
+	// snapshot; a restore keeps it beside the disk it describes.
+	BlockMapName = "vmstate.snap.overlay"
 )
 
 // SandboxObject names an artifact object within a sandbox generation.
@@ -94,13 +98,31 @@ func SandboxObject(sandboxID, generation, fileName string) (string, error) {
 	return fmt.Sprintf("%s/%s/%s/%s", sandboxPrefix, sandboxID, generation, fileName), nil
 }
 
+// SnapshotObject names an artifact object within a saved snapshot's
+// generation. Saved snapshots get their own prefix rather than their source
+// sandbox's: they outlive that sandbox, and its backups are purged with it.
+func SnapshotObject(snapshotID, generation, fileName string) (string, error) {
+	if err := validSegment(snapshotID); err != nil {
+		return "", fmt.Errorf("snapshot id: %w", err)
+	}
+	if err := validSegment(generation); err != nil {
+		return "", fmt.Errorf("generation: %w", err)
+	}
+	if err := validSegment(fileName); err != nil {
+		return "", fmt.Errorf("file name: %w", err)
+	}
+	return fmt.Sprintf("%s/%s/%s/%s", snapshotPrefix, snapshotID, generation, fileName), nil
+}
+
 // SharedBaseObject names a bucket-wide content-addressed base image
 // object: bases/<sha256>.p<fingerprint>. The digest addresses the bytes
 // and the fingerprint binds the extent table, so identical bases from
 // any sandbox or host converge on one immutable object.
 func SharedBaseObject(sha256, fingerprint string) string {
-	return "bases/" + sha256 + ".p" + fingerprint
+	return sharedBasePrefix + sha256 + ".p" + fingerprint
 }
+
+const sharedBasePrefix = "bases/"
 
 // TemplateObject names an artifact object within a template build
 // generation. The generation segment matters even though a finished build

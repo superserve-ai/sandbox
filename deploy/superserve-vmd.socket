@@ -1,5 +1,7 @@
 [Unit]
 Description=Superserve vmd listeners
+ConditionPathExists=/etc/sandbox/host-identity.json
+ConditionPathExists=/etc/sandbox/host-identity.env
 
 # systemd owns these sockets, so they survive vmd restarts: connections
 # arriving mid-deploy queue in the kernel accept backlog instead of being

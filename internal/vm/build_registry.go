@@ -28,7 +28,7 @@ func (s BuildStatus) IsTerminal() bool {
 }
 
 // buildRecord is the in-memory state of one build. The record is keyed in
-// Manager.builds by the build VM ID (which is also "build-" + templateID).
+// Manager.builds by the build VM ID.
 //
 // Records are kept indefinitely after terminal status so polling
 // consumers that come back late (e.g. supervisor after a control plane
@@ -37,11 +37,28 @@ func (s BuildStatus) IsTerminal() bool {
 type buildRecord struct {
 	BuildVMID  string
 	TemplateID string
-	Status     BuildStatus
-	Result     *BuildTemplateResult // populated on ready
-	Error      string               // populated on failed/cancelled
-	StartedAt  time.Time
-	EndedAt    time.Time // zero until terminal
+	// VCPU and MemoryMiB are the build VM's resource allocation, recorded
+	// so capacity pressure can count in-flight builds: the subprocess VM
+	// never enters the instance map, but its memory and CPU are as real
+	// as any sandbox's.
+	VCPU      uint32
+	MemoryMiB uint32
+	// AllocReleased marks that this build's memory/vCPU pressure counters
+	// have been returned: the last build VM (subprocess, then the
+	// access-pattern recorder) is gone. Guarded by buildsMu.
+	AllocReleased bool
+	// RecorderLive marks the window in which THIS build's access-pattern
+	// recorder VM is expected in the instance map and covered by the
+	// build's counters. Recorder ids carry only the template, so without
+	// this phase bit a recorder LEAKED by an earlier build would be
+	// re-hidden by any later build of the same template. Guarded by
+	// buildsMu; cleared together with the allocation release.
+	RecorderLive bool
+	Status       BuildStatus
+	Result       *BuildTemplateResult // populated on ready
+	Error        string               // populated on failed/cancelled
+	StartedAt    time.Time
+	EndedAt      time.Time // zero until terminal
 
 	// cancel stops the goroutine running the build. Calling it under a
 	// non-terminal status transitions the record to cancelled once the
@@ -52,6 +69,12 @@ type buildRecord struct {
 	// logs is the build's per-build log buffer. Publishers append; SSE /
 	// gRPC stream consumers subscribe. Closed on terminal status.
 	logs *buildLogBuffer
+
+	// workerDone is closed when the build's worker returns, after its
+	// subprocess has exited. A cancelled build is terminal before that, and
+	// its id stays reserved until then: a retry that took the id earlier
+	// would prepare a directory the old subprocess can still write to.
+	workerDone chan struct{}
 }
 
 // Snapshot is the client-visible read view of a buildRecord (no cancel fn).
@@ -79,7 +102,7 @@ func (m *Manager) initBuildRegistry() {
 // registerBuild inserts a new record in the registry. Fails if a build
 // with the same ID is already in-flight — the caller is expected to pick a
 // unique buildVMID per BuildTemplate invocation.
-func (m *Manager) registerBuild(buildVMID, templateID string, cancel context.CancelFunc) (*buildRecord, error) {
+func (m *Manager) registerBuild(buildVMID, templateID string, vcpu, memoryMiB uint32, cancel context.CancelFunc, prepare func() error) (*buildRecord, error) {
 	m.initBuildRegistry()
 	// An adoption reconcile for this template+build may be mid-flight
 	// with stamped-metadata writes pending; cancel it and AWAIT its exit
@@ -98,19 +121,61 @@ func (m *Manager) registerBuild(buildVMID, templateID string, cancel context.Can
 	}
 	m.buildsMu.Lock()
 	defer m.buildsMu.Unlock()
-	if existing, ok := m.builds[buildVMID]; ok && !existing.Status.IsTerminal() {
-		return nil, fmt.Errorf("build %s already in flight", buildVMID)
+	if existing, ok := m.builds[buildVMID]; ok {
+		if !existing.Status.IsTerminal() {
+			return nil, fmt.Errorf("build %s already in flight", buildVMID)
+		}
+		if existing.workerDone != nil {
+			select {
+			case <-existing.workerDone:
+			default:
+				return nil, fmt.Errorf("build %s is still shutting down; retry once it has exited", buildVMID)
+			}
+		}
+	}
+	if m.cfg.TemplateBuilderBin != "" {
+		procs, err := findAttemptBuilders(m.cfg.TemplateBuilderBin, buildVMID)
+		if err != nil {
+			return nil, err
+		}
+		if len(procs) != 0 {
+			return nil, fmt.Errorf("build %s is still running in a previous daemon", buildVMID)
+		}
+	}
+	// Under the lock, so nothing can claim the id between the check above
+	// and whatever prepare removes.
+	if prepare != nil {
+		if err := prepare(); err != nil {
+			return nil, err
+		}
 	}
 	rec := &buildRecord{
 		BuildVMID:  buildVMID,
 		TemplateID: templateID,
+		VCPU:       vcpu,
+		MemoryMiB:  memoryMiB,
 		Status:     BuildStatusRunning,
 		StartedAt:  time.Now(),
 		cancel:     cancel,
 		logs:       newBuildLogBuffer(),
+		workerDone: make(chan struct{}),
 	}
 	m.builds[buildVMID] = rec
+	// Pressure counters pair with the worker-exit release in
+	// buildTemplateWorker; see the field comment on buildPressureCount.
+	m.buildPressureCount.Add(1)
+	m.buildPressureMem.Add(int64(memoryMiB))
+	m.buildPressureVcpus.Add(int64(vcpu))
 	return rec, nil
+}
+
+// finishBuildWorker releases the workflow count and its inclusion marker
+// atomically so a pressure sample cannot count an unidentified build.
+func (m *Manager) finishBuildWorker(rec *buildRecord) {
+	m.buildsMu.Lock()
+	defer m.buildsMu.Unlock()
+	m.buildPressureCount.Add(-1)
+	close(rec.workerDone)
 }
 
 // setBuildStatus transitions a record to a new status. Guarded so terminal
@@ -135,11 +200,22 @@ func (m *Manager) setBuildStatus(buildVMID string, newStatus BuildStatus) bool {
 // or to failed with the error. Idempotent: if the record is already
 // terminal (e.g. cancelled before snapshot finished), the earlier terminal
 // status wins and this call is a no-op.
-func (m *Manager) completeBuild(buildVMID string, result *BuildTemplateResult, buildErr error) {
+func (m *Manager) completeBuild(buildVMID string, worker *buildRecord, result *BuildTemplateResult, buildErr error) {
 	m.buildsMu.Lock()
 	rec, ok := m.builds[buildVMID]
 	if !ok {
 		m.buildsMu.Unlock()
+		return
+	}
+	if rec != worker {
+		// The id was re-registered while this worker ran (a cancelled
+		// build retried before its worker exited): this completion
+		// belongs to the REPLACED generation, and publishing it would
+		// stamp the old result onto the new build's record as a frozen
+		// terminal state the new worker could never overwrite.
+		m.buildsMu.Unlock()
+		m.log.Warn().Str("build_vm_id", buildVMID).
+			Msg("dropping completion from a replaced build worker")
 		return
 	}
 	if rec.Status.IsTerminal() {
@@ -225,8 +301,17 @@ func (m *Manager) GetBuildStatus(buildVMID string) (BuildStatusSnapshot, bool) {
 		// have exited before enqueueing it for backup; make sure the
 		// journal knows about it (idempotent, async).
 		m.reconcileAdoptedBuildBackup(snap)
+		return snap, true
 	}
-	return snap, ok
+	if m.cfg.TemplateBuilderBin != "" {
+		procs, err := findAttemptBuilders(m.cfg.TemplateBuilderBin, buildVMID)
+		if err != nil || len(procs) != 0 {
+			// A restarted daemon has no registry record for a surviving
+			// builder. An inconclusive scan cannot establish its absence.
+			return BuildStatusSnapshot{BuildVMID: buildVMID, Status: BuildStatusRunning}, true
+		}
+	}
+	return BuildStatusSnapshot{}, false
 }
 
 // loadDurableBuild adopts a completed build from its on-disk artifacts. To
@@ -242,6 +327,7 @@ func loadDurableBuild(snapshotRoot, buildVMID string) (BuildStatusSnapshot, bool
 	if err != nil || !buildArtifactsPresent(res) {
 		return BuildStatusSnapshot{}, false
 	}
+	populateBuildAllocations(res)
 	return BuildStatusSnapshot{
 		BuildVMID:  buildVMID,
 		TemplateID: filepath.Base(filepath.Dir(dir)),
@@ -268,11 +354,23 @@ func buildArtifactsPresent(r *BuildTemplateResult) bool {
 	return true
 }
 
+func populateBuildAllocations(result *BuildTemplateResult) {
+	if result == nil {
+		return
+	}
+	result.RootfsAllocatedBytes = physicalAllocatedBytes(result.RootfsPath)
+	result.BaseAllocatedBytes = physicalAllocatedBytes(result.BasePath)
+	result.DeltaAllocatedBytes = physicalAllocatedBytes(result.DeltaPath)
+}
+
 // CancelBuild marks a build cancelled and signals its template-builder
-// subprocess (via ctx.Cancel → SIGTERM → cleanup defers). Safe on
-// unknown or already-terminal builds.
+// subprocess. After a daemon restart, it finds and stops the predecessor's
+// builder before acknowledging cancellation.
 func (m *Manager) CancelBuild(ctx context.Context, buildVMID string) error {
-	m.cancelBuildRecord(buildVMID, "cancelled by caller")
+	_, found := m.cancelBuildRecord(buildVMID, "cancelled by caller")
+	if !found && m.cfg.TemplateBuilderBin != "" {
+		return m.stopRecoveredBuild(ctx, buildVMID)
+	}
 	return nil
 }
 

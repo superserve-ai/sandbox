@@ -1,10 +1,22 @@
+# Deploy and verify ingress on every remote destination before enabling routing
+# on its source hosts. Production routing does not enable ingress on the source;
+# serving ingress uses the cell's ingress variable, and manual standby forces it.
+# On partial destination rollout failure, keep source routing disabled.
+# Before removing a destination's ingress or rolling it back to an older binary,
+# disable routing on every source that can reach it and drain existing streams.
 # Deploy Proxy — edge proxy on the VMD hosts.
 #
-# Production NEVER deploys without staging first. Same pattern as Deploy API /
-# Deploy VMD. The us-west2 cell host deploys as a final production step,
-# after the primary region succeeds — same shape as Deploy API's usw steps.
+# Staging runs first; production standby deploys may skip an absent staging
+# standby, matching Deploy VMD. Normal deployments run west after the primary
+# region succeeds — same shape as Deploy API's usw steps.
 
 name: Deploy Proxy
+
+# Durable cell ownership and host flock also serialize interrupted sessions.
+concurrency:
+  group: deploy-vmd
+  cancel-in-progress: false
+  queue: max
 
 on:
   workflow_dispatch:
@@ -16,16 +28,238 @@ on:
         options:
           - staging
           - production
+      target:
+        description: 'Host target'
+        required: true
+        type: choice
+        default: serving
+        options:
+          - serving
+          - standby
+      deployment_mode:
+        description: 'Keep existing listeners, or use generation cutover; retries must keep the original mode'
+        required: true
+        type: choice
+        default: legacy
+        options:
+          - legacy
+          - generation
+      revision:
+        description: 'Original commit SHA when resuming an interrupted rollout'
+        required: false
+        type: string
+      rollout_id:
+        description: 'Original rollout ID when resuming an interrupted run; use the same revision and inputs'
+        required: false
+        type: string
+      operation:
+        description: 'Prepare or resume the bootstrap generation around Terraform frontend migration, or deploy'
+        required: true
+        type: choice
+        default: deploy
+        options:
+          - deploy
+          - bootstrap
+      production_cell:
+        description: 'Production cell for manual deployments'
+        required: true
+        type: choice
+        default: usw2
+        options:
+          - usw2
+          - use4
   push:
     branches: [main]
     paths:
+      # Every internal package the proxy imports must be listed, or a change to
+      # it merges without deploying. Enforced by the deploy-trigger-coverage CI
+      # check against `go list -deps`.
+      - 'supabase/migrations/**'
       - 'cmd/proxy/**'
-      - 'internal/proxy/**'
+      - 'cmd/check-legacy-heartbeat/**'
+      - 'internal/analytics/**'
       - 'internal/auth/**'
+      - 'internal/preview/**'
+      - 'internal/proxy/**'
+      - 'internal/db/**'
+      - 'internal/sentrylog/**'
+      - 'internal/telemetry/**'
+      - 'internal/vmdclient/**'
+      - 'proto/**'
+      - 'go.mod'
+      - 'go.sum'
       - 'deploy/proxy.service'
+      - 'deploy/proxy.socket'
+      - 'deploy/proxy-generation.service'
+      - 'deploy/refresh-peer-credentials.py'
+      - '.github/workflows/scripts/proxy_rollout.py'
+      - '.github/workflows/deploy-proxy.yml'
+      - '.github/workflows/scripts/deploy-proxy.py'
+      - '.github/workflows/scripts/deploy-proxy-legacy.py'
+      - '.github/workflows/scripts/legacy_proxy_preflight.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
+
+env:
+  PROXY_DEPLOYMENT_MODE: ${{ (inputs.operation == 'bootstrap' || inputs.deployment_mode == 'generation' || (github.event_name == 'push' && vars.PROXY_GENERATION_PROMOTION_READY == 'true')) && 'generation' || 'legacy' }}
+  PROXY_ROLLOUT_ID: ${{ inputs.rollout_id || github.run_id }}
+  PROXY_OPERATION: ${{ inputs.operation || 'deploy' }}
+  PROXY_ROLLOUT_MANIFESTS: bin/proxy-rollout.json
+  # These repository variables are populated only after the executable
+  # Notion runbook is published and its staging evidence is recorded.
+  PROXY_GENERATION_RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
+  PROXY_GENERATION_PROMOTION_EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
+  PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
+  DEPLOY_EVENT: ${{ github.event_name }}
+  DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+  DEPLOY_TARGET: ${{ inputs.target || 'serving' }}
+  # Carry the selected role into the immutable host request.  The remote
+  # controller must not infer serving behavior from a reused cell manifest.
+  PROXY_TARGET: ${{ inputs.target || 'serving' }}
+  DEPLOY_PRODUCTION_CELL: ${{ inputs.production_cell || 'usw2' }}
 
 jobs:
+  migration-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      revision: ${{ steps.revision.outputs.revision }}
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Validate deployment revision
+        id: revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT_REF: ${{ github.ref }}
+          CURRENT_SHA: ${{ github.sha }}
+          REQUESTED_REVISION: ${{ inputs.revision }}
+          REQUESTED_ROLLOUT_ID: ${{ inputs.rollout_id }}
+          VALIDATION_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          if [ "${DEPLOY_EVENT:-}" = workflow_dispatch ] && [ "${VALIDATION_ENVIRONMENT:-}" = staging ] &&
+             [ "${PROXY_DEPLOYMENT_MODE:-}" = legacy ] && [ -z "$REQUESTED_REVISION$REQUESTED_ROLLOUT_ID" ]; then
+            echo "revision=$CURRENT_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$CURRENT_REF" = refs/heads/main ] || { echo 'Deployments must be dispatched from main.' >&2; exit 1; }
+          revision="$CURRENT_SHA"
+          if [ -n "$REQUESTED_REVISION$REQUESTED_ROLLOUT_ID" ]; then
+            [[ "$REQUESTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo 'Retry requires the original full commit SHA.' >&2; exit 1; }
+            [[ "$REQUESTED_ROLLOUT_ID" =~ ^[0-9]+$ ]] || { echo 'Retry requires the original workflow run ID.' >&2; exit 1; }
+            gh api "repos/$GH_REPO/actions/runs/$REQUESTED_ROLLOUT_ID" > original-run.json
+            jq -e --arg sha "$REQUESTED_REVISION" '
+              .head_sha == $sha and .head_branch == "main" and
+              .path == ".github/workflows/deploy-proxy.yml" and
+              (.event == "push" or .event == "workflow_dispatch")
+            ' original-run.json > /dev/null
+            revision="$REQUESTED_REVISION"
+          fi
+          git merge-base --is-ancestor "$revision" origin/main
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - name: Select proxy deployment mode
+        id: mode
+        run: echo "mode=$PROXY_DEPLOYMENT_MODE" >> "$GITHUB_OUTPUT"
+      - name: Require host identity readiness for automatic rollout
+        env:
+          DEPLOY_EVENT: ${{ github.event_name }}
+          ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
+          GENERATION_READY: ${{ vars.PROXY_GENERATION_PROMOTION_READY }}
+          RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
+          EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
+          EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
+        run: |
+          if [ "${PROXY_DEPLOYMENT_MODE:-generation}" = generation ] && [ "$DEPLOY_EVENT" = push ] && [ "${GENERATION_READY:-}" != true ]; then
+            echo 'Generation migration and staging promotion evidence are required before automatic rollout.' >&2
+            exit 1
+          fi
+          if [ "${PROXY_DEPLOYMENT_MODE:-generation}" = generation ] && [ "$DEPLOY_EVENT" = push ]; then
+            notion_url_pattern='^https://(([A-Za-z0-9-]+\.)?(notion\.so|notion\.site)|app\.notion\.com)/[^[:space:]<>#]+$'
+            https_url_pattern='^https://[^[:space:]<>#]+$'
+            if [[ ! "${RUNBOOK_URL:-}" =~ $notion_url_pattern ]] ||
+               [[ ! "${EVIDENCE_URL:-}" =~ $https_url_pattern ]] ||
+               [ "${EVIDENCE_STATUS:-}" != passed ]; then
+              echo 'Generation promotion requires a published Notion runbook, immutable HTTPS staging evidence link, and passed evidence status.' >&2
+              exit 1
+            fi
+          fi
+          if [ "$DEPLOY_EVENT" = push ] && [ "${ROLLOUT_READY:-}" != true ]; then
+            echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
+            exit 1
+          fi
+
+      # Manual dispatch requires the operator to apply migrations first.
+      - name: Check rollout hold and same-SHA push CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          git checkout "$GITHUB_SHA" -- .github/workflows/scripts/wait-for-push-ci.py
+          python3 .github/workflows/scripts/wait-for-push-ci.py
+
+      - name: Wait for same-SHA CD Migrate to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Manual dispatch — operator owns migration ordering; skipping gate."
+            exit 0
+          fi
+
+          git checkout --detach "${{ steps.revision.outputs.revision }}"
+
+          # Diff the WHOLE pushed range, not just the tip commit — a
+          # multi-commit push can carry migrations in an earlier commit.
+          # An endpoint diff (before vs sha) is exactly "what changed on
+          # main since the last deployed tip", and works even for a force
+          # push where `before` is no longer an ancestor.
+          BEFORE="${{ github.event.before }}"
+          MIGRATIONS_CHANGED=unknown
+          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] &&
+             git fetch --quiet --depth=1 origin "$BEFORE" 2>/dev/null; then
+            if git diff --name-only "$BEFORE" HEAD | grep -Eq '^(supabase/(migrations|shared-auth-history)/|scripts/migrate_database[.]py$|[.]github/workflows/cd[.]yml$)'; then
+              MIGRATIONS_CHANGED=yes
+            else
+              MIGRATIONS_CHANGED=no
+            fi
+          fi
+
+          if [ "$MIGRATIONS_CHANGED" = "no" ]; then
+            echo "No migration changes in ${BEFORE}..${{ github.sha }}; skipping gate."
+            exit 0
+          fi
+
+          # An unknown range must still observe a successful migration run.
+          echo "migrations_changed=$MIGRATIONS_CHANGED — checking CD Migrate for ${{ github.sha }}"
+          # ~20 min budget (60 × 20s), then fail closed: a deploy against a
+          # missing column is worse than a late deploy.
+          for i in $(seq 1 60); do
+            run=$(gh api "repos/${{ github.repository }}/actions/workflows/cd.yml/runs?head_sha=${{ github.sha }}&event=push" \
+              --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
+            status=${run% *}; conclusion=${run#* }
+            echo "attempt $i: status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CD Migrate succeeded; proceeding."
+                exit 0
+              fi
+              echo "CD Migrate concluded '$conclusion' — refusing to deploy against an unmigrated schema."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for CD Migrate; refusing to deploy."
+          exit 1
+
   deploy-staging:
+    needs: [migration-gate]
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -34,6 +268,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.migration-gate.outputs.revision }}
+
+      - name: Record proxy revision
+        run: echo "PROXY_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -45,6 +284,7 @@ jobs:
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/check-legacy-heartbeat ./cmd/check-legacy-heartbeat
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -55,27 +295,74 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Read applied proxy manifests from the owning state
+        if: env.PROXY_DEPLOYMENT_MODE == 'generation'
+        env:
+          PROXY_OPERATION: ${{ inputs.environment == 'production' && 'deploy' || inputs.operation || 'deploy' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          terraform -chdir=infra/envs/staging/us-central1 init -input=false
+          # Preparation can precede frontend imports; retries use the applied
+          # output once available so the same rollout can finalize or revert.
+          terraform -chdir=infra/envs/staging/us-central1 output -json |
+            jq -e --arg operation "$PROXY_OPERATION" '
+              if $operation == "bootstrap" and (has("proxy_generation_rollout") | not)
+              then .proxy_generation_bootstrap.value
+              else .proxy_generation_rollout.value end
+            ' > "$PROXY_ROLLOUT_MANIFESTS"
+
       # GCP_REGION scopes label discovery to the primary region so the
       # usw cell host (same project, same label) isn't folded into this
       # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy proxy to VMD instances
         env:
+          DEPLOY_CELL: staging
+          # Production bootstrap still verifies the already-promoted staging deployment.
+          PROXY_OPERATION: ${{ inputs.environment == 'production' && 'deploy' || inputs.operation || 'deploy' }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ env.PROXY_REVISION }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_STAGING }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_STAGING }}
+          # Enables the proxy's OTLP exporter (host-local collector) so the
+          # data-plane exec phase histograms export.
+          OTEL_ENVIRONMENT: staging
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
+          # Bootstrap owns each host's identity and certificate paths.
+          # Host 1 retains its legacy peer configuration.
+          # Require bootstrap only after this cell's operator-run migration.
+          PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_STAGING == 'true' && 'superserve-vmd-staging-2' || '' }}
+          # Routing-enabled hosts must remain reachable by their peers.
+          PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_ROUTING_ENABLED == '1' && 'auto' || vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
+          PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
+          PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
+          PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
+          PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
+          PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
         run: |
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           python3 .github/workflows/scripts/deploy-proxy.py
 
   deploy-production:
-    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
-    needs: [deploy-staging]
+    if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && (needs['migration-gate'].outputs.mode == 'legacy' || (vars.PROXY_GENERATION_PROMOTION_READY == 'true' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed' && vars.PROXY_GENERATION_RUNBOOK_URL != '' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL != ''))
+    needs: [migration-gate, deploy-staging]
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -84,6 +371,35 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.migration-gate.outputs.revision }}
+
+      - name: Validate linked staging promotion evidence
+        if: env.PROXY_DEPLOYMENT_MODE == 'generation'
+        env:
+          RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
+          EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
+          EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
+        run: |
+          set -eu
+          notion_url_pattern='^https://(([A-Za-z0-9-]+\.)?(notion\.so|notion\.site)|app\.notion\.com)/[^[:space:]<>#]+$'
+          https_url_pattern='^https://[^[:space:]<>#]+$'
+          if [[ ! "$RUNBOOK_URL" =~ $notion_url_pattern ]] ||
+             [[ ! "$EVIDENCE_URL" =~ $https_url_pattern ]] ||
+             [ "$EVIDENCE_STATUS" != passed ]; then
+            echo 'Linked Notion runbook or staging promotion evidence is missing or invalid; refusing production deployment.' >&2
+            exit 1
+          fi
+          {
+            echo '### Proxy generation promotion evidence'
+            # Actions summaries are public for this repository.  Keep the
+            # configured runbook/evidence URLs out of the summary because the
+            # gate intentionally accepts links whose access may be private.
+            echo "- Evidence status: $EVIDENCE_STATUS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record proxy revision
+        run: echo "PROXY_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -95,6 +411,7 @@ jobs:
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/check-legacy-heartbeat ./cmd/check-legacy-heartbeat
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -105,46 +422,92 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Read applied us-east4 proxy manifests from the owning state
+        if: env.PROXY_DEPLOYMENT_MODE == 'generation' && (github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4')
+        run: |
+          set -euo pipefail
+          umask 077
+          terraform -chdir=infra/envs/production/us-east4 init -input=false
+          terraform -chdir=infra/envs/production/us-east4 output -json |
+            jq -e --arg operation "$PROXY_OPERATION" '
+              if $operation == "bootstrap" and (has("proxy_generation_rollout") | not)
+              then .proxy_generation_bootstrap.value
+              else .proxy_generation_rollout.value end
+            ' > "$PROXY_ROLLOUT_MANIFESTS"
+
       # us-east4 is the "use" cell's primary host (api.superserve.ai routes to
       # the use-cell control plane there). It deploys FIRST so a usw-cell failure
       # below can't leave the primary host on a stale proxy. Reuses the primary
-      # proxy env (domain + seed) since it is the same cell. Unguarded: use4 is
+      # proxy env (domain + seed) since it is the same cell. For normal deploys, use4 is
       # the permanent primary, so a missing GCP_REGION_USE4 must fail the deploy
       # rather than silently skip the only primary-host proxy rollout
       # (deploy-proxy.py fails on zero VMD_LABEL matches).
       - name: Deploy proxy to us-east4 use-cell VMD instance
+        if: github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4'
         env:
+          DEPLOY_CELL: use4
+          # Host 3 requires managed identity regardless of its serving role.
+          PEER_IDENTITY_HOSTS: superserve-vmd-use4-3
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ env.PROXY_REVISION }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
+          OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          # Outbound routing does not require this host to accept peer ingress.
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_INGRESS_ENABLED_PROD == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
+          PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
+          PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
+          PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
+          PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED_USE4 }}
+          PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
-          # Fail closed: an empty GCP_REGION makes deploy-proxy.py drop the region
-          # filter and apply the primary proxy env (prod domain + seed) to every
-          # VMD_LABEL match. use4 is the permanent primary, so a missing
-          # GCP_REGION_USE4 must abort, not run unscoped.
-          : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary proxy fan-out}"
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           python3 .github/workflows/scripts/deploy-proxy.py
+
+      - name: Read applied us-west2 proxy manifests from the owning state
+        if: env.PROXY_DEPLOYMENT_MODE == 'generation' && ((github.event_name == 'workflow_dispatch' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != ''))
+        run: |
+          set -euo pipefail
+          umask 077
+          terraform -chdir=infra/envs/production/us-west2 init -input=false
+          terraform -chdir=infra/envs/production/us-west2 output -json |
+            jq -e --arg operation "$PROXY_OPERATION" '
+              if $operation == "bootstrap" and (has("proxy_generation_rollout") | not)
+              then .proxy_generation_bootstrap.value
+              else .proxy_generation_rollout.value end
+            ' > "$PROXY_ROLLOUT_MANIFESTS"
 
       # The usw cell deploys as a step in this job — not a separate job —
       # for the same reason Deploy API / CD Migrate / Seed Templates do it
       # this way: a second job referencing the production environment would
       # double any approval gate. Running after the primary step means a bad
       # rollout stops at the primary, and the step reuses the binary built
-      # above (build once, deploy per region). Skipped until
+      # above (build once, deploy per region). On push, skipped until
       # CLOUD_RUN_SERVICE_USW (the repo-level cell-exists flag) is set.
       # Discovery is the same VMD_LABEL filter scoped to GCP_REGION_USW, so
       # the cell host must carry the label; zero matches fails the deploy
       # rather than silently skipping the cell.
       #
-      # The deploy rewrites /etc/sandbox/proxy.env on the host, so the cell
+      # Each generation receives its own environment file, so the cell
       # MUST NOT reuse the prod values: its domain differs per the
       # regional hostname scheme
       # (PROXY_DOMAIN_USW = usw-sandbox.superserve.ai) and its token seed
@@ -153,19 +516,39 @@ jobs:
       # would break every access token in the cell. The seed is fetched at
       # deploy time so Secret Manager stays the single source of truth.
       - name: Deploy proxy to usw cell VMD instances
-        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        if: (github.event_name == 'workflow_dispatch' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '')
         env:
+          DEPLOY_CELL: usw2
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ env.PROXY_REVISION }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_USWEST }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
+          # Production opts in separately after its staging-proven migration.
+          PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_USW == 'true' && 'superserve-vmd-usw2-2' || '' }}
+          OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          # Outbound routing does not require this host to accept peer ingress.
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_INGRESS_ENABLED_USW == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
+          PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
+          PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
+          PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
+          PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED_USW }}
+          PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           SANDBOX_ACCESS_TOKEN_SEED=$(gcloud secrets versions access latest \
             --secret=sandbox-access-token-seed --project "$GCP_PROJECT")
           export SANDBOX_ACCESS_TOKEN_SEED

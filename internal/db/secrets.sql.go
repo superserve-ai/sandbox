@@ -13,26 +13,40 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const addSandboxSecret = `-- name: AddSandboxSecret :exec
+const addSandboxSecret = `-- name: AddSandboxSecret :execrows
+WITH live AS (
+  SELECT s.id AS sandbox_id FROM sandbox s
+  WHERE s.id = $4 AND s.destroyed_at IS NULL
+  FOR UPDATE
+)
 INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-VALUES ($1, $2, $3, $4)
+SELECT live.sandbox_id, $1, $2, $3 FROM live
 `
 
 type AddSandboxSecretParams struct {
-	SandboxID  uuid.UUID `json:"sandbox_id"`
 	SecretID   uuid.UUID `json:"secret_id"`
 	EnvKey     string    `json:"env_key"`
 	ProxyToken *string   `json:"proxy_token"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
 }
 
-func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) error {
-	_, err := q.db.Exec(ctx, addSandboxSecret,
-		arg.SandboxID,
+// FOR UPDATE on the sandbox row, taken before the insert because the insert
+// depends on it, serializes this against every destroy path. A destroy that
+// already committed leaves `live` empty, so nothing is bound and 0 rows come
+// back — the caller must not mint a JWT for a sandbox that no longer exists. A
+// destroy that has not started blocks until this commits, by which point the
+// had_secret_bindings trigger has fired, so it still writes the revocation.
+func (q *Queries) AddSandboxSecret(ctx context.Context, arg AddSandboxSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, addSandboxSecret,
 		arg.SecretID,
 		arg.EnvKey,
 		arg.ProxyToken,
+		arg.SandboxID,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const claimSandboxSecretProxyToken = `-- name: ClaimSandboxSecretProxyToken :one
@@ -145,6 +159,34 @@ func (q *Queries) DeleteSandboxSecrets(ctx context.Context, sandboxID uuid.UUID)
 	return err
 }
 
+const forgetDetachedSecretKey = `-- name: ForgetDetachedSecretKey :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2
+`
+
+type ForgetDetachedSecretKeyParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+func (q *Queries) ForgetDetachedSecretKey(ctx context.Context, arg ForgetDetachedSecretKeyParams) error {
+	_, err := q.db.Exec(ctx, forgetDetachedSecretKey, arg.SandboxID, arg.EnvKey)
+	return err
+}
+
+const forgetDetachedSecretKeys = `-- name: ForgetDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY($2::text[])
+`
+
+type ForgetDetachedSecretKeysParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKeys   []string  `json:"env_keys"`
+}
+
+func (q *Queries) ForgetDetachedSecretKeys(ctx context.Context, arg ForgetDetachedSecretKeysParams) error {
+	_, err := q.db.Exec(ctx, forgetDetachedSecretKeys, arg.SandboxID, arg.EnvKeys)
+	return err
+}
+
 const getSecretByID = `-- name: GetSecretByID :one
 SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
@@ -243,6 +285,51 @@ func (q *Queries) GetSecretByName(ctx context.Context, arg GetSecretByNameParams
 	return i, err
 }
 
+const getSecretsByIDs = `-- name: GetSecretsByIDs :many
+SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
+WHERE team_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL
+`
+
+type GetSecretsByIDsParams struct {
+	TeamID  uuid.UUID   `json:"team_id"`
+	Column2 []uuid.UUID `json:"column_2"`
+}
+
+func (q *Queries) GetSecretsByIDs(ctx context.Context, arg GetSecretsByIDsParams) ([]Secret, error) {
+	rows, err := q.db.Query(ctx, getSecretsByIDs, arg.TeamID, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Secret{}
+	for rows.Next() {
+		var i Secret
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.AuthType,
+			&i.AuthConfig,
+			&i.ProviderShortcut,
+			&i.Hosts,
+			&i.Ciphertext,
+			&i.EncryptedDek,
+			&i.KekID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.LastUsedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getSecretsByNames = `-- name: GetSecretsByNames :many
 SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
 WHERE team_id = $1 AND name = ANY($2::text[]) AND deleted_at IS NULL
@@ -286,6 +373,17 @@ func (q *Queries) GetSecretsByNames(ctx context.Context, arg GetSecretsByNamesPa
 		return nil, err
 	}
 	return items, nil
+}
+
+const holdSandboxSecretWrites = `-- name: HoldSandboxSecretWrites :exec
+SELECT pg_advisory_lock(hashtext($1)::bigint)
+`
+
+// The same lock, held by the session until released: an attach keeps it
+// through its guest update, which no transaction should stay open across.
+func (q *Queries) HoldSandboxSecretWrites(ctx context.Context, hashtext string) error {
+	_, err := q.db.Exec(ctx, holdSandboxSecretWrites, hashtext)
+	return err
 }
 
 const insertProxyAudit = `-- name: InsertProxyAudit :exec
@@ -470,11 +568,17 @@ func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEv
 
 const listSandboxSecretBindingMeta = `-- name: ListSandboxSecretBindingMeta :many
 SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
-       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
+       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts, false AS detached
 FROM sandbox_secret ss
 JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
-ORDER BY ss.env_key
+UNION ALL
+SELECT '00000000-0000-0000-0000-000000000000'::uuid, d.env_key, NULL::text,
+       ''::text, '{}'::jsonb, NULL::text, NULL::text[], true
+FROM sandbox_secret_detached d
+WHERE d.sandbox_id = $1
+  AND NOT EXISTS (SELECT 1 FROM sandbox_secret x WHERE x.sandbox_id = $1 AND x.env_key = d.env_key)
+ORDER BY env_key
 `
 
 type ListSandboxSecretBindingMetaRow struct {
@@ -485,10 +589,12 @@ type ListSandboxSecretBindingMetaRow struct {
 	AuthConfig       []byte    `json:"auth_config"`
 	ProviderShortcut *string   `json:"provider_shortcut"`
 	Hosts            []string  `json:"hosts"`
+	Detached         bool      `json:"detached"`
 }
 
 // Per-binding auth shape, hosts, and proxy token for a sandbox; excludes
-// soft-deleted secrets.
+// soft-deleted secrets. Keys detached and not bound again follow, marked
+// detached and with nothing else: the guest may still hold them.
 func (q *Queries) ListSandboxSecretBindingMeta(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretBindingMetaRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxSecretBindingMeta, sandboxID)
 	if err != nil {
@@ -506,6 +612,7 @@ func (q *Queries) ListSandboxSecretBindingMeta(ctx context.Context, sandboxID uu
 			&i.AuthConfig,
 			&i.ProviderShortcut,
 			&i.Hosts,
+			&i.Detached,
 		); err != nil {
 			return nil, err
 		}
@@ -748,6 +855,54 @@ SELECT pg_advisory_xact_lock(hashtext($1)::bigint)
 func (q *Queries) LockSandboxForSecretWrites(ctx context.Context, hashtext string) error {
 	_, err := q.db.Exec(ctx, lockSandboxForSecretWrites, hashtext)
 	return err
+}
+
+const pruneDetachedSecretKeys = `-- name: PruneDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached d
+WHERE d.sandbox_id = $1::uuid AND d.env_key IN (
+  SELECT k.env_key FROM sandbox_secret_detached k
+  WHERE k.sandbox_id = $1::uuid
+  ORDER BY k.detached_at DESC, k.env_key
+  OFFSET $2::int
+)
+`
+
+type PruneDetachedSecretKeysParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Keep      int32     `json:"keep"`
+}
+
+// Keeps the most recent detached keys only, so what a snapshot records
+// stays bounded however many keys a sandbox churns through.
+func (q *Queries) PruneDetachedSecretKeys(ctx context.Context, arg PruneDetachedSecretKeysParams) error {
+	_, err := q.db.Exec(ctx, pruneDetachedSecretKeys, arg.SandboxID, arg.Keep)
+	return err
+}
+
+const recordDetachedSecretKey = `-- name: RecordDetachedSecretKey :exec
+INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, $2)
+ON CONFLICT (sandbox_id, env_key) DO UPDATE SET detached_at = now()
+`
+
+type RecordDetachedSecretKeyParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+func (q *Queries) RecordDetachedSecretKey(ctx context.Context, arg RecordDetachedSecretKeyParams) error {
+	_, err := q.db.Exec(ctx, recordDetachedSecretKey, arg.SandboxID, arg.EnvKey)
+	return err
+}
+
+const releaseSandboxSecretWrites = `-- name: ReleaseSandboxSecretWrites :one
+SELECT pg_advisory_unlock(hashtext($1)::bigint)
+`
+
+func (q *Queries) ReleaseSandboxSecretWrites(ctx context.Context, hashtext string) (bool, error) {
+	row := q.db.QueryRow(ctx, releaseSandboxSecretWrites, hashtext)
+	var pg_advisory_unlock bool
+	err := row.Scan(&pg_advisory_unlock)
+	return pg_advisory_unlock, err
 }
 
 const softDeleteSecret = `-- name: SoftDeleteSecret :one

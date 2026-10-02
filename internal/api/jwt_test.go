@@ -148,9 +148,13 @@ func TestSecretsSigner_ExpiryHorizon(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Validate against the same instant the token was signed at. Without this
+	// the parser uses the wall clock, so a fixture signed at a fixed date
+	// starts failing once SecretsJWTLifetime elapses from it — a scheduled
+	// break unrelated to anything this test asserts.
 	parsed, err := jwt.ParseWithClaims(tok, &SecretsClaims{}, func(*jwt.Token) (any, error) {
 		return signer.PublicKey(), nil
-	})
+	}, jwt.WithTimeFunc(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}

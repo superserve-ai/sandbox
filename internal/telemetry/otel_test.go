@@ -5,18 +5,130 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestSafeResultBoundsValues(t *testing.T) {
-	for _, result := range []string{ResultSuccess, ResultError, ResultConflict, ResultTimeout} {
+	for _, result := range []string{ResultSuccess, ResultError, ResultConflict, ResultTimeout, ResultClientError} {
 		if got := safeResult(result); got != result {
 			t.Fatalf("safeResult(%q) = %q", result, got)
 		}
 	}
 	if got := safeResult("raw error: secret token leaked"); got != ResultError {
 		t.Fatalf("unexpected fallback result: %q", got)
+	}
+}
+
+func TestPeerLabelsAreBounded(t *testing.T) {
+	long := "ひ" + "x" // ensure rune-aware truncation
+	for len([]rune(long)) <= 64 {
+		long += "x"
+	}
+	if got := safeHostID(long); len([]rune(got)) != 64 {
+		t.Fatalf("host label length = %d, want 64", len([]rune(got)))
+	}
+	if safeRegion("") != "unknown" {
+		t.Fatal("empty region should map to unknown")
+	}
+}
+
+func TestSafeTeardownLabelsBoundValues(t *testing.T) {
+	for _, v := range []string{"delete", "sweep"} {
+		if got := safeTeardownPath(v); got != v {
+			t.Fatalf("safeTeardownPath(%q) = %q", v, got)
+		}
+	}
+	for _, v := range []string{"completed", "deferred", "timeout", "permanent", "skipped"} {
+		if got := safeTeardownResult(v); got != v {
+			t.Fatalf("safeTeardownResult(%q) = %q", v, got)
+		}
+	}
+	if got := safeTeardownPath("sandbox 123"); got != "unknown" {
+		t.Fatalf("safeTeardownPath(free text) = %q", got)
+	}
+	if got := safeTeardownResult("host down: 10.0.0.1"); got != "unknown" {
+		t.Fatalf("safeTeardownResult(free text) = %q", got)
+	}
+}
+
+func TestSafeRoutingOutcomeBoundsValues(t *testing.T) {
+	for _, outcome := range []string{"local", "remote", "hint_local", "hint_remote", "ownership_error", "peer_error"} {
+		if got := safeRoutingOutcome(outcome); got != outcome {
+			t.Fatalf("safeRoutingOutcome(%q) = %q", outcome, got)
+		}
+	}
+	if got := safeRoutingOutcome("sandbox_id=secret"); got != "ownership_error" {
+		t.Fatalf("unexpected fallback outcome: %q", got)
+	}
+}
+
+func TestRecordRoutingOutcomeEmitsBoundedAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+	counter, err := provider.Meter(instrumentationName).Int64Counter("proxy_routing_outcome_total")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &OTelRecorder{
+		provider:        provider,
+		serviceName:     "sandbox-proxy",
+		environment:     "test",
+		routingOutcomes: counter,
+	}
+	for _, outcome := range []string{"local", "remote", "ownership_error", "peer_error",
+		"sandbox_id=12345678-1234-1234-1234-123456789abc", "team_id=example-team", "user_id=example-user"} {
+		recorder.RecordRoutingOutcome(ctx, RoutingOutcome{Outcome: outcome, HostID: "host-a"})
+	}
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &collected); err != nil {
+		t.Fatal(err)
+	}
+	wantCounts := map[string]int64{"local": 1, "remote": 1, "ownership_error": 4, "peer_error": 1}
+	found := false
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "proxy_routing_outcome_total" {
+				continue
+			}
+			found = true
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("routing metric data = %T, want Sum[int64]", m.Data)
+			}
+			if len(sum.DataPoints) != len(wantCounts) {
+				t.Fatalf("routing series = %d, want %d", len(sum.DataPoints), len(wantCounts))
+			}
+			for _, dp := range sum.DataPoints {
+				outcome, _ := dp.Attributes.Value("outcome")
+				want, ok := wantCounts[outcome.AsString()]
+				if !ok || dp.Value != want {
+					t.Fatalf("outcome %q count = %d, want %d (known=%v)", outcome.AsString(), dp.Value, want, ok)
+				}
+				wantAttrs := attribute.NewSet(
+					attribute.String("service.name", "sandbox-proxy"),
+					attribute.String("environment", "test"),
+					attribute.String("host_id", "host-a"),
+					attribute.String("outcome", outcome.AsString()),
+				)
+				if !dp.Attributes.Equals(&wantAttrs) {
+					t.Fatalf("routing attributes = %v, want only %v", dp.Attributes.ToSlice(), wantAttrs.ToSlice())
+				}
+				delete(wantCounts, outcome.AsString())
+			}
+		}
+	}
+	if !found || len(wantCounts) != 0 {
+		t.Fatalf("missing routing outcomes: %v", wantCounts)
 	}
 }
 
@@ -91,6 +203,119 @@ func TestHostCapacityQueryTimeoutIndependentOfInterval(t *testing.T) {
 		}
 	}
 }
+
+// resourceAttr looks up a single resource-level attribute by key, the
+// counterpart to the point-level attribute maps the other tests build from
+// datapoint.Attributes.
+func resourceAttr(t *testing.T, kvs []attribute.KeyValue, key string) (string, bool) {
+	t.Helper()
+	for _, kv := range kvs {
+		if string(kv.Key) == key {
+			return kv.Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+func TestNewInstanceIDIsUniqueAndNonEmpty(t *testing.T) {
+	a := NewInstanceID()
+	b := NewInstanceID()
+	if a == "" || b == "" {
+		t.Fatalf("NewInstanceID returned empty value: a=%q b=%q", a, b)
+	}
+	if a == b {
+		t.Fatalf("two NewInstanceID calls returned the same value %q", a)
+	}
+}
+
+func TestBuildOTelResourceGeneratesUniqueInstanceIDsPerReplica(t *testing.T) {
+	// Simulates two concurrent Cloud Run replicas of the same service, each
+	// constructing its own recorder from the same base config. Without a
+	// per-process instance.id, both would export identical
+	// service.name+environment series and collide as duplicate time series
+	// once they land in Google Managed Prometheus (the bug this fix closes).
+	cfg := OTelConfig{
+		ServiceName: "sandbox-controlplane",
+		Environment: "production",
+	}
+	cfg.InstanceID = uuid.New().String()
+	resA, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource (replica A): %v", err)
+	}
+
+	cfg.InstanceID = uuid.New().String()
+	resB, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource (replica B): %v", err)
+	}
+
+	idA, ok := resourceAttr(t, resA.Attributes(), "service.instance.id")
+	if !ok || idA == "" {
+		t.Fatalf("replica A resource missing non-empty service.instance.id: %#v", resA.Attributes())
+	}
+	idB, ok := resourceAttr(t, resB.Attributes(), "service.instance.id")
+	if !ok || idB == "" {
+		t.Fatalf("replica B resource missing non-empty service.instance.id: %#v", resB.Attributes())
+	}
+	if idA == idB {
+		t.Fatalf("replica A and B share service.instance.id %q; each replica must be independently identifiable", idA)
+	}
+}
+
+func TestBuildOTelResourceHonorsExplicitInstanceID(t *testing.T) {
+	cfg := OTelConfig{
+		ServiceName: "sandbox-vmd",
+		Environment: "production",
+		InstanceID:  "usw2-fixed-id",
+	}
+	res, err := buildOTelResource(cfg)
+	if err != nil {
+		t.Fatalf("buildOTelResource: %v", err)
+	}
+	if got, ok := resourceAttr(t, res.Attributes(), "service.instance.id"); !ok || got != "usw2-fixed-id" {
+		t.Fatalf("service.instance.id = %q, ok=%v, want %q", got, ok, "usw2-fixed-id")
+	}
+}
+
+func TestNewOTelRecorderDefaultsInstanceIDWhenUnset(t *testing.T) {
+	ctx := context.Background()
+
+	makeRecorder := func() *OTelRecorder {
+		t.Helper()
+		r, err := NewOTelRecorder(ctx, OTelConfig{
+			ServiceName: "sandbox-controlplane",
+			Environment: "production",
+			// Endpoint left at its default; NewOTelRecorder only
+			// constructs the OTLP client here, it does not dial out.
+		})
+		if err != nil {
+			t.Fatalf("NewOTelRecorder: %v", err)
+		}
+		t.Cleanup(func() {
+			shutdownCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			// Best-effort: Shutdown force-flushes to the configured OTLP
+			// endpoint, which nothing is listening on in this test. That
+			// flush failure is expected here and orthogonal to what this
+			// test checks (instance ID uniqueness), so it's swallowed
+			// rather than failing the test.
+			_ = r.Shutdown(shutdownCtx)
+		})
+		return r
+	}
+
+	first := makeRecorder()
+	second := makeRecorder()
+
+	if first.instanceID == "" {
+		t.Fatal("NewOTelRecorder left InstanceID empty; every replica would export identical series")
+	}
+	if first.instanceID == second.instanceID {
+		t.Fatalf("two NewOTelRecorder calls produced the same instanceID %q", first.instanceID)
+	}
+}
+
 func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
 	ctx := context.Background()
 
@@ -194,5 +419,503 @@ func TestRecordVMDCallEmitsHostIDAndMethodAttributes(t *testing.T) {
 				attributes,
 			)
 		}
+	}
+	if _, ok := attributes["sandbox_id"]; ok {
+		t.Fatalf("vmd_call_duration_seconds unexpectedly included sandbox_id: %#v", attributes)
+	}
+}
+
+func TestRecordSandboxTransitionEmitsHostIDAndNoSandboxID(t *testing.T) {
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+
+	meter := provider.Meter(instrumentationName)
+
+	transitionTotal, err := meter.Int64Counter("sandbox_transition_total")
+	if err != nil {
+		t.Fatalf("create sandbox transition counter: %v", err)
+	}
+	transitionDuration, err := meter.Float64Histogram("sandbox_transition_duration_seconds")
+	if err != nil {
+		t.Fatalf("create sandbox transition duration histogram: %v", err)
+	}
+
+	recorder := &OTelRecorder{
+		provider:           provider,
+		serviceName:        "sandbox-controlplane",
+		environment:        "staging",
+		sandboxTransitions: transitionTotal,
+		sandboxDuration:    transitionDuration,
+	}
+
+	recorder.RecordSandboxTransition(ctx, SandboxTransition{
+		Operation: "create",
+		Result:    ResultSuccess,
+		Region:    "us-central1",
+		HostID:    "host-123",
+		Duration:  125 * time.Millisecond,
+	})
+
+	var resourceMetrics metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	var datapoint *metricdata.HistogramDataPoint[float64]
+	for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			if metric.Name != "sandbox_transition_duration_seconds" {
+				continue
+			}
+			histogram, ok := metric.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric data type = %T, want metricdata.Histogram[float64]", metric.Data)
+			}
+			if len(histogram.DataPoints) != 1 {
+				t.Fatalf("histogram datapoints = %d, want 1", len(histogram.DataPoints))
+			}
+			datapoint = &histogram.DataPoints[0]
+		}
+	}
+	if datapoint == nil {
+		t.Fatal("sandbox_transition_duration_seconds metric not found")
+	}
+
+	attributes := make(map[string]string)
+	for _, attr := range datapoint.Attributes.ToSlice() {
+		attributes[string(attr.Key)] = attr.Value.AsString()
+	}
+
+	for key, wantValue := range map[string]string{
+		"service.name": "sandbox-controlplane",
+		"environment":  "staging",
+		"operation":    "create",
+		"result":       ResultSuccess,
+		"region":       "us-central1",
+		"host_id":      "host-123",
+	} {
+		if got := attributes[key]; got != wantValue {
+			t.Fatalf("attribute %q = %q, want %q; all attributes: %#v", key, got, wantValue, attributes)
+		}
+	}
+	if _, ok := attributes["sandbox_id"]; ok {
+		t.Fatalf("sandbox_transition_duration_seconds unexpectedly included sandbox_id: %#v", attributes)
+	}
+}
+
+func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
+	ctx := context.Background()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+
+	meter := provider.Meter(instrumentationName)
+
+	mustGauge := func(name string) metric.Int64Gauge {
+		instrument, err := meter.Int64Gauge(name)
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return instrument
+	}
+	mustCounter := func(name string) metric.Int64Counter {
+		instrument, err := meter.Int64Counter(name)
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return instrument
+	}
+
+	recorder := &OTelRecorder{
+		provider:                provider,
+		serviceName:             "sandbox-vmd",
+		environment:             "staging",
+		pausedNetworkSlotsTotal: mustGauge("vmd_network_slots_total"),
+		pausedNetworkSlotsUsed:  mustGauge("vmd_network_slots_used"),
+		pausedNetworkSlotsAvail: mustGauge("vmd_network_slots_available"),
+		pausedNetworkPoolSlots:  mustGauge("vmd_network_pool_slots"),
+		pausedNetworkNetnsTotal: mustGauge("vmd_network_netns_total"),
+		pausedNetworkMountTotal: mustGauge("vmd_network_mounts_total"),
+		pausedNetworkPressure:   mustGauge("vmd_network_controller_pressure_state"),
+		pausedNetworkReclaimed:  mustCounter("vmd_network_slots_reclaimed_total"),
+		pausedNetworkPaused:     mustCounter("vmd_network_slots_reclaimed_paused_total"),
+	}
+
+	recorder.RecordPausedNetworkPressure(ctx, PausedNetworkPressure{
+		TotalSlots:        65000,
+		UsedSlots:         64950,
+		AvailableSlots:    50,
+		FreshPool:         12,
+		RecycledPool:      8,
+		NetnsTotal:        51,
+		MountTotal:        102,
+		PressureState:     "kernel",
+		ReclaimedRecycle:  2,
+		ReclaimedTeardown: 3,
+		ReclaimedPaused:   5,
+	})
+
+	var resourceMetrics metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &resourceMetrics); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+
+	seen := map[string]bool{}
+	for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
+		for _, metric := range scopeMetrics.Metrics {
+			switch metric.Name {
+			case "vmd_network_slots_total":
+				gauge, ok := metric.Data.(metricdata.Gauge[int64])
+				if !ok {
+					t.Fatalf("slots total data type = %T, want metricdata.Gauge[int64]", metric.Data)
+				}
+				if len(gauge.DataPoints) != 1 || gauge.DataPoints[0].Value != 65000 {
+					t.Fatalf("slots total datapoints = %+v, want one value 65000", gauge.DataPoints)
+				}
+				seen[metric.Name] = true
+			case "vmd_network_pool_slots":
+				gauge, ok := metric.Data.(metricdata.Gauge[int64])
+				if !ok {
+					t.Fatalf("pool slots data type = %T, want metricdata.Gauge[int64]", metric.Data)
+				}
+				if len(gauge.DataPoints) != 2 {
+					t.Fatalf("pool slot datapoints = %d, want 2", len(gauge.DataPoints))
+				}
+				byType := map[string]int64{}
+				for _, dp := range gauge.DataPoints {
+					attrs := map[string]string{}
+					for _, attr := range dp.Attributes.ToSlice() {
+						attrs[string(attr.Key)] = attr.Value.AsString()
+					}
+					byType[attrs["type"]] = dp.Value
+				}
+				if byType["fresh"] != 12 || byType["recycled"] != 8 {
+					t.Fatalf("pool slot values = %#v, want fresh=12 recycled=8", byType)
+				}
+				seen[metric.Name] = true
+			case "vmd_network_slots_reclaimed_total":
+				sum, ok := metric.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("reclaimed data type = %T, want metricdata.Sum[int64]", metric.Data)
+				}
+				if len(sum.DataPoints) != 2 {
+					t.Fatalf("reclaimed datapoints = %d, want 2", len(sum.DataPoints))
+				}
+				byMode := map[string]int64{}
+				for _, dp := range sum.DataPoints {
+					attrs := map[string]string{}
+					for _, attr := range dp.Attributes.ToSlice() {
+						attrs[string(attr.Key)] = attr.Value.AsString()
+					}
+					byMode[attrs["mode"]] = dp.Value
+				}
+				if byMode["recycle"] != 2 || byMode["teardown"] != 3 {
+					t.Fatalf("reclaimed values = %#v, want recycle=2 teardown=3", byMode)
+				}
+				seen[metric.Name] = true
+			case "vmd_network_slots_reclaimed_paused_total":
+				sum, ok := metric.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("paused reclaimed data type = %T, want metricdata.Sum[int64]", metric.Data)
+				}
+				if len(sum.DataPoints) != 1 || sum.DataPoints[0].Value != 5 {
+					t.Fatalf("paused reclaimed datapoints = %+v, want one value 5", sum.DataPoints)
+				}
+				seen[metric.Name] = true
+			case "vmd_network_controller_pressure_state":
+				gauge, ok := metric.Data.(metricdata.Gauge[int64])
+				if !ok {
+					t.Fatalf("pressure state data type = %T, want metricdata.Gauge[int64]", metric.Data)
+				}
+				if len(gauge.DataPoints) != 4 {
+					t.Fatalf("pressure state datapoints = %+v, want four reason series", gauge.DataPoints)
+				}
+				byReason := map[string]int64{}
+				for _, dp := range gauge.DataPoints {
+					attrs := map[string]string{}
+					for _, attr := range dp.Attributes.ToSlice() {
+						attrs[string(attr.Key)] = attr.Value.AsString()
+					}
+					byReason[attrs["reason"]] = dp.Value
+				}
+				if byReason["idle"] != 0 || byReason["slot"] != 0 || byReason["kernel"] != 1 || byReason["both"] != 0 {
+					t.Fatalf("pressure state values = %#v, want idle=0 slot=0 kernel=1 both=0", byReason)
+				}
+				seen[metric.Name] = true
+			}
+		}
+	}
+
+	for _, name := range []string{
+		"vmd_network_slots_total",
+		"vmd_network_pool_slots",
+		"vmd_network_slots_reclaimed_total",
+		"vmd_network_slots_reclaimed_paused_total",
+		"vmd_network_controller_pressure_state",
+	} {
+		if !seen[name] {
+			t.Fatalf("metric %q not found", name)
+		}
+	}
+}
+
+func TestRecordPeerEventEmitsLifecycleMetricsWithBoundedAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+	gauge := func(name string) metric.Int64UpDownCounter {
+		v, err := meter.Int64UpDownCounter(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	counter := func(name string) metric.Int64Counter {
+		v, err := meter.Int64Counter(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	hist, err := meter.Float64Histogram("peer_handshake_duration_seconds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &OTelRecorder{provider: provider, serviceName: "proxy", environment: "test", peerConnections: gauge("peer_connections"), peerStreams: gauge("peer_active_streams"), peerEvents: counter("peer_events_total"), peerHandshakeDuration: hist}
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "connection", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "stream", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "handshake", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Duration: 250 * time.Millisecond})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "drain", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Forced: true})
+	for _, kind := range []string{"connection", "stream"} {
+		for _, delta := range []int64{1, 1, -1} {
+			r.RecordPeerEvent(ctx, PeerEvent{Kind: kind, Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: delta})
+		}
+	}
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	allowed := map[string]bool{"service.name": true, "environment": true, "kind": true, "result": true, "region": true, "host_id": true, "forced": true}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			seen[m.Name] = true
+			var attrs []attribute.Set
+			switch d := m.Data.(type) {
+			case metricdata.Gauge[int64]:
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			case metricdata.Sum[int64]:
+				if m.Name == "peer_connections" || m.Name == "peer_active_streams" {
+					if d.IsMonotonic || len(d.DataPoints) != 1 || d.DataPoints[0].Value != 2 {
+						t.Fatalf("incorrect active total: %+v", d)
+					}
+				}
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			case metricdata.Histogram[float64]:
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			}
+			for _, set := range attrs {
+				for _, kv := range set.ToSlice() {
+					if !allowed[string(kv.Key)] {
+						t.Fatalf("metric %q has unapproved attribute %q", m.Name, kv.Key)
+					}
+				}
+			}
+		}
+	}
+	for _, name := range []string{"peer_connections", "peer_active_streams", "peer_handshake_duration_seconds", "peer_events_total"} {
+		if !seen[name] {
+			t.Fatalf("metric %q not emitted", name)
+		}
+	}
+}
+
+// RecordLatencyPhase must label every sample with the bounded phase enums,
+// fold empties to addressable values, and fall back to the recorder's own
+// host identity when the caller has none (vmd/proxy).
+func TestRecordLatencyPhaseAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+
+	phaseDuration, err := meter.Float64Histogram("sandbox_phase_duration_seconds")
+	if err != nil {
+		t.Fatalf("create phase histogram: %v", err)
+	}
+	recorder := &OTelRecorder{
+		provider:      provider,
+		serviceName:   "sandbox-vmd",
+		environment:   "staging",
+		hostID:        "host-abc",
+		phaseDuration: phaseDuration,
+	}
+
+	recorder.RecordLatencyPhase(ctx, LatencyPhase{
+		Plane:    "vmd",
+		Op:       "launch",
+		Phase:    "wait_socket",
+		Duration: 30 * time.Millisecond,
+		// Mode, Region, HostID empty: must fold, not vanish.
+	})
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	var dp *metricdata.HistogramDataPoint[float64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "sandbox_phase_duration_seconds" {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok || len(h.DataPoints) != 1 {
+				t.Fatalf("want one histogram datapoint, got %T / %d", m.Data, len(h.DataPoints))
+			}
+			dp = &h.DataPoints[0]
+		}
+	}
+	if dp == nil {
+		t.Fatal("phase histogram not collected")
+	}
+	want := map[string]string{
+		"plane":   "vmd",
+		"op":      "launch",
+		"phase":   "wait_socket",
+		"mode":    "none",
+		"host_id": "host-abc", // recorder fallback
+	}
+	for k, v := range want {
+		got, ok := dp.Attributes.Value(attribute.Key(k))
+		if !ok || got.AsString() != v {
+			t.Errorf("attribute %s = %q (present=%v), want %q", k, got.AsString(), ok, v)
+		}
+	}
+	if dp.Sum < 0.029 || dp.Sum > 0.031 {
+		t.Errorf("sum = %v, want ~0.030s", dp.Sum)
+	}
+}
+
+// The phase histogram sits on lifecycle paths; its per-sample cost must stay
+// in the microsecond class (in-memory bucket update, no I/O — the OTLP export
+// runs on the periodic reader, never on the caller).
+func BenchmarkRecordLatencyPhase(b *testing.B) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	b.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+	h, err := meter.Float64Histogram("sandbox_phase_duration_seconds")
+	if err != nil {
+		b.Fatal(err)
+	}
+	r := &OTelRecorder{provider: provider, hostID: "host-abc", phaseDuration: h}
+	p := LatencyPhase{Plane: "vmd", Op: "launch", Phase: "wait_socket", Mode: "direct", Duration: 30 * time.Millisecond}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.RecordLatencyPhase(ctx, p)
+	}
+}
+
+// The metric's accepted labels must match what the scheduler emits.
+// These drifted once — the evaluator moved to in_band/out_of_band while
+// the recorder still accepted same/different — and every meaningful
+// result was exported as "other", so the metric looked healthy while
+// measuring nothing. The constants live in different packages, so this
+// pins the contract from the recorder's side.
+func TestShadowLabelsAcceptWhatTheSchedulerEmits(t *testing.T) {
+	for _, v := range []string{"ranked", "no_candidates", "error"} {
+		if got := normalizeShadowResult(v); got != v {
+			t.Errorf("result %q normalized to %q; the emitter's value must survive", v, got)
+		}
+	}
+	for _, v := range []string{"in_band", "out_of_band", "unknown"} {
+		if got := normalizeShadowAgreement(v); got != v {
+			t.Errorf("agreement %q normalized to %q; the emitter's value must survive", v, got)
+		}
+	}
+	// Anything unrecognized is still collapsed, so cardinality stays bounded.
+	if got := normalizeShadowAgreement("something-new"); got != "other" {
+		t.Errorf("unknown agreement normalized to %q, want other", got)
+	}
+}
+
+// A failed ranking counted nothing, and composition is a last-value
+// gauge — so publishing its zeros would report an empty fleet until the
+// next successful sample. A database blip must not look like a fleet
+// that vanished.
+func TestCapacityShadowSkipsCompositionOnError(t *testing.T) {
+	if !shadowPublishesComposition("ranked") {
+		t.Error("a successful ranking must publish composition")
+	}
+	if !shadowPublishesComposition("no_candidates") {
+		t.Error("an empty-but-successful ranking must publish composition: zero hosts is a real answer")
+	}
+	if shadowPublishesComposition("error") {
+		t.Error("a failed ranking must not publish composition; its zeros would erase readiness")
+	}
+}
+
+func TestOwnershipLookupHistogram(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(ctx)
+	histogram, err := provider.Meter(instrumentationName).Float64Histogram("proxy_ownership_lookup_duration_seconds", metric.WithExplicitBucketBoundaries(latencyBuckets...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &OTelRecorder{ownershipLookupDuration: histogram, hostID: "host-a"}
+	for _, result := range []string{"success", "timeout", "canceled", "raw-error"} {
+		recorder.RecordOwnershipLookup(ctx, OwnershipLookup{Result: result, Duration: 100 * time.Millisecond})
+	}
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &collected); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"success": true, "timeout": true, "canceled": true, "error": true}
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			data, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric type=%T", m.Data)
+			}
+			for _, point := range data.DataPoints {
+				result, _ := point.Attributes.Value("result")
+				if !want[result.AsString()] || point.Count != 1 || point.Sum != 0.1 {
+					t.Fatalf("unexpected point: %+v", point)
+				}
+				delete(want, result.AsString())
+			}
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing results: %v", want)
 	}
 }

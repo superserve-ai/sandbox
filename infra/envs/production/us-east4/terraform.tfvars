@@ -1,25 +1,23 @@
-project_id             = "rayai-prod"
-environment            = "production"
-region                 = "us-east4"
-zone                   = "us-east4-c"
-create_network         = false
-network_name           = "superserve-production-vpc"
-resource_suffix        = "use4"
-service_account_suffix = "use4"
-subnet_cidr            = "10.2.0.0/24"
+# Attach prepared promotion evidence credentials; credit enforcement is separate.
+promotion_evidence_enabled = true
+
+project_id               = "rayai-prod"
+environment              = "production"
+region                   = "us-east4"
+zone                     = "us-east4-c"
+create_network           = false
+network_name             = "superserve-production-vpc"
+resource_suffix          = "use4"
+service_account_suffix   = "use4"
+subnet_cidr              = "10.2.0.0/24"
+peer_ca_operator_members = ["user:alejandro@superserve.ai"]
 # Direct-VPC-egress subnet for the Cloud Run control plane — distinct from the
 # host subnet, sourced by the vmd-gRPC + OTLP firewall rules so Cloud Run can
 # reach the host. Direct VPC egress allocates instance IPs from this range and
 # needs ~2x max_instances of headroom (Google's documented minimum is /26), so
 # this is a /22, mirroring the usw2 cell's 10.1.4.0/22 in the 10.2 block.
 connector_subnet_cidr = "10.2.4.0/22"
-host_internal_ip      = "10.2.0.2"
-machine_type          = "c4-highmem-288-lssd-metal"
 boot_disk_type        = "hyperdisk-balanced"
-# The reservation-us-east-c4-288-lssd-metal reservation is non-specific
-# (specificReservationRequired=false), so it can't be targeted by name. Null =
-# default affinity, which auto-consumes that matching reservation in the zone.
-reservation_name = null
 
 # A5 control plane — same "use" cell as us-central1. Point every runtime secret
 # at the shared, suffix-less use-cell secrets (not per-region "-use4" names) so
@@ -31,3 +29,39 @@ internal_api_token_secret_name        = "internal-api-token"
 sandbox_access_token_seed_secret_name = "sandbox-access-token-seed"
 secrets_signing_key_secret_name       = "secretsproxy-signing-key"
 system_team_id_secret_name            = "system-team-id-production"
+notification_channel_ids              = ["projects/rayai-prod/notificationChannels/7690949645937454026"]
+
+host_c_reservation_name = "superserve-vmd-use4-z3-a"
+host_c_host_id          = "use4-3-3d1e6cebc17448d693e5458619ad00c4"
+
+proxy_generation_cells = {
+  use4 = {
+    zone            = "us-east4-c"
+    instance        = "superserve-vmd-use4-3"
+    ip              = "10.2.0.4"
+    network         = "projects/rayai-prod/global/networks/superserve-production-vpc"
+    subnetwork      = "projects/rayai-prod/regions/us-east4/subnetworks/superserve-use4-subnet"
+    target_tags     = ["vmd-use4"]
+    service_account = "vmd-runtime-production-use4@rayai-prod.iam.gserviceaccount.com"
+    routes = {
+      "public-http" = {
+        protocol = "HTTP"
+        listener = "public"
+        probe    = "https://sandbox.superserve.ai/health"
+        probe_ip = "34.8.17.193"
+      }
+      "public-tcp" = {
+        protocol = "TCP"
+        listener = "public"
+        probe    = "https://sandbox.superserve.ai/health"
+        probe_ip = "34.102.191.241"
+      }
+      redirect = {
+        protocol = "TCP"
+        listener = "redirect"
+        probe    = "http://sandbox.superserve.ai/health"
+        probe_ip = "34.102.191.241"
+      }
+    }
+  }
+}

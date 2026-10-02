@@ -13,13 +13,27 @@ on:
         options:
           - staging
           - production
+      target:
+        description: 'Staging host target (production deploys to every VMD-role host in each enabled cell)'
+        required: true
+        type: choice
+        default: serving
+        options:
+          - serving
+          - standby
   push:
     branches: [main]
     paths:
+      # Every Terraform revision that supersedes the gate needs a collector run.
+      - 'infra/**'
+      - '.github/workflows/terraform-cd.yml'
+      - '.github/workflows/scripts/wait_credentials_key_iam.py'
       - 'deploy/otel/**'
       - 'deploy/superserve-otel-collector.service'
       - '.github/workflows/deploy-otel-collector.yml'
       - '.github/workflows/scripts/deploy-otel-collector.py'
+      - '.github/workflows/scripts/wait-for-otel-alerts.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
 
 jobs:
   deploy-staging:
@@ -44,23 +58,54 @@ jobs:
 
       - name: Deploy OTEL Collector to VMD instances
         env:
+          DEPLOY_EVENT: ${{ github.event_name }}
+          DEPLOY_TARGET: ${{ inputs.target }}
+          DEPLOY_CELL: staging
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
+          source .github/workflows/scripts/select-deploy-target.sh
           python3 .github/workflows/scripts/deploy-otel-collector.py
 
   deploy-production:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    # Runs on ordinary main pushes like deploy-vmd.yml and terraform-cd:
+    # the collector must roll out on the same automatic path as the vmd
+    # metrics exporter and the alert policies that watch its series, or a
+    # merge leaves alerts staring at ports nothing listens on. A push only
+    # proceeds once deploy-staging (which always runs on push) has
+    # actually succeeded, so a broken collector build or config never
+    # reaches production. deploy-staging is conditional on the dispatch
+    # input and never runs on a production-only workflow_dispatch, so that
+    # path is evaluated on its own, preserving the manual behavior.
+    if: |
+      always() && (
+        (github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+      )
+    # Keep collectors ordered without taking a lock needed by Terraform CD.
+    concurrency:
+      group: otel-collector-production
+      cancel-in-progress: false
+    needs: [deploy-staging]
     runs-on: ubuntu-latest
     environment: production
     permissions:
       contents: read
+      actions: read
       id-token: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OTEL_USE4_ENABLED: ${{ vars.CLOUD_RUN_SERVICE_USE4 }}
+      OTEL_USW2_ENABLED: ${{ vars.CLOUD_RUN_SERVICE_USW }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for same-revision production alert applies
+        run: python3 .github/workflows/scripts/wait-for-otel-alerts.py
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -71,15 +116,35 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # The use4 cell host is the primary production host (api.superserve.ai).
-      # Skipped until CLOUD_RUN_SERVICE_USE4 is set. (usw remains uncovered here
-      # — pre-existing gap, tracked separately.)
+      # In both production cells, sandbox_role includes serving and standby
+      # hosts regardless of component changes during promotion.
+      # Skipped until CLOUD_RUN_SERVICE_USE4 is set.
       - name: Deploy OTEL Collector to use4 cell VMD instances
         if: vars.CLOUD_RUN_SERVICE_USE4 != ''
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: us-east4
-          VMD_FILTER: labels.component=vmd AND labels.environment=production AND labels.region=us-east4
+          VMD_FILTER: labels.sandbox_role=vmd AND labels.environment=production AND labels.region=us-east4
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
+          python3 .github/workflows/scripts/wait-for-otel-alerts.py
+          python3 .github/workflows/scripts/deploy-otel-collector.py
+
+      # Both production cells need a host-local collector: without one,
+      # vmd's OTLP export lands on a closed localhost port and every
+      # backup alert policy for the cell (including backup-disabled)
+      # watches series that never arrive. Gated on the usw cell's own
+      # rollout flag, matching deploy-vmd.yml's usw step.
+      - name: Deploy OTEL Collector to usw2 cell VMD instances
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GCP_REGION: us-west2
+          # sandbox_role is vmd on every host of the cell regardless of its
+          # component label, so a host that is out of the deploy fleet still
+          # gets its collector.
+          VMD_FILTER: labels.sandbox_role=vmd AND labels.environment=production AND labels.region=us-west2
+          OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          python3 .github/workflows/scripts/wait-for-otel-alerts.py
           python3 .github/workflows/scripts/deploy-otel-collector.py

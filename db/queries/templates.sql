@@ -136,9 +136,7 @@ WHERE deleted_at IS NULL
        OR name LIKE sqlc.narg('name_prefix')::text || '%');
 
 -- name: SoftDeleteTemplateIfUnused :one
--- Soft-deletes a template only if no live sandbox references it AND no
--- build is in flight. Blocking on builds prevents the vmd-side artifact
--- cleanup from racing with template-builder still writing to the same dirs.
+-- Deletion fences all builds before committing; live sandbox and snapshot references still block it.
 WITH locked AS (
   SELECT t.id AS tpl_id FROM template t
   WHERE t.id = $1 AND t.team_id = $2 AND t.deleted_at IS NULL
@@ -147,24 +145,29 @@ WITH locked AS (
 counted AS (
   SELECT
     (SELECT COUNT(*)::bigint FROM sandbox
-     WHERE template_id = $1 AND destroyed_at IS NULL) AS live_count,
-    (SELECT COUNT(*)::bigint FROM template_build
-     WHERE template_id = $1
-       AND status IN ('pending', 'building', 'snapshotting')) AS inflight_build_count
+     WHERE template_id = $1 AND destroyed_at IS NULL)
+    + (SELECT COUNT(*)::bigint FROM sandbox_snapshot
+       WHERE template_id = $1 AND deleted_at IS NULL AND status IN ('creating', 'ready')) AS live_count
+),
+cancelled AS (
+  UPDATE template_build
+  SET status = 'cancelled', finalized_at = now(), updated_at = now(), error_message = 'template deleted'
+  WHERE template_id IN (SELECT tpl_id FROM locked)
+    AND (SELECT live_count FROM counted) = 0
+    AND status IN ('pending', 'building', 'snapshotting')
+  RETURNING id
 ),
 deleted AS (
   UPDATE template t
   SET deleted_at = now(), updated_at = now()
   WHERE t.id IN (SELECT tpl_id FROM locked)
     AND (SELECT live_count FROM counted) = 0
-    AND (SELECT inflight_build_count FROM counted) = 0
+    AND (SELECT count(*) FROM cancelled) >= 0
   RETURNING t.id
 )
-SELECT
-  EXISTS(SELECT 1 FROM locked)  AS found,
-  (SELECT live_count FROM counted) AS live_count,
-  (SELECT inflight_build_count FROM counted) AS inflight_build_count,
-  EXISTS(SELECT 1 FROM deleted) AS deleted;
+SELECT EXISTS(SELECT 1 FROM locked) AS found,
+ (SELECT live_count FROM counted) AS live_count,
+ 0::bigint AS inflight_build_count, EXISTS(SELECT 1 FROM deleted) AS deleted;
 
 -- name: CreateTemplateBuild :one
 -- Insert a new build row. Will fail with a unique-violation if there is
@@ -181,10 +184,13 @@ RETURNING *;
 -- pre-existing build id to the caller. team_id is included defensively so
 -- the query is safe if called outside the post-admission path.
 SELECT * FROM template_build
-WHERE template_id = $1
-  AND team_id = $2
-  AND build_spec_hash = $3
-  AND status IN ('pending', 'building', 'snapshotting');
+WHERE template_build.template_id = $1
+  AND template_build.team_id = $2
+  AND (template_build.build_spec_hash = $3 OR EXISTS (
+    SELECT 1 FROM template_build_input i JOIN template t ON t.id=template_build.template_id
+    WHERE i.build_id=template_build.id AND i.build_spec=t.build_spec
+      AND i.vcpu=t.vcpu AND i.memory_mib=t.memory_mib AND i.disk_mib=t.disk_mib))
+  AND template_build.status IN ('pending', 'building', 'snapshotting');
 
 -- name: GetTemplateBuild :one
 -- Fetch a build visible to the caller's team, scoped to the given template
@@ -214,6 +220,7 @@ WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting');
 -- lock), not here.
 SELECT * FROM template_build
 WHERE status = 'pending'
+  AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id)
 ORDER BY created_at ASC
 LIMIT $1;
 
@@ -221,19 +228,43 @@ LIMIT $1;
 -- Claims a pending row for dispatch. Stamps host + caller-generated
 -- build_vm_id up front so a timed-out BuildTemplate RPC can still be
 -- reconciled by GetBuildStatus on the next tick.
+-- The claim itself requires the target host to be active WHEN a row for it
+-- exists (a drain landing between the supervisor's pre-check and this claim
+-- must lose the race); a missing row keeps the bootstrap path dispatching.
+-- FOR SHARE serializes the claim against a concurrent drain's row UPDATE:
+-- without the lock, the statement snapshot could predate a drain that
+-- commits mid-claim, and the build would start on the drained host anyway.
+WITH target_host AS (
+    SELECT h.status FROM host h WHERE h.id = $2 FOR SHARE
+)
 UPDATE template_build
 SET status = 'building',
     started_at = now(),
     updated_at = now(),
     vmd_host_id = $2,
     vmd_build_vm_id = $3
-WHERE id = $1 AND status = 'pending';
+WHERE template_build.id = $1 AND template_build.status = 'pending'
+  AND COALESCE((SELECT th.status = 'active' FROM target_host th), true);
+
+-- name: RequeueBuildDispatch :execrows
+-- Returns a just-claimed build to pending after a TRANSIENT dispatch
+-- failure (e.g. a host-resolution timeout), so the next tick retries it
+-- instead of failing a customer's build on a blip. Bounded: the pending
+-- reap keys on created_at, so requeueing never extends a build's life.
+UPDATE template_build
+SET status = 'pending',
+    vmd_host_id = NULL,
+    vmd_build_vm_id = NULL,
+    started_at = NULL,
+    updated_at = now()
+WHERE id = $1 AND status = 'building';
 
 -- name: ListActiveBuilds :many
 -- Read-only: builds the supervisor is currently watching. Used per tick to
 -- poll vmd for status. No row-level lock — these are already past 'pending'.
 SELECT * FROM template_build
 WHERE status IN ('building', 'snapshotting')
+  AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id)
 ORDER BY started_at ASC NULLS LAST;
 
 -- name: AdvanceBuildStatus :exec
@@ -259,7 +290,7 @@ WITH build_done AS (
       updated_at = now()
   WHERE template_build.id = $1 AND status IN ('building', 'snapshotting')
   RETURNING template_id
-)
+), updated AS (
 UPDATE template
 SET status = 'ready',
     rootfs_path = $2,
@@ -273,7 +304,29 @@ SET status = 'ready',
     error_message = NULL
 FROM build_done
 WHERE template.id = build_done.template_id
-RETURNING template.*;
+RETURNING template.*
+), artifacts AS (
+INSERT INTO artifact_manifest (
+    template_id, file_name, path, size_bytes, allocated_bytes, sha256
+)
+SELECT DISTINCT ON (a.path) updated.id, a.file_name, a.path, a.size_bytes, a.allocated_bytes,
+       repeat('0', 64)
+FROM updated
+CROSS JOIN LATERAL (
+    VALUES
+        ('rootfs.ext4', updated.rootfs_path, COALESCE(updated.size_bytes, 0), sqlc.arg('rootfs_allocated_bytes')::bigint),
+        ('base.ext4', updated.base_path, 0::bigint, sqlc.arg('base_allocated_bytes')::bigint),
+        ('delta.ext4', updated.delta_path, 0::bigint, sqlc.arg('delta_allocated_bytes')::bigint)
+) AS a(file_name, path, size_bytes, allocated_bytes)
+WHERE a.path IS NOT NULL
+ORDER BY a.path, (a.file_name = 'rootfs.ext4') DESC
+ON CONFLICT (template_id, path) WHERE template_id IS NOT NULL DO UPDATE
+SET path = EXCLUDED.path,
+    size_bytes = EXCLUDED.size_bytes,
+    allocated_bytes = EXCLUDED.allocated_bytes
+RETURNING 1
+)
+SELECT * FROM updated;
 
 -- name: FailBuild :one
 -- Build row flips to failed if not already terminal; template flips only if
@@ -311,15 +364,16 @@ JOIN template t ON t.id = tb.template_id;
 -- cancelled and (if the template never reached 'ready') transitions
 -- template → failed so listings don't show it stuck in 'building' forever.
 -- A template with a prior successful build keeps its 'ready' status.
-WITH build_done AS (
+WITH locked_template AS (SELECT t.id FROM template t WHERE t.id=sqlc.arg('template_id') AND t.team_id=sqlc.arg('team_id') FOR UPDATE),
+build_done AS (
   UPDATE template_build tb
   SET status = 'cancelled',
       finalized_at = now(),
       updated_at = now(),
       error_message = 'cancelled by user'
-  WHERE tb.id = $1
-    AND tb.template_id = $2
-    AND tb.team_id = $3
+  WHERE tb.id = sqlc.arg('id')
+    AND tb.template_id IN (SELECT id FROM locked_template)
+    AND tb.team_id = sqlc.arg('team_id')
     AND tb.status IN ('pending', 'building', 'snapshotting')
   RETURNING tb.template_id AS tpl_id
 )
@@ -335,22 +389,40 @@ WHERE t.id = build_done.tpl_id
 -- Mark builds failed if they have stayed in pending past pending_timeout, or
 -- in building/snapshotting past build_timeout. Returns affected rows so the
 -- caller can call vmd.CancelBuild for orphan VM cleanup. Same idempotent
--- pattern as ClaimExpiredSandboxes.
+-- pattern as ClaimExpiredSandboxes. A never-ready template fails together
+-- with its timed-out build (mirroring FailBuild): this reap is the bound on
+-- requeued dispatch retries, and a bound that strands the template in
+-- 'building' forever is not a bound. Templates with a prior successful
+-- build keep their 'ready' status.
 WITH stale AS (
   SELECT id, template_id, team_id, vmd_host_id, vmd_build_vm_id FROM template_build
-  WHERE
+  WHERE NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id) AND (
     (status = 'pending' AND created_at < now() - (sqlc.arg('pending_timeout_seconds')::int || ' seconds')::interval)
     OR
     (status IN ('building', 'snapshotting') AND COALESCE(started_at, created_at) < now() - (sqlc.arg('build_timeout_seconds')::int || ' seconds')::interval)
+  )
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED
+),
+build_done AS (
+  UPDATE template_build
+  SET status = 'failed',
+      finalized_at = now(),
+      updated_at = now(),
+      error_message = 'build timed out'
+  FROM stale
+  WHERE template_build.id = stale.id
+  RETURNING template_build.id
+),
+tpl_update AS (
+  UPDATE template
+  SET status = 'failed',
+      error_message = 'build timed out',
+      updated_at = now()
+  FROM stale
+  WHERE template.id = stale.template_id
+    AND template.status IN ('pending', 'building')
+  RETURNING template.id
 )
-UPDATE template_build
-SET status = 'failed',
-    finalized_at = now(),
-    updated_at = now(),
-    error_message = 'build timed out'
-FROM stale
-WHERE template_build.id = stale.id
-RETURNING template_build.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id;
+SELECT stale.id, stale.template_id, stale.team_id, stale.vmd_host_id, stale.vmd_build_vm_id FROM stale;

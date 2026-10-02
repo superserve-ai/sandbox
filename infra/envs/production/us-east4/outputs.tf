@@ -5,7 +5,12 @@ output "network_contract" {
 
 output "sandbox_host_contract" {
   description = "Rendered us-east4 sandbox host contract."
-  value       = module.sandbox_host.contract
+  value       = module.sandbox_host_c.contract
+}
+
+output "controlplane_identity_contract" {
+  description = "Per-cell Cloud Run identity, backup read boundary, secret dependencies, and migration ownership."
+  value       = local.controlplane_identity_contract
 }
 
 output "deployment_config" {

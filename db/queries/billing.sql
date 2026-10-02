@@ -1,3 +1,79 @@
+-- name: UpdateHostSandboxStorageMeasurements :execrows
+-- Apply trusted host-side overlay allocations without rewriting history.
+-- statement_timestamp() is stable for the whole statement, so closing and
+-- opening an interval use the exact same measurement boundary.
+WITH measurements AS MATERIALIZED (
+    SELECT unnest(sqlc.arg(sandbox_ids)::uuid[]) AS sandbox_id,
+           unnest(sqlc.arg(disk_mib)::int[]) AS disk_mib
+), eligible AS MATERIALIZED (
+    SELECT s.id, s.team_id, m.disk_mib
+    FROM measurements m
+    JOIN sandbox s ON s.id = m.sandbox_id
+    WHERE s.host_id = sqlc.arg(host_id)
+      AND s.destroyed_at IS NULL
+      AND feature_enabled('billing_metrics_write', s.team_id)
+), closed AS (
+    UPDATE sandbox_storage_interval i
+    SET ended_at = statement_timestamp(), end_reason = 'measurement'
+    FROM eligible e
+    WHERE i.sandbox_id = e.id
+      AND i.team_id = e.team_id
+      AND i.ended_at IS NULL
+      AND i.disk_mib IS DISTINCT FROM e.disk_mib
+    RETURNING i.sandbox_id, i.team_id
+)
+INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
+SELECT e.id, e.team_id, e.disk_mib, statement_timestamp()
+FROM eligible e
+LEFT JOIN closed c ON c.sandbox_id = e.id AND c.team_id = e.team_id
+ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
+
+-- name: GetLegacyStripeActivationUser :one
+-- Ownership is only fallback evidence when the membership models identify
+-- one person; ordering members cannot establish who activated billing.
+WITH owners AS (
+    SELECT tm.profile_id AS user_id
+    FROM team_member tm
+    WHERE tm.team_id = sqlc.arg(team_id)
+      AND tm.role IN ('owner', 'team_owner')
+    UNION
+    SELECT tm.user_id
+    FROM team_memberships tm
+    JOIN user_role_assignments a ON a.team_id = tm.team_id AND a.user_id = tm.user_id
+    JOIN roles r ON r.id = a.role_id
+    WHERE tm.team_id = sqlc.arg(team_id)
+      AND tm.status = 'active'
+      AND a.scope_type = 'team'
+      AND a.revoked_at IS NULL
+      AND r.name = 'team_owner'
+)
+SELECT tm.profile_id AS user_id
+FROM team_member tm
+WHERE tm.team_id = sqlc.arg(team_id)
+  AND tm.role IN ('owner', 'team_owner')
+  AND (SELECT COUNT(*) FROM owners) = 1;
+
+-- name: GetCurrentStripeActivationUser :one
+WITH owners AS (
+    SELECT tm.profile_id AS user_id
+    FROM team_member tm
+    WHERE tm.team_id = sqlc.arg(team_id)
+      AND tm.role IN ('owner', 'team_owner')
+    UNION
+    SELECT tm.user_id
+    FROM team_memberships tm
+    JOIN user_role_assignments a ON a.team_id = tm.team_id AND a.user_id = tm.user_id
+    JOIN roles r ON r.id = a.role_id
+    WHERE tm.team_id = sqlc.arg(team_id)
+      AND tm.status = 'active'
+      AND a.scope_type = 'team'
+      AND a.revoked_at IS NULL
+      AND r.name = 'team_owner'
+)
+SELECT user_id
+FROM owners
+WHERE (SELECT COUNT(*) FROM owners) = 1;
+
 -- name: GetTeamBillingUsage :one
 -- Allocated usage for one team clipped to [period_start, period_end).
 WITH compute AS (
@@ -21,17 +97,7 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
 storage AS (
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
-            - GREATEST(i.started_at, sqlc.arg(period_start))
-        )) * i.disk_mib
-    ), 0)::numeric AS storage_mib_seconds
-    FROM sandbox_storage_interval i
-    WHERE i.team_id = sqlc.arg(team_id)
-      AND sqlc.arg(period_start) < LEAST(now(), sqlc.arg(period_end))
-      AND i.started_at < LEAST(now(), sqlc.arg(period_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
+ SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)::numeric AS storage_mib_seconds
 )
 SELECT
     sqlc.arg(team_id)::uuid AS team_id,
@@ -39,7 +105,8 @@ SELECT
     sqlc.arg(period_end)::timestamptz AS period_end,
     compute.vcpu_seconds,
     (compute.memory_mib_seconds / 1024.0)::numeric AS memory_gib_seconds,
-    (storage.storage_mib_seconds / 1024.0)::numeric AS storage_gib_seconds
+    (storage.storage_mib_seconds / 1024.0)::numeric AS storage_gib_seconds,
+    (billable_storage_mib_seconds(sqlc.arg(team_id),sqlc.arg(period_start),sqlc.arg(period_end))/1024.0)::numeric AS billable_storage_gib_seconds
 FROM compute, storage;
 
 -- name: GetActiveTeamBillingPeriod :one
@@ -74,17 +141,7 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
 storage AS (
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
-            - GREATEST(i.started_at, sqlc.arg(period_start))
-        )) * i.disk_mib
-    ), 0)::numeric AS storage_mib_seconds
-    FROM sandbox_storage_interval i
-    WHERE i.team_id = sqlc.arg(team_id)
-      AND sqlc.arg(period_start) < LEAST(now(), sqlc.arg(period_end))
-      AND i.started_at < LEAST(now(), sqlc.arg(period_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
+ SELECT billable_storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)::numeric AS storage_mib_seconds
 ),
 usage AS (
     SELECT
@@ -121,6 +178,8 @@ upserted AS (
               OR p.finalized_at IS NOT NULL
           )
     )
+      AND storage_reports_complete_through(usage.team_id, usage.period_end)
+      AND usage.storage_mib_seconds IS NOT NULL
     ON CONFLICT (team_id, period_start, period_end) DO UPDATE
     SET vcpu_seconds = EXCLUDED.vcpu_seconds,
         memory_mib_seconds = EXCLUDED.memory_mib_seconds,
@@ -154,6 +213,7 @@ immutable_existing AS (
           existing.exported_at IS NOT NULL
           OR existing.finalized_at IS NOT NULL
       )
+      AND storage_reports_complete_through(existing.team_id, existing.period_end)
 )
 SELECT * FROM upserted
 UNION ALL
@@ -182,17 +242,7 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
 ),
 storage AS (
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
-            - GREATEST(i.started_at, sqlc.arg(hour_start))
-        )) * i.disk_mib
-    ), 0)::numeric AS storage_mib_seconds
-    FROM sandbox_storage_interval i
-    WHERE i.team_id = sqlc.arg(team_id)
-      AND i.started_at < sqlc.arg(hour_end)
-      AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
-      AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
+ SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(hour_start)::timestamptz,sqlc.arg(hour_end)::timestamptz)::numeric AS storage_mib_seconds
 ),
 usage AS (
     SELECT
@@ -204,6 +254,8 @@ usage AS (
         storage.storage_mib_seconds
     FROM compute, storage
     WHERE feature_enabled('billing_hourly_rollups', sqlc.arg(team_id)::uuid)
+      AND storage_reports_complete_through(sqlc.arg(team_id)::uuid, sqlc.arg(hour_end)::timestamptz)
+      AND storage.storage_mib_seconds IS NOT NULL
 )
 INSERT INTO team_billing_usage_hourly (
     team_id, hour_start, hour_end,
@@ -234,17 +286,64 @@ WHERE team_id = sqlc.arg(team_id)
   AND hour_start < sqlc.arg(period_end)
 ORDER BY hour_start ASC;
 
+-- name: GetTeamBillingUsageRollup :one
+SELECT *
+FROM team_billing_usage
+WHERE team_id = sqlc.arg(team_id)
+  AND period_start = sqlc.arg(period_start)
+  AND period_end = sqlc.arg(period_end);
+
+-- name: ListTeamBillingPeriods :many
+SELECT *
+FROM team_billing_period
+WHERE team_id = sqlc.arg(team_id)
+ORDER BY period_start DESC
+LIMIT sqlc.arg(limit_count);
+
+-- name: GetTeamBillingPeriod :one
+SELECT *
+FROM team_billing_period
+WHERE team_id = sqlc.arg(team_id)
+  AND period_start = sqlc.arg(period_start)
+  AND period_end = sqlc.arg(period_end);
+
+-- name: GetTeamBillingPeriodForUpdate :one
+SELECT *
+FROM team_billing_period
+WHERE team_id = sqlc.arg(team_id)
+  AND period_start = sqlc.arg(period_start)
+  AND period_end = sqlc.arg(period_end)
+FOR UPDATE;
+
 -- name: UpsertTeamBillingPeriod :one
 INSERT INTO team_billing_period (team_id, period_start, period_end, status)
-VALUES (
+SELECT
     sqlc.arg(team_id),
     sqlc.arg(period_start),
     sqlc.arg(period_end),
     sqlc.arg(status)
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM team_billing_period billed
+    WHERE billed.team_id = sqlc.arg(team_id)
+      AND (billed.period_start, billed.period_end) <>
+          (sqlc.arg(period_start), sqlc.arg(period_end))
+      AND (
+          billed.status = 'exported'
+          OR billed.exported_at IS NOT NULL
+          OR (
+              billed.finalized_at IS NOT NULL
+              AND (billed.blocked_reason IS NULL OR billed.blocked_reason NOT IN (
+                  'reporting_only_calendar_period', 'discarded_before_billing_cutover'
+              ))
+          )
+      )
+      AND tstzrange(billed.period_start, billed.period_end, '[)') &&
+          tstzrange(sqlc.arg(period_start), sqlc.arg(period_end), '[)')
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
 SET status = CASE
-        WHEN team_billing_period.status IN ('blocked', 'approved', 'exported')
+        WHEN team_billing_period.status IN ('blocked', 'approved', 'exporting', 'exported')
             THEN team_billing_period.status
         ELSE EXCLUDED.status
     END,
@@ -298,7 +397,7 @@ WITH exported_period AS (
     WHERE team_billing_period.team_id = sqlc.arg(team_id)
       AND team_billing_period.period_start = sqlc.arg(period_start)
       AND team_billing_period.period_end = sqlc.arg(period_end)
-      AND team_billing_period.status = 'approved'
+      AND team_billing_period.status IN ('approved', 'exporting')
       AND team_billing_period.finalized_at IS NULL
       AND EXISTS (
           SELECT 1
@@ -306,9 +405,9 @@ WITH exported_period AS (
           WHERE u.team_id = team_billing_period.team_id
             AND u.period_start = team_billing_period.period_start
             AND u.period_end = team_billing_period.period_end
-            AND u.exported_at IS NULL
             AND u.finalized_at IS NULL
       )
+      AND storage_reports_complete_through(team_billing_period.team_id, team_billing_period.period_end)
       AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
     RETURNING *
 ),
@@ -326,6 +425,34 @@ exported_usage AS (
 )
 SELECT *
 FROM exported_period;
+
+-- name: MarkTeamBillingPeriodExporting :one
+WITH exporting_period AS (
+    UPDATE team_billing_period
+    SET status = 'exporting',
+        updated_at = now()
+    WHERE team_billing_period.team_id = sqlc.arg(team_id)
+      AND team_billing_period.period_start = sqlc.arg(period_start)
+      AND team_billing_period.period_end = sqlc.arg(period_end)
+      AND team_billing_period.status IN ('approved', 'exporting', 'exported')
+      AND team_billing_period.finalized_at IS NULL
+      AND storage_reports_complete_through(team_billing_period.team_id, team_billing_period.period_end)
+      AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
+    RETURNING *
+),
+exporting_usage AS (
+    UPDATE team_billing_usage u
+    SET exported_at = COALESCE(u.exported_at, now()),
+        updated_at = now()
+    FROM exporting_period
+    WHERE u.team_id = exporting_period.team_id
+      AND u.period_start = exporting_period.period_start
+      AND u.period_end = exporting_period.period_end
+      AND u.finalized_at IS NULL
+    RETURNING u.team_id
+)
+SELECT *
+FROM exporting_period;
 
 -- name: CreateBillingPeriodAnomaly :one
 INSERT INTO billing_period_anomaly (
@@ -363,6 +490,373 @@ SET resolved_at = now(),
     resolved_by = sqlc.arg(resolved_by)
 WHERE billing_period_anomaly.id = sqlc.arg(id)
   AND billing_period_anomaly.resolved_at IS NULL
+RETURNING *;
+
+-- name: GetTeamBillingAccount :one
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id, stripe_activation_user_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, checkout_subscription_id, checkout_completed_at
+FROM team_billing_account
+WHERE team_id = sqlc.arg(team_id);
+
+-- name: GetTeamBillingAccountByStripeCustomerID :one
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, stripe_invoice_status, stripe_subscription_event_at, current_period_start, current_period_end, commercial_billing_anchor, cancel_at_period_end, created_at, updated_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, checkout_initializing_at, checkout_session_id, stripe_activation_user_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, checkout_subscription_id, checkout_completed_at
+FROM team_billing_account
+WHERE stripe_customer_id = sqlc.arg(stripe_customer_id);
+
+-- name: ClaimTeamCommercialBillingAnchor :one
+SELECT claim_team_commercial_billing_anchor(sqlc.arg(team_id), sqlc.arg(anchor))::timestamptz AS commercial_billing_anchor;
+
+-- name: EstablishBillingCutover :one
+SELECT establish_billing_cutover(sqlc.arg(cutover), sqlc.arg(preserved_team_ids)::uuid[])::int AS team_count;
+
+-- name: PrepareStripeCheckoutIdentity :exec
+SELECT prepare_stripe_checkout_identity(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid);
+
+-- name: GetTeamBillingCheckoutForRecovery :one
+SELECT * FROM team_billing_account WHERE team_id = sqlc.arg(team_id);
+
+-- name: LockStripeCheckoutRecoveryIdentity :exec
+SELECT lock_stripe_checkout_identity(sqlc.arg(actor_id)::uuid);
+
+-- name: StripeCheckoutRecoveryEvidenceAvailable :one
+SELECT CASE WHEN sqlc.narg(evidence_version)::uuid IS NULL
+    THEN NOT canonical_promotion_identity_enabled()
+    ELSE EXISTS (SELECT 1 FROM promotion_identity_evidence
+        WHERE evidence_version = sqlc.narg(evidence_version)::uuid AND user_id = sqlc.arg(actor_id)::uuid)
+END::boolean AS available;
+
+-- name: LockTeamBillingCheckoutForRecovery :one
+SELECT * FROM team_billing_account
+WHERE team_id = sqlc.arg(team_id)
+  AND stripe_checkout_actor_id = sqlc.arg(actor_id)
+  AND checkout_initializing_at = sqlc.arg(generation)
+  AND stripe_customer_id = sqlc.arg(customer_id)
+  AND checkout_session_id = sqlc.arg(session_id)
+  AND checkout_request_key IS NOT DISTINCT FROM sqlc.narg(request_key)
+  AND stripe_checkout_identity_evidence_version IS NOT DISTINCT FROM sqlc.narg(evidence_version)::uuid
+  AND checkout_completed_at IS NULL
+  AND checkout_subscription_id IS NULL
+FOR UPDATE;
+
+-- name: BeginTeamBillingCheckout :one
+WITH locks AS MATERIALIZED (
+    SELECT lock_stripe_checkout_identity(sqlc.arg(actor_id)::uuid)
+)
+UPDATE team_billing_account
+SET checkout_initializing_at = now(),
+    checkout_request_key = sqlc.arg(request_key),
+    checkout_pending_attempt_ids = ARRAY[sqlc.arg(attempt_id)::uuid],
+    checkout_may_exist = false,
+    checkout_subscription_id = NULL,
+    checkout_completed_at = NULL,
+    checkout_session_id = NULL,
+    stripe_checkout_actor_id = sqlc.arg(actor_id),
+    stripe_checkout_actor_claimed_at = now(),
+    stripe_checkout_identity_evidence_version = capture_promotion_identity_evidence(sqlc.arg(actor_id)::uuid),
+    checkout_anchor_snapshot = COALESCE(checkout_anchor_snapshot, commercial_billing_anchor),
+    updated_at = now()
+FROM locks
+WHERE team_billing_account.team_id = sqlc.arg(team_id)
+  AND checkout_completed_at IS NULL
+  AND checkout_initializing_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM stripe_promotion_migration_fence f
+      WHERE f.team_id = sqlc.arg(team_id)
+  )
+RETURNING team_billing_account.*;
+
+-- name: ResumeTeamBillingCheckout :one
+UPDATE team_billing_account
+SET checkout_pending_attempt_ids = CASE
+        -- Discarded attempts may still be in flight. Preserve that uncertainty
+        -- while replaying the same generation and Stripe idempotency key.
+        WHEN cardinality(checkout_pending_attempt_ids) >= 32
+          THEN ARRAY[sqlc.arg(attempt_id)::uuid]
+        ELSE array_append(checkout_pending_attempt_ids, sqlc.arg(attempt_id)::uuid)
+    END,
+    checkout_may_exist = checkout_may_exist OR cardinality(checkout_pending_attempt_ids) >= 32,
+    updated_at = now()
+WHERE team_billing_account.team_id = sqlc.arg(team_id)
+  AND NOT EXISTS (SELECT 1 FROM stripe_promotion_migration_fence f WHERE f.team_id=sqlc.arg(team_id))
+  AND stripe_checkout_actor_id = sqlc.arg(actor_id)
+  AND checkout_request_key = sqlc.arg(request_key)
+  AND NOT (sqlc.arg(attempt_id)::uuid = ANY(checkout_pending_attempt_ids))
+  AND checkout_completed_at IS NULL
+  -- Keep replays within Stripe's idempotency retention and leave at least
+  -- 30 minutes before expires_at, even if request validation runs again.
+  AND checkout_initializing_at > now() - interval '23 hours'
+RETURNING *;
+
+-- name: FinishTeamBillingCheckout :exec
+UPDATE team_billing_account SET checkout_initializing_at = NULL, checkout_anchor_snapshot = NULL, checkout_session_id = NULL, checkout_subscription_id = NULL, checkout_completed_at = NULL, checkout_request_key = NULL, checkout_pending_attempt_ids = '{}', checkout_may_exist = false, updated_at = now() WHERE team_id = sqlc.arg(team_id);
+
+-- name: AbortTeamBillingCheckout :exec
+UPDATE team_billing_account
+SET checkout_initializing_at = NULL,
+    checkout_request_key = NULL,
+    checkout_pending_attempt_ids = '{}',
+    checkout_may_exist = false,
+    checkout_anchor_snapshot = NULL,
+    checkout_session_id = NULL,
+    checkout_subscription_id = NULL,
+    checkout_completed_at = NULL,
+    stripe_checkout_actor_id = NULL,
+    stripe_checkout_actor_claimed_at = NULL,
+    stripe_checkout_identity_evidence_version = NULL,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND checkout_initializing_at = sqlc.arg(lease_started_at)
+  AND checkout_completed_at IS NULL;
+
+-- name: RecordStripeCheckoutExpiration :exec
+INSERT INTO stripe_checkout_expiration_evidence
+    (team_id, stripe_customer_id, checkout_generation, checkout_session_id)
+VALUES (sqlc.arg(team_id), sqlc.arg(stripe_customer_id), sqlc.arg(checkout_generation), sqlc.arg(checkout_session_id))
+ON CONFLICT (team_id, checkout_generation) DO NOTHING;
+
+-- name: FinishFailedTeamBillingCheckoutAttempt :exec
+WITH attempt AS (
+    SELECT current.team_id,
+           cardinality(current.checkout_pending_attempt_ids) = 1
+             AND NOT current.checkout_may_exist AND NOT sqlc.arg(may_exist)::boolean
+             AND current.checkout_session_id IS NULL AND current.checkout_completed_at IS NULL
+             AND current.checkout_subscription_id IS NULL AS release
+    FROM team_billing_account current
+    WHERE current.team_id = sqlc.arg(team_id)
+      AND current.checkout_initializing_at = sqlc.arg(lease_started_at)
+      AND sqlc.arg(attempt_id)::uuid = ANY(current.checkout_pending_attempt_ids)
+    FOR UPDATE
+)
+UPDATE team_billing_account a
+SET checkout_pending_attempt_ids = array_remove(a.checkout_pending_attempt_ids, sqlc.arg(attempt_id)::uuid),
+    checkout_may_exist = a.checkout_may_exist OR sqlc.arg(may_exist)::boolean,
+    checkout_initializing_at = CASE WHEN attempt.release THEN NULL ELSE a.checkout_initializing_at END,
+    checkout_request_key = CASE WHEN attempt.release THEN NULL ELSE a.checkout_request_key END,
+    checkout_anchor_snapshot = CASE WHEN attempt.release THEN NULL ELSE a.checkout_anchor_snapshot END,
+    stripe_checkout_actor_id = CASE WHEN attempt.release THEN NULL ELSE a.stripe_checkout_actor_id END,
+    stripe_checkout_actor_claimed_at = CASE WHEN attempt.release THEN NULL ELSE a.stripe_checkout_actor_claimed_at END,
+    stripe_checkout_identity_evidence_version = CASE WHEN attempt.release THEN NULL ELSE a.stripe_checkout_identity_evidence_version END,
+    updated_at = now()
+FROM attempt
+WHERE a.team_id = attempt.team_id;
+
+-- name: SetTeamBillingCheckoutSession :one
+UPDATE team_billing_account
+SET checkout_session_id = sqlc.arg(session_id),
+    checkout_may_exist = true,
+    checkout_pending_attempt_ids = array_remove(checkout_pending_attempt_ids, sqlc.arg(attempt_id)::uuid),
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND checkout_initializing_at = sqlc.arg(lease_started_at)
+  AND sqlc.arg(attempt_id)::uuid = ANY(checkout_pending_attempt_ids)
+  AND (checkout_session_id IS NULL OR checkout_session_id = sqlc.arg(session_id))
+RETURNING team_id;
+
+-- name: CompleteTeamBillingCheckoutWithoutSubscription :exec
+UPDATE team_billing_account
+SET checkout_completed_at = COALESCE(checkout_completed_at, now()), updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND checkout_session_id = sqlc.arg(session_id)
+  AND checkout_initializing_at IS NOT NULL;
+
+-- name: AssociateTeamBillingCheckoutSubscription :exec
+UPDATE team_billing_account
+SET stripe_subscription_id = sqlc.arg(subscription_id),
+    checkout_subscription_id = sqlc.arg(subscription_id),
+    checkout_completed_at = COALESCE(checkout_completed_at, now()),
+    stripe_subscription_status = CASE WHEN stripe_subscription_id IS DISTINCT FROM sqlc.arg(subscription_id) THEN NULL ELSE stripe_subscription_status END,
+    stripe_subscription_event_at = CASE WHEN stripe_subscription_id IS DISTINCT FROM sqlc.arg(subscription_id) THEN NULL ELSE stripe_subscription_event_at END,
+    current_period_start = CASE WHEN stripe_subscription_id IS DISTINCT FROM sqlc.arg(subscription_id) THEN NULL ELSE current_period_start END,
+    current_period_end = CASE WHEN stripe_subscription_id IS DISTINCT FROM sqlc.arg(subscription_id) THEN NULL ELSE current_period_end END,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id);
+
+-- name: AssociateCompletedTeamBillingCheckoutSubscription :exec
+UPDATE team_billing_account
+SET checkout_subscription_id = sqlc.arg(subscription_id), updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND checkout_initializing_at IS NOT NULL
+  AND checkout_completed_at IS NOT NULL
+  AND checkout_subscription_id IS NULL
+  AND (stripe_subscription_id IS DISTINCT FROM sqlc.arg(subscription_id)
+       OR stripe_subscription_event_at IS NULL);
+
+-- name: FinishTeamBillingCheckoutForSubscription :exec
+UPDATE team_billing_account
+-- Keep the subscription association with its actor/evidence after closing the
+-- replay lease: a paused or unpaid subscription can activate later.
+SET checkout_initializing_at = NULL, checkout_anchor_snapshot = NULL, checkout_session_id = NULL, checkout_completed_at = NULL, checkout_request_key = NULL, checkout_pending_attempt_ids = '{}', checkout_may_exist = false, updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND stripe_subscription_id = sqlc.arg(subscription_id)
+  AND checkout_subscription_id = sqlc.arg(subscription_id)
+  AND stripe_subscription_event_at IS NOT NULL
+  AND stripe_subscription_status IN ('active', 'trialing', 'past_due', 'unpaid', 'paused', 'canceled', 'incomplete_expired')
+  AND checkout_initializing_at IS NOT NULL;
+
+-- name: ReleaseStripeCheckoutActor :exec
+UPDATE team_billing_account
+SET stripe_checkout_actor_id = NULL,
+    stripe_checkout_actor_claimed_at = NULL,
+    stripe_checkout_identity_evidence_version = NULL,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND stripe_checkout_actor_id = sqlc.arg(actor_id);
+
+-- name: UpsertTeamBillingAccountCustomer :one
+INSERT INTO team_billing_account (team_id, stripe_customer_id)
+VALUES (sqlc.arg(team_id), sqlc.arg(stripe_customer_id))
+ON CONFLICT (team_id) DO UPDATE
+SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+    updated_at = now()
+RETURNING *;
+
+-- name: UpsertTeamBillingAccountSubscription :one
+INSERT INTO team_billing_account (
+    team_id,
+    stripe_customer_id,
+    stripe_subscription_id,
+    stripe_subscription_status,
+    stripe_invoice_status,
+    stripe_subscription_event_at,
+    current_period_start,
+    current_period_end,
+    commercial_billing_anchor,
+    cancel_at_period_end
+)
+VALUES (
+    sqlc.arg(team_id),
+    sqlc.narg(stripe_customer_id),
+    sqlc.narg(stripe_subscription_id),
+    sqlc.narg(stripe_subscription_status),
+    sqlc.narg(stripe_invoice_status),
+    sqlc.narg(stripe_subscription_event_at),
+    sqlc.narg(current_period_start),
+    sqlc.narg(current_period_end),
+    sqlc.narg(commercial_billing_anchor),
+    COALESCE(sqlc.narg(cancel_at_period_end), false)
+)
+ON CONFLICT (team_id) DO UPDATE
+SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_account.stripe_customer_id),
+    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, team_billing_account.stripe_subscription_id),
+    stripe_subscription_status = COALESCE(EXCLUDED.stripe_subscription_status, team_billing_account.stripe_subscription_status),
+    stripe_invoice_status = COALESCE(EXCLUDED.stripe_invoice_status, team_billing_account.stripe_invoice_status),
+    stripe_subscription_event_at = COALESCE(EXCLUDED.stripe_subscription_event_at, team_billing_account.stripe_subscription_event_at),
+    current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
+    current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
+    commercial_billing_anchor = COALESCE(team_billing_account.commercial_billing_anchor, EXCLUDED.commercial_billing_anchor),
+    cancel_at_period_end = COALESCE(sqlc.narg(cancel_at_period_end), team_billing_account.cancel_at_period_end),
+    updated_at = now()
+RETURNING *;
+
+-- name: CreateBillingUsageExport :one
+INSERT INTO billing_usage_export (
+    team_id,
+    period_start,
+    period_end,
+    resource_type,
+    stripe_customer_id,
+    stripe_meter_event_identifier,
+    stripe_idempotency_key,
+    stripe_event_name,
+    value,
+    status,
+    error,
+    sent_at
+)
+VALUES (
+    sqlc.arg(team_id),
+    sqlc.arg(period_start),
+    sqlc.arg(period_end),
+    sqlc.arg(resource_type),
+    sqlc.narg(stripe_customer_id),
+    sqlc.arg(stripe_meter_event_identifier),
+    sqlc.narg(stripe_idempotency_key),
+    sqlc.arg(stripe_event_name),
+    sqlc.arg(value),
+    sqlc.arg(status),
+    sqlc.narg(error),
+    sqlc.narg(sent_at)
+)
+RETURNING *;
+
+-- name: UpdateBillingUsageExportStatus :one
+UPDATE billing_usage_export
+SET status = sqlc.arg(status),
+    error = sqlc.narg(error),
+    sent_at = COALESCE(sqlc.narg(sent_at), billing_usage_export.sent_at),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+RETURNING *;
+
+-- name: MarkBillingUsageExportSent :one
+UPDATE billing_usage_export
+SET status = 'sent',
+    sent_at = sqlc.arg(sent_at),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+  AND status = 'pending'
+RETURNING *;
+
+-- name: SetBillingUsageExportIdempotencyKey :one
+UPDATE billing_usage_export
+SET stripe_idempotency_key = sqlc.arg(stripe_idempotency_key),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+  AND (stripe_idempotency_key IS NULL OR stripe_idempotency_key = stripe_meter_event_identifier)
+RETURNING *;
+
+-- name: ListBillingUsageExportsForPeriod :many
+SELECT *
+FROM billing_usage_export
+WHERE team_id = sqlc.arg(team_id)
+  AND period_start = sqlc.arg(period_start)
+  AND period_end = sqlc.arg(period_end)
+ORDER BY created_at ASC, id ASC;
+
+-- name: GetBillingUsageExportByIdempotencyKey :one
+SELECT *
+FROM billing_usage_export
+WHERE stripe_idempotency_key = sqlc.arg(stripe_idempotency_key)
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+
+-- name: GetBillingUsageExportByIdentifier :one
+SELECT *
+FROM billing_usage_export
+WHERE stripe_meter_event_identifier = sqlc.arg(stripe_meter_event_identifier)
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+
+-- name: CreateStripeWebhookEvent :one
+INSERT INTO stripe_webhook_event (event_id, event_type, payload)
+VALUES (sqlc.arg(event_id), sqlc.arg(event_type), sqlc.arg(payload))
+ON CONFLICT (event_id) DO NOTHING
+RETURNING *;
+
+-- name: GetStripeWebhookEvent :one
+SELECT *
+FROM stripe_webhook_event
+WHERE event_id = sqlc.arg(event_id);
+
+-- name: GetStripeWebhookEventForUpdate :one
+SELECT *
+FROM stripe_webhook_event
+WHERE event_id = sqlc.arg(event_id)
+FOR UPDATE;
+
+-- name: MarkStripeWebhookEventProcessed :one
+UPDATE stripe_webhook_event
+SET processed_at = now(),
+    last_error = NULL,
+    updated_at = now()
+WHERE event_id = sqlc.arg(event_id)
+RETURNING *;
+
+-- name: MarkStripeWebhookEventFailed :one
+UPDATE stripe_webhook_event
+SET last_error = sqlc.arg(last_error),
+    updated_at = now()
+WHERE event_id = sqlc.arg(event_id)
+  AND processed_at IS NULL
 RETURNING *;
 
 -- name: IsFeatureEnabledForTeam :one
@@ -530,6 +1024,7 @@ WITH ranked AS (
         ) AS team_rank
     FROM team_billing_period
     WHERE finalized_at IS NULL
+      AND storage_reports_complete_through(team_id, period_end)
 )
 SELECT *
 FROM ranked
@@ -558,6 +1053,328 @@ FROM team_credit_grant
 WHERE team_id = sqlc.arg(team_id)
   AND remaining_usd > 0
   AND (expires_at IS NULL OR expires_at > now());
+
+-- name: GetTeamTrialBalance :one
+SELECT trial.grant_usd::numeric AS grant_usd,
+       trial.consumed_usd::numeric AS consumed_usd,
+       trial.remaining_usd::numeric AS remaining_usd,
+       trial.state::text AS state,
+       trial.eligible::boolean AS eligible
+FROM get_team_trial_balance(sqlc.arg(team_id)) AS trial;
+-- name: HasSignupTrialCredit :one
+SELECT EXISTS (
+    SELECT 1
+    FROM team_credit_grant
+    WHERE team_id = sqlc.arg(team_id)
+      AND reason = 'signup trial credit'
+) AS has_signup_trial;
+
+-- Bound both index reads and aggregation; oversized samples yield no forecast.
+-- Separate open and closed intervals to use the team/open and team/end indexes.
+-- name: GetRecentTrialBurnSample :one
+WITH sample_window AS MATERIALIZED (
+  -- A new signup grant starts a new warning lifecycle. Do not extrapolate
+  -- consumption from the previous lifecycle into its warning.
+  SELECT GREATEST(now() - interval '6 hours', MAX(created_at)) AS started_at
+  FROM team_credit_grant
+  WHERE team_id = sqlc.arg(team_id) AND reason = 'signup trial credit'
+), selected_plan AS (
+  SELECT COALESCE((SELECT tpp.plan_key FROM team_pricing_plan tpp JOIN pricing_plan pp ON pp.key = tpp.plan_key
+    WHERE tpp.team_id = sqlc.arg(team_id) AND pp.active AND tpp.effective_from <= now()
+      AND (tpp.effective_to IS NULL OR tpp.effective_to > now())
+    ORDER BY tpp.effective_from DESC LIMIT 1), 'payg') AS plan_key
+), ranked_rates AS (
+  SELECT r.resource, r.price_usd,
+         row_number() OVER (PARTITION BY r.resource, r.unit ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC) AS rate_rank
+  FROM pricing_rate r
+  JOIN selected_plan p ON p.plan_key = r.plan_key
+  JOIN pricing_plan pp ON pp.key = r.plan_key AND pp.active
+  WHERE r.unit = 'second' AND r.effective_from <= now() AND (r.effective_to IS NULL OR r.effective_to > now())
+), rates AS (
+  SELECT COALESCE(MAX(price_usd) FILTER (WHERE resource = 'vcpu' AND rate_rank = 1), 0)::numeric AS vcpu,
+         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'memory_gib' AND rate_rank = 1), 0)::numeric AS memory,
+         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'storage_gib' AND rate_rank = 1), 0)::numeric AS storage
+  FROM ranked_rates
+  WHERE rate_rank = 1
+), recent_compute AS MATERIALIZED (
+  SELECT GREATEST(i.started_at, (SELECT started_at FROM sample_window)) AS started_at,
+         i.ended_at, vcpu_count, memory_mib
+  FROM (
+    (SELECT started_at, ended_at, vcpu_count, memory_mib FROM sandbox_compute_billing_interval
+     WHERE team_id = sqlc.arg(team_id) AND ended_at IS NULL
+     LIMIT 1025)
+    UNION ALL
+    (SELECT started_at, ended_at, vcpu_count, memory_mib FROM sandbox_compute_billing_interval
+     WHERE team_id = sqlc.arg(team_id) AND ended_at > (SELECT started_at FROM sample_window)
+     LIMIT 1025)
+  ) i
+), compute AS (
+  -- Convert each resource's usage to USD before aggregating.  The raw
+  -- interval duration is vCPU-seconds and must never be exposed as spend.
+  SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(b.ended_at, now()), now()) - b.started_at)) * (b.vcpu_count * rates.vcpu + b.memory_mib / 1024.0 * rates.memory)), 0)::numeric AS amount,
+       MIN(b.started_at) AS started_at,
+       MAX(COALESCE(b.ended_at, now())) AS ended_at
+FROM recent_compute b
+ CROSS JOIN rates
+ WHERE b.started_at < now()
+), recent_storage AS MATERIALIZED (
+  SELECT i.sandbox_id,
+         GREATEST(i.started_at, (SELECT started_at FROM sample_window), (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id))) AS started_at,
+         i.ended_at, disk_mib
+  FROM (
+    (SELECT sandbox_id, started_at, ended_at, disk_mib FROM sandbox_storage_interval
+     WHERE team_id = sqlc.arg(team_id) AND ended_at IS NULL AND storage_billing_activated(sqlc.arg(team_id))
+     LIMIT 1025)
+    UNION ALL
+    (SELECT sandbox_id, started_at, ended_at, disk_mib FROM sandbox_storage_interval
+     WHERE team_id = sqlc.arg(team_id) AND ended_at > (SELECT started_at FROM sample_window) AND storage_billing_activated(sqlc.arg(team_id))
+     LIMIT 1025)
+  ) i
+), recent_retained AS MATERIALIZED (
+ -- Retained spend is clipped at storage activation as well as the trial
+ -- sample window; otherwise storage-only trials get a pre-activation
+ -- denominator with no corresponding spend.
+ SELECT GREATEST(
+          started_at,
+          (SELECT started_at FROM sample_window),
+          COALESCE((SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id)), started_at)
+        ) started_at,ended_at
+ FROM retained_storage_interval WHERE team_id=sqlc.arg(team_id)
+ AND COALESCE(ended_at,now())>GREATEST(
+       (SELECT started_at FROM sample_window),
+       COALESCE((SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id)), (SELECT started_at FROM sample_window))
+     )
+ AND storage_billing_activated(sqlc.arg(team_id)) LIMIT 1025
+), sample_bounds AS (
+  SELECT MIN(started_at) AS started_at,
+         MAX(LEAST(ended_at, now())) AS ended_at
+  FROM (
+    SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute WHERE started_at < now()
+    UNION ALL
+    SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage WHERE started_at < now()
+ UNION ALL SELECT started_at,COALESCE(ended_at,now()) FROM recent_retained WHERE started_at<now()
+  ) intervals
+)
+SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 OR (SELECT count(*) FROM recent_retained)>1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated(sqlc.arg(team_id)) THEN storage_mib_seconds(sqlc.arg(team_id)::uuid,GREATEST((SELECT started_at FROM sample_window),(SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id))),now())/1024.0*rates.storage ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
+       sample_bounds.started_at, sample_bounds.ended_at,
+       EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
+FROM compute, rates, sample_bounds;
+
+-- name: ClaimTrialCreditWarning :one
+-- A claimed row is never reclaimed after a timeout: the worker may have
+-- crashed after provider acceptance, so retrying could duplicate the email.
+INSERT INTO trial_credit_warning_state (team_id, lifecycle_key, status, claim_token, claimed_at)
+VALUES (sqlc.arg(team_id), trial_credit_warning_lifecycle(sqlc.arg(team_id)), 'claimed', gen_random_uuid(), now())
+ON CONFLICT (team_id, lifecycle_key) DO UPDATE
+SET status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now(), updated_at = now()
+WHERE trial_credit_warning_state.status = 'pending'
+RETURNING claim_token;
+
+-- name: ClaimTrialCreditWarningForLifecycle :one
+INSERT INTO trial_credit_warning_state (team_id, lifecycle_key, status, claim_token, claimed_at)
+SELECT sqlc.arg(team_id), sqlc.arg(lifecycle_key)::text, 'claimed', gen_random_uuid(), now()
+WHERE trial_credit_warning_lifecycle(sqlc.arg(team_id)) = sqlc.arg(lifecycle_key)::text
+ON CONFLICT (team_id, lifecycle_key) DO UPDATE
+SET status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now(), updated_at = now()
+WHERE trial_credit_warning_state.status = 'pending'
+  AND trial_credit_warning_state.lifecycle_key = sqlc.arg(lifecycle_key)::text
+  AND trial_credit_warning_lifecycle(sqlc.arg(team_id)) = sqlc.arg(lifecycle_key)::text
+RETURNING claim_token;
+
+-- name: IsTrialCreditWarningClaimCurrent :one
+SELECT EXISTS (
+    SELECT 1 FROM trial_credit_warning_state
+    WHERE team_id = sqlc.arg(team_id) AND claim_token = sqlc.arg(claim_token)
+      AND status = 'claimed'
+      AND lifecycle_key = trial_credit_warning_lifecycle(sqlc.arg(team_id))
+)::boolean AS current;
+
+-- name: CompleteTrialCreditWarning :exec
+-- A finished recipient loop with rejections is terminal, but not fully sent.
+UPDATE trial_credit_warning_state
+SET status = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = sqlc.arg(team_id) AND d.lifecycle_key = trial_credit_warning_state.lifecycle_key AND d.rejected_at IS NOT NULL
+    ) THEN 'suppressed' ELSE 'sent' END,
+    sent_at = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = sqlc.arg(team_id) AND d.lifecycle_key = trial_credit_warning_state.lifecycle_key AND d.rejected_at IS NOT NULL
+    ) THEN NULL ELSE now() END,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
+-- name: ListTrialCreditWarningDeliveries :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = sqlc.arg(team_id) AND lifecycle_key = trial_credit_warning_lifecycle(sqlc.arg(team_id)) AND sent_at IS NOT NULL;
+
+-- name: ListTrialCreditWarningRejections :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = sqlc.arg(team_id) AND lifecycle_key = trial_credit_warning_lifecycle(sqlc.arg(team_id)) AND rejected_at IS NOT NULL;
+
+-- name: RecordTrialCreditWarningRejection :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, lifecycle_key, recipient, sent_at, rejected_at)
+SELECT s.team_id, s.lifecycle_key, sqlc.arg(recipient)::text, NULL, now() FROM trial_credit_warning_state s
+WHERE s.team_id = sqlc.arg(team_id) AND s.status = 'claimed' AND s.claim_token = sqlc.arg(claim_token)
+ON CONFLICT (team_id, lifecycle_key, recipient) DO NOTHING;
+
+-- name: RecordTrialCreditWarningDelivery :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, lifecycle_key, recipient)
+SELECT s.team_id, s.lifecycle_key, sqlc.arg(recipient)::text FROM trial_credit_warning_state s
+WHERE s.team_id = sqlc.arg(team_id) AND s.status = 'claimed' AND s.claim_token = sqlc.arg(claim_token)
+ON CONFLICT (team_id, lifecycle_key, recipient) DO NOTHING;
+
+-- name: ReleaseTrialCreditWarning :exec
+UPDATE trial_credit_warning_state SET status = 'pending', claimed_at = NULL, updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
+-- name: MarkTrialCreditWarningUnknown :exec
+-- An interrupted provider request may have been accepted. Do not reclaim it,
+-- because retrying would violate the one-warning invariant.
+UPDATE trial_credit_warning_state SET status = 'unknown', updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
+-- name: IsTeamSandboxBillingEligible :one
+SELECT team_sandbox_billing_eligible(sqlc.arg(team_id)) AS eligible;
+
+-- name: RefreshTeamTrialEligibility :exec
+INSERT INTO team_trial_eligibility_cache (team_id, eligible, updated_at)
+SELECT sqlc.arg(team_id), refresh_team_trial_eligibility(sqlc.arg(team_id)), now()
+ON CONFLICT (team_id) DO UPDATE
+SET eligible = EXCLUDED.eligible,
+    updated_at = EXCLUDED.updated_at;
+
+-- name: ListTeamsWithTrialCredits :many
+SELECT DISTINCT g.team_id
+FROM team_credit_grant g
+LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
+WHERE g.reason = 'signup trial credit'
+  AND a.trial_ended_at IS NULL
+  -- A false verdict is stable until a newer grant arrives. Avoid rescanning
+  -- exhausted/expired historical trials while still picking up renewals.
+  AND (c.team_id IS NULL OR c.eligible OR g.created_at > c.updated_at)
+  AND g.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+ORDER BY g.team_id
+LIMIT sqlc.arg(batch_limit);
+
+-- name: ListTrialCreditWarningTeams :many
+WITH consuming_teams AS (
+    SELECT s.team_id
+    FROM sandbox s
+    WHERE s.destroyed_at IS NULL AND s.status = 'active'
+      AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+    UNION
+    SELECT i.team_id
+    FROM sandbox_storage_interval i
+    -- A zero-sized overlay can still retain billable shared artifacts.
+    WHERE i.ended_at IS NULL AND i.started_at < now()
+      AND i.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+      AND storage_billing_activated(i.team_id)
+    UNION
+    SELECT i.team_id FROM retained_storage_interval i
+    WHERE i.ended_at IS NULL AND i.started_at < now()
+      AND i.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+      AND storage_billing_activated(i.team_id)
+)
+SELECT c.team_id
+FROM consuming_teams c
+LEFT JOIN team_billing_account a ON a.team_id = c.team_id
+WHERE a.trial_ended_at IS NULL
+  AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = c.team_id AND g.reason = 'signup trial credit')
+ORDER BY c.team_id
+LIMIT sqlc.arg(batch_limit);
+
+-- name: ListTeamsWithActiveIneligibleSandboxes :many
+-- MATERIALIZED fence, same reason as the rollup's interval_team_set: dedupe
+-- the active-team set first so team_sandbox_billing_eligible() runs once per
+-- team. Inlined in the WHERE clause the planner may evaluate it per active
+-- sandbox row — the function does three reads, and this sweep runs on a
+-- timer against every control-plane instance.
+WITH active_teams AS MATERIALIZED (
+    SELECT DISTINCT s.team_id
+    FROM sandbox s
+    WHERE s.destroyed_at IS NULL
+      AND s.status = 'active'
+      AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+)
+SELECT team_id
+FROM active_teams
+WHERE NOT team_sandbox_billing_eligible(team_id)
+ORDER BY team_id
+LIMIT sqlc.arg(batch_limit);
+
+-- name: ActivateTeamBilling :exec
+SELECT activate_team_billing(sqlc.arg(team_id), sqlc.narg(user_id)::uuid, sqlc.arg(stripe_grant_id));
+
+-- name: LockStripePromotion :exec
+SELECT lock_stripe_promotion(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid);
+
+-- name: StripePromotionEligible :one
+SELECT stripe_promotion_eligible(sqlc.arg(team_id)::uuid, sqlc.narg(user_id)::uuid) AS eligible;
+
+-- name: ReserveStripePromotion :one
+SELECT reserve_stripe_promotion(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid) AS reserved;
+
+-- name: ReleaseStripePromotion :exec
+SELECT release_stripe_promotion(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid);
+
+-- name: ReserveStripePromotionForEvent :one
+SELECT reserve_stripe_promotion_for_event(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(event_id)) AS reserved;
+
+-- name: ReserveStripePromotionForEventState :one
+SELECT reserve_stripe_promotion_for_event_state(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(event_id)) AS state;
+
+-- name: ReserveStripePromotionForSubscriptionEventState :one
+SELECT reserve_stripe_promotion_for_subscription_event_state(
+    sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(event_id)::text,
+    sqlc.narg(subscription_id)::text, sqlc.narg(checkout_generation)::timestamptz,
+    sqlc.arg(has_checkout_generation)::boolean
+) AS state;
+
+-- name: ReleaseStripePromotionForEvent :exec
+SELECT release_stripe_promotion_for_event(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(event_id));
+
+-- name: MarkStripePromotionAttempt :one
+WITH locks AS MATERIALIZED (
+    SELECT lock_stripe_promotion(sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid)
+)
+UPDATE user_promotion_entitlement u
+SET stripe_redemption_attempted_at = COALESCE(stripe_redemption_attempted_at, now()), updated_at = now()
+FROM locks
+WHERE u.user_id = sqlc.arg(user_id)
+  AND u.stripe_redemption_reserved_team_id = sqlc.arg(team_id)
+  AND u.stripe_redemption_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM team_billing_account a
+      JOIN promotion_identity i ON i.identity_key = a.stripe_activation_identity_key
+      WHERE a.team_id = sqlc.arg(team_id) AND a.stripe_activation_user_id = u.user_id
+        AND a.stripe_activation_credit_reservation_event_id = sqlc.arg(event_id)
+        AND i.stripe_reserved_team_id = a.team_id AND i.stripe_reserved_user_id = u.user_id
+  )
+RETURNING u.stripe_redemption_attempted_at;
+
+-- name: ClaimStripeWebhookProcessingLease :one
+INSERT INTO stripe_webhook_processing_lease(customer_id, token, expires_at)
+VALUES(sqlc.arg(customer_id), sqlc.arg(token), now() + interval '1 minute')
+ON CONFLICT (customer_id) DO UPDATE
+SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at
+WHERE stripe_webhook_processing_lease.expires_at <= now()
+RETURNING token;
+
+-- name: LockStripeWebhookProcessingLease :one
+SELECT token FROM stripe_webhook_processing_lease
+WHERE customer_id = sqlc.arg(customer_id) AND token = sqlc.arg(token) AND expires_at > now()
+FOR UPDATE;
+
+-- name: ReleaseStripeWebhookProcessingLease :exec
+DELETE FROM stripe_webhook_processing_lease
+WHERE customer_id = sqlc.arg(customer_id) AND token = sqlc.arg(token);
+
+-- name: StripePromotionWasAttempted :one
+SELECT EXISTS (
+    SELECT 1 FROM user_promotion_entitlement
+    WHERE user_id = sqlc.arg(user_id) AND stripe_redemption_reserved_team_id = sqlc.arg(team_id)
+      AND stripe_redemption_attempted_at IS NOT NULL
+) AS attempted;
+
+-- name: FinalizeStripePromotion :exec
+SELECT finalize_stripe_promotion(sqlc.arg(team_id), sqlc.arg(user_id)::uuid, sqlc.arg(stripe_grant_id));
 
 -- name: ListTeamCreditGrants :many
 SELECT *
@@ -596,3 +1413,91 @@ VALUES (
     sqlc.narg(created_by)
 )
 RETURNING *;
+
+-- name: GetTeamBillingUsageSeries :many
+-- Allocated usage for each requested bucket, clipped exactly to bucket bounds.
+WITH buckets AS (
+ SELECT starts.bucket_start, ends.bucket_end
+ FROM unnest(sqlc.arg(period_starts)::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
+JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
+), bounds AS (
+ SELECT min(bucket_start) AS range_start, max(bucket_end) AS range_end FROM buckets
+), compute_intervals AS (
+ SELECT i.* FROM sandbox_compute_billing_interval i CROSS JOIN bounds r
+ WHERE i.team_id=sqlc.arg(team_id) AND i.started_at < LEAST(now(),r.range_end)
+   AND COALESCE(i.ended_at,now()) > r.range_start
+), compute AS (
+ SELECT b.bucket_start,b.bucket_end,
+   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.vcpu_count),0)::numeric vcpu_seconds,
+   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.memory_mib),0)::numeric memory_mib_seconds
+ FROM buckets b LEFT JOIN compute_intervals i ON
+  i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
+ GROUP BY b.bucket_start,b.bucket_end
+), storage AS (
+ SELECT b.bucket_start,b.bucket_end,
+ storage_mib_seconds(sqlc.arg(team_id)::uuid,b.bucket_start,b.bucket_end,false)::numeric AS storage_mib_seconds
+ FROM buckets b
+)
+SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(billable_storage_mib_seconds(sqlc.arg(team_id),c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
+FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
+
+
+-- name: GetTeamTrialRunway :one
+WITH lifecycle AS (
+    SELECT trial_credit_warning_lifecycle(sqlc.arg(team_id))::text AS key
+)
+SELECT lifecycle.key::text AS lifecycle_key,
+       COALESCE(r.state, 'unknown')::text AS state,
+       r.observed_at
+FROM lifecycle
+LEFT JOIN team_trial_runway r ON r.team_id = sqlc.arg(team_id) AND r.lifecycle_key = lifecycle.key;
+
+-- name: UpsertTeamTrialRunway :exec
+INSERT INTO team_trial_runway (team_id, lifecycle_key, state, observed_at)
+SELECT sqlc.arg(team_id), sqlc.arg(lifecycle_key)::text, sqlc.arg(state)::text, sqlc.arg(observed_at)::timestamptz
+WHERE trial_credit_warning_lifecycle(sqlc.arg(team_id)) = sqlc.arg(lifecycle_key)
+ON CONFLICT (team_id) DO UPDATE
+SET lifecycle_key = EXCLUDED.lifecycle_key, state = EXCLUDED.state, observed_at = EXCLUDED.observed_at
+WHERE team_trial_runway.observed_at < EXCLUDED.observed_at;
+
+-- name: RequestStripeActivationCreditRevocation :exec
+INSERT INTO stripe_activation_credit_revocation (team_id, stripe_customer_id)
+SELECT a.team_id, a.stripe_customer_id FROM team_billing_account a
+WHERE a.team_id = sqlc.arg(team_id) AND a.stripe_customer_id IS NOT NULL
+ON CONFLICT (team_id) DO NOTHING;
+
+-- name: GetStripeActivationCreditRevocation :one
+SELECT r.*, a.stripe_activation_credit_grant_id AS activation_grant_id
+FROM stripe_activation_credit_revocation r
+JOIN team_billing_account a ON a.team_id = r.team_id AND a.stripe_customer_id = r.stripe_customer_id
+WHERE r.stripe_customer_id = sqlc.arg(customer_id);
+
+-- name: CompleteStripeActivationCreditRevocation :one
+WITH account AS (
+    UPDATE team_billing_account a
+    SET stripe_activation_credit_grant_id = sqlc.arg(grant_id)::text, updated_at = now()
+    WHERE a.team_id = sqlc.arg(team_id) AND a.stripe_customer_id = sqlc.arg(customer_id)
+      AND (a.stripe_activation_credit_grant_id IS NULL OR a.stripe_activation_credit_grant_id = sqlc.arg(grant_id))
+    RETURNING a.team_id
+)
+UPDATE stripe_activation_credit_revocation r
+SET completed_at = COALESCE(r.completed_at, now()), stripe_grant_id = sqlc.arg(grant_id)
+FROM account a
+WHERE r.team_id = a.team_id AND r.stripe_customer_id = sqlc.arg(customer_id)
+  AND (r.stripe_grant_id IS NULL OR r.stripe_grant_id = sqlc.arg(grant_id))
+RETURNING r.team_id;
+
+-- name: IsStorageBillingActivated :one
+SELECT storage_billing_activated(sqlc.arg(team_id)::uuid)::boolean;
+
+-- name: IsStorageBillingActivatedForWindow :one
+SELECT storage_billing_activated(sqlc.arg(team_id)::uuid, sqlc.arg(period_end)::timestamptz)::boolean;
+
+-- name: BeginStripeCheckoutWithPublicationDecision :exec
+SELECT begin_stripe_checkout_with_publication_decision(
+    sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(operation_id)::uuid,
+    sqlc.arg(home_region)::text, sqlc.arg(request_key)::text, sqlc.arg(decision)::text, sqlc.arg(attempt_id)::uuid);
+
+-- name: StripeCheckoutPublicationFailed :one
+SELECT stripe_checkout_publication_failed(sqlc.arg(team_id)::uuid,
+    sqlc.arg(generation)::timestamptz, sqlc.arg(user_id)::uuid)::boolean AS publication_failed;

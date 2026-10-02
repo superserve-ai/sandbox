@@ -1,3 +1,10 @@
+variable "promotion_evidence_enabled" {
+  description = "Attach promotion evidence secrets only after operators publish all four versions and prepare shared Auth. Does not enable device policy."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
 variable "project_id" {
   description = "GCP project ID for the new region rollout."
   type        = string
@@ -8,6 +15,12 @@ variable "environment" {
   description = "Logical environment name."
   type        = string
   default     = "us-west2"
+}
+
+variable "team_creation_public_keys" {
+  description = "JSON map of dedicated Console assertion key IDs to base64 Ed25519 public keys. Empty disables team creation."
+  type        = string
+  default     = "{}"
 }
 
 variable "region" {
@@ -108,4 +121,62 @@ variable "create_network" {
 variable "network_name" {
   type    = string
   default = "superserve-production-vpc"
+}
+
+variable "standby_host_id" {
+  description = "The host's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it."
+  type        = string
+  default     = "usw2-2"
+}
+
+variable "cloud_ids_runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.cloud_ids_runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
+  }
+}
+
+variable "boot_disk_image" {
+  default     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  description = "Regional creation-time image default; existing boot disks remain unchanged."
+  type        = string
+  nullable    = false
+}
+
+variable "host_image_overrides" {
+  description = "Creation-time image overrides keyed by configured host module name."
+  type        = map(string)
+  default     = {}
+}
+
+variable "provisioning_hosts" {
+  description = "Host module names held outside scheduling and runtime deployment during maintenance. Remove only after readiness and explicit admission."
+  type        = set(string)
+  default     = []
+}
+
+variable "compute_restrictions_secret_name" {
+  description = "Existing operator-managed compute restriction secret ID, supplied through deployment configuration."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]+$", var.compute_restrictions_secret_name))
+    error_message = "Set compute_restrictions_secret_name to an existing Secret Manager secret ID."
+  }
+}
+
+variable "alert_runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.alert_runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
+  }
 }

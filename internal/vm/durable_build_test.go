@@ -59,6 +59,9 @@ func TestLoadDurableBuild(t *testing.T) {
 		if got.Result == nil || got.Result.ResolvedDigest != "sha256:abc" {
 			t.Error("result must be populated from build.meta.json")
 		}
+		if got.Result.RootfsAllocatedBytes == 0 || got.Result.BaseAllocatedBytes == 0 || got.Result.DeltaAllocatedBytes == 0 {
+			t.Fatalf("allocated bytes must be recomputed for adopted builds: %+v", got.Result)
+		}
 	})
 
 	t.Run("missing referenced artifact is not adopted", func(t *testing.T) {

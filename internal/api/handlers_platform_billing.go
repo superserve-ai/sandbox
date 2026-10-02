@@ -244,6 +244,16 @@ rates AS (
 			  AND unit = 'second'
 			  AND resource IN ('vcpu', 'memory_gib', 'storage_gib')
 		) AS rate_count,
+		count(*) FILTER (
+			WHERE rate_rank = 1
+			  AND unit = 'second'
+			  AND resource IN ('vcpu', 'memory_gib')
+		) AS required_rate_count,
+		count(*) FILTER (
+			WHERE rate_rank = 1
+			  AND unit = 'second'
+			  AND resource = 'storage_gib'
+		) AS storage_rate_count,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'vcpu') AS vcpu_rate,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'memory_gib') AS memory_rate,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'storage_gib') AS storage_rate
@@ -274,21 +284,10 @@ compute_usage AS (
 	GROUP BY sp.team_id
 ),
 storage_usage AS (
-	SELECT
-		sp.team_id,
-		COALESCE(SUM(
-			EXTRACT(EPOCH FROM (
-				LEAST(COALESCE(i.ended_at, sp.calculated_at), sp.period_end)
-				- GREATEST(i.started_at, sp.period_start)
-			)) * i.disk_mib
-		), 0)::numeric AS storage_mib_seconds
-	FROM selected_plans sp
-	LEFT JOIN sandbox_storage_interval i
-	  ON i.team_id = sp.team_id
-	 AND sp.period_start < LEAST(sp.calculated_at, sp.period_end)
-	 AND i.started_at < LEAST(sp.calculated_at, sp.period_end)
-	 AND COALESCE(i.ended_at, LEAST(sp.calculated_at, sp.period_end)) > sp.period_start
-	GROUP BY sp.team_id
+ SELECT sp.team_id,
+        storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds,
+        billable_storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS billable_storage_mib_seconds
+ FROM selected_plans sp
 ),
 credits AS (
 	SELECT
@@ -325,16 +324,26 @@ costed AS (
 		sp.*,
 		r.plan_name,
 		r.currency,
+		su.storage_mib_seconds,
+		su.billable_storage_mib_seconds,
 		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
-		((su.storage_mib_seconds / 1024.0) * r.storage_rate) AS storage_usd,
 		CASE
-			WHEN COALESCE(r.rate_count, 0) <> 3
+			WHEN storage_billing_activated(sp.team_id)
+			THEN ((billable_storage_mib_seconds(sp.team_id, sp.period_start, LEAST(sp.calculated_at, sp.period_end)) / 1024.0) * r.storage_rate)
+			ELSE 0
+		END AS storage_usd,
+		CASE
+			WHEN COALESCE(r.required_rate_count, 0) <> 2
 			  OR r.vcpu_rate IS NULL
 			  OR r.memory_rate IS NULL
-			  OR r.storage_rate IS NULL
+			  OR (storage_billing_activated(sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
+			  OR (storage_billing_activated(sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
+			WHEN su.storage_mib_seconds IS NULL
+			  OR (storage_billing_activated(sp.team_id) AND su.billable_storage_mib_seconds IS NULL)
+			THEN 'storage_unavailable'
 		END AS error_code
 	FROM selected_plans sp
 	LEFT JOIN rates r ON r.team_id = sp.team_id
@@ -388,6 +397,7 @@ response_rows AS (
 				'credits_applied_usd', credits_applied_usd,
 				'credits_remaining_usd', credits_remaining_usd,
 				'expected_invoice_amount_usd', expected_invoice_amount_usd,
+				'storage_mib_seconds', storage_mib_seconds,
 				'cost_breakdown_usd', jsonb_build_object(
 					'compute', compute_usd,
 					'memory', memory_usd,
@@ -403,7 +413,9 @@ response_rows AS (
 			) END,
 			'error', CASE WHEN error_code IS NOT NULL THEN jsonb_build_object(
 				'code', error_code,
-				'message', 'Billing pricing is not available for this team'
+				'message', CASE WHEN error_code = 'storage_unavailable'
+					THEN 'Storage usage is temporarily unavailable'
+					ELSE 'Billing pricing is not available for this team' END
 			) END
 		) AS value
 	FROM paged
@@ -499,6 +511,16 @@ rates AS (
 			  AND unit = 'second'
 			  AND resource IN ('vcpu', 'memory_gib', 'storage_gib')
 		) AS rate_count,
+		count(*) FILTER (
+			WHERE rate_rank = 1
+			  AND unit = 'second'
+			  AND resource IN ('vcpu', 'memory_gib')
+		) AS required_rate_count,
+		count(*) FILTER (
+			WHERE rate_rank = 1
+			  AND unit = 'second'
+			  AND resource = 'storage_gib'
+		) AS storage_rate_count,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'vcpu') AS vcpu_rate,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'memory_gib') AS memory_rate,
 		max(price_usd) FILTER (WHERE rate_rank = 1 AND unit = 'second' AND resource = 'storage_gib') AS storage_rate
@@ -529,21 +551,10 @@ compute_usage AS (
 	GROUP BY sp.team_id
 ),
 storage_usage AS (
-	SELECT
-		sp.team_id,
-		COALESCE(SUM(
-			EXTRACT(EPOCH FROM (
-				LEAST(COALESCE(i.ended_at, sp.calculated_at), sp.period_end)
-				- GREATEST(i.started_at, sp.period_start)
-			)) * i.disk_mib
-		), 0)::numeric AS storage_mib_seconds
-	FROM selected_plans sp
-	LEFT JOIN sandbox_storage_interval i
-	  ON i.team_id = sp.team_id
-	 AND sp.period_start < LEAST(sp.calculated_at, sp.period_end)
-	 AND i.started_at < LEAST(sp.calculated_at, sp.period_end)
-	 AND COALESCE(i.ended_at, LEAST(sp.calculated_at, sp.period_end)) > sp.period_start
-	GROUP BY sp.team_id
+ SELECT sp.team_id,
+        storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds,
+        billable_storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS billable_storage_mib_seconds
+ FROM selected_plans sp
 ),
 credits AS (
 	SELECT
@@ -580,16 +591,26 @@ costed AS (
 		sp.*,
 		r.plan_name,
 		r.currency,
+		su.storage_mib_seconds,
+		su.billable_storage_mib_seconds,
 		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
-		((su.storage_mib_seconds / 1024.0) * r.storage_rate) AS storage_usd,
 		CASE
-			WHEN COALESCE(r.rate_count, 0) <> 3
+			WHEN storage_billing_activated(sp.team_id)
+			THEN ((billable_storage_mib_seconds(sp.team_id, sp.period_start, LEAST(sp.calculated_at, sp.period_end)) / 1024.0) * r.storage_rate)
+			ELSE 0
+		END AS storage_usd,
+		CASE
+			WHEN COALESCE(r.required_rate_count, 0) <> 2
 			  OR r.vcpu_rate IS NULL
 			  OR r.memory_rate IS NULL
-			  OR r.storage_rate IS NULL
+			  OR (storage_billing_activated(sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
+			  OR (storage_billing_activated(sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
+			WHEN su.storage_mib_seconds IS NULL
+			  OR (storage_billing_activated(sp.team_id) AND su.billable_storage_mib_seconds IS NULL)
+			THEN 'storage_unavailable'
 		END AS error_code
 	FROM selected_plans sp
 	LEFT JOIN rates r ON r.team_id = sp.team_id
@@ -636,6 +657,7 @@ response_rows AS (
 				'credits_applied_usd', credits_applied_usd,
 				'credits_remaining_usd', credits_remaining_usd,
 				'expected_invoice_amount_usd', expected_invoice_amount_usd,
+				'storage_mib_seconds', storage_mib_seconds,
 				'cost_breakdown_usd', jsonb_build_object(
 					'compute', compute_usd,
 					'memory', memory_usd,
@@ -651,7 +673,9 @@ response_rows AS (
 			) END,
 			'error', CASE WHEN error_code IS NOT NULL THEN jsonb_build_object(
 				'code', error_code,
-				'message', 'Billing pricing is not available for this team'
+				'message', CASE WHEN error_code = 'storage_unavailable'
+					THEN 'Storage usage is temporarily unavailable'
+					ELSE 'Billing pricing is not available for this team' END
 			) END
 		) AS value
 	FROM paged

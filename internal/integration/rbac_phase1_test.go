@@ -60,11 +60,13 @@ func TestRbacSeedData(t *testing.T) {
 		"settings:read",
 		"settings:write",
 		"audit_logs:read",
+		"platform:billing:read",
 		"platform:teams:read",
 		"platform:team_users:write",
 		"platform:team_roles:write",
-		"platform:billing:read",
 		"platform:billing:write",
+		"platform:abuse:read",
+		"platform:abuse:write",
 	}
 	var gotPerms []string
 	rows, err = testPool.Query(ctx, `SELECT name FROM permissions ORDER BY name`)
@@ -95,11 +97,13 @@ func TestRbacSeedData(t *testing.T) {
 
 	expectedMappings := map[string][]string{
 		"platform_admin": {
+			"platform:billing:read",
 			"platform:teams:read",
 			"platform:team_users:write",
 			"platform:team_roles:write",
-			"platform:billing:read",
 			"platform:billing:write",
+			"platform:abuse:read",
+			"platform:abuse:write",
 			"billing:read",
 			"billing:write",
 			"users:read",
@@ -607,6 +611,7 @@ func mustCreateTeam(t *testing.T, ctx context.Context, name string) uuid.UUID {
 	if err != nil {
 		t.Fatalf("create team %s: %v", name, err)
 	}
+	seedHistoricalTeam(t, team.ID)
 	return team.ID
 }
 

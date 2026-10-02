@@ -17,6 +17,20 @@ receivers:
           scrape_interval: 30s
           static_configs:
             - targets: ["127.0.0.1:8888"]
+  # Root-filesystem telemetry for the OS disk. Scoped to the root
+  # mountpoint only: the sandbox data arrays are separate, far larger
+  # filesystems with their own reclaim logic, and folding them in would
+  # make utilization mean the wrong disk.
+  hostmetrics:
+    collection_interval: 60s
+    scrapers:
+      filesystem:
+        include_mount_points:
+          mount_points: ["/"]
+          match_type: strict
+        metrics:
+          system.filesystem.utilization:
+            enabled: true
 
 processors:
   memory_limiter:
@@ -49,6 +63,21 @@ processors:
         action: delete
       - key: error
         action: delete
+  # Stable deployment identity for alert selection. Keep the sender's host_id
+  # intact: it identifies the registered host incarnation's full database ID.
+  attributes/collector_host_id:
+    actions:
+      - key: collector_host_id
+        value: ${env:COLLECTOR_HOST_ID}
+        action: upsert
+  # Host-level series carry the same bounded host_id label the vmd backup
+  # metrics use, so alert policies scope one cell's host the same way for
+  # both. HOST_ID is the installed identity, or the instance name on legacy hosts.
+  attributes/host_id:
+    actions:
+      - key: host_id
+        value: ${env:HOST_ID}
+        action: upsert
   batch:
     send_batch_size: 256
     timeout: 5s
@@ -76,5 +105,11 @@ service:
   pipelines:
     metrics:
       receivers: [otlp, prometheus/self]
-      processors: [memory_limiter, resourcedetection/gcp, resource/gmp_location, attributes/drop_internal_high_cardinality, batch]
+      processors: [memory_limiter, resourcedetection/gcp, resource/gmp_location, attributes/drop_internal_high_cardinality, attributes/collector_host_id, batch]
+      exporters: [googlemanagedprometheus]
+    # Separate pipeline so host_id is only stamped onto host-level series;
+    # OTLP senders (control plane, vmd) already set their own host_id.
+    metrics/host:
+      receivers: [hostmetrics]
+      processors: [memory_limiter, resourcedetection/gcp, resource/gmp_location, attributes/host_id, attributes/collector_host_id, batch]
       exporters: [googlemanagedprometheus]

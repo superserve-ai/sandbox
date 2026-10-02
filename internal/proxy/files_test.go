@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -77,7 +78,7 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 		domain:    "sandbox.test",
 	}
 
-	env.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		env.upstreamMu.Lock()
 		env.lastReq = capturedRequest{
@@ -95,7 +96,15 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
+	})
+	// Keep the harness usable in sandboxes where IPv6 loopback binds are
+	// restricted; production behavior is unaffected.
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable: %v", err)
+	}
+	env.upstream = &httptest.Server{Listener: ln, Config: &http.Server{Handler: h}}
+	env.upstream.Start()
 	t.Cleanup(env.upstream.Close)
 
 	upURL, _ := url.Parse(env.upstream.URL)
@@ -252,14 +261,32 @@ func TestFiles_TokenReusable(t *testing.T) {
 }
 
 func TestFiles_SandboxNotRunningReturns503(t *testing.T) {
-	env := newFilesTestEnv(t)
-	env.resolver.info.Status = "paused"
-	tok := env.validToken()
-	req := env.buildRequest(http.MethodGet, "/f.txt", tok, nil)
-	w := httptest.NewRecorder()
-	env.handler.ServeHTTP(w, req)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", w.Code)
+	for _, state := range []string{"paused", "stopped"} {
+		t.Run(state, func(t *testing.T) {
+			env := newFilesTestEnv(t)
+			env.resolver.info.Status = state
+			req := env.buildRequest(http.MethodGet, "/f.txt", env.validToken(), nil)
+			w := httptest.NewRecorder()
+			env.handler.ServeHTTP(w, req)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", w.Code)
+			}
+			if got := w.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("content type = %q, want application/json", got)
+			}
+			var body struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Error.Code != "sandbox_unavailable" || body.Error.Message != "sandbox is "+state {
+				t.Fatalf("unexpected unavailable error: %s", w.Body)
+			}
+		})
 	}
 }
 

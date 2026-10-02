@@ -6,6 +6,11 @@ on:
     paths:
       - "infra/**"
       - "scripts/terraform-*.sh"
+      - "scripts/provision-host.py"
+      - "deploy/host-provisioning-hold.sh"
+      - "deploy/release-host-provisioning.sh"
+      - ".github/workflows/host-provision.yml"
+      - ".github/workflows/scripts/test_terraform_boot_image.py"
       - "scripts/sanitize-terraform-plan.sh"
       - ".github/workflows/terraform-*.yml"
 
@@ -13,7 +18,34 @@ concurrency:
   group: terraform-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
+
 jobs:
+  terraform-code-validation:
+    name: Terraform code validation (no cloud credentials)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          # Terraform 1.14+ supports test cleanup for prevent_destroy resources.
+          terraform_version: '1.14.9'
+          terraform_wrapper: false
+      - name: Validate regional configurations without backends
+        run: bash scripts/terraform-validate.sh
+      - name: Test host modules with mocked providers
+        run: |
+          set -euo pipefail
+          for module in sandbox-host managed-identity-host; do
+            terraform -chdir="infra/modules/$module" init -backend=false -input=false
+            terraform -chdir="infra/modules/$module" test
+          done
+      - name: Check image input wiring
+        run: python3 -m unittest discover -s .github/workflows/scripts -p 'test_terraform_boot_image.py'
+
   terraform-plan:
     name: terraform-plan (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -43,6 +75,8 @@ jobs:
       # Existing Monitoring channel resource names are non-secret references;
       # the channel's Slack credential remains owned by Cloud Monitoring.
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -68,6 +102,15 @@ jobs:
             echo
             echo "Skipped because GCP auth secrets are not configured."
           } > "$summary_file"
+
+      - name: Set PR runbook base URL
+        if: env.HAS_GCP_AUTH == 'true'
+        shell: bash
+        run: |
+          # PR plans are never applied; allow them before private destinations exist.
+          if [[ -z "${TF_VAR_alert_runbook_base_url:-}" ]]; then
+            echo 'TF_VAR_alert_runbook_base_url=https://example.com/runbooks' >> "$GITHUB_ENV"
+          fi
 
       - name: Validate and plan
         if: env.HAS_GCP_AUTH == 'true'
@@ -118,7 +161,7 @@ jobs:
           terraform validate
 
           set +e
-          terraform plan -input=false -no-color -detailed-exitcode -out=tfplan
+          terraform plan -input=false -lock-timeout=5m -no-color -detailed-exitcode -out=tfplan
           plan_status=$?
           set -e
 
@@ -146,6 +189,11 @@ jobs:
             echo "See the job logs for details."
           } > "$summary_file"
           exit "$plan_status"
+
+      - name: Verify west VMD and OTLP ingress
+        if: env.HAS_GCP_AUTH == 'true' && matrix.name == 'production-us-west2'
+        shell: bash
+        run: bash "${GITHUB_WORKSPACE}/scripts/terraform-plan-west.sh"
 
       - name: Upload Terraform plan summary
         if: always()

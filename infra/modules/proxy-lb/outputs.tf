@@ -12,3 +12,8 @@ output "global_addresses" {
   description = "Global IP addresses keyed by logical name."
   value       = { for key, addr in google_compute_global_address.addresses : key => addr.address }
 }
+
+output "generation_backend_services" {
+  description = "Generation backend service self-links consumed by the owning frontend state."
+  value       = { for key, backend in google_compute_backend_service.generation : key => backend.self_link }
+}

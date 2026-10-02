@@ -267,7 +267,7 @@
             "dataSets": [
               {
                 "timeSeriesQuery": {
-                  "prometheusQuery": "sum by (result) (rate(sandbox_transition_total{environment=\"${environment}\",result=~\"conflict|error|timeout\"}[5m]))"
+                  "prometheusQuery": "sum by (result) (rate(sandbox_transition_total{environment=\"${environment}\",result=~\"conflict|error|timeout|client_error\"}[5m]))"
                 },
                 "plotType": "LINE",
                 "targetAxis": "Y1"

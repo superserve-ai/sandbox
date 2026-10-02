@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	kms "cloud.google.com/go/kms/apiv1"
+	"cloud.google.com/go/storage"
 	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -24,8 +27,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/abuse"
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
@@ -136,6 +141,22 @@ func run() error {
 			poolCfg.MaxConns = int32(n)
 		}
 	}
+	// Lifetime + jitter bound how long any one connection can persist and
+	// stagger recycling so a pool's worth of connections never expires (and
+	// redials) in the same instant. ConnectTimeout bounds the dial itself, so
+	// re-establishment after churn fails fast instead of stacking behind a
+	// slow pooler. All of these act on idle or released connections only: a
+	// connection a caller holds and never releases is out of the pool's
+	// reach, which is what the saturation log below exists to surface.
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnLifetimeJitter = 5 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 30 * time.Second
+	// Clamped to the cap: a DB_MAX_CONNS below 2 is a valid override, and
+	// pgxpool rejects (rather than clamps) a minimum above the maximum,
+	// which would fail startup instead of running with a smaller pool.
+	poolCfg.MinIdleConns = min(2, poolCfg.MaxConns)
+	poolCfg.ConnConfig.ConnectTimeout = 5 * time.Second
 	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
@@ -145,9 +166,17 @@ func run() error {
 		return fmt.Errorf("ping database: %w", err)
 	}
 	log.Info().Msg("connected to database")
+	// Deliberately outside the OTel gate: sustained pool saturation must
+	// surface through plain logs even in cells where metrics export is
+	// disabled or the pipeline is down.
+	telemetry.StartDBPoolSaturationLog(ctx, dbPool, log.Logger, 15*time.Second)
 	if cfg.OTelMetricsEnabled {
 		telemetry.StartDBPoolSampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
 		telemetry.StartHostCapacitySampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
+		// No-op when OTel init failed and recorder is the noop: the
+		// coverage sampler holds a cell-wide lease in exchange for
+		// exporting, and a replica that cannot export must not win it.
+		telemetry.StartBackupCoverageSampler(ctx, dbPool, recorder, cfg.OTelExportInterval)
 	}
 
 	reconcileSystemTeamQuota(ctx, dbPool, cfg.SystemTeamID)
@@ -169,7 +198,15 @@ func run() error {
 	queries := dbq.New(dbPool)
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
+	if apiKey, from := os.Getenv("RESEND_API_KEY"), os.Getenv("QUOTA_EMAIL_FROM"); apiKey != "" && from != "" {
+		handlers.TrialWarningSender = api.NewResendTrialCreditWarningSender(apiKey, from, queries)
+	}
 	handlers.Pool = dbPool
+	handlers.PromotionAuthPool = newPromotionAuthPool(ctx, os.Getenv("PROMOTION_AUTH_DATABASE_URL"))
+	if handlers.PromotionAuthPool != nil {
+		defer handlers.PromotionAuthPool.Close()
+	}
+	handlers.Stripe = api.NewStripeBillingClient(cfg)
 
 	// Product-usage analytics — no-op when POSTHOG_KEY is unset.
 	analyticsClient, err := analytics.New(os.Getenv("POSTHOG_KEY"), os.Getenv("POSTHOG_HOST"), log.Logger)
@@ -223,36 +260,143 @@ func run() error {
 		}
 		return telemetry.WrapVMDClient(newGRPCVMDClient(conn), recorder, api.SandboxIDRegion(), hostID), nil
 	}
-	handlers.Hosts = hostreg.New(queries, dialVMD)
+	hostRegistry := hostreg.New(queries, dialVMD)
+	hostRegistry.Observe = func(kind string, d time.Duration, err error) {
+		result := telemetry.ResultSuccess
+		if err != nil {
+			result = telemetry.ResultError
+		}
+		recorder.RecordHostResolution(context.Background(), telemetry.HostResolution{
+			Kind: kind, Result: result, Duration: d,
+		})
+	}
+	handlers.Hosts = hostRegistry
 	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 	handlers.Scheduler = sched
+
+	// Capacity ranking, measurement only. Placement stays exactly as it
+	// was: this observes a sample of creates and reports what ranking
+	// WOULD have chosen, so the scoring can be judged against real
+	// traffic before anything is allowed to depend on it. Enforcement
+	// needs a host-side admission gate that does not exist yet, so there
+	// is deliberately no flag here that makes ranking decide anything.
+	if cfg.SchedulerCapacityShadow {
+		ranker := &scheduler.CapacityRanker{DB: queries, Region: api.SandboxIDRegion()}
+		shadow := scheduler.NewShadowEvaluator(ranker, func(obs scheduler.ShadowObservation) {
+			recorder.RecordCapacityShadow(context.Background(), telemetry.CapacityShadow{
+				Result:         obs.Result,
+				Agreement:      obs.Agreement,
+				Profile:        obs.Profile,
+				Described:      obs.Described,
+				UnderDescribed: obs.UnderDescribed,
+				Legacy:         obs.Legacy,
+				Stale:          obs.Stale,
+				Duration:       obs.Duration,
+				Refresh:        obs.Refresh,
+			})
+		})
+		handlers.Shadow = shadow
+		go shadow.Run(ctx)
+		log.Info().Msg("capacity ranking shadow evaluation enabled (measurement only; placement unchanged)")
+	}
+
+	computeSource := abuse.NewConfigComputeSource(cfg.ComputeRestrictionsFile, abuse.LoadComputeOwners(dbPool), func(ctx context.Context, result string) {
+		if rec, ok := recorder.(telemetry.ComputeRecorder); ok {
+			rec.RecordComputeRefresh(ctx, result)
+		}
+	})
+	computeSource.Refresh(ctx)
+	handlers.ComputeRestrictions = &abuse.ComputeEvaluator{Source: computeSource}
+	handlers.SignupRestrictions = &abuse.SignupEvaluator{Source: computeSource}
+	go handlers.RunComputeReconciliation(ctx, computeSource)
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
-	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+	reaperCfg := api.DefaultReaperConfig()
+	// Both bound how much the reaper pauses per tick; the defaults suit
+	// steady-state expirations, and an operator raises them for a planned
+	// wave (a whole host's worth of sandboxes brought back to paused). The
+	// ceilings keep one tick from turning into a fleet-sized query; a value
+	// outside them is ignored, not clamped, so a typo changes nothing.
+	if v := os.Getenv("REAPER_BATCH_SIZE"); v != "" {
+		if n, perr := strconv.ParseInt(v, 10, 32); perr == nil && n > 0 && n <= 2000 {
+			reaperCfg.BatchSize = int32(n)
+		} else {
+			log.Warn().Str("value", v).Msg("REAPER_BATCH_SIZE ignored; want 1..2000")
+		}
+	}
+	if v := os.Getenv("REAPER_PARALLELISM"); v != "" {
+		if n, perr := strconv.ParseInt(v, 10, 32); perr == nil && n > 0 && n <= 200 {
+			reaperCfg.Parallelism = int(n)
+		} else {
+			log.Warn().Str("value", v).Msg("REAPER_PARALLELISM ignored; want 1..200")
+		}
+	}
+	handlers.StartTimeoutReaper(ctx, reaperCfg)
+	handlers.StartPauseReconciler(ctx)
+	handlers.StartSnapshotSweeper(ctx)
+	// How long a delete spends reclaiming the host side before it answers;
+	// the sweeper finishes anything that did not fit. Bounded so a value
+	// cannot turn deletes into long waits.
+	if v := os.Getenv("TEARDOWN_INLINE_BUDGET"); v != "" {
+		if d, perr := time.ParseDuration(v); perr == nil && d >= time.Second && d <= 30*time.Second {
+			handlers.TeardownInlineBudget = d
+		} else {
+			log.Warn().Str("value", v).Msg("TEARDOWN_INLINE_BUDGET ignored; want 1s..30s")
+		}
+	}
+	handlers.StartTeardownSweeper(ctx)
+	handlers.StartLogRetention(ctx)
+	retentionConfig := dbPool.Config()
+	retentionConfig.MaxConns = 1
+	retentionConfig.MinConns = 0
+	retentionConfig.MinIdleConns = 0
+	retentionConfig.ConnConfig.RuntimeParams["statement_timeout"] = "1000"
+	retentionPool, err := pgxpool.NewWithConfig(ctx, retentionConfig)
+	if err != nil {
+		return fmt.Errorf("routing retention pool: %w", err)
+	}
+	defer retentionPool.Close()
+	api.StartRoutingRevocationRetention(ctx, dbq.New(retentionPool))
+	if cfg.BackupGCServiceAccount != "" {
+		admin, err := backup.NewGCSAdmin(ctx, cfg.TemplateBackupBucket, cfg.BackupGCServiceAccount)
+		if err != nil {
+			return fmt.Errorf("backup gc: %w", err)
+		}
+		handlers.BackupGC = admin
+		handlers.StartBackupGC(ctx)
+	}
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling
 	// vmd's BuildTemplate / GetBuildStatus / CancelBuild RPCs.
 	buildResolver := func(rctx context.Context, hostID string) (vmdclient.Client, error) {
-		if hostID == "" || handlers.Hosts == nil {
-			return vmdClient, nil
+		if hostID == "" {
+			return nil, supervisor.ErrBuildHostGone
 		}
 		c, err := handlers.Hosts.ClientFor(rctx, hostID)
-		if err != nil {
-			log.Warn().Err(err).Str("host_id", hostID).Msg("supervisor: host lookup failed, using default client")
-			return vmdClient, nil
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, supervisor.ErrBuildHostGone
 		}
-		return c, nil
+		return c, err
 	}
-	supervisor.NewBuildSupervisor(
-		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
-		queries,
-		buildResolver,
-	).WithAnalytics(analyticsClient).WithFinalizeHook(api.InvalidateTemplateCache).Start(ctx)
+	buildCfg := supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID)
+	buildCfg.Cell = cfg.TemplateBuildRegion
+	buildCfg.PublicationBucket = cfg.TemplateBackupBucket
+	buildSupervisor := supervisor.NewBuildSupervisor(buildCfg, queries, buildResolver).
+		WithAnalytics(analyticsClient).WithFinalizeHook(api.InvalidateTemplateCache)
+	if cfg.TemplateBackupBucket != "" {
+		storageClient, err := storage.NewClient(ctx)
+		if err != nil {
+			return fmt.Errorf("initialize template publication reader: %w", err)
+		}
+		defer storageClient.Close()
+		buildSupervisor.WithPublicationStore(backup.NewGCSReader(storageClient, cfg.TemplateBackupBucket))
+	}
+	buildSupervisor.Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
@@ -261,6 +405,7 @@ func run() error {
 	// host unhealthy, so this instance stops routing to it at detection time
 	// rather than at cache expiry.
 	go api.StartHostDetector(ctx, queries, sched.Invalidate)
+	api.StartStorageReportWorker(ctx, dbPool)
 
 	// Billing dashboard rollups are provisional and recomputable from raw
 	// interval rows. Team-level feature flags decide which tenants roll up.
@@ -269,7 +414,13 @@ func run() error {
 	} else {
 		billing.StartHourlyRollupService(ctx, dbPool, queries, billing.DefaultHourlyRollupConfig())
 	}
-	billing.StartBillingFinalizationService(ctx, dbPool, billing.DefaultBillingFinalizationConfig())
+	billingFinalizationConfig := billing.DefaultBillingFinalizationConfig()
+	billingFinalizationConfig.ResolveActiveMeter = handlers.ResolveActiveBillingMeter
+	billing.StartBillingFinalizationService(ctx, dbPool, billingFinalizationConfig)
+	handlers.StartIncrementalBillingService(ctx)
+	handlers.StartInvoiceEnrollmentService(ctx)
+	handlers.StartInvoiceReconciliationService(ctx)
+	handlers.StartStripeCheckoutAssociationMonitor(ctx)
 
 	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out
 	// to a Slack webhook and an email notifier; each channel is independently
@@ -334,6 +485,27 @@ func run() error {
 	return nil
 }
 
+func newPromotionAuthPool(ctx context.Context, authURL string) *pgxpool.Pool {
+	if authURL == "" {
+		return nil
+	}
+	authCfg, err := pgxpool.ParseConfig(authURL)
+	if err != nil {
+		// Parse errors can contain credentials from the connection string.
+		log.Warn().Msg("invalid PROMOTION_AUTH_DATABASE_URL; promotion authority unavailable")
+		return nil
+	}
+	authCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	authCfg.ConnConfig.ConnectTimeout = 5 * time.Second
+	authCfg.MaxConns = 4
+	authPool, err := pgxpool.NewWithConfig(ctx, authCfg)
+	if err != nil {
+		log.Warn().Msg("promotion auth database pool initialization failed; promotion authority unavailable")
+		return nil
+	}
+	return authPool
+}
+
 // reconcileSystemTeamQuota lifts the system team's max_sandboxes and
 // max_templates so the quota trigger and template-count check never block it.
 func reconcileSystemTeamQuota(ctx context.Context, pool *pgxpool.Pool, systemTeamID string) {
@@ -385,49 +557,119 @@ func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force 
 	return nil
 }
 
-func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir string) (string, string, []vmdclient.ManifestEntry, error) {
+func (c *grpcVMDClient) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID, kind string) (vmdclient.SavedSnapshot, error) {
+	resp, err := c.client.CreateSavedSnapshot(ctx, &vmdpb.CreateSavedSnapshotRequest{VmId: vmID, SnapshotId: snapshotID, Kind: kind})
+	if err != nil {
+		return vmdclient.SavedSnapshot{}, fmt.Errorf("gRPC CreateSavedSnapshot: %w", err)
+	}
+	return vmdclient.SavedSnapshot{
+		Kind:              resp.GetKind(),
+		BasePath:          resp.GetBasePath(),
+		DiskPath:          resp.GetDiskPath(),
+		SnapshotPath:      resp.GetSnapshotPath(),
+		MemPath:           resp.GetMemPath(),
+		BaseMemPath:       resp.GetBaseMemPath(),
+		VCPU:              resp.GetVcpuCount(),
+		MemoryMiB:         resp.GetMemoryMib(),
+		DiskSizeMiB:       resp.GetDiskSizeMib(),
+		SizeBytes:         resp.GetSizeBytes(),
+		FirecrackerSHA256: resp.GetFirecrackerSha256(),
+	}, nil
+}
+
+func (c *grpcVMDClient) DeleteSavedSnapshot(ctx context.Context, snapshotID string) error {
+	if _, err := c.client.DeleteSavedSnapshot(ctx, &vmdpb.DeleteSavedSnapshotRequest{SnapshotId: snapshotID}); err != nil {
+		return fmt.Errorf("gRPC DeleteSavedSnapshot: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
 	resp, err := c.client.PauseVM(ctx, &vmdpb.PauseVMRequest{
 		VmId:        vmID,
 		SnapshotDir: snapshotDir,
+		PauseToken:  pauseToken,
 	})
 	if err != nil {
-		return "", "", nil, fmt.Errorf("gRPC PauseVM: %w", err)
+		return "", "", nil, "", fmt.Errorf("gRPC PauseVM: %w", err)
 	}
 	manifest := make([]vmdclient.ManifestEntry, 0, len(resp.GetManifest()))
 	for _, e := range resp.GetManifest() {
 		manifest = append(manifest, vmdclient.ManifestEntry{
-			FileName:  e.GetFileName(),
-			Path:      e.GetPath(),
-			SizeBytes: e.GetSizeBytes(),
-			SHA256:    e.GetSha256(),
-			BasePath:  e.GetBasePath(),
+			FileName:       e.GetFileName(),
+			Path:           e.GetPath(),
+			SizeBytes:      e.GetSizeBytes(),
+			SHA256:         e.GetSha256(),
+			BasePath:       e.GetBasePath(),
+			AllocatedBytes: e.GetAllocatedBytes(),
 		})
 	}
-	return resp.SnapshotPath, resp.MemFilePath, manifest, nil
+	acked := ""
+	if resp.GetPauseToken() == pauseToken {
+		acked = pauseToken
+	}
+	return resp.SnapshotPath, resp.MemFilePath, manifest, acked, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string) (string, uint32, uint32, error) {
-	resp, err := c.client.ResumeVM(ctx, &vmdpb.ResumeVMRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
-	})
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, backupGeneration string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+	req := &vmdpb.ResumeVMRequest{
+		VmId:                  vmID,
+		SnapshotPath:          snapshotPath,
+		MemFilePath:           memPath,
+		PreviewAccess:         previewAccess,
+		PreviewPorts:          previewPortsToProto(previewPorts),
+		PreviewPolicyRevision: previewPolicyRevision,
+		BackupGeneration:      backupGeneration,
+	}
+	if len(networkConfig) > 0 {
+		var persisted struct {
+			Egress struct {
+				AllowedCIDRs   []string `json:"allowed_cidrs"`
+				DeniedCIDRs    []string `json:"denied_cidrs"`
+				AllowedDomains []string `json:"allowed_domains"`
+			} `json:"egress"`
+		}
+		if err := json.Unmarshal(networkConfig, &persisted); err != nil {
+			return "", 0, 0, vmdclient.ResumeAttestation{}, fmt.Errorf("parse persisted network_config: %w", err)
+		}
+		if len(persisted.Egress.AllowedCIDRs) != 0 || len(persisted.Egress.DeniedCIDRs) != 0 || len(persisted.Egress.AllowedDomains) != 0 {
+			req.SandboxNetwork = &vmdpb.SandboxNetworkConfig{
+				Egress: &vmdpb.SandboxNetworkEgressConfig{
+					AllowedCidrs:   persisted.Egress.AllowedCIDRs,
+					DeniedCidrs:    persisted.Egress.DeniedCIDRs,
+					AllowedDomains: persisted.Egress.AllowedDomains,
+				},
+			}
+		}
+	}
+	resp, err := c.client.ResumeVM(ctx, req)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
+		return "", 0, 0, vmdclient.ResumeAttestation{}, fmt.Errorf("gRPC ResumeVM: %w", err)
 	}
 	var actualVcpu, actualMemMiB uint32
 	if rl := resp.GetResourceLimits(); rl != nil {
 		actualVcpu = rl.GetVcpuCount()
 		actualMemMiB = rl.GetMemoryMib()
 	}
-	return resp.IpAddress, actualVcpu, actualMemMiB, nil
+	return resp.IpAddress, actualVcpu, actualMemMiB, vmdclient.ResumeAttestation{
+		PreviewProtocol:       resp.GetPreviewProtocol(),
+		PreviewPolicyRevision: resp.GetPreviewPolicyRevision(),
+		NetworkRulesApplied:   resp.GetNetworkRulesApplied(),
+		ColdBoot:              resp.GetColdBoot(),
+	}, nil
 }
 
 // RestoreSnapshot is the stateless restore path — VMD creates a fresh VM
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string) (string, uint32, uint32, string, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
+	var sandboxNetwork *vmdpb.SandboxNetworkConfig
+	if e := limits.Egress; e != nil {
+		sandboxNetwork = &vmdpb.SandboxNetworkConfig{Egress: &vmdpb.SandboxNetworkEgressConfig{
+			AllowedCidrs: e.AllowedCIDRs, DeniedCidrs: e.DeniedCIDRs, AllowedDomains: e.AllowedDomains,
+		}}
+	}
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -440,16 +682,39 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		PreviewPorts:          previewPortsToProto(previewPorts),
 		PreviewPolicyRevision: previewPolicyRevision,
 		EnvVars:               envVars,
+		// Declared so the daemon can size this VM without asking
+		// Firecracker after the fact: undeclared, every restore costs a
+		// socket probe and a goroutine on the host, and the VM is
+		// counted as unsized until that lands. Omitted (zero) only by
+		// callers that do not know the shape.
+		ResourceLimits:   restoreResourceLimits(limits),
+		SavedSnapshotId:  limits.SavedSnapshotID,
+		SandboxNetwork:   sandboxNetwork,
+		BackupGeneration: limits.BackupGeneration,
 	})
 	if err != nil {
-		return "", 0, 0, "", fmt.Errorf("gRPC RestoreSnapshot: %w", err)
+		return "", 0, 0, "", false, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
 	}
 	var vcpu, mem uint32
 	if rl := resp.GetResourceLimits(); rl != nil {
 		vcpu = rl.GetVcpuCount()
 		mem = rl.GetMemoryMib()
 	}
-	return resp.IpAddress, vcpu, mem, resp.GetPreviewProtocol(), nil
+	return resp.IpAddress, vcpu, mem, resp.GetPreviewProtocol(), resp.GetNetworkRulesApplied(), nil
+}
+
+// restoreResourceLimits maps a declared allocation onto the request
+// field, and stays nil when nothing was declared: an empty message would
+// be indistinguishable from "declared as zero" on the daemon side, where
+// zero is exactly the signal that means "recover this yourself".
+func restoreResourceLimits(limits vmdclient.ResourceLimits) *vmdpb.ResourceLimits {
+	if limits.VCPU == 0 || limits.MemoryMiB == 0 {
+		return nil
+	}
+	return &vmdpb.ResourceLimits{
+		VcpuCount: limits.VCPU,
+		MemoryMib: limits.MemoryMiB,
+	}
 }
 
 func previewPortsToProto(ports map[int32]vmdclient.PortPolicy) []*vmdpb.PreviewPort {
@@ -648,18 +913,22 @@ func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (v
 		return vmdclient.BuildStatusResult{}, fmt.Errorf("gRPC GetBuildStatus: %w", err)
 	}
 	return vmdclient.BuildStatusResult{
-		NotFound:       resp.GetNotFound(),
-		Status:         resp.GetStatus(),
-		SnapshotPath:   resp.GetSnapshotPath(),
-		MemFilePath:    resp.GetMemFilePath(),
-		RootfsPath:     resp.GetRootfsPath(),
-		BasePath:       resp.GetBasePath(),
-		DeltaPath:      resp.GetDeltaPath(),
-		ResolvedDigest: resp.GetResolvedDigest(),
-		SizeBytes:      resp.GetSizeBytes(),
-		ErrorMessage:   resp.GetErrorMessage(),
-		StartedAtUnix:  resp.GetStartedAtUnix(),
-		EndedAtUnix:    resp.GetEndedAtUnix(),
+		NotFound:                resp.GetNotFound(),
+		Status:                  resp.GetStatus(),
+		SnapshotPath:            resp.GetSnapshotPath(),
+		MemFilePath:             resp.GetMemFilePath(),
+		RootfsPath:              resp.GetRootfsPath(),
+		BasePath:                resp.GetBasePath(),
+		DeltaPath:               resp.GetDeltaPath(),
+		ResolvedDigest:          resp.GetResolvedDigest(),
+		SizeBytes:               resp.GetSizeBytes(),
+		RootfsAllocatedBytes:    resp.GetRootfsAllocatedBytes(),
+		BaseAllocatedBytes:      resp.GetBaseAllocatedBytes(),
+		DeltaAllocatedBytes:     resp.GetDeltaAllocatedBytes(),
+		AllocatedBytesSupported: resp.GetAllocatedBytesSupported(),
+		ErrorMessage:            resp.GetErrorMessage(),
+		StartedAtUnix:           resp.GetStartedAtUnix(),
+		EndedAtUnix:             resp.GetEndedAtUnix(),
 	}, nil
 }
 
@@ -713,6 +982,7 @@ func (c *grpcVMDClient) streamBuildLogsOnce(ctx context.Context, buildVMID strin
 		}
 		delivered = true
 		if cbErr := onEvent(vmdclient.BuildLogEvent{
+			Sequence:           pbEv.GetSequence(),
 			TimestampUnixNanos: pbEv.GetTimestampUnixNanos(),
 			Stream:             pbEv.GetStream(),
 			Text:               pbEv.GetText(),

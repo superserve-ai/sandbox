@@ -1,11 +1,31 @@
 name: Terraform CD
 
+# Serialize infra-inclusive API deployments with the staged identity rollout
+# and code-only Deploy API workflow through the full apply and verification
+# sequence.
+concurrency:
+  group: control-plane-deploy
+  queue: max
+  cancel-in-progress: false
+
 on:
   push:
     branches: [main]
     paths:
       - 'infra/**'
       - '.github/workflows/terraform-cd.yml'
+      # Production collectors require same-revision alert applies, even on
+      # collector-only pushes. Keep these paths aligned with that workflow.
+      - 'deploy/otel/**'
+      - 'deploy/superserve-otel-collector.service'
+      - '.github/workflows/deploy-otel-collector.yml'
+      - '.github/workflows/scripts/deploy-otel-collector.py'
+      - '.github/workflows/scripts/wait-for-otel-alerts.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
+      - '.github/workflows/scripts/wait_credentials_key_iam.py'
+
+env:
+  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
 
 jobs:
   wait-for-migrations:
@@ -18,6 +38,14 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Check rollout hold and same-SHA push CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          git checkout "$GITHUB_SHA" -- .github/workflows/scripts/wait-for-push-ci.py
+          python3 .github/workflows/scripts/wait-for-push-ci.py
+
       - name: Wait for same-SHA CD Migrate to succeed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -26,7 +54,7 @@ jobs:
           MIGRATIONS_CHANGED=unknown
           if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] &&
              git fetch --quiet --depth=1 origin "$BEFORE" 2>/dev/null; then
-            if git diff --name-only "$BEFORE" HEAD | grep -q '^supabase/migrations/'; then
+            if git diff --name-only "$BEFORE" HEAD | grep -Eq '^(supabase/(migrations|shared-auth-history)/|scripts/migrate_database[.]py$|[.]github/workflows/cd[.]yml$)'; then
               MIGRATIONS_CHANGED=yes
             else
               MIGRATIONS_CHANGED=no
@@ -85,12 +113,14 @@ jobs:
   staging-us-central1-infra:
     name: Apply staging/us-central1
     runs-on: ubuntu-latest
+    environment: staging
     needs: [wait-for-migrations]
     permissions:
       contents: read
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -111,6 +141,8 @@ jobs:
           command -v curl
 
       - name: Terraform apply staging/us-central1
+        env:
+          TF_VAR_proxy_generation_frontends_enabled: ${{ vars.PROXY_STAGING_FRONTEND_MIGRATED == 'true' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: staging/us-central1" >> "$GITHUB_STEP_SUMMARY"
@@ -118,6 +150,9 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell staging
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_proxy_frontend_steady_plan.py" staging
           terraform apply -input=false -auto-approve tfplan
 
   staging-us-central1-api:
@@ -130,7 +165,7 @@ jobs:
       id-token: write
     env:
       API_BASE_URL: https://api-staging.superserve.ai
-      API_KEY: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
+      API_KEY: ${{ secrets.SS_TEST_API_KEY_STAGING }}
       SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai
     steps:
       - uses: actions/checkout@v4
@@ -202,7 +237,7 @@ jobs:
           echo "staging/us-central1 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
 
   production-us-central1-bootstrap:
-    name: Bootstrap production/us-central1 project services
+    name: Bootstrap production/us-central1 project services and CD permissions
     runs-on: ubuntu-latest
     environment: production
     needs: [staging-us-central1-infra]
@@ -212,6 +247,7 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -225,13 +261,15 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
+      - uses: google-github-actions/setup-gcloud@v2
+
       - name: Verify validation dependencies
         run: |
           set -euo pipefail
           command -v jq
           command -v curl
 
-      - name: Apply production/us-central1 project services
+      - name: Apply production/us-central1 project services and CD permissions
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-central1 bootstrap" >> "$GITHUB_STEP_SUMMARY"
@@ -239,12 +277,38 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false \
+            -target=google_project_iam_member.cd_credentials_key_iam \
             -target=google_project_service.cloud_ids \
             -target=google_project_service.compute \
             -target=google_project_service.logging \
             -target=google_project_service.monitoring \
+            -target='module.iam.google_project_iam_member.project_bindings["cd_privateca_auditor"]' \
+            -target='module.iam.google_project_iam_member.project_bindings["cd_role_admin"]' \
             -out=tfplan
           terraform apply -input=false -auto-approve tfplan
+
+      - name: Wait for credentials key IAM propagation
+        run: python3 .github/workflows/scripts/wait_credentials_key_iam.py --project "${{ vars.GCP_PROJECT }}"
+
+      - name: Wait for custom role management permissions
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          set -euo pipefail
+          permissions='["iam.roles.create","iam.roles.get","iam.roles.update","iam.roles.delete"]'
+          for attempt in $(seq 1 30); do
+            token="$(gcloud auth print-access-token)"
+            if curl --fail --silent --show-error --max-time 15 \
+              -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+              --data "{\"permissions\":$permissions}" \
+              "https://cloudresourcemanager.googleapis.com/v1/projects/$GCP_PROJECT:testIamPermissions" |
+              jq -e --argjson expected "$permissions" '($expected - (.permissions // [])) | length == 0'; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'CI role-management permissions did not become available.' >&2
+          exit 1
 
   production-us-west2-infra:
     name: Apply production/us-west2
@@ -257,6 +321,8 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -269,6 +335,8 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
 
       - name: Verify validation dependencies
         run: |
@@ -283,8 +351,35 @@ jobs:
           cd infra/envs/production/us-west2
           terraform init -input=false
           terraform validate
+          gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
+            --region "${{ vars.GCP_REGION_USW }}" \
+            --project "${{ vars.GCP_PROJECT }}" \
+            --format=json > "$RUNNER_TEMP/production-usw2-before.json"
+          previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' \
+            "$RUNNER_TEMP/production-usw2-before.json")
+          test -n "$previous" || { echo "No 100% serving revision; refusing an identity-changing Terraform apply." >&2; exit 1; }
+          rollback() {
+            rc=$?
+            if [[ "$rc" -ne 0 ]]; then
+              gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
+                --to-revisions "${previous}=100" \
+                --region "${{ vars.GCP_REGION_USW }}" \
+                --project "${{ vars.GCP_PROJECT }}" || true
+            fi
+            exit "$rc"
+          }
+          trap rollback EXIT
+          # Pin before planning: a saved plan can otherwise restore LATEST
+          # during a template update, before the API job verifies access.
+          gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
+            --to-revisions "${previous}=100" \
+            --region "${{ vars.GCP_REGION_USW }}" \
+            --project "${{ vars.GCP_PROJECT }}"
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-usw2 --pinned-revision "$previous"
           terraform apply -input=false -auto-approve tfplan
+          trap - EXIT
 
   production-us-west2-api:
     name: Deploy API production/us-west2
@@ -330,10 +425,43 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
+          gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_USW }} \
+            --region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }} --format=json | \
+            python3 .github/workflows/scripts/check_controlplane_identity.py \
+              --project ${{ vars.GCP_PROJECT }} --cell usw2
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
+            --no-cpu-throttling \
+            --min-instances 10 \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USW }} \
-            --project ${{ vars.GCP_PROJECT }}
+            --project ${{ vars.GCP_PROJECT }} \
+            --no-traffic
+
+      - name: Verify KMS access before routing traffic
+        env:
+          RUNTIME_IDENTITY: superserve-controlplane-usw2@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
+        run: |
+          set -euo pipefail
+          bash scripts/verify-control-plane-kms.sh \
+            --project "${{ vars.GCP_PROJECT }}" \
+            --region "${{ vars.GCP_REGION_USW }}" \
+            --service "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
+            --runtime-service-account "$RUNTIME_IDENTITY" \
+            --kms-key-resource "projects/${{ vars.GCP_PROJECT }}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek" \
+            --evidence-dir "$RUNNER_TEMP/control-plane-kms/usw2" \
+            --secret operator-api-token-usw2 \
+            --secret database-url-usw2 \
+            --secret internal-api-token \
+            --secret sandbox-access-token-seed \
+            --secret secretsproxy-signing-key \
+            --secret "${TF_VAR_compute_restrictions_secret_name:?Set COMPUTE_RESTRICTIONS_SECRET_NAME}" \
+            --secret sentry-dsn \
+            --secret system-team-id-production \
+            --secret slack-quota-alert-webhook \
+            --secret posthog-project-key \
+            --secret stripe-secret-key-usw \
+            --secret stripe-webhook-secret-usw \
+            --secret stripe-meter-error-webhook-secret-usw
 
       - name: Route traffic to the new revision
         run: |
@@ -376,6 +504,7 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -427,6 +556,8 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -440,15 +571,47 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
+      - uses: google-github-actions/setup-gcloud@v2
+
       - name: Terraform apply production/us-east4
+        env:
+          TF_VAR_proxy_generation_frontends_enabled: ${{ vars.PROXY_PRODUCTION_FRONTEND_MIGRATED == 'true' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-east4" >> "$GITHUB_STEP_SUMMARY"
           cd infra/envs/production/us-east4
           terraform init -input=false
           terraform validate
+          gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
+            --region "${{ vars.GCP_REGION_USE4 }}" \
+            --project "${{ vars.GCP_PROJECT }}" \
+            --format=json > "$RUNNER_TEMP/production-use4-before.json"
+          previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' \
+            "$RUNNER_TEMP/production-use4-before.json")
+          test -n "$previous" || { echo "No 100% serving revision; refusing an identity-changing Terraform apply." >&2; exit 1; }
+          rollback() {
+            rc=$?
+            if [[ "$rc" -ne 0 ]]; then
+              gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
+                --to-revisions "${previous}=100" \
+                --region "${{ vars.GCP_REGION_USE4 }}" \
+                --project "${{ vars.GCP_PROJECT }}" || true
+            fi
+            exit "$rc"
+          }
+          trap rollback EXIT
+          # Pin before planning: a saved plan can otherwise restore LATEST
+          # during a template update, before the API job verifies access.
+          gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
+            --to-revisions "${previous}=100" \
+            --region "${{ vars.GCP_REGION_USE4 }}" \
+            --project "${{ vars.GCP_PROJECT }}"
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --guarded module.sandbox_host_c
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-use4 --pinned-revision "$previous"
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_proxy_frontend_steady_plan.py"
           terraform apply -input=false -auto-approve tfplan
+          trap - EXIT
 
   production-us-east4-api:
     name: Deploy API production/us-east4
@@ -494,10 +657,43 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
+          gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
+            --region ${{ vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }} --format=json | \
+            python3 .github/workflows/scripts/check_controlplane_identity.py \
+              --project ${{ vars.GCP_PROJECT }} --cell use4
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
+            --no-cpu-throttling \
+            --min-instances 10 \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USE4 }} \
-            --project ${{ vars.GCP_PROJECT }}
+            --project ${{ vars.GCP_PROJECT }} \
+            --no-traffic
+
+      - name: Verify KMS access before routing traffic
+        env:
+          RUNTIME_IDENTITY: superserve-controlplane-use4@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
+        run: |
+          set -euo pipefail
+          bash scripts/verify-control-plane-kms.sh \
+            --project "${{ vars.GCP_PROJECT }}" \
+            --region "${{ vars.GCP_REGION_USE4 }}" \
+            --service "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
+            --runtime-service-account "$RUNTIME_IDENTITY" \
+            --kms-key-resource "projects/${{ vars.GCP_PROJECT }}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek" \
+            --evidence-dir "$RUNNER_TEMP/control-plane-kms/use4" \
+            --secret operator-api-token-use4 \
+            --secret database-url \
+            --secret internal-api-token \
+            --secret sandbox-access-token-seed \
+            --secret secretsproxy-signing-key \
+            --secret "${TF_VAR_compute_restrictions_secret_name:?Set COMPUTE_RESTRICTIONS_SECRET_NAME}" \
+            --secret sentry-dsn \
+            --secret system-team-id-production \
+            --secret slack-quota-alert-webhook \
+            --secret posthog-project-key \
+            --secret stripe-secret-key-use \
+            --secret stripe-webhook-secret-use \
+            --secret stripe-meter-error-webhook-secret-use
 
       - name: Route traffic to the new revision
         run: |

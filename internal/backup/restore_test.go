@@ -66,6 +66,14 @@ func (m *memBlobs) NewReader(_ context.Context, object string) (io.ReadCloser, e
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
+func (m *memBlobs) Delete(_ context.Context, object string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.objects, object)
+	delete(m.created, object)
+	return nil
+}
+
 func (m *memBlobs) List(_ context.Context, prefix string) ([]ObjectInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -139,8 +147,13 @@ func genObject(task Task, name string) string {
 func uploadFixture(t *testing.T, store *memBlobs, task Task) {
 	t.Helper()
 	j, _ := testJournal(t)
+	// Progress writes are fenced on the row existing, as in production,
+	// where uploadTask only ever runs on enqueued rows.
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
 	u := &Uploader{Journal: j, Store: store}
-	completed, err := u.uploadTask(context.Background(), &task)
+	completed, _, _, err := u.uploadTask(context.Background(), &task)
 	if err != nil || !completed {
 		t.Fatalf("upload fixture: completed=%v err=%v", completed, err)
 	}
@@ -397,7 +410,7 @@ func TestRestoreRootPinsDirAcrossSwap(t *testing.T) {
 	if err := os.Symlink(elsewhere, destDir); err != nil {
 		t.Fatal(err)
 	}
-	madeFile, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[1], root)
+	madeFile, _, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[1], root)
 	if err != nil || !madeFile {
 		t.Fatalf("restoreFile after dir swap: made=%v err=%v", madeFile, err)
 	}
@@ -502,7 +515,7 @@ func TestRestoreFileNeverOpensExistingDest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	madeFile, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[0], root)
+	madeFile, _, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[0], root)
 	if err == nil || !errors.Is(err, os.ErrExist) {
 		t.Fatalf("err = %v, want ErrExist", err)
 	}
@@ -1104,9 +1117,12 @@ func TestRestoreValidatesStagedCopyFallbackGeneration(t *testing.T) {
 	}
 
 	j, _ := testJournal(t)
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
 	store := newMemStore()
 	u := &Uploader{Journal: j, Store: store}
-	if completed, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
+	if completed, _, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
 		t.Fatalf("upload: completed=%v err=%v", completed, err)
 	}
 

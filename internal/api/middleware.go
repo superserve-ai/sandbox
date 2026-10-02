@@ -18,6 +18,7 @@ import (
 )
 
 const consoleImpersonationKeyName = "__console_impersonation__"
+const stripeCheckoutAssociationPendingRequestKey = "stripe_checkout_association_pending"
 
 func isConsoleImpersonation(c *gin.Context) bool {
 	return c.GetString("api_key_name") == consoleImpersonationKeyName
@@ -60,6 +61,35 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 	}
 	return func(c *gin.Context) {
 		authStart := time.Now()
+		// Handlers base their phase-series totals on this so user-visible
+		// latency includes a slow auth cache miss (auth must never exceed
+		// its own request's total).
+		c.Set("auth_start", authStart)
+		// A request aborted before its handler (auth failure, or a
+		// downstream middleware like the team rate limit) never runs the
+		// handler defer that emits the op's phase series, so those slow
+		// exits would vanish from the distributions. Emit here unless a
+		// handler claimed ownership via PhaseStart.
+		defer func() {
+			if _, owned := c.Get(phaseSeriesOwnedKey); owned {
+				return
+			}
+			op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath())
+			if !ok {
+				return
+			}
+			phases := map[string]time.Duration{"total": time.Since(authStart)}
+			if v, ok := c.Get("auth_duration"); ok {
+				// Auth completed; the abort came later (e.g. rate limit).
+				if d, ok := v.(time.Duration); ok {
+					phases["auth"] = d
+				}
+			} else {
+				// Aborted inside auth itself.
+				phases["auth"] = time.Since(authStart)
+			}
+			RecordLatencyPhases(c.Request.Context(), op, "", phases)
+		}()
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
 			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
@@ -112,6 +142,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			}
 			setAPIKeyContext(c, entry)
 			c.Set("auth_ms", time.Since(authStart).Milliseconds())
+			c.Set("auth_duration", time.Since(authStart))
 			c.Next()
 			return
 		}
@@ -161,6 +192,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 
 		setAPIKeyContext(c, entry)
 		c.Set("auth_ms", time.Since(authStart).Milliseconds())
+		c.Set("auth_duration", time.Since(authStart))
 		c.Next()
 	}
 }
@@ -193,12 +225,12 @@ func RequestLogger() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 
-		if raw != "" {
+		if raw != "" && c.FullPath() != "/internal/teams" {
 			path = path + "?" + raw
 		}
 
 		evt := log.Info()
-		if status >= 500 {
+		if status >= 500 && !c.GetBool(stripeCheckoutAssociationPendingRequestKey) {
 			evt = log.Error()
 		} else if status >= 400 {
 			evt = log.Warn()

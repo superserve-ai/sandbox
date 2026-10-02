@@ -13,6 +13,14 @@
 
 name: Deploy API
 
+# Serialize all control-plane changes with the staged identity migration and
+# Terraform CD. A queued deployment must not route a revision while the
+# identity rollout is still applying and verifying its permissions.
+concurrency:
+  group: control-plane-deploy
+  queue: max
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -27,13 +35,27 @@ on:
   push:
     branches: [main]
     paths:
+      # Every internal package the control-plane binary imports must be listed,
+      # or a change to it merges without deploying — silently, since a push that
+      # matches no path is not a skipped job but no job at all. The
+      # deploy-trigger-coverage CI check enforces this against `go list -deps`.
       - 'cmd/controlplane/**'
+      - 'internal/abuse/**'
+      - 'internal/analytics/**'
       - 'internal/api/**'
+      - 'internal/auth/**'
+      - 'internal/authz/**'
+      - 'internal/backup/**'
+      - 'internal/billing/**'
+      - 'internal/builder/**'
       - 'internal/config/**'
       - 'internal/db/**'
       - 'internal/hostreg/**'
+      - 'internal/preview/**'
+      - 'internal/retainedstorage/**'
       - 'internal/scheduler/**'
       - 'internal/secrets/**'
+      - 'internal/sentrylog/**'
       - 'internal/supervisor/**'
       - 'internal/telemetry/**'
       - 'internal/vmdclient/**'
@@ -41,6 +63,14 @@ on:
       - 'go.mod'
       - 'go.sum'
       - 'Dockerfile'
+      # The workflow must self-trigger (as deploy-proxy and deploy-vmd do), or
+      # a deployment-command fix lands without ever running until an unrelated
+      # source change happens to redeploy.
+      - '.github/workflows/deploy-api.yml'
+      - '.github/workflows/scripts/check_controlplane_identity.py'
+
+env:
+  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
 
 jobs:
   detect-changes:
@@ -77,6 +107,14 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Check rollout hold and same-SHA push CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          git checkout "$GITHUB_SHA" -- .github/workflows/scripts/wait-for-push-ci.py
+          python3 .github/workflows/scripts/wait-for-push-ci.py
+
       - name: Wait for same-SHA CD Migrate to succeed
         env:
           GH_TOKEN: ${{ github.token }}
@@ -95,7 +133,7 @@ jobs:
           MIGRATIONS_CHANGED=unknown
           if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] &&
              git fetch --quiet --depth=1 origin "$BEFORE" 2>/dev/null; then
-            if git diff --name-only "$BEFORE" HEAD | grep -q '^supabase/migrations/'; then
+            if git diff --name-only "$BEFORE" HEAD | grep -Eq '^(supabase/(migrations|shared-auth-history)/|scripts/migrate_database[.]py$|[.]github/workflows/cd[.]yml$)'; then
               MIGRATIONS_CHANGED=yes
             else
               MIGRATIONS_CHANGED=no
@@ -279,10 +317,43 @@ jobs:
       # use4 has a public invoker binding, so /health is a meaningful probe.
       - name: Deploy use4 cell to Cloud Run
         run: |
+          gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
+            --region ${{ vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }} --format=json | \
+            python3 .github/workflows/scripts/check_controlplane_identity.py \
+              --project ${{ vars.GCP_PROJECT }} --cell use4
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
+            --no-cpu-throttling \
+            --min-instances 10 \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USE4 }} \
-            --project ${{ vars.GCP_PROJECT }}
+            --project ${{ vars.GCP_PROJECT }} \
+            --no-traffic
+
+      - name: Verify use4 KMS access before routing traffic
+        env:
+          RUNTIME_IDENTITY: superserve-controlplane-use4@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
+        run: |
+          set -euo pipefail
+          bash scripts/verify-control-plane-kms.sh \
+            --project "${{ vars.GCP_PROJECT }}" \
+            --region "${{ vars.GCP_REGION_USE4 }}" \
+            --service "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
+            --runtime-service-account "$RUNTIME_IDENTITY" \
+            --kms-key-resource "projects/${{ vars.GCP_PROJECT }}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek" \
+            --evidence-dir "$RUNNER_TEMP/control-plane-kms/use4" \
+            --secret operator-api-token-use4 \
+            --secret database-url \
+            --secret internal-api-token \
+            --secret sandbox-access-token-seed \
+            --secret secretsproxy-signing-key \
+            --secret "${TF_VAR_compute_restrictions_secret_name:?Set COMPUTE_RESTRICTIONS_SECRET_NAME}" \
+            --secret sentry-dsn \
+            --secret system-team-id-production \
+            --secret slack-quota-alert-webhook \
+            --secret posthog-project-key \
+            --secret stripe-secret-key-use \
+            --secret stripe-webhook-secret-use \
+            --secret stripe-meter-error-webhook-secret-use
 
       - name: Route use4 cell traffic to the new revision
         run: |
@@ -318,10 +389,44 @@ jobs:
       - name: Deploy usw cell to Cloud Run
         if: vars.CLOUD_RUN_SERVICE_USW != ''
         run: |
+          gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_USW }} \
+            --region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }} --format=json | \
+            python3 .github/workflows/scripts/check_controlplane_identity.py \
+              --project ${{ vars.GCP_PROJECT }} --cell usw2
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
+            --no-cpu-throttling \
+            --min-instances 10 \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USW }} \
-            --project ${{ vars.GCP_PROJECT }}
+            --project ${{ vars.GCP_PROJECT }} \
+            --no-traffic
+
+      - name: Verify usw KMS access before routing traffic
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        env:
+          RUNTIME_IDENTITY: superserve-controlplane-usw2@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
+        run: |
+          set -euo pipefail
+          bash scripts/verify-control-plane-kms.sh \
+            --project "${{ vars.GCP_PROJECT }}" \
+            --region "${{ vars.GCP_REGION_USW }}" \
+            --service "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
+            --runtime-service-account "$RUNTIME_IDENTITY" \
+            --kms-key-resource "projects/${{ vars.GCP_PROJECT }}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek" \
+            --evidence-dir "$RUNNER_TEMP/control-plane-kms/usw2" \
+            --secret operator-api-token-usw2 \
+            --secret database-url-usw2 \
+            --secret internal-api-token \
+            --secret sandbox-access-token-seed \
+            --secret secretsproxy-signing-key \
+            --secret "${TF_VAR_compute_restrictions_secret_name:?Set COMPUTE_RESTRICTIONS_SECRET_NAME}" \
+            --secret sentry-dsn \
+            --secret system-team-id-production \
+            --secret slack-quota-alert-webhook \
+            --secret posthog-project-key \
+            --secret stripe-secret-key-usw \
+            --secret stripe-webhook-secret-usw \
+            --secret stripe-meter-error-webhook-secret-usw
 
       - name: Route usw cell traffic to the new revision
         if: vars.CLOUD_RUN_SERVICE_USW != ''
