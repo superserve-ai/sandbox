@@ -375,8 +375,7 @@ def _identity_only_migration_target(before, after, unknown, old_id, new_id, path
     require(False, 'Unrelated east migration change: ' + str(path))
 
 
-def validate_host_logging_migration_update(change, vm_change, old_id, new_id,
-                                           migration_state_present=True):
+def validate_host_logging_migration_update(change, vm_change):
     resource = change.get('address', '').split('[', 1)[0].split('module.host_logging.', 1)[-1]
     actions = change['change']['actions']
     require(actions == ['update'],
@@ -392,17 +391,26 @@ def validate_host_logging_migration_update(change, vm_change, old_id, new_id,
         return
     require(resource == 'google_storage_bucket_object.legacy_migration_target',
             'Unexpected east migration resource: ' + resource)
-    # The target object is derived from the validated terraform_data input. A
-    # provider may mark the full JSON string unknown when only instance_ids is
-    # unknown; allow that one case while keeping the migration phase fixed.
-    if unknown.get('content') is True:
-        require(new_id is None, 'East migration target unexpectedly resolved')
-        require(migration_state_present,
-                'Unknown east migration content requires its Terraform state target')
-        prior = _migration_target(before.get('content'))
-        require(prior is not None and prior.get('phase') == 'preserve',
-                'Host replacement must keep east migration in preserve phase')
-        return
+    # An unknown JSON string hides all controls, even when a separate state
+    # target validates successfully. Dependency presence does not prove that
+    # the artifact uses the same expression or value.
+    require(unknown.get('content') is not True,
+            'Unresolved east migration target: identity-only change cannot be verified; '
+            'use a separately reviewed, evidence-gated logging rollout')
+    upload_metadata = {'generation', 'crc32c', 'md5hash'}
+
+    def has_unknown(value):
+        if isinstance(value, dict):
+            return any(has_unknown(child) for child in value.values())
+        if isinstance(value, list):
+            return any(has_unknown(child) for child in value)
+        return value is True
+
+    for key in before.keys() | after.keys() | unknown.keys():
+        if key == 'content' or key in upload_metadata and unknown.get(key) is True:
+            continue
+        require(not has_unknown(unknown.get(key)) and before.get(key) == after.get(key),
+                'Unrelated or unknown east migration artifact field: ' + key)
     left = _migration_target(before.get('content'))
     right = _migration_target(after.get('content'))
     require(left is not None and right is not None,
@@ -410,8 +418,7 @@ def validate_host_logging_migration_update(change, vm_change, old_id, new_id,
     _identity_only_migration_target(left, right, {}, old_id, new_id)
 
 
-def validate_host_logging_update(change, vm_change, config, host, region,
-                                 migration_state_present=True):
+def validate_host_logging_update(change, vm_change, config, host, region):
     """Allow only selected-host-bound logging dependencies in a VM plan.
 
     Host creation/replacement can change identity-derived values embedded in
@@ -439,9 +446,7 @@ def validate_host_logging_update(change, vm_change, config, host, region,
         'google_storage_bucket_object.legacy_migration_target',
         'terraform_data.legacy_migration',
     }:
-        validate_host_logging_migration_update(
-            change, vm_change, old_id=None, new_id=None,
-            migration_state_present=migration_state_present)
+        validate_host_logging_migration_update(change, vm_change)
         return
 
     actions = change['change']['actions']
@@ -526,9 +531,6 @@ def validate_plan(plan, host, image, operation, region, run_id=None):
                 disk_creation and disk_address+'.id' in disk_refs, 'Wrong attachment disk')
         require(value.get('device_name') == 'superserve-sandbox-data', 'Wrong data device')
         require(value.get('mode') == 'READ_WRITE', 'Wrong disk attachment mode')
-    migration_state_present = any(
-        addr.startswith('module.host_logging.terraform_data.legacy_migration')
-        for addr in changes)
     for addr, item in changes.items():
         actions = item['change']['actions']
         if actions in (['no-op'], ['read']) or addr == address or addr == disk_address and disk_creation:
@@ -560,8 +562,7 @@ def validate_plan(plan, host, image, operation, region, run_id=None):
                 validate_host_logging_alert_update(item, change, config, host, region)
                 continue
         if addr.startswith('module.host_logging.'):
-            validate_host_logging_update(item, change, config, host, region,
-                                         migration_state_present)
+            validate_host_logging_update(item, change, config, host, region)
             continue
         raise ValueError(f'Unrelated mutation in full plan: {addr}: {actions}')
     inline = after.get('attached_disk') or []

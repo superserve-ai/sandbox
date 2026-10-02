@@ -313,11 +313,12 @@ class ProvisionPlanTests(unittest.TestCase):
         plan['resource_changes'].extend([migration, artifact])
         return plan
 
-    def test_replacement_updates_only_preserved_east_migration_identity(self):
-        provision.validate_plan(self.migration_replacement_plan(), 'sandbox_host_c',
-                                'opaque-image', 'replace', 'us-east4')
+    def test_unresolved_east_migration_target_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, 'migration target.*cannot be verified'):
+            provision.validate_plan(self.migration_replacement_plan(), 'sandbox_host_c',
+                                    'opaque-image', 'replace', 'us-east4')
 
-    def test_east_migration_target_allows_known_selected_identity_substitution(self):
+    def known_migration_replacement_plan(self):
         plan = self.migration_replacement_plan()
         new = '789012'
         plan['resource_changes'][0]['change']['after']['instance_id'] = new
@@ -329,23 +330,77 @@ class ProvisionPlanTests(unittest.TestCase):
         before['instance_ids'] = [new]
         artifact['after'] = {'content': json.dumps(before, sort_keys=True)}
         artifact['after_unknown'] = {}
+        return plan
+
+    def test_east_migration_target_allows_known_selected_identity_substitution(self):
+        plan = self.known_migration_replacement_plan()
+        artifact = plan['resource_changes'][-1]['change']
+        artifact['before'].update(bucket='original-bucket', name='migration.json',
+                                  generation=1, crc32c='old-crc', md5hash='old-hash')
+        artifact['after'].update(bucket='original-bucket', name='migration.json')
+        artifact['after_unknown'].update(generation=True, crc32c=True, md5hash=True)
         provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
 
-    def test_east_migration_replacement_cannot_activate_or_change_controls(self):
-        for mutation in ('phase', 'baseline', 'create', 'missing_state'):
-            with self.subTest(mutation=mutation):
+    def test_terraform_replacement_hides_migration_artifact_changes(self):
+        cases = json.loads((ROOT / 'scripts/fixtures/host_logging_unknown_migration.json').read_text())['cases']
+        for name, case in cases.items():
+            with self.subTest(case=name):
+                if name != 'identity_only':
+                    self.assertNotEqual(case['known']['artifact']['before'], case['known']['artifact']['after'])
+                output = case['replacement']['artifact']
+                self.assertEqual(output, cases['identity_only']['replacement']['artifact'])
+                self.assertIs(output['after_unknown'], True)
                 plan = self.migration_replacement_plan()
+                migration = case['replacement']['migration']
+                self.assertEqual(migration['after']['input']['phase'], 'preserve')
+                plan['resource_changes'][-2]['change'] = migration
+                artifact = plan['resource_changes'][-1]['change']
+                artifact.update(before={'content': output['before']},
+                                after={'content': output.get('after')},
+                                after_unknown={'content': output['after_unknown']})
+                with self.assertRaisesRegex(ValueError, 'migration target.*cannot be verified'):
+                    provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_east_migration_artifact_fields_cannot_change(self):
+        for field in ('bucket', 'name', 'source', 'content_type', 'kms_key_name',
+                      'metadata', 'cache_control', 'detect_md5hash', 'temporary_hold',
+                      'storage_class'):
+            for unresolved in (False, True):
+                with self.subTest(field=field, unresolved=unresolved):
+                    plan = self.known_migration_replacement_plan()
+                    artifact = plan['resource_changes'][-1]['change']
+                    old, new = ('original', 'changed') if field != 'metadata' else ({'id': 'original'}, {'id': 'changed'})
+                    artifact['before'][field] = old
+                    artifact['after'][field] = None if unresolved else new
+                    if unresolved:
+                        artifact['after_unknown'][field] = True
+                    with self.assertRaisesRegex(ValueError, 'migration artifact field'):
+                        provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_known_migration_artifact_cannot_change_controls(self):
+        for field, value in [('phase', 'overlap'), ('baseline', 'logging: {}'),
+                             ('deadline', '2099-01-01T00:00:00Z')]:
+            with self.subTest(field=field):
+                plan = self.known_migration_replacement_plan()
+                artifact = plan['resource_changes'][-1]['change']
+                content = json.loads(artifact['after']['content'])
+                content[field] = value
+                artifact['after']['content'] = json.dumps(content)
+                with self.assertRaises(ValueError):
+                    provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_east_migration_replacement_cannot_activate_or_change_controls(self):
+        for mutation in ('phase', 'baseline', 'create'):
+            with self.subTest(mutation=mutation):
+                plan = self.known_migration_replacement_plan()
                 item = plan['resource_changes'][-2]
                 if mutation == 'phase':
                     item['change']['after']['input']['phase'] = 'overlap'
                 elif mutation == 'baseline':
                     item['change']['after']['input']['baseline'] = 'unreviewed'
                 else:
-                    if mutation == 'create':
-                        item['change']['actions'] = ['create']
-                        item['change']['before'] = None
-                    else:
-                        plan['resource_changes'].pop(-2)
+                    item['change']['actions'] = ['create']
+                    item['change']['before'] = None
                 with self.assertRaises(ValueError):
                     provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
 

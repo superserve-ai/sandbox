@@ -179,3 +179,12 @@ instance ID and a configuration reference do not prove the new query is safe.
 Do not bypass the guard: a separately reviewed logging rollout with the required
 staging evidence is needed. Automatic provisioning with unresolved logging alert
 identities requires additional proof of the unchanged query/filter template.
+
+The same rule applies to the east migration JSON artifact, including in
+`preserve` before logging alerts are active. An unresolved artifact is rejected:
+a separately validated migration input does not prove the file contains that
+input. Known content may substitute only the selected instance ID, and the
+bucket, object path, and other configurable fields must remain unchanged.
+East replacement plans with unresolved migration content therefore require a
+separately reviewed logging rollout with staging evidence; they cannot proceed
+through the identity-only provisioning exception.
