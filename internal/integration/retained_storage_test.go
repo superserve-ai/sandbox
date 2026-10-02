@@ -1066,7 +1066,7 @@ VALUES($1,$2,2,1024,$3,$4,'paused')`, computeSandbox, team, start, end)
 				if got := summary["storage_mib_seconds"].(float64); got != want {
 					t.Fatalf("platform MiB-seconds %v want %v", got, want)
 				}
-				if got := summary["cost_breakdown_usd"].(map[string]any)["storage"].(float64); math.Abs(got-cost) > 1e-12 {
+				if got := summary["current_charges_usd"].(float64); math.Abs(got-cost) > 1e-12 {
 					t.Fatalf("platform USD %v want %v", got, cost)
 				}
 			}
