@@ -75,3 +75,19 @@ run "first_install_identity_is_bound_to_target" {
     error_message = "First-install authorization must be included in the exact migration target."
   }
 }
+
+run "heartbeat_receipt_access_is_scoped" {
+  command = plan
+  assert {
+    condition     = length(google_logging_log_view.heartbeat_receipts) == 1 && length(google_logging_log_view_iam_member.heartbeat_reader) == 1
+    error_message = "Receipt access must use one view per migration, not per host."
+  }
+  assert {
+    condition     = google_logging_log_view.heartbeat_receipts[0].filter == "log_id(\"superserve_host_logs\") AND resource.type=\"gce_instance\" AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.environment=\"staging\" AND labels.region=\"us-central1\"" && google_logging_log_view_iam_member.heartbeat_reader["vmd@example-project.iam.gserviceaccount.com"].role == "roles/logging.viewAccessor"
+    error_message = "Runtime read access must be limited to trusted heartbeat records."
+  }
+  assert {
+    condition     = local.legacy_target.heartbeat_receipt_view == "projects/example-project/locations/global/buckets/_Default/views/example-host-logging-heartbeats"
+    error_message = "Host migration must query the exact managed view."
+  }
+}

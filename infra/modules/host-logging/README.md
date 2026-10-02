@@ -104,14 +104,25 @@ The migration phases are `preserve`, `verify`, `overlap`, `drain`, `retire`, and
 start guard stop OTel when the deadline expires. Drain requires measured cloud
 receipt and duplicate/gap counts. Retirement requires receipt and empty-buffer
 evidence for every enrolled instance plus a local overlap snapshot for that
-same instance, policy, and baseline. A bounded local check also requires a fresh
-successful export, an empty queue with no in-flight requests, no new export
-failures, and an unchanged collector process. Its metrics endpoint listens only
-on loopback. Retirement disables all Ops Agent logging pipelines
+same instance, policy, and baseline. A bounded check requires the exact newly
+injected heartbeat receipt, an empty queue with no in-flight requests, no new
+export failures, and an unchanged collector process. Its metrics endpoint
+listens only on loopback. Retirement disables all Ops Agent logging pipelines
 while preserving metrics configuration and receiver definitions. Applying the
 Ops Agent configuration briefly restarts that agent; the independent application
 metrics collector is not changed by migration. Rollback restores the exact
 audited baseline before stopping OTel, and retains the OTel cursor and queue.
+
+Retirement additionally restarts the managed heartbeat and obtains its trusted
+journal invocation ID, then requires that exact ID and current host incarnation
+in Cloud Logging before disabling legacy logging. Older queue completions cannot
+satisfy this check. Terraform creates one heartbeat-only view per migrating
+assignment in the project's global `_Default` bucket and grants runtime accounts
+read access on that view only. The bounded, one-minute query window is used only
+at retirement; inaccessible or delayed receipts preserve the legacy writer.
+Deployments routing these logs elsewhere must configure an equivalent restricted
+view and matching target before attempting retirement. View filters and grants
+are bound to the migration evidence digest.
 
 A replacement must go through `preserve` then `overlap` with fresh receipt and
 drain evidence before `retire`. If its user configuration is absent, explicitly

@@ -223,7 +223,7 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
     }
   }
 
-  depends_on = [google_storage_bucket_iam_member.artifact_reader]
+  depends_on = [google_storage_bucket_iam_member.artifact_reader, google_logging_log_view_iam_member.heartbeat_reader]
 }
 
 resource "google_project_iam_member" "log_writer" {

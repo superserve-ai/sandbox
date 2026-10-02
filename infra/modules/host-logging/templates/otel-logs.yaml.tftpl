@@ -50,6 +50,7 @@ processors:
           - set(cache["journal"]["_PID"], body["_PID"]) where IsString(body["_PID"]) and Len(body["_PID"]) <= 256
           - set(cache["journal"]["_BOOT_ID"], body["_BOOT_ID"]) where IsString(body["_BOOT_ID"]) and Len(body["_BOOT_ID"]) <= 256
           - set(cache["journal"]["UNIT"], body["UNIT"]) where IsString(body["UNIT"]) and Len(body["UNIT"]) <= 256
+          - set(cache["journal"]["_SYSTEMD_INVOCATION_ID"], body["_SYSTEMD_INVOCATION_ID"]) where IsString(body["_SYSTEMD_INVOCATION_ID"]) and IsMatch(body["_SYSTEMD_INVOCATION_ID"], "^[0-9a-f]{32}$")
           - set(cache["journal"]["PRIORITY"], body["PRIORITY"]) where IsString(body["PRIORITY"]) and Len(body["PRIORITY"]) <= 256
           - set(cache["application"], IsMatch(body["_SYSTEMD_UNIT"], "^(superserve-vmd|proxy(-[^.]*)?)\\.service$")) where IsString(body["_SYSTEMD_UNIT"])
           - set(cache["parsed"], ParseJSON(body["MESSAGE"])) where cache["application"] == true and IsString(body["MESSAGE"]) and Len(body["MESSAGE"]) <= 65536
@@ -116,6 +117,7 @@ processors:
           - set(body["diagnostic"], "service stopped") where attributes["_private"]["journal"]["_PID"] == "1" and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "^Stopped ")
           - set(attributes["host_logging_export_error"], "true") where attributes["journal_unit"] == "superserve-otel-logs.service" and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)(export.*fail|permission denied|drop|storage.*full|queue.*full|cursor.*(fail|invalid))")
           - set(attributes["host_logging_heartbeat"], "true") where attributes["journal_unit"] == "superserve-host-logging-heartbeat.service"
+          - set(attributes["heartbeat_invocation_id"], attributes["_private"]["journal"]["_SYSTEMD_INVOCATION_ID"]) where attributes["journal_unit"] == "superserve-host-logging-heartbeat.service"
           - delete_key(attributes, "_private")
   filter/info_plus:
     error_mode: propagate

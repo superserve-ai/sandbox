@@ -22,6 +22,15 @@ class LegacyMigrationTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         migration.STATE.mkdir()
         migration.IDENTITY.write_text(json.dumps({'instance_id': '123'}))
+        self.inject_patch = patch.object(migration, 'inject_heartbeat', return_value='b' * 32)
+        self.inject = self.inject_patch.start()
+        self.addCleanup(self.inject_patch.stop)
+        self.request_patch = patch.object(migration, 'receipt_request', return_value=('request', {}, 'log'))
+        self.request = self.request_patch.start()
+        self.addCleanup(self.request_patch.stop)
+        self.received_patch = patch.object(migration, 'heartbeat_received', return_value=True)
+        self.received = self.received_patch.start()
+        self.addCleanup(self.received_patch.stop)
         self.baseline = json.dumps({'metrics': {'service': {'pipelines': {'custom': {'receivers': ['hostmetrics']}}}}, 'logging': {'service': {'pipelines': {'extra': {'receivers': ['custom']}}}}})
         retired = json.loads(self.baseline)
         retired['logging']['service']['pipelines']['default_pipeline'] = {'receivers': []}
@@ -73,7 +82,7 @@ class LegacyMigrationTests(unittest.TestCase):
         self.target['phase'] = 'retire'
         with patch.object(migration, 'assert_exporter_healthy') as health:
             self.assertEqual(self.run_action('--enforce'), 100)
-        health.assert_called_once_with()
+        health.assert_called_once_with(self.target)
         retired = json.loads(migration.CONFIG.read_text())
         self.assertEqual(retired['metrics'], json.loads(self.baseline)['metrics'])
         self.assertEqual(retired['logging']['service']['pipelines']['extra'], {'receivers': []})
@@ -185,30 +194,80 @@ class LegacyMigrationTests(unittest.TestCase):
         pending = dict(initial, sent=13, queued=0, inflight=1)
         success = dict(pending, inflight=0)
         with patch.object(migration, 'read_export_metrics', side_effect=[initial, pending, success]) as read, patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run') as command, patch.object(migration.time, 'sleep'):
-            migration.assert_exporter_healthy()
+            migration.assert_exporter_healthy(self.target)
         self.assertEqual(read.call_count, 3)
-        command.assert_called_once()
-        self.assertIn('superserve-host-logging-heartbeat.service', command.call_args.args[0])
+        self.inject.assert_called_once()
+        self.received.assert_called_once()
 
     def test_retire_guard_rejects_queue_pressure_export_errors_and_restart(self):
         initial = {'sent': 12, 'failed': 0, 'rejected': 0, 'queued': 0, 'capacity': 100, 'inflight': 0}
         for changed in [dict(initial, failed=1), dict(initial, rejected=1), dict(initial, sent=0)]:
             with patch.object(migration, 'read_export_metrics', side_effect=[initial, changed]), patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run'), patch.object(migration.time, 'sleep'):
                 with self.assertRaises(ValueError):
-                    migration.assert_exporter_healthy()
+                    migration.assert_exporter_healthy(self.target)
         with patch.object(migration, 'read_export_metrics', return_value=dict(initial, queued=100)), patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run') as command:
             with self.assertRaises(ValueError):
-                migration.assert_exporter_healthy()
+                migration.assert_exporter_healthy(self.target)
             command.assert_not_called()
         with patch.object(migration, 'read_export_metrics', side_effect=[initial, dict(initial, sent=13)]), patch.object(migration, 'collector_invocation', side_effect=['a' * 32, 'b' * 32]), patch.object(migration.subprocess, 'run'), patch.object(migration.time, 'sleep'):
             with self.assertRaises(ValueError):
-                migration.assert_exporter_healthy()
+                migration.assert_exporter_healthy(self.target)
 
     def test_retire_guard_times_out_without_success(self):
         initial = {'sent': 12, 'failed': 0, 'rejected': 0, 'queued': 0, 'capacity': 100, 'inflight': 0}
-        with patch.object(migration, 'read_export_metrics', return_value=initial), patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run'), patch.object(migration.time, 'monotonic', side_effect=[0, 21]):
+        with patch.object(migration, 'read_export_metrics', return_value=initial), patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run'), patch.object(migration.time, 'monotonic', side_effect=[0, 31]):
             with self.assertRaises(ValueError):
-                migration.assert_exporter_healthy()
+                migration.assert_exporter_healthy(self.target)
+
+    def test_old_queue_success_does_not_acknowledge_injected_heartbeat(self):
+        initial = {'sent': 12, 'failed': 0, 'rejected': 0, 'queued': 1, 'capacity': 100, 'inflight': 0}
+        delivered_old = dict(initial, sent=13, queued=0)
+        self.received.return_value = False
+        with patch.object(migration, 'read_export_metrics', side_effect=[initial, delivered_old]), patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.time, 'sleep'), patch.object(migration.time, 'monotonic', side_effect=[0, 1, 31]), patch.object(migration.subprocess, 'run'):
+            with self.assertRaisesRegex(ValueError, 'acknowledge'):
+                migration.assert_exporter_healthy(self.target)
+        self.received.assert_called_once()
+
+    def test_heartbeat_probe_rejects_old_journal_invocation(self):
+        self.inject_patch.stop()
+        old = {'_SYSTEMD_UNIT': 'superserve-host-logging-heartbeat.service', '_SYSTEMD_INVOCATION_ID': 'b' * 32, '__REALTIME_TIMESTAMP': '999999'}
+        fresh = dict(old, __REALTIME_TIMESTAMP='1000001', _SYSTEMD_INVOCATION_ID='c' * 32)
+        with patch.object(migration.time, 'time_ns', return_value=1000000000), patch.object(migration.time, 'sleep'), patch.object(migration.subprocess, 'run', side_effect=[MagicMock(), MagicMock(stdout=json.dumps(old)), MagicMock(stdout=json.dumps(fresh))]) as run:
+            self.assertEqual(migration.inject_heartbeat(), 'c' * 32)
+        self.assertEqual(run.call_args_list[0].args[0], ['systemctl', 'restart', 'superserve-host-logging-heartbeat.service'])
+
+    def test_receipt_query_is_restricted_and_bound_to_host_incarnation(self):
+        self.request_patch.stop()
+        migration.IDENTITY.write_text(json.dumps({'instance_id': '123', 'incarnation_id': 'inc-1'}))
+        target = {'heartbeat_receipt_view': 'projects/example-project/locations/global/buckets/_Default/views/example-heartbeats'}
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"access_token":"synthetic-fixture-token"}'
+        with patch.object(migration.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.return_value = response
+            request, labels, name = migration.receipt_request(target, 'b' * 32)
+        payload = json.loads(request.data)
+        self.assertEqual(payload['resourceNames'], [target['heartbeat_receipt_view']])
+        self.assertEqual(payload['pageSize'], 1)
+        self.assertIn('labels.heartbeat_invocation_id="' + 'b' * 32 + '"', payload['filter'])
+        self.assertIn('labels.incarnation="inc-1"', payload['filter'])
+        self.assertIn('labels.provider_instance_id="123"', payload['filter'])
+        self.assertEqual(name, 'projects/example-project/logs/superserve_host_logs')
+        with self.assertRaises(ValueError):
+            migration.receipt_request({'heartbeat_receipt_view': 'projects/example-project'}, 'b' * 32)
+
+    def test_cloud_receipt_must_match_exact_invocation_and_identity(self):
+        self.received_patch.stop()
+        expected = {'heartbeat_invocation_id': 'b' * 32, 'provider_instance_id': '123', 'incarnation': 'inc-1'}
+        response = MagicMock()
+        with patch.object(migration.urllib.request, 'urlopen', return_value=response):
+            for changed in ({'heartbeat_invocation_id': 'c' * 32}, {'provider_instance_id': '456'}, {'incarnation': 'inc-2'}):
+                response.__enter__.return_value.read.return_value = json.dumps({'entries': [{'logName': 'log', 'labels': dict(expected, **changed)}]}).encode()
+                self.assertFalse(migration.heartbeat_received('request', expected, 'log'))
+            response.__enter__.return_value.read.return_value = json.dumps({'entries': [{'logName': 'log', 'labels': expected}]}).encode()
+            self.assertTrue(migration.heartbeat_received('request', expected, 'log'))
+            response.__enter__.return_value.read.return_value = b'X' * 65537
+            with self.assertRaises(ValueError):
+                migration.heartbeat_received('request', expected, 'log')
 
     def test_metric_reader_selects_only_expected_exporter_and_fails_closed(self):
         raw = b'\n'.join([

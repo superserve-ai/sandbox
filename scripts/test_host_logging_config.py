@@ -230,10 +230,10 @@ RUN apt-get update \\
                 now=1700000000123456
                 emit() {
                   unit="$1"; transport="$2"; priority="$3"; message="$4"
-                  { printf '__REALTIME_TIMESTAMP=%s\\n' "$now"; printf '_BOOT_ID=11111111111111111111111111111111\\n'; printf '_HOSTNAME=fixture-host\\n'; printf '_PID=42\\n'; printf 'PRIORITY=%s\\n' "$priority"; [ -z "$unit" ] || printf '_SYSTEMD_UNIT=%s\\n' "$unit"; printf '_TRANSPORT=%s\\n' "$transport"; printf 'MESSAGE=%s\\n\\n' "$message"; }
+                  { printf '__REALTIME_TIMESTAMP=%s\\n' "$now"; printf '_BOOT_ID=11111111111111111111111111111111\\n'; printf '_HOSTNAME=fixture-host\\n'; printf '_PID=42\\n'; printf '_SYSTEMD_INVOCATION_ID=22222222222222222222222222222222\\n'; printf 'PRIORITY=%s\\n' "$priority"; [ -z "$unit" ] || printf '_SYSTEMD_UNIT=%s\\n' "$unit"; printf '_TRANSPORT=%s\\n' "$transport"; printf 'MESSAGE=%s\\n\\n' "$message"; }
                 }
                 : > /fixture/journal.export
-                emit superserve-vmd.service journal 6 '{"level":"INFO","message":"safe-info","request_id":"req-1","host_id":"evil-host","incarnation":"evil-incarnation","provider_instance_id":"evil-instance","parse_outcome":"failure","journal_unit":"evil.service","source":"evil-source","host_logging_heartbeat":"true","host_logging_export_error":"true","severity_number":1,"resource":{"host.id":"evil-resource"},"attributes":{"log.name":"evil-log"},"labels":{"authorization":"SECRET_NESTED"}}' >> /fixture/journal.export
+                emit superserve-vmd.service journal 6 '{"level":"INFO","message":"safe-info","request_id":"req-1","host_id":"evil-host","incarnation":"evil-incarnation","provider_instance_id":"evil-instance","parse_outcome":"failure","journal_unit":"evil.service","source":"evil-source","host_logging_heartbeat":"true","heartbeat_invocation_id":"evil-heartbeat","host_logging_export_error":"true","severity_number":1,"resource":{"host.id":"evil-resource"},"attributes":{"log.name":"evil-log"},"labels":{"authorization":"SECRET_NESTED"}}' >> /fixture/journal.export
                 emit superserve-vmd.service journal 6 '{"level":"DEBUG","message":"debug-only"}' >> /fixture/journal.export
                 emit proxy-generation.service journal 6 '{"level":"INFO","message":"proxy-safe","sandbox_id":"sandbox-1"}' >> /fixture/journal.export
                 emit superserve-vmd.service journal 6 '{"level":"WARN","message":"safe-warn"}' >> /fixture/journal.export
@@ -320,9 +320,11 @@ RUN apt-get update \\
             self.assertEqual(attributes["provider_instance_id"], "fixture-instance")
             if attributes.get("journal_unit") == "superserve-host-logging-heartbeat.service":
                 self.assertEqual(attributes["host_logging_heartbeat"], "true")
+                self.assertEqual(attributes["heartbeat_invocation_id"], "2" * 32)
                 self.assertLess(int(record["timeUnixNano"]) / 1e9, time.time() - 300)
             else:
                 self.assertNotIn("host_logging_heartbeat", attributes)
+                self.assertNotIn("heartbeat_invocation_id", attributes)
                 self.assertNotIn("host_logging_retained_history_lag_seconds", attributes)
             self.assertNotIn("host_logging_export_error", attributes)
             if attributes.get("journal_unit") == "superserve-vmd.service":
@@ -336,7 +338,7 @@ RUN apt-get update \\
             self.assertEqual(resource["cloud.platform"], "gcp_compute_engine")
             self.assertEqual(resource["host.id"], "fixture-instance")
             self.assertEqual(resource["gcp.project_id"], "example-project")
-        for forbidden in ["debug-only", "drop-me", "missing-unit-drop", "SECRET_SENTINEL", "SECRET_NESTED", "evil-host", "evil-incarnation", "evil-instance", "evil.service", "evil-source", "evil-resource", "evil-log"]:
+        for forbidden in ["debug-only", "drop-me", "missing-unit-drop", "SECRET_SENTINEL", "SECRET_NESTED", "evil-host", "evil-incarnation", "evil-instance", "evil.service", "evil-source", "evil-resource", "evil-log", "evil-heartbeat"]:
             self.assertNotIn(forbidden, output)
         shutdown_seen = False
         for line in self_logs.splitlines():

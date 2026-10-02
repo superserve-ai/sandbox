@@ -251,7 +251,20 @@ def migration_content_digest(plan):
                     references.append(entry)
     if len(references) != 2:
         raise ValueError("migration policy must bind helper and target")
-    manifest = {"target": target, "artifacts": artifacts, "reconcile": reconcile, "references": references}
+    receipt_access = []
+    for item in plan["resource_changes"]:
+        address = item.get("address", "")
+        if "google_logging_log_view.heartbeat_receipts" in address:
+            fields = ("parent", "location", "bucket", "name", "filter")
+        elif "google_logging_log_view_iam_member.heartbeat_reader" in address:
+            fields = ("parent", "location", "bucket", "name", "role", "member", "condition")
+        else:
+            continue
+        receipt_access.append({"resource": address, "value": _selected(item["change"], fields)})
+    if target.get("heartbeat_receipt_view") and len(receipt_access) < 2:
+        raise ValueError("heartbeat receipt view and scoped grants are required")
+    manifest = {"target": target, "artifacts": artifacts, "reconcile": reconcile, "references": references,
+                "receipt_access": sorted(receipt_access, key=lambda item: item["resource"])}
     return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 
 

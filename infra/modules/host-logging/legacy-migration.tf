@@ -11,6 +11,7 @@ locals {
     })
   })
   legacy_target = {
+    heartbeat_receipt_view  = "projects/${var.project_id}/locations/global/buckets/_Default/views/${var.assignment_name}-heartbeats"
     legacy_policy_name      = var.legacy_policy_name
     phase                   = var.legacy_transition
     baseline                = local.legacy_baseline
@@ -48,4 +49,26 @@ resource "google_storage_bucket_object" "legacy_migration_target" {
   name       = "${var.assignment_name}/${var.assignment_revision}/legacy-migration.json"
   content    = jsonencode(local.legacy_target)
   depends_on = [terraform_data.legacy_migration]
+}
+
+# One view per migrating assignment, not per sandbox or host. Only trusted
+# heartbeat metadata is readable; application logs are outside this view.
+resource "google_logging_log_view" "heartbeat_receipts" {
+  count       = var.legacy_policy_name == null ? 0 : 1
+  parent      = "projects/${var.project_id}"
+  location    = "global"
+  bucket      = "_Default"
+  name        = "${var.assignment_name}-heartbeats"
+  description = "Host logging cutover heartbeat receipts"
+  filter      = "log_id(\"superserve_host_logs\") AND resource.type=\"gce_instance\" AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.environment=${jsonencode(var.environment)} AND labels.region=${jsonencode(var.region)}"
+}
+
+resource "google_logging_log_view_iam_member" "heartbeat_reader" {
+  for_each = var.legacy_policy_name == null ? toset([]) : toset([for host in values(var.enrolled_hosts) : host.service_account_email])
+  parent   = google_logging_log_view.heartbeat_receipts[0].parent
+  location = google_logging_log_view.heartbeat_receipts[0].location
+  bucket   = google_logging_log_view.heartbeat_receipts[0].bucket
+  name     = google_logging_log_view.heartbeat_receipts[0].name
+  role     = "roles/logging.viewAccessor"
+  member   = "serviceAccount:${each.value}"
 }

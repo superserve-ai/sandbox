@@ -174,24 +174,88 @@ def read_export_metrics():
     return values
 
 
-def assert_exporter_healthy():
-    # Receipt evidence authorizes the change; this fresh check catches an outage
-    # or saturated queue arising between evidence collection and host activation.
+def inject_heartbeat():
+    started = time.time_ns() // 1000
+    unit = 'superserve-host-logging-heartbeat.service'
+    subprocess.run(['systemctl', 'restart', unit], check=True, capture_output=True, timeout=5)
+    # Read the trusted journal invocation, not an application-supplied marker.
+    for _ in range(10):
+        result = subprocess.run(['journalctl', '_SYSTEMD_UNIT=' + unit,
+                                 '--since=@' + str(started // 1000000), '--lines=1',
+                                 '--output=json', '--no-pager',
+                                 '--output-fields=_SYSTEMD_UNIT,_SYSTEMD_INVOCATION_ID,__REALTIME_TIMESTAMP'],
+                                check=True, capture_output=True, text=True, timeout=2)
+        if len(result.stdout) > 65536:
+            raise ValueError('heartbeat journal response exceeds bound')
+        if result.stdout.strip():
+            entry = json.loads(result.stdout)
+            invocation = entry.get('_SYSTEMD_INVOCATION_ID', '')
+            if (entry.get('_SYSTEMD_UNIT') == unit and isinstance(invocation, str)
+                    and re.fullmatch(r'[0-9a-f]{32}', invocation)
+                    and int(entry.get('__REALTIME_TIMESTAMP', 0)) >= started):
+                return invocation
+        time.sleep(0.2)
+    raise ValueError('fresh heartbeat was not written to the journal')
+
+
+def receipt_request(target, heartbeat):
+    view = target.get('heartbeat_receipt_view', '')
+    match = re.fullmatch(r'projects/([a-z0-9-]+)/locations/global/buckets/_Default/views/([a-z0-9-]+)', view)
+    if not match:
+        raise ValueError('restricted heartbeat receipt view required')
+    identity = json.loads(IDENTITY.read_text())
+    labels = {'heartbeat_invocation_id': heartbeat, 'provider_instance_id': identity['instance_id'],
+              'incarnation': identity['incarnation_id'], 'host_logging_heartbeat': 'true',
+              'journal_unit': 'superserve-host-logging-heartbeat.service'}
+    if not all(isinstance(value, str) and value for value in labels.values()):
+        raise ValueError('heartbeat receipt identity unavailable')
+    log_name = 'projects/' + match[1] + '/logs/superserve_host_logs'
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)).isoformat()
+    filters = ['logName=' + json.dumps(log_name), 'timestamp>=' + json.dumps(cutoff)] + ['labels.' + key + '=' + json.dumps(value) for key, value in labels.items()]
+    payload = {'resourceNames': [view], 'filter': ' AND '.join(filters), 'pageSize': 1, 'orderBy': 'timestamp desc'}
+    token_request = urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor': 'Google'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(token_request, timeout=2) as response:
+        raw = response.read(16385)
+    if len(raw) > 16384:
+        raise ValueError('metadata response exceeds bound')
+    token = json.loads(raw)['access_token']
+    request = urllib.request.Request('https://logging.googleapis.com/v2/entries:list', data=json.dumps(payload).encode(),
+                                     headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+    return request, labels, log_name
+
+
+def heartbeat_received(request, labels, log_name):
+    with urllib.request.urlopen(request, timeout=2) as response:
+        raw = response.read(65537)
+    if len(raw) > 65536:
+        raise ValueError('heartbeat receipt response exceeds bound')
+    entries = json.loads(raw).get('entries', [])
+    return any(entry.get('logName') == log_name and all(entry.get('labels', {}).get(key) == value for key, value in labels.items()) for entry in entries)
+
+
+def assert_exporter_healthy(target):
+    # Earlier rollout evidence authorizes the change. This exact invocation receipt
+    # proves the journal input and cloud export are still working at retirement.
     invocation = collector_invocation()
     before = read_export_metrics()
     if before['queued'] >= before['capacity']:
         raise ValueError('collector export queue is full')
-    subprocess.run(['systemctl', 'start', 'superserve-host-logging-heartbeat.service'], check=True, capture_output=True, timeout=2)
-    deadline = time.monotonic() + 20
+    heartbeat = inject_heartbeat()
+    request, labels, log_name = receipt_request(target, heartbeat)
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        time.sleep(1)
+        time.sleep(2)
         current = read_export_metrics()
         if current['failed'] != before['failed'] or current['rejected'] != before['rejected'] or current['sent'] < before['sent']:
             raise ValueError('collector export failed during cutover check')
         if collector_invocation() != invocation or not active(LOGS):
             raise ValueError('collector restarted during cutover check')
         if current['sent'] > before['sent'] and current['queued'] == 0 and current['inflight'] == 0:
-            return
+            if heartbeat_received(request, labels, log_name):
+                if collector_invocation() != invocation or not active(LOGS):
+                    raise ValueError('collector restarted during receipt check')
+                return
     raise ValueError('collector did not acknowledge fresh logs before cutover')
 
 
@@ -214,7 +278,7 @@ def enforce(target):
     elif phase == 'retire':
         if not active(LOGS):
             raise ValueError('OTel must be healthy before retiring legacy logging')
-        assert_exporter_healthy()
+        assert_exporter_healthy(target)
         atomic(STATE / 'legacy-retired.json', json.dumps({'baseline': target['baseline']}))
         set_legacy_config(target['retired'])
     else:

@@ -137,6 +137,22 @@ class HostLoggingDigestTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 MODULE.deployment_content_digest(changed)
 
+    def test_migration_digest_binds_heartbeat_view_and_reader(self):
+        data = json.loads((ROOT / "scripts/fixtures/host_logging_migration_plan.json").read_text())
+        for kind, name, value in [
+            ("google_logging_log_view", "heartbeat_receipts", {"parent": "projects/example-project", "location": "global", "bucket": "_Default", "name": "heartbeat", "filter": 'labels.host_logging_heartbeat="true"'}),
+            ("google_logging_log_view_iam_member", "heartbeat_reader", {"parent": "projects/example-project", "location": "global", "bucket": "_Default", "name": "heartbeat", "role": "roles/logging.viewAccessor", "member": "serviceAccount:fixture@example-project.iam.gserviceaccount.com"}),
+        ]:
+            data['resource_changes'].append({'address': 'module.host_logging.' + kind + '.' + name, 'change': {'actions': ['create'], 'after': value, 'after_unknown': {}}})
+        digest = MODULE.migration_content_digest(data)
+        for name, field, value in [('google_logging_log_view.heartbeat_receipts', 'filter', 'resource.type="gce_instance"'), ('google_logging_log_view_iam_member.heartbeat_reader', 'role', 'roles/logging.admin'), ('google_logging_log_view_iam_member.heartbeat_reader', 'member', 'allUsers')]:
+            changed = copy.deepcopy(data)
+            resource(changed, name)['after'][field] = value
+            self.assertNotEqual(digest, MODULE.migration_content_digest(changed))
+        resource(data, 'google_logging_log_view.heartbeat_receipts')['after_unknown'] = {'filter': True}
+        with self.assertRaises(ValueError):
+            MODULE.migration_content_digest(data)
+
     def migration_plan_and_receipt(self):
         data = json.loads((ROOT / "scripts/fixtures/host_logging_migration_plan.json").read_text())
         change = resource(data, "terraform_data.legacy_migration")
