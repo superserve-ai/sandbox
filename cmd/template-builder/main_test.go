@@ -142,11 +142,16 @@ func TestClassifyBuildError(t *testing.T) {
 	}
 }
 
-func TestHomeDirFor(t *testing.T) {
-	if got := homeDirFor("root"); got != "/root" {
-		t.Fatalf("root: %q", got)
+func TestHomeFromPasswd(t *testing.T) {
+	cases := map[string]string{
+		"www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n": "/var/www",
+		"root:x:0:0:root:/root:/bin/bash":                        "/root",
+		"":                                                       "/home/desktop",
+		"garbage":                                                "/home/desktop",
 	}
-	if got := homeDirFor("desktop"); got != "/home/desktop" {
-		t.Fatalf("desktop: %q", got)
+	for in, want := range cases {
+		if got := homeFromPasswd(in, "desktop"); got != want {
+			t.Errorf("homeFromPasswd(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
