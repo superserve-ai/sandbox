@@ -1,3 +1,6 @@
+# Attach prepared promotion evidence credentials; credit enforcement is separate.
+promotion_evidence_enabled = true
+
 project_id               = "rayai-prod"
 environment              = "production"
 region                   = "us-east4"
