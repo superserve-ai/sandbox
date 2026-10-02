@@ -274,6 +274,7 @@ jobs:
             -target=google_project_service.compute \
             -target=google_project_service.logging \
             -target=google_project_service.monitoring \
+            -target=google_project_service.host_log_os_config \
             -target='module.iam.google_project_iam_member.project_bindings["cd_privateca_auditor"]' \
             -target='module.iam.google_project_iam_member.project_bindings["cd_role_admin"]' \
             -out=tfplan

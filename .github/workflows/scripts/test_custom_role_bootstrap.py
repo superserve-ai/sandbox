@@ -11,6 +11,26 @@ WORKFLOW = Path(__file__).parents[1] / 'terraform-cd.yml'
 
 
 class CustomRoleBootstrapTests(unittest.TestCase):
+    def test_logging_api_bootstrap_precedes_both_regions(self):
+        text = WORKFLOW.read_text()
+        bootstrap = text.split('  production-us-central1-bootstrap:\n')[1].split('\n  production-us-west2-infra:')[0]
+        self.assertIn('-target=google_project_service.host_log_os_config', bootstrap)
+        self.assertIn('terraform apply -input=false -auto-approve tfplan', bootstrap)
+        root = WORKFLOW.parents[2] / 'infra/envs'
+        owners = []
+        for config in root.glob('production/*/main.tf'):
+            if 'service            = "osconfig.googleapis.com"' in config.read_text():
+                owners.append(config.parent.name)
+        self.assertEqual(owners, ['us-central1'])
+        for cell in ('us-east4', 'us-west2'):
+            region = text.split('  production-' + cell + '-infra:\n')[1].split('    steps:')[0]
+            self.assertIn('production-us-central1-bootstrap', region)
+            self.assertNotIn('production-us-west2-infra', region)
+        staging = (root / 'staging/us-central1/main.tf').read_text()
+        logging = staging.split('module "host_logging" {')[1].split('\n}')[0]
+        self.assertIn('google_project_service.host_log_os_config', logging)
+        self.assertIn('google_project_service.host_log_telemetry', logging)
+
     def test_effective_permissions_gate_regional_applies(self):
         text = WORKFLOW.read_text()
         job = text.split('  production-us-central1-bootstrap:\n')[1].split('\n  production-us-west2-infra:')[0]

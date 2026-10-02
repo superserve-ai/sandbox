@@ -740,7 +740,7 @@ module "host_logging" {
       service_account_email = google_service_account.vmd_runtime.email
     }
   }
-  depends_on = [module.sandbox_host, module.sandbox_host_b]
+  depends_on = [module.sandbox_host, module.sandbox_host_b, google_project_service.host_log_os_config, google_project_service.host_log_telemetry]
 }
 
 # Durability tier for the host's local artifacts (sandbox snapshots, template
@@ -784,5 +784,11 @@ resource "google_service_account_iam_member" "controlplane_backup_gc" {
 resource "google_project_service" "host_log_telemetry" {
   project            = local.project_id
   service            = "telemetry.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "host_log_os_config" {
+  project            = local.project_id
+  service            = "osconfig.googleapis.com"
   disable_on_destroy = false
 }

@@ -44,6 +44,12 @@ resource "google_project_service" "monitoring" {
   disable_on_destroy = false
 }
 
+resource "google_project_service" "host_log_os_config" {
+  project            = local.project_id
+  service            = "osconfig.googleapis.com"
+  disable_on_destroy = false
+}
+
 locals {
   project_id                = var.project_id
   environment               = var.environment

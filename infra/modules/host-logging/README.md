@@ -34,10 +34,14 @@ is beta. Component maturity and a successful configuration validation are not
 delivery guarantees.
 
 The exporter uses Google's [native OTLP logs endpoint](https://docs.cloud.google.com/stackdriver/docs/reference/telemetry/v1.logs).
-Terraform enables the Telemetry API in each project. The runtime identity needs
+Terraform enables the Telemetry and OS Config APIs. Staging orders the logging
+module after both services; production enables OS Config in the shared
+us-central1 bootstrap that both regional infrastructure jobs require. The runtime identity needs
 `roles/logging.logWriter`, `roles/serviceusage.serviceUsageConsumer`, and read
-access to the dedicated artifact bucket. The shared production API is owned
-by the west root and must exist before east activation.
+access to the dedicated artifact bucket. Production
+Telemetry remains owned by west and must exist before east activation. Direct
+regional applies must establish these project prerequisites first; east does
+not duplicate project-service ownership in its regional state.
 
 ## State and resource bounds
 
