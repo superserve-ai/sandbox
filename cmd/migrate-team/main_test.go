@@ -282,6 +282,11 @@ func seedFixture(t *testing.T) *fixture {
 			VALUES ($1, $2, $3, $4||'/disk.snap', $4||'/mem.snap', 0, 'pause')`,
 			pair.snap, pair.sb, f.team, snapDir)
 		mustExec(t, srcPool, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, pair.sb, pair.snap)
+		mustExec(t, srcPool, `
+			INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256)
+			VALUES ($1, 'base.ext4', $2||'/base.ext4', 4096, repeat('aa', 32)),
+			       ($1, 'delta.ext4', $2||'/delta.ext4', 2048, repeat('bb', 32))`,
+			pair.snap, "/srv/sandboxes/"+pair.sb.String())
 	}
 	// Integrity manifest rows: one through each parent kind, so the copy
 	// scope's snapshot and template branches are both exercised.
@@ -327,6 +332,41 @@ func seedFixture(t *testing.T) *fixture {
 		mustExec(t, srcPool, `
 			INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 			VALUES ($1, $2, 4096, $3)`, sb, f.team, base)
+		mustExec(t, srcPool, `
+			INSERT INTO sandbox_storage_baseline
+				(sandbox_id, team_id, host_id, path, generation, allocated_bytes,
+				 observed_at, effective_at, started_at, receipt_id)
+			VALUES ($1, $2, $3, $4, $5, 1048576, $6, $6, $6, $7)`,
+			sb, f.team, sourceHostID, "/srv/templates/"+f.tpl.String()+"/base.ext4",
+			strings.Repeat("a", 64), base, uuid.New())
+	}
+
+	// Retained history uses cell-local IDs. Pick one value that is demonstrably
+	// unused in both fixture databases, then use it for the unrelated
+	// destination row and the source history row. The sequence state is
+	// advanced after these committed explicit inserts; migration itself never
+	// rewinds or repairs destination identity sequences.
+	neighbor := uuid.New()
+	mustExec(t, dstPool, `INSERT INTO team(id,name) VALUES($1,'retained-neighbor')`, neighbor)
+	var sourceMax, destMax int64
+	if err := srcPool.QueryRow(t.Context(), `SELECT COALESCE(max(id), 0) FROM retained_storage_interval`).Scan(&sourceMax); err != nil {
+		t.Fatal(err)
+	}
+	if err := dstPool.QueryRow(t.Context(), `SELECT COALESCE(max(id), 0) FROM retained_storage_interval`).Scan(&destMax); err != nil {
+		t.Fatal(err)
+	}
+	localID := sourceMax
+	if destMax > localID {
+		localID = destMax
+	}
+	localID++
+	mustExec(t, dstPool, `INSERT INTO retained_storage_interval(id,host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at) OVERRIDING SYSTEM VALUE
+ VALUES($1,$2,$3,'sandbox',$4,'neighbor','[]',$5,$6)`, localID, destHostID, neighbor, uuid.New(), base, base.Add(time.Hour))
+	mustExec(t, srcPool, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, sourceHostID, f.team, base.Add(15*time.Minute))
+	mustExec(t, srcPool, `INSERT INTO retained_storage_interval(id,host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at,baseline_path,baseline_generation,baseline_allocated_bytes) OVERRIDING SYSTEM VALUE
+ VALUES($1,$2,$3,'sandbox',$4,'retained','[{"device":"fs","start":0,"length":1048576}]',$5,$6,$7,repeat('a',64),1048576)`, localID, sourceHostID, f.team, f.sb1, base.Add(15*time.Minute), base.Add(time.Hour), "/srv/templates/"+f.tpl.String()+"/base.ext4")
+	for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+		mustExec(t, pool, `SELECT setval(pg_get_serial_sequence('retained_storage_interval','id'), GREATEST((SELECT last_value FROM retained_storage_interval_id_seq), (SELECT max(id) FROM retained_storage_interval)), true)`)
 	}
 
 	// Billing rows with awkward numerics — the copy must not round them.
@@ -458,24 +498,28 @@ func seedFixture(t *testing.T) *fixture {
 		VALUES ($1, $2, 'still-running', 'active', 1, 1024, $3, '10.0.0.9')`, f.sbActive, f.teamC, sourceHostID)
 
 	f.expectedCounts = map[string]int64{
-		"profile":                                  2,
-		"team":                                     1,
-		"team_member":                              2,
-		"team_memberships":                         2,
-		"user_role_assignments":                    2,
-		"api_key":                                  2,
-		"secret":                                   1,
-		"template":                                 1,
-		"template_build":                           1,
-		"sandbox":                                  4,
-		"snapshot":                                 2,
-		"artifact_manifest":                        2,
-		"backup_generation":                        2,
-		"sandbox_secret":                           1,
-		"sandbox_secret_detached":                  1,
-		"sandbox_active_interval":                  2,
-		"sandbox_compute_billing_interval":         2,
-		"sandbox_storage_interval":                 2,
+		"profile":                          2,
+		"team":                             1,
+		"team_member":                      2,
+		"team_memberships":                 2,
+		"user_role_assignments":            2,
+		"api_key":                          2,
+		"secret":                           1,
+		"template":                         1,
+		"template_build":                   1,
+		"sandbox":                          4,
+		"snapshot":                         2,
+		"artifact_manifest":                6,
+		"backup_generation":                2,
+		"sandbox_secret":                   1,
+		"sandbox_secret_detached":          1,
+		"sandbox_active_interval":          2,
+		"sandbox_compute_billing_interval": 2,
+		"sandbox_storage_interval":         2,
+		"sandbox_storage_baseline":         2,
+		"retained_storage_cutover":         1,
+		"retained_storage_interval":        1,
+		"retained_storage_measurement_obligation":  0,
 		"team_billing_usage":                       1,
 		"team_billing_usage_hourly":                2,
 		"team_billing_period":                      1,
@@ -484,9 +528,6 @@ func seedFixture(t *testing.T) *fixture {
 		"billing_rollup_team_backfill_state":       1,
 		"team_feature_flag":                        2,
 		"team_billing_account":                     0,
-		"stripe_checkout_generation_authority":     0,
-		"stripe_checkout_publication_decision":     0,
-		"stripe_checkout_publication_subscription": 0,
 		"team_storage_billing_activation":          0,
 		"stripe_checkout_expiration_evidence":      2,
 		"team_trial_eligibility_cache":             0,
@@ -499,6 +540,9 @@ func seedFixture(t *testing.T) *fixture {
 		"activity":                                 3,
 		"sandbox_revocation":                       1,
 		"revoked_proxy_token":                      1,
+		"stripe_checkout_generation_authority":     0,
+		"stripe_checkout_publication_decision":     0,
+		"stripe_checkout_publication_subscription": 0,
 	}
 
 	f.expectedDirs = []string{
@@ -521,6 +565,392 @@ func (f *fixture) cfg(phase string) config {
 		destHostID: destHostID,
 		destRegion: destRegion,
 		phase:      phase,
+	}
+}
+
+func TestRetainedStorageCopyRetryClosesPreviousIntervals(t *testing.T) {
+	for _, owners := range []int{1, copyBatchSize + 1} {
+		t.Run(fmt.Sprintf("owners=%d", owners), func(t *testing.T) {
+			ctx := t.Context()
+			team := uuid.New()
+			base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+			boundary := base.Add(5 * time.Minute)
+			for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+				mustExec(t, pool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "retained-retry-"+team.String())
+			}
+			mustExec(t, srcPool, `INSERT INTO retained_storage_interval
+				(host_id,team_id,owner_kind,owner_id,generation,extents,started_at)
+				SELECT $1,$2,'sandbox',gen_random_uuid(),'initial',
+				'[{"device":"fs","start":0,"length":1048576}]',$3
+				FROM generate_series(1,$4::int)`, sourceHostID, team, base, owners)
+			spec, ok := tableByName("retained_storage_interval")
+			if !ok {
+				t.Fatal("retained storage is missing from the migration table list")
+			}
+			if copied, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err != nil || copied != int64(owners) {
+				t.Fatalf("initial copy: copied=%d err=%v", copied, err)
+			}
+			const idsQuery = `SELECT jsonb_object_agg(owner_id,id)::text FROM retained_storage_interval WHERE team_id=$1 AND started_at=$2`
+			initialIDs := scanString(t, dstPool, idsQuery, team, base)
+			mustExec(t, srcPool, `UPDATE retained_storage_interval SET ended_at=$2 WHERE team_id=$1`, team, boundary)
+			mustExec(t, srcPool, `INSERT INTO retained_storage_interval
+				(host_id,team_id,owner_kind,owner_id,generation,extents,started_at)
+				SELECT host_id,team_id,owner_kind,owner_id,'replacement',
+				'[{"device":"fs","start":0,"length":2097152}]',$2
+				FROM retained_storage_interval WHERE team_id=$1`, team, boundary)
+
+			// Force replacements ahead of closures unless the copy orders its
+			// source query; correctness must not depend on the source scan plan.
+			tx, err := srcPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, `CREATE TEMP VIEW retained_storage_interval AS
+				SELECT * FROM public.retained_storage_interval ORDER BY started_at DESC`); err != nil {
+				t.Fatal(err)
+			}
+			var firstGeneration string
+			if err := tx.QueryRow(ctx, `SELECT generation FROM retained_storage_interval WHERE team_id=$1 LIMIT 1`, team).Scan(&firstGeneration); err != nil || firstGeneration != "replacement" {
+				t.Fatalf("source order premise: generation=%q err=%v", firstGeneration, err)
+			}
+			const historyQuery = `SELECT jsonb_agg(to_jsonb(i)-'id' ORDER BY owner_id,started_at)::text
+				FROM retained_storage_interval i WHERE team_id=$1`
+			wantHistory := scanString(t, srcPool, historyQuery, team)
+			for retry := 0; retry < 2; retry++ {
+				if copied, _, err := copyTable(ctx, tx, dstPool, spec, team, nil); err != nil || copied != int64(2*owners) {
+					t.Fatalf("retry %d: copied=%d err=%v", retry, copied, err)
+				}
+				if got := scanString(t, dstPool, historyQuery, team); got != wantHistory {
+					t.Fatalf("retry %d: destination history differs from source", retry)
+				}
+				if got := scanString(t, dstPool, idsQuery, team, base); got != initialIDs {
+					t.Fatalf("retry %d: destination interval identities changed", retry)
+				}
+			}
+		})
+	}
+}
+
+func TestRetainedStorageMigrationRefusal(t *testing.T) {
+	ctx := context.Background()
+	team := uuid.New()
+	owner := uuid.New()
+	mustExec(t, dstPool, `
+		INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
+		VALUES ($1, '192.0.2.2:50051', '192.0.2.2:8080', $2, 65536, 32)
+		ON CONFLICT (id) DO NOTHING`, destHostID, destRegion)
+	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'migration-refusal')`, team)
+	mustExec(t, srcPool, `
+		INSERT INTO retained_storage_measurement_obligation
+			(team_id, owner_kind, owner_id, host_id, effective_at)
+		VALUES ($1, 'sandbox', $2, $3, now() - interval '1 hour')`, team, owner, sourceHostID)
+	defer func() {
+		mustExec(t, srcPool, `DELETE FROM retained_storage_measurement_obligation WHERE team_id = $1`, team)
+		mustExec(t, srcPool, `DELETE FROM team WHERE id = $1`, team)
+	}()
+
+	cfg := config{phase: phaseCopy, teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion}
+	err := run(ctx, cfg)
+	if err == nil || !strings.Contains(err.Error(), "obligation") {
+		t.Fatalf("unresolved retained accounting must refuse before copy, got: %v", err)
+	}
+	var n int
+	if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE id = $1`, team).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("refused migration wrote %d destination team row(s)", n)
+	}
+
+	t.Run("missing baseline provenance", func(t *testing.T) {
+		team := uuid.New()
+		sandbox := uuid.New()
+		base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+		mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'migration-missing-baseline')`, team)
+		mustExec(t, srcPool, `
+			INSERT INTO sandbox (id, team_id, name, status, host_id, base_path, delta_path)
+			VALUES ($1, $2, 'paused-missing-baseline', 'paused', $3, '/srv/missing/base.ext4', '/srv/missing/delta.ext4')`, sandbox, team, sourceHostID)
+		mustExec(t, srcPool, `
+			INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
+			VALUES ($1, $2, 1, $3)`, sandbox, team, base)
+		mustExec(t, srcPool, `INSERT INTO retained_storage_cutover(host_id, team_id, started_at) VALUES ($1, $2, $3)`, sourceHostID, team, base)
+		defer func() {
+			mustExec(t, srcPool, `DELETE FROM sandbox_storage_interval WHERE team_id = $1`, team)
+			mustExec(t, srcPool, `DELETE FROM retained_storage_cutover WHERE team_id = $1`, team)
+			mustExec(t, srcPool, `DELETE FROM sandbox WHERE id = $1`, sandbox)
+			mustExec(t, srcPool, `DELETE FROM team WHERE id = $1`, team)
+		}()
+		cfg := config{phase: phaseCopy, teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion}
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), "quantity is unknown") {
+			t.Fatalf("missing baseline provenance must refuse, got: %v", err)
+		}
+	})
+
+	t.Run("incomplete applicable report", func(t *testing.T) {
+		team := uuid.New()
+		sandbox := uuid.New()
+		reportHost := "migration-report-host-" + strings.ReplaceAll(team.String(), "-", "")
+		incarnation, report := uuid.New(), uuid.New()
+		received := time.Now().UTC().Add(-time.Hour)
+		mustExec(t, srcPool, `
+			INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
+			VALUES ($1, '192.0.2.3:50051', '192.0.2.3:8080', 'use', 65536, 32)`, reportHost)
+		mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'migration-incomplete-report')`, team)
+		mustExec(t, srcPool, `
+			INSERT INTO sandbox (id, team_id, name, status, host_id, created_at)
+			VALUES ($1, $2, 'paused-incomplete-report', 'paused', $3, $4)`, sandbox, team, reportHost, received.Add(-time.Hour))
+		mustExec(t, srcPool, `
+			INSERT INTO host_storage_report(host_id, incarnation_id, report_id, ingest_seq, received_at, payload, state)
+			VALUES ($1, $2, $3, 1, $4, '[]'::jsonb, 'pending')`, reportHost, incarnation, report, received)
+		defer func() {
+			mustExec(t, srcPool, `DELETE FROM host_storage_report WHERE host_id = $1`, reportHost)
+			mustExec(t, srcPool, `DELETE FROM sandbox WHERE id = $1`, sandbox)
+			mustExec(t, srcPool, `DELETE FROM team WHERE id = $1`, team)
+			mustExec(t, srcPool, `DELETE FROM host WHERE id = $1`, reportHost)
+		}()
+		cfg := config{phase: phaseCopy, teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion}
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), "pending or incomplete") {
+			t.Fatalf("incomplete applicable report must refuse, got: %v", err)
+		}
+	})
+}
+
+func TestRetainedStorageMigrationRetry(t *testing.T) {
+	ctx := context.Background()
+	team := uuid.New()
+	neighbor := uuid.New()
+	baselineSandbox := uuid.New()
+	identity := uuid.New()
+	base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+		mustExec(t, pool, `INSERT INTO team (id, name) VALUES ($1, $2), ($3, $4)`, team, "migration-retry", neighbor, "migration-neighbor")
+	}
+	defer func() {
+		for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+			mustExec(t, pool, `DELETE FROM sandbox_storage_baseline WHERE team_id IN ($1, $2)`, team, neighbor)
+			mustExec(t, pool, `DELETE FROM retained_storage_measurement_obligation WHERE team_id IN ($1, $2)`, team, neighbor)
+			mustExec(t, pool, `DELETE FROM team WHERE id IN ($1, $2)`, team, neighbor)
+		}
+	}()
+
+	// Occupy the source-generated ids in the destination under another team;
+	// accounting history must retain destination-local ids across retries.
+	var baselineID, obligationID int64
+	if err := srcPool.QueryRow(ctx, `
+		INSERT INTO sandbox_storage_baseline
+			(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+		VALUES ($1, $2, $3, '/srv/retry/base.ext4', repeat('a', 64), 1048576, $4, $4, $4, $5)
+		RETURNING id`, baselineSandbox, team, sourceHostID, base, uuid.New()).Scan(&baselineID); err != nil {
+		t.Fatal(err)
+	}
+	if err := srcPool.QueryRow(ctx, `
+		INSERT INTO retained_storage_measurement_obligation
+			(team_id, owner_kind, owner_id, host_id, effective_at, ended_at, resolved_at, migration_identity)
+		VALUES ($1, 'sandbox', $2, $3, $4, $4, $4, $5)
+		RETURNING id`, team, baselineSandbox, sourceHostID, base, identity).Scan(&obligationID); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, dstPool, `
+		INSERT INTO sandbox_storage_baseline (id, sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+		OVERRIDING SYSTEM VALUE
+		VALUES ($1, $2, $3, $4, '/srv/neighbor/base.ext4', repeat('b', 64), 2, $5, $5, $5, $6)`, baselineID, uuid.New(), neighbor, destHostID, base, uuid.New())
+	mustExec(t, dstPool, `
+		INSERT INTO retained_storage_measurement_obligation (id, team_id, owner_kind, owner_id, host_id, effective_at, ended_at, resolved_at, migration_identity)
+		OVERRIDING SYSTEM VALUE
+		VALUES ($1, $2, 'sandbox', $3, $4, $5, $5, $5, $6)`, obligationID, neighbor, uuid.New(), destHostID, base, uuid.New())
+	// These explicit restored IDs model a correctly prepared destination
+	// database. Advance, never reduce, the local generators before any writer
+	// or migration connection is allowed to allocate another row.
+	mustExec(t, dstPool, `SELECT setval(pg_get_serial_sequence('sandbox_storage_baseline','id'), GREATEST((SELECT last_value FROM sandbox_storage_baseline_id_seq), (SELECT max(id) FROM sandbox_storage_baseline)), true)`)
+	mustExec(t, dstPool, `SELECT setval(pg_get_serial_sequence('retained_storage_measurement_obligation','id'), GREATEST((SELECT last_value FROM retained_storage_measurement_obligation_id_seq), (SELECT max(id) FROM retained_storage_measurement_obligation)), true)`)
+
+	baselineSpec, _ := tableByName("sandbox_storage_baseline")
+	if _, _, err := copyTable(ctx, srcPool, dstPool, baselineSpec, team, nil); err != nil {
+		t.Fatalf("copy baseline history: %v", err)
+	}
+	obligationSpec, _ := tableByName("retained_storage_measurement_obligation")
+	if _, _, err := copyTable(ctx, srcPool, dstPool, obligationSpec, team, nil); err != nil {
+		t.Fatalf("copy obligation history: %v", err)
+	}
+	var gotID int64
+	if err := dstPool.QueryRow(ctx, `SELECT id FROM sandbox_storage_baseline WHERE team_id=$1`, team).Scan(&gotID); err != nil {
+		t.Fatal(err)
+	}
+	if gotID == baselineID {
+		t.Fatalf("baseline retry reused source-local id %d", gotID)
+	}
+	if err := dstPool.QueryRow(ctx, `SELECT id FROM retained_storage_measurement_obligation WHERE team_id=$1`, team).Scan(&gotID); err != nil {
+		t.Fatal(err)
+	}
+	if gotID == obligationID {
+		t.Fatalf("obligation retry reused source-local id %d", gotID)
+	}
+
+	// A second copy converges content using the stable natural/UUID identities.
+	mustExec(t, srcPool, `UPDATE sandbox_storage_baseline SET allocated_bytes = 2097152 WHERE team_id = $1`, team)
+	if _, _, err := copyTable(ctx, srcPool, dstPool, baselineSpec, team, nil); err != nil {
+		t.Fatalf("retry baseline history: %v", err)
+	}
+	if got := scanString(t, dstPool, `SELECT allocated_bytes::text FROM sandbox_storage_baseline WHERE team_id=$1`, team); got != "2097152" {
+		t.Fatalf("baseline retry did not converge content: %s", got)
+	}
+	if got := scanString(t, dstPool, `SELECT count(*)::text FROM retained_storage_measurement_obligation WHERE team_id=$1`, team); got != "1" {
+		t.Fatalf("obligation retry duplicated history: %s", got)
+	}
+
+	// Generated destination identities must not be rewound around an unrelated
+	// transaction that has already reserved a value. Exercise both commit
+	// orders against real PostgreSQL connections: migration-first leaves the
+	// writer pending, while writer-first gates the retry upsert on a row lock.
+	for _, writerFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("concurrent destination identity commit-order-%t", writerFirst), func(t *testing.T) {
+			raceTeam, raceNeighbor, sourceSandbox := uuid.New(), uuid.New(), uuid.New()
+			for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+				mustExec(t, pool, `INSERT INTO team (id, name) VALUES ($1, $2), ($3, $4)`,
+					raceTeam, "migration-sequence-race-"+raceTeam.String(), raceNeighbor, "migration-sequence-neighbor-"+raceNeighbor.String())
+			}
+			base := time.Date(2026, 7, 1, 11, 0, 0, 0, time.UTC)
+			sourceReceipt := uuid.New()
+			mustExec(t, srcPool, `
+				INSERT INTO sandbox_storage_baseline
+					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+				VALUES ($1, $2, $3, '/srv/race/source.ext4', repeat('c', 64), 1048576, $4, $4, $4, $5)`,
+				sourceSandbox, raceTeam, sourceHostID, base, sourceReceipt)
+			var committedID int64
+			if err := dstPool.QueryRow(ctx, `
+				INSERT INTO sandbox_storage_baseline
+					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+				VALUES ($1, $2, $3, '/srv/race/committed.ext4', repeat('d', 64), 2, $4, $4, $4, $5)
+				RETURNING id`, uuid.New(), raceNeighbor, destHostID, base, uuid.New()).Scan(&committedID); err != nil {
+				t.Fatal(err)
+			}
+			writerTx, err := dstPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writerTx.Rollback(ctx)
+			var writerID int64
+			if err := writerTx.QueryRow(ctx, `
+				INSERT INTO sandbox_storage_baseline
+					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+				VALUES ($1, $2, $3, '/srv/race/outstanding.ext4', repeat('e', 64), 3, $4, $4, $4, $5)
+				RETURNING id`, uuid.New(), raceNeighbor, destHostID, base.Add(time.Minute), uuid.New()).Scan(&writerID); err != nil {
+				t.Fatal(err)
+			}
+			if writerID <= committedID {
+				t.Fatalf("destination identity did not advance: committed=%d writer=%d", committedID, writerID)
+			}
+
+			// Writer-first uses a committed matching natural-key row as a
+			// supported barrier. The unrelated writer owns its row lock while
+			// copyTable reaches the ON CONFLICT update, so the test observes a
+			// real destination wait without locking a sequence relation.
+			if writerFirst {
+				mustExec(t, dstPool, `
+					INSERT INTO sandbox_storage_baseline
+						(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+					VALUES ($1, $2, $3, '/srv/race/barrier.ext4', repeat('f', 64), 7, $4, $4, $4, $5)`,
+					sourceSandbox, raceTeam, sourceHostID, base, sourceReceipt)
+				var barrierID int64
+				if err := writerTx.QueryRow(ctx, `
+					SELECT id FROM sandbox_storage_baseline
+					WHERE sandbox_id=$1 AND host_id=$2 AND effective_at=$3 AND receipt_id=$4
+					FOR UPDATE`, sourceSandbox, sourceHostID, base, sourceReceipt).Scan(&barrierID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			spec, ok := tableByName("sandbox_storage_baseline")
+			if !ok {
+				t.Fatal("sandbox baseline table is missing from migration table list")
+			}
+			raceCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, _, copyErr := copyTable(raceCtx, srcPool, dstPool, spec, raceTeam, nil)
+				done <- copyErr
+			}()
+			if writerFirst {
+				waited := false
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					var waiting bool
+					if err := dstPool.QueryRow(raceCtx, `SELECT EXISTS(
+						SELECT 1 FROM pg_stat_activity
+						WHERE wait_event_type='Lock' AND $1::integer=ANY(pg_blocking_pids(pid)))`, writerTx.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+					if waiting {
+						waited = true
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if !waited {
+					t.Fatal("migration copy did not wait for the destination barrier row lock")
+				}
+			}
+
+			var copyErr error
+			if writerFirst {
+				if err := writerTx.Commit(raceCtx); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case copyErr = <-done:
+				case <-raceCtx.Done():
+					t.Fatalf("migration copy did not finish after barrier release: %v", raceCtx.Err())
+				}
+			} else {
+				select {
+				case copyErr = <-done:
+				case <-raceCtx.Done():
+					t.Fatal("migration copy did not commit before unrelated writer")
+				}
+				if err := writerTx.Commit(raceCtx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if copyErr != nil {
+				t.Fatalf("concurrent accounting copy: %v", copyErr)
+			}
+			var migratedID int64
+			if err := dstPool.QueryRow(ctx, `SELECT id FROM sandbox_storage_baseline WHERE team_id=$1`, raceTeam).Scan(&migratedID); err != nil {
+				t.Fatal(err)
+			}
+			if migratedID == writerID {
+				t.Fatalf("accounting copy reused outstanding destination identity %d", writerID)
+			}
+			if got := scanString(t, dstPool, `SELECT count(*)::text FROM sandbox_storage_baseline WHERE id=$1 AND team_id=$2`, writerID, raceNeighbor); got != "1" {
+				t.Fatalf("unrelated destination writer row was lost: %s", got)
+			}
+			var subsequentID int64
+			if err := dstPool.QueryRow(ctx, `
+				INSERT INTO sandbox_storage_baseline
+					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+				VALUES ($1, $2, $3, '/srv/race/subsequent.ext4', repeat('1', 64), 4, $4, $4, $4, $5)
+				RETURNING id`, uuid.New(), raceNeighbor, destHostID, base.Add(2*time.Minute), uuid.New()).Scan(&subsequentID); err != nil {
+				t.Fatal(err)
+			}
+			if subsequentID == writerID || subsequentID == migratedID || subsequentID <= writerID {
+				t.Fatalf("ordinary generated insert reused or regressed identity: writer=%d migrated=%d subsequent=%d", writerID, migratedID, subsequentID)
+			}
+			mustExec(t, srcPool, `DELETE FROM sandbox_storage_baseline WHERE team_id=$1`, raceTeam)
+			mustExec(t, dstPool, `DELETE FROM sandbox_storage_baseline WHERE team_id IN ($1,$2)`, raceTeam, raceNeighbor)
+			mustExec(t, srcPool, `DELETE FROM team WHERE id IN ($1,$2)`, raceTeam, raceNeighbor)
+			mustExec(t, dstPool, `DELETE FROM team WHERE id IN ($1,$2)`, raceTeam, raceNeighbor)
+		})
+	}
+
+	// Reassigning the durable baseline key to another team must be rejected,
+	// rather than treated as a successful idempotent retry.
+	mustExec(t, dstPool, `UPDATE sandbox_storage_baseline SET team_id=$2 WHERE team_id=$1`, team, neighbor)
+	if _, _, err := copyTable(ctx, srcPool, dstPool, baselineSpec, team, nil); err == nil || !strings.Contains(err.Error(), "another team") {
+		t.Fatalf("foreign baseline identity must refuse, got: %v", err)
 	}
 }
 
@@ -661,6 +1091,18 @@ func TestTeamMigration(t *testing.T) {
 			if want := team == f.team; expired != want {
 				t.Errorf("dest expiration evidence for team %s: got %v, want %v", team, expired, want)
 			}
+		}
+
+		sourceUsage := scanString(t, srcPool, `SELECT storage_mib_seconds($1,'2026-07-01 10:00Z','2026-07-01 11:00Z')::text`, f.team)
+		destUsage := scanString(t, dstPool, `SELECT storage_mib_seconds($1,'2026-07-01 10:00Z','2026-07-01 11:00Z')::text`, f.team)
+		if sourceID, destID := scanString(t, srcPool, `SELECT id::text FROM retained_storage_interval WHERE team_id=$1`, f.team), scanString(t, dstPool, `SELECT id::text FROM retained_storage_interval WHERE team_id=$1`, f.team); sourceID == destID {
+			t.Fatal("retained history reused a colliding source identity")
+		}
+		if sourceUsage != destUsage {
+			t.Fatalf("retained migration usage: source=%s destination=%s", sourceUsage, destUsage)
+		}
+		if got := scanString(t, dstPool, `SELECT count(*)::text FROM retained_storage_interval WHERE generation='neighbor'`); got != "1" {
+			t.Fatal("migration overwrote another team's identity")
 		}
 
 		// The pre-existing dest profile is not clobbered; the source stays as-is.

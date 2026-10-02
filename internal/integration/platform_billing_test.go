@@ -151,6 +151,7 @@ func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *te
 	if err != nil {
 		t.Fatalf("parse sandbox id: %v", err)
 	}
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
 	}
@@ -282,7 +283,7 @@ func TestPlatformBillingDeduplicatesSharedArtifactStorage(t *testing.T) {
 		}
 		if _, err := testPool.Exec(ctx, `
 			UPDATE sandbox
-			SET created_at = $2, base_path = $4, delta_path = $5
+			SET created_at = $2, base_path = $4, delta_path = NULLIF($5,'')
 			WHERE id = $1 AND team_id = $3
 		`, sandboxID, periodStart, teamID, basePath, deltaPathForSandbox); err != nil {
 			t.Fatalf("prepare sandbox %d: %v", i, err)
@@ -420,6 +421,7 @@ func TestPlatformBillingUsesHalfOpenMonthBoundaryForUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse sandbox id: %v", err)
 	}
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
 	}

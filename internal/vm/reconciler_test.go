@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
 
 const (
@@ -326,6 +327,200 @@ func TestReclaimDiskOrphans_StopsOnCancel(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(runDir, trashDirName)); !os.IsNotExist(err) {
 		t.Error("no .trash should be created when ctx is cancelled")
+	}
+}
+
+// An archived orphan's private directory can be quarantined while its
+// template/base remains referenced by another sandbox. Retirement must use
+// the authoritative owner termination plus the private cleanup, and must not
+// wait for shared artifacts to disappear. The state reopen and inventory at
+// the end model the restart that previously left the survivor unmeasurable.
+func TestRetireArchivedOrphanAfterQuarantinePreservesSharedBase(t *testing.T) {
+	root := t.TempDir()
+	runDir := filepath.Join(root, "run")
+	snapshotDir := filepath.Join(root, "snapshots")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if state != nil {
+			_ = state.Close()
+		}
+	}()
+
+	sharedBase := filepath.Join(root, "templates", "base.ext4")
+	if err := os.MkdirAll(filepath.Dir(sharedBase), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sharedBase, []byte("shared base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orphanID := uuid.NewString()
+	orphanDir := filepath.Join(runDir, orphanID)
+	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sharedSnapshotDir := filepath.Join(snapshotDir, TemplatesDirName, "template-a")
+	if err := os.MkdirAll(sharedSnapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sharedSnapshot := filepath.Join(sharedSnapshotDir, "vmstate.snap")
+	sharedMemory := filepath.Join(sharedSnapshotDir, "mem.snap")
+	orphan := VMRecord{
+		ID: orphanID, Status: StatusPaused,
+		DiskPath:     filepath.Join(orphanDir, "overlay.ext4"),
+		SnapshotPath: sharedSnapshot,
+		MemFilePath:  sharedMemory,
+		BasePath:     sharedBase,
+	}
+	for _, path := range []string{orphan.DiskPath, orphan.SnapshotPath, orphan.MemFilePath} {
+		if err := os.WriteFile(path, []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := state.Put(orphan); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReleaseRetainingStorage(orphanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineDir(orphanDir, "2026-10-01"); err != nil {
+		t.Fatal(err)
+	}
+
+	survivorID := uuid.NewString()
+	survivorDir := filepath.Join(runDir, survivorID)
+	if err := os.MkdirAll(survivorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	survivor := VMRecord{
+		ID: survivorID, Status: StatusRunning,
+		DiskPath: filepath.Join(survivorDir, "overlay.ext4"),
+		BasePath: sharedBase, SourceSnapshotID: uuid.NewString(),
+	}
+	if err := os.WriteFile(survivor.DiskPath, []byte("survivor"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Put(survivor); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &Manager{state: state, cfg: ManagerConfig{RunDir: runDir, SnapshotDir: snapshotDir}, log: zerolog.Nop()}
+	r := NewReconciler(mgr, ReconcilerConfig{GracePeriod: 0})
+	dbSandboxes := map[string]db.ListSandboxesByHostRow{}
+	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	r.retireArchivedOrphans(context.Background(), now, dbSandboxes, nil, nil, zerolog.Nop())
+	r.retireArchivedOrphans(context.Background(), now.Add(time.Second), dbSandboxes, nil, nil, zerolog.Nop())
+	archived, err := state.retainedArchivedRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archived) != 0 {
+		t.Fatalf("quarantined orphan archive remains: %+v", archived)
+	}
+	if _, err := os.Stat(sharedBase); err != nil {
+		t.Fatalf("shared base was removed while survivor retained it: %v", err)
+	}
+	for _, path := range []string{sharedSnapshot, sharedMemory} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("shared template dependency was removed while survivor retained it: %v", err)
+		}
+	}
+
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, err = OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.state = state
+	inv, err := mgr.retainedStorageInventoryWithPersistence(context.Background(), func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+		return []retainedstorage.Extent{{Device: "fixture", Start: 0, Length: 4096}}, "fixture", nil
+	}, false)
+	if err != nil {
+		t.Fatalf("survivor inventory failed after restart: %v", err)
+	}
+	if len(inv.Owners) != 1 || inv.Owners[0].ID != survivorID {
+		t.Fatalf("inventory owners = %+v, want survivor %s", inv.Owners, survivorID)
+	}
+}
+
+// A stale archive scan must not retire an archive after a replacement live
+// generation appears. The live record's indexes and preview policy are kept
+// intact, and the archive remains available for live-over-archive precedence.
+func TestRetireArchivedOrphanReplacementGenerationWins(t *testing.T) {
+	root := t.TempDir()
+	runDir := filepath.Join(root, "run")
+	snapshotDir := filepath.Join(root, "snapshots")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+
+	id := uuid.NewString()
+	old := VMRecord{ID: id, Status: StatusPaused, CreatedAt: time.Unix(10, 0).UTC(),
+		DiskPath: filepath.Join(runDir, id, "overlay.ext4"), SnapshotPath: filepath.Join(runDir, id, "vmstate.snap"),
+		MemFilePath: filepath.Join(runDir, id, "mem.snap")}
+	if err := state.Put(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReleaseRetainingStorage(id); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{state: state, cfg: ManagerConfig{RunDir: runDir, SnapshotDir: snapshotDir}, log: zerolog.Nop()}
+	r := NewReconciler(mgr, ReconcilerConfig{GracePeriod: 0})
+	unlock, err := mgr.lockVMOp(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An in-flight lifecycle operation wins before the replacement is visible.
+	r.retireArchivedOrphans(context.Background(), time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), nil, nil, nil, zerolog.Nop())
+	unlock()
+
+	// This is the replacement that raced the pass-level archive snapshot.
+	newer := old
+	newer.Status = StatusRunning
+	newer.CreatedAt = time.Unix(20, 0).UTC()
+	newer.PID = 1234
+	newer.Supervision = SupervisionCgroup
+	newer.Namespace = "ns-replacement"
+	newer.PreviewAccess = "private"
+	newer.PreviewPolicyRevision = 7
+	if err := state.Put(newer); err != nil {
+		t.Fatal(err)
+	}
+
+	r.retireArchivedOrphans(context.Background(), time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), nil, nil, nil, zerolog.Nop())
+
+	got, err := state.Get(id)
+	if err != nil || got == nil || got.CreatedAt != newer.CreatedAt || got.PreviewPolicyRevision != 7 {
+		t.Fatalf("replacement live record changed or disappeared: got=%+v err=%v", got, err)
+	}
+	if gotNamespaces, err := state.SlotNamespaces(); err != nil || gotNamespaces[id] != newer.Namespace {
+		t.Fatalf("replacement slot index = %#v err=%v", gotNamespaces, err)
+	}
+	hasCgroup, err := state.HasCgroupRecords()
+	if err != nil || !hasCgroup {
+		t.Fatalf("replacement cgroup index missing: has=%v err=%v", hasCgroup, err)
+	}
+	archived, err := state.retainedArchivedRecords()
+	if err != nil || len(archived) != 1 || archived[0].CreatedAt != old.CreatedAt {
+		t.Fatalf("stale archive was retired or changed: archived=%+v err=%v", archived, err)
 	}
 }
 
