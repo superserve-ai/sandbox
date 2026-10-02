@@ -1,56 +1,146 @@
 # Regional database migrations
 
-Use the deployment wrapper for the configured remote databases:
+Install `scripts/migration-requirements.txt` and use Supabase CLI 2.119.0.
+All remote actions go through `scripts/migrate_database.py`; `make migrate-local`
+is only for disposable databases. Targets are `staging`, `use4`, and `usw2`.
+The wrapper requires the selected project's direct port 5432 endpoint and
+PostgreSQL 17+, with startup/reset defaults of 250ms lock timeout and 2s
+transaction timeout. Session poolers are not accepted. The hosted runner must
+have a working route to the direct endpoint; DNS alone does not prove access.
+Never print `DATABASE_URL` or include it in a command transcript.
 
-```sh
-# DATABASE_URL is supplied by the environment; never print it.
-python3 scripts/migrate_database.py use4 dry-run
-python3 scripts/migrate_database.py use4 list
-python3 scripts/migrate_database.py use4 push
-```
+## Shared Auth history
 
-Targets are `staging`, `use4`, and `usw2`. The wrapper verifies that the
-connection identifies the selected Supabase project, including the project
-suffix in pooled connection usernames. All CD migration steps, including
-manual workflow dispatches, use this same path. `make migrate-local` remains
-for disposable local databases only.
+East also hosts shared Auth. Its existing migration entry
+`20261002155220_shared_signup_device_evidence_setup` is a single statement
+assembled from three pinned sources. The exact bytes live under
+`supabase/shared-auth-history/`, outside the regional migration directory.
+The wrapper verifies its version, name, statement count and hash before and
+after execution. It adds the unchanged artifact to an isolated CLI workdir
+only for East, and refuses a dry run proposing to replay it.
 
-The East project also hosts shared Auth. Its migration history includes
-`20261002155220_shared_signup_device_evidence_setup`, originally applied as
-one statement assembled from three shared-Auth scripts. The exact historical
-SQL is retained under `supabase/shared-auth-history/`, outside the ordinary
-regional migration directory. Its source comments and whitespace are part of
-the recorded fingerprint; do not regenerate or edit it casually.
-
-For East only, the wrapper checks the existing history version, name,
-single-statement count and SHA-256 before adding that artifact to an isolated
-temporary migration workdir. It verifies the canonical source hashes and
-rejects collisions. A CLI dry run must not propose applying the aggregate.
-The subsequent push uses the same files and preserves the existing history.
-This recognizes an already completed setup; it cannot initialize shared Auth.
-
-Staging and West use only the ordinary regional chain. Existing Auth tables
-do not select an overlay. Missing or mismatched East history, or unexpected
-aggregate history in another target, stops migration without changing history.
-Route such failures to the database owner; do not mark versions reverted, add
-placeholder migrations, use `--include-all`, or replay Auth setup regionally.
-
-Regression coverage uses the actual deployment CLI and disposable Docker
-PostgreSQL: `python3 scripts/test_migration_overlay.py`. No live database is
-used by these tests.
+This recognizes completed setup; it cannot initialize shared Auth. Missing or
+mismatched East history, or aggregate history in another region, stops execution.
+Do not repair history manually, mark versions reverted, use `--include-all`,
+or replay Auth setup regionally.
 
 ## Coordinated release
 
-Automatic API, Proxy, and Terraform rollout jobs intentionally stop before
-deployment or infrastructure apply when the complete push changes migration
-composition, shared-Auth history, or their deployment controls. Mixed changes
-also stop, and an unverifiable push range fails closed. CI and CD Migrate remain
-independent and can finish. Other automatic releases require successful push CI
-at the exact revision in addition to their migration gate.
+Control-changing pushes intentionally stop CD Migrate before database jobs.
+The same hold stops applicable automatic application deployment lanes. This
+includes mixed SQL/control changes and unverified push ranges. A held CD run
+is not successful migration evidence. CI still runs.
 
-After verifying successful CI and every target's migrations at the approved
-revision, use the normal coordinated manual API, VMD, and Proxy workflows.
-Manual dispatch retains the operator's responsibility for those prerequisites.
-A held Terraform rollout is not permission to apply infrastructure manually;
-route any infrastructure release to its owner. Never race to cancel an already
-running deployment as a substitute for the gate.
+After a separately approved merge, verify successful push CI at the exact main
+revision. Dispatch CD Migrate with `action=preflight` for a read-only direct
+connection/settings check. `action=migrate` is a separate release and requires
+a successful same-revision preflight run covering all selected environments.
+Staging runs first, then East and West. Each regional action rechecks main after
+protected-environment approval, immediately before database access. If main
+advances, stop and reassess the release. A code approval does not authorize
+merge, database execution, service pause, session termination or activation.
+
+Only after actual successful migrations and a separate application release,
+use the coordinated manual API, VMD and Proxy workflows. Their manual paths
+retain the operator's responsibility for migration prerequisites. Route held
+infrastructure work to its owner. Do not cancel an in-flight deployment as a
+substitute for the gates.
+
+## Retained-storage recovery
+
+The fixed `retained-storage-v1` plan handles West before retained migration 01
+or at a prefix produced by this recovery. Staging and East must already have
+all 24 canonical entries and remain read-only. Source files and applied history
+are never rewritten. West's new 01/03/14 entries truthfully contain the recovery
+SQL executed by the CLI; the other 21 retain their canonical statements.
+
+The runner first installs nullable host attribution and its stamping trigger
+without backfilling old intervals. It builds three indexes concurrently outside
+the short metadata transactions and validates the new reason constraint before
+swapping it into place. A private database journal binds the exact plan,
+predecessor history, preparation state and index table identities. Each phase
+checks the expected catalog and ledger under the same session mutex used for
+mutation. Ordinary migrations refuse an incomplete journal. Completed recovery
+preserves its historical receipts while allowing subsequent ordinary migrations.
+
+Use the distinct `recovery-preflight` and `recover` actions. Production requires
+an authenticated evidence run ID described below. Recovery preflight reads the
+database without initializing the journal and uploads regional state receipts.
+Recover downloads those receipts from the successful same-revision recovery
+preflight run. A normal connection preflight cannot authorize recovery.
+Fresh evidence may replace an expired collection only when its verified writer
+state and inventory match the preflight receipt. Any changed database or writer
+state requires a new preflight and release decision.
+
+Execution retains the 250ms lock acquisition, 2s transaction and 60s command
+limits. Standalone concurrent index create/drop operations also have a 2s
+statement limit. These reduce exposure; they do not guarantee zero customer
+latency. Stop on failure. There is no automatic retry or timeout increase.
+After a separately authorized new preflight, a recorded invalid concurrent
+index may be removed only if its name, definition and table identity match the
+owned intent. Removal stops again before rebuilding. Unknown objects, altered
+source/history, journal holes, active retained accounting or queued retained
+payloads fail closed. Never delete an unrelated index or manually mark a
+migration applied.
+
+## Operational evidence prerequisite (currently blocked)
+
+The verifier is an artifact contract, not a collector or an access provisioner.
+This repository does not yet supply `.github/workflows/recovery-evidence.yml`.
+Consequently production recovery cannot pass its evidence gate until a separately
+reviewed collector and existing authenticated host-observation route are available.
+Do not replace that requirement with an operator-authored JSON assertion.
+
+The collector must run from the exact approved main revision, using
+`workflow_dispatch`, and publish the unique artifact
+`retained-recovery-evidence-usw2` containing only `evidence.json`. The verifier
+checks the authenticated GitHub run, artifact digest, plan/database identity,
+full cloud inventory and an observation at most 120 seconds old before each
+phase. Test fixtures in `scripts/test_recovery_evidence.py` illustrate the schema;
+they are synthetic data, not acceptable operational evidence.
+
+The existing deployment identity is selected by `GCP_WORKLOAD_IDENTITY_PROVIDER`
+and `GCP_SERVICE_ACCOUNT`. Reusing those secret references does not establish
+that the identity has the needed permissions. An operator must establish these
+specific prerequisites without changing live configuration as part of recovery:
+
+- GitHub `contents:read` and `actions:read` for the exact run/artifact, plus OIDC
+  `id-token:write` to use the existing GCP workload identity.
+- Existing cloud permissions for service metadata, all service revisions, all
+  project VM instances, and complete revision-deletion audit logs. The relevant
+  reads are `run.services.get`, `run.revisions.list`, `compute.instances.list`
+  and `logging.logEntries.list`. The verifier uses `gh`, Cloud SDK and Python.
+- An already authenticated, non-provisioning route to read every relevant host's
+  process inventory, executable hashes, installed restart units/drop-ins and
+  effective configuration, process start/incarnation/destination, and all report
+  spools. Do not invoke deployment scripts or let SSH register keys or metadata.
+  Configuration evidence must be hashed/redacted without exporting secrets.
+- Authenticated binary-to-source provenance. API build image archives can be
+  digest-compared with the observed image. Existing VMD deployment builds upload
+  binaries without a retained provenance artifact; those installed binaries need
+  authenticated historical build evidence or a verified reproducible build.
+
+Coverage includes serving, tagged, zero-traffic/background and draining revisions,
+all project instances including standby hosts, installed restart executables and
+alternate producers. Sidecars, command overrides, unaudited builds, automatic
+binary downloads or unfinished rollouts prevent admission. Recent revision deletion
+must be excluded through complete audit coverage spanning at least ten minutes
+before collection. The admitted source is pinned in the verifier and was audited
+for both retained production and persisted replay behavior.
+
+Sampling disabled is insufficient: publishers can replay persisted payloads.
+Inspect `.storage-report-queue`, `.storage-report-queue.v2` and
+`.storage-report-queue.migrating/state.json`, plus both database report queues.
+Require an independently coordinated deployment/configuration hold for the whole
+recovery. Observe effective runtime and restart sources; a source label or a
+configuration checkbox is not evidence. Missing access or provenance blocks
+operations and must be routed to the deployment owner; this change grants no IAM,
+creates no observer, provisions no SSH access and performs no production trial.
+
+## Validation
+
+Regression tests use the actual pinned CLI against disposable Docker PostgreSQL 17.6:
+`test_migration_cli.py`, `test_migration_overlay.py`, `test_migration_execution.py`
+and `test_migration_recovery.py`. Evidence and release-gate tests exercise missing,
+stale and changed observations and the distinction between ordinary and recovery
+preflight. They do not establish hosted connectivity or production writer exclusion.

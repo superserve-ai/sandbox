@@ -10,6 +10,12 @@ import time
 
 RECOVERY_PATHS = {
     "scripts/migrate_database.py",
+    "scripts/retained_storage_recovery.py",
+    "scripts/recovery_evidence.py",
+    "scripts/migration-requirements.txt",
+    "scripts/test_migration_recovery.py",
+    "scripts/test_recovery_evidence.py",
+    ".github/workflows/recovery-evidence.yml",
     ".github/workflows/cd.yml",
     ".github/workflows/deploy-api.yml",
     ".github/workflows/deploy-proxy.yml",
@@ -34,7 +40,7 @@ def recovery_hold(before, revision, event, *, run=subprocess.run):
         if result.returncode:
             return True
         return any(path in RECOVERY_PATHS or path.startswith(
-            ("supabase/shared-auth-history/", "supabase/shared-auth-migrations/"))
+            ("supabase/shared-auth-history/", "supabase/shared-auth-migrations/", "supabase/recovery/"))
             for path in result.stdout.split("\0"))
     except (OSError, subprocess.TimeoutExpired):
         return True
