@@ -1,3 +1,7 @@
+-- Hold the lock and the trigger replacement in one transaction; `supabase db push`
+-- applies each file with autocommit, so a bare LOCK TABLE cannot run.
+BEGIN;
+
 SET LOCAL lock_timeout = '250ms';
 
 -- Drain inserts using the former trigger before making the marker mandatory.
@@ -17,3 +21,5 @@ BEGIN
  RETURN NEW;
 END;
 $$;
+
+COMMIT;
