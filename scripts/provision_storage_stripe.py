@@ -92,28 +92,36 @@ class Stripe:
             raise ProvisionError("Credential belongs to a different Stripe account")
 
     def inventory(self, kind):
-        rows, cursor, seen = [], None, set()
-        for _ in range(100):
-            params = {"limit": 100}
-            if cursor:
-                params["starting_after"] = cursor
-            page = self.request("GET", PATHS[kind], params)
-            data = page.get("data")
-            if not isinstance(data, list) or type(page.get("has_more")) is not bool:
-                raise ProvisionError("Malformed Stripe inventory")
-            for item in data:
-                if not isinstance(item, dict) or not item.get("id") or item["id"] in seen:
-                    raise ProvisionError("Malformed or repeated Stripe inventory item")
-                if item.get("livemode") is not self.live:
-                    raise ProvisionError("Stripe inventory environment mismatch")
-                seen.add(item["id"])
-                rows.append(item)
-            if not page["has_more"]:
-                return rows
-            if not data:
-                raise ProvisionError("Incomplete Stripe inventory")
-            cursor = data[-1]["id"]
-        raise ProvisionError("Stripe inventory exceeds 10,000 objects; no writes attempted")
+        rows, seen = [], set()
+        # Stripe lists only active prices by default; archived prices can still conflict.
+        filters = [{"active": "true"}, {"active": "false"}] if kind == "price" else [{}]
+        for filters_for_state in filters:
+            cursor = None
+            for _ in range(100):
+                params = {"limit": 100, **filters_for_state}
+                if cursor:
+                    params["starting_after"] = cursor
+                page = self.request("GET", PATHS[kind], params)
+                data = page.get("data")
+                if not isinstance(data, list) or type(page.get("has_more")) is not bool:
+                    raise ProvisionError("Malformed Stripe inventory")
+                for item in data:
+                    if not isinstance(item, dict) or not item.get("id") or item["id"] in seen:
+                        raise ProvisionError("Malformed or repeated Stripe inventory item")
+                    if item.get("livemode") is not self.live:
+                        raise ProvisionError("Stripe inventory environment mismatch")
+                    seen.add(item["id"])
+                    rows.append(item)
+                    if len(rows) > 10000:
+                        raise ProvisionError("Stripe inventory exceeds 10,000 objects; no writes attempted")
+                if not page["has_more"]:
+                    break
+                if not data:
+                    raise ProvisionError("Incomplete Stripe inventory")
+                cursor = data[-1]["id"]
+            else:
+                raise ProvisionError("Stripe inventory exceeds 100 pages per state; no writes attempted")
+        return rows
 
 
 def one(items, kind):
