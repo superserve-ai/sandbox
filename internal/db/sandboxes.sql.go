@@ -28,7 +28,7 @@ WITH activated AS (
   RETURNING id, team_id, host_id, vcpu_count, memory_mib, disk_mib
 ),
 retained_fence AS (
-  SELECT pg_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || a.host_id, 0))
+  SELECT pg_try_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || a.host_id, 0))
   FROM activated a
 ),
 opened_compute AS (
@@ -54,7 +54,6 @@ opened_measurement_obligation AS (
   )
   SELECT a.team_id, 'sandbox', a.id, a.host_id, clock_timestamp()
   FROM activated a
-  CROSS JOIN retained_fence f
   WHERE feature_enabled('billing_metrics_write', a.team_id)
     AND EXISTS (
       SELECT 1 FROM retained_storage_cutover c
@@ -73,6 +72,7 @@ opened_measurement_obligation AS (
 INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
+CROSS JOIN (SELECT count(*) FROM retained_fence) retained_fence_guard
 CROSS JOIN (SELECT count(*) FROM opened_measurement_obligation) obligation_fence
 WHERE feature_enabled('billing_metrics_write', a.team_id)
   -- After retained physical reporting has cut over, activation.disk_mib is

@@ -52,7 +52,11 @@ SELECT EXISTS (
 	// Lock only owners whose contribution is new or changed. A host-wide lock
 	// (or locking an unchanged fleet) would make a periodic inventory contend
 	// with unrelated pause/resume/destroy writes.
-	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
+	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id,
+       baseline->>'path' AS baseline_path,
+       baseline->>'generation' AS baseline_generation,
+       (baseline->>'allocated_bytes')::bigint AS baseline_allocated_bytes
+       FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,baseline jsonb))
  SELECT s.id FROM sandbox s JOIN supplied o ON o.kind='sandbox' AND o.id=s.id
 			 WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
 			   AND NOT EXISTS (
@@ -61,11 +65,18 @@ SELECT EXISTS (
 				   ON current.kind='sandbox' AND current.id=s.id
 				 WHERE i.host_id=$1 AND i.owner_kind='sandbox' AND i.owner_id=s.id
 				   AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
-				   AND i.generation=current.generation AND i.extents=current.extents)
+				   AND i.generation=current.generation AND i.extents=current.extents
+				   AND i.baseline_path IS NOT DISTINCT FROM current.baseline_path
+				   AND i.baseline_generation IS NOT DISTINCT FROM current.baseline_generation
+				   AND i.baseline_allocated_bytes IS NOT DISTINCT FROM current.baseline_allocated_bytes)
  FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
+	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id,
+       baseline->>'path' AS baseline_path,
+       baseline->>'generation' AS baseline_generation,
+       (baseline->>'allocated_bytes')::bigint AS baseline_allocated_bytes
+       FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,baseline jsonb))
 	 SELECT s.id FROM sandbox_snapshot s JOIN supplied o ON o.kind='snapshot' AND o.id=s.id
 			 WHERE s.host_id=$1 AND (s.status IN ('ready','creating','deleting') OR s.retention_ended_at>$2)
 			   AND s.created_at<=$2 AND (LEAST(s.deleted_at,s.retention_ended_at) IS NULL OR LEAST(s.deleted_at,s.retention_ended_at)>$2)
@@ -75,7 +86,10 @@ SELECT EXISTS (
 				   ON current.kind='snapshot' AND current.id=s.id
 				 WHERE i.host_id=$1 AND i.owner_kind='snapshot' AND i.owner_id=s.id
 				   AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
-				   AND i.generation=current.generation AND i.extents=current.extents)
+				   AND i.generation=current.generation AND i.extents=current.extents
+				   AND i.baseline_path IS NOT DISTINCT FROM current.baseline_path
+				   AND i.baseline_generation IS NOT DISTINCT FROM current.baseline_generation
+				   AND i.baseline_allocated_bytes IS NOT DISTINCT FROM current.baseline_allocated_bytes)
  FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
@@ -162,6 +176,32 @@ SELECT EXISTS (
 	}
 	if !complete {
 		return retainedStorageIncompleteError("retained inventory is incomplete or superseded")
+	}
+	// A receipt can be delayed behind an activation that happened after its
+	// boundary.  The activation may have opened a legacy provisioned interval
+	// because the cutover row was not visible yet.  Install the prospective
+	// cutover first, then retire only those intervening legacy rows at the
+	// receipt boundary; the retained interval below owns the post-boundary
+	// quantity and the initial gap remains unknown/unbilled.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO retained_storage_cutover(host_id,team_id,started_at)
+		SELECT DISTINCT $1,s.team_id,$2::timestamptz
+		FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid)
+		JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
+		WHERE s.host_id=$1 AND feature_enabled('billing_metrics_write',s.team_id)
+		ON CONFLICT DO NOTHING`, hostID, at, payload); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sandbox_storage_interval i
+		SET ended_at=$2::timestamptz,end_reason='reassigned'
+		WHERE i.host_id=$1 AND i.started_at>$2::timestamptz
+		  AND (i.ended_at IS NULL OR i.ended_at>$2::timestamptz)
+		  AND EXISTS (
+			SELECT 1 FROM retained_storage_cutover c
+			WHERE c.host_id=$1 AND c.team_id=i.team_id AND c.started_at=$2::timestamptz
+		  )`, hostID, at); err != nil {
+		return err
 	}
 	_, err = tx.Exec(ctx, `WITH supplied AS MATERIALIZED (
   SELECT o.kind,o.id,o.generation,o.extents,

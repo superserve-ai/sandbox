@@ -19,7 +19,7 @@ WHERE s.id = @sandbox_id AND s.team_id = @team_id AND s.destroyed_at IS NULL
   AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
 FOR SHARE OF s
 ), retained_fence AS (
-  SELECT pg_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || t.host_id, 0))
+  SELECT pg_try_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || t.host_id, 0))
   FROM target t
 ), inserted AS (
 INSERT INTO sandbox_snapshot (
@@ -32,7 +32,7 @@ SELECT @id::uuid, t.team_id, t.id, t.template_id, @kind::text, 'creating', sqlc.
     t.timeout_seconds, COALESCE(t.network_config, '{}'::jsonb),
     sandbox_secret_record(t.id),
     @sweep_after::timestamptz
-FROM target t CROSS JOIN retained_fence
+FROM target t
 RETURNING *
 ), opened_measurement_obligation AS (
 INSERT INTO retained_storage_measurement_obligation (
@@ -49,6 +49,7 @@ ON CONFLICT (owner_kind, owner_id) WHERE resolved_at IS NULL AND ended_at IS NUL
 RETURNING owner_id
 )
 SELECT i.* FROM inserted i
+CROSS JOIN (SELECT count(*) FROM retained_fence) retained_fence_guard
 CROSS JOIN (SELECT count(*) FROM opened_measurement_obligation) obligation_fence;
 
 -- name: GetSandboxSnapshot :one

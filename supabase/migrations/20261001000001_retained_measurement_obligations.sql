@@ -171,7 +171,8 @@ WITH bounds AS MATERIALIZED (
   CASE WHEN i.team_cutover IS NULL OR i.started_at<i.team_cutover
        THEN s.base_path END baseline_path,
   NULL::text baseline_generation,NULL::bigint baseline_allocated_bytes,
-  ((s.template_id IS NOT NULL AND s.base_path IS NULL)
+  ((s.template_id IS NOT NULL AND s.base_path IS NULL
+       AND i.team_cutover IS NOT NULL AND i.started_at>=i.team_cutover)
    OR (i.team_cutover IS NOT NULL AND s.base_path IS NOT NULL
        AND i.started_at>=i.team_cutover)) unresolved_baseline
  FROM sandbox s JOIN legacy_intervals i ON i.sandbox_id=s.id
@@ -187,6 +188,8 @@ WITH bounds AS MATERIALIZED (
  SELECT a.interval_host_id,a.team_cutover,p.path,
   CASE WHEN p.path=a.baseline_path THEN
     CASE WHEN a.baseline_generation IS NULL THEN NULL ELSE 'baseline:'||a.baseline_path||':'||a.baseline_generation END
+   WHEN p.path=a.delta_path AND a.template_id IS NOT NULL
+     THEN 'template-delta:'||a.template_id::text||':'||p.path
    ELSE 'private:'||a.id::text||':'||p.path END allocation_identity,
   CASE WHEN p.path=a.baseline_path THEN COALESCE(a.baseline_allocated_bytes,am_snapshot.allocated_bytes,am_template.allocated_bytes)
    ELSE COALESCE(am_snapshot.allocated_bytes,am_template.allocated_bytes) END artifact_bytes,
@@ -194,8 +197,12 @@ WITH bounds AS MATERIALIZED (
   LEAST(COALESCE(a.retention_end,a.request_now),p_end) range_end,
   a.unresolved_baseline,a.template_id,a.base_path,a.baseline_path
  FROM artifact_bounds a
+ LEFT JOIN template t ON t.id=a.template_id
  CROSS JOIN LATERAL unnest(ARRAY[a.base_path,a.delta_path,
-   CASE WHEN a.baseline_path IN (a.base_path,a.delta_path) THEN NULL ELSE a.baseline_path END]) p(path)
+   CASE WHEN a.baseline_path IN (a.base_path,a.delta_path) THEN NULL
+        WHEN a.baseline_path IS NOT NULL THEN a.baseline_path
+        WHEN a.base_path IS NULL AND a.delta_path IS NULL THEN t.rootfs_path
+        ELSE NULL END]) p(path)
  LEFT JOIN artifact_manifest am_snapshot ON am_snapshot.snapshot_id=a.snapshot_id AND am_snapshot.path=p.path
  LEFT JOIN artifact_manifest am_template ON am_template.snapshot_id IS NULL AND am_template.template_id=a.template_id AND am_template.path=p.path
  WHERE p.path IS NOT NULL
@@ -246,7 +253,9 @@ WITH bounds AS MATERIALIZED (
        AND GREATEST(a.billing_started_at,p_start)
            < LEAST(COALESCE(a.retention_end,a.request_now),p_end))
    OR EXISTS(SELECT 1 FROM artifact_bounds a WHERE a.template_id IS NOT NULL AND a.base_path IS NULL
-	       AND a.baseline_path IS NULL
+       AND a.team_cutover IS NOT NULL
+       AND a.billing_started_at >= a.team_cutover
+       AND a.baseline_path IS NULL
 	       -- An unresolved legacy prefix must not poison a wholly later
 	       -- window whose retained receipts have supplied valid provenance.
 	       AND GREATEST(a.billing_started_at,p_start)

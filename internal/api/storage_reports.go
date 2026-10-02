@@ -472,12 +472,15 @@ func processOneStorageReport(ctx context.Context, pool *pgxpool.Pool) bool {
 			  -- Once a newer report exists, repeatedly retrying the immutable
 			  -- incomplete predecessor would starve the recovery report.
 			  AND NOT (
-				state='retry_exhausted' AND EXISTS (
-				  SELECT 1 FROM host_storage_report newer
+				state='retry_exhausted' AND last_error LIKE 'retained storage inventory incomplete:%' AND EXISTS (
+					SELECT 1 FROM host_storage_report newer
 				  WHERE newer.host_id=host_storage_report.host_id
 				    AND newer.incarnation_id=host_storage_report.incarnation_id
 				    AND newer.ingest_seq>host_storage_report.ingest_seq
-				    AND newer.state<>'terminal'
+					-- Only this explicitly incomplete predecessor may be overtaken.
+					-- Database/lock failures remain ordered and retryable even after
+					-- recovery reports have arrived.
+					AND newer.state<>'terminal'
 				)
 			  )
 			  AND NOT EXISTS (
@@ -716,6 +719,7 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 			  AND prior.host_id=$1 AND prior.incarnation_id=$2 AND prior.report_id<>$3
 			  AND prior.received_at<$4 AND prior.state='retry_exhausted'
 			  AND prior.payload IS NOT NULL
+			  AND prior.last_error LIKE 'retained storage inventory incomplete:%'
 			  AND EXISTS (
 				SELECT 1 FROM jsonb_array_elements(prior.payload) entry
 				WHERE entry ? 'retained'
