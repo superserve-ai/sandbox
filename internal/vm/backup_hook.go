@@ -7,6 +7,7 @@ import (
 	"golang.org/x/time/rate"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -562,6 +563,14 @@ func (m *Manager) ensureRehashSlots() chan struct{} {
 // wait for the next process restart to try again.
 const pendingBackupSweepInterval = 5 * time.Minute
 
+// pendingSweepPassBudget bounds how long one pass keeps dispatching. Well
+// inside the interval so a slow pass never runs into its successor, and
+// long enough that a pass clears many records rather than the one the
+// old shape managed: at two concurrent rehashes this paces the backlog
+// down over hours while leaving the artifact array idle of sweep work
+// most of the time.
+const pendingSweepPassBudget = time.Minute
+
 // enqueueStagedPending hashes a pause's immutable staged copies and
 // enqueues them. The staged files carry no mutation risk, so the only
 // checks that remain are the base's (the base is not staged: guests
@@ -899,12 +908,16 @@ func (m *Manager) RecoverPendingBackups(ctx context.Context, log zerolog.Logger)
 		return
 	}
 	m.ensureRehashSlots()
-	m.runPendingBackups(ctx, log)
 	interval := m.pendingSweepInterval
 	if interval <= 0 {
 		interval = pendingBackupSweepInterval
 	}
+	// The first pass joins the ticker goroutine rather than running here:
+	// a pass now works until its budget is spent, and the caller's
+	// startup sequence continues into the template recovery, which must
+	// not wait on it.
 	go func() {
+		m.runPendingBackups(ctx, log)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -924,21 +937,62 @@ func (m *Manager) runPendingBackups(ctx context.Context, log zerolog.Logger) {
 		log.Error().Err(err).Msg("pending backup recovery: list failed")
 		return
 	}
-	for _, pb := range pending {
+	// rehashSlots bounds the disk cost; the budget bounds the pass, so it
+	// cannot run into its successor or hold the shared slots away from
+	// the template reconcile and the backfill for longer than one tick.
+	budget := m.pendingSweepBudget
+	if budget <= 0 {
+		budget = pendingSweepPassBudget
+	}
+	passCtx, endPass := context.WithTimeout(ctx, budget)
+	defer endPass()
+	// Resume after the last record offered a turn, wrapping once. The
+	// listing is key-ordered, so always starting at the head would keep
+	// re-offering the same records whenever they retain their markers
+	// (an unstaged enqueue does), and the tail of a long backlog would
+	// never be reached at all.
+	dispatched := 0
+	for _, pb := range m.pendingSweepOrder(pending) {
 		select {
 		case m.rehashSlots <- struct{}{}:
-		default:
-			// All slots busy: the rest of the backlog waits for the next
-			// sweep rather than piling up unbounded hash work.
-			log.Info().Msg("pending backup slots saturated; remaining records wait for the next sweep")
+		case <-passCtx.Done():
+			// Budget spent (or shutdown): the remainder is picked up by
+			// the next sweep, which starts where the listing does.
+			log.Info().Int("dispatched", dispatched).Int("pending", len(pending)).
+				Msg("pending backup sweep budget spent; remaining records wait for the next sweep")
 			return
 		}
+		dispatched++
+		m.pendingSweepCursor = pb.VMID
 		log.Info().Str("vm_id", pb.VMID).Msg("retrying pending pause backup")
+		// The worker runs under the caller's context, not the pass
+		// budget: a dispatched rehash owns its own deadline and must not
+		// be cut short because the pass stopped handing out work.
 		go func(pb PendingBackup) {
 			defer func() { <-m.rehashSlots }()
 			m.rehashPendingBackup(ctx, pb, log)
 		}(pb)
 	}
+	if dispatched > 0 {
+		log.Info().Int("dispatched", dispatched).Msg("pending backup sweep dispatched every retained record")
+	}
+}
+
+// pendingSweepOrder rotates a key-ordered listing to start after the last
+// record the previous pass offered a turn, so successive passes walk the
+// whole backlog instead of re-offering its head. Single-goroutine: the
+// startup pass and the ticker both run on the sweep goroutine.
+func (m *Manager) pendingSweepOrder(pending []PendingBackup) []PendingBackup {
+	if m.pendingSweepCursor == "" || len(pending) == 0 {
+		return pending
+	}
+	at := sort.Search(len(pending), func(i int) bool { return pending[i].VMID > m.pendingSweepCursor })
+	if at == 0 || at == len(pending) {
+		return pending
+	}
+	ordered := make([]PendingBackup, 0, len(pending))
+	ordered = append(ordered, pending[at:]...)
+	return append(ordered, pending[:at]...)
 }
 
 // fileMissing reports a definite ENOENT; any other stat outcome (success

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2077,5 +2078,131 @@ func TestEnqueueCarriesAllocatedBytes(t *testing.T) {
 		if f.AllocatedBytes != want[i] {
 			t.Fatalf("%s allocated = %d, want %d", f.Name, f.AllocatedBytes, want[i])
 		}
+	}
+}
+
+// One pass must work through the backlog, not dispatch a single record
+// and sleep until the next tick: with two slots and a five-minute cadence
+// that paced a backlog of thousands at about eight an hour, so it never
+// cleared.
+func TestPendingSweepDispatchesTheWholeBacklogInOnePass(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	const records = 25
+	for i := 0; i < records; i++ {
+		if err := st.PutPendingBackup(newPendingBackup(fmt.Sprintf("vm-%02d", i), "/snap", "/disk", "", "")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// No instance and a dead unit: every record resolves immediately as
+	// superseded, so the pass is measured on dispatch rather than on how
+	// long a rehash takes.
+	var mu sync.Mutex
+	done := 0
+	m := &Manager{
+		state:    st,
+		log:      zerolog.Nop(),
+		vms:      map[string]*VMInstance{},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.rehashDone = func() {
+		mu.Lock()
+		done++
+		mu.Unlock()
+	}
+
+	m.ensureRehashSlots()
+	m.runPendingBackups(context.Background(), zerolog.Nop())
+	// Taking every slot waits for the dispatched workers: each releases
+	// its slot only after its rehash returns.
+	for i := 0; i < cap(m.rehashSlots); i++ {
+		m.rehashSlots <- struct{}{}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if done != records {
+		t.Fatalf("one pass dispatched %d of %d retained records", done, records)
+	}
+}
+
+// A pass that runs out of budget while every slot is held must return,
+// not block the sweep goroutine behind a long rehash.
+func TestPendingSweepReturnsWhenItsBudgetIsSpent(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for i := 0; i < 10; i++ {
+		if err := st.PutPendingBackup(newPendingBackup(fmt.Sprintf("vm-%02d", i), "/snap", "/disk", "", "")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := &Manager{state: st, log: zerolog.Nop(), pendingSweepBudget: 20 * time.Millisecond}
+	m.ensureRehashSlots()
+	// Every slot held by work this pass cannot influence.
+	for i := 0; i < cap(m.rehashSlots); i++ {
+		m.rehashSlots <- struct{}{}
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		m.runPendingBackups(context.Background(), zerolog.Nop())
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pass never returned with its budget spent and every slot held")
+	}
+}
+
+// Records that keep their markers would otherwise be re-offered at the
+// head of every key-ordered pass, and the tail of a long backlog would
+// never get a turn. The rotation is what prevents that, so it is asserted
+// directly rather than through a pass whose reach depends on timing.
+func TestPendingSweepOrderResumesAfterTheCursor(t *testing.T) {
+	pending := make([]PendingBackup, 0, 6)
+	for i := 0; i < 6; i++ {
+		pending = append(pending, PendingBackup{VMID: fmt.Sprintf("vm-%02d", i)})
+	}
+	names := func(got []PendingBackup) []string {
+		out := make([]string, 0, len(got))
+		for _, pb := range got {
+			out = append(out, pb.VMID)
+		}
+		return out
+	}
+
+	for _, tc := range []struct {
+		name   string
+		cursor string
+		want   []string
+	}{
+		{"no cursor starts at the head", "", []string{"vm-00", "vm-01", "vm-02", "vm-03", "vm-04", "vm-05"}},
+		{"resumes after the cursor and wraps", "vm-02", []string{"vm-03", "vm-04", "vm-05", "vm-00", "vm-01", "vm-02"}},
+		{"a cursor past the tail starts at the head", "vm-05", []string{"vm-00", "vm-01", "vm-02", "vm-03", "vm-04", "vm-05"}},
+		{"a cursor whose record is gone resumes after it", "vm-02x", []string{"vm-03", "vm-04", "vm-05", "vm-00", "vm-01", "vm-02"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Manager{pendingSweepCursor: tc.cursor}
+			got := names(m.pendingSweepOrder(pending))
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("order = %v, want %v", got, tc.want)
+			}
+			// The listing the caller handed in is never reordered.
+			if first := pending[0].VMID; first != "vm-00" {
+				t.Fatalf("the caller's listing was rotated in place: starts at %s", first)
+			}
+		})
 	}
 }

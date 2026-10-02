@@ -508,6 +508,14 @@ type Manager struct {
 	// pendingInFlight guards one pending-backup worker per VM across the
 	// startup recovery and the periodic sweep.
 	pendingInFlight sync.Map
+	// pendingSweepCursor is the last record a sweep pass offered a turn,
+	// so the next pass resumes after it instead of re-offering the head
+	// of a key-ordered listing. Sweep-goroutine only, and deliberately
+	// not persisted: a restart may re-offer the head once.
+	pendingSweepCursor string
+	// pendingSweepBudget overrides how long one pending-backup sweep pass
+	// keeps dispatching in tests; zero means pendingSweepPassBudget.
+	pendingSweepBudget time.Duration
 	// pendingSweepInterval overrides the pending-backup sweep pace in
 	// tests; 0 means pendingBackupSweepInterval.
 	pendingSweepInterval time.Duration
