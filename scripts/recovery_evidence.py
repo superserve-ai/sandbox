@@ -152,6 +152,7 @@ class Observation:
         self.plan_hash, self.database_project, self.deadline = plan_hash, database_project, deadline
         self.artifact_digest = None
         self.state_digest = None
+        self.valid_until = None
 
     def api(self, path, binary=False):
         return command(["gh", "api", f"repos/{self.repository}/{path}"], self.deadline, binary=binary)
@@ -185,5 +186,6 @@ class Observation:
             "inventory_after", "revisions", "hosts", "alternate_producers", "deployment_and_toggle_hold")})
         require(self.state_digest is None or self.state_digest == state_digest,
                 "Observed writer state changed during recovery")
+        self.valid_until = timestamp(document["started_at"]) + MAX_AGE_SECONDS
         self.state_digest = state_digest
         self.artifact_digest = digest

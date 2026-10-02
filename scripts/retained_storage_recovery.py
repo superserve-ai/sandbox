@@ -15,6 +15,7 @@ PLAN = "retained-storage-v1"
 FIRST = "20261003010001"
 LAST = "20261003010024"
 MUTEX = 6834211091020401
+RECOVERY_TIMEOUT = 180
 PREPARATIONS = ("host", "storage_index", "reason", "validated_reason", "owner_index", "snapshot_index")
 INDEXES = {
     "storage_index": (0, "sandbox_storage_interval", "sandbox_storage_interval_host_window",
@@ -135,6 +136,7 @@ class Recovery:
     def __init__(self, target, database_url, root, cli, deadline, observation=None):
         self.target, self.url, self.root, self.cli = target, database_url, root, cli
         self.deadline, self.observation = deadline, observation
+        self.overall_deadline = deadline
         self.manifest, self.plan_hash, self.overlays, self.names, self.host_sql = load_plan(root)
 
     @contextlib.contextmanager
@@ -274,14 +276,25 @@ class Recovery:
                 "guard_catalog": conn.execute("SELECT md5(value::text) FROM (" + self.catalog_query() + ") q(value)").fetchone()[0],
                 "guard_receipts": conn.execute(RECEIPT_GUARD).fetchone()[0] if journal else None}
 
+    def guard_mutation(self, conn):
+        remaining = min(self.deadline, self.overall_deadline) - time.monotonic()
+        if self.target == "usw2":
+            remaining = min(remaining, float(self.observation.valid_until) - time.time())
+        milliseconds = min(2000, int(remaining * 1000))
+        require(milliseconds > 0, "Recovery deadline or evidence expired before mutation")
+        conn.execute("SELECT set_config('statement_timeout', %s, false)", (str(milliseconds),))
+
     def initialize(self, conn, state):
         require(self.target == "usw2" and state["prefix"] == 0, "Only an eligible West database can initialize recovery")
         with conn.transaction():
+            self.guard_mutation(conn)
             conn.execute(JOURNAL_SQL)
+            self.guard_mutation(conn)
             conn.execute("INSERT INTO migration_recovery.plan(plan_hash,predecessor_hash) VALUES(%s,%s)",
                          (self.plan_hash, state["predecessor_hash"]))
 
     def receipt(self, conn, name, state="ready", **data):
+        self.guard_mutation(conn)
         evidence = {"plan_hash": self.plan_hash, **data}
         conn.execute("INSERT INTO migration_recovery.preparation(name,state,evidence) VALUES(%s,%s,%s) "
                      "ON CONFLICT(name) DO UPDATE SET state=excluded.state,evidence=excluded.evidence",
@@ -303,17 +316,16 @@ class Recovery:
             if value is not None or item[0] == "dropping":
                 self.receipt(conn, name, "dropping", table_oid=oid)
                 if value is not None:
-                    conn.execute("SET statement_timeout='2s'")
+                    self.guard_mutation(conn)
                     conn.execute(f"DROP INDEX CONCURRENTLY public.{index}")
-                    conn.execute("RESET statement_timeout")
                 self.receipt(conn, name, "intent", table_oid=oid)
                 raise migration.MigrationError("Owned invalid index removed; obtain authorization before resuming")
-            conn.execute("SET statement_timeout='2s'")
+            self.guard_mutation(conn)
             conn.execute(f"CREATE INDEX CONCURRENTLY {index} ON public.{table}({columns})")
-            conn.execute("RESET statement_timeout")
             self.receipt(conn, name, table_oid=oid)
         else:
             with conn.transaction():
+                self.guard_mutation(conn)
                 if name == "host":
                     conn.execute(self.host_sql)
                 elif name == "reason":
@@ -333,6 +345,7 @@ class Recovery:
         return PREPARATIONS[count] if count < limit else None
 
     def push_one(self, state, project):
+        self.command_deadline()
         self.observe()
         version = sorted(self.names)[state["prefix"]]
         paths = project / "supabase/migrations"
@@ -348,6 +361,8 @@ class Recovery:
         guard = migration.EXECUTION_GUARD + "SET search_path=public,pg_catalog;\n" + f"""
 DO $$ BEGIN
  IF NOT pg_try_advisory_lock({MUTEX}) THEN RAISE EXCEPTION 'migration mutex busy'; END IF;
+ IF clock_timestamp() >= to_timestamp({float(self.observation.valid_until)})
+ THEN RAISE EXCEPTION 'recovery evidence expired'; END IF;
  IF ({HISTORY_GUARD}) <> '{state["guard_history"]}'
  OR NOT EXISTS(SELECT FROM migration_recovery.plan WHERE plan_hash='{self.plan_hash}' AND NOT complete)
  OR (SELECT md5(value::text) FROM ({self.catalog_query()}) q(value)) <> '{state["guard_catalog"]}'
@@ -370,18 +385,47 @@ END $writers$;
         (project / "supabase/roles.sql").write_text(guard)
         migration.cli_run(self.cli, self.url, project, ["db", "push", "--yes", "--include-roles"], self.deadline)
 
+    def command_deadline(self):
+        self.deadline = min(self.overall_deadline, time.monotonic() + migration.COMMAND_TIMEOUT)
+        require(time.monotonic() < self.deadline, "Whole recovery deadline exceeded")
+        if self.observation is not None:
+            self.observation.deadline = self.deadline
+        return self.deadline
+
     def observe(self):
         require(self.observation is not None, "Authenticated deployment observation is required")
         self.observation.verify()
 
-    def run(self, project):
+    @staticmethod
+    def approved_state(state):
+        return {key: state[key] for key in ("prefix", "journal", "receipts", "history", "catalog", "guard_catalog")}
+
+    def run(self, project, approved):
+        expected, pushed = self.approved_state(approved), False
+        self.overall_deadline = time.monotonic() + RECOVERY_TIMEOUT
         while True:
-            if self.target == "usw2":
-                self.observe()
+            self.command_deadline()
             with self.connection() as conn:
+                if self.target == "usw2":
+                    self.observe()
                 state = self.inspect(conn)
+                if pushed:
+                    # The CLI released its mutex after committing exactly one
+                    # migration. Accept only that transition, never progress
+                    # made by another executor in the intervening gap.
+                    previous = self.approved_state(state)
+                    previous["prefix"] -= 1
+                    version = sorted(self.names)[expected["prefix"]]
+                    previous["history"] = [r for r in state["history"] if r[0] != version]
+                    previous["catalog"] = expected["catalog"]
+                    previous["guard_catalog"] = expected["guard_catalog"]
+                    require(previous == expected, "Recovery state changed after the approved migration")
+                else:
+                    require(self.approved_state(state) == expected,
+                            "Recovery state changed since the approved preflight or previous phase")
                 if state["prefix"] == 24:
                     if state["journal"] and not state["journal"][2]:
+                        self.guard_mutation(conn)
                         conn.execute("UPDATE migration_recovery.plan SET complete=true WHERE singleton")
                     return
                 if not state["journal"]:
@@ -390,8 +434,12 @@ END $writers$;
                 name = self.next_preparation(state)
                 if name:
                     self.prepare(conn, state, name)
+                    expected = self.approved_state(self.inspect(conn))
+                    pushed = False
                     continue
+                expected = self.approved_state(state)
             self.push_one(state, project)
+            pushed = True
 
 
 def ordinary_guard(target, database_url, root, cli, deadline):
@@ -408,6 +456,7 @@ def ordinary_guard(target, database_url, root, cli, deadline):
                          f" OR (SELECT md5(value::text) FROM ({runner.catalog_query()}) q(value))"
                          f" IS DISTINCT FROM '{state['guard_catalog']}'")
         else:
+            require(target != "usw2", "Ordinary West migration requires completed recovery")
             condition = "EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')"
             require(not conn.execute("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')").fetchone()[0],
                     "Unrecognized recovery namespace")

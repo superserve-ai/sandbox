@@ -39,7 +39,7 @@ class RecoveryTest(fixture.MigrationCLITest):
         self.copy_migrations("20261003010000")
         self.url = f"postgresql://postgres@127.0.0.1:{self.port}/{self.database}?sslmode=disable"
         self.runner = recovery.Recovery("usw2", migration.bounded_url(self.url), fixture.ROOT,
-                                        fixture.CLI, time.monotonic() + 60, observation=Mock())
+                                        fixture.CLI, time.monotonic() + 60, observation=Mock(valid_until=time.time() + 120))
 
     def inspect(self):
         with self.runner.connection() as conn:
@@ -93,9 +93,9 @@ class RecoveryTest(fixture.MigrationCLITest):
         before = self.history()
         with self.assertRaisesRegex(migration.MigrationError, "incomplete"):
             recovery.ordinary_guard("usw2", self.runner.url, fixture.ROOT, fixture.CLI, self.runner.deadline)
-        self.runner.run(self.project)
+        self.runner.run(self.project, self.inspect())
         self.assertTrue(self.inspect()["journal"][2])
-        self.runner.run(self.project)
+        self.runner.run(self.project, self.inspect())
         self.assertEqual(self.history(), before)
         self.assertEqual(amount(), before_amount)
         self.assertEqual(self.sql(f"SELECT COALESCE(host_id,'NULL') FROM sandbox_storage_interval "
@@ -126,9 +126,125 @@ class RecoveryTest(fixture.MigrationCLITest):
         self.runner.observation.verify.side_effect = migration.MigrationError("evidence unavailable")
         before = self.history()
         with self.assertRaisesRegex(migration.MigrationError, "evidence unavailable"):
-            self.runner.run(self.project)
+            self.runner.run(self.project, self.inspect())
         self.assertEqual(self.history(), before)
         self.assertEqual(self.sql("SELECT to_regnamespace('migration_recovery') IS NULL"), "t")
+
+    def test_entrypoint_refuses_state_advanced_after_receipt_comparison(self):
+        observation = Mock(state_digest="stable-writers", valid_until=time.time() + 120)
+        with patch.object(migration, "verify_connection_identity"), patch.dict(os.environ, {
+                "GITHUB_SHA": "a" * 40, "RECOVERY_RECEIPT_DIR": str(self.project / "receipts")}), \
+                patch("recovery_evidence.Observation", return_value=observation):
+            migration.migrate("usw2", "recovery-preflight", self.url, cli=fixture.CLI)
+            original = recovery.Recovery.run
+            def race(runner, project, approved):
+                self.initialize()
+                self.prepare_next()
+                with psycopg.connect(self.url, autocommit=True) as holder:
+                    with holder.transaction():
+                        holder.execute("LOCK TABLE sandbox_storage_interval IN ROW EXCLUSIVE MODE")
+                        with self.assertRaises(psycopg.errors.LockNotAvailable):
+                            self.prepare_next()
+                failed = self.inspect()
+                with self.assertRaisesRegex(migration.MigrationError, "changed since"):
+                    original(runner, project, approved)
+                self.assertEqual(recovery.Recovery.approved_state(self.inspect()),
+                                 recovery.Recovery.approved_state(failed))
+                self.assertEqual(self.sql("SELECT indisvalid FROM pg_index WHERE indexrelid="
+                                          "'sandbox_storage_interval_host_window'::regclass"), "f")
+                raise migration.MigrationError("approved state race refused")
+            with patch.object(recovery.Recovery, "run", race), self.assertRaisesRegex(
+                    migration.MigrationError, "approved state race refused"):
+                migration.migrate("usw2", "recover", self.url, cli=fixture.CLI)
+
+    def test_progress_by_another_executor_between_cli_phases_is_not_adopted(self):
+        self.initialize()
+        while self.prepare_next():
+            pass
+        approved = self.inspect()
+        original = self.runner.push_one
+        after = []
+        def race(state, project):
+            original(state, project)
+            original(self.inspect(), project)
+            after.append(self.history())
+        with patch.object(self.runner, "push_one", race), self.assertRaisesRegex(
+                migration.MigrationError, "changed after"):
+            self.runner.run(self.project, approved)
+        self.assertEqual(self.history(), after[0])
+        self.assertEqual(self.inspect()["prefix"], 2)
+        self.assertEqual(len(self.inspect()["receipts"]), 2)
+
+    def test_inspection_crossing_expiry_never_initializes_journal(self):
+        approved = self.inspect()
+        original = self.runner.inspect
+        for boundary in ("evidence", "deadline"):
+            with self.subTest(boundary=boundary):
+                self.runner.observation.valid_until = time.time() + 120
+                def inspect_then_expire(conn):
+                    state = original(conn)
+                    if boundary == "evidence":
+                        self.runner.observation.valid_until = time.time() - 1
+                    else:
+                        self.runner.overall_deadline = time.monotonic() - 1
+                    return state
+                with patch.object(self.runner, "inspect", inspect_then_expire), self.assertRaisesRegex(
+                        migration.MigrationError, "expired before mutation"):
+                    self.runner.run(self.project, approved)
+                self.assertEqual(self.sql("SELECT to_regnamespace('migration_recovery') IS NULL"), "t")
+
+    def test_expiry_after_committed_preparation_stops_and_fresh_receipt_resumes(self):
+        approved = self.inspect()
+        original = self.runner.prepare
+        def expire_after_commit(conn, state, name):
+            original(conn, state, name)
+            self.runner.observation.valid_until = time.time() - 1
+        with patch.object(self.runner, "prepare", expire_after_commit), self.assertRaisesRegex(
+                migration.MigrationError, "expired before mutation"):
+            self.runner.run(self.project, approved)
+        state = self.inspect()
+        self.assertEqual(state["prefix"], 0)
+        self.assertEqual(list(state["receipts"]), ["host"])
+        self.runner.observation.valid_until = time.time() + 120
+        self.runner.run(self.project, state)
+        self.assertEqual(self.inspect()["prefix"], 24)
+        self.assertTrue(self.inspect()["journal"][2])
+
+    def test_index_physical_state_change_requires_a_new_receipt(self):
+        self.initialize()
+        self.prepare_next()
+        with psycopg.connect(self.url, autocommit=True) as holder:
+            with holder.transaction():
+                holder.execute("LOCK TABLE sandbox_storage_interval IN ROW EXCLUSIVE MODE")
+                with self.assertRaises(psycopg.errors.LockNotAvailable):
+                    self.prepare_next()
+        approved = self.inspect()
+        # Simulate another authorized cleanup completing while our receipt
+        # still describes the physically present invalid index.
+        self.sql("DROP INDEX sandbox_storage_interval_host_window")
+        self.assertEqual(self.inspect()["catalog"], approved["catalog"])
+        with self.assertRaisesRegex(migration.MigrationError, "changed since"):
+            self.runner.run(self.project, approved)
+        self.assertEqual(self.sql("SELECT to_regclass('sandbox_storage_interval_host_window') IS NULL"), "t")
+
+    def test_west_ordinary_empty_partial_and_canonical_ledgers_are_refused(self):
+        for through in ("20261003010000", "20261003010002", "20261003010024"):
+            self.copy_migrations(through)
+            self.push()
+            before = self.history()
+            with self.assertRaisesRegex(migration.MigrationError, "completed recovery"):
+                recovery.ordinary_guard("usw2", self.runner.url, fixture.ROOT, fixture.CLI, self.runner.deadline)
+            self.assertEqual(self.history(), before)
+
+    def test_expired_evidence_is_rechecked_on_cli_mutation_session(self):
+        self.initialize()
+        while self.prepare_next():
+            pass
+        before = self.history()
+        self.runner.observation.valid_until = time.time() - 1
+        with self.assertRaises(migration.MigrationError):
+            self.runner.push_one(self.inspect(), self.project)
+        self.assertEqual(self.history(), before)
 
     def test_mutex_and_stale_cli_state_refuse_mutation(self):
         self.initialize()
@@ -166,7 +282,7 @@ class RecoveryTest(fixture.MigrationCLITest):
                 self.assertEqual(self.inspect()["prefix"], prefix)
                 self.sql("DROP TRIGGER reject_recovery_history ON supabase_migrations.schema_migrations; DROP FUNCTION reject_recovery_history();")
             self.runner.push_one(self.inspect(), self.project)
-        self.runner.run(self.project)
+        self.runner.run(self.project, self.inspect())
         self.assertEqual(self.inspect()["prefix"], 24)
 
     def test_admission_rejects_history_catalog_and_journal_drift(self):
@@ -253,7 +369,9 @@ class RecoveryTest(fixture.MigrationCLITest):
                                      (migration.VERSION, migration.NAME, [aggregate]))
                 runner = recovery.Recovery(target, self.runner.url, fixture.ROOT, fixture.CLI, time.monotonic() + 60)
                 before = self.history()
-                runner.run(self.project)
+                with runner.connection(lock=False) as conn:
+                    approved = runner.inspect(conn)
+                runner.run(self.project, approved)
                 receipts = self.project / "receipts"
                 with patch.object(migration, "verify_connection_identity"), patch.dict(os.environ, {
                         "GITHUB_SHA": "a" * 40, "RECOVERY_RECEIPT_DIR": str(receipts)}):
@@ -275,13 +393,27 @@ class RecoveryTest(fixture.MigrationCLITest):
         path = next((root / "supabase/migrations").glob("20261003010001_*.sql"))
         path.write_text(path.read_text() + "\nSELECT 1;\n")
         with self.assertRaisesRegex(migration.MigrationError, "source hash"):
-            recovery.Recovery("usw2", self.runner.url, root, fixture.CLI, time.monotonic() + 60, observation=Mock())
+            recovery.Recovery("usw2", self.runner.url, root, fixture.CLI, time.monotonic() + 60, observation=Mock(valid_until=time.time() + 120))
         # Disable the fixture FK only to inject a queued report without needing
         # an unrelated host's registration protocol.
         self.sql("SET session_replication_role=replica; INSERT INTO legacy_host_storage_report(host_id,report_id,received_at,payload) "
                  "VALUES('fixture-host','00000000-0000-0000-0000-000000000001',now(),'[{\"retained\":{}}]'::jsonb)")
         with self.assertRaisesRegex(migration.MigrationError, "Pending retained reports"):
             self.inspect()
+
+
+class RecoveryDeadlineTest(unittest.TestCase):
+    def test_individual_watchdogs_cannot_extend_overall_deadline(self):
+        runner = object.__new__(recovery.Recovery)
+        runner.overall_deadline = 280
+        runner.observation = Mock()
+        for now, expected in ((100, 160), (150, 210), (270, 280)):
+            with patch.object(recovery.time, "monotonic", return_value=now):
+                self.assertEqual(runner.command_deadline(), expected)
+                self.assertEqual(runner.observation.deadline, expected)
+        with patch.object(recovery.time, "monotonic", return_value=280), self.assertRaisesRegex(
+                migration.MigrationError, "Whole recovery deadline"):
+            runner.command_deadline()
 
 
 if __name__ == "__main__":

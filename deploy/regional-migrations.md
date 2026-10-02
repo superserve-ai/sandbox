@@ -60,7 +60,10 @@ the short metadata transactions and validates the new reason constraint before
 swapping it into place. A private database journal binds the exact plan,
 predecessor history, preparation state and index table identities. Each phase
 checks the expected catalog and ledger under the same session mutex used for
-mutation. Ordinary migrations refuse an incomplete journal. Completed recovery
+mutation. The approved receipt is rechecked under that mutex, and each next
+phase must match this invocation's own progress. Ordinary West migrations
+require a completed journal, including on an empty or canonical partial ledger.
+Completed recovery
 preserves its historical receipts while allowing subsequent ordinary migrations.
 
 Use the distinct `recovery-preflight` and `recover` actions. Production requires
@@ -73,7 +76,10 @@ state and inventory match the preflight receipt. Any changed database or writer
 state requires a new preflight and release decision.
 
 Execution retains the 250ms lock acquisition, 2s transaction and 60s command
-limits. Standalone concurrent index create/drop operations also have a 2s
+limits. The complete recovery has a separate 180s deadline, chosen as roughly
+three times the 59s disposable full-path regression duration. Evidence still
+expires after 120s and is checked under the mutation mutex; the total deadline
+does not extend evidence validity or authorize retries. Standalone concurrent index create/drop operations also have a 2s
 statement limit. These reduce exposure; they do not guarantee zero customer
 latency. Stop on failure. There is no automatic retry or timeout increase.
 After a separately authorized new preflight, a recorded invalid concurrent
@@ -126,7 +132,10 @@ alternate producers. Sidecars, command overrides, unaudited builds, automatic
 binary downloads or unfinished rollouts prevent admission. Recent revision deletion
 must be excluded through complete audit coverage spanning at least ten minutes
 before collection. The admitted source is pinned in the verifier and was audited
-for both retained production and persisted replay behavior.
+for both retained production and persisted replay behavior. A newer build with
+retained-report production or replay capability does not satisfy this policy,
+even with sampling disabled. It requires a separately reviewed exclusion policy
+and complete fresh evidence; do not add a source revision based on deploy success.
 
 Sampling disabled is insufficient: publishers can replay persisted payloads.
 Inspect `.storage-report-queue`, `.storage-report-queue.v2` and

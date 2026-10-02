@@ -226,6 +226,7 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
                 state = runner.inspect(conn)
             receipt = {"revision": revision, "target": target, "plan_hash": runner.plan_hash,
                        "history": recovery.digest(state["history"]), "catalog": recovery.digest(state["catalog"]),
+                       "physical_catalog": state["guard_catalog"],
                        "preparations": recovery.digest(state["receipts"]),
                        "writer_state": runner.observation.state_digest if target == "usw2" else None}
             receipt_dir = Path(os.environ.get("RECOVERY_RECEIPT_DIR", ""))
@@ -239,8 +240,8 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
                 return
             if json.loads(receipt_path.read_text()) != receipt:
                 raise MigrationError("Recovery state changed since the approved preflight")
-            runner.run(project)
-            verify_history(history_row(cli, database_url, project, deadline), target)
+            runner.run(project, state)
+            verify_history(history_row(cli, database_url, project, runner.command_deadline()), target)
             print(f"{target}: recovery verified; existing history preserved")
             return
         import retained_storage_recovery as recovery
