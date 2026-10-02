@@ -943,11 +943,14 @@ func (u *Uploader) verificationKey(object string) string {
 // scoped: pre-upgrade records are claimed for the then-configured
 // bucket once at startup (MigrateVerificationScope), so a later bucket
 // change correctly misses everything.
+//
+// History is not aged out here: a record's claim is about bytes already
+// streamed and verified, which no amount of time undoes.
 func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
 	if task.HasVerified(u.verificationKey(object)) {
 		return true, nil
 	}
-	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
+	return u.Journal.WasVerified(u.verificationKey(object))
 }
 
 // claimRenewer returns the task's renewal gate: callable as often as a

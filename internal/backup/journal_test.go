@@ -397,7 +397,7 @@ func TestPromotionWhileTaskInFlight(t *testing.T) {
 		if got.Priority != PriorityPause {
 			t.Fatalf("row priority = %d, want the promotion kept", got.Priority)
 		}
-		if verified, err := j.WasVerified("obj-1", reclaimAt); err != nil || !verified {
+		if verified, err := j.WasVerified("obj-1"); err != nil || !verified {
 			t.Fatalf("WasVerified = %v (err %v), want the history recorded", verified, err)
 		}
 	})
@@ -756,7 +756,7 @@ func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
 	if err := j.RecordVerification(stale, "bucket\x00obj", now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
 		t.Fatalf("stale RecordVerification = %v, want errClaimStolen", err)
 	}
-	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL)); err != nil || !verified {
+	if verified, err := j.WasVerified("bucket\x00obj"); err != nil || !verified {
 		t.Fatalf("WasVerified after refused stale record = %v/%v, want history preserved", verified, err)
 	}
 	// The full attack chain stays closed: the follow-up stale Ack is
@@ -775,7 +775,7 @@ func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
 	if err := j.RecordVerification(redo, "bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil || !verified {
+	if verified, err := j.WasVerified("bucket\x00obj"); err != nil || !verified {
 		t.Fatalf("WasVerified = %v/%v after live-claim record", verified, err)
 	}
 }
@@ -1212,7 +1212,7 @@ func TestPruneKeepsProofWhileItsGenerationIsQueued(t *testing.T) {
 		{"a settled generation's proof expires", settledProof, false},
 		{"a shared base's history is only a shortcut", sharedProof, false},
 	} {
-		got, err := j.WasVerified(tc.object, stale)
+		got, err := j.WasVerified(tc.object)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1229,7 +1229,8 @@ func TestPruneKeepsProofWhileItsGenerationIsQueued(t *testing.T) {
 func TestEnqueueDeclinesAnUnvouchableGeneration(t *testing.T) {
 	j, _ := testJournal(t)
 	j.SetScope("test-bucket")
-	now := time.Unix(4000, 0)
+	// Enqueue reads the real clock, so the mark is anchored to it.
+	now := time.Now()
 	stuck := Task{
 		TemplateID: "tpl-a", BuildID: "build-a", Generation: "gen-stuck", EnqueuedAt: now,
 		Priority: PriorityCheckpoint,
@@ -1260,6 +1261,24 @@ func TestEnqueueDeclinesAnUnvouchableGeneration(t *testing.T) {
 		t.Fatal(err)
 	} else if counts[PriorityCheckpoint] != 1 {
 		t.Fatalf("pending = %v, want the rebuilt generation queued", counts)
+	}
+
+	// Past the cooldown the generation is offered again: an artifact
+	// relaid on disk maps to a different object name, which may upload
+	// cleanly, and the name's packing fingerprint is not in the key.
+	stale := stuck
+	stale.Generation = "gen-cooled"
+	stale.Files = []TaskFile{{Name: "mem.snap", Path: "/mem", SHA256: "m3", Size: 1}}
+	if err := j.MarkUnvouchable("test-bucket", stale, now.Add(-unvouchableCooldown-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Enqueue(stale); err != nil {
+		t.Fatal(err)
+	}
+	if counts, err := j.Pending(); err != nil {
+		t.Fatal(err)
+	} else if counts[PriorityCheckpoint] != 2 {
+		t.Fatalf("pending = %v, want the cooled generation offered again", counts)
 	}
 
 	// Another bucket has not met those objects, so the mark does not carry.

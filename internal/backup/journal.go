@@ -253,12 +253,13 @@ var (
 	// yet confirmed drained stays in the set until RemoveStagingRoot
 	// removes it, however many are outstanding at once.
 	stagingRootBucket = []byte("backup_staging_root")
-	// unvouchableBucket records generations whose objects are in the
-	// bucket with no proof this host can offer for them. Such a
-	// generation cannot be completed by any later attempt, so Enqueue
-	// stops accepting it rather than letting every sweep re-offer work
-	// that abandons. A rebuild or any changed artifact keys differently
-	// and is unaffected.
+	// unvouchableBucket records when a generation was last found to have
+	// objects in the bucket with no proof this host can offer for them.
+	// Enqueue declines it for unvouchableCooldown so every sweep stops
+	// re-offering work that abandons, and allows an attempt after that: an
+	// artifact relaid on disk maps to a different object name (the name
+	// carries a packing fingerprint the generation key does not), which
+	// may upload cleanly. A rebuild keys differently and never waits.
 	unvouchableBucket = []byte("backup_unvouchable_generations")
 )
 
@@ -270,6 +271,13 @@ var (
 // meeting them as a dedupe nothing can vouch for, and the generation
 // abandoned on every attempt from then on.
 const verifiedRetention = 14 * 24 * time.Hour
+
+// unvouchableCooldown paces re-attempts of a generation whose objects
+// cannot be vouched for. Long enough that a stuck generation costs a
+// negligible amount of work rather than one abandoned upload per sweep,
+// short enough that a relaid artifact or a repaired bucket is picked up
+// without an operator.
+const unvouchableCooldown = 24 * time.Hour
 
 // pruneExamineLimit bounds verification-history entries examined per ack.
 const pruneExamineLimit = 64
@@ -401,7 +409,7 @@ func (j *Journal) Enqueue(task Task) error {
 	// that re-offer it (the template sweep, the backfill, a re-pause of
 	// unchanged artifacts) have nothing to act on.
 	if j.scope != "" {
-		if unvouchable, err := j.Unvouchable(j.scope, task); err == nil && unvouchable {
+		if unvouchable, err := j.Unvouchable(j.scope, task, time.Now()); err == nil && unvouchable {
 			return nil
 		}
 	}
@@ -735,12 +743,20 @@ func (j *Journal) MarkUnvouchable(scope string, task Task, now time.Time) error 
 	})
 }
 
-// Unvouchable reports whether this generation has already been found
-// unvouchable against this store.
-func (j *Journal) Unvouchable(scope string, task Task) (bool, error) {
+// Unvouchable reports whether this generation was found unvouchable
+// against this store within the cooldown.
+func (j *Journal) Unvouchable(scope string, task Task, now time.Time) (bool, error) {
 	var ok bool
 	err := j.db.View(func(tx *bolt.Tx) error {
-		ok = tx.Bucket(unvouchableBucket).Get(completionKey(scope, task)) != nil
+		v := tx.Bucket(unvouchableBucket).Get(completionKey(scope, task))
+		if v == nil {
+			return nil
+		}
+		var ns int64
+		if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
+			return nil // unparsable mark counts as absent: attempt it
+		}
+		ok = now.Sub(time.Unix(0, ns)) < unvouchableCooldown
 		return nil
 	})
 	return ok, err
@@ -978,19 +994,25 @@ func (j *Journal) Covered(scope string, task Task) (bool, error) {
 }
 
 // WasVerified reports whether any task ever digest-verified this object
-// within the retention window.
-func (j *Journal) WasVerified(object string, now time.Time) (bool, error) {
+// against this store.
+//
+// Presence is the whole answer: an object this host streamed and verified
+// cannot stop holding those bytes, because the store is create-only and a
+// generation's prefix is keyed by its own content. Age belongs to
+// retention, which bounds how many records are kept — reading it here as
+// well is what let a record outlive its usefulness while still existing,
+// so a generation with its proof on disk was abandoned anyway.
+func (j *Journal) WasVerified(object string) (bool, error) {
 	var ok bool
 	err := j.db.View(func(tx *bolt.Tx) error {
 		v := tx.Bucket(verifiedBucket).Get([]byte(object))
-		if v == nil {
-			return nil
+		ok = v != nil
+		if ok {
+			var ns int64
+			if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
+				ok = false // unparsable entry counts as absent
+			}
 		}
-		var ns int64
-		if _, err := fmt.Sscanf(string(v), "%d", &ns); err != nil {
-			return nil // unparsable entry counts as absent
-		}
-		ok = now.Sub(time.Unix(0, ns)) <= verifiedRetention
 		return nil
 	})
 	return ok, err
