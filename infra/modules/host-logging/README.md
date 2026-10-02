@@ -43,6 +43,14 @@ Telemetry remains owned by west and must exist before east activation. Direct
 regional applies must establish these project prerequisites first; east does
 not duplicate project-service ownership in its regional state.
 
+Metrics priority is checked against the running process's OOM adjustment. When
+an active metrics collector has drifted, reconciliation restarts it under the
+managed priority settings and verifies the result; inactive metrics stay stopped.
+Rollback restores the prior unit configuration and restarts metrics when needed,
+repairing preexisting live-process drift to that configuration. Metrics service
+start/stop timeouts apply to the restart; reconciliation waits for the systemd
+job to finish and checks the actual score after startup.
+
 ## State and resource bounds
 
 | Resource | Initial setting | Meaning |

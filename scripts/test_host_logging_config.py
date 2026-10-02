@@ -414,7 +414,7 @@ RUN apt-get update \\
                 cat > /fixture/bin/systemctl <<'EOF'
                 #!/bin/sh
                 case "$1" in
-                  is-active|is-enabled) exit 0;;
+                  is-active|is-enabled|show) exit 0;;
                   *) printf '%s\n' "$*" >> /fixture/systemctl.calls; exit 0;;
                 esac
                 EOF
@@ -490,7 +490,13 @@ RUN apt-get update \\
     def test_partial_metrics_limit_failure_restores_runtime_properties(self):
         self._exercise_reconciliation(True, metrics_failure=True)
 
-    def _exercise_reconciliation(self, activation_failure, metrics_failure=False):
+    def test_metrics_oom_failure_restores_configured_priority(self):
+        self._exercise_reconciliation(True, oom_failure=True)
+
+    def test_metrics_oom_timeout_restores_configured_priority(self):
+        self._exercise_reconciliation(True, oom_failure=True, oom_timeout=True)
+
+    def _exercise_reconciliation(self, activation_failure, metrics_failure=False, oom_failure=False, oom_timeout=False):
         with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
             rendered = self._render_templates(Path(directory))
             with tempfile.TemporaryDirectory(prefix="host-logging-converged-") as work:
@@ -501,6 +507,10 @@ RUN apt-get update \\
                     (fixture / "test-rollback").touch()
                 if metrics_failure:
                     (fixture / "test-metrics-failure").touch()
+                if oom_failure:
+                    (fixture / "test-oom-failure").touch()
+                if oom_timeout:
+                    (fixture / "test-oom-timeout").touch()
                 script = self._acquire_release(fixture) + textwrap.dedent(r"""
                     mkdir -p /var/lib/superserve/host-logging /etc/sandbox /opt/superserve/otelcol-contrib/bin
                     cp /fixture/bin/otelcol-contrib /opt/superserve/otelcol-contrib/bin/otelcol-contrib
@@ -511,14 +521,29 @@ RUN apt-get update \\
                     cat > /fixture/bin/systemctl <<'EOF'
                     #!/bin/bash
                     if [ "$1" = show ]; then
+                      if [ "$3" = --property=MainPID ]; then cat /fixture/metrics.pid 2>/dev/null || echo 0; exit 0; fi
+                      if [ "$3" = --property=OOMScoreAdjust ]; then awk -F= '/^OOMScoreAdjust=/ {print $2}' /etc/systemd/system/superserve-otel-collector.service.d/30-host-logging-priority.conf; exit 0; fi
                       if [ -e /fixture/metrics.properties ]; then cat /fixture/metrics.properties; else printf 'CPUWeight=100\nIOWeight=100\nMemoryHigh=infinity\nMemoryMax=infinity\n'; fi
                       exit 0
                     fi
                     if [ "$1" = set-property ]; then
-                      printf '%s\n' "${@:4}" > /fixture/metrics.properties
+                      printf '%s\n' "${@:4}" | sed -e 's/MemoryHigh=192M/MemoryHigh=201326592/' -e 's/MemoryMax=256M/MemoryMax=268435456/' > /fixture/metrics.properties
                       printf '%s\n' "$*" >> /fixture/systemctl.calls
                       if [ -e /fixture/fail-metrics ]; then rm /fixture/fail-metrics; exit 1; fi
                       exit 0
+                    fi
+                    if [ "$1 $2" = 'restart superserve-otel-collector.service' ]; then
+                      if [ -e /fixture/metrics.pid ]; then kill "$(cat /fixture/metrics.pid)" 2>/dev/null || true; fi
+                      score=$(awk -F= '/^OOMScoreAdjust=/ {print $2}' /etc/systemd/system/superserve-otel-collector.service.d/30-host-logging-priority.conf)
+                      if [ -e /fixture/fail-oom-score ]; then rm /fixture/fail-oom-score; score=0; fi
+                      bash -c 'sleep 0.15; echo "$1" > /proc/self/oom_score_adj; exec sleep 300' bash "$score" 9>&- >/dev/null 2>&1 &
+                      pid=$!; echo "$pid" > /fixture/metrics.pid
+                      printf '%s\n' "$*" >> /fixture/systemctl.calls
+                      if [ -e /fixture/fail-oom ]; then rm /fixture/fail-oom; exit 1; fi
+                      exit 0
+                    fi
+                    if [ "$1" = is-active ] && [ "$3" = superserve-otel-collector.service ]; then
+                      test -e /fixture/metrics.pid && kill -0 "$(cat /fixture/metrics.pid)"; exit $?
                     fi
                     if [ "$1 $2" = 'restart superserve-otel-logs.service' ] && [ -e /fixture/fail-activation ]; then
                       rm /fixture/fail-activation
@@ -549,11 +574,15 @@ RUN apt-get update \\
                       set -e
                       [ "$rc" -eq "$expected" ] || { echo "expected=$expected actual=$rc" >&2; exit 1; }
                     }
+                    mkdir -p /etc/systemd/system/superserve-otel-collector.service.d
+                    printf '[Service]\nOOMScoreAdjust=0\n' > /etc/systemd/system/superserve-otel-collector.service.d/30-host-logging-priority.conf
+                    systemctl restart superserve-otel-collector.service
                     result 101 bash /fixture/validate
                     mkdir /var/lib/superserve/host-logging/.attempt.interrupted
                     printf 'orphan candidate' > /var/lib/superserve/host-logging/.attempt.interrupted/release.tar.gz
                     result 100 bash /fixture/reconcile
                     test ! -e /var/lib/superserve/host-logging/.attempt.interrupted
+                    test "$(cat /proc/$(cat /fixture/metrics.pid)/oom_score_adj)" -eq 800
                     printf 'cursor-sentinel' > /var/lib/superserve/host-logging/cursor/sentinel
                     printf 'queue-sentinel' > /var/lib/superserve/host-logging/export-queue/sentinel
                     cp /fixture/systemctl.calls /fixture/calls.before
@@ -563,10 +592,35 @@ RUN apt-get update \\
                     cmp /fixture/calls.before /fixture/systemctl.calls
                     find /etc/superserve/host-logging /etc/sandbox /etc/systemd/system /etc/systemd/journald.conf.d /opt/superserve/otelcol-contrib/bin /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue -type f -exec sha256sum {} + > /fixture/files.after
                     cmp /fixture/files.before /fixture/files.after
+                    if [ ! -e /fixture/test-rollback ]; then
+                      kill "$(cat /fixture/metrics.pid)"
+                      sleep 300 >/dev/null 2>&1 &
+                      echo "$!" > /fixture/metrics.pid
+                      result 101 bash /fixture/validate
+                      result 100 bash /fixture/reconcile
+                      test "$(cat /proc/$(cat /fixture/metrics.pid)/oom_score_adj)" -eq 800
+                      cp /fixture/systemctl.calls /fixture/calls.before
+                      result 100 bash /fixture/reconcile
+                      cmp /fixture/calls.before /fixture/systemctl.calls
+                      kill "$(cat /fixture/metrics.pid)"
+                      rm /fixture/metrics.pid
+                      printf '\n# changed while metrics inactive\n' >> /var/lib/superserve/host-logging/otel-logs.yaml.candidate
+                      : > /fixture/systemctl.calls
+                      result 100 bash /fixture/reconcile
+                      test ! -e /fixture/metrics.pid
+                      ! grep -q 'superserve-otel-collector.service' /fixture/systemctl.calls
+                    fi
                     if [ -e /fixture/test-rollback ]; then
                       printf '\n# changed candidate\n' >> /var/lib/superserve/host-logging/otel-logs.yaml.candidate
                       : > /fixture/systemctl.calls
-                      if [ -e /fixture/test-metrics-failure ]; then
+                      if [ -e /fixture/test-oom-failure ]; then
+                        printf '[Service]\nOOMScoreAdjust=0\n' > /etc/systemd/system/superserve-otel-collector.service.d/30-host-logging-priority.conf
+                        systemctl restart superserve-otel-collector.service
+                        printf '[Service]\nOOMScoreAdjust=120\n' > /etc/systemd/system/superserve-otel-collector.service.d/30-host-logging-priority.conf
+                        find /etc/superserve/host-logging /etc/sandbox /etc/systemd/system /etc/systemd/journald.conf.d /opt/superserve/otelcol-contrib/bin /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue -type f -exec sha256sum {} + > /fixture/files.before
+                        : > /fixture/systemctl.calls
+                        if [ -e /fixture/test-oom-timeout ]; then touch /fixture/fail-oom-score; else touch /fixture/fail-oom; fi
+                      elif [ -e /fixture/test-metrics-failure ]; then
                         printf 'CPUWeight=123\nIOWeight=234\nMemoryHigh=500000000\nMemoryMax=600000000\n' > /fixture/metrics.properties
                         cp /fixture/metrics.properties /fixture/metrics.before
                         touch /fixture/fail-metrics
@@ -577,7 +631,10 @@ RUN apt-get update \\
                       find /etc/superserve/host-logging /etc/sandbox /etc/systemd/system /etc/systemd/journald.conf.d /opt/superserve/otelcol-contrib/bin /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue -type f -exec sha256sum {} + > /fixture/files.rollback
                       cmp /fixture/files.before /fixture/files.rollback
                       grep -q '^restart superserve-otel-logs.service$' /fixture/systemctl.calls
-                      if [ -e /fixture/test-metrics-failure ]; then
+                      if [ -e /fixture/test-oom-failure ]; then
+                        test "$(cat /proc/$(cat /fixture/metrics.pid)/oom_score_adj)" -eq 120
+                        test "$(grep -c '^restart superserve-otel-collector.service$' /fixture/systemctl.calls)" -eq 2
+                      elif [ -e /fixture/test-metrics-failure ]; then
                         cmp /fixture/metrics.before /fixture/metrics.properties
                         test "$(grep -c '^set-property ' /fixture/systemctl.calls)" -eq 2
                       else

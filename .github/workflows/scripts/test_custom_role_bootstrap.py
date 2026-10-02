@@ -31,6 +31,14 @@ class CustomRoleBootstrapTests(unittest.TestCase):
         self.assertIn('google_project_service.host_log_os_config', logging)
         self.assertIn('google_project_service.host_log_telemetry', logging)
 
+    def test_manual_west_bootstraps_logging_api_before_regional_plan(self):
+        west = WORKFLOW.with_name('terraform-rollout-production.yml').read_text().split('  central1:', 1)[0]
+        bootstrap = west.split('      - name: Bootstrap credentials key IAM and host logging API\n')[1].split('      - name: Terraform apply production/us-west2')[0]
+        self.assertIn('-target=google_project_service.host_log_os_config', bootstrap)
+        self.assertIn('-chdir=infra/envs/production/us-central1 plan', bootstrap)
+        self.assertIn('apply -input=false -auto-approve cd-key.tfplan', bootstrap)
+        self.assertLess(west.index('apply -input=false -auto-approve cd-key.tfplan'), west.index('cd infra/envs/production/us-west2'))
+
     def test_effective_permissions_gate_regional_applies(self):
         text = WORKFLOW.read_text()
         job = text.split('  production-us-central1-bootstrap:\n')[1].split('\n  production-us-west2-infra:')[0]

@@ -86,6 +86,8 @@ cat > "$attempt/metrics.conf" <<'EOF'
 CPUWeight=1
 IOWeight=1
 OOMScoreAdjust=800
+TimeoutStartSec=15s
+TimeoutStopSec=15s
 MemoryHigh=192M
 MemoryMax=256M
 EOF
@@ -111,6 +113,23 @@ done
 for unit in superserve-otel-logs.service superserve-host-logging-heartbeat.timer; do
   systemctl is-enabled --quiet "$unit" && systemctl is-active --quiet "$unit" || changed=1
 done
+metrics_oom_matches() {
+  local pid score
+  pid=$(systemctl show superserve-otel-collector.service --property=MainPID --value) || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  score=$(cat "/proc/$pid/oom_score_adj") || return 1
+  [ "$score" = "$1" ] && [ "$pid" = "$(systemctl show superserve-otel-collector.service --property=MainPID --value)" ]
+}
+wait_metrics_oom() {
+  for retry in {1..20}; do
+    if systemctl is-active --quiet superserve-otel-collector.service && metrics_oom_matches "$1"; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+if systemctl is-active --quiet superserve-otel-collector.service; then
+  metrics_oom_matches 800 || changed=1
+fi
 if [ "$check" -eq 1 ]; then
   [ "$changed" -eq 0 ] || exit 101
   "$binary" validate --config "$active_config" >/dev/null 2>&1 || exit 101
@@ -147,6 +166,9 @@ journal_changed=0
 cmp -s "$attempt/journald.conf" "$dropin" || journal_changed=1
 metrics_runtime_properties=()
 metrics_runtime_changed=0
+metrics_restart_started=0
+metrics_dropin_changed=0
+cmp -s "$attempt/metrics.conf" "$metrics_dropin" || metrics_dropin_changed=1
 if systemctl is-active --quiet superserve-otel-collector.service; then
   properties=$(systemctl show superserve-otel-collector.service --property=CPUWeight --property=IOWeight --property=MemoryHigh --property=MemoryMax)
   while IFS='=' read -r key value; do
@@ -180,6 +202,12 @@ rollback() {
     systemctl daemon-reload || true
     if [ "$metrics_runtime_changed" -eq 1 ]; then
       systemctl set-property --runtime superserve-otel-collector.service "$${metrics_runtime_properties[@]}" || true
+    fi
+    if [ "$${#metrics_runtime_properties[@]}" -eq 4 ] && { [ "$metrics_restart_started" -eq 1 ] || [ "$metrics_dropin_changed" -eq 1 ]; }; then
+      # Restore configured behavior, including any preexisting live-process drift.
+      systemctl restart superserve-otel-collector.service || true
+      restored_score=$(systemctl show superserve-otel-collector.service --property=OOMScoreAdjust --value) || restored_score=
+      wait_metrics_oom "$restored_score" || echo 'Metrics OOM priority rollback verification failed.' >&2
     fi
     if [ "$activation_started" -eq 1 ]; then
       if [ "$was_active" -eq 1 ]; then systemctl restart superserve-otel-logs.service || true; else systemctl disable --now superserve-otel-logs.service || true; fi
@@ -222,6 +250,12 @@ systemctl is-active --quiet superserve-host-logging-heartbeat.timer
 if [ "$${#metrics_runtime_properties[@]}" -eq 4 ]; then
   metrics_runtime_changed=1
   systemctl set-property --runtime superserve-otel-collector.service CPUWeight=1 IOWeight=1 MemoryHigh=192M MemoryMax=256M
+  # Execution properties do not update an already-running process on daemon-reload.
+  if ! metrics_oom_matches 800; then
+    metrics_restart_started=1
+    systemctl restart superserve-otel-collector.service
+    wait_metrics_oom 800
+  fi
 fi
 if [ "$legacy_enabled" -eq 1 ]; then
   python3 "$legacy_helper" --enforce && rc=0 || rc=$?
