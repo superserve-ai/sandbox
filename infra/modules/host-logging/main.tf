@@ -235,7 +235,7 @@ resource "google_project_iam_member" "log_writer" {
 
 resource "google_storage_bucket" "host_logging_artifacts" {
   project                     = var.project_id
-  name                        = "superserve-host-logging-${var.environment}-${replace(var.region, "-", "")}"
+  name                        = "ss-host-logging-${substr(sha256("${var.project_id}/${var.environment}/${var.region}"), 0, 32)}"
   location                    = var.region
   uniform_bucket_level_access = true
   versioning { enabled = true }

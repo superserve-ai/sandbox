@@ -26,6 +26,11 @@ run "host_logging_contract" {
   }
 
   assert {
+    condition     = google_storage_bucket.host_logging_artifacts.name == "ss-host-logging-${substr(sha256("example-project/staging/us-central1"), 0, 32)}"
+    error_message = "Artifact bucket identity must be stable and scoped to project, environment, and region."
+  }
+
+  assert {
     condition     = strcontains(google_storage_bucket_object.otel_config.content, "limit_mib: 192") && strcontains(google_storage_bucket_object.otel_config.content, "spike_limit_mib: 32") && strcontains(google_storage_bucket_object.otel_service.content, "MemoryHigh=224M") && strcontains(google_storage_bucket_object.otel_service.content, "MemoryMax=256M") && strcontains(google_storage_bucket_object.otel_service.content, "GOMEMLIMIT=192MiB")
     error_message = "Collector limiter and service thresholds must scale with the configured memory ceiling."
   }
@@ -64,5 +69,22 @@ run "host_logging_deployment_plan" {
         service_account_email = "vmd@example-project.iam.gserviceaccount.com"
       }
     }
+  }
+}
+
+run "artifact_bucket_other_project" {
+  command = plan
+  variables {
+    project_id      = "another-project"
+    zone            = "us-central1-a"
+    environment     = "staging"
+    region          = "us-central1"
+    assignment_name = "example-host-logging"
+    enrolled_hosts  = {}
+  }
+
+  assert {
+    condition     = google_storage_bucket.host_logging_artifacts.name != "ss-host-logging-${substr(sha256("example-project/staging/us-central1"), 0, 32)}" && length(google_storage_bucket.host_logging_artifacts.name) <= 63
+    error_message = "Identical regional deployments in different projects must not share the global bucket name."
   }
 }
