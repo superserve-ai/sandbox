@@ -2,8 +2,10 @@
 
 import contextlib
 import io
+import json
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,6 +14,40 @@ import migrate_database as migration
 import test_migration_cli as cli_test
 
 CLI, ROOT = cli_test.CLI, cli_test.ROOT
+
+
+class HistoryResponseTest(unittest.TestCase):
+    def response(self, data):
+        return subprocess.CompletedProcess([], 0, stdout=json.dumps(data), stderr="")
+
+    def test_normal_array_and_agent_envelope(self):
+        expected = [{"version": migration.VERSION, "name": migration.NAME,
+                     "statement_count": 1, "sha256": migration.SHA256}]
+        for envelope in (False, True):
+            def encode(rows):
+                return self.response({"rows": rows, "boundary": "test", "warning": "test"}
+                                     if envelope else rows)
+            with self.subTest(envelope=envelope):
+                with patch.object(migration.subprocess, "run", return_value=encode([{"present": False}])):
+                    self.assertEqual(migration.history_row(CLI, "unused", ROOT), [])
+                with patch.object(migration.subprocess, "run", side_effect=[
+                        encode([{"present": True}]), encode(expected)]):
+                    rows = migration.history_row(CLI, "unused", ROOT)
+                    self.assertEqual(rows, expected)
+                    migration.verify_history(rows, "use4")
+
+    def test_malformed_responses_fail_closed(self):
+        invalid = [None, True, 1, "rows", {}, {"rows": None}, {"rows": {}},
+                   [None], ["row"], {"rows": [1]}]
+        responses = [self.response(data) for data in invalid]
+        responses.append(subprocess.CompletedProcess([], 0, stdout="not json", stderr=""))
+        for response in responses:
+            for history_query in (False, True):
+                with self.subTest(data=response.stdout, history_query=history_query):
+                    results = ([self.response([{"present": True}])] if history_query else []) + [response]
+                    with patch.object(migration.subprocess, "run", side_effect=results):
+                        with self.assertRaisesRegex(migration.MigrationError, "Unrecognized CLI history response"):
+                            migration.history_row(CLI, "unused", ROOT)
 
 
 class ConnectionIdentityTest(unittest.TestCase):

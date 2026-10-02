@@ -95,7 +95,12 @@ def history_row(cli, database_url, project):
         if result.returncode:
             raise MigrationError("Could not verify migration history; no raw output logged")
         try:
-            return json.loads(result.stdout)["rows"]
+            data = json.loads(result.stdout)
+            # Normal CLI output is an array; agent mode wraps it in an envelope.
+            rows = data["rows"] if isinstance(data, dict) else data
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError()
+            return rows
         except (ValueError, KeyError, TypeError):
             raise MigrationError("Unrecognized CLI history response") from None
 
