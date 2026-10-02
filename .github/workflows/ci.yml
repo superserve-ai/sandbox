@@ -19,7 +19,9 @@ jobs:
           version: latest
 
       - name: Validate fresh and interrupted migrations
-        run: python3 scripts/test_migration_cli.py
+        run: |
+          python3 scripts/test_migration_cli.py
+          python3 scripts/test_migration_overlay.py
 
   unit-tests:
     name: Unit Tests
