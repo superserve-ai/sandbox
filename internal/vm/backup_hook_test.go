@@ -2061,9 +2061,11 @@ func TestEnqueueCarriesAllocatedBytes(t *testing.T) {
 		// The manifest's sentinel for an allocation it could not measure.
 		{FileName: "vmstate.snap", Path: "/snap", SizeBytes: 4096, AllocatedBytes: -1, SHA256: "s"},
 	}
-	// Unknown, not negative: the control plane stores this verbatim and
-	// sums it, so a sentinel would make the generation shrink the totals.
-	want := []int64{4 << 20, 0}
+	// Carried as measured, sentinel included: only the sentinel can tell
+	// an allocation that is missing from one that is genuinely zero, and
+	// a dedupe downstream has to make exactly that distinction. The
+	// rendering for readers outside the host is where it becomes zero.
+	want := []int64{4 << 20, -1}
 	if ok, _, _ := m.enqueueBackup("vm-1", manifest, backup.PriorityPause, ""); !ok {
 		t.Fatal("enqueue refused a complete manifest")
 	}

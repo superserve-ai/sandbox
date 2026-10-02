@@ -3722,3 +3722,36 @@ func TestPreStreamHashRenewsWhileItReads(t *testing.T) {
 		t.Fatal("the lease never moved while the hash read the artifact")
 	}
 }
+
+// The sentinel lives inside the pipeline only. A reader outside the host
+// sums these numbers, so an unmeasured allocation has to arrive as
+// unknown rather than as a negative that shrinks the totals.
+func TestPublishedManifestRendersAnUnmeasuredAllocationAsZero(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	task.Files[0].BasePath = ""
+	task.Files[0].AllocatedBytes = -1
+	task.Files[1].AllocatedBytes = 0
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop()}
+	if completed, _, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
+		t.Fatalf("upload: completed=%v err=%v", completed, err)
+	}
+
+	raw, ok := store.objects["sandboxes/sb-1/gen-abc/"+ManifestObject]
+	if !ok {
+		t.Fatal("no manifest published")
+	}
+	var published GenerationManifest
+	if err := json.Unmarshal(raw, &published); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range published.Files {
+		if f.AllocatedBytes < 0 {
+			t.Fatalf("%s published allocated = %d, want it rendered as unknown", f.Name, f.AllocatedBytes)
+		}
+	}
+}

@@ -634,19 +634,22 @@ func (j *Journal) RenewClaim(task Task, now time.Time) bool {
 	return renewed
 }
 
-// mergeAllocations adopts allocation sizes from an incoming task for the
-// files a queued one names, reporting whether anything was adopted. Only
-// a size the queued row lacks is filled in: the enqueue is a dedupe of
-// the same generation, so the digests already match and the incoming
-// measurement describes the same bytes.
+// mergeAllocations fills in allocations a queued task is MISSING from an
+// incoming one, reporting whether anything was adopted. Missing means the
+// manifest could not measure it (negative), never zero: a fully sparse
+// artifact measures zero legitimately, and a generation's identity covers
+// apparent content rather than physical layout, so the same generation
+// re-enqueued from a differently laid out file carries a different
+// allocation for the same bytes. Adopting that over a real zero would
+// report the other layout's footprint for the paths this row keeps.
 func mergeAllocations(queued, incoming []TaskFile) bool {
 	adopted := false
 	for i := range queued {
-		if queued[i].AllocatedBytes > 0 {
+		if queued[i].AllocatedBytes >= 0 {
 			continue
 		}
 		for _, in := range incoming {
-			if in.Name == queued[i].Name && in.AllocatedBytes > 0 {
+			if in.Name == queued[i].Name && in.AllocatedBytes >= 0 {
 				queued[i].AllocatedBytes = in.AllocatedBytes
 				adopted = true
 				break

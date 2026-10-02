@@ -209,18 +209,6 @@ const pauseRehashBudget = 10 * time.Minute
 // so these retries need neither hashing nor a still-paused sandbox.
 const enqueueRetryAttempts = 3
 
-// measuredAllocation maps the manifest's "unavailable" sentinel onto the
-// absent value the report already uses for it. The field is a size that
-// the control plane stores verbatim and sums for storage accounting and
-// lifecycle GC: a negative would make a generation shrink the totals it
-// belongs to, which is worse than not knowing.
-func measuredAllocation(allocated int64) int64 {
-	if allocated < 0 {
-		return 0
-	}
-	return allocated
-}
-
 // pauseManifestComplete reports whether the manifest carries both durable
 // artifacts a restore needs. The pair is the unit of durability: a
 // disk-only generation would publish a manifest that restore rejects,
@@ -659,7 +647,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	for _, e := range entries {
 		files = append(files, backup.TaskFile{
 			Name: e.FileName, Path: e.Path, SHA256: e.SHA256, Size: e.SizeBytes,
-			AllocatedBytes: measuredAllocation(e.AllocatedBytes),
+			AllocatedBytes: e.AllocatedBytes,
 			BasePath:       e.BasePath, BaseSHA256: e.BaseSHA256,
 		})
 	}
@@ -1355,7 +1343,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 			Path:           e.Path,
 			SHA256:         e.SHA256,
 			Size:           e.SizeBytes,
-			AllocatedBytes: measuredAllocation(e.AllocatedBytes),
+			AllocatedBytes: e.AllocatedBytes,
 			BasePath:       e.BasePath,
 			BaseStagedPath: e.BaseStagedPath,
 			BaseSHA256:     e.BaseSHA256,
@@ -1471,7 +1459,7 @@ func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority, pa
 			Path:           e.Path,
 			SHA256:         e.SHA256,
 			Size:           e.SizeBytes,
-			AllocatedBytes: measuredAllocation(e.AllocatedBytes),
+			AllocatedBytes: e.AllocatedBytes,
 			BasePath:       e.BasePath,
 			BaseStagedPath: e.BaseStagedPath,
 			BaseSHA256:     e.BaseSHA256,
@@ -1512,7 +1500,7 @@ func (m *Manager) enqueueTemplateBackup(templateID, buildID, snapshotDir string,
 		// twice.
 		files = append(files, backup.TaskFile{
 			Name:        e.FileName,
-			RuntimePath: e.Path, AllocatedBytes: measuredAllocation(e.AllocatedBytes),
+			RuntimePath: e.Path, AllocatedBytes: e.AllocatedBytes,
 			Path:   e.Path,
 			SHA256: e.SHA256,
 			Size:   e.SizeBytes,

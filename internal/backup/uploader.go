@@ -1053,7 +1053,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile, re
 				Object:         objectName,
 				SHA256:         file.SHA256,
 				Size:           apparent,
-				AllocatedBytes: file.AllocatedBytes,
+				AllocatedBytes: ReportedAllocation(file.AllocatedBytes),
 				PackedSize:     PackedSize(extents),
 				Extents:        extents,
 			}, object, 0, nil
@@ -1217,7 +1217,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile, re
 		BasePath:       file.BasePath,
 		BaseSHA256:     file.BaseSHA256,
 		Size:           apparent,
-		AllocatedBytes: file.AllocatedBytes,
+		AllocatedBytes: ReportedAllocation(file.AllocatedBytes),
 		PackedSize:     PackedSize(extents),
 		Extents:        extents,
 	}, object, shipped, nil
@@ -1244,6 +1244,20 @@ func HashFileApparent(ctx context.Context, path string) (string, int64, error) {
 		return "", 0, err
 	}
 	return sum, apparent, nil
+}
+
+// ReportedAllocation renders an allocation for a reader outside this
+// host. Unavailable and genuinely zero are the same thing to a consumer
+// that sums sizes, and the control plane stores what it is given
+// verbatim, so the sentinel must not survive the boundary: a negative
+// would make a generation shrink the totals it belongs to. Inside the
+// pipeline the sentinel stays, because only it can tell a measurement
+// that is missing from one that is zero.
+func ReportedAllocation(allocated int64) int64 {
+	if allocated < 0 {
+		return 0
+	}
+	return allocated
 }
 
 // hashApparent digests the file's full apparent content from its extent

@@ -961,7 +961,7 @@ func TestEnqueueAdoptsAllocationsOnDedupe(t *testing.T) {
 			}},
 		}
 	}
-	if err := j.Enqueue(queued(0)); err != nil {
+	if err := j.Enqueue(queued(-1)); err != nil {
 		t.Fatal(err)
 	}
 	// An unchanged re-pause of the same generation, same staging state,
@@ -996,7 +996,7 @@ func TestAckAdoptsAllocationsMeasuredDuringTheUpload(t *testing.T) {
 			}},
 		}
 	}
-	if err := j.Enqueue(queued(0)); err != nil {
+	if err := j.Enqueue(queued(-1)); err != nil {
 		t.Fatal(err)
 	}
 	claimed, ok, err := j.Next(now)
@@ -1017,7 +1017,8 @@ func TestAckAdoptsAllocationsMeasuredDuringTheUpload(t *testing.T) {
 	finalized := claimed
 	finalized.Files = []TaskFile{{
 		Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
-		Object: "sandboxes/sb-late/gen/rootfs.p0000",
+		AllocatedBytes: -1,
+		Object:         "sandboxes/sb-late/gen/rootfs.p0000",
 	}}
 	if _, err := j.Ack(finalized, "test-bucket", true); err != nil {
 		t.Fatal(err)
@@ -1056,14 +1057,14 @@ func TestPreservedOutboxManifestAdoptsNewerAllocations(t *testing.T) {
 	const object = "sandboxes/sb-keep/gen/rootfs.p0000"
 
 	// A first completion banks the objects, with nothing measured.
-	if err := j.Enqueue(queued(0)); err != nil {
+	if err := j.Enqueue(queued(-1)); err != nil {
 		t.Fatal(err)
 	}
 	first, ok, err := j.Next(now)
 	if err != nil || !ok {
 		t.Fatalf("claim = %v (%v)", ok, err)
 	}
-	first.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10, Object: object}}
+	first.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10, AllocatedBytes: -1, Object: object}}
 	if _, err := j.Ack(first, "test-bucket", true); err != nil {
 		t.Fatal(err)
 	}
@@ -1120,5 +1121,30 @@ func TestRenewClaimRefusesAnExpiredLease(t *testing.T) {
 	}
 	if _, ok, err := j.Next(now.Add(claimTTL + 2*time.Minute)); err != nil || !ok {
 		t.Fatalf("the task was not claimable after its lease expired: %v (%v)", ok, err)
+	}
+}
+
+// A fully sparse artifact measures zero legitimately. Since a
+// generation's identity covers apparent content and not physical layout,
+// the same generation can be re-enqueued from a file laid out with
+// allocated zero-filled extents — and that footprint belongs to the other
+// layout, not to the paths this row keeps.
+func TestMergeAllocationsKeepsARealZero(t *testing.T) {
+	queued := []TaskFile{
+		{Name: "sparse.ext4", AllocatedBytes: 0},
+		{Name: "unmeasured.ext4", AllocatedBytes: -1},
+	}
+	incoming := []TaskFile{
+		{Name: "sparse.ext4", AllocatedBytes: 4 << 20},
+		{Name: "unmeasured.ext4", AllocatedBytes: 8192},
+	}
+	if !mergeAllocations(queued, incoming) {
+		t.Fatal("the missing measurement was not adopted")
+	}
+	if queued[0].AllocatedBytes != 0 {
+		t.Fatalf("a measured zero became %d, taking another layout's footprint", queued[0].AllocatedBytes)
+	}
+	if queued[1].AllocatedBytes != 8192 {
+		t.Fatalf("the missing measurement = %d, want the incoming one", queued[1].AllocatedBytes)
 	}
 }
