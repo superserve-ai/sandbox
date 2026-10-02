@@ -486,6 +486,27 @@ func withFakeBin(t *testing.T, bins map[string]string) {
 		}
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	prev := desktopHelperPath
+	desktopHelperPath = dir + string(os.PathListSeparator) + prev
+	t.Cleanup(func() { desktopHelperPath = prev })
+}
+
+// A helper that only exists on the sandbox's PATH must not resolve: boxd
+// runs helpers as root, and that PATH is under the sandbox user's control.
+func TestDesktopCommandIgnoresSandboxPATH(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "xdotool"), []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := desktopHelperPath
+	desktopHelperPath = t.TempDir() // trusted path with nothing in it
+	t.Cleanup(func() { desktopHelperPath = prev })
+
+	sandboxCtx := &sandboxContext{}
+	sandboxCtx.merge(map[string]string{"PATH": dir}, "", "")
+	if _, err := newDesktopService(sandboxCtx).commandContext(context.Background(), "xdotool"); err == nil {
+		t.Fatal("helper resolved from the sandbox PATH")
+	}
 }
 
 func TestDesktopCommandUsesSandboxDisplay(t *testing.T) {
