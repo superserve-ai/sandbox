@@ -16,11 +16,12 @@ const (
 	desktopResizePath      = boxdpbconnect.DesktopServiceResizeProcedure
 	desktopSendActionsPath = boxdpbconnect.DesktopServiceSendActionsProcedure
 
-	// Sized above the largest request boxd itself accepts — a SendActions
-	// batch of 64 actions × 64KiB text (~4MiB) plus envelope/JSON-encoding
-	// headroom — so the proxy never rejects a request boxd would take,
-	// while still bounding abuse.
-	maxDesktopRequestBytes = 8 << 20 // 8 MiB
+	// Sized above the largest request boxd itself accepts on the wire: a
+	// SendActions batch of 64 actions × 64KiB text is 4MiB decoded, and
+	// Connect JSON can expand every byte to a 6-byte \u escape (24MiB),
+	// plus envelope headroom. The proxy must never reject a request boxd
+	// would take, while still bounding abuse.
+	maxDesktopRequestBytes = 32 << 20 // 32 MiB
 
 	// desktopUsageWindow debounces desktop usage events per (sandbox,
 	// event). Screenshots and input arrive per agent-loop iteration —
