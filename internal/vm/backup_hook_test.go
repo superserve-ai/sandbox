@@ -2079,3 +2079,54 @@ func TestEnqueueCarriesAllocatedBytes(t *testing.T) {
 		}
 	}
 }
+
+// One pass must work through the backlog, not dispatch a single record
+// and sleep until the next tick: with two slots and a five-minute cadence
+// that paced a backlog of thousands at about eight an hour, so it never
+// cleared.
+func TestPendingSweepDispatchesTheWholeBacklogInOnePass(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	const records = 25
+	for i := 0; i < records; i++ {
+		if err := st.PutPendingBackup(newPendingBackup(fmt.Sprintf("vm-%02d", i), "/snap", "/disk", "", "")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// No instance and a dead unit: every record resolves immediately as
+	// superseded, so the pass is measured on dispatch rather than on how
+	// long a rehash takes.
+	var mu sync.Mutex
+	done := 0
+	m := &Manager{
+		state:    st,
+		log:      zerolog.Nop(),
+		vms:      map[string]*VMInstance{},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.rehashDone = func() {
+		mu.Lock()
+		done++
+		mu.Unlock()
+	}
+
+	m.ensureRehashSlots()
+	m.runPendingBackups(context.Background(), zerolog.Nop())
+	// Taking every slot waits for the dispatched workers: each releases
+	// its slot only after its rehash returns.
+	for i := 0; i < cap(m.rehashSlots); i++ {
+		m.rehashSlots <- struct{}{}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if done != records {
+		t.Fatalf("one pass dispatched %d of %d retained records", done, records)
+	}
+}

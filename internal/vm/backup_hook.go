@@ -562,6 +562,14 @@ func (m *Manager) ensureRehashSlots() chan struct{} {
 // wait for the next process restart to try again.
 const pendingBackupSweepInterval = 5 * time.Minute
 
+// pendingSweepPassBudget bounds how long one pass keeps dispatching. Well
+// inside the interval so a slow pass never runs into its successor, and
+// long enough that a pass clears many records rather than the one the
+// old shape managed: at two concurrent rehashes this paces the backlog
+// down over hours while leaving the artifact array idle of sweep work
+// most of the time.
+const pendingSweepPassBudget = time.Minute
+
 // enqueueStagedPending hashes a pause's immutable staged copies and
 // enqueues them. The staged files carry no mutation risk, so the only
 // checks that remain are the base's (the base is not staged: guests
@@ -924,20 +932,41 @@ func (m *Manager) runPendingBackups(ctx context.Context, log zerolog.Logger) {
 		log.Error().Err(err).Msg("pending backup recovery: list failed")
 		return
 	}
+	// A pass waits for a slot rather than abandoning the backlog at the
+	// first busy one. The concurrency cap is what bounds disk bandwidth;
+	// returning on top of it only idled the sweep, so a pass dispatched
+	// about one record and slept until the next tick — eight an hour,
+	// against backlogs of thousands that therefore never cleared. The
+	// budget is what keeps a pass from running into its successor.
+	budget := m.pendingSweepBudget
+	if budget <= 0 {
+		budget = pendingSweepPassBudget
+	}
+	passCtx, endPass := context.WithTimeout(ctx, budget)
+	defer endPass()
+	dispatched := 0
 	for _, pb := range pending {
 		select {
 		case m.rehashSlots <- struct{}{}:
-		default:
-			// All slots busy: the rest of the backlog waits for the next
-			// sweep rather than piling up unbounded hash work.
-			log.Info().Msg("pending backup slots saturated; remaining records wait for the next sweep")
+		case <-passCtx.Done():
+			// Budget spent (or shutdown): the remainder is picked up by
+			// the next sweep, which starts where the listing does.
+			log.Info().Int("dispatched", dispatched).Int("pending", len(pending)).
+				Msg("pending backup sweep budget spent; remaining records wait for the next sweep")
 			return
 		}
+		dispatched++
 		log.Info().Str("vm_id", pb.VMID).Msg("retrying pending pause backup")
+		// The worker runs under the caller's context, not the pass
+		// budget: a dispatched rehash owns its own deadline and must not
+		// be cut short because the pass stopped handing out work.
 		go func(pb PendingBackup) {
 			defer func() { <-m.rehashSlots }()
 			m.rehashPendingBackup(ctx, pb, log)
 		}(pb)
+	}
+	if dispatched > 0 {
+		log.Info().Int("dispatched", dispatched).Msg("pending backup sweep dispatched every retained record")
 	}
 }
 
