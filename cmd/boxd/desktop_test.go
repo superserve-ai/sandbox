@@ -496,7 +496,7 @@ func TestDesktopCommandUsesSandboxDisplay(t *testing.T) {
 
 	sandboxCtx := &sandboxContext{}
 	sandboxCtx.merge(map[string]string{"DISPLAY": ":77"}, "", "")
-	service := newDesktopService(sandboxCtx)
+	service := newTestDesktopService(sandboxCtx)
 	cmd, err := service.commandContext(context.Background(), "xdotool")
 	if err != nil {
 		t.Fatalf("commandContext: %v", err)
@@ -517,7 +517,7 @@ func TestDesktopCommandDefaultsDisplay(t *testing.T) {
 	})
 	t.Setenv("DISPLAY", "")
 
-	service := newDesktopService(nil)
+	service := newTestDesktopService(nil)
 	cmd, err := service.commandContext(context.Background(), "xdotool")
 	if err != nil {
 		t.Fatalf("commandContext: %v", err)
@@ -539,7 +539,7 @@ exit 0
 `, logFile),
 	})
 
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	resp, err := s.SendPointer(context.Background(), connect.NewRequest(&pb.PointerEvent{
 		X:      42,
 		Y:      7,
@@ -568,7 +568,7 @@ func TestSendPointer_EndToEnd_ExecFailurePropagates(t *testing.T) {
 		"xdotool": "echo 'no display' >&2\nexit 1\n",
 	})
 
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.SendPointer(context.Background(), connect.NewRequest(&pb.PointerEvent{
 		X: 1, Y: 1, Action: pb.PointerAction_POINTER_ACTION_MOVE,
 	}))
@@ -589,7 +589,7 @@ func TestSendPointer_ValidationErrorNeverShellsOut(t *testing.T) {
 	// before exec, this would fail with "executable file not found" instead
 	// of the expected InvalidArgument, so this also proves validation runs
 	// first.
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.SendPointer(context.Background(), connect.NewRequest(&pb.PointerEvent{
 		X: -1, Y: 0,
 	}))
@@ -610,7 +610,7 @@ exit 0
 `, logFile),
 	})
 
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.SendKey(context.Background(), connect.NewRequest(&pb.KeyEvent{
 		Input:     &pb.KeyEvent_Key{Key: "Delete"},
 		Modifiers: []string{"ctrl", "alt"},
@@ -629,7 +629,7 @@ exit 0
 }
 
 func TestSendKey_ValidationErrorNeverShellsOut(t *testing.T) {
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.SendKey(context.Background(), connect.NewRequest(&pb.KeyEvent{}))
 	if err == nil {
 		t.Fatal("expected error when neither key nor text is set")
@@ -648,7 +648,7 @@ exit 0
 `, logFile),
 	})
 
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.Scroll(context.Background(), connect.NewRequest(&pb.ScrollEvent{Dy: 3}))
 	if err != nil {
 		t.Fatalf("Scroll: %v", err)
@@ -680,7 +680,7 @@ exit 1
 `,
 	})
 
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.Resize(context.Background(), connect.NewRequest(&pb.DesktopResizeRequest{Width: 1280, Height: 720}))
 	if err != nil {
 		t.Fatalf("Resize: %v", err)
@@ -702,7 +702,7 @@ exit 1
 }
 
 func TestResize_ValidationErrorNeverShellsOut(t *testing.T) {
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.Resize(context.Background(), connect.NewRequest(&pb.DesktopResizeRequest{Width: 0, Height: 0}))
 	if err == nil {
 		t.Fatal("expected error for zero dimensions")
@@ -718,10 +718,19 @@ func TestResize_ValidationErrorNeverShellsOut(t *testing.T) {
 // connect.ServerStream has no exported constructor for direct unit testing.
 // ---------------------------------------------------------------------------
 
+// newTestDesktopService builds a service with the persistent X11 backend
+// disabled, so tests exercise the shell fallback deterministically (and can
+// never inject input into a real display on a dev machine).
+func newTestDesktopService(ctx *sandboxContext) *desktopService {
+	s := newDesktopService(ctx)
+	s.x11.disabled = true
+	return s
+}
+
 func newDesktopTestServer(t *testing.T) boxdpbconnect.DesktopServiceClient {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.Handle(boxdpbconnect.NewDesktopServiceHandler(newDesktopService(nil)))
+	mux.Handle(boxdpbconnect.NewDesktopServiceHandler(newTestDesktopService(nil)))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return boxdpbconnect.NewDesktopServiceClient(srv.Client(), srv.URL)
@@ -957,7 +966,7 @@ func TestScreenshot_EndToEnd(t *testing.T) {
 }
 
 func TestScreenshot_UnsupportedFormat_InvalidArgument(t *testing.T) {
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.Screenshot(context.Background(), connect.NewRequest(&pb.ScreenshotRequest{
 		Format: pb.FrameFormat(99),
 	}))
@@ -972,7 +981,7 @@ func TestScreenshot_InvalidPNG_Internal(t *testing.T) {
 		"import": `printf 'NOTAPNG'
 `,
 	})
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	_, err := s.Screenshot(context.Background(), connect.NewRequest(&pb.ScreenshotRequest{}))
 	var ce *connect.Error
 	if !errors.As(err, &ce) || ce.Code() != connect.CodeInternal {
@@ -994,7 +1003,7 @@ func TestScreenshot_WorksWhileStreamSlotHeld(t *testing.T) {
 `, pngFile),
 	})
 
-	s := newDesktopService(nil)
+	s := newTestDesktopService(nil)
 	// Simulate an active Stream holding the per-sandbox slot.
 	s.streamSlot <- struct{}{}
 	defer func() { <-s.streamSlot }()
@@ -1008,9 +1017,10 @@ func TestScreenshot_WorksWhileStreamSlotHeld(t *testing.T) {
 // SendActions (batch)
 // ---------------------------------------------------------------------------
 
-func TestBatchCommands(t *testing.T) {
+func TestLowerActions(t *testing.T) {
+	svc := newTestDesktopService(nil)
 	t.Run("empty rejected", func(t *testing.T) {
-		if _, err := batchCommands(nil); err == nil {
+		if _, err := svc.lowerActions(nil); err == nil {
 			t.Error("expected error for empty batch")
 		}
 	})
@@ -1020,13 +1030,13 @@ func TestBatchCommands(t *testing.T) {
 		for i := range actions {
 			actions[i] = &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 1, Y: 1}}}
 		}
-		if _, err := batchCommands(actions); err == nil {
+		if _, err := svc.lowerActions(actions); err == nil {
 			t.Error("expected error for oversized batch")
 		}
 	})
 
 	t.Run("invalid action reports its index", func(t *testing.T) {
-		_, err := batchCommands([]*pb.Action{
+		_, err := svc.lowerActions([]*pb.Action{
 			{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 1, Y: 1}}},
 			{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: -1, Y: 1}}},
 		})
@@ -1036,20 +1046,21 @@ func TestBatchCommands(t *testing.T) {
 	})
 
 	t.Run("unset action rejected", func(t *testing.T) {
-		if _, err := batchCommands([]*pb.Action{{}}); err == nil {
+		if _, err := svc.lowerActions([]*pb.Action{{}}); err == nil {
 			t.Error("expected error for action with no payload")
 		}
 	})
 
-	t.Run("scroll expands to per-axis commands", func(t *testing.T) {
-		cmds, err := batchCommands([]*pb.Action{
+	t.Run("valid batch lowers one executor per action", func(t *testing.T) {
+		lowered, err := svc.lowerActions([]*pb.Action{
 			{Action: &pb.Action_Scroll{Scroll: &pb.ScrollEvent{Dx: 1, Dy: -2}}},
+			{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "x"}}}},
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(cmds) != 1 || len(cmds[0]) != 2 {
-			t.Errorf("cmds = %v, want one action with two xdotool invocations", cmds)
+		if len(lowered) != 2 {
+			t.Errorf("lowered %d executors, want 2", len(lowered))
 		}
 	})
 }
