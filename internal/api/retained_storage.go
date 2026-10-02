@@ -52,44 +52,42 @@ SELECT EXISTS (
 	// Lock only owners whose contribution is new or changed. A host-wide lock
 	// (or locking an unchanged fleet) would make a periodic inventory contend
 	// with unrelated pause/resume/destroy writes.
-	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id,
+	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id,generation,extents,
        baseline->>'path' AS baseline_path,
        baseline->>'generation' AS baseline_generation,
        (baseline->>'allocated_bytes')::bigint AS baseline_allocated_bytes
-       FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,baseline jsonb))
+       FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline jsonb))
  SELECT s.id FROM sandbox s JOIN supplied o ON o.kind='sandbox' AND o.id=s.id
 			 WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
 			   AND NOT EXISTS (
-				 SELECT 1 FROM retained_storage_interval i
-				 JOIN jsonb_to_recordset($3::jsonb) AS current(kind text,id uuid,generation text,extents jsonb)
-				   ON current.kind='sandbox' AND current.id=s.id
+					 SELECT 1 FROM retained_storage_interval i
+						 JOIN supplied current ON current.kind='sandbox' AND current.id=s.id
 				 WHERE i.host_id=$1 AND i.owner_kind='sandbox' AND i.owner_id=s.id
 				   AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
 				   AND i.generation=current.generation AND i.extents=current.extents
-				   AND i.baseline_path IS NOT DISTINCT FROM current.baseline_path
-				   AND i.baseline_generation IS NOT DISTINCT FROM current.baseline_generation
-				   AND i.baseline_allocated_bytes IS NOT DISTINCT FROM current.baseline_allocated_bytes)
+					   AND i.baseline_path IS NOT DISTINCT FROM current.baseline_path
+					   AND i.baseline_generation IS NOT DISTINCT FROM current.baseline_generation
+					   AND i.baseline_allocated_bytes IS NOT DISTINCT FROM current.baseline_allocated_bytes)
  FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id,
+	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id,generation,extents,
        baseline->>'path' AS baseline_path,
        baseline->>'generation' AS baseline_generation,
        (baseline->>'allocated_bytes')::bigint AS baseline_allocated_bytes
-       FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,baseline jsonb))
+       FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline jsonb))
 	 SELECT s.id FROM sandbox_snapshot s JOIN supplied o ON o.kind='snapshot' AND o.id=s.id
 			 WHERE s.host_id=$1 AND (s.status IN ('ready','creating','deleting') OR s.retention_ended_at>$2)
 			   AND s.created_at<=$2 AND (LEAST(s.deleted_at,s.retention_ended_at) IS NULL OR LEAST(s.deleted_at,s.retention_ended_at)>$2)
 			   AND NOT EXISTS (
-				 SELECT 1 FROM retained_storage_interval i
-				 JOIN jsonb_to_recordset($3::jsonb) AS current(kind text,id uuid,generation text,extents jsonb)
-				   ON current.kind='snapshot' AND current.id=s.id
+					 SELECT 1 FROM retained_storage_interval i
+						 JOIN supplied current ON current.kind='snapshot' AND current.id=s.id
 				 WHERE i.host_id=$1 AND i.owner_kind='snapshot' AND i.owner_id=s.id
 				   AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
 				   AND i.generation=current.generation AND i.extents=current.extents
-				   AND i.baseline_path IS NOT DISTINCT FROM current.baseline_path
-				   AND i.baseline_generation IS NOT DISTINCT FROM current.baseline_generation
-				   AND i.baseline_allocated_bytes IS NOT DISTINCT FROM current.baseline_allocated_bytes)
+					   AND i.baseline_path IS NOT DISTINCT FROM current.baseline_path
+					   AND i.baseline_generation IS NOT DISTINCT FROM current.baseline_generation
+					   AND i.baseline_allocated_bytes IS NOT DISTINCT FROM current.baseline_allocated_bytes)
  FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
