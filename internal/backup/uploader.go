@@ -990,6 +990,11 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile, re
 		return ManifestFile{}, "", 0, err
 	}
 	defer f.Close()
+	// Enter the artifact's preparation on a fresh lease: the extent scan
+	// is metadata work with no cancellation of its own, so the honest
+	// bound on it is to start it with a full lease rather than whatever
+	// the previous artifact left.
+	renew()
 	extents, apparent, err := Extents(f)
 	if err != nil {
 		return ManifestFile{}, "", 0, fmt.Errorf("extents %s: %w", file.Path, err)
