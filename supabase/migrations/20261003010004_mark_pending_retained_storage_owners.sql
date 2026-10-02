@@ -1,5 +1,9 @@
 SET LOCAL lock_timeout = '250ms';
 
+-- LOCK requires a transaction block even inside the CLI's implicit batch.
+-- Keep the lock and replacement atomic with the appended migration-history row.
+DO $migration$
+BEGIN
 -- Drain inserts using the former trigger before making the marker mandatory.
 LOCK TABLE sandbox, sandbox_snapshot IN SHARE ROW EXCLUSIVE MODE;
 
@@ -17,3 +21,5 @@ BEGIN
  RETURN NEW;
 END;
 $$;
+END;
+$migration$;

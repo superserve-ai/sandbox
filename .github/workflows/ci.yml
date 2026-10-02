@@ -7,6 +7,20 @@ on:
     branches: [main]
 
 jobs:
+  migration-cli:
+    name: Migration CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Exercise the same runner as CD, including migration-history writes.
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Validate fresh and interrupted migrations
+        run: python3 scripts/test_migration_cli.py
+
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
