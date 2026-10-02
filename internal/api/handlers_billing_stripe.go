@@ -668,6 +668,10 @@ func (h *Handlers) getTeamBillingUsage(c *gin.Context, platform bool) {
 	}
 	usage, period, err := h.readBillingSnapshot(c.Request.Context(), teamID, periodStart, periodEnd)
 	if err != nil {
+		if errors.Is(err, billing.ErrStorageUsageUnavailable) {
+			respondErrorMsg(c, "storage_unavailable", "Storage usage is temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read billing snapshot failed")
 		respondError(c, ErrInternal)
 		return
@@ -3940,6 +3944,9 @@ func billingTeamUsageFromUpsertRow(usage db.UpsertTeamBillingUsageRow) db.TeamBi
 }
 
 func billingTeamUsageFromReadRow(usage db.GetTeamBillingUsageRow) (db.TeamBillingUsage, error) {
+	if !usage.StorageGibSeconds.Valid || !usage.BillableStorageGibSeconds.Valid {
+		return db.TeamBillingUsage{}, billing.ErrStorageUsageUnavailable
+	}
 	memoryGibSeconds, err := numericFloat64(usage.MemoryGibSeconds)
 	if err != nil {
 		return db.TeamBillingUsage{}, err

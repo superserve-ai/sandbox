@@ -287,7 +287,7 @@ func TestIntegration_SnapshotRecordsBindingsUnderTheSecretWriteLock(t *testing.T
 		if err == nil {
 			err = tx.Commit(ctx)
 		}
-		done <- result{row, err}
+		done <- result{db.SandboxSnapshot(row), err}
 	}()
 	select {
 	case r := <-done:
@@ -407,7 +407,7 @@ func TestIntegration_CaptureWaitsOutAnAttachAndItsUndo(t *testing.T) {
 		if err == nil {
 			err = tx.Commit(ctx)
 		}
-		done <- result{row, err}
+		done <- result{db.SandboxSnapshot(row), err}
 	}()
 	select {
 	case r := <-done:

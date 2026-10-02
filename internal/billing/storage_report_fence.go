@@ -23,8 +23,9 @@ var ErrStorageSettlementBoundaryOpen = errors.New("billing period is still open 
 func FenceStorageReportReceipts(ctx context.Context, tx pgx.Tx, teamID uuid.UUID) error {
 	rows, err := tx.Query(ctx, `
 		SELECT DISTINCT host_id
-		FROM sandbox
-		WHERE team_id=$1 AND host_id IS NOT NULL
+		FROM (SELECT host_id FROM sandbox WHERE team_id=$1
+ UNION SELECT host_id FROM sandbox_snapshot WHERE team_id=$1) owners
+ WHERE host_id IS NOT NULL
 		ORDER BY host_id`, teamID)
 	if err != nil {
 		return fmt.Errorf("list storage receipt hosts: %w", err)
@@ -45,6 +46,11 @@ func FenceStorageReportReceipts(ctx context.Context, tx pgx.Tx, teamID uuid.UUID
 			return ErrStorageReportsIncomplete
 		}
 	}
+	// Owner creation uses a non-blocking shared marker. Do not acquire its
+	// exclusive counterpart here: settlement aggregation can run for seconds,
+	// and lifecycle writers must never wait behind that transaction. Receipt
+	// host locks plus the persisted obligation/receipt fence preserve the
+	// boundary without coupling unrelated lifecycle operations to settlement.
 	return nil
 }
 

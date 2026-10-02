@@ -23,6 +23,7 @@ const ExportRemeasurementSQL = `WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(now(), $3)) > $2
 ),
 storage AS (
-    SELECT billable_storage_mib_seconds($1,$2,$3) AS storage_mib_seconds
+ SELECT billable_storage_mib_seconds($1::uuid,$2::timestamptz,$3::timestamptz) AS storage_mib_seconds
 )
+
 SELECT compute.vcpu_seconds,compute.memory_mib_seconds,storage.storage_mib_seconds FROM compute,storage`

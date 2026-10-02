@@ -202,6 +202,9 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 			if err = tx.QueryRow(ctx, billingBoundaryUsageSQL, team, at, until).Scan(&c, &m, &s); err != nil {
 				return false, err
 			}
+			if !s.Valid {
+				return false, billing.ErrStorageReportsIncomplete
+			}
 		} else if !effective.Valid || !effective.Time.Before(until) {
 			_ = s.Scan("0")
 		}
@@ -226,6 +229,9 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 			if effective.Valid && effective.Time.Before(until) {
 				if err = tx.QueryRow(ctx, `SELECT billable_storage_mib_seconds($1,$2,$3)`, team, at, until).Scan(&s); err != nil {
 					return false, err
+				}
+				if !s.Valid {
+					return false, billing.ErrStorageReportsIncomplete
 				}
 			}
 			// Hourly totals may lag the authoritative close snapshot. Compare the

@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
@@ -31,11 +32,16 @@ const (
 var (
 	errStorageReportStaleIncarnation = errors.New("stale host incarnation")
 	errStorageReportInvalidPayload   = errors.New("invalid storage report payload")
+	// Valid JSON can still describe an incomplete or superseded retained
+	// inventory. Such a report remains retryable so settlement cannot treat an
+	// unmeasured first interval as an explicit zero.
+	errStorageReportRetainedIncomplete = errors.New("retained storage inventory incomplete")
 )
 
 type storageReportMeasurement struct {
-	SandboxID      string `json:"sandbox_id"`
-	AllocatedBytes int64  `json:"allocated_bytes"`
+	Retained       *retainedstorage.Inventory `json:"retained,omitempty"`
+	SandboxID      string                     `json:"sandbox_id"`
+	AllocatedBytes int64                      `json:"allocated_bytes"`
 }
 
 type storageReportRequest struct {
@@ -110,6 +116,7 @@ func (h *Handlers) enqueueStorageReportWithRetry(ctx context.Context, hostID, in
 func (h *Handlers) HostStorageReport(c *gin.Context) {
 	hostID := c.Param("host_id")
 	var req storageReportRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<20)
 	if err := bindJSONStrict(c, &req); err != nil {
 		respondErrorMsg(c, "bad_request", "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
@@ -130,6 +137,13 @@ func (h *Handlers) HostStorageReport(c *gin.Context) {
 	}
 	seen := make(map[uuid.UUID]struct{}, len(req.Measurements))
 	for _, m := range req.Measurements {
+		if m.Retained != nil {
+			if len(req.Measurements) != 1 || m.SandboxID != "" || m.AllocatedBytes != 0 || m.Retained.Validate() != nil {
+				respondErrorMsg(c, "bad_request", "invalid retained inventory", http.StatusBadRequest)
+				return
+			}
+			continue
+		}
 		sandboxID, err := uuid.Parse(m.SandboxID)
 		if err != nil || m.AllocatedBytes < 0 {
 			respondErrorMsg(c, "bad_request", "invalid storage measurement", http.StatusBadRequest)
@@ -455,13 +469,36 @@ func processOneStorageReport(ctx context.Context, pool *pgxpool.Pool) bool {
 			SELECT host_id, incarnation_id, report_id FROM host_storage_report
 			WHERE (state IN ('pending', 'retry_exhausted') OR (state='processing' AND next_attempt_at < now()-interval '1 minute'))
 			  AND next_attempt_at <= now()
+			  -- Once a newer report exists, repeatedly retrying the immutable
+			  -- incomplete predecessor would starve the recovery report.
+			  AND NOT (
+				state='retry_exhausted' AND last_error LIKE 'retained storage inventory incomplete:%' AND EXISTS (
+					SELECT 1 FROM host_storage_report newer
+				  WHERE newer.host_id=host_storage_report.host_id
+				    AND newer.incarnation_id=host_storage_report.incarnation_id
+				    AND newer.ingest_seq>host_storage_report.ingest_seq
+					-- Only this explicitly incomplete predecessor may be overtaken.
+					-- Database/lock failures remain ordered and retryable even after
+					-- recovery reports have arrived.
+					AND newer.state<>'terminal'
+				)
+			  )
 			  AND NOT EXISTS (
 				SELECT 1 FROM host_storage_report prior
 				WHERE prior.host_id=host_storage_report.host_id
 				  AND prior.incarnation_id=host_storage_report.incarnation_id
 				  AND prior.ingest_seq < host_storage_report.ingest_seq
+				  -- Preserve receipt order for every retryable predecessor. Only an
+				  -- explicitly incomplete retained inventory may be overtaken by a
+				  -- newer retained receipt; transient database/lock failures remain
+				  -- ordered so their accepted quantity can still be recovered.
 				  AND prior.state NOT IN ('processed', 'terminal')
-			  )
+				  AND NOT (
+				    prior.state='retry_exhausted'
+				    AND prior.last_error LIKE 'retained storage inventory incomplete:%'
+				    AND jsonb_path_exists(host_storage_report.payload, '$[*] ? (@.retained != null)')
+				  )
+				)
 			ORDER BY received_at
 			FOR UPDATE SKIP LOCKED LIMIT 1
 		)
@@ -516,6 +553,19 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 	ids := make([]uuid.UUID, 0, len(measurements))
 	disk := make([]int32, 0, len(measurements))
 	for _, m := range measurements {
+		if m.Retained != nil {
+			if len(measurements) != 1 || totalMeasurements != 1 || m.SandboxID != "" || m.AllocatedBytes != 0 {
+				// The durable row has already passed the ingress shape check. If a
+				// processor sees a retained envelope that is incomplete or has been
+				// superseded, keep it retryable so the first measurement remains a
+				// settlement fence instead of discarding the evidence as zero.
+				return retainedStorageIncompleteError("retained report envelope is incomplete")
+			}
+			if err := applyRetainedStorage(ctx, tx, hostID, receivedAt, m.Retained, reportID); err != nil {
+				return err
+			}
+			continue
+		}
 		id, err := uuid.Parse(m.SandboxID)
 		if err != nil {
 			return fmt.Errorf("%w: sandbox_id %q: %v", errStorageReportInvalidPayload, m.SandboxID, err)
@@ -535,6 +585,40 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 		ORDER BY id FOR NO KEY UPDATE`, ids, hostID); err != nil {
 		return err
 	}
+	// Close source-host intervals in their own statements before attempting the
+	// destination insert. Data-modifying CTEs that are not referenced by the
+	// final statement do not provide an execution-order guarantee, so relying on
+	// them can let the one-open-interval constraint discard the destination.
+	if _, err := tx.Exec(ctx, `
+		UPDATE retained_storage_interval old
+		SET ended_at=$3::timestamptz
+		FROM unnest($1::uuid[]) AS ids(sandbox_id) JOIN sandbox owner ON owner.id=ids.sandbox_id
+		WHERE old.owner_kind='sandbox' AND old.owner_id=ids.sandbox_id
+		  AND old.host_id IS DISTINCT FROM $2
+		  AND old.started_at<$3::timestamptz
+		  AND (old.ended_at IS NULL OR old.ended_at>$3::timestamptz)
+		  AND owner.host_id=$2 AND owner.created_at <= $3::timestamptz
+		  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $3::timestamptz)
+		  AND feature_enabled('billing_metrics_write',owner.team_id)
+		  AND NOT EXISTS (SELECT 1 FROM sandbox_storage_interval future WHERE future.sandbox_id=owner.id AND future.started_at>$3::timestamptz)
+		  AND NOT EXISTS (SELECT 1 FROM retained_storage_interval future WHERE future.owner_kind='sandbox' AND future.owner_id=owner.id AND future.started_at>$3::timestamptz)`, ids, hostID, receivedAt); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sandbox_storage_interval old
+		SET ended_at=$3::timestamptz, end_reason='reassigned'
+		FROM unnest($1::uuid[]) AS ids(sandbox_id) JOIN sandbox owner ON owner.id=ids.sandbox_id
+		WHERE old.sandbox_id=owner.id
+		  AND old.host_id IS DISTINCT FROM $2
+		  AND old.started_at<$3::timestamptz
+		  AND (old.ended_at IS NULL OR old.ended_at>$3::timestamptz)
+		  AND owner.host_id=$2 AND owner.created_at <= $3::timestamptz
+		  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $3::timestamptz)
+		  AND feature_enabled('billing_metrics_write',owner.team_id)
+		  AND NOT EXISTS (SELECT 1 FROM sandbox_storage_interval future WHERE future.sandbox_id=owner.id AND future.started_at>$3::timestamptz)
+		  AND NOT EXISTS (SELECT 1 FROM retained_storage_interval future WHERE future.owner_kind='sandbox' AND future.owner_id=owner.id AND future.started_at>$3::timestamptz)`, ids, hostID, receivedAt); err != nil {
+		return err
+	}
 	_, err = tx.Exec(ctx, `
 		WITH measurements AS MATERIALIZED (
 			SELECT unnest($1::uuid[]) AS sandbox_id, unnest($2::int[]) AS disk_mib
@@ -542,6 +626,13 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 			SELECT s.id, s.team_id, s.destroyed_at, m.disk_mib FROM measurements m
 			JOIN sandbox s ON s.id=m.sandbox_id
 			WHERE s.host_id=$3
+			  AND NOT EXISTS (
+				SELECT 1 FROM retained_storage_interval retained
+				WHERE retained.host_id=s.host_id AND retained.team_id=s.team_id
+				  AND retained.owner_kind='sandbox' AND retained.owner_id=s.id
+				  AND retained.started_at<=$4::timestamptz
+				  AND (retained.ended_at IS NULL OR retained.ended_at>$4::timestamptz)
+			  )
 			  AND s.created_at <= $4::timestamptz
 			  -- A worker can lag sandbox destruction. Reports are eligible based
 			  -- on the sandbox lifetime at receipt, not processing time.
@@ -555,13 +646,19 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 				  AND future.team_id=s.team_id
 				  AND future.started_at > $4::timestamptz
 			)
+			  AND NOT EXISTS (
+				SELECT 1 FROM retained_storage_interval future
+				WHERE future.owner_kind='sandbox' AND future.owner_id=s.id AND future.started_at>$4::timestamptz
+			)
 		), current_intervals AS MATERIALIZED (
 			SELECT e.id, e.team_id, e.destroyed_at, e.disk_mib,
-			       i.id AS interval_id, i.disk_mib AS current_disk_mib
+			       i.id AS interval_id, i.disk_mib AS current_disk_mib,
+			       i.ended_at AS prior_end, i.end_reason AS prior_end_reason
 			FROM eligible e
-			LEFT JOIN sandbox_storage_interval i
-			  ON i.sandbox_id=e.id
-			 AND i.team_id=e.team_id
+				LEFT JOIN sandbox_storage_interval i
+				  ON i.sandbox_id=e.id
+				 AND i.team_id=e.team_id
+				 AND i.host_id=$3
 			 AND i.started_at <= $4::timestamptz
 			 AND (i.ended_at IS NULL OR i.ended_at > $4::timestamptz)
 		), closed AS (
@@ -572,8 +669,9 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 		)
 		INSERT INTO sandbox_storage_interval(sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason)
 		SELECT e.id, e.team_id, e.disk_mib, $4::timestamptz,
-		       e.destroyed_at,
-		       CASE WHEN e.destroyed_at IS NULL THEN NULL ELSE 'deleted' END
+		       LEAST(e.destroyed_at,e.prior_end),
+		       CASE WHEN e.prior_end IS NOT NULL AND (e.destroyed_at IS NULL OR e.prior_end<e.destroyed_at)
+		         THEN e.prior_end_reason WHEN e.destroyed_at IS NOT NULL THEN 'deleted' END
 		FROM current_intervals e
 		LEFT JOIN closed c ON c.sandbox_id=e.id AND c.team_id=e.team_id
 		WHERE e.interval_id IS NULL OR e.current_disk_mib IS DISTINCT FROM e.disk_mib
@@ -608,6 +706,31 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 	state := "pending"
 	if nextIndex == totalMeasurements {
 		state = "processed"
+	}
+	if state == "processed" {
+		// Keep the immutable failed report for audit, but stop it from blocking
+		// the host stream once this newer retained receipt has applied. Any
+		// unresolved owner still blocks settlement through its obligation row.
+		if _, err := tx.Exec(ctx, `
+			UPDATE host_storage_report prior
+			SET state='terminal', processed_at=COALESCE(processed_at, now()),
+			    last_error='superseded by a newer complete retained inventory', payload=NULL
+			WHERE EXISTS (
+				SELECT 1 FROM host_storage_report current
+				WHERE current.host_id=$1 AND current.incarnation_id=$2 AND current.report_id=$3
+				  AND current.payload IS NOT NULL
+				  AND jsonb_path_exists(current.payload, '$[*] ? (@.retained != null)')
+			)
+			  AND prior.host_id=$1 AND prior.incarnation_id=$2 AND prior.report_id<>$3
+			  AND prior.received_at<$4 AND prior.state='retry_exhausted'
+			  AND prior.payload IS NOT NULL
+			  AND prior.last_error LIKE 'retained storage inventory incomplete:%'
+			  AND EXISTS (
+				SELECT 1 FROM jsonb_array_elements(prior.payload) entry
+				WHERE entry ? 'retained'
+			  )`, hostID, incarnationID, reportID, receivedAt); err != nil {
+			return fmt.Errorf("supersede retained predecessor: %w", err)
+		}
 	}
 	var progressErr error
 	var progressRows int64
@@ -690,6 +813,13 @@ func finishStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string,
 // than a terminal state so billing cannot treat unapplied data as settled.
 func storageReportErrorIsTerminal(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Retained inventory failures may wrap the generic invalid-payload marker
+	// for compatibility with direct callers, but they are still retryable: the
+	// durable report or its owner set is the evidence needed to keep settlement
+	// blocked until a valid first measurement arrives.
+	if errors.Is(err, errStorageReportRetainedIncomplete) {
 		return false
 	}
 	// Database constraints can reflect deployment skew or a repairable schema

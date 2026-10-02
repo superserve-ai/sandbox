@@ -70,7 +70,25 @@ jobs:
       - name: Validate billing suites and worker load
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
-        run: bash scripts/validate-billing.sh
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xfsprogs
+          storage_test_root=$(mktemp -d "$RUNNER_TEMP/retained-storage.XXXXXX")
+          export RETAINED_STORAGE_TEST_DIR="$storage_test_root/mount"
+          cleanup() {
+            if mountpoint -q "$RETAINED_STORAGE_TEST_DIR"; then
+              sudo umount "$RETAINED_STORAGE_TEST_DIR" || return 1
+            fi
+            rm -rf "$storage_test_root"
+          }
+          trap cleanup EXIT
+          truncate -s 1G "$storage_test_root/storage.xfs"
+          mkfs.xfs -f -m reflink=1 "$storage_test_root/storage.xfs"
+          mkdir "$RETAINED_STORAGE_TEST_DIR"
+          sudo mount -t xfs -o loop "$storage_test_root/storage.xfs" "$RETAINED_STORAGE_TEST_DIR"
+          sudo chown "$(id -u):$(id -g)" "$RETAINED_STORAGE_TEST_DIR"
+          xfs_info "$RETAINED_STORAGE_TEST_DIR"
+          bash scripts/validate-billing.sh
 
       - name: Run integration tests
         env:

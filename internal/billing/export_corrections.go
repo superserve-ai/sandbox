@@ -91,6 +91,9 @@ func measureCorrection(ctx context.Context, tx pgx.Tx, p ExportPeriod, resource 
 	if err != nil {
 		return c, err
 	}
+	if resource == "storage" && !storage.Valid {
+		return c, ErrStorageReportsIncomplete
+	}
 	value := cpu
 	if resource == "memory" {
 		value = memory

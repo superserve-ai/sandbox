@@ -352,7 +352,7 @@ func testStreamAttemptLogsReconnectsWithReplay(t *testing.T, firstCallNotFound b
 	}}
 	client := &retryLogClient{stubVMD: &stubVMD{}, firstCallNotFound: firstCallNotFound}
 	h := &Handlers{DB: db.New(q), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) { return client, nil }}}
-	w := &logNotifyWriter{ResponseRecorder: httptest.NewRecorder(), seen: make(chan struct{})}
+	w := &logNotifyWriter{ResponseRecorder: httptest.NewRecorder(), seen: make(chan struct{}), match: "third log"}
 	c, _ := gin.CreateTestContext(w)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

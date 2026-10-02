@@ -297,10 +297,11 @@ func TestLoadHostsServesStaleAndRefreshesInBackground(t *testing.T) {
 	if _, _, err := s.SelectHost(context.Background(), nil); err != nil {
 		t.Fatalf("stale select: %v", err)
 	}
+	// The query counter advances before the refreshed cache is published.
 	deadline := time.Now().Add(2 * time.Second)
-	for store.calls.Load() < 2 {
+	for store.calls.Load() < 2 || refreshInFlight(s) {
 		if time.Now().After(deadline) {
-			t.Fatalf("background refresh never ran, calls=%d", store.calls.Load())
+			t.Fatalf("background refresh never completed, calls=%d", store.calls.Load())
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

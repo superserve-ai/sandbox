@@ -23,6 +23,8 @@ func TestStorageReportErrorIsTerminal(t *testing.T) {
 	}{
 		{name: "stale incarnation", err: errStorageReportStaleIncarnation, want: true},
 		{name: "invalid payload", err: errStorageReportInvalidPayload, want: true},
+		{name: "retained inventory incomplete", err: errStorageReportRetainedIncomplete, want: false},
+		{name: "retained inventory wrapping invalid payload", err: fmt.Errorf("%w: %w", errStorageReportRetainedIncomplete, errStorageReportInvalidPayload), want: false},
 		{name: "missing database row", err: pgx.ErrNoRows, want: false},
 		{name: "constraint violation", err: &pgconn.PgError{Code: "23514"}, want: false},
 		{name: "data exception", err: &pgconn.PgError{Code: "22003"}, want: false},
@@ -55,6 +57,18 @@ func TestHostStorageReportRejectsAllocatedBytesOverflowBeforeDB(t *testing.T) {
 				t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestHostStorageReportRejectsOverlayOnlyShapeForRetainedReport(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/internal/hosts/:host_id/storage-reports", (&Handlers{}).HostStorageReport)
+	body := `{"incarnation_id":"0f794b2e-f7a4-46eb-85b4-60f69e6cc831","report_id":"2f794b2e-f7a4-46eb-85b4-60f69e6cc831","measurements":[{"sandbox_id":"","allocated_bytes":0}]}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/internal/hosts/example-host/storage-reports", strings.NewReader(body)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a legacy reader that dropped retained data; body: %s", w.Code, w.Body.String())
 	}
 }
 

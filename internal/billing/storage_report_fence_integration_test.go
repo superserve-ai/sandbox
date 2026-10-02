@@ -36,11 +36,15 @@ func TestIntegration_StorageReceiptFenceScopesAndReleasesLocks(t *testing.T) {
 	prefix := uuid.NewString()
 	firstHost, busyHost, unrelatedHost := prefix+"-a", prefix+"-b", prefix+"-c"
 	if _, err := conn.Exec(ctx, `CREATE TEMP TABLE sandbox(team_id uuid, host_id text);
+ CREATE TEMP TABLE sandbox_snapshot(team_id uuid,host_id text);
 		CREATE INDEX ON sandbox(team_id,host_id)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.Exec(ctx, `INSERT INTO sandbox VALUES ($1,$3),($1,$4),($1,$4),($2,$5)`,
-		teamID, unrelatedTeamID, firstHost, busyHost, unrelatedHost); err != nil {
+	if _, err := conn.Exec(ctx, `INSERT INTO sandbox VALUES ($1,$3),($1,$3),($2,$4)`,
+		teamID, unrelatedTeamID, firstHost, unrelatedHost); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO sandbox_snapshot VALUES($1,$2)`, teamID, busyHost); err != nil {
 		t.Fatal(err)
 	}
 	blocked, err := blocker.Begin(ctx)
