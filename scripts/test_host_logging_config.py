@@ -238,6 +238,10 @@ RUN apt-get update \\
                 emit proxy-generation.service journal 6 '{"level":"INFO","message":"proxy-safe","sandbox_id":"sandbox-1"}' >> /fixture/journal.export
                 emit superserve-vmd.service journal 6 '{"level":"WARN","message":"safe-warn"}' >> /fixture/journal.export
                 emit superserve-vmd.service journal 6 '{"level":"ERROR","message":"safe-error"}' >> /fixture/journal.export
+                emit superserve-vmd.service journal 4 '{"level":"SECRET_LEVEL","message":"unknown-level"}' >> /fixture/journal.export
+                emit superserve-vmd.service journal 3 '{"severity":"SECRET_SEVERITY","message":"unknown-severity"}' >> /fixture/journal.export
+                emit superserve-vmd.service journal 6 "$(python3 -c 'import json; print(json.dumps({"level": "SECRET_LONG" * 256, "message": "long-level"}))')" >> /fixture/journal.export
+                emit superserve-vmd.service journal 6 '{"severity":"WaRnInG","message":"severity-alias"}' >> /fixture/journal.export
                 emit proxy.service journal 6 'malformed SECRET_SENTINEL authorization=Bearer-SECRET' >> /fixture/journal.export
                 emit systemd-journald.service journal 5 'trusted-systemd-diagnostic' >> /fixture/journal.export
                 emit '' kernel 5 'trusted-kernel-diagnostic' >> /fixture/journal.export
@@ -292,13 +296,21 @@ RUN apt-get update \\
                 resources.append(self._attributes(resource["resource"].get("attributes", [])))
                 for scope in resource["scopeLogs"]:
                     records.extend(scope["logRecords"])
-        self.assertEqual(len(records), 8, output)
+        self.assertEqual(len(records), 12, output)
         bodies = [self._value(record.get("body", {})) for record in records]
         self.assertIn({"message": "safe-info", "request_id": "req-1"}, bodies)
         self.assertIn({"message": "proxy-safe", "sandbox_id": "sandbox-1"}, bodies)
         self.assertIn({"message": "safe-warn"}, bodies)
         self.assertIn({"message": "safe-error"}, bodies)
         self.assertIn({}, bodies)
+        extra_severities = {"unknown-level": 13, "unknown-severity": 17, "long-level": 9, "severity-alias": 13}
+        for message in extra_severities:
+            matches = [record for record in records if self._value(record.get("body", {})) == {"message": message}]
+            self.assertEqual(len(matches), 1, (message, bodies))
+            record = matches[0]
+            self.assertEqual(record.get("severityText", ""), "")
+        for marker in ("secret_level", "secret_severity", "secret_long"):
+            self.assertNotIn(marker, output.lower())
         for record in records:
             attributes = self._attributes(record["attributes"])
             self.assertEqual(attributes["host_id"], "fixture-host")
@@ -316,7 +328,7 @@ RUN apt-get update \\
             if attributes.get("journal_unit") == "superserve-vmd.service":
                 self.assertEqual(attributes["parse_outcome"], "success")
                 self.assertEqual(attributes["source"], "journal")
-                self.assertEqual(record["severityNumber"], {"safe-info": 9, "safe-warn": 13, "safe-error": 17}[self._value(record["body"])["message"]])
+                self.assertEqual(record["severityNumber"], {"safe-info": 9, "safe-warn": 13, "safe-error": 17, **extra_severities}[self._value(record["body"])["message"]])
             if attributes.get("journal_unit") == "proxy.service":
                 self.assertEqual(attributes["parse_outcome"], "failure")
                 self.assertEqual(self._value(record["body"]), {})

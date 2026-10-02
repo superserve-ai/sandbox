@@ -85,6 +85,8 @@ processors:
           - set(severity_number, SEVERITY_NUMBER_WARN) where severity_text == "warn" or severity_text == "warning"
           - set(severity_number, SEVERITY_NUMBER_ERROR) where severity_text == "error"
           - set(severity_number, SEVERITY_NUMBER_FATAL) where severity_text == "fatal" or severity_text == "panic"
+          # Only the mapped numeric severity may leave the private parser.
+          - set(severity_text, "")
           - set(attributes["_private"], cache)
   transform/approved_fields:
     error_mode: silent
