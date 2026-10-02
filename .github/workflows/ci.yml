@@ -16,12 +16,13 @@ jobs:
       # Exercise the same runner as CD, including migration-history writes.
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: '2.119.0'
 
       - name: Validate fresh and interrupted migrations
         run: |
           python3 scripts/test_migration_cli.py
           python3 scripts/test_migration_overlay.py
+          python3 scripts/test_migration_execution.py
 
   unit-tests:
     name: Unit Tests
