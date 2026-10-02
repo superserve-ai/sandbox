@@ -187,12 +187,17 @@ SELECT EXISTS (
 		FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid)
 		JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
 		WHERE s.host_id=$1 AND feature_enabled('billing_metrics_write',s.team_id)
+		UNION
+		SELECT DISTINCT $1,s.team_id,$2::timestamptz
+		FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid)
+		JOIN sandbox_snapshot s ON o.kind='snapshot' AND s.id=o.id
+		WHERE s.host_id=$1 AND feature_enabled('billing_metrics_write',s.team_id)
 		ON CONFLICT DO NOTHING`, hostID, at, payload); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE sandbox_storage_interval i
-		SET ended_at=$2::timestamptz,end_reason='reassigned'
+		SET ended_at=i.started_at,end_reason='reassigned'
 		WHERE i.host_id=$1 AND i.started_at>$2::timestamptz
 		  AND (i.ended_at IS NULL OR i.ended_at>$2::timestamptz)
 		  AND EXISTS (

@@ -46,20 +46,11 @@ func FenceStorageReportReceipts(ctx context.Context, tx pgx.Tx, teamID uuid.UUID
 			return ErrStorageReportsIncomplete
 		}
 	}
-	// Activation takes the shared pending-owner lock before it commits the
-	// obligation. Acquire the exclusive side after host receipt locks, using
-	// the same sorted host order, so an activation that began before settlement
-	// cannot commit invisibly inside an already-closed window. A busy lock is a
-	// retryable settlement fence rather than a wait on lifecycle work.
-	for _, hostID := range hostIDs {
-		var acquired bool
-		if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('retained-storage-owner-pending:' || $1::text, 0))`, hostID).Scan(&acquired); err != nil {
-			return fmt.Errorf("fence pending retained owners: %w", err)
-		}
-		if !acquired {
-			return ErrStorageReportsIncomplete
-		}
-	}
+	// Owner creation uses a non-blocking shared marker. Do not acquire its
+	// exclusive counterpart here: settlement aggregation can run for seconds,
+	// and lifecycle writers must never wait behind that transaction. Receipt
+	// host locks plus the persisted obligation/receipt fence preserve the
+	// boundary without coupling unrelated lifecycle operations to settlement.
 	return nil
 }
 

@@ -458,3 +458,84 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	}
 
 }
+
+func TestRetainedPhysicalInventorySavedSnapshotFSExcludesMemoryArtifacts(t *testing.T) {
+	root := os.Getenv("RETAINED_STORAGE_TEST_DIR")
+	if root == "" {
+		t.Skip("RETAINED_STORAGE_TEST_DIR is required for physical inventory qualification")
+	}
+	dir, err := os.MkdirTemp(root, "retained-fs-manifest-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	state, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	m := &Manager{state: state, cfg: ManagerConfig{RunDir: dir, SnapshotDir: filepath.Join(dir, "snapshots")}}
+	id := uuid.NewString()
+	snapshotDir := filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, id)
+	if err := os.MkdirAll(snapshotDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(path string, n int) {
+		t.Helper()
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(bytes.Repeat([]byte{0x7f}, n)); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disk := filepath.Join(snapshotDir, "overlay.ext4")
+	manifestPath := filepath.Join(snapshotDir, savedSnapshotManifestName)
+	write(disk, 3*4096)
+	// These files are intentionally present beside an FS-only manifest. They
+	// must not become retained memory contributions merely because their names
+	// resemble pause artifacts.
+	write(filepath.Join(snapshotDir, "mem.snap"), 5*4096)
+	write(filepath.Join(snapshotDir, "vmstate.snap"), 2*4096)
+	manifest := SavedSnapshotManifest{Version: savedSnapshotVersion, SnapshotID: id, Kind: SavedSnapshotFS, DiskPath: disk}
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeData := func(path string, data []byte) {
+		t.Helper()
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeData(manifestPath, encoded)
+	inv, err := m.RetainedStorageInventory(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inv.Owners) != 1 || inv.Owners[0].Kind != "snapshot" {
+		t.Fatalf("FS snapshot owners = %#v", inv.Owners)
+	}
+	got := retainedTestUnion(inv.Owners[0].Extents)
+	allocated := func(path string) int64 {
+		t.Helper()
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Sys().(*syscall.Stat_t).Blocks * 512
+	}
+	diskBytes := allocated(disk) + allocated(manifestPath)
+	if got != diskBytes {
+		t.Fatalf("FS snapshot retained bytes=%d, want disk+manifest=%d", got, diskBytes)
+	}
+}

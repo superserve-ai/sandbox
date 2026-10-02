@@ -488,12 +488,17 @@ func processOneStorageReport(ctx context.Context, pool *pgxpool.Pool) bool {
 				WHERE prior.host_id=host_storage_report.host_id
 				  AND prior.incarnation_id=host_storage_report.incarnation_id
 				  AND prior.ingest_seq < host_storage_report.ingest_seq
-				  -- A retained inventory can be permanently incomplete because an
-				  -- owner was created after its receipt boundary. Let a newer
-				  -- immutable inventory overtake that retry-exhausted predecessor;
-				  -- its obligation remains the settlement fence until resolved.
-				  AND prior.state NOT IN ('processed', 'terminal', 'retry_exhausted')
-			  )
+				  -- Preserve receipt order for every retryable predecessor. Only an
+				  -- explicitly incomplete retained inventory may be overtaken by a
+				  -- newer retained receipt; transient database/lock failures remain
+				  -- ordered so their accepted quantity can still be recovered.
+				  AND prior.state NOT IN ('processed', 'terminal')
+				  AND NOT (
+				    prior.state='retry_exhausted'
+				    AND prior.last_error LIKE 'retained storage inventory incomplete:%'
+				    AND jsonb_path_exists(host_storage_report.payload, '$[*] ? (@.retained != null)')
+				  )
+				)
 			ORDER BY received_at
 			FOR UPDATE SKIP LOCKED LIMIT 1
 		)

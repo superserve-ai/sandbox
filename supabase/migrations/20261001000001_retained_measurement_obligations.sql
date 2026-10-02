@@ -169,13 +169,29 @@ WITH bounds AS MATERIALIZED (
   -- path-based. Preserve that union even when no retained provenance row has
   -- arrived yet; after cutover the same absence is an unknown contribution.
   CASE WHEN i.team_cutover IS NULL OR i.started_at<i.team_cutover
-       THEN s.base_path END baseline_path,
+       THEN s.base_path
+       -- Before retained provenance existed, a full-copy sandbox could have
+       -- no persisted base_path even though its immutable template manifest
+       -- was already measured. Carry that known path forward prospectively;
+       -- mutable template metadata is only used when the manifest proves the
+       -- allocation exists.
+       WHEN s.template_id IS NOT NULL AND s.base_path IS NULL
+            AND t.rootfs_path IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM artifact_manifest am
+              WHERE am.template_id=s.template_id AND am.path=t.rootfs_path
+                AND am.allocated_bytes>0
+            )
+       THEN t.rootfs_path
+  END baseline_path,
   NULL::text baseline_generation,NULL::bigint baseline_allocated_bytes,
   ((s.template_id IS NOT NULL AND s.base_path IS NULL
+       AND t.rootfs_path IS NULL
        AND i.team_cutover IS NOT NULL AND i.started_at>=i.team_cutover)
    OR (i.team_cutover IS NOT NULL AND s.base_path IS NOT NULL
        AND i.started_at>=i.team_cutover)) unresolved_baseline
  FROM sandbox s JOIN legacy_intervals i ON i.sandbox_id=s.id
+ LEFT JOIN template t ON t.id=s.template_id
  LEFT JOIN LATERAL (
    SELECT MIN(x.effective_at) first_effective FROM sandbox_storage_baseline x
    WHERE x.sandbox_id=s.id AND x.team_id=p_team AND x.host_id=i.host_id
@@ -187,7 +203,7 @@ WITH bounds AS MATERIALIZED (
 ), artifact_refs AS MATERIALIZED (
  SELECT a.interval_host_id,a.team_cutover,p.path,
   CASE WHEN p.path=a.baseline_path THEN
-    CASE WHEN a.baseline_generation IS NULL THEN NULL ELSE 'baseline:'||a.baseline_path||':'||a.baseline_generation END
+    'baseline:'||a.baseline_path||':'||COALESCE(a.baseline_generation,'')
    WHEN p.path=a.delta_path AND a.template_id IS NOT NULL
      THEN 'template-delta:'||a.template_id::text||':'||p.path
    ELSE 'private:'||a.id::text||':'||p.path END allocation_identity,
@@ -195,7 +211,7 @@ WITH bounds AS MATERIALIZED (
    ELSE COALESCE(am_snapshot.allocated_bytes,am_template.allocated_bytes) END artifact_bytes,
   GREATEST(a.billing_started_at,p_start) range_start,
   LEAST(COALESCE(a.retention_end,a.request_now),p_end) range_end,
-  a.unresolved_baseline,a.template_id,a.base_path,a.baseline_path
+  a.unresolved_baseline,a.template_id,a.base_path,a.baseline_path,a.baseline_generation
  FROM artifact_bounds a
  LEFT JOIN template t ON t.id=a.template_id
  CROSS JOIN LATERAL unnest(ARRAY[a.base_path,a.delta_path,
@@ -227,10 +243,12 @@ WITH bounds AS MATERIALIZED (
  FROM retained_baselines GROUP BY host_id,team_id,baseline_path,allocation_identity
 ), post_ranges AS (
  SELECT ar.interval_host_id,ar.path,ar.allocation_identity,ar.artifact_bytes::numeric/1048576.0 artifact_mib,
-  range_agg(tstzrange(GREATEST(ar.range_start,ar.team_cutover),ar.range_end,'[)'))
+ range_agg(tstzrange(GREATEST(ar.range_start,ar.team_cutover),ar.range_end,'[)'))
     -COALESCE(rc.covered,'{}'::tstzmultirange) retained_ranges
  FROM artifact_refs ar LEFT JOIN retained_coverage rc ON rc.host_id=ar.interval_host_id AND rc.team_id=p_team
-  AND rc.baseline_path=ar.path AND rc.allocation_identity=ar.allocation_identity
+  AND rc.baseline_path=ar.path
+  AND (rc.allocation_identity=ar.allocation_identity
+       OR ar.baseline_generation IS NULL)
  WHERE ar.team_cutover IS NOT NULL AND ar.range_end>GREATEST(ar.range_start,ar.team_cutover)
    AND ar.artifact_bytes IS NOT NULL
  GROUP BY ar.interval_host_id,ar.path,ar.allocation_identity,ar.artifact_bytes,rc.covered

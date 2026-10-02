@@ -19,7 +19,8 @@ WHERE s.id = @sandbox_id AND s.team_id = @team_id AND s.destroyed_at IS NULL
   AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
 FOR SHARE OF s
 ), retained_fence AS (
-  SELECT pg_try_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || t.host_id, 0))
+  SELECT pg_try_advisory_xact_lock_shared(hashtextextended(t.host_id, 0)),
+         pg_try_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || t.host_id, 0))
   FROM target t
 ), inserted AS (
 INSERT INTO sandbox_snapshot (

@@ -28,7 +28,8 @@ WITH activated AS (
   RETURNING id, team_id, host_id, vcpu_count, memory_mib, disk_mib
 ),
 retained_fence AS (
-  SELECT pg_try_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || a.host_id, 0))
+  SELECT pg_try_advisory_xact_lock_shared(hashtextextended(a.host_id, 0)),
+         pg_try_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || a.host_id, 0))
   FROM activated a
 ),
 opened_compute AS (

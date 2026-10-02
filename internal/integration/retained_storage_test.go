@@ -956,6 +956,13 @@ func TestRetainedStorageConsumerParity(t *testing.T) {
 		// unresolved observation. It must not turn the surrounding numeric
 		// consumer results into unknown.
 		insert(uuid.New(), start, end, `[]`)
+		computeSandbox, err := insertSandboxRow(ctx, team, "retained-consumer-compute-"+uuid.NewString())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM sandbox WHERE id=$1`, computeSandbox) })
+		exec(t, `INSERT INTO sandbox_compute_billing_interval(sandbox_id,team_id,vcpu_count,memory_mib,started_at,ended_at,end_reason)
+VALUES($1,$2,2,1024,$3,$4,'paused')`, computeSandbox, team, start, end)
 	}
 	for i, tc := range []struct {
 		want, secondBucket float64
@@ -985,8 +992,8 @@ func TestRetainedStorageConsumerParity(t *testing.T) {
 			}
 			assertNumeric("aggregate GiB-seconds", usage.StorageGibSeconds, 1024, want)
 			assertNumeric("payable GiB-seconds", usage.BillableStorageGibSeconds, 1024, want)
-			assertNumeric("paused CPU", usage.VcpuSeconds, 1, 0)
-			assertNumeric("paused memory", usage.MemoryGibSeconds, 1, 0)
+			assertNumeric("compute CPU", usage.VcpuSeconds, 1, 2*3600)
+			assertNumeric("compute memory", usage.MemoryGibSeconds, 1, 3600)
 			series, err := testQueries.GetTeamBillingUsageSeries(ctx, db.GetTeamBillingUsageSeriesParams{TeamID: team, PeriodStarts: []time.Time{start, mid}, PeriodEnds: []time.Time{mid, end}})
 			if err != nil {
 				t.Fatal(err)
@@ -996,13 +1003,17 @@ func TestRetainedStorageConsumerParity(t *testing.T) {
 			}
 			assertNumeric("first series bucket", series[0].StorageGibSeconds, 1024, 1536*1800)
 			assertNumeric("second series bucket", series[1].StorageGibSeconds, 1024, tc.secondBucket)
+			assertNumeric("first series CPU", series[0].VcpuSeconds, 1, 2*1800)
+			assertNumeric("second series CPU", series[1].VcpuSeconds, 1, 2*1800)
+			assertNumeric("first series memory", series[0].MemoryGibSeconds, 1, 1800)
+			assertNumeric("second series memory", series[1].MemoryGibSeconds, 1, 1800)
 			assertNumeric("first payable series bucket", series[0].BillableStorageGibSeconds, 1024, 1536*1800)
 			assertNumeric("second payable series bucket", series[1].BillableStorageGibSeconds, 1024, tc.secondBucket)
 			var cpu, memory, storage float64
 			if err := testPool.QueryRow(ctx, billing.ExportRemeasurementSQL, team, start, end).Scan(&cpu, &memory, &storage); err != nil {
 				t.Fatal(err)
 			}
-			if cpu != 0 || memory != 0 || storage != want {
+			if cpu != 2*3600 || memory != 1024*3600 || storage != want {
 				t.Fatalf("export: cpu=%v memory=%v storage=%v", cpu, memory, storage)
 			}
 			stamp := func(v time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: v, Valid: true} }
@@ -1038,7 +1049,7 @@ func TestRetainedStorageConsumerParity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cost := want / 1024 * 0.00000003
+			cost := (2*3600)*0.000011 + (1024*3600/1024)*0.0000045 + want/1024*0.00000003
 			assertNumeric("trial USD", trial.ConsumedUsd, 1, math.Round(cost*1e6)/1e6)
 			router := newInternalRouterWithNow(t, func() time.Time { return end })
 			actor := seedPlatformAdminProfile(t)
