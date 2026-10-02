@@ -37,8 +37,12 @@ ALTER TABLE retained_storage_interval ENABLE ROW LEVEL SECURITY;
 -- Billing must not consult sandbox.host_id later: reassignment is a lifecycle
 -- operation and must not move an already-finalized legacy cutover boundary.
 ALTER TABLE sandbox_storage_interval ADD COLUMN host_id text;
-UPDATE sandbox_storage_interval i SET host_id=s.host_id
-FROM sandbox s WHERE s.id=i.sandbox_id AND i.host_id IS NULL;
+-- Existing rows do not carry an assignment-history key. Copying the
+-- sandbox's current host here would silently rewrite a reassigned owner's
+-- historical attribution. Leave those rows unresolved; later billing reads
+-- fail closed for post-cutover windows until a host-scoped retained receipt
+-- supplies authoritative ownership. New rows are stamped below while the
+-- assignment is authoritative.
 CREATE FUNCTION stamp_sandbox_storage_interval_host() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF NEW.host_id IS NULL THEN

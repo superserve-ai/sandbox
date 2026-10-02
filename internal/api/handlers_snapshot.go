@@ -317,7 +317,8 @@ func respondSnapshotReplay(c *gin.Context, row db.SandboxSnapshot) {
 // it and is left out or waits for it.
 func (h *Handlers) insertSnapshotRow(ctx context.Context, p db.CreateSandboxSnapshotParams) (db.SandboxSnapshot, error) {
 	if h.Pool == nil {
-		return h.DB.CreateSandboxSnapshot(ctx, p)
+		row, err := h.DB.CreateSandboxSnapshot(ctx, p)
+		return db.SandboxSnapshot(row), err
 	}
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -332,7 +333,7 @@ func (h *Handlers) insertSnapshotRow(ctx context.Context, p db.CreateSandboxSnap
 	if err != nil {
 		return db.SandboxSnapshot{}, err
 	}
-	return row, tx.Commit(ctx)
+	return db.SandboxSnapshot(row), tx.Commit(ctx)
 }
 
 func (h *Handlers) markSnapshotReady(ctx context.Context, id uuid.UUID, snap vmdclient.SavedSnapshot) (db.SandboxSnapshot, error) {

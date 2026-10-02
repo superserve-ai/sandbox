@@ -46,7 +46,7 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create %s: %v", kind, err)
 		}
-		return row
+		return db.SandboxSnapshot(row)
 	}
 	fs := create("fs", &key)
 	if fs.Status != "creating" {

@@ -301,6 +301,10 @@ func resolveRetainedRecordPaths(rec VMRecord, runDir string) ([]string, VMRecord
 	rec.BaseMemPath = baseMem
 	rec.RootfsPath = rootfs
 	rec.DeltaDir = deltaDir
+	// Keep the resolved writable disk available to accounting provenance.  A
+	// revival witness may be a staging path that has already been reclaimed;
+	// the disk path above is the retained allocation that was actually sampled.
+	rec.DiskPath = disk
 	return paths, rec, nil
 }
 
@@ -662,6 +666,13 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 		baselinePath := resolved.RootfsPath
 		if baselinePath == "" {
 			baselinePath = resolved.BasePath
+		}
+		// A completed revival may intentionally have no template generation
+		// anchor. Treat its durable salvage disk as the measured baseline so the
+		// receiver can distinguish this valid private allocation from an
+		// unverified full-copy template baseline.
+		if baselinePath == "" && rec.RevivedDisk != "" {
+			baselinePath = resolved.DiskPath
 		}
 		if err := add("sandbox", rec.ID, paths, baselinePath); err != nil {
 			return nil, err

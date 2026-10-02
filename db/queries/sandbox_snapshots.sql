@@ -10,21 +10,46 @@
 -- caller. The bindings a fork re-binds or clears are read here too, by a
 -- caller that holds the sandbox's secret-write lock, so a detach is in the
 -- row or after it.
+WITH target AS (
+SELECT s.id, s.team_id, s.template_id, s.host_id, s.vcpu_count, s.memory_mib,
+       s.disk_mib, s.base_path, s.timeout_seconds, s.network_config,
+       s.destroyed_at
+FROM sandbox s
+WHERE s.id = @sandbox_id AND s.team_id = @team_id AND s.destroyed_at IS NULL
+  AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
+FOR SHARE OF s
+), retained_fence AS (
+  SELECT pg_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || t.host_id, 0))
+  FROM target t
+), inserted AS (
 INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
     timeout_seconds, network_config, secret_bindings, sweep_after
 )
-SELECT @id::uuid, s.team_id, s.id, s.template_id, @kind::text, 'creating', sqlc.narg('name')::text, sqlc.narg('idempotency_key')::text,
-    s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.base_path,
-    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb),
-    sandbox_secret_record(s.id),
+SELECT @id::uuid, t.team_id, t.id, t.template_id, @kind::text, 'creating', sqlc.narg('name')::text, sqlc.narg('idempotency_key')::text,
+    t.host_id, t.vcpu_count, t.memory_mib, t.disk_mib, t.base_path,
+    t.timeout_seconds, COALESCE(t.network_config, '{}'::jsonb),
+    sandbox_secret_record(t.id),
     @sweep_after::timestamptz
-FROM sandbox s
-WHERE s.id = @sandbox_id AND s.team_id = @team_id AND s.destroyed_at IS NULL
-  AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
-FOR SHARE OF s
-RETURNING *;
+FROM target t CROSS JOIN retained_fence
+RETURNING *
+), opened_measurement_obligation AS (
+INSERT INTO retained_storage_measurement_obligation (
+    team_id, owner_kind, owner_id, host_id, effective_at
+)
+SELECT i.team_id, 'snapshot', i.id, i.host_id, clock_timestamp()
+FROM inserted i
+WHERE feature_enabled('billing_metrics_write', i.team_id)
+  AND EXISTS (
+    SELECT 1 FROM retained_storage_cutover c
+    WHERE c.team_id=i.team_id AND c.host_id=i.host_id AND c.started_at <= clock_timestamp()
+  )
+ON CONFLICT (owner_kind, owner_id) WHERE resolved_at IS NULL AND ended_at IS NULL DO NOTHING
+RETURNING owner_id
+)
+SELECT i.* FROM inserted i
+CROSS JOIN (SELECT count(*) FROM opened_measurement_obligation) obligation_fence;
 
 -- name: GetSandboxSnapshot :one
 -- Team-scoped: another team's row and a deleted row are the same 404.

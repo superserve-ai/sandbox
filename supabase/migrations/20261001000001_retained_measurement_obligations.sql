@@ -20,6 +20,32 @@ CREATE UNIQUE INDEX retained_storage_measurement_obligation_active
 CREATE INDEX retained_storage_measurement_obligation_window
   ON retained_storage_measurement_obligation(team_id,host_id,effective_at,ended_at,resolved_at);
 ALTER TABLE retained_storage_measurement_obligation ENABLE ROW LEVEL SECURITY;
+
+-- Snapshot rows can be created by the API, the lost-answer sweeper, or a
+-- rolling-deploy compatibility path. Keep the first-measurement fence at
+-- the retention boundary so delayed readiness cannot look like zero.
+CREATE FUNCTION open_retained_snapshot_measurement_obligation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.deleted_at IS NULL
+     AND NEW.status IN ('creating','ready','deleting')
+     AND feature_enabled('billing_metrics_write', NEW.team_id)
+     AND EXISTS (
+       SELECT 1 FROM retained_storage_cutover c
+       WHERE c.team_id=NEW.team_id AND c.host_id=NEW.host_id
+         AND c.started_at <= clock_timestamp()
+     ) THEN
+    INSERT INTO retained_storage_measurement_obligation
+      (team_id,owner_kind,owner_id,host_id,effective_at)
+    VALUES (NEW.team_id,'snapshot',NEW.id,NEW.host_id,clock_timestamp())
+    ON CONFLICT (owner_kind,owner_id) WHERE resolved_at IS NULL AND ended_at IS NULL DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER open_retained_snapshot_measurement_obligation
+AFTER INSERT OR UPDATE OF status,host_id,deleted_at ON sandbox_snapshot
+FOR EACH ROW EXECUTE FUNCTION open_retained_snapshot_measurement_obligation();
+
 CREATE FUNCTION close_retained_storage_measurement_obligation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF NEW.destroyed_at IS NOT NULL THEN
@@ -34,6 +60,26 @@ CREATE TRIGGER close_retained_storage_measurement_obligation
 AFTER UPDATE OF destroyed_at ON sandbox
 FOR EACH ROW WHEN (OLD.destroyed_at IS NULL AND NEW.destroyed_at IS NOT NULL)
 EXECUTE FUNCTION close_retained_storage_measurement_obligation();
+
+CREATE FUNCTION close_retained_snapshot_measurement_obligation() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE boundary timestamptz;
+BEGIN
+  boundary := COALESCE(NEW.deleted_at,NEW.retention_ended_at);
+  IF boundary IS NOT NULL THEN
+    UPDATE retained_storage_measurement_obligation
+    SET ended_at=GREATEST(effective_at,boundary)
+    WHERE owner_kind='snapshot' AND owner_id=NEW.id AND ended_at IS NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER close_retained_snapshot_measurement_obligation
+AFTER UPDATE OF deleted_at,retention_ended_at ON sandbox_snapshot
+FOR EACH ROW WHEN (
+  (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL)
+  OR (OLD.retention_ended_at IS NULL AND NEW.retention_ended_at IS NOT NULL)
+)
+EXECUTE FUNCTION close_retained_snapshot_measurement_obligation();
 
 -- Persisted baseline observations are piecewise temporal evidence.  The
 -- original legacy stay remains the accounting envelope, while effective_at is
@@ -74,7 +120,13 @@ WITH bounds AS MATERIALIZED (
  SELECT i.sandbox_id,i.team_id,i.host_id,i.disk_mib,i.started_at,i.ended_at,i.end_reason,
   s.destroyed_at,c.started_at team_cutover,b.period_end,b.request_now
  FROM sandbox_storage_interval i JOIN sandbox s ON s.id=i.sandbox_id
- CROSS JOIN bounds b LEFT JOIN retained_storage_cutover c ON c.host_id=i.host_id AND c.team_id=i.team_id
+ CROSS JOIN bounds b
+ LEFT JOIN LATERAL (
+   SELECT CASE WHEN i.host_id IS NULL THEN MIN(c.started_at)
+               ELSE MIN(c.started_at) FILTER (WHERE c.host_id=i.host_id) END started_at
+   FROM retained_storage_cutover c
+   WHERE c.team_id=i.team_id AND (i.host_id IS NULL OR c.host_id=i.host_id)
+ ) c ON true
  WHERE i.team_id=p_team AND p_start<b.period_end AND i.started_at<b.period_end
    -- An overlay interval can close while its referenced artifacts remain
    -- retained. Keep that reference until the sandbox's retention ends.
@@ -188,8 +240,17 @@ WITH bounds AS MATERIALIZED (
  SELECT CASE WHEN EXISTS(SELECT 1 FROM artifact_refs WHERE range_end>range_start AND artifact_bytes IS NULL)
    OR EXISTS(SELECT 1 FROM artifact_refs a WHERE a.unresolved_baseline AND a.team_cutover IS NOT NULL
        AND a.range_end>GREATEST(a.range_start,a.team_cutover))
+   OR EXISTS(SELECT 1 FROM artifact_bounds a WHERE a.interval_host_id IS NULL
+       AND a.team_cutover IS NOT NULL
+       AND LEAST(COALESCE(a.retention_end,a.request_now),p_end)>a.team_cutover
+       AND GREATEST(a.billing_started_at,p_start)
+           < LEAST(COALESCE(a.retention_end,a.request_now),p_end))
    OR EXISTS(SELECT 1 FROM artifact_bounds a WHERE a.template_id IS NOT NULL AND a.base_path IS NULL
-       AND a.baseline_path IS NULL AND a.retention_end>a.billing_started_at)
+	       AND a.baseline_path IS NULL
+	       -- An unresolved legacy prefix must not poison a wholly later
+	       -- window whose retained receipts have supplied valid provenance.
+	       AND GREATEST(a.billing_started_at,p_start)
+	           < LEAST(COALESCE(a.retention_end,a.request_now),p_end))
   THEN NULL::numeric
   ELSE (CASE WHEN p_floor_legacy_artifacts THEN FLOOR(artifacts.amount) ELSE artifacts.amount END)
     +overlays.amount+retained_storage_mib_seconds(p_team,p_start,p_end) END amount

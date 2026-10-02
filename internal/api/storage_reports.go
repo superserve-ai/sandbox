@@ -469,12 +469,27 @@ func processOneStorageReport(ctx context.Context, pool *pgxpool.Pool) bool {
 			SELECT host_id, incarnation_id, report_id FROM host_storage_report
 			WHERE (state IN ('pending', 'retry_exhausted') OR (state='processing' AND next_attempt_at < now()-interval '1 minute'))
 			  AND next_attempt_at <= now()
+			  -- Once a newer report exists, repeatedly retrying the immutable
+			  -- incomplete predecessor would starve the recovery report.
+			  AND NOT (
+				state='retry_exhausted' AND EXISTS (
+				  SELECT 1 FROM host_storage_report newer
+				  WHERE newer.host_id=host_storage_report.host_id
+				    AND newer.incarnation_id=host_storage_report.incarnation_id
+				    AND newer.ingest_seq>host_storage_report.ingest_seq
+				    AND newer.state<>'terminal'
+				)
+			  )
 			  AND NOT EXISTS (
 				SELECT 1 FROM host_storage_report prior
 				WHERE prior.host_id=host_storage_report.host_id
 				  AND prior.incarnation_id=host_storage_report.incarnation_id
 				  AND prior.ingest_seq < host_storage_report.ingest_seq
-				  AND prior.state NOT IN ('processed', 'terminal')
+				  -- A retained inventory can be permanently incomplete because an
+				  -- owner was created after its receipt boundary. Let a newer
+				  -- immutable inventory overtake that retry-exhausted predecessor;
+				  -- its obligation remains the settlement fence until resolved.
+				  AND prior.state NOT IN ('processed', 'terminal', 'retry_exhausted')
 			  )
 			ORDER BY received_at
 			FOR UPDATE SKIP LOCKED LIMIT 1
@@ -683,6 +698,30 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 	state := "pending"
 	if nextIndex == totalMeasurements {
 		state = "processed"
+	}
+	if state == "processed" {
+		// Keep the immutable failed report for audit, but stop it from blocking
+		// the host stream once this newer retained receipt has applied. Any
+		// unresolved owner still blocks settlement through its obligation row.
+		if _, err := tx.Exec(ctx, `
+			UPDATE host_storage_report prior
+			SET state='terminal', processed_at=COALESCE(processed_at, now()),
+			    last_error='superseded by a newer complete retained inventory', payload=NULL
+			WHERE EXISTS (
+				SELECT 1 FROM host_storage_report current
+				WHERE current.host_id=$1 AND current.incarnation_id=$2 AND current.report_id=$3
+				  AND current.payload IS NOT NULL
+				  AND jsonb_path_exists(current.payload, '$[*] ? (@.retained != null)')
+			)
+			  AND prior.host_id=$1 AND prior.incarnation_id=$2 AND prior.report_id<>$3
+			  AND prior.received_at<$4 AND prior.state='retry_exhausted'
+			  AND prior.payload IS NOT NULL
+			  AND EXISTS (
+				SELECT 1 FROM jsonb_array_elements(prior.payload) entry
+				WHERE entry ? 'retained'
+			  )`, hostID, incarnationID, reportID, receivedAt); err != nil {
+			return fmt.Errorf("supersede retained predecessor: %w", err)
+		}
 	}
 	var progressErr error
 	var progressRows int64

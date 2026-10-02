@@ -223,9 +223,12 @@ SELECT EXISTS (
 	if err != nil {
 		return err
 	}
-	// Resolve only obligations covered by this complete, compatible receipt. The
-	// report id is retained as immutable audit evidence when the processor has it;
-	// direct unit callers use the zero UUID sentinel without changing authority.
+	// Resolve only obligations covered by this complete, compatible receipt. A
+	// validated owner may have moved hosts since its first-measurement fence;
+	// rebinding the obligation to this authenticated host lets the receipt
+	// resolve it without accepting host-supplied ownership. The report id is
+	// retained as immutable audit evidence when the processor has it; direct
+	// unit callers use the zero UUID sentinel without changing authority.
 	var reportID any = uuid.Nil
 	if len(reportIDs) > 0 && reportIDs[0] != uuid.Nil {
 		reportID = reportIDs[0]
@@ -264,9 +267,9 @@ SELECT EXISTS (
 	   AND i.baseline_allocated_bytes IS NOT DISTINCT FROM e.baseline_allocated_bytes
  )
 UPDATE retained_storage_measurement_obligation o
-SET resolved_at=$2,resolution_report_id=$3
+SET host_id=$4,resolved_at=$2,resolution_report_id=$3
 FROM accepted s
-WHERE s.kind=o.owner_kind AND s.id=o.owner_id AND s.team_id=o.team_id AND o.host_id=$4
+WHERE s.kind=o.owner_kind AND s.id=o.owner_id AND s.team_id=o.team_id
   AND o.effective_at<=$2 AND (o.ended_at IS NULL OR o.ended_at>$2)
   AND o.resolved_at IS NULL`, payload, at, reportID, hostID); err != nil {
 		return err
