@@ -1085,7 +1085,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile, re
 	// digest. On mismatch the generation is abandoned before its manifest
 	// object is written, and a generation without its completion marker is
 	// never restored from; the orphaned artifact object is inert.
-	hasher := newApparentStreamHasher(NewPackedReader(f, extents), extents, apparent)
+	hasher := newApparentStreamHasher(NewPackedReader(f, extents), extents, apparent, renew)
 	reader := &limitedReader{
 		r: hasher, limiter: u.Limiter, ctx: ctx,
 		// A bandwidth-capped multi-GB artifact can outrun the claim TTL;
@@ -1262,6 +1262,9 @@ func hashApparentProgress(ctx context.Context, f *os.File, extents []Extent, app
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if progress != nil {
+				progress()
+			}
 			n := upTo - pos
 			if n > int64(len(zeros)) {
 				n = int64(len(zeros))
@@ -1358,14 +1361,24 @@ type apparentStreamHasher struct {
 	pos      int64 // apparent offset hashed so far
 	zeros    []byte
 	consumed int64 // total packed bytes seen
+	// progress is reported while hashing holes too: the apparent zeros of
+	// a very sparse artifact are hashed without a byte being read, so a
+	// caller holding a lease gets no other signal from this work.
+	progress func()
 }
 
-func newApparentStreamHasher(r io.Reader, extents []Extent, apparent int64) *apparentStreamHasher {
-	return &apparentStreamHasher{r: r, extents: extents, apparent: apparent, h: sha256.New(), zeros: make([]byte, 64<<10)}
+func newApparentStreamHasher(r io.Reader, extents []Extent, apparent int64, progress func()) *apparentStreamHasher {
+	return &apparentStreamHasher{
+		r: r, extents: extents, apparent: apparent,
+		h: sha256.New(), zeros: make([]byte, 64<<10), progress: progress,
+	}
 }
 
 func (a *apparentStreamHasher) hashZerosTo(target int64) {
 	for a.pos < target {
+		if a.progress != nil {
+			a.progress()
+		}
 		n := target - a.pos
 		if n > int64(len(a.zeros)) {
 			n = int64(len(a.zeros))

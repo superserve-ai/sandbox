@@ -620,7 +620,11 @@ func (j *Journal) RenewClaim(task Task, now time.Time) bool {
 			return nil
 		}
 		c, held := j.claims[string(qk)]
-		if !held || c.token != task.ClaimToken {
+		// A lease already past its expiry is not the caller's to extend,
+		// whoever still holds the token: it is claimable from this moment
+		// on, and renewing it would let a worker that wedged for an hour
+		// win a race against the recovery the expiry exists to allow.
+		if !held || c.token != task.ClaimToken || !c.until.After(now) {
 			return nil
 		}
 		j.claims[string(qk)] = claim{until: now.Add(claimTTL), token: c.token}

@@ -1095,3 +1095,30 @@ func TestPreservedOutboxManifestAdoptsNewerAllocations(t *testing.T) {
 		t.Fatalf("allocated = %d, want the size the later pass measured", got)
 	}
 }
+
+// Once a lease has run out the task belongs to whoever claims it next,
+// even if nobody has yet and the old worker still holds the token:
+// reviving it would postpone by another full lease the recovery that the
+// expiry exists to allow.
+func TestRenewClaimRefusesAnExpiredLease(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(2000, 0)
+	task := Task{SandboxID: "sb-wedged", Generation: "gen", EnqueuedAt: now,
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 1}}}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+
+	// The worker wakes past its lease, before any other drain worker has
+	// looked: the token still matches, and that is not enough.
+	if j.RenewClaim(claimed, now.Add(claimTTL+time.Minute)) {
+		t.Fatal("an expired lease was revived by the worker still holding its token")
+	}
+	if _, ok, err := j.Next(now.Add(claimTTL + 2*time.Minute)); err != nil || !ok {
+		t.Fatalf("the task was not claimable after its lease expired: %v (%v)", ok, err)
+	}
+}
