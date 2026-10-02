@@ -1065,10 +1065,10 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile, re
 	// artifact — on the array serving live VM disk I/O, with the staging
 	// pages already dropped, so both passes reach the platters.
 	if !immutableSource(task, file) {
-		sum, err := hashApparent(ctx, f, extents, apparent)
-		// A full read of a multi-GB artifact is progress the lease has to
-		// survive even though nothing shipped.
-		renew()
+		// Renewing as it reads, not after: the read itself can outlast
+		// the lease, and a thief would then create the object this
+		// attempt is about to write.
+		sum, err := hashApparentProgress(ctx, f, extents, apparent, renew)
 		if err != nil {
 			return ManifestFile{}, "", 0, fmt.Errorf("verify %s: %w", file.Path, err)
 		}
@@ -1246,6 +1246,14 @@ func HashFileApparent(ctx context.Context, path string) (string, int64, error) {
 // This must equal the pause manifest's digest, and restore recomputes the
 // same thing after rebuilding the sparse file.
 func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent int64) (string, error) {
+	return hashApparentProgress(ctx, f, extents, apparent, nil)
+}
+
+// hashApparentProgress is hashApparent reporting as it reads, for a
+// caller whose lease is running while it hashes: a full read of a
+// multi-GB artifact on contended storage can outlast the lease on its
+// own, and a renewal that waits for the hash to return comes too late.
+func hashApparentProgress(ctx context.Context, f *os.File, extents []Extent, apparent int64, progress func()) (string, error) {
 	h := sha256.New()
 	zeros := make([]byte, 1<<20)
 	var pos int64
@@ -1272,7 +1280,7 @@ func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent in
 		// shutdown join waits on this loop, and an uncancelable multi-GB
 		// read on a slow filesystem would outlive the join's deadline and
 		// leave the loop touching closed dependencies.
-		if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: io.NewSectionReader(f, e.Offset, e.Length)}); err != nil {
+		if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: io.NewSectionReader(f, e.Offset, e.Length), progress: progress}); err != nil {
 			return "", err
 		}
 		pos = e.Offset + e.Length
@@ -1288,13 +1296,21 @@ func hashApparent(ctx context.Context, f *os.File, extents []Extent, apparent in
 type ctxReader struct {
 	ctx context.Context
 	r   io.Reader
+	// progress is called per read, not per extent: a single dense extent
+	// can be the whole artifact, so extent boundaries are no granularity
+	// at all for a caller holding a lease.
+	progress func()
 }
 
 func (c *ctxReader) Read(p []byte) (int, error) {
 	if err := c.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return c.r.Read(p)
+	n, err := c.r.Read(p)
+	if n > 0 && c.progress != nil {
+		c.progress()
+	}
+	return n, err
 }
 
 // limitedReader applies the bandwidth cap per read. A nil limiter means

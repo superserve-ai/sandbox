@@ -3678,3 +3678,47 @@ func (p *perObjectClock) Create(ctx context.Context, object string, r io.Reader)
 	p.tick()
 	return p.memStore.Create(ctx, object, r)
 }
+
+// The pre-stream hash is a full read of the artifact, and on contended
+// storage it can outlast the lease on its own. Renewing only after it
+// returns is too late: a thief would already hold the task.
+func TestPreStreamHashRenewsWhileItReads(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().Add(100 * time.Hour)
+	claimed, ok, err := j.Next(start)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	before := soleClaimUntil(t, j)
+
+	now := start
+	u := &Uploader{Journal: j, Log: zerolog.Nop(), Now: func() time.Time { return now }}
+	renew := u.claimRenewer(&claimed)
+	// Time passes as the read does, which is the whole point: the lease
+	// has to move before the hash returns.
+	progress := func() {
+		now = now.Add(claimRenewEvery)
+		renew()
+	}
+
+	f, err := os.Open(claimed.Files[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	extents, apparent, err := Extents(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hashApparentProgress(context.Background(), f, extents, apparent, progress); err != nil {
+		t.Fatal(err)
+	}
+
+	if after := soleClaimUntil(t, j); !after.After(before) {
+		t.Fatal("the lease never moved while the hash read the artifact")
+	}
+}
