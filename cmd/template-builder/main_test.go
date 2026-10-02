@@ -141,3 +141,12 @@ func TestClassifyBuildError(t *testing.T) {
 		})
 	}
 }
+
+func TestHomeDirFor(t *testing.T) {
+	if got := homeDirFor("root"); got != "/root" {
+		t.Fatalf("root: %q", got)
+	}
+	if got := homeDirFor("desktop"); got != "/home/desktop" {
+		t.Fatalf("desktop: %q", got)
+	}
+}

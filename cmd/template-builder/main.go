@@ -919,11 +919,24 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 			}
 		}
 		bc.user = name
+		// Later steps and start_cmd run as this user; without this they would
+		// inherit root's HOME and write their config into /root.
+		bc.env["HOME"] = homeDirFor(name)
+		bc.env["USER"] = name
 		emitUser("system", "User: %s", name)
 		return bc, nil
 	default:
 		return bc, fmt.Errorf("step has no op set")
 	}
+}
+
+// homeDirFor is the home directory adduser gives a build user; root keeps
+// /root.
+func homeDirFor(name string) string {
+	if name == "root" {
+		return "/root"
+	}
+	return "/home/" + name
 }
 
 // runShellCmd runs a user build step: the command and its output stream to the
