@@ -1293,3 +1293,51 @@ func TestEnqueueDeclinesAnUnvouchableGeneration(t *testing.T) {
 		t.Fatalf("other bucket pending = %v, want the generation attempted there", counts)
 	}
 }
+
+// An unvouchable mark must never cost a queued row its upgrade. A live
+// pause re-enqueueing the same generation promotes the row to staged
+// paths and pause priority; suppressed instead, the pause reads success,
+// clears its marker, and the in-flight attempt then acks away a row that
+// was never upgraded — leaving the pause with no row and no marker.
+func TestEnqueueStillUpgradesAQueuedRowMarkedUnvouchable(t *testing.T) {
+	j, _ := testJournal(t)
+	j.SetScope("test-bucket")
+	now := time.Now()
+
+	// In flight from the unstaged path, at best-effort priority.
+	queued := Task{
+		SandboxID: "sb-live", Generation: "gen-live", EnqueuedAt: now,
+		Priority: PriorityBestEffort,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/live/disk", SHA256: "d", Size: 1}},
+	}
+	if err := j.Enqueue(queued); err != nil {
+		t.Fatal(err)
+	}
+	// That attempt finds its objects unvouchable and records it.
+	if err := j.MarkUnvouchable("test-bucket", queued, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// The live pause re-enqueues the same generation from staged copies.
+	staged := queued
+	staged.Priority = PriorityPause
+	staged.Staged = true
+	staged.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/staged/disk", SHA256: "d", Size: 1}}
+	if err := j.Enqueue(staged); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := j.Next(now.Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	if !got.Staged {
+		t.Fatal("the row was not promoted to staged: the pause has cleared its marker against it")
+	}
+	if got.Priority != PriorityPause {
+		t.Fatalf("priority = %v, want the live pause's", got.Priority)
+	}
+	if got.Files[0].Path != "/staged/disk" {
+		t.Fatalf("path = %s, want the staged copy that survives teardown", got.Files[0].Path)
+	}
+}

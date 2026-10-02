@@ -404,15 +404,6 @@ func (j *Journal) Enqueue(task Task) error {
 	if task.Generation == "" {
 		return fmt.Errorf("task missing generation: %+v", task)
 	}
-	// Declined like a duplicate rather than reported: a generation found
-	// unvouchable cannot be completed by any attempt, and the callers
-	// that re-offer it (the template sweep, the backfill, a re-pause of
-	// unchanged artifacts) have nothing to act on.
-	if j.scope != "" {
-		if unvouchable, err := j.Unvouchable(j.scope, task, time.Now()); err == nil && unvouchable {
-			return nil
-		}
-	}
 	owners := 0
 	for _, id := range []string{task.SandboxID, task.TemplateID, task.SnapshotID} {
 		if id != "" {
@@ -444,6 +435,23 @@ func (j *Journal) Enqueue(task Task) error {
 		idx := tx.Bucket(indexBucket)
 		// One point lookup; a stale index entry (its queue key gone, e.g.
 		// the entry was dropped as corrupt) self-heals by overwriting.
+		// Declined like a duplicate rather than reported, and only where
+		// there is no row to carry: a generation found unvouchable
+		// completes for nobody, so starting it again is work that always
+		// abandons. An EXISTING row is left to the dedupe below — it may
+		// be mid-upload, and a live pause re-enqueueing the same
+		// generation must still promote it to staged paths and pause
+		// priority, or the pause clears its marker against an un-upgraded
+		// row the attempt then acks away.
+		if idx.Get(task.indexKey()) == nil && j.scope != "" {
+			if v := tx.Bucket(unvouchableBucket).Get(completionKey(j.scope, task)); v != nil {
+				var ns int64
+				if _, err := fmt.Sscanf(string(v), "%d", &ns); err == nil &&
+					time.Since(time.Unix(0, ns)) < unvouchableCooldown {
+					return nil
+				}
+			}
+		}
 		if qk := idx.Get(task.indexKey()); qk != nil {
 			if existing := queue.Get(qk); existing != nil {
 				// Dedupe, with a path upgrade: a first enqueue can carry
