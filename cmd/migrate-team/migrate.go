@@ -921,6 +921,20 @@ var insertOnlyTables = map[string]bool{
 	// Activation rows are immutable; retries must preserve the original
 	// timestamp and validation must detect any destination divergence.
 	"team_storage_billing_activation": true,
+	// Checkout publication authority is append-only and protected by an
+	// immutability trigger. A retry must leave the destination fact untouched.
+	"stripe_checkout_generation_authority":     true,
+	"stripe_checkout_publication_decision":     true,
+	"stripe_checkout_publication_subscription": true,
+}
+
+// These records deliberately outlive source-team purge. They are immutable
+// generation authority and may still be needed to explain or reject a late
+// Stripe callback after the team's ownership rows have been retired.
+var retainedAfterPurgeTables = map[string]bool{
+	"stripe_checkout_generation_authority":     true,
+	"stripe_checkout_publication_decision":     true,
+	"stripe_checkout_publication_subscription": true,
 }
 
 // allColumns lists a table's column names in attnum order.
@@ -1056,6 +1070,9 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 		if err != nil {
 			return err
 		}
+		if err := verifyRetainedBatch(ctx, dst, t.name, batch); err != nil {
+			return err
+		}
 		tag, err := dst.Exec(ctx, insertQ, payload)
 		if err != nil {
 			return err
@@ -1089,6 +1106,21 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 	}
 	if err := flush(); err != nil {
 		return copied, 0, err
+	}
+	if retainedAfterPurgeTables[t.name] {
+		// The source row count is already known from the streaming copy. A
+		// single destination count catches destination-only retained rows
+		// without another historical JSON checksum pass; differing rows with
+		// matching keys were checked by verifyRetainedBatch above.
+		var destinationRows int64
+		if err := dst.QueryRow(ctx,
+			fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.effectiveCopyScope()), teamID).
+			Scan(&destinationRows); err != nil {
+			return copied, 0, fmt.Errorf("count retained %s rows: %w", t.name, err)
+		}
+		if destinationRows != total {
+			return copied, 0, fmt.Errorf("%s: content drift before billing account publication", t.name)
+		}
 	}
 	return copied, total - copied, nil
 }
@@ -1864,6 +1896,9 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		if t.name == "team_storage_billing_activation" {
 			continue
 		}
+		if retainedAfterPurgeTables[t.name] {
+			continue
+		}
 		tag, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, t.name, t.scope), cfg.teamID)
 		if err != nil {
 			return fmt.Errorf("delete from %s: %w", t.name, err)
@@ -1884,6 +1919,6 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		log.Info().Msg("purge: dest rollup hold released to the source's pre-delete state")
 	}
 
-	log.Info().Int64("deleted", total).Msg("purge: source rows removed (profiles and append-only audit tables retained)")
+	log.Info().Int64("deleted", total).Msg("purge: source rows removed (profiles, immutable publication authority, and append-only audit tables retained)")
 	return nil
 }

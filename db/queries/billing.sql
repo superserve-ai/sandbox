@@ -664,15 +664,28 @@ SET checkout_initializing_at = now(),
     checkout_anchor_snapshot = COALESCE(checkout_anchor_snapshot, commercial_billing_anchor),
     updated_at = now()
 FROM locks
-WHERE team_id = sqlc.arg(team_id)
+WHERE team_billing_account.team_id = sqlc.arg(team_id)
   AND checkout_completed_at IS NULL
   AND checkout_initializing_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM stripe_promotion_migration_fence f
+      WHERE f.team_id = sqlc.arg(team_id)
+  )
 RETURNING team_billing_account.*;
 
 -- name: ResumeTeamBillingCheckout :one
 UPDATE team_billing_account
-SET checkout_pending_attempt_ids = array_append(checkout_pending_attempt_ids, sqlc.arg(attempt_id)::uuid), updated_at = now()
-WHERE team_id = sqlc.arg(team_id)
+SET checkout_pending_attempt_ids = CASE
+        -- Discarded attempts may still be in flight. Preserve that uncertainty
+        -- while replaying the same generation and Stripe idempotency key.
+        WHEN cardinality(checkout_pending_attempt_ids) >= 32
+          THEN ARRAY[sqlc.arg(attempt_id)::uuid]
+        ELSE array_append(checkout_pending_attempt_ids, sqlc.arg(attempt_id)::uuid)
+    END,
+    checkout_may_exist = checkout_may_exist OR cardinality(checkout_pending_attempt_ids) >= 32,
+    updated_at = now()
+WHERE team_billing_account.team_id = sqlc.arg(team_id)
+  AND NOT EXISTS (SELECT 1 FROM stripe_promotion_migration_fence f WHERE f.team_id=sqlc.arg(team_id))
   AND stripe_checkout_actor_id = sqlc.arg(actor_id)
   AND checkout_request_key = sqlc.arg(request_key)
   AND NOT (sqlc.arg(attempt_id)::uuid = ANY(checkout_pending_attempt_ids))
@@ -1617,3 +1630,12 @@ SELECT storage_billing_activated(sqlc.arg(team_id)::uuid)::boolean;
 
 -- name: IsStorageBillingActivatedForWindow :one
 SELECT storage_billing_activated(sqlc.arg(team_id)::uuid, sqlc.arg(period_end)::timestamptz)::boolean;
+
+-- name: BeginStripeCheckoutWithPublicationDecision :exec
+SELECT begin_stripe_checkout_with_publication_decision(
+    sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(operation_id)::uuid,
+    sqlc.arg(home_region)::text, sqlc.arg(request_key)::text, sqlc.arg(decision)::text, sqlc.arg(attempt_id)::uuid);
+
+-- name: StripeCheckoutPublicationFailed :one
+SELECT stripe_checkout_publication_failed(sqlc.arg(team_id)::uuid,
+    sqlc.arg(generation)::timestamptz, sqlc.arg(user_id)::uuid)::boolean AS publication_failed;

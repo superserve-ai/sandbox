@@ -237,6 +237,35 @@ func (q *Queries) AssociateTeamBillingCheckoutSubscription(ctx context.Context, 
 	return err
 }
 
+const beginStripeCheckoutWithPublicationDecision = `-- name: BeginStripeCheckoutWithPublicationDecision :exec
+SELECT begin_stripe_checkout_with_publication_decision(
+    $1::uuid, $2::uuid, $3::uuid,
+    $4::text, $5::text, $6::text, $7::uuid)
+`
+
+type BeginStripeCheckoutWithPublicationDecisionParams struct {
+	TeamID      uuid.UUID `json:"team_id"`
+	UserID      uuid.UUID `json:"user_id"`
+	OperationID uuid.UUID `json:"operation_id"`
+	HomeRegion  string    `json:"home_region"`
+	RequestKey  string    `json:"request_key"`
+	Decision    string    `json:"decision"`
+	AttemptID   uuid.UUID `json:"attempt_id"`
+}
+
+func (q *Queries) BeginStripeCheckoutWithPublicationDecision(ctx context.Context, arg BeginStripeCheckoutWithPublicationDecisionParams) error {
+	_, err := q.db.Exec(ctx, beginStripeCheckoutWithPublicationDecision,
+		arg.TeamID,
+		arg.UserID,
+		arg.OperationID,
+		arg.HomeRegion,
+		arg.RequestKey,
+		arg.Decision,
+		arg.AttemptID,
+	)
+	return err
+}
+
 const beginTeamBillingCheckout = `-- name: BeginTeamBillingCheckout :one
 WITH locks AS MATERIALIZED (
     SELECT lock_stripe_checkout_identity($3::uuid)
@@ -255,9 +284,13 @@ SET checkout_initializing_at = now(),
     checkout_anchor_snapshot = COALESCE(checkout_anchor_snapshot, commercial_billing_anchor),
     updated_at = now()
 FROM locks
-WHERE team_id = $4
+WHERE team_billing_account.team_id = $4
   AND checkout_completed_at IS NULL
   AND checkout_initializing_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM stripe_promotion_migration_fence f
+      WHERE f.team_id = $4
+  )
 RETURNING team_billing_account.team_id, team_billing_account.stripe_customer_id, team_billing_account.stripe_subscription_id, team_billing_account.stripe_subscription_status, team_billing_account.current_period_start, team_billing_account.current_period_end, team_billing_account.cancel_at_period_end, team_billing_account.created_at, team_billing_account.updated_at, team_billing_account.stripe_invoice_status, team_billing_account.stripe_subscription_event_at, team_billing_account.trial_ended_at, team_billing_account.stripe_activation_credit_granted_at, team_billing_account.stripe_activation_credit_grant_id, team_billing_account.commercial_billing_anchor, team_billing_account.checkout_initializing_at, team_billing_account.checkout_anchor_snapshot, team_billing_account.checkout_session_id, team_billing_account.checkout_subscription_id, team_billing_account.checkout_completed_at, team_billing_account.checkout_request_key, team_billing_account.checkout_pending_attempt_ids, team_billing_account.checkout_may_exist, team_billing_account.stripe_activation_user_id, team_billing_account.stripe_activation_credit_reserved_at, team_billing_account.stripe_activation_credit_reservation_event_id, team_billing_account.stripe_checkout_actor_id, team_billing_account.stripe_checkout_actor_claimed_at, team_billing_account.stripe_activation_identity_key, team_billing_account.stripe_checkout_identity_evidence_version, team_billing_account.stripe_activation_identity_evidence_version
 `
 
@@ -3365,8 +3398,17 @@ func (q *Queries) ResolveBillingPeriodAnomaly(ctx context.Context, arg ResolveBi
 
 const resumeTeamBillingCheckout = `-- name: ResumeTeamBillingCheckout :one
 UPDATE team_billing_account
-SET checkout_pending_attempt_ids = array_append(checkout_pending_attempt_ids, $1::uuid), updated_at = now()
-WHERE team_id = $2
+SET checkout_pending_attempt_ids = CASE
+        -- Discarded attempts may still be in flight. Preserve that uncertainty
+        -- while replaying the same generation and Stripe idempotency key.
+        WHEN cardinality(checkout_pending_attempt_ids) >= 32
+          THEN ARRAY[$1::uuid]
+        ELSE array_append(checkout_pending_attempt_ids, $1::uuid)
+    END,
+    checkout_may_exist = checkout_may_exist OR cardinality(checkout_pending_attempt_ids) >= 32,
+    updated_at = now()
+WHERE team_billing_account.team_id = $2
+  AND NOT EXISTS (SELECT 1 FROM stripe_promotion_migration_fence f WHERE f.team_id=$2)
   AND stripe_checkout_actor_id = $3
   AND checkout_request_key = $4
   AND NOT ($1::uuid = ANY(checkout_pending_attempt_ids))
@@ -3552,6 +3594,24 @@ func (q *Queries) SetTeamFeatureFlag(ctx context.Context, arg SetTeamFeatureFlag
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const stripeCheckoutPublicationFailed = `-- name: StripeCheckoutPublicationFailed :one
+SELECT stripe_checkout_publication_failed($1::uuid,
+    $2::timestamptz, $3::uuid)::boolean AS publication_failed
+`
+
+type StripeCheckoutPublicationFailedParams struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Generation time.Time `json:"generation"`
+	UserID     uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) StripeCheckoutPublicationFailed(ctx context.Context, arg StripeCheckoutPublicationFailedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, stripeCheckoutPublicationFailed, arg.TeamID, arg.Generation, arg.UserID)
+	var publication_failed bool
+	err := row.Scan(&publication_failed)
+	return publication_failed, err
 }
 
 const stripeCheckoutRecoveryEvidenceAvailable = `-- name: StripeCheckoutRecoveryEvidenceAvailable :one
