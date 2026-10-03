@@ -42,10 +42,8 @@ After a separately approved merge, verify successful push CI at the exact main
 revision. Dispatch CD Migrate with `action=preflight` for a read-only
 connection/settings check. `action=migrate` is a separate release and requires
 a successful same-revision preflight run covering all selected environments.
-A manually dispatched `preflight` may also run from a branch with its exact
-approved SHA; the branch head is rechecked before each region. This read-only
-path does not require main push CI and cannot authorize migration writes or
-establish a deployment baseline. `migrate` and recovery still require main.
+All hosted migration actions, including preflight, require the exact approved
+main revision and successful push CI.
 Staging runs first, then East and West. Each regional action rechecks main after
 protected-environment approval, immediately before database access. If main
 advances, stop and reassess the release. A code approval does not authorize

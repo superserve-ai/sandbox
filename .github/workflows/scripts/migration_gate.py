@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import re
 import subprocess
-from urllib.parse import quote
 
 
 spec = importlib.util.spec_from_file_location("push_ci", Path(__file__).with_name("wait-for-push-ci.py"))
@@ -36,23 +35,8 @@ def api(repository, path):
     return json.loads(result.stdout)
 
 
-def branch_preflight(env):
-    return (env.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-            and env.get("MIGRATION_ACTION") == "preflight"
-            and env.get("GITHUB_REF", "").startswith("refs/heads/")
-            and env["GITHUB_REF"] != "refs/heads/main")
-
-
 def verify_revision(env):
     revision = env["GITHUB_SHA"]
-    if branch_preflight(env):
-        if (not re.fullmatch(r"[0-9a-f]{40}", revision)
-                or env.get("APPROVED_REVISION") != revision):
-            raise GateError("Branch preflight requires its exact approved revision")
-        ref = quote(env["GITHUB_REF"][len("refs/"):], safe="/")
-        if api(env["GITHUB_REPOSITORY"], f"git/ref/{ref}")["object"]["sha"] != revision:
-            raise GateError("Branch advanced; preflight must be re-approved")
-        return
     if not re.fullmatch(r"[0-9a-f]{40}", revision) or env.get("GITHUB_REF") != "refs/heads/main":
         raise GateError("Migration execution requires an exact main revision")
     if api(env["GITHUB_REPOSITORY"], "git/ref/heads/main")["object"]["sha"] != revision:
@@ -61,11 +45,6 @@ def verify_revision(env):
 
 def select_action(env):
     revision, repository = env["GITHUB_SHA"], env["GITHUB_REPOSITORY"]
-    if branch_preflight(env):
-        if env.get("MIGRATION_ENVIRONMENT") not in ("staging", "production"):
-            raise GateError("Select an explicit preflight environment")
-        verify_revision(env)
-        return "preflight", env["MIGRATION_ENVIRONMENT"] == "production"
     if not re.fullmatch(r"[0-9a-f]{40}", revision) or env.get("GITHUB_REF") != "refs/heads/main":
         raise GateError("Migration execution requires an exact main revision")
     event = env["GITHUB_EVENT_NAME"]

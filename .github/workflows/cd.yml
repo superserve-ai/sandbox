@@ -10,7 +10,7 @@ on:
         default: preflight
         options: [preflight, migrate, recovery-preflight, recover]
       approved_revision:
-        description: 'Exact approved commit SHA (branch allowed for read-only preflight only)'
+        description: 'Exact approved main commit SHA'
         required: true
         type: string
       environment:
@@ -45,9 +45,6 @@ on:
       - '.github/workflows/scripts/migration_gate.py'
       - '.github/workflows/scripts/test_migration_gate.py'
       - '.github/workflows/scripts/wait-for-push-ci.py'
-
-env:
-  APPROVED_REVISION: ${{ inputs.approved_revision }}
 
 permissions:
   contents: read

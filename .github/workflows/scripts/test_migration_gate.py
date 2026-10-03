@@ -32,22 +32,6 @@ class MigrationGateTest(unittest.TestCase):
             return {"object": {"sha": SHA}}
         return self.jobs if "/jobs?" in path else self.run
 
-    def test_branch_preflight_is_exact_revision_and_never_authorizes_writes(self):
-        env = {**self.env, "GITHUB_REF": "refs/heads/example-branch"}
-        with patch.object(gate, "api", return_value={"object": {"sha": SHA}}) as api:
-            self.assertEqual(gate.select_action(env), ("preflight", True))
-            gate.verify_revision(env)
-            api.assert_called_with("example/project", "git/ref/heads/example-branch")
-            self.ci.assert_not_called()
-            for action in ("migrate", "recover", "recovery-preflight", "push"):
-                with self.assertRaises(gate.GateError):
-                    gate.select_action({**env, "MIGRATION_ACTION": action})
-            with self.assertRaises(gate.GateError):
-                gate.select_action({**env, "APPROVED_REVISION": BEFORE})
-        with patch.object(gate, "api", return_value={"object": {"sha": BEFORE}}):
-            with self.assertRaises(gate.GateError):
-                gate.verify_revision(env)
-
     def test_preflight_is_read_only_and_migrate_requires_receipt(self):
         with patch.object(gate, "api", side_effect=self.api):
             self.assertEqual(gate.select_action(self.env), ("preflight", True))
@@ -80,7 +64,7 @@ class MigrationGateTest(unittest.TestCase):
     def test_invalid_manual_inputs_fail_closed(self):
         for key, value in (("APPROVED_REVISION", BEFORE), ("MIGRATION_ACTION", ""),
                            ("MIGRATION_ACTION", "push"), ("MIGRATION_ENVIRONMENT", ""),
-                           ("GITHUB_REF", "refs/tags/example"), ("GITHUB_SHA", "main")):
+                           ("GITHUB_REF", "refs/heads/other"), ("GITHUB_SHA", "main")):
             with self.subTest(key=key, value=value), patch.object(gate, "api", side_effect=self.api):
                 with self.assertRaises(gate.GateError):
                     gate.select_action({**self.env, key: value})
