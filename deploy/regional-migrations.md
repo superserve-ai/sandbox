@@ -64,9 +64,15 @@ predecessor history, preparation state and index table identities. Each phase
 checks the expected catalog and ledger under the same session mutex used for
 mutation. The approved receipt is rechecked under that mutex, and each next
 phase must match this invocation's own progress. Ordinary West migrations
-require a completed journal, including on an empty or canonical partial ledger.
-Completed recovery
-preserves its historical receipts while allowing subsequent ordinary migrations.
+require either a completed recovery journal or all 24 exact canonical entries
+with no recovery namespace. Empty, partial and alternate unjournaled histories
+remain blocked. Canonical completion checks predecessor/Auth history and the
+completed catalog in one consistent read snapshot, then rechecks history and
+catalog under the execution session's mutex. Subsequent ordinary migrations may
+evolve that catalog; their recorded versions and names must belong to the checkout.
+Neither path rewrites history or fabricates a recovery journal. This admission
+rule does not authorize an initial canonical migration attempt or change the
+separate recovery entrypoint requirements.
 
 Use the distinct `recovery-preflight` and `recover` actions. Production requires
 an authenticated evidence run ID described below. Recovery preflight reads the
