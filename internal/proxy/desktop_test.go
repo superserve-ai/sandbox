@@ -253,9 +253,9 @@ func TestDesktopProxy_RoutableThroughOwnershipRouter(t *testing.T) {
 
 func TestDesktopProxy_CORSPreflightAllowsRoutingHint(t *testing.T) {
 	env := newDesktopProxyTestEnv(t)
-	env.handler.allowedOrigins = []string{"https://console.superserve.ai"}
+	env.handler.allowedOrigins = []string{"https://console.example.com"}
 	req := env.request(http.MethodOptions, desktopScreenshotPath, "", nil)
-	req.Header.Set("Origin", "https://console.superserve.ai")
+	req.Header.Set("Origin", "https://console.example.com")
 	w := httptest.NewRecorder()
 
 	env.handler.ServeHTTP(w, req)
