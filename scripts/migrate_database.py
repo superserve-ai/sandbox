@@ -7,12 +7,28 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
-from urllib.parse import parse_qsl, unquote, urlsplit
+import time
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CLI_VERSION = "2.119.0"
+COMMAND_TIMEOUT = 60
+STARTUP_OPTIONS = "-c transaction_timeout=2s -c lock_timeout=250ms"
+EXECUTION_GUARD = """RESET ALL;
+DO $$ BEGIN
+ IF current_setting('server_version_num')::int < 170000
+ OR NOT EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout'
+                AND setting='2000' AND reset_val='2000')
+ OR NOT EXISTS (SELECT FROM pg_settings WHERE name='lock_timeout'
+                AND setting='250' AND reset_val='250') THEN
+  RAISE EXCEPTION 'Migration execution settings are unavailable';
+ END IF;
+END $$;
+"""
 PROJECTS = {
     "staging": "rifhalqzxgskwajjgipj",
     "use4": "xompkvadqplatcchfqjq",
@@ -34,14 +50,14 @@ class MigrationError(Exception):
 
 
 def verify_connection_identity(database_url, target):
-    """Accept direct project hosts or project-scoped Supabase pooler logins."""
+    """Require a direct project connection that reapplies startup defaults."""
     try:
         url = urlsplit(database_url)
         project = PROJECTS[target]
         user = unquote(url.username or "")
         params = parse_qsl(url.query, strict_parsing=True, keep_blank_values=True)
         if (url.scheme not in ("postgres", "postgresql") or not user or url.fragment
-                or url.path != "/postgres" or url.port not in (None, 5432, 6543)
+                or url.path != "/postgres" or url.port not in (None, 5432)
                 or any(k not in {"sslmode", "connect_timeout", "application_name"}
                        for k, _ in params)
                 or len({k for k, _ in params}) != len(params)):
@@ -50,13 +66,54 @@ def verify_connection_identity(database_url, target):
             if "." in user and user.rsplit(".", 1)[1] != project:
                 raise ValueError()
             return
-        if (re.fullmatch(r"aws-\d+-[a-z0-9-]+\.pooler\.supabase\.com", url.hostname or "")
-                and user == f"postgres.{project}"):
-            return
     except (ValueError, KeyError):
         pass
     # Never include a connection URL or parsed credentials in errors.
-    raise MigrationError("Database connection does not match the selected project")
+    raise MigrationError("Database connection must use the selected project's direct port 5432 endpoint")
+
+
+def bounded_url(database_url):
+    url = urlsplit(database_url)
+    params = parse_qsl(url.query, keep_blank_values=True)
+    return urlunsplit(url._replace(query=urlencode(params + [("options", STARTUP_OPTIONS)], quote_via=quote)))
+
+
+def run_cli(args, deadline=None):
+    timeout = COMMAND_TIMEOUT if deadline is None else deadline - time.monotonic()
+    if timeout <= 0:
+        raise MigrationError("Migration command deadline exceeded")
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        # The CLI can have child processes. Local cancellation is secondary to
+        # the server transaction timer, which also survives loss of the runner.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+
+
+def preflight(cli, database_url, project, deadline):
+    # Read-only even on an empty database: no push, roles hook or ledger setup.
+    result = run_cli([cli, "db", "query",
+                      "SELECT current_setting('server_version_num')::int >= 170000 "
+                      "AND EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout' "
+                      "AND setting='2000' AND reset_val='2000') "
+                      "AND EXISTS (SELECT FROM pg_settings WHERE name='lock_timeout' "
+                      "AND setting='250' AND reset_val='250') AS ready",
+                      "--db-url", database_url, "--workdir", str(project), "--output", "json"], deadline)
+    try:
+        data = json.loads(result.stdout)
+        rows = data.get("rows") if isinstance(data, dict) else data
+        if result.returncode or rows != [{"ready": True}]:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise MigrationError("Read-only migration preflight failed; no raw output logged") from None
 
 
 def verified_aggregate(root):
@@ -72,10 +129,8 @@ def verified_aggregate(root):
     return data
 
 
-def cli_run(cli, database_url, project, args):
-    result = subprocess.run(
-        [cli, *args, "--db-url", database_url, "--workdir", str(project)],
-        capture_output=True, text=True, timeout=1200)
+def cli_run(cli, database_url, project, args, deadline=None):
+    result = run_cli([cli, *args, "--db-url", database_url, "--workdir", str(project)], deadline)
     if result.returncode:
         # CLI failures may echo connection strings or database statement data.
         states = sorted(set(re.findall(r"SQLSTATE ([A-Z0-9]{5})", result.stdout + result.stderr)))
@@ -84,14 +139,13 @@ def cli_run(cli, database_url, project, args):
     return result.stdout + result.stderr
 
 
-def history_row(cli, database_url, project):
+def history_row(cli, database_url, project, deadline=None):
     # The migration runner creates this table on a fresh database. Query its
     # existence first so ordinary fresh regional databases need no setup.
     def query(sql):
-        result = subprocess.run(
+        result = run_cli(
             [cli, "db", "query", sql, "--db-url", database_url,
-             "--workdir", str(project), "--output", "json"],
-            capture_output=True, text=True, timeout=60)
+             "--workdir", str(project), "--output", "json"], deadline)
         if result.returncode:
             raise MigrationError("Could not verify migration history; no raw output logged")
         try:
@@ -124,13 +178,27 @@ def verify_history(rows, target):
 
 
 def migrate(target, action, database_url, root=ROOT, cli="supabase"):
+    deadline = time.monotonic() + COMMAND_TIMEOUT
+    if action not in ("preflight", "recovery-preflight", "recover", "push", "list", "dry-run"):
+        raise MigrationError("Unsupported migration action")
     verify_connection_identity(database_url, target)
+    database_url = bounded_url(database_url)
+    version = run_cli([cli, "--version"], deadline)
+    if version.returncode or version.stdout.strip() != CLI_VERSION:
+        raise MigrationError(f"Migration execution requires Supabase CLI {CLI_VERSION}")
     aggregate = verified_aggregate(root)
     with tempfile.TemporaryDirectory(prefix="regional-migrations-") as workdir:
         project = Path(workdir)
         migrations = project / "supabase/migrations"
         migrations.mkdir(parents=True)
         (project / "supabase/config.toml").write_text('project_id = "regional-migrations"\n')
+        if action == "preflight":
+            preflight(cli, database_url, project, deadline)
+            print(f"{target}: read-only direct-connection preflight succeeded")
+            return
+        # This CLI hook runs on its migration session without a history row.
+        # Never copy repository roles: this file only verifies startup defaults.
+        (project / "supabase/roles.sql").write_text(EXECUTION_GUARD)
         versions = set()
         for source in sorted((root / "supabase/migrations").glob("*.sql")):
             version = source.name.split("_", 1)[0]
@@ -138,35 +206,77 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
                 raise MigrationError("Duplicate or shared-Auth version in regional migrations")
             versions.add(version)
             shutil.copyfile(source, migrations / source.name)
-        rows = history_row(cli, database_url, project)
+        rows = history_row(cli, database_url, project, deadline)
         verify_history(rows, target)
         if target == "use4":
             (migrations / AGGREGATE).write_bytes(aggregate)
-        preview = cli_run(cli, database_url, project, ["db", "push", "--dry-run", "--yes"])
+        if action in ("recovery-preflight", "recover"):
+            import retained_storage_recovery as recovery
+            import recovery_evidence
+            runner = recovery.Recovery(target, database_url, root, cli, deadline)
+            revision = os.environ.get("GITHUB_SHA", "")
+            evidence_run = os.environ.get("RECOVERY_EVIDENCE_RUN_ID", "")
+            if target == "usw2":
+                runner.observation = recovery_evidence.Observation(
+                    repository=os.environ.get("GITHUB_REPOSITORY", ""), revision=revision,
+                    run_id=evidence_run, plan_hash=runner.plan_hash,
+                    database_project=PROJECTS[target], deadline=deadline)
+                runner.observe()
+            with runner.connection(lock=False) as conn:
+                state = runner.inspect(conn)
+            receipt = {"revision": revision, "target": target, "plan_hash": runner.plan_hash,
+                       "history": recovery.digest(state["history"]), "catalog": recovery.digest(state["catalog"]),
+                       "physical_catalog": state["guard_catalog"],
+                       "preparations": recovery.digest(state["receipts"]),
+                       "writer_state": runner.observation.state_digest if target == "usw2" else None}
+            receipt_dir = Path(os.environ.get("RECOVERY_RECEIPT_DIR", ""))
+            if not os.environ.get("RECOVERY_RECEIPT_DIR") or not re.fullmatch(r"[a-f0-9]{40}", revision):
+                raise MigrationError("Recovery requires an exact revision and receipt directory")
+            receipt_path = receipt_dir / (target + ".json")
+            if action == "recovery-preflight":
+                receipt_dir.mkdir(parents=True, exist_ok=True)
+                receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+                print(f"{target}: read-only recovery preflight succeeded")
+                return
+            if json.loads(receipt_path.read_text()) != receipt:
+                raise MigrationError("Recovery state changed since the approved preflight")
+            runner.run(project, state)
+            verify_history(history_row(cli, database_url, project, runner.command_deadline()), target)
+            print(f"{target}: recovery verified; existing history preserved")
+            return
+        import retained_storage_recovery as recovery
+        ordinary_guard = recovery.ordinary_guard(target, database_url, root, cli, deadline)
+        (project / "supabase/roles.sql").write_text(EXECUTION_GUARD + ordinary_guard)
+        preview = cli_run(cli, database_url, project, ["db", "push", "--dry-run", "--yes"], deadline)
         if AGGREGATE in preview:
             raise MigrationError("CLI proposed replaying the shared-Auth aggregate")
         # Recheck before executing against the same composed snapshot. No path
         # can provision shared Auth or repair a missing history entry.
-        verify_history(history_row(cli, database_url, project), target)
+        verify_history(history_row(cli, database_url, project, deadline), target)
         if action == "push":
-            cli_run(cli, database_url, project, ["db", "push", "--yes"])
+            cli_run(cli, database_url, project, ["db", "push", "--yes", "--include-roles"], deadline)
         elif action == "list":
-            cli_run(cli, database_url, project, ["migration", "list"])
+            cli_run(cli, database_url, project, ["migration", "list"], deadline)
         elif action != "dry-run":
             raise MigrationError("Unsupported migration action")
-        verify_history(history_row(cli, database_url, project), target)
+        verify_history(history_row(cli, database_url, project, deadline), target)
         print(f"{target}: migration {action} succeeded; shared-Auth history preserved")
 
 
 def main():
+    def cancelled(signum, frame):
+        raise MigrationError("Migration command cancelled")
+
+    signal.signal(signal.SIGTERM, cancelled)
+    signal.signal(signal.SIGINT, cancelled)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=PROJECTS)
-    parser.add_argument("action", choices=["dry-run", "list", "push"])
+    parser.add_argument("action", choices=["preflight", "recovery-preflight", "recover", "dry-run", "list", "push"])
     args = parser.parse_args()
     database_url = os.environ.get("DATABASE_URL", "")
     try:
         migrate(args.target, args.action, database_url)
-    except (MigrationError, OSError, subprocess.TimeoutExpired):
+    except Exception:
         # OSError and subprocess exceptions may contain command arguments.
         import sys
         error = sys.exc_info()[1]
@@ -176,4 +286,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
+    sys.modules.setdefault("migrate_database", sys.modules[__name__])
     raise SystemExit(main())

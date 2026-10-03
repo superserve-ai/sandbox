@@ -27,7 +27,7 @@ class MigrationCLITest(unittest.TestCase):
         cls.addClassCleanup(run, "docker", "rm", "-f", cls.container)
         result = run("docker", "run", "-d", "--name", cls.container,
                      "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
-                     "-p", "127.0.0.1::5432", "postgres:16")
+                     "-p", "127.0.0.1::5432", "postgres:17.6")
         if result.returncode:
             raise RuntimeError(result.stdout)
         for _ in range(60):

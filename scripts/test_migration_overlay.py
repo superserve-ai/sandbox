@@ -28,9 +28,9 @@ class HistoryResponseTest(unittest.TestCase):
                 return self.response({"rows": rows, "boundary": "test", "warning": "test"}
                                      if envelope else rows)
             with self.subTest(envelope=envelope):
-                with patch.object(migration.subprocess, "run", return_value=encode([{"present": False}])):
+                with patch.object(migration, "run_cli", return_value=encode([{"present": False}])):
                     self.assertEqual(migration.history_row(CLI, "unused", ROOT), [])
-                with patch.object(migration.subprocess, "run", side_effect=[
+                with patch.object(migration, "run_cli", side_effect=[
                         encode([{"present": True}]), encode(expected)]):
                     rows = migration.history_row(CLI, "unused", ROOT)
                     self.assertEqual(rows, expected)
@@ -45,17 +45,16 @@ class HistoryResponseTest(unittest.TestCase):
             for history_query in (False, True):
                 with self.subTest(data=response.stdout, history_query=history_query):
                     results = ([self.response([{"present": True}])] if history_query else []) + [response]
-                    with patch.object(migration.subprocess, "run", side_effect=results):
+                    with patch.object(migration, "run_cli", side_effect=results):
                         with self.assertRaisesRegex(migration.MigrationError, "Unrecognized CLI history response"):
                             migration.history_row(CLI, "unused", ROOT)
 
 
 class ConnectionIdentityTest(unittest.TestCase):
-    def test_direct_and_pooler_projects(self):
+    def test_direct_projects(self):
         for target, project in migration.PROJECTS.items():
             for url in (
                 f"postgresql://postgres:example@db.{project}.supabase.co:5432/postgres",
-                f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
             ):
                 migration.verify_connection_identity(url, target)
                 for other in migration.PROJECTS.keys() - {target}:
@@ -70,6 +69,9 @@ class ConnectionIdentityTest(unittest.TestCase):
             "postgresql://postgres@aws-0-us-east-1.pooler.supabase.com/postgres",
             valid.replace("supabase.co", "supabase.co.example.com"),
             valid.replace("postgres:example", "postgres.otherproject:example"),
+            valid.replace("/postgres", ":6543/postgres"),
+            f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
+            f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
             valid + "?hostaddr=127.0.0.1",
             valid + "?host=other",
             valid + "?host=",
@@ -106,6 +108,11 @@ class MigrationOverlayTest(cli_test.MigrationCLITest):
                     # Existing Auth tables do not establish ownership of an overlay.
                     self.sql("CREATE TABLE signup_device_attempt(id integer); "
                              "INSERT INTO signup_device_attempt VALUES(1);")
+                if target == "usw2":
+                    with self.assertRaisesRegex(migration.MigrationError, "completed recovery"):
+                        self.invoke(target)
+                    self.assertEqual(self.sql("SELECT to_regclass('supabase_migrations.schema_migrations') IS NULL"), "t")
+                    continue
                 self.invoke(target)
                 self.invoke(target, "list")
                 before = self.history()
