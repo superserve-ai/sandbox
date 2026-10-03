@@ -112,29 +112,35 @@ def wait_for_migration_baseline(repository, revision, event, *, attempts=60, int
             if api("git/ref/heads/main")["object"]["sha"] != revision:
                 return False
             runs = inventory()
-            # Older runs can be rerun after newer ones. Never select only successes
-            # or rely on creation order while a later attempt may mutate a region.
-            if any(item["status"] != "completed" for item in runs):
-                pending = True
-            else:
-                pending = False
+            def job_sets(item):
+                if (item.get("path") != ".github/workflows/cd.yml"
+                        or item.get("head_branch") != "main"
+                        or item.get("event") not in ("push", "workflow_dispatch")
+                        or not re.fullmatch(r"[0-9a-f]{40}", item.get("head_sha", ""))
+                        or not isinstance(item.get("run_attempt"), int) or item["run_attempt"] < 1):
+                    raise MigrationProofError("Unverified migration attempt")
+                jobs = api(f"actions/runs/{item['id']}/attempts/{item['run_attempt']}/jobs?per_page=100")
+                if jobs["total_count"] != len(jobs["jobs"]) or not jobs["jobs"]:
+                    raise MigrationProofError("Incomplete migration job inventory")
+                return ({job["name"] for job in jobs["jobs"]},
+                        {job["name"] for job in jobs["jobs"] if job["conclusion"] == "success"})
+
+            def read_only(names):
+                return (names <= {"Verify migration release", "Preflight Staging", "Preflight Production"}
+                        and "Preflight Staging" in names)
+
+            # Older runs can be rerun after newer ones. Classify named read-only
+            # preflights before waiting on potentially mutating attempts.
+            pending = False
+            for item in runs:
+                if item["status"] != "completed" and not read_only(job_sets(item)[0]):
+                    pending = True
+                    break
+            if not pending:
                 baseline = None
                 for item in sorted(runs, key=lambda item: item["updated_at"], reverse=True):
-                    if (item.get("path") != ".github/workflows/cd.yml"
-                            or item.get("head_branch") != "main"
-                            or item.get("event") not in ("push", "workflow_dispatch")
-                            or not re.fullmatch(r"[0-9a-f]{40}", item.get("head_sha", ""))
-                            or not isinstance(item.get("run_attempt"), int) or item["run_attempt"] < 1):
-                        return False
-                    jobs = api(f"actions/runs/{item['id']}/attempts/{item['run_attempt']}/jobs?per_page=100")
-                    if jobs["total_count"] != len(jobs["jobs"]) or not jobs["jobs"]:
-                        return False
-                    names = {job["name"] for job in jobs["jobs"]}
-                    success = {job["name"] for job in jobs["jobs"] if job["conclusion"] == "success"}
-                    # A named read-only preflight cannot establish or invalidate
-                    # a migration baseline. Everything ambiguous holds deployment.
-                    if (names <= {"Verify migration release", "Preflight Staging", "Preflight Production"}
-                            and "Preflight Staging" in names):
+                    names, success = job_sets(item)
+                    if read_only(names):
                         continue
                     if (item["conclusion"] != "success"
                             or not {"Migrate Staging", "Migrate Production"} <= success):

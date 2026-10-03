@@ -114,6 +114,18 @@ class MigrationBaselineTests(unittest.TestCase):
         self.jobs[2]["Migrate Production"] = "failure"
         self.check(False)
 
+    def test_pending_read_only_preflight_does_not_hold_rollout(self):
+        self.runs = [self.record(2, self.b), self.record(1, self.a)]
+        self.jobs[2] = {"Verify migration release": "success", "Preflight Staging": None,
+                        "Preflight Production": None}
+        for status in ("waiting", "queued", "in_progress"):
+            self.runs[0].update(status=status, conclusion=None)
+            self.check(True)
+        self.jobs[2] = {"Verify migration release": None}
+        self.check(False)
+        self.jobs[2]["Migrate Staging"] = None
+        self.check(False)
+
     def test_newer_failed_or_running_attempt_invalidates_older_success(self):
         self.runs = [self.record(2, self.a), self.record(1, self.a)]
         # Creation order is deliberately different from attempt completion order.
@@ -175,6 +187,42 @@ class MigrationBaselineTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout=json.dumps(payload))
             return result
         self.assertFalse(GATE.wait_for_migration_baseline("example/repo", self.tip, "push", run=incomplete_jobs))
+
+    def test_main_advancing_only_at_final_proof_check_rejects_release(self):
+        self.runs = [self.record(2, self.a)]
+        main_reads = 0
+        def advancing_main(args, **kwargs):
+            nonlocal main_reads
+            if args[0] == "gh" and args[2].endswith("git/ref/heads/main"):
+                main_reads += 1
+                if main_reads == 2:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps({"object": {"sha": self.a}}))
+            return self.command(args, **kwargs)
+        self.assertFalse(GATE.wait_for_migration_baseline("example/repo", self.tip, "push", run=advancing_main))
+        self.assertEqual(main_reads, 2)
+
+    def test_pending_preflight_requires_complete_known_job_inventory(self):
+        self.runs = [self.record(2, self.b), self.record(1, self.a)]
+        self.runs[0].update(status="waiting", conclusion=None)
+        self.jobs[2] = {"Preflight Staging": None, "Unknown database action": None}
+        self.check(False)
+        self.jobs[2] = {"Preflight Staging": None}
+        def truncated_jobs(args, **kwargs):
+            result = self.command(args, **kwargs)
+            if args[0] == "gh" and "/runs/2/attempts/" in args[2]:
+                data = json.loads(result.stdout)
+                data["total_count"] += 1
+                return SimpleNamespace(returncode=0, stdout=json.dumps(data))
+            return result
+        self.assertFalse(GATE.wait_for_migration_baseline("example/repo", self.tip, "push", run=truncated_jobs))
+
+    def test_non_successful_migration_conclusions_require_later_full_success(self):
+        self.runs = [self.record(2, self.a), self.record(1, self.base)]
+        for conclusion in ("failure", "cancelled", "timed_out", "skipped", "neutral"):
+            self.runs[0]["conclusion"] = conclusion
+            self.check(False)
+        self.runs.insert(0, self.record(3, self.b))
+        self.check(True)
 
     def test_manual_dispatch_and_ci_function_do_not_require_migration_baseline(self):
         run = Mock()
