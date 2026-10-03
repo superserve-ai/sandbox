@@ -11,10 +11,12 @@ import re
 import subprocess
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, parse_qsl, unquote
 from urllib.request import Request, urlopen
 
 from collect_recovery_evidence import Reader
+from recovery_database_binding import matches_project
+from migrate_database import PROJECTS
 from staging_receiver_diagnostic import check_dispatch as receiver_check_dispatch
 
 PROJECT = 'rayai-dev'
@@ -95,6 +97,9 @@ def classify_stderr(stderr):
         ('invalid connection option', 'invalid_connection_option'),
         ('invalid uri', 'invalid_connection_uri'),
     )
+    state = re.search(r'error:\s+([0-9A-Z]{5})(?:\s|$)', stderr)
+    if state:
+        return 'postgres_sqlstate_'+state.group(1)
     return next((category for needle, category in patterns if needle in text), 'command_failed')
 
 
@@ -112,7 +117,7 @@ def command(reader, args, *, env=None, timeout=60, reject_stderr=False):
     if reject_stderr and result.stderr:
         category = classify_stderr(result.stderr)
         raise DiagnosticError(category if category != 'command_failed' else 'provider_warning_completeness_unknown')
-    if len(result.stdout) > 2_000_000:
+    if len(result.stdout) > 16_000_000:
         raise DiagnosticError('output_bound_exceeded')
     return result.stdout
 
@@ -250,9 +255,22 @@ def sql(reader, statement):
     remaining = reader.deadline-time.monotonic()
     if remaining <= 0:
         raise ValueError('deadline')
-    env = dict(os.environ, PGCONNECT_TIMEOUT='10', PGOPTIONS='')
-    env['PGDATABASE'] = env.pop('DATABASE_URL')
-    output = command(reader, ['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c',
+    value = os.environ.get('DATABASE_URL', '')
+    try:
+        matches_project(value, PROJECTS['staging'])
+    except Exception:
+        raise DiagnosticError('staging_database_identity_unverified') from None
+    url = urlsplit(value)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith('PG') and key != 'DATABASE_URL'}
+    env.update(PGHOST=url.hostname, PGPORT=str(url.port or 5432),
+               PGUSER=unquote(url.username), PGPASSWORD=unquote(url.password),
+               PGDATABASE='postgres', PGCONNECT_TIMEOUT='10', PGOPTIONS='')
+    names = {'sslmode': 'PGSSLMODE', 'application_name': 'PGAPPNAME'}
+    for key, value in parse_qsl(url.query):
+        if key in names:
+            env[names[key]] = value
+    output = command(reader, ['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate', '-c',
                              "BEGIN READ ONLY; SET LOCAL statement_timeout='10s'; SET LOCAL lock_timeout='250ms'; "
                              +statement+'; COMMIT;'], env=env, timeout=25)
     return json.loads(output)

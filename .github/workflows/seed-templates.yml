@@ -86,9 +86,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 8
-    concurrency:
-      group: control-plane-deploy
-      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
