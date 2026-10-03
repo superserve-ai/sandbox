@@ -7,7 +7,9 @@ The wrapper requires the selected project's direct port 5432 endpoint and
 PostgreSQL 17+, with startup/reset defaults of 250ms lock timeout and 2s
 transaction timeout. Session poolers are not accepted. The hosted runner must
 have a working route to the direct endpoint; DNS alone does not prove access.
-Never print `DATABASE_URL` or include it in a command transcript.
+Never print `DATABASE_URL` or include it in a command transcript. Connection
+rejections report fixed categories without URL, host, username or password values.
+A pooler rejection describes the migration contract, not invalid credentials.
 
 ## Shared Auth history
 
@@ -35,6 +37,10 @@ After a separately approved merge, verify successful push CI at the exact main
 revision. Dispatch CD Migrate with `action=preflight` for a read-only direct
 connection/settings check. `action=migrate` is a separate release and requires
 a successful same-revision preflight run covering all selected environments.
+A manually dispatched `preflight` may also run from a branch with its exact
+approved SHA; the branch head is rechecked before each region. This read-only
+path does not require main push CI and cannot authorize migration writes or
+establish a deployment baseline. `migrate` and recovery still require main.
 Staging runs first, then East and West. Each regional action rechecks main after
 protected-environment approval, immediately before database access. If main
 advances, stop and reassess the release. A code approval does not authorize

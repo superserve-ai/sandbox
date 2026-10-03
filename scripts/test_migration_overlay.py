@@ -51,6 +51,19 @@ class HistoryResponseTest(unittest.TestCase):
 
 
 class ConnectionIdentityTest(unittest.TestCase):
+    def test_rejections_are_categorical_and_do_not_expose_values(self):
+        project = migration.PROJECTS["usw2"]
+        for port, reason in ((5432, "session_pooler_not_supported"),
+                             (6543, "transaction_pooler_not_supported")):
+            url = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:{port}/postgres"
+            with self.assertRaises(migration.MigrationError) as error:
+                migration.verify_connection_identity(url, "usw2")
+            self.assertEqual(str(error.exception), f"Migration connection rejected: {reason}")
+        for url, reason in (("", "missing_url"),
+                            ("postgres://user:private-example@[bad", "malformed_url"),
+                            (f"postgres://user:private-example@db.{project}.supabase.co/postgres?private-example=x", "unsupported_query_parameter")):
+            self.assertEqual(migration.connection_rejection(url, "usw2"), reason)
+
     def test_direct_projects(self):
         for target, project in migration.PROJECTS.items():
             for url in (

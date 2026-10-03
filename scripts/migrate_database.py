@@ -49,27 +49,50 @@ class MigrationError(Exception):
     pass
 
 
-def verify_connection_identity(database_url, target):
-    """Require a direct project connection that reapplies startup defaults."""
+def connection_rejection(database_url, target):
+    """Return a fixed category only; connection details must never reach logs."""
+    if not database_url:
+        return "missing_url"
     try:
         url = urlsplit(database_url)
         project = PROJECTS[target]
         user = unquote(url.username or "")
         params = parse_qsl(url.query, strict_parsing=True, keep_blank_values=True)
-        if (url.scheme not in ("postgres", "postgresql") or not user or url.fragment
-                or url.path != "/postgres" or url.port not in (None, 5432)
-                or any(k not in {"sslmode", "connect_timeout", "application_name"}
-                       for k, _ in params)
-                or len({k for k, _ in params}) != len(params)):
-            raise ValueError()
+        port = url.port
+        if url.scheme not in ("postgres", "postgresql"):
+            return "unsupported_scheme"
+        if not user:
+            return "missing_user"
+        if url.fragment:
+            return "fragment_not_allowed"
+        if url.path != "/postgres":
+            return "database_mismatch"
+        if any(k not in {"sslmode", "connect_timeout", "application_name"} for k, _ in params):
+            return "unsupported_query_parameter"
+        if len({k for k, _ in params}) != len(params):
+            return "duplicate_query_parameter"
         if url.hostname == f"db.{project}.supabase.co":
             if "." in user and user.rsplit(".", 1)[1] != project:
-                raise ValueError()
-            return
+                return "user_project_mismatch"
+            return None if port in (None, 5432) else "unsupported_port"
+        if re.fullmatch(r"aws-\d+-[a-z0-9-]+\.pooler\.supabase\.com", url.hostname or ""):
+            if user != f"postgres.{project}":
+                return "user_project_mismatch"
+            if port in (None, 5432):
+                return "session_pooler_not_supported"
+            if port == 6543:
+                return "transaction_pooler_not_supported"
+            return "unsupported_port"
+        return "host_or_project_mismatch"
     except (ValueError, KeyError):
-        pass
-    # Never include a connection URL or parsed credentials in errors.
-    raise MigrationError("Database connection must use the selected project's direct port 5432 endpoint")
+        return "malformed_url"
+
+
+def verify_connection_identity(database_url, target):
+    """Require a direct project connection that reapplies startup defaults."""
+    reason = connection_rejection(database_url, target)
+    if reason is not None:
+        raise MigrationError(f"Migration connection rejected: {reason}")
 
 
 def bounded_url(database_url):
