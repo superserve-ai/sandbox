@@ -184,6 +184,20 @@ configuration checkbox is not evidence. Missing access or provenance blocks
 operations and must be routed to the deployment owner; this change grants no IAM,
 creates no observer, provisions no SSH access and performs no production trial.
 
+## Failure diagnostics
+
+The runner reports a fixed stage and category for CLI invocation, connection/query,
+JSON parsing, settings checks, and migration/history failures. Nonzero CLI exits
+include the exit code, allowlisted SQLSTATEs, and fixed text markers. Markers only
+identify text observed in CLI output; they do not prove a root cause. Raw command
+output and connection details are never printed.
+
+Preflight reports separate booleans for PostgreSQL 17+, the presence of each
+required timeout, and its current and reset values. Both transaction timeout
+values must equal 2000 ms and both lock timeout values must equal 250 ms. A missing
+or malformed result still fails closed. Diagnostics do not change these guards,
+the execution `RESET ALL` check, or release authorization.
+
 ## Validation
 
 Regression tests use the actual pinned CLI against disposable Docker PostgreSQL 17.6:

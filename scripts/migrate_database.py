@@ -121,22 +121,81 @@ def run_cli(args, deadline=None):
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
-def preflight(cli, database_url, project, deadline):
-    # Read-only even on an empty database: no push, roles hook or ledger setup.
-    result = run_cli([cli, "db", "query",
-                      "SELECT current_setting('server_version_num')::int >= 170000 "
-                      "AND EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout' "
-                      "AND setting='2000' AND reset_val='2000') "
-                      "AND EXISTS (SELECT FROM pg_settings WHERE name='lock_timeout' "
-                      "AND setting='250' AND reset_val='250') AS ready",
-                      "--db-url", database_url, "--workdir", str(project), "--output", "json"], deadline)
+# Only these known codes and fixed text markers may cross the CLI log boundary.
+SQLSTATES = {"08000", "08001", "08003", "08004", "08006", "08007", "08P01",
+             "22023", "25006", "25P02", "25P04", "28000", "28P01", "3D000",
+             "42501", "42601", "42704", "42883", "53300", "53400", "55P03",
+             "57014", "57P01", "57P02", "57P03", "P0001"}
+ERROR_MARKERS = {
+    "dns": ("no such host", "name resolution"),
+    "connection_refused": ("connection refused",),
+    "network_unreachable": ("network is unreachable", "no route to host"),
+    "timeout": ("i/o timeout", "context deadline exceeded", "connection timed out"),
+    "tls": ("tls error", "tls handshake", "certificate verify failed", "x509:"),
+    "authentication": ("password authentication failed", "authentication failed"),
+    "startup_parameter": ("unsupported startup parameter", "unrecognized configuration parameter"),
+    "cli_usage": ("unknown flag", "unknown command"),
+    "execution_settings": ("migration execution settings are unavailable",),
+}
+
+
+def invoke_cli(args, deadline, stage):
+    try:
+        result = run_cli(args, deadline)
+    except subprocess.TimeoutExpired:
+        raise MigrationError(f"stage={stage} category=command_timeout") from None
+    except OSError:
+        raise MigrationError(f"stage={stage} category=process_io_error") from None
+    except MigrationError as error:
+        raise MigrationError(f"stage={stage}: {error}") from None
+    if result.returncode:
+        output = (result.stdout or "") + (result.stderr or "")
+        states = sorted(SQLSTATES.intersection(re.findall(r"SQLSTATE ([A-Z0-9]{5})\b", output)))
+        lowered = output.lower()
+        markers = sorted(name for name, patterns in ERROR_MARKERS.items()
+                         if any(pattern in lowered for pattern in patterns))
+        # Markers describe observed CLI text, not a proven underlying cause.
+        raise MigrationError(f"stage={stage} category=cli_exit exit_code={result.returncode} "
+                             f"SQLSTATE {', '.join(states) or 'none'} "
+                             f"markers={','.join(markers) or 'none'}; no raw output logged")
+    return result
+
+
+def query_rows(result, stage):
     try:
         data = json.loads(result.stdout)
-        rows = data.get("rows") if isinstance(data, dict) else data
-        if result.returncode or rows != [{"ready": True}]:
-            raise ValueError()
     except (ValueError, TypeError):
-        raise MigrationError("Read-only migration preflight failed; no raw output logged") from None
+        raise MigrationError(f"stage={stage} category=invalid_json") from None
+    rows = data.get("rows") if isinstance(data, dict) else data
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise MigrationError(f"stage={stage} category=output_shape")
+    return rows
+
+
+PREFLIGHT_CHECKS = {
+    "postgres_version_ok": "current_setting('server_version_num')::int >= 170000",
+    "transaction_timeout_present": "EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout')",
+    "transaction_timeout_setting_ok": "EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout' AND setting='2000')",
+    "transaction_timeout_reset_ok": "EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout' AND reset_val='2000')",
+    "lock_timeout_present": "EXISTS (SELECT FROM pg_settings WHERE name='lock_timeout')",
+    "lock_timeout_setting_ok": "EXISTS (SELECT FROM pg_settings WHERE name='lock_timeout' AND setting='250')",
+    "lock_timeout_reset_ok": "EXISTS (SELECT FROM pg_settings WHERE name='lock_timeout' AND reset_val='250')",
+}
+
+
+def preflight(cli, database_url, project, deadline):
+    # These booleans preserve the readiness predicate without logging arbitrary values.
+    sql = "SELECT " + ", ".join(f"{expression} AS {name}" for name, expression in PREFLIGHT_CHECKS.items())
+    result = invoke_cli([cli, "db", "query", sql, "--db-url", database_url,
+                         "--workdir", str(project), "--output", "json"], deadline, "preflight_query")
+    rows = query_rows(result, "preflight_response")
+    if (len(rows) != 1 or rows[0].keys() != PREFLIGHT_CHECKS.keys()
+            or any(type(value) is not bool for value in rows[0].values())):
+        raise MigrationError("stage=preflight_response category=check_shape")
+    checks = " ".join(f"{name}={str(rows[0][name]).lower()}" for name in PREFLIGHT_CHECKS)
+    if not all(rows[0].values()):
+        raise MigrationError(f"stage=preflight_settings category=settings_mismatch {checks}")
+    print(f"stage=preflight_settings category=passed {checks}")
 
 
 def verified_aggregate(root):
@@ -153,51 +212,38 @@ def verified_aggregate(root):
 
 
 def cli_run(cli, database_url, project, args, deadline=None):
-    result = run_cli([cli, *args, "--db-url", database_url, "--workdir", str(project)], deadline)
-    if result.returncode:
-        # CLI failures may echo connection strings or database statement data.
-        states = sorted(set(re.findall(r"SQLSTATE ([A-Z0-9]{5})", result.stdout + result.stderr)))
-        suffix = f" (SQLSTATE {', '.join(states)})" if states else ""
-        raise MigrationError(f"Supabase {args[0]} {args[1]} failed{suffix}; no raw output logged")
+    stage = ("migration_preview" if "--dry-run" in args else
+             "migration_execute" if args[:2] == ["db", "push"] else "migration_list")
+    result = invoke_cli([cli, *args, "--db-url", database_url, "--workdir", str(project)], deadline, stage)
     return result.stdout + result.stderr
 
 
 def history_row(cli, database_url, project, deadline=None):
-    # The migration runner creates this table on a fresh database. Query its
-    # existence first so ordinary fresh regional databases need no setup.
-    def query(sql):
-        result = run_cli(
+    # A fresh database has no migration ledger yet.
+    def query(sql, stage):
+        result = invoke_cli(
             [cli, "db", "query", sql, "--db-url", database_url,
-             "--workdir", str(project), "--output", "json"], deadline)
-        if result.returncode:
-            raise MigrationError("Could not verify migration history; no raw output logged")
-        try:
-            data = json.loads(result.stdout)
-            # Normal CLI output is an array; agent mode wraps it in an envelope.
-            rows = data["rows"] if isinstance(data, dict) else data
-            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                raise ValueError()
-            return rows
-        except (ValueError, KeyError, TypeError):
-            raise MigrationError("Unrecognized CLI history response") from None
+             "--workdir", str(project), "--output", "json"], deadline, stage)
+        return query_rows(result, stage)
 
-    present = query("SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL AS present")
+    present = query("SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL AS present",
+                    "history_presence")
     if present != [{"present": True}]:
         if present == [{"present": False}]:
             return []
-        raise MigrationError("Unrecognized migration history presence")
+        raise MigrationError("stage=history_presence category=presence_shape; Unrecognized migration history presence")
     return query(f"SELECT version,name,cardinality(statements) AS statement_count, "
                  "encode(sha256(convert_to(statements[1],'UTF8')),'hex') AS sha256 "
-                 f"FROM supabase_migrations.schema_migrations WHERE version='{VERSION}'")
+                 f"FROM supabase_migrations.schema_migrations WHERE version='{VERSION}'", "history_query")
 
 
 def verify_history(rows, target):
     if target == "use4":
         expected = [{"version": VERSION, "name": NAME, "statement_count": 1, "sha256": SHA256}]
         if rows != expected:
-            raise MigrationError("East shared-Auth history is missing or mismatched; refusing replay")
+            raise MigrationError("stage=history_verification category=east_history_mismatch; East shared-Auth history is missing or mismatched; refusing replay")
     elif rows:
-        raise MigrationError("Unexpected shared-Auth history in a regional-only migration target")
+        raise MigrationError("stage=history_verification category=unexpected_regional_history; Unexpected shared-Auth history in a regional-only migration target")
 
 
 def migrate(target, action, database_url, root=ROOT, cli="supabase"):
@@ -206,9 +252,9 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
         raise MigrationError("Unsupported migration action")
     verify_connection_identity(database_url, target)
     database_url = bounded_url(database_url)
-    version = run_cli([cli, "--version"], deadline)
+    version = invoke_cli([cli, "--version"], deadline, "cli_version")
     if version.returncode or version.stdout.strip() != CLI_VERSION:
-        raise MigrationError(f"Migration execution requires Supabase CLI {CLI_VERSION}")
+        raise MigrationError(f"stage=cli_version category=version_mismatch expected={CLI_VERSION} version_ok=false")
     aggregate = verified_aggregate(root)
     with tempfile.TemporaryDirectory(prefix="regional-migrations-") as workdir:
         project = Path(workdir)
@@ -217,7 +263,7 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
         (project / "supabase/config.toml").write_text('project_id = "regional-migrations"\n')
         if action == "preflight":
             preflight(cli, database_url, project, deadline)
-            print(f"{target}: read-only direct-connection preflight succeeded")
+            print(f"{target}: read-only connection preflight succeeded")
             return
         # This CLI hook runs on its migration session without a history row.
         # Never copy repository roles: this file only verifies startup defaults.
@@ -303,7 +349,7 @@ def main():
         # OSError and subprocess exceptions may contain command arguments.
         import sys
         error = sys.exc_info()[1]
-        print(str(error) if isinstance(error, MigrationError) else "Migration command failed", file=sys.stderr)
+        print(str(error) if isinstance(error, MigrationError) else "stage=runner category=unexpected_error; no raw output logged", file=sys.stderr)
         return 1
     return 0
 

@@ -46,7 +46,7 @@ class HistoryResponseTest(unittest.TestCase):
                 with self.subTest(data=response.stdout, history_query=history_query):
                     results = ([self.response([{"present": True}])] if history_query else []) + [response]
                     with patch.object(migration, "run_cli", side_effect=results):
-                        with self.assertRaisesRegex(migration.MigrationError, "Unrecognized CLI history response"):
+                        with self.assertRaisesRegex(migration.MigrationError, "category=(invalid_json|output_shape)"):
                             migration.history_row(CLI, "unused", ROOT)
 
 
