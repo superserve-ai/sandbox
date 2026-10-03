@@ -79,7 +79,7 @@ def connection_rejection(database_url, target):
             if user != f"postgres.{project}":
                 return "user_project_mismatch"
             if port in (None, 5432):
-                return "session_pooler_not_supported"
+                return None
             if port == 6543:
                 return "transaction_pooler_not_supported"
             return "unsupported_port"
@@ -89,7 +89,7 @@ def connection_rejection(database_url, target):
 
 
 def verify_connection_identity(database_url, target):
-    """Require a direct project connection that reapplies startup defaults."""
+    """Allow project-bound direct or session connections; settings are checked next."""
     reason = connection_rejection(database_url, target)
     if reason is not None:
         raise MigrationError(f"Migration connection rejected: {reason}")

@@ -3,10 +3,12 @@
 Install `scripts/migration-requirements.txt` and use Supabase CLI 2.119.0.
 All remote actions go through `scripts/migrate_database.py`; `make migrate-local`
 is only for disposable databases. Targets are `staging`, `use4`, and `usw2`.
-The wrapper requires the selected project's direct port 5432 endpoint and
-PostgreSQL 17+, with startup/reset defaults of 250ms lock timeout and 2s
-transaction timeout. Session poolers are not accepted. The hosted runner must
-have a working route to the direct endpoint; DNS alone does not prove access.
+The wrapper accepts the selected project's direct endpoint or a Supabase session
+pooler on port 5432 with the exact `postgres.<project>` login. Transaction poolers
+are rejected. Both paths require PostgreSQL 17+ and verified startup/reset defaults
+of 250ms lock timeout and 2s transaction timeout. Session pooling is usable only
+if those defaults survive the pooler; endpoint acceptance alone is not proof.
+The hosted runner must verify connectivity and settings before migration.
 Never print `DATABASE_URL` or include it in a command transcript. Connection
 rejections report fixed categories without URL, host, username or password values.
 A pooler rejection describes the migration contract, not invalid credentials.
@@ -34,7 +36,7 @@ includes mixed SQL/control changes and unverified push ranges. A held CD run
 is not successful migration evidence. CI still runs.
 
 After a separately approved merge, verify successful push CI at the exact main
-revision. Dispatch CD Migrate with `action=preflight` for a read-only direct
+revision. Dispatch CD Migrate with `action=preflight` for a read-only
 connection/settings check. `action=migrate` is a separate release and requires
 a successful same-revision preflight run covering all selected environments.
 A manually dispatched `preflight` may also run from a branch with its exact

@@ -53,16 +53,28 @@ class HistoryResponseTest(unittest.TestCase):
 class ConnectionIdentityTest(unittest.TestCase):
     def test_rejections_are_categorical_and_do_not_expose_values(self):
         project = migration.PROJECTS["usw2"]
-        for port, reason in ((5432, "session_pooler_not_supported"),
-                             (6543, "transaction_pooler_not_supported")):
-            url = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:{port}/postgres"
-            with self.assertRaises(migration.MigrationError) as error:
-                migration.verify_connection_identity(url, "usw2")
-            self.assertEqual(str(error.exception), f"Migration connection rejected: {reason}")
+        url = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:6543/postgres"
+        with self.assertRaises(migration.MigrationError) as error:
+            migration.verify_connection_identity(url, "usw2")
+        self.assertEqual(str(error.exception), "Migration connection rejected: transaction_pooler_not_supported")
         for url, reason in (("", "missing_url"),
                             ("postgres://user:private-example@[bad", "malformed_url"),
                             (f"postgres://user:private-example@db.{project}.supabase.co/postgres?private-example=x", "unsupported_query_parameter")):
             self.assertEqual(migration.connection_rejection(url, "usw2"), reason)
+
+    def test_session_pooler_requires_exact_project_and_retains_timeout_options(self):
+        for target, project in migration.PROJECTS.items():
+            for port in ("", ":5432"):
+                url = f"postgres://postgres.{project}:example@aws-0-us-west-1.pooler.supabase.com{port}/postgres?sslmode=require"
+                migration.verify_connection_identity(url, target)
+                self.assertIn("transaction_timeout", migration.bounded_url(url))
+                self.assertIn("lock_timeout", migration.bounded_url(url))
+                for other in migration.PROJECTS.keys() - {target}:
+                    with self.assertRaises(migration.MigrationError):
+                        migration.verify_connection_identity(url, other)
+        with patch.object(migration, "run_cli", return_value=subprocess.CompletedProcess([], 0, stdout='[{"ready":false}]')):
+            with self.assertRaises(migration.MigrationError):
+                migration.preflight(CLI, "unused", ROOT, None)
 
     def test_direct_projects(self):
         for target, project in migration.PROJECTS.items():
@@ -83,7 +95,7 @@ class ConnectionIdentityTest(unittest.TestCase):
             valid.replace("supabase.co", "supabase.co.example.com"),
             valid.replace("postgres:example", "postgres.otherproject:example"),
             valid.replace("/postgres", ":6543/postgres"),
-            f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
+            f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com.example.com:5432/postgres",
             f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
             valid + "?hostaddr=127.0.0.1",
             valid + "?host=other",
