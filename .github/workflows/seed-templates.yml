@@ -44,6 +44,15 @@ on:
         required: false
         type: boolean
         default: false
+      receiver_diagnostic:
+        description: 'Read-only staging receiver access diagnostic; never seed or recover'
+        required: false
+        type: boolean
+        default: false
+      receiver_revision:
+        description: 'Exact reviewed branch commit for the staging receiver diagnostic'
+        required: false
+        type: string
   push:
     branches: [main]
     paths:
@@ -67,8 +76,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  receiver-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.receiver_diagnostic
+    runs-on: ${{ vars.STAGING_RECOVERY_OBSERVER_RUNNER || 'ubuntu-latest' }}
+    environment: staging
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+      SMOKE_PREFLIGHT: ${{ inputs.smoke_preflight }}
+      FORCE_REBUILD: ${{ inputs.force_rebuild }}
+      RECEIVER_DIAGNOSTIC: ${{ inputs.receiver_diagnostic }}
+      APPROVED_REVISION: ${{ inputs.receiver_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check exact branch and staging-only inputs before authentication
+        run: python3 scripts/staging_receiver_diagnostic.py --check-dispatch
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Observe staging access without provisioning or database connections
+        env:
+          RECOVERY_SSH_USER: ${{ vars.STAGING_RECOVERY_SSH_USER }}
+        run: python3 scripts/staging_receiver_diagnostic.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-receiver-diagnostic
+          path: staging-receiver-diagnostic/result.json
+          if-no-files-found: ignore
+          retention-days: 1
+
   smoke-preflight:
-    if: github.event_name == 'workflow_dispatch' && inputs.smoke_preflight && inputs.environment == 'staging'
+    if: github.event_name == 'workflow_dispatch' && inputs.smoke_preflight && !inputs.receiver_diagnostic && inputs.environment == 'staging'
     runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 5
@@ -90,7 +136,7 @@ jobs:
         run: python3 scripts/template-build-preflight.py
 
   seed-staging:
-    if: ${{ !inputs.smoke_preflight }}
+    if: ${{ !inputs.smoke_preflight && !inputs.receiver_diagnostic }}
     name: Seed Staging
     runs-on: ubuntu-latest
     environment: staging
@@ -166,7 +212,7 @@ jobs:
 
   seed-prod:
     name: Seed Production
-    if: ${{ !inputs.smoke_preflight && (github.event_name == 'push' || inputs.environment == 'production') }}
+    if: ${{ !inputs.smoke_preflight && !inputs.receiver_diagnostic && (github.event_name == 'push' || inputs.environment == 'production') }}
     runs-on: ubuntu-latest
     environment: production
     # Two blocking seeder invocations (primary, then the usw cell), each with

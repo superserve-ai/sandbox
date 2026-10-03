@@ -102,7 +102,8 @@ def receiver_inventory(reader):
     return state
 
 
-def guest_observation(reader, instance):
+def guest_observation(reader, instance, *, project=PROJECT):
+    require(project in {PROJECT, 'rayai-dev'}, 'Guest observation project is not allowed')
     name, zone = instance['name'], instance['zone'].rsplit('/', 1)[-1]
     require(re.fullmatch(r'[a-z][a-z0-9-]{0,62}', name)
             and re.fullmatch(r'[a-z]+-[a-z0-9]+[0-9]-[a-z]', zone), 'Guest identity is invalid')
@@ -113,8 +114,8 @@ def guest_observation(reader, instance):
             'Existing authenticated guest route is missing: require an existing SSH identity/user and verified known_hosts; no keys will be registered')
     source = (ROOT / 'scripts/recovery_guest_probe.py').read_text()
     proxy = shlex.join(['gcloud', 'compute', 'start-iap-tunnel', name, '22', '--listen-on-stdin',
-                        '--project=' + PROJECT, '--zone=' + zone, '--quiet'])
-    alias = f"{PROJECT}.{zone}.{instance['id']}"
+                        '--project=' + project, '--zone=' + zone, '--quiet'])
+    alias = f"{project}.{zone}.{instance['id']}"
     args = ['ssh', '-F', '/dev/null', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
             '-o', 'IdentitiesOnly=yes', '-o', 'UpdateHostKeys=no', '-o', 'ControlMaster=no',
             '-o', 'UserKnownHostsFile=' + str(known), '-o', 'HostKeyAlias=' + alias,
