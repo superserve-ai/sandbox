@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   migration-cli:
@@ -16,12 +15,17 @@ jobs:
       # Exercise the same runner as CD, including migration-history writes.
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: '2.119.0'
+
+      - run: python3 -m pip install -r scripts/migration-requirements.txt
 
       - name: Validate fresh and interrupted migrations
         run: |
           python3 scripts/test_migration_cli.py
           python3 scripts/test_migration_overlay.py
+          python3 scripts/test_migration_execution.py
+          python3 scripts/test_migration_recovery.py
+          python3 scripts/test_recovery_evidence.py
 
   unit-tests:
     name: Unit Tests
