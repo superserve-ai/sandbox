@@ -596,30 +596,35 @@ class Observation:
                     "Deployment evidence is stale")
             observation_deadline = self.deadline
         if document.get('schema') in (2, 3):
-            from collect_recovery_evidence import Reader, receiver_inventory, guest_observation, active_mutations
+            from collect_recovery_evidence import (Reader, receiver_inventory, guest_observation, active_mutations,
+                                                   mutable_inventory, attach_history, check_deletion_delta)
             reader = Reader(observation_deadline)
             if renewable:
                 active_mutations(reader, consumer[0])
             history = document.get('deletion_history')
-            current = receiver_inventory(reader, history) if history else receiver_inventory(reader)
-            if not renewable:
-                active_mutations(reader, os.environ.get('GITHUB_RUN_ID', ''))
-            if 'manual_guests' in document:
-                validate_manual_guests(document['manual_guests'], self.revision, self.plan_hash, current, time.time())
-                guests = document['manual_guests']['hosts']
-            else:
-                with ThreadPoolExecutor(max_workers=4) as executor:
-                    guests = list(executor.map(lambda host: guest_observation(reader, host), current['instances']))
-            require(sorted(map(stable_guest, guests), key=lambda h: h['instance_id']) ==
-                    sorted(map(stable_guest, document['hosts']), key=lambda h: h['instance_id']),
-                    'Guest process, executable or effective destination changed')
-            require(document['coordinated_assumption']['run_id'] == self.run_id,
-                    'Coordination acknowledgment belongs to another collection run')
-            if renewable:
-                after = receiver_inventory(reader, history) if history else receiver_inventory(reader)
-                require(current == after, 'Receiver inventory changed during live observation')
-                active_mutations(reader, consumer[0])
-                require(self.consumer_identity() == consumer, 'Consumer coordination changed during observation')
+            with ThreadPoolExecutor(max_workers=1) as audit_executor:
+                audit = audit_executor.submit(check_deletion_delta, reader, history) if history else None
+                current = attach_history(mutable_inventory(reader), history) if history else receiver_inventory(reader)
+                if not renewable:
+                    active_mutations(reader, os.environ.get('GITHUB_RUN_ID', ''))
+                if 'manual_guests' in document:
+                    validate_manual_guests(document['manual_guests'], self.revision, self.plan_hash, current, time.time())
+                    guests = document['manual_guests']['hosts']
+                else:
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        guests = list(executor.map(lambda host: guest_observation(reader, host), current['instances']))
+                require(sorted(map(stable_guest, guests), key=lambda h: h['instance_id']) ==
+                        sorted(map(stable_guest, document['hosts']), key=lambda h: h['instance_id']),
+                        'Guest process, executable or effective destination changed')
+                require(document['coordinated_assumption']['run_id'] == self.run_id,
+                        'Coordination acknowledgment belongs to another collection run')
+                if audit is not None:
+                    audit.result()
+                if renewable:
+                    after = attach_history(mutable_inventory(reader), history) if history else receiver_inventory(reader)
+                    require(current == after, 'Receiver inventory changed during live observation')
+                    active_mutations(reader, consumer[0])
+                    require(self.consumer_identity() == consumer, 'Consumer coordination changed during observation')
             fresh = dict(document, hosts=guests)
             validate_receivers(fresh, revision=self.revision, plan_hash=self.plan_hash,
                                database_project=self.database_project, current=current, now=time.time(),

@@ -59,7 +59,7 @@ def deletion_history(reader, earliest, cutoff=None):
                         fields='timestamp,receiveTimestamp,protoPayload.methodName,protoPayload.resourceName,protoPayload.status')
 
 
-def receiver_inventory(reader, history=None):
+def mutable_inventory(reader):
     queries = {
         'services': ('run', 'services', 'list', '--platform=managed', '--limit=1000'),
         'jobs': ('run', 'jobs', 'list', '--limit=1000'),
@@ -83,27 +83,40 @@ def receiver_inventory(reader, history=None):
         return key, sorted(rows, key=lambda r: str(r.get('name', r.get('metadata', {}).get('name', r.get('id', '')))))
     with ThreadPoolExecutor(max_workers=8) as executor:
         state = dict(executor.map(query, queries.items()))
+    # Compute returns consumer references in varying order. Preserve every
+    # reference/value while canonicalizing this unordered metadata list.
+    for backend in state['backends']:
+        if 'usedBy' in backend:
+            require(isinstance(backend['usedBy'], list), 'Backend consumer references are malformed')
+            backend['usedBy'] = sorted(backend['usedBy'], key=evidence.sha)
     state['canary_image'] = reader.cloud('artifacts', 'docker', 'images', 'describe',
                                          CANARY_IMAGE + ':' + CANARY['source'])['image_summary']['digest']
-    earliest = min(r['metadata']['creationTimestamp'] for region in CELLS for r in state['revisions_'+region])
-    if history is None:
-        state['deleted_receivers'] = deletion_history(reader, earliest)
-    else:
-        require(earliest == history['earliest'], 'Historical revision coverage changed')
-        delta = deletion_history(reader, earliest, history['cutoff'])
-        require(all(event in history['events'] for event in delta),
-                'New or late receiver deletion observed; recollect complete history')
-        state['deleted_receivers'] = history['events']
     # Also enumerate the retired job's region even without a current job there.
     job_regions = {job.get('metadata', {}).get('labels', {}).get('cloud.googleapis.com/location', '')
                    for job in state['jobs']}
+    live_job_regions = set(job_regions)
     job_regions.add('us-central1')
     require(all(re.fullmatch(r'[a-z]+-[a-z]+[0-9]', region) for region in job_regions),
             'Job region is missing from the global inventory')
     def executions(region):
-        rows = reader.cloud('run', 'jobs', 'executions', 'list', '--region='+region,
-                            '--filter=NOT status.completionTime:*', '--limit=1000')
+        # Cloud SDK treats completionTime as a date and rejects a wildcard.
+        # Negating an epoch comparison retains missing/null completion times.
+        # An empty retired region produces an SDK "filter keys not present"
+        # warning. Enumerate it without a filter; retain the completeness bound
+        # and classify completed executions locally instead of ignoring warnings.
+        filters = ['--filter=NOT status.completionTime>=1970-01-01T00:00:00Z'] if region in live_job_regions else []
+        rows = reader.cloud('run', 'jobs', 'executions', 'list', '--region='+region, *filters, '--limit=1000')
         require(isinstance(rows, list), 'Job execution inventory is incomplete')
+        if not filters:
+            active = []
+            for row in rows:
+                completed = row.get('status', {}).get('completionTime')
+                if completed is None:
+                    active.append(row)
+                else:
+                    require(isinstance(completed, str) and evidence.timestamp(completed) <= time.time(),
+                            'Retired-region execution completion is invalid')
+            rows = active
         return rows
     with ThreadPoolExecutor(max_workers=8) as executor:
         state['active_job_executions'] = sorted(sum(executor.map(executions, sorted(job_regions)), []),
@@ -118,6 +131,26 @@ def receiver_inventory(reader, history=None):
     state['service_dns'] = {s['status']['url']: sorted({row[4][0] for row in socket.getaddrinfo(
         urlsplit(s['status']['url']).hostname, 443, type=socket.SOCK_STREAM)}) for s in state['services']}
     return state
+
+
+def receiver_inventory(reader):
+    state = mutable_inventory(reader)
+    earliest = min(r['metadata']['creationTimestamp'] for region in CELLS for r in state['revisions_'+region])
+    state['deleted_receivers'] = deletion_history(reader, earliest)
+    return state
+
+
+def check_deletion_delta(reader, history):
+    delta = deletion_history(reader, history['earliest'], history['cutoff'])
+    require(all(event in history['events'] for event in delta),
+            'New or late receiver deletion observed; recollect complete history')
+
+
+def attach_history(current, history):
+    earliest = min(r['metadata']['creationTimestamp'] for region in CELLS for r in current['revisions_'+region])
+    require(earliest == history['earliest'], 'Historical revision coverage changed')
+    current['deleted_receivers'] = history['events']
+    return current
 
 
 def guest_failure_reason(output):
@@ -193,8 +226,10 @@ def host_provenance(reader):
 
 def active_mutations(reader, own_run):
     runs = []
-    for status in ('in_progress', 'queued', 'waiting', 'pending', 'requested'):
-        runs.extend(reader.pages('actions/runs?status=' + status, 'workflow_runs'))
+    statuses = ('in_progress', 'queued', 'waiting', 'pending', 'requested')
+    with ThreadPoolExecutor(max_workers=len(statuses)) as executor:
+        for page in executor.map(lambda status: reader.pages('actions/runs?status='+status, 'workflow_runs'), statuses):
+            runs.extend(page)
     readonly = {'.github/workflows/ci.yml', '.github/workflows/terraform-checks.yml', evidence.COLLECTOR_WORKFLOW}
     require(not [r for r in runs if str(r['id']) != own_run and r.get('path') not in readonly],
             'Another workflow may mutate deployment state; complete operator coordination first')
@@ -221,27 +256,30 @@ def collect(reader, revision, env):
     active_mutations(reader, env['GITHUB_RUN_ID'])
     started = utc()
     reader.deadline = min(reader.deadline, time.monotonic() + evidence.MAX_AGE_SECONDS)
-    before = receiver_inventory(reader, history)
-    require(before == preliminary, 'Inventory changed during provenance preparation; recollect')
-    if manual is not None:
-        guests = manual['hosts']
-        evidence.validate_manual_guests(manual, revision, evidence.sha(json.loads(
-            (ROOT/'supabase/recovery/retained-storage-v1.json').read_text())), before, time.time())
-        require(manual['operator'] == env['GITHUB_ACTOR'], 'Manual capture operator must dispatch collection')
-    else:
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            guests = list(executor.map(lambda instance: guest_observation(reader, instance), before['instances']))
-    bindings = {}
-    for region, secret in [('us-west2', 'database-url-usw2'), ('us-east4', 'database-url')]:
-        # All historical executables are proved incapable. Bind every active
-        # instance lifetime; its original latest version may remain loaded.
-        active = [r for r in before['revisions_'+region] if any(c.get('type') == 'Active' and c.get('status') == 'True'
-                         for c in r.get('status', {}).get('conditions', []))]
-        require(active, 'No active receiver was observed')
-        earliest = min(r['metadata']['creationTimestamp'] for r in active)
-        bindings[secret] = private_binding(reader, secret, earliest, utc())
-    after = receiver_inventory(reader, history)
-    require(after == before, 'Inventory changed during observation; no evidence issued')
+    with ThreadPoolExecutor(max_workers=1) as audit_executor:
+        audit = audit_executor.submit(check_deletion_delta, reader, history)
+        before = attach_history(mutable_inventory(reader), history)
+        require(before == preliminary, 'Inventory changed during provenance preparation; recollect')
+        if manual is not None:
+            guests = manual['hosts']
+            evidence.validate_manual_guests(manual, revision, evidence.sha(json.loads(
+                (ROOT/'supabase/recovery/retained-storage-v1.json').read_text())), before, time.time())
+            require(manual['operator'] == env['GITHUB_ACTOR'], 'Manual capture operator must dispatch collection')
+        else:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                guests = list(executor.map(lambda instance: guest_observation(reader, instance), before['instances']))
+        bindings = {}
+        for region, secret in [('us-west2', 'database-url-usw2'), ('us-east4', 'database-url')]:
+            # All historical executables are proved incapable. Bind every active
+            # instance lifetime; its original latest version may remain loaded.
+            active = [r for r in before['revisions_'+region] if any(c.get('type') == 'Active' and c.get('status') == 'True'
+                             for c in r.get('status', {}).get('conditions', []))]
+            require(active, 'No active receiver was observed')
+            earliest = min(r['metadata']['creationTimestamp'] for r in active)
+            bindings[secret] = private_binding(reader, secret, earliest, utc())
+        audit.result()
+        after = attach_history(mutable_inventory(reader), history)
+        require(after == before, 'Inventory changed during observation; no evidence issued')
     verify_dispatch(reader, env)
     active_mutations(reader, env['GITHUB_RUN_ID'])
     completed = utc()

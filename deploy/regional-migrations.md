@@ -155,7 +155,9 @@ full current source/configuration policy. Unknown events still reject. This is a
 source/deployment and termination argument, not proof against arbitrary
 out-of-band historical code. The collector reads full history once and binds its
 original lower bound, rows, catalog digest and pre-query cutoff into the artifact.
-Later inventories query `(timestamp >= cutoff OR receiveTimestamp >= cutoff)`
+Each observation runs one mandatory delta query concurrently with opening mutable
+inventory and guest work, awaits it, then takes the closing inventory and workflow
+checks. The delta query uses `(timestamp >= cutoff OR receiveTimestamp >= cutoff)`
 within that original history range; unknown or changed rows stop recovery. The
 cutoff never advances, so delayed older events remain eligible. Cloud Logging has
 no assumed ingestion watermark: absence of a delivered event is not proof that no
@@ -194,7 +196,7 @@ configuration changes; an empty Actions queue alone does not establish that hold
 After code approval, merge, successful main CI and explicit operational release,
 run this single capture from the clean approved checkout using the operator's
 **already working** gcloud SSH route, with `RECOVERY_SSH_USER` set to its existing
-Linux username. `--plain` suppresses gcloud key creation/registration; explicit
+Linux username (the verified current operator uses `alejandro_superserve_ai`). `--plain` suppresses gcloud key creation/registration; explicit
 SSH flags require the existing key and verified host entry. It neither dispatches collection nor reads
 database secret payloads. If the route needs key registration or new access, stop.
 Do not accept an interactive key-registration/host-key prompt. The timestamps and

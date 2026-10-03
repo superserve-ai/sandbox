@@ -1,7 +1,7 @@
 """Exercise the collector/verifier boundary with synthetic cloud and guest data."""
 
 import copy
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import datetime
 import hashlib
 import io
@@ -22,7 +22,7 @@ from migrate_database import MigrationError, PROJECTS
 
 
 def fixture():
-    now = time.time()
+    now = evidence.timestamp(datetime.datetime.fromtimestamp(time.time(), datetime.timezone.utc).isoformat())
     stamp = lambda delta: datetime.datetime.fromtimestamp(now+delta, datetime.timezone.utc).isoformat()
     digest = 'sha256:' + 'c'*64
     state = {'services': [], 'jobs': [], 'instances': [{'id': '1', 'name': 'host', 'zone': 'zones/us-west2-a'}],
@@ -339,6 +339,8 @@ class CollectorTest(unittest.TestCase):
 
     def test_inventory_lists_alternate_consumers_across_all_regions(self):
         reader = Mock()
+        retired_rows = [{'metadata': {'name': 'finished'}, 'status': {'completionTime': '2026-01-01T00:00:00Z'}},
+                        {'metadata': {'name': 'still-running'}, 'status': {}}]
         def cloud(*args, **kwargs):
             if args[:3] == ('artifacts', 'docker', 'images'):
                 return {'image_summary': {'digest': collector.CANARY['image']}}
@@ -346,6 +348,8 @@ class CollectorTest(unittest.TestCase):
                 return [{'metadata': {'name': 'revision', 'creationTimestamp': '2026-01-01T00:00:00Z'}}]
             if args[:3] == ('run', 'worker-pools', 'list'):
                 return [{'name': 'projects/example/locations/europe-west1/workerPools/other'}]
+            if args[:4] == ('run', 'jobs', 'executions', 'list') and '--region=us-central1' in args:
+                return retired_rows
             if args[:3] == ('run', 'jobs', 'list'):
                 return [{'metadata': {'name': region, 'labels': {'cloud.googleapis.com/location': region}}}
                         for region in ('us-west2', 'us-east4', 'europe-west1')]
@@ -354,15 +358,34 @@ class CollectorTest(unittest.TestCase):
         with patch.object(collector.socket, 'getaddrinfo', return_value=[(None, None, None, None, ('192.0.2.1', 443))]):
             state = collector.receiver_inventory(reader)
         self.assertEqual(len(state['workers']), 1)
+        self.assertEqual(state['active_job_executions'], [retired_rows[1]])
         calls = [call.args for call in reader.cloud.call_args_list if call.args[:3] == ('run', 'worker-pools', 'list')]
         self.assertEqual(len(calls), 1)
         self.assertFalse(any(arg.startswith('--region=') for arg in calls[0]))
         calls = [call.args for call in reader.cloud.call_args_list if call.args[:4] == ('run', 'jobs', 'executions', 'list')]
         self.assertEqual(len(calls), 4)
+        self.assertTrue(all(('--filter=NOT status.completionTime>=1970-01-01T00:00:00Z' in call) == ('--region=us-central1' not in call) for call in calls))
         self.assertEqual({arg for call in calls for arg in call if arg.startswith('--region=')},
                          {'--region=us-west2', '--region=us-east4', '--region=europe-west1', '--region=us-central1'})
         audit = [call.args for call in reader.cloud.call_args_list if call.args[:2] == ('logging', 'read')]
         self.assertIn('DeleteJob', audit[0][2])
+
+    def test_backend_reference_order_is_stable_without_hiding_changed_values(self):
+        reader = Mock()
+        references = [{'reference': 'map-a'}, {'reference': 'map-b'}]
+        def cloud(*args, **kwargs):
+            if args[:3] == ('artifacts', 'docker', 'images'):
+                return {'image_summary': {'digest': collector.CANARY['image']}}
+            if args[:3] == ('compute', 'backend-services', 'list'):
+                return [{'name': 'backend', 'usedBy': copy.deepcopy(references)}]
+            return []
+        reader.cloud.side_effect = cloud
+        with patch.object(collector.socket, 'getaddrinfo', return_value=[(0, 0, 0, 0, ('192.0.2.1', 443))]):
+            first = collector.mutable_inventory(reader)
+            references.reverse()
+            self.assertEqual(collector.mutable_inventory(reader), first)
+            references[0]['reference'] = 'changed-map'
+            self.assertNotEqual(collector.mutable_inventory(reader), first)
 
     def test_history_delta_query_includes_late_old_events_and_only_metadata(self):
         reader = Mock()
@@ -386,11 +409,12 @@ class CollectorTest(unittest.TestCase):
         history = {'earliest': '2026-07-01T00:00:00Z', 'cutoff': '2026-10-03T07:00:00Z', 'events': [event]}
         with patch.object(collector, 'deletion_history', return_value=[event]) as delta, \
              patch.object(collector.socket, 'getaddrinfo', return_value=[(0, 0, 0, 0, ('192.0.2.1', 443))]):
-            self.assertEqual(collector.receiver_inventory(reader, history)['deleted_receivers'], [event])
+            collector.check_deletion_delta(reader, history)
+            self.assertEqual(collector.attach_history(collector.mutable_inventory(reader), history)['deleted_receivers'], [event])
             delta.assert_called_once_with(reader, history['earliest'], history['cutoff'])
             delta.return_value = [dict(event, receiveTimestamp='2026-10-03T07:00:01Z')]
             with self.assertRaisesRegex(MigrationError, 'late receiver deletion'):
-                collector.receiver_inventory(reader, history)
+                collector.check_deletion_delta(reader, history)
             self.assertEqual(history['cutoff'], '2026-10-03T07:00:00Z')
 
     def test_manual_input_transport_is_exact_and_bounded(self):
@@ -499,7 +523,9 @@ class CollectorTest(unittest.TestCase):
                 result['observed_at'] = end
                 self.assertEqual(result['earliest_revision_start'], start)
                 return result
-            inventory_mock = stack.enter_context(patch.object(collector, 'receiver_inventory', side_effect=inventory))
+            inventory_mock = stack.enter_context(patch.object(collector, 'mutable_inventory', side_effect=inventory))
+            stack.enter_context(patch.object(collector, 'receiver_inventory', side_effect=inventory))
+            stack.enter_context(patch.object(collector, 'check_deletion_delta'))
             guest_mock = stack.enter_context(patch.object(collector, 'guest_observation', side_effect=guest))
             private = stack.enter_context(patch.object(collector, 'private_binding', side_effect=binding))
             document = collector.collect(reader, 'a'*40, env)
@@ -508,11 +534,11 @@ class CollectorTest(unittest.TestCase):
             self.assertLessEqual(reader.deadline, time.monotonic()+evidence.MAX_AGE_SECONDS)
             changed = copy.deepcopy(self.state)
             changed['instances'][0]['id'] = '2'
-            inventory_mock.side_effect = [self.state, self.state, changed]
+            inventory_mock.side_effect = [self.state, changed]
             with self.assertRaisesRegex(MigrationError, 'Inventory changed during observation'):
                 collector.collect(reader, 'a'*40, env)
             private.reset_mock()
-            inventory_mock.side_effect = [self.state, changed]
+            inventory_mock.side_effect = [changed]
             with self.assertRaisesRegex(MigrationError, 'provenance preparation'):
                 collector.collect(reader, 'a'*40, env)
             private.assert_not_called()
@@ -569,6 +595,8 @@ class ConsumerFreshnessTest(unittest.TestCase):
         self.doc['coordinated_assumption']['started_at'] = self.doc['started_at']
         for proof in self.doc['database_bindings'].values():
             proof['observed_at'] = self.stamp(evidence.timestamp(proof['observed_at'])-600)
+        self.doc['deletion_history'] = {'earliest': min(r['metadata']['creationTimestamp'] for region in collector.CELLS for r in self.state['revisions_'+region]),
+            'cutoff': self.stamp(self.now-620), 'events': self.state['deleted_receivers'], 'catalog_sha256': evidence.sha(collector.RETIRED_RECEIVERS)}
         self.env = {'RECOVERY_COORDINATION_ACK': 'accepted', 'GITHUB_ACTIONS': 'true',
                     'GITHUB_REPOSITORY': 'example/project', 'GITHUB_SHA': 'a'*40,
                     'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
@@ -580,7 +608,9 @@ class ConsumerFreshnessTest(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.dict(os.environ, self.env))
         self.clock = self.stack.enter_context(patch.object(evidence.time, 'time', return_value=self.now))
-        self.inventory = self.stack.enter_context(patch.object(collector, 'receiver_inventory', return_value=self.state))
+        self.inventory = self.stack.enter_context(patch.object(collector, 'mutable_inventory', return_value=self.state))
+        self.preliminary = self.stack.enter_context(patch.object(collector, 'receiver_inventory', return_value=self.state))
+        self.audit = self.stack.enter_context(patch.object(collector, 'check_deletion_delta'))
         self.mutations = self.stack.enter_context(patch.object(collector, 'active_mutations'))
         self.guest = self.stack.enter_context(patch.object(collector, 'guest_observation', return_value=self.doc['hosts'][0]))
 
@@ -616,11 +646,40 @@ class ConsumerFreshnessTest(unittest.TestCase):
             self.assertEqual(self.observation.valid_until, self.now+120)
         self.assertEqual(self.inventory.call_count, 2)
         self.assertEqual(self.guest.call_count, 1)
+        self.assertEqual(self.audit.call_count, 1)
         self.assertEqual(self.mutations.call_count, 2)
         self.clock.return_value = self.now+115
         self.observation.verify()
         self.assertEqual(self.inventory.call_count, 4)
         self.assertEqual(self.observation.valid_until, self.now+235)
+
+    def test_audit_is_awaited_before_closing_inventory(self):
+        calls = []
+        actual_executor = evidence.ThreadPoolExecutor
+        def executor(max_workers):
+            if max_workers != 1:
+                return actual_executor(max_workers=max_workers)
+            return nullcontext(SimpleNamespace(submit=lambda function, *args:
+                SimpleNamespace(result=lambda: function(*args))))
+        def inventory(_):
+            if calls:
+                self.assertEqual(calls[-1], 'audit-finished')
+            calls.append('inventory')
+            return self.state
+        self.inventory.side_effect = inventory
+        self.audit.side_effect = lambda *_: calls.append('audit-finished')
+        with patch.object(evidence, 'ThreadPoolExecutor', side_effect=executor):
+            self.observation.verify()
+        self.assertEqual(calls, ['inventory', 'audit-finished', 'inventory'])
+        self.audit.assert_called_once()
+
+    def test_combined_read_path_cannot_exceed_command_deadline(self):
+        self.observation.deadline = 70
+        with patch.object(evidence.time, 'monotonic', side_effect=[10, 10, 71]), \
+             self.assertRaisesRegex(MigrationError, 'expired'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
+        self.assertIsNone(self.observation._lease)
 
     def test_backward_wall_clock_revokes_lease(self):
         self.observation.verify()
@@ -724,9 +783,17 @@ class ConsumerFreshnessTest(unittest.TestCase):
             self.assertEqual(output['hosts'], manual['hosts'])
             self.assertEqual(bindings.call_count, 2)
             self.guest.assert_not_called()
-            self.assertEqual(len(self.inventory.call_args_list[0].args), 1)
-            for call in self.inventory.call_args_list[1:]:
-                self.assertEqual(call.args[1], output['deletion_history'])
+            self.preliminary.assert_called_once_with(reader)
+            self.assertEqual(self.inventory.call_count, 2)
+            self.audit.assert_called_once_with(reader, output['deletion_history'])
+
+    def test_manual_collector_uses_one_clock_precision_including_rounding_up(self):
+        for raw in (1791000000.1234567, 1791000000.123456, 1791000000.1234562):
+            with self.subTest(raw=raw), patch.object(evidence.time, 'time', return_value=raw):
+                case = ConsumerFreshnessTest('test_manual_input_flows_through_real_collector_without_ssh')
+                result = unittest.TestResult()
+                case.run(result)
+                self.assertTrue(result.wasSuccessful(), result.errors+result.failures)
 
     def test_manual_capture_expiring_during_observation_issues_no_lease(self):
         self.make_manual(age=1790)
@@ -758,7 +825,7 @@ class ConsumerFreshnessTest(unittest.TestCase):
         self.observation.verify()
         before = (self.observation.state_digest, self.observation.artifact_digest)
         self.clock.return_value = self.now+180
-        for target in (self.inventory, self.guest, self.mutations):
+        for target in (self.inventory, self.guest, self.mutations, self.audit):
             target.side_effect = MigrationError('live read failed')
             with self.subTest(target=target), self.assertRaisesRegex(MigrationError, 'live read failed'):
                 self.observation.verify()
