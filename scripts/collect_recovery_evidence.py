@@ -40,7 +40,11 @@ MAX_ITEMS = 1000
 MAX_ARCHIVE = 64 * 1024 * 1024
 MAX_CONFIG = 1024 * 1024
 CELLS = {'us-west2': 'superserve-api-usw2', 'us-east4': 'superserve-api-use4'}
-HOST_SOURCE = 'b69a7b2a50b7f692a1f0b198f2be246600cd21ab'
+HOST_SOURCE = 'b7ea7b9b2f663f2e1ba318a92d8d511c6542acb6'
+HOST_BINARIES = {
+    'vmd': 'c935a32171af63ea99fd2c52d84ff355c2b750b318c7825007c2a87756f63bc3',
+    'secretsproxy': '24dc59dc86b13ffa7780fa722a7e71052eb117b2a1598fac7fc1f2208e43351c',
+}
 
 
 def receiver_inventory(reader):
@@ -149,7 +153,7 @@ def host_provenance(reader):
                 result[binary]['dropins'][name] = hashlib.sha256(path.read_bytes()).hexdigest()
                 if guard:
                     result[binary]['guards'][guard] = hashlib.sha256((source/'deploy'/guard).read_bytes()).hexdigest()
-    require(result['vmd']['binary'] == '102dbc3cf0c7ea1a5bc73002b8ba7e01893f3e714b9bea9906b5ac00d23c5d96',
+    require(all(result[name]['binary'] == expected for name, expected in HOST_BINARIES.items()),
             'Audited host build is not reproducible')
     return result
 

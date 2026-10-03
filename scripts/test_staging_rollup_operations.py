@@ -37,12 +37,16 @@ class StagingRollupOperationsTest(unittest.TestCase):
         self.assertRegex(pause_job, r'concurrency:\n      group: control-plane-deploy\n      queue: max\n      cancel-in-progress: false')
 
     def test_requested_fixed_hour_controls_diagnostic_completeness(self):
-        for requested, error, expected in (
-            ('', None, 'observed'),
-            ('2026-10-03T04:00:00Z', None, 'observed'),
-            ('2026-10-03T04:00:00Z', TimeoutError(), 'partial'),
-            ('2026-99-03T04:00:00Z', None, 'partial'),
-            ('invalid', None, 'partial'),
+        comparison = {'valid_closed_hour': True, 'candidate_limit_exceeded': False, 'unequal_teams': 2}
+        for requested, error, expected, response in (
+            ('', None, 'observed', comparison),
+            ('2026-10-03T04:00:00Z', None, 'observed', comparison),
+            ('2026-10-03T04:00:00Z', TimeoutError(), 'partial', comparison),
+            ('2026-99-03T04:00:00Z', None, 'partial', comparison),
+            ('invalid', None, 'partial', comparison),
+            ('2026-10-03T04:00:00Z', None, 'partial', dict(comparison, valid_closed_hour=False)),
+            ('2026-10-03T04:00:00Z', None, 'partial', dict(comparison, candidate_limit_exceeded=True)),
+            ('2026-10-03T04:00:00Z', None, 'partial', {}),
         ):
             with self.subTest(requested=requested, error=error), tempfile.TemporaryDirectory() as directory:
                 result_path = Path(directory)/'result.json'
@@ -56,7 +60,7 @@ class StagingRollupOperationsTest(unittest.TestCase):
                      patch.object(diagnostic, 'monitoring', return_value={'status': 'observed'}), \
                      patch.object(diagnostic, 'logging', return_value={'status': 'observed'}), \
                      patch.object(diagnostic, 'database', return_value={'status': 'observed'}), \
-                     patch.object(diagnostic, 'sql', side_effect=error, return_value={'unequal_teams': 2}) as sql:
+                     patch.object(diagnostic, 'sql', side_effect=error, return_value=response) as sql:
                     self.assertEqual(diagnostic.main(), 0)
                 result = json.loads(result_path.read_text())
                 self.assertEqual(result['status'], expected)

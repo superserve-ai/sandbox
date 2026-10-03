@@ -89,6 +89,37 @@ class CollectorTest(unittest.TestCase):
         evidence.validate_receivers(doc or self.doc, revision='a'*40, plan_hash='b'*64,
             database_project=PROJECTS['usw2'], current=state or self.state, now=self.now)
 
+    def test_reproduced_host_build_rejects_either_binary_mismatch(self):
+        from recovery_guest_probe import DROPINS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'audited-host-source'
+            (source/'bin').mkdir(parents=True)
+            (source/'deploy').mkdir()
+            expected = {}
+            for binary in ('vmd', 'secretsproxy'):
+                data = binary.encode()
+                (source/'bin'/binary).write_bytes(data)
+                expected[binary] = hashlib.sha256(data).hexdigest()
+                (source/'deploy'/f'superserve-{binary}.service').write_text('unit')
+            for name, guard in DROPINS.items():
+                (source/'deploy'/('superserve-vmd-'+name.split('-', 1)[1])).write_text('dropin')
+                if guard:
+                    (source/'deploy'/guard).write_text('guard')
+            reader = Mock()
+            reader.command.return_value = collector.HOST_SOURCE
+            with patch.object(collector, 'ROOT', root), patch.object(collector, 'HOST_BINARIES', expected):
+                self.assertEqual(set(collector.host_provenance(reader)), set(expected))
+                for binary in expected:
+                    path = source/'bin'/binary
+                    path.write_bytes(b'changed')
+                    with self.subTest(binary=binary), self.assertRaisesRegex(MigrationError, 'not reproducible'):
+                        collector.host_provenance(reader)
+                    path.write_bytes(binary.encode())
+                reader.command.return_value = '0'*40
+                with self.assertRaisesRegex(MigrationError, 'source checkout'):
+                    collector.host_provenance(reader)
+
     def test_complete_receiver_proof_accepts_capable_publisher_without_spool_assertions(self):
         self.validate()
         self.assertNotIn('spools', self.doc['hosts'][0])

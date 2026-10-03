@@ -51,7 +51,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: b69a7b2a50b7f692a1f0b198f2be246600cd21ab
+          ref: b7ea7b9b2f663f2e1ba318a92d8d511c6542acb6
           path: audited-host-source
           persist-credentials: false
       - uses: actions/setup-go@v5

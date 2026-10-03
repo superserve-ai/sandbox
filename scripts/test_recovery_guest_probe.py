@@ -98,6 +98,19 @@ class GuestProbeTest(unittest.TestCase):
         path.write_bytes(b'example' * 200000)
         self.assertEqual(probe.digest(path), hashlib.sha256(path.read_bytes()).hexdigest())
 
+    def test_failure_identifies_static_check_without_exception_payload(self):
+        self.properties['superserve-vmd.service']['Environment'] = 'private-value'
+        with self.assertRaises(ValueError) as caught:
+            self.run_probe()
+        result = probe.failure(caught.exception)
+        self.assertEqual(result['check'], 'loaded-environment')
+        self.assertEqual(result['service'], 'vmd')
+        self.assertEqual(result['error_type'], 'ValueError')
+        self.assertNotIn('private-value', repr(probe.failure(PermissionError('private-value'))))
+        private_error = type('private-value', (Exception,), {})('private-value')
+        self.assertEqual(probe.failure(private_error)['error_type'], 'OtherError')
+        self.assertNotIn('private-value', repr(probe.failure(private_error)))
+
 
 if __name__ == '__main__':
     unittest.main()

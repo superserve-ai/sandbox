@@ -379,7 +379,10 @@ def main():
                 dt.datetime.fromisoformat(fixed_hour.replace('Z', '+00:00'))
                 query = Path(__file__).with_name('staging_rollup_fixed_hour.sql').read_text().replace('__FIXED_HOUR_START_UTC__', fixed_hour).strip().rstrip(';')
                 result['fixed_hour'] = sql(reader, 'SELECT row_to_json(comparison) FROM ('+query+') comparison')
-                result['capabilities']['fixed_hour'] = 'observed'
+                comparison = result['fixed_hour']
+                result['capabilities']['fixed_hour'] = ('observed'
+                    if comparison.get('valid_closed_hour') is True
+                    and comparison.get('candidate_limit_exceeded') is False else 'unknown')
             except Exception as error:
                 result['fixed_hour'] = {'status': 'unknown', 'reason': diagnostic_category(error)}
                 result['capabilities']['fixed_hour'] = 'unknown'
