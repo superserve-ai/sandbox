@@ -239,6 +239,19 @@ def receiver_state(document):
             'database_bindings': bindings, 'coordinated_assumption': assumption}
 
 
+def canary_configuration(spec, destinations):
+    containers = spec.get('containers', [])
+    require(len(containers) == 1 and not spec.get('volumes') and not containers[0].get('volumeMounts'),
+            'Canary sidecar/volume is not audited')
+    container = containers[0]
+    env = container.get('env', [])
+    endpoint = [e.get('value') for e in env if e['name'] == 'API_BASE_URL']
+    require(len(endpoint) == 1 and isinstance(endpoint[0], str) and endpoint[0].rstrip('/') in destinations
+            and not any(e['name'] == 'DATABASE_URL' or e['name'].startswith('PG') for e in env),
+            'Canary destination or database configuration is not audited')
+    return container
+
+
 def validate_receivers(document, *, revision, plan_hash, database_project, current, now):
     from collect_recovery_evidence import CANARY, CANARY_IMAGE, CELLS, HOST_SOURCE
     from recovery_database_binding import BINDINGS, candidate_versions
@@ -312,28 +325,22 @@ def validate_receivers(document, *, revision, plan_hash, database_project, curre
     require(document.get('canary_provenance') == CANARY, 'Canary provenance changed')
     require(current.get('canary_image') == CANARY['image'], 'Canary image tag changed')
     for execution in current.get('active_job_executions', []):
-        containers = execution.get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
-        require(len(containers) == 1 and containers[0].get('image') == CANARY_IMAGE + '@' + CANARY['image']
-                and not containers[0].get('command')
-                and containers[0].get('args') in (['-mode', 'lifecycle'], ['-mode', 'janitor']),
+        # An execution retains its task configuration when its job is updated.
+        container = canary_configuration(execution.get('spec', {}).get('template', {}).get('spec', {}), destinations)
+        require(container.get('image') == CANARY_IMAGE + '@' + CANARY['image']
+                and not container.get('command')
+                and container.get('args') in (['-mode', 'lifecycle'], ['-mode', 'janitor']),
                 'An active job execution has unreviewed executable provenance')
     expected_jobs = {f'{prefix}-production-{region}' for prefix in ('api-canary', 'api-canary-janitor') for region in CELLS}
     require({j['metadata']['name'] for j in current['jobs']} == expected_jobs and len(current['jobs']) == 4,
             'Unknown alternate job consumer')
     for job in current['jobs']:
         spec = job['spec']['template']['spec']['template']['spec']
-        containers = spec.get('containers', [])
-        require(len(containers) == 1 and not spec.get('volumes'), 'Canary sidecar/volume is not audited')
-        container = containers[0]
+        container = canary_configuration(spec, destinations)
         mode = 'janitor' if 'janitor' in job['metadata']['name'] else 'lifecycle'
         require(not container.get('command') and container.get('args') == ['-mode', mode]
                 and container.get('image') in {CANARY_IMAGE + ':' + CANARY['source'], CANARY_IMAGE + '@' + CANARY['image']},
                 'Alternate consumer image/entrypoint is not audited')
-        env = container.get('env', [])
-        endpoint = [e.get('value') for e in env if e['name'] == 'API_BASE_URL']
-        require(len(endpoint) == 1 and endpoint[0].rstrip('/') in destinations
-                and not any(e['name'] == 'DATABASE_URL' or e['name'].startswith('PG') for e in env),
-                'Canary destination or database configuration is not audited')
     hosts = {str(h['id']): h for h in current['instances']}
     observed = document.get('hosts', [])
     require(len(observed) == len(hosts) and {h.get('instance_id') for h in observed} == set(hosts),

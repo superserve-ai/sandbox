@@ -123,6 +123,41 @@ class CollectorTest(unittest.TestCase):
             with self.assertRaises(MigrationError):
                 self.validate(doc)
 
+    def test_active_execution_keeps_its_own_configuration_after_job_update(self):
+        spec = copy.deepcopy(self.state['jobs'][0]['spec']['template']['spec']['template']['spec'])
+        spec['containers'][0]['image'] = collector.CANARY_IMAGE+'@'+collector.CANARY['image']
+        for mode in ('lifecycle', 'janitor'):
+            spec['containers'][0]['args'] = ['-mode', mode]
+            state = copy.deepcopy(self.state)
+            state['active_job_executions'] = [{'spec': {'template': {'spec': copy.deepcopy(spec)}}}]
+            doc = copy.deepcopy(self.doc)
+            doc['inventory_before'] = doc['inventory_after'] = evidence.sha(state)
+            self.validate(doc, state)
+        cases = [lambda s: s['containers'][0]['env'][0].update(value='https://elsewhere.example'),
+                 lambda s: s['containers'][0]['env'].append({'name': 'DATABASE_URL', 'value': 'private-value'}),
+                 lambda s: s['containers'][0]['env'].append({'name': 'PGHOST', 'value': 'elsewhere.example'}),
+                 lambda s: s.update(volumes=[{'name': 'credentials', 'secret': {'secretName': 'other'}}]),
+                 lambda s: s['containers'][0].update(volumeMounts=[{'name': 'credentials', 'mountPath': '/credentials'}])]
+        for mutate in cases:
+            state = copy.deepcopy(self.state)
+            old_spec = copy.deepcopy(spec)
+            mutate(old_spec)
+            state['active_job_executions'] = [{'spec': {'template': {'spec': old_spec}}}]
+            doc = copy.deepcopy(self.doc)
+            doc['inventory_before'] = doc['inventory_after'] = evidence.sha(state)
+            with self.assertRaises(MigrationError):
+                self.validate(doc, state)
+            # Refresh must reject the old execution even when the current job
+            # template and authenticated evidence agree on the new safe config.
+            observation = evidence.Observation(repository='example/project', revision='a'*40, run_id='12',
+                plan_hash='b'*64, database_project=PROJECTS['usw2'], deadline=time.monotonic()+60)
+            observation.load_artifact = Mock(return_value=(doc, 'synthetic-authenticated-digest'))
+            with patch.object(collector, 'receiver_inventory', return_value=state), \
+                 patch.object(collector, 'active_mutations'), \
+                 patch.object(collector, 'guest_observation', return_value=doc['hosts'][0]), \
+                 self.assertRaises(MigrationError):
+                observation.verify()
+
     def test_report_forwarder_must_uniquely_cover_tcp_443(self):
         for ports in ({'portRange': '443-443'}, {'portRange': '400-500'}, {'ports': ['80', '443']}, {'allPorts': True}):
             state = copy.deepcopy(self.state)
