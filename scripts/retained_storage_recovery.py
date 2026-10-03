@@ -581,6 +581,8 @@ def ordinary_guard(target, database_url, root, cli, deadline):
             with conn.transaction():
                 conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 conn.execute("SET LOCAL search_path=public,pg_catalog")
+                require(conn.execute("SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL").fetchone()[0],
+                        "Ordinary West migration requires completed recovery or canonical history")
                 state = runner.inspect(conn, ordinary=True)
             require(state["prefix"] == 24, "Ordinary West migration requires completed canonical history or recovery")
             condition = ("EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')"
