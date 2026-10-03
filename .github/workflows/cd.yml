@@ -1,75 +1,111 @@
-# CD — Migrate — Supabase schema migrations.
-#
-# Triggers:
-#   - push to main on supabase/migrations/**: runs staging, then production
-#   - workflow_dispatch with environment=staging: staging only
-#   - workflow_dispatch with environment=production: staging FIRST, then production
-#
-# Production NEVER migrates without staging first. Running prod migrations
-# while staging is behind is a recipe for schema drift and rollback pain.
-
 name: CD — Migrate
 
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: 'Read-only connection preflight, or separately approved migrations'
+        required: true
+        type: choice
+        default: preflight
+        options: [preflight, migrate]
+      approved_revision:
+        description: 'Exact approved main commit SHA'
+        required: true
+        type: string
       environment:
         description: 'Target environment (staging always runs first)'
-        required: false
+        required: true
         type: choice
-        options:
-          - staging
-          - production
+        default: staging
+        options: [staging, production]
+      preflight_run_id:
+        description: 'Migrate only: successful same-revision preflight covering every target'
+        required: false
+        type: string
   push:
     branches: [main]
     paths:
       - 'supabase/migrations/**'
       - 'supabase/shared-auth-history/**'
       - 'scripts/migrate_database.py'
+      - 'scripts/test_migration_*.py'
       - '.github/workflows/cd.yml'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/scripts/migration_gate.py'
+      - '.github/workflows/scripts/test_migration_gate.py'
+      - '.github/workflows/scripts/wait-for-push-ci.py'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: database-migrations
+  cancel-in-progress: false
 
 jobs:
+  gate:
+    name: Verify migration release
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.gate.outputs.action }}
+      production: ${{ steps.gate.outputs.production }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gate
+        run: python3 .github/workflows/scripts/migration_gate.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          APPROVED_REVISION: ${{ inputs.approved_revision }}
+          MIGRATION_ACTION: ${{ inputs.action }}
+          MIGRATION_ENVIRONMENT: ${{ inputs.environment }}
+          PREFLIGHT_RUN_ID: ${{ inputs.preflight_run_id }}
+
   migrate-staging:
-    name: Migrate Staging
+    name: ${{ needs.gate.outputs.action == 'preflight' && 'Preflight Staging' || 'Migrate Staging' }}
+    needs: [gate]
     runs-on: ubuntu-latest
     environment: staging
     steps:
       - uses: actions/checkout@v4
-
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
-
-      - name: Push migrations to staging
-        run: python3 scripts/migrate_database.py staging push
+          version: '2.119.0'
+      - name: Run approved staging action
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py staging "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
+          MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
 
   migrate-prod:
-    name: Migrate Production
-    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
+    name: ${{ needs.gate.outputs.action == 'preflight' && 'Preflight Production' || 'Migrate Production' }}
+    if: needs.gate.outputs.production == 'true'
+    needs: [gate, migrate-staging]
     runs-on: ubuntu-latest
     environment: production
-    needs: [migrate-staging]
     steps:
       - uses: actions/checkout@v4
-
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
-
-      - name: Push migrations to production
-        run: python3 scripts/migrate_database.py use4 push
+          version: '2.119.0'
+      - name: Run approved primary production action
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py use4 "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
+          MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
-
-      # Every cell DB runs the identical migration set; a cell that misses a
-      # migration silently drifts until a deploy 500s against it. A step in
-      # this job — not a separate job — so a protected production environment
-      # gates ONE approval (a second env-referencing job would double-gate
-      # Deploy API, which waits on this whole workflow). Step order still
-      # stops a bad migration at the primary before it spreads.
-      - name: Push migrations to usw cell
-        run: python3 scripts/migrate_database.py usw2 push
+      - name: Run approved west production action
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py usw2 "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
+          MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
