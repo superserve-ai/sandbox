@@ -11,7 +11,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,7 +75,7 @@ def verify_connection_identity(database_url, target):
 def bounded_url(database_url):
     url = urlsplit(database_url)
     params = parse_qsl(url.query, keep_blank_values=True)
-    return urlunsplit(url._replace(query=urlencode(params + [("options", STARTUP_OPTIONS)])))
+    return urlunsplit(url._replace(query=urlencode(params + [("options", STARTUP_OPTIONS)], quote_via=quote)))
 
 
 def run_cli(args, deadline=None):
@@ -179,7 +179,7 @@ def verify_history(rows, target):
 
 def migrate(target, action, database_url, root=ROOT, cli="supabase"):
     deadline = time.monotonic() + COMMAND_TIMEOUT
-    if action not in ("preflight", "push", "list", "dry-run"):
+    if action not in ("preflight", "recovery-preflight", "recover", "push", "list", "dry-run"):
         raise MigrationError("Unsupported migration action")
     verify_connection_identity(database_url, target)
     database_url = bounded_url(database_url)
@@ -210,6 +210,43 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
         verify_history(rows, target)
         if target == "use4":
             (migrations / AGGREGATE).write_bytes(aggregate)
+        if action in ("recovery-preflight", "recover"):
+            import retained_storage_recovery as recovery
+            import recovery_evidence
+            runner = recovery.Recovery(target, database_url, root, cli, deadline)
+            revision = os.environ.get("GITHUB_SHA", "")
+            evidence_run = os.environ.get("RECOVERY_EVIDENCE_RUN_ID", "")
+            if target == "usw2":
+                runner.observation = recovery_evidence.Observation(
+                    repository=os.environ.get("GITHUB_REPOSITORY", ""), revision=revision,
+                    run_id=evidence_run, plan_hash=runner.plan_hash,
+                    database_project=PROJECTS[target], deadline=deadline)
+                runner.observe()
+            with runner.connection(lock=False) as conn:
+                state = runner.inspect(conn)
+            receipt = {"revision": revision, "target": target, "plan_hash": runner.plan_hash,
+                       "history": recovery.digest(state["history"]), "catalog": recovery.digest(state["catalog"]),
+                       "physical_catalog": state["guard_catalog"],
+                       "preparations": recovery.digest(state["receipts"]),
+                       "writer_state": runner.observation.state_digest if target == "usw2" else None}
+            receipt_dir = Path(os.environ.get("RECOVERY_RECEIPT_DIR", ""))
+            if not os.environ.get("RECOVERY_RECEIPT_DIR") or not re.fullmatch(r"[a-f0-9]{40}", revision):
+                raise MigrationError("Recovery requires an exact revision and receipt directory")
+            receipt_path = receipt_dir / (target + ".json")
+            if action == "recovery-preflight":
+                receipt_dir.mkdir(parents=True, exist_ok=True)
+                receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+                print(f"{target}: read-only recovery preflight succeeded")
+                return
+            if json.loads(receipt_path.read_text()) != receipt:
+                raise MigrationError("Recovery state changed since the approved preflight")
+            runner.run(project, state)
+            verify_history(history_row(cli, database_url, project, runner.command_deadline()), target)
+            print(f"{target}: recovery verified; existing history preserved")
+            return
+        import retained_storage_recovery as recovery
+        ordinary_guard = recovery.ordinary_guard(target, database_url, root, cli, deadline)
+        (project / "supabase/roles.sql").write_text(EXECUTION_GUARD + ordinary_guard)
         preview = cli_run(cli, database_url, project, ["db", "push", "--dry-run", "--yes"], deadline)
         if AGGREGATE in preview:
             raise MigrationError("CLI proposed replaying the shared-Auth aggregate")
@@ -234,12 +271,12 @@ def main():
     signal.signal(signal.SIGINT, cancelled)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=PROJECTS)
-    parser.add_argument("action", choices=["preflight", "dry-run", "list", "push"])
+    parser.add_argument("action", choices=["preflight", "recovery-preflight", "recover", "dry-run", "list", "push"])
     args = parser.parse_args()
     database_url = os.environ.get("DATABASE_URL", "")
     try:
         migrate(args.target, args.action, database_url)
-    except (MigrationError, OSError, subprocess.TimeoutExpired):
+    except Exception:
         # OSError and subprocess exceptions may contain command arguments.
         import sys
         error = sys.exc_info()[1]
@@ -249,4 +286,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
+    sys.modules.setdefault("migrate_database", sys.modules[__name__])
     raise SystemExit(main())

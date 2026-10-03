@@ -126,6 +126,32 @@ class MigrationBaselineTests(unittest.TestCase):
         self.jobs[2]["Migrate Staging"] = None
         self.check(False)
 
+    def test_recovery_baseline_requires_matching_full_regional_jobs(self):
+        self.runs = [self.record(2, self.b), self.record(1, self.base)]
+        for names in (
+            {"Recovery Preflight Staging": "success", "Recovery Preflight Production": "success"},
+            {"Recover Staging": "success", "Recover Production": "skipped"},
+            {"Recover Staging": "success", "Migrate Production": "success"},
+        ):
+            self.jobs[2] = names
+            self.check(False)
+        self.jobs[2] = {"Recover Staging": "success", "Recover Production": "success"}
+        self.check(True)
+        self.runs.insert(0, self.record(3, self.b))
+        self.jobs[3] = {"Recovery Preflight Staging": "success", "Recovery Preflight Production": "success"}
+        self.check(True)
+        for conclusion in ("failure", "cancelled", "timed_out"):
+            self.runs[0]["conclusion"] = conclusion
+            self.jobs[3] = {"Recovery Preflight Staging": "failure", "Recovery Preflight Production": "skipped"}
+            self.check(True)
+
+        for status in ("waiting", "queued", "in_progress"):
+            self.runs[0].update(status=status, conclusion=None)
+            self.jobs[3] = {"Recovery Preflight Staging": None, "Recovery Preflight Production": None}
+            self.check(True)
+        self.jobs[3]["Recover Production"] = None
+        self.check(False)
+
     def test_newer_failed_or_running_attempt_invalidates_older_success(self):
         self.runs = [self.record(2, self.a), self.record(1, self.a)]
         # Creation order is deliberately different from attempt completion order.

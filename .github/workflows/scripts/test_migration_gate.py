@@ -44,6 +44,23 @@ class MigrationGateTest(unittest.TestCase):
             self.assertEqual(gate.select_action(self.env), ("push", False))
         self.ci.assert_called_with("example/project", SHA, "push")
 
+    def test_recovery_requires_distinct_preflight_and_fresh_evidence(self):
+        self.env["MIGRATION_ACTION"] = "recovery-preflight"
+        with patch.object(gate, "api", side_effect=self.api):
+            with self.assertRaises(gate.GateError):
+                gate.select_action(self.env)
+            self.env["RECOVERY_EVIDENCE_RUN_ID"] = "456"
+            self.assertEqual(gate.select_action(self.env), ("recovery-preflight", True))
+            self.env["MIGRATION_ACTION"] = "recover"
+            with self.assertRaises(gate.GateError):
+                gate.select_action(self.env)
+            self.jobs["jobs"] = [{"name": name, "conclusion": "success"} for name in
+                                 ("Recovery Preflight Staging", "Recovery Preflight Production")]
+            self.assertEqual(gate.select_action(self.env), ("recover", True))
+            self.env["MIGRATION_ACTION"] = "migrate"
+            with self.assertRaises(gate.GateError):
+                gate.select_action(self.env)
+
     def test_invalid_manual_inputs_fail_closed(self):
         for key, value in (("APPROVED_REVISION", BEFORE), ("MIGRATION_ACTION", ""),
                            ("MIGRATION_ACTION", "push"), ("MIGRATION_ENVIRONMENT", ""),

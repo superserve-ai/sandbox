@@ -1,0 +1,1396 @@
+{
+  "catalog_hashes": {
+    "0": "6b69139aea93acf7952a3490e25f8362a2649716d7d6d877f9ced3d7da90f749",
+    "1": "fa1c53bfa26b88861ab338533db7f0d5becf4cb56d4d89dd0795432a6c54bde2",
+    "10": "5a0f526e591edb2217ca1c038be6ecd39813e1b9d0cdb05e920a34dcf2bdf006",
+    "11": "cf6a9afaceb7de3d9672779222bb6c091e93516e1116cedfcac1b3c2c3984683",
+    "12": "b0558bda1d28d826f75c33ec00bdcdc71d36a50bff1ffd99895e4130846308d5",
+    "13": "5549bdccaa85edc7e3a3ca5fac2164f200f338da2bc542eb44d6be399a25079e",
+    "14": "c0b06921d58d2831a63baeb0eed8cb7d1e5b3782262ff9aad3dc2c548a2a11ce",
+    "15": "dc71c702ac5a82270d33f07492a6217ac86099e5decb2bfb9216245105e01a59",
+    "16": "6d0a3950baa89951ae25454fd18d778c8d9755618c19b62dc41fa71e669c7f3e",
+    "17": "156208a6a2fb6460bc2eb6e1b8c169b9be4cb96d1b814973d2f6b0ba31daffe0",
+    "18": "19e782f22360c3b08f44ac8549d1f2d602ed5d4f4298c553ee06059ba4ff44f9",
+    "19": "94fa9e10c0a0c4e73d7aef472c94ab5e42c473e8b9ff0b95299178e171562b26",
+    "2": "76e044de9c55bb94f651876fca4d003d5fa981a8480c43437cbd93d1d579844e",
+    "20": "302904f816d7c8fa6b717c740979d2a719094792de546729c5a9310c031e04bf",
+    "21": "f1f98d19df1eaa25c7a8335b2fb78b00326d3f3183de0603e334c3e0482a110d",
+    "22": "cd2c4609bc514465054c5505ae88c9f0703b8f49866bad62469b51a699b841fb",
+    "23": "cd2c4609bc514465054c5505ae88c9f0703b8f49866bad62469b51a699b841fb",
+    "24": "0cd8e5af9498a7fe59f040ee9bcf5cf2bdc84a6c28862e3054796ef13c18ef4d",
+    "3": "ab0bd29a92fc5b822651c575f42ad3e38367b53115f7577ce50b035f4e92677b",
+    "4": "e1711584c3c1d2dd22dbd6bbda8ff378b3969e562d340b24fbb81ca1b90ac8f4",
+    "5": "03ed26f34379ff5c1e2eae3cca8fc0f46b9c94fff067397904745163b7cd0c45",
+    "6": "702aa65681f051a8ff94a18cab1f9c7851538c0a9ba676b256117fea8ba56089",
+    "7": "077c2fa0d08da406a6919a6475f6386f431a3f7293c2088749091cd493fd06d2",
+    "8": "2fc8965590e6d6fcce59a986a9dae72bdce82b31d1c3bdda7b80ecd97dff2448",
+    "9": "870fe795fd7ceebf36f887ba3a807dd01a6d830f148e9edee196f5e0515b0921",
+    "host": "73983cc09c23e91000f532003fd878d8cf2bf251e32963b6ecd5e2cf08928bb5",
+    "owner_index": "05675196cb1e2f5ae944887d7938bd59374516987a4ee367957667b7d918e990",
+    "reason": "3bc755d0d7c0cac82b1e7262ddf73970ed1815b20a78083e91262a387c08d42b",
+    "snapshot_index": "24058c89db7907304c11882f19b0ab361233223cbe4feb41ffa1f1cfbb2b9468",
+    "storage_index": "76c30f6832250a692e5185a40cb595f79d07ada6c350e823a9f279426d373b80",
+    "validated_reason": "8f6841c34f2c766dcaf268dc20f0c1a4074f04b1b408f594d9c238e29addfba6"
+  },
+  "catalog_keys": [
+    "column:retained_storage_cutover.host_id",
+    "column:retained_storage_cutover.started_at",
+    "column:retained_storage_cutover.team_id",
+    "column:retained_storage_interval.baseline_allocated_bytes",
+    "column:retained_storage_interval.baseline_generation",
+    "column:retained_storage_interval.baseline_path",
+    "column:retained_storage_interval.ended_at",
+    "column:retained_storage_interval.extents",
+    "column:retained_storage_interval.generation",
+    "column:retained_storage_interval.host_id",
+    "column:retained_storage_interval.id",
+    "column:retained_storage_interval.owner_id",
+    "column:retained_storage_interval.owner_kind",
+    "column:retained_storage_interval.started_at",
+    "column:retained_storage_interval.team_id",
+    "column:retained_storage_measurement_obligation.effective_at",
+    "column:retained_storage_measurement_obligation.ended_at",
+    "column:retained_storage_measurement_obligation.host_id",
+    "column:retained_storage_measurement_obligation.id",
+    "column:retained_storage_measurement_obligation.migration_identity",
+    "column:retained_storage_measurement_obligation.owner_id",
+    "column:retained_storage_measurement_obligation.owner_kind",
+    "column:retained_storage_measurement_obligation.resolution_report_id",
+    "column:retained_storage_measurement_obligation.resolved_at",
+    "column:retained_storage_measurement_obligation.team_id",
+    "column:sandbox.auto_delete_at",
+    "column:sandbox.auto_delete_seconds",
+    "column:sandbox.base_path",
+    "column:sandbox.created_at",
+    "column:sandbox.delta_path",
+    "column:sandbox.destroyed_at",
+    "column:sandbox.disk_mib",
+    "column:sandbox.failed_at",
+    "column:sandbox.had_secret_bindings",
+    "column:sandbox.host_id",
+    "column:sandbox.id",
+    "column:sandbox.ip_address",
+    "column:sandbox.mem_path",
+    "column:sandbox.memory_mib",
+    "column:sandbox.metadata",
+    "column:sandbox.name",
+    "column:sandbox.network_config",
+    "column:sandbox.pause_op_actor_id",
+    "column:sandbox.pause_op_attention_at",
+    "column:sandbox.pause_op_id",
+    "column:sandbox.pause_op_lease_until",
+    "column:sandbox.pause_op_lease_version",
+    "column:sandbox.pause_op_started_at",
+    "column:sandbox.pause_op_trigger",
+    "column:sandbox.pid",
+    "column:sandbox.routing_version",
+    "column:sandbox.secret_env_expires_at",
+    "column:sandbox.secret_env_fingerprint",
+    "column:sandbox.secret_env_injected_at",
+    "column:sandbox.secret_env_ip",
+    "column:sandbox.snapshot_id",
+    "column:sandbox.snapshot_path",
+    "column:sandbox.source_snapshot_id",
+    "column:sandbox.status",
+    "column:sandbox.team_id",
+    "column:sandbox.template_id",
+    "column:sandbox.timeout_seconds",
+    "column:sandbox.updated_at",
+    "column:sandbox.vcpu_count",
+    "column:sandbox_snapshot.base_mem_path",
+    "column:sandbox_snapshot.base_path",
+    "column:sandbox_snapshot.created_at",
+    "column:sandbox_snapshot.deleted_at",
+    "column:sandbox_snapshot.disk_mib",
+    "column:sandbox_snapshot.fc_build_sha",
+    "column:sandbox_snapshot.guest_kernel",
+    "column:sandbox_snapshot.host_id",
+    "column:sandbox_snapshot.id",
+    "column:sandbox_snapshot.idempotency_key",
+    "column:sandbox_snapshot.kind",
+    "column:sandbox_snapshot.mem_path",
+    "column:sandbox_snapshot.memory_mib",
+    "column:sandbox_snapshot.name",
+    "column:sandbox_snapshot.network_config",
+    "column:sandbox_snapshot.overlay_path",
+    "column:sandbox_snapshot.ready_at",
+    "column:sandbox_snapshot.retention_ended_at",
+    "column:sandbox_snapshot.sandbox_id",
+    "column:sandbox_snapshot.secret_bindings",
+    "column:sandbox_snapshot.size_bytes",
+    "column:sandbox_snapshot.snapshot_format",
+    "column:sandbox_snapshot.snapshot_path",
+    "column:sandbox_snapshot.status",
+    "column:sandbox_snapshot.sweep_after",
+    "column:sandbox_snapshot.team_id",
+    "column:sandbox_snapshot.template_id",
+    "column:sandbox_snapshot.timeout_seconds",
+    "column:sandbox_snapshot.vcpu_count",
+    "column:sandbox_storage_baseline.allocated_bytes",
+    "column:sandbox_storage_baseline.effective_at",
+    "column:sandbox_storage_baseline.ended_at",
+    "column:sandbox_storage_baseline.generation",
+    "column:sandbox_storage_baseline.host_id",
+    "column:sandbox_storage_baseline.id",
+    "column:sandbox_storage_baseline.observed_at",
+    "column:sandbox_storage_baseline.path",
+    "column:sandbox_storage_baseline.receipt_id",
+    "column:sandbox_storage_baseline.sandbox_id",
+    "column:sandbox_storage_baseline.started_at",
+    "column:sandbox_storage_baseline.team_id",
+    "column:sandbox_storage_interval.disk_mib",
+    "column:sandbox_storage_interval.end_reason",
+    "column:sandbox_storage_interval.ended_at",
+    "column:sandbox_storage_interval.host_id",
+    "column:sandbox_storage_interval.id",
+    "column:sandbox_storage_interval.sandbox_id",
+    "column:sandbox_storage_interval.started_at",
+    "column:sandbox_storage_interval.team_id",
+    "constraint:retained_storage_cutover.retained_storage_cutover_pkey",
+    "constraint:retained_storage_cutover.retained_storage_cutover_team_id_fkey",
+    "constraint:retained_storage_interval.retained_storage_baseline_bytes_nonnegative",
+    "constraint:retained_storage_interval.retained_storage_baseline_identity_valid",
+    "constraint:retained_storage_interval.retained_storage_interval_check",
+    "constraint:retained_storage_interval.retained_storage_interval_extents_check",
+    "constraint:retained_storage_interval.retained_storage_interval_host_id_owner_kind_owner_id_start_key",
+    "constraint:retained_storage_interval.retained_storage_interval_owner_kind_check",
+    "constraint:retained_storage_interval.retained_storage_interval_pkey",
+    "constraint:retained_storage_interval.retained_storage_interval_team_id_fkey",
+    "constraint:retained_storage_measurement_obligation.retained_storage_measurement_obligation_check",
+    "constraint:retained_storage_measurement_obligation.retained_storage_measurement_obligation_check1",
+    "constraint:retained_storage_measurement_obligation.retained_storage_measurement_obligation_check2",
+    "constraint:retained_storage_measurement_obligation.retained_storage_measurement_obligation_effective_at_check",
+    "constraint:retained_storage_measurement_obligation.retained_storage_measurement_obligation_owner_kind_check",
+    "constraint:retained_storage_measurement_obligation.retained_storage_measurement_obligation_pkey",
+    "constraint:retained_storage_measurement_obligation.retained_storage_measurement_obligation_team_id_fkey",
+    "constraint:sandbox.fk_sandbox_snapshot",
+    "constraint:sandbox.sandbox_auto_delete_seconds_valid",
+    "constraint:sandbox.sandbox_disk_positive",
+    "constraint:sandbox.sandbox_id_team_unique",
+    "constraint:sandbox.sandbox_memory_positive",
+    "constraint:sandbox.sandbox_pause_op_actor_id_fkey",
+    "constraint:sandbox.sandbox_pkey",
+    "constraint:sandbox.sandbox_routing_version_positive",
+    "constraint:sandbox.sandbox_source_snapshot_fk",
+    "constraint:sandbox.sandbox_team_id_fkey",
+    "constraint:sandbox.sandbox_template_id_fkey",
+    "constraint:sandbox.sandbox_vcpu_positive",
+    "constraint:sandbox_snapshot.sandbox_snapshot_deleted_was_deleting",
+    "constraint:sandbox_snapshot.sandbox_snapshot_disk_mib_check",
+    "constraint:sandbox_snapshot.sandbox_snapshot_id_team_id_key",
+    "constraint:sandbox_snapshot.sandbox_snapshot_idempotency_key_check",
+    "constraint:sandbox_snapshot.sandbox_snapshot_kind_check",
+    "constraint:sandbox_snapshot.sandbox_snapshot_memory_mib_check",
+    "constraint:sandbox_snapshot.sandbox_snapshot_name_check",
+    "constraint:sandbox_snapshot.sandbox_snapshot_pkey",
+    "constraint:sandbox_snapshot.sandbox_snapshot_ready_has_artifacts",
+    "constraint:sandbox_snapshot.sandbox_snapshot_sandbox_id_team_id_fkey",
+    "constraint:sandbox_snapshot.sandbox_snapshot_size_bytes_check",
+    "constraint:sandbox_snapshot.sandbox_snapshot_status_check",
+    "constraint:sandbox_snapshot.sandbox_snapshot_team_id_fkey",
+    "constraint:sandbox_snapshot.sandbox_snapshot_template_id_fkey",
+    "constraint:sandbox_snapshot.sandbox_snapshot_vcpu_count_check",
+    "constraint:sandbox_storage_baseline.sandbox_storage_baseline_allocated_bytes_check",
+    "constraint:sandbox_storage_baseline.sandbox_storage_baseline_check",
+    "constraint:sandbox_storage_baseline.sandbox_storage_baseline_effective_order_unique",
+    "constraint:sandbox_storage_baseline.sandbox_storage_baseline_generation_check",
+    "constraint:sandbox_storage_baseline.sandbox_storage_baseline_path_check",
+    "constraint:sandbox_storage_baseline.sandbox_storage_baseline_pkey",
+    "constraint:sandbox_storage_baseline.sandbox_storage_baseline_sandbox_id_host_id_path_generation_key",
+    "constraint:sandbox_storage_baseline.sandbox_storage_baseline_team_id_fkey",
+    "constraint:sandbox_storage_interval.sandbox_storage_interval_disk_nonnegative",
+    "constraint:sandbox_storage_interval.sandbox_storage_interval_end_after_start",
+    "constraint:sandbox_storage_interval.sandbox_storage_interval_pkey",
+    "constraint:sandbox_storage_interval.sandbox_storage_interval_reason_valid",
+    "constraint:sandbox_storage_interval.sandbox_storage_interval_reason_with_end",
+    "constraint:sandbox_storage_interval.sandbox_storage_interval_sandbox_team_fk",
+    "constraint:sandbox_storage_interval.storage_reason_recovery_candidate",
+    "function:billable_storage_mib_seconds(uuid,timestamp with time zone,timestamp with time zone)",
+    "function:clip_storage_export_cache()",
+    "function:close_retained_snapshot_measurement_obligation()",
+    "function:close_retained_storage_measurement_obligation()",
+    "function:close_retained_storage_owner()",
+    "function:close_snapshot_retained_storage_owner()",
+    "function:close_storage_intervals_on_sandbox_destruction()",
+    "function:fence_retained_storage_lifetime()",
+    "function:fence_retained_storage_owner_creation()",
+    "function:open_retained_snapshot_measurement_obligation()",
+    "function:refresh_team_trial_eligibility(uuid)",
+    "function:retained_storage_mib_seconds(uuid,timestamp with time zone,timestamp with time zone)",
+    "function:routing_private.revoke_sandbox_route()",
+    "function:sandbox_failed_at_on_transition()",
+    "function:sandbox_metadata_default_empty()",
+    "function:sandbox_quota_on_delete()",
+    "function:sandbox_quota_on_insert()",
+    "function:sandbox_quota_on_update()",
+    "function:sandbox_snapshot_no_revive()",
+    "function:sandbox_snapshot_quota_on_insert()",
+    "function:stamp_sandbox_storage_interval_host()",
+    "function:storage_mib_seconds(uuid,timestamp with time zone,timestamp with time zone,boolean)",
+    "function:storage_mib_seconds_segmented(uuid,timestamp with time zone,timestamp with time zone,boolean)",
+    "function:storage_mib_seconds_without_obligations(uuid,timestamp with time zone,timestamp with time zone,boolean)",
+    "function:storage_reports_complete_through(uuid,timestamp with time zone)",
+    "index:idx_sandbox_auto_delete_due",
+    "index:idx_sandbox_base_path_active",
+    "index:idx_sandbox_compute_pause_candidates",
+    "index:idx_sandbox_deleted_destroyed",
+    "index:idx_sandbox_host",
+    "index:idx_sandbox_host_active",
+    "index:idx_sandbox_host_destroyed",
+    "index:idx_sandbox_host_reconcile",
+    "index:idx_sandbox_status",
+    "index:idx_sandbox_team",
+    "index:idx_sandbox_team_created_active",
+    "index:idx_sandbox_team_metadata",
+    "index:idx_sandbox_team_status",
+    "index:idx_sandbox_template",
+    "index:idx_sandbox_timeout_reap",
+    "index:idx_ssi_ended_team_rollup",
+    "index:idx_ssi_one_open_per_sandbox",
+    "index:idx_ssi_open_started_team_rollup",
+    "index:idx_ssi_started_team_rollup",
+    "index:idx_ssi_team_ended",
+    "index:idx_ssi_team_open",
+    "index:idx_ssi_team_started",
+    "index:retained_storage_baseline_identity",
+    "index:retained_storage_current",
+    "index:retained_storage_cutover_pkey",
+    "index:retained_storage_host_time",
+    "index:retained_storage_host_window",
+    "index:retained_storage_interval_host_id_owner_kind_owner_id_start_key",
+    "index:retained_storage_interval_pkey",
+    "index:retained_storage_measurement_obligation_active",
+    "index:retained_storage_measurement_obligation_migration_identity",
+    "index:retained_storage_measurement_obligation_pkey",
+    "index:retained_storage_measurement_obligation_window",
+    "index:retained_storage_owner_close",
+    "index:retained_storage_team_time",
+    "index:retained_storage_team_window",
+    "index:sandbox_by_source_snapshot",
+    "index:sandbox_id_team_unique",
+    "index:sandbox_pkey",
+    "index:sandbox_retained_receiver_host_lifetime",
+    "index:sandbox_snapshot_base_path",
+    "index:sandbox_snapshot_by_sandbox",
+    "index:sandbox_snapshot_by_team",
+    "index:sandbox_snapshot_id_team_id_key",
+    "index:sandbox_snapshot_idempotency",
+    "index:sandbox_snapshot_pkey",
+    "index:sandbox_snapshot_quota_sandbox",
+    "index:sandbox_snapshot_quota_team",
+    "index:sandbox_snapshot_retained_receiver_host_lifetime",
+    "index:sandbox_snapshot_sweep",
+    "index:sandbox_snapshot_template",
+    "index:sandbox_storage_baseline_effective_lookup",
+    "index:sandbox_storage_baseline_effective_order_unique",
+    "index:sandbox_storage_baseline_lookup",
+    "index:sandbox_storage_baseline_pkey",
+    "index:sandbox_storage_baseline_sandbox_id_host_id_path_generation_key",
+    "index:sandbox_storage_interval_host_window",
+    "index:sandbox_storage_interval_pkey",
+    "index:sandbox_storage_interval_sandbox_team_started_at_idx",
+    "table:retained_storage_cutover",
+    "table:retained_storage_interval",
+    "table:retained_storage_measurement_obligation",
+    "table:sandbox",
+    "table:sandbox_snapshot",
+    "table:sandbox_storage_baseline",
+    "table:sandbox_storage_interval",
+    "trigger:sandbox.a_fence_retained_storage_lifetime",
+    "trigger:sandbox.close_retained_storage_measurement_obligation",
+    "trigger:sandbox.close_sandbox_retained_storage",
+    "trigger:sandbox.fence_retained_storage_owner_creation",
+    "trigger:sandbox.sandbox_destruction_close_storage",
+    "trigger:sandbox.sandbox_route_version",
+    "trigger:sandbox.trg_sandbox_failed_at_on_transition",
+    "trigger:sandbox.trg_sandbox_metadata_default_empty",
+    "trigger:sandbox.trg_sandbox_quota_on_delete",
+    "trigger:sandbox.trg_sandbox_quota_on_insert",
+    "trigger:sandbox.trg_sandbox_quota_on_update",
+    "trigger:sandbox_snapshot.a_fence_retained_storage_lifetime",
+    "trigger:sandbox_snapshot.close_retained_snapshot_measurement_obligation",
+    "trigger:sandbox_snapshot.close_snapshot_retained_storage",
+    "trigger:sandbox_snapshot.fence_retained_storage_owner_creation",
+    "trigger:sandbox_snapshot.open_retained_snapshot_measurement_obligation",
+    "trigger:sandbox_snapshot.trg_sandbox_snapshot_no_revive",
+    "trigger:sandbox_snapshot.trg_sandbox_snapshot_quota",
+    "trigger:sandbox_storage_interval.stamp_sandbox_storage_interval_host"
+  ],
+  "catalog_tables": [
+    "retained_storage_cutover",
+    "retained_storage_interval",
+    "retained_storage_measurement_obligation",
+    "sandbox",
+    "sandbox_snapshot",
+    "sandbox_storage_baseline",
+    "sandbox_storage_interval"
+  ],
+  "history": {
+    "canonical": {
+      "20261003010001": "e0ffa90127bfaefb88fa9a83bcb075796ce0e73f1e6a6730172de3fab2c3402f",
+      "20261003010002": "bc6478d87f2f69aea962c8f6fe460ddd3690e46de32505707a9f9722ad7a287c",
+      "20261003010003": "a5276d145d8427a25d51b6c25112aea9e1a6481b64f321d1b3ceb36f9dca33f3",
+      "20261003010004": "00d83f189a25508dc0ba68096a0ad196c275b233249d05647ac8bc2adc5dc5e0",
+      "20261003010005": "36a30d9ecef288725fb8bf96465b9ca183dad79a67c2619103473cf7c9f092e8",
+      "20261003010006": "b3a2c549f6a02b527a53cb7c7219a01cd100f77e8745c8ac2438289209630a76",
+      "20261003010007": "b1e0fbd1e4be5864ed850419e21820261083cdfb622c615f7d2ef3d821bf1137",
+      "20261003010008": "ea0f5188a92e0cfdd40523a91b309e0b8624b52571a6d4a21ac8cd979160e1f9",
+      "20261003010009": "72c03fe74a00039022488306fc9c205d4d5e13248ac2a153e2d62eee20165128",
+      "20261003010010": "2d2adb9f1890b32e4ff8652cf54f215ead437a6cc283898cb55720e6488d4209",
+      "20261003010011": "fcc998c281afbbca42a81d3bb40f2e7fdc7d50b2077a28df3aaeb77ba7c15d83",
+      "20261003010012": "bf9a216695f41ab9188a9ba23488c389df84feb7c5be5c31f1f4c2d4c3c4e9c3",
+      "20261003010013": "5cac7676deb908f1a8d607e32d535b55ed830cf0426340178ce19fc8ac42f965",
+      "20261003010014": "9d53df02d88a4702485e6d266cb945c66c4a84fbee08d5bdf62306472561f882",
+      "20261003010015": "8dd402159b3f7f144185c04f7aea019a0ff018be9ac9694e893a9bad118e6d65",
+      "20261003010016": "c74b8cc5b58e0f1f60bc92decf9492b730c35ed8a2455c35a3d16be6d6662680",
+      "20261003010017": "72851e8ebf3db65151c2603f3eb31ad956783ab80716c39b635d0c41d82c63fc",
+      "20261003010018": "ab60755ba45cf8b6da949863460d9407db10abe48d9a410dcd7c689fb864a7bc",
+      "20261003010019": "b2b5158ce52a580ad64bf9e7cbf94fcdf9f629d731b225f40ee11237f62139a6",
+      "20261003010020": "7165cbdc6c355f7cb202e76b1a94d011f4402f486a625b56b1c8c9ae85455ccd",
+      "20261003010021": "e1130eac710f72dc64297ea25b706a264efc5521b11e6dacf0409fb90c09378b",
+      "20261003010022": "a6aef4649a343493711fd84d544f68c9618f104df39036571a5252fe3ded9cb6",
+      "20261003010023": "15bb2ba939bb83cb848dd998f882fe95627485c0ea43f383ae583171e8e97645",
+      "20261003010024": "0aef5f346346f72a61dd8d889857093713bf6883b3593a0af34eeb8e1ca9f4ce"
+    },
+    "overlay": {
+      "20261003010001": "34edec70450f1c93446761ade0ef862020645b6cf83117ac5b3dda7ca7c6d36e",
+      "20261003010002": "e6d325ccba6f2d5a692b97b17e1b90453fff66a778adc3e9c2fdf8b32e63590d",
+      "20261003010003": "d2a88362ff4a1392f51ca7f3ff744fd60aac1fa410ca6daba9c6d5b609793935",
+      "20261003010004": "f062bd71f4508846c60230b469f464c764e54c79eb13f20cf6b9a0d8a58fe75b",
+      "20261003010005": "de7ac3b26c2e62deeed5cfe157fb8c44843c1e1a15049897a69ba2b5788c58a2",
+      "20261003010006": "9c00a99e403d16abb7b1b39e033f2e2ed445b62129a6b40d75e9e46f9e232a85",
+      "20261003010007": "b0fb992e0b11288a5cb8315b847dd132d287ea8e9e95f86a45a0ff14ce5f362f",
+      "20261003010008": "40b833201dca6c4d788ef007466f41a2c2d4087cb33ace72093b3cfe9383a465",
+      "20261003010009": "1482300b34f7ff3c1e25093bcad012f5e4ced39c7921ef6abe9ff27789d52332",
+      "20261003010010": "ecd1c85d496477af17a80c09c36875ab9afc1c4112b59aee7679ccef26a4163f",
+      "20261003010011": "eb2bb7d9dbb59d11ccbb6b1f917dc43b7cff5a3a4b441717ccf22a99f9fdb6e6",
+      "20261003010012": "041683e2a09b483462ea93c5b9f309390ab6d4056d91f7ac27bda388dd305716",
+      "20261003010013": "55878f1d4acc3663f59faa2128e8f408f172f35dd8fbe20dce43dda788f4a065",
+      "20261003010014": "5e88817f5fd10ac580bce7218f6b42299c6af6d15db0e262af58cc43627782df",
+      "20261003010015": "25b6fa4b7da14bd3f70d16e98c9324b9150cdb94859b44a195ec2baa77fc8293",
+      "20261003010016": "4a2d51345bb0540d2a4a41c8c82a953ca6e02f14bcbaa865a3b59c72aad4a6cc",
+      "20261003010017": "0aa388db2ad837e3a53998f32d33c00677763ae4497bd8b361604a8caf944fb7",
+      "20261003010018": "a472ea394507fec5267cbadccfe143c721bb2c01ce6227249f91c6ca46134a36",
+      "20261003010019": "60a8a0396c3c3d807520e54bf9d876f922d973d25fb9e485027c0c95ad945a8e",
+      "20261003010020": "391ee67565294ab59aa74a0251909599a8b3aaa822f3274da09baca4e9ec2a92",
+      "20261003010021": "760248e1704a680ad77fe301f9141c13b972b5e4a300a3d7c84941e8ce161aae",
+      "20261003010022": "7215631db9cbab5125d2085639e9fec0bd141c73e682dfa019fe04d38037114c",
+      "20261003010023": "2cc256d26e85b3e25bf02d2de41025be1c673d593eb083f075505990106f6669",
+      "20261003010024": "04565ce31cb3cae93414312f21b5238cd7bb0d812a27fe53ecc5bbaca80cdc8d"
+    }
+  },
+  "indexes": {
+    "owner_index": [
+      "CREATE INDEX sandbox_retained_receiver_host_lifetime ON public.sandbox USING btree (host_id, created_at, destroyed_at, id)",
+      true,
+      true,
+      true
+    ],
+    "snapshot_index": [
+      "CREATE INDEX sandbox_snapshot_retained_receiver_host_lifetime ON public.sandbox_snapshot USING btree (host_id, created_at, deleted_at, retention_ended_at, id)",
+      true,
+      true,
+      true
+    ],
+    "storage_index": [
+      "CREATE INDEX sandbox_storage_interval_host_window ON public.sandbox_storage_interval USING btree (host_id, started_at, ended_at)",
+      true,
+      true,
+      true
+    ]
+  },
+  "plan": "retained-storage-v1",
+  "predecessors": [
+    [
+      "20260403000001",
+      "profile"
+    ],
+    [
+      "20260403000002",
+      "team"
+    ],
+    [
+      "20260403000003",
+      "api_key"
+    ],
+    [
+      "20260403000004",
+      "sandbox"
+    ],
+    [
+      "20260403000005",
+      "snapshot"
+    ],
+    [
+      "20260403000006",
+      "activity"
+    ],
+    [
+      "20260403000007",
+      "device_code"
+    ],
+    [
+      "20260403000008",
+      "early_access_request"
+    ],
+    [
+      "20260406000001",
+      "add_failed_status"
+    ],
+    [
+      "20260406000002",
+      "sandbox_network_config"
+    ],
+    [
+      "20260407000001",
+      "sandbox_timeout"
+    ],
+    [
+      "20260408000001",
+      "sandbox_metadata"
+    ],
+    [
+      "20260409000001",
+      "enable_rls_all_tables"
+    ],
+    [
+      "20260410000001",
+      "host_table"
+    ],
+    [
+      "20260410000002",
+      "reconciler_log"
+    ],
+    [
+      "20260414000001",
+      "snapshot_mem_path"
+    ],
+    [
+      "20260415000001",
+      "template"
+    ],
+    [
+      "20260415000002",
+      "template_build"
+    ],
+    [
+      "20260415000003",
+      "team_build_concurrency"
+    ],
+    [
+      "20260417000001",
+      "sandbox_host_index"
+    ],
+    [
+      "20260417000002",
+      "sandbox_host_active_index"
+    ],
+    [
+      "20260420000001",
+      "drop_last_activity"
+    ],
+    [
+      "20260420000002",
+      "rename_idle_to_paused"
+    ],
+    [
+      "20260421000001",
+      "snapshot_sandbox_live_unique"
+    ],
+    [
+      "20260421000002",
+      "add_resuming_status"
+    ],
+    [
+      "20260422000001",
+      "activity_generic"
+    ],
+    [
+      "20260427000001",
+      "simplify_snapshot"
+    ],
+    [
+      "20260429000001",
+      "template_alias_to_name"
+    ],
+    [
+      "20260430000001",
+      "team_template_limits"
+    ],
+    [
+      "20260505000001",
+      "template_overlay_paths"
+    ],
+    [
+      "20260506000001",
+      "sandbox_artifact_paths"
+    ],
+    [
+      "20260513000001",
+      "sandbox_quota_counter"
+    ],
+    [
+      "20260529000001",
+      "sandbox_active_interval"
+    ],
+    [
+      "20260529000002",
+      "analytics_weekly_user_metrics"
+    ],
+    [
+      "20260605000001",
+      "raise_sandbox_default"
+    ],
+    [
+      "20260605000002",
+      "quota_alert_state"
+    ],
+    [
+      "20260607000001",
+      "quota_alert_state_rls"
+    ],
+    [
+      "20260608000001",
+      "sandbox_secrets"
+    ],
+    [
+      "20260608000002",
+      "sandbox_revocation"
+    ],
+    [
+      "20260608000003",
+      "secret_auth_type_per_host"
+    ],
+    [
+      "20260608000004",
+      "secret_fk_on_delete"
+    ],
+    [
+      "20260608000005",
+      "activity_secret_events"
+    ],
+    [
+      "20260608000006",
+      "net_flow"
+    ],
+    [
+      "20260612000001",
+      "lower_default_limits"
+    ],
+    [
+      "20260615000001",
+      "sandbox_billing_usage"
+    ],
+    [
+      "20260617000001",
+      "sandbox_secret_team_guard"
+    ],
+    [
+      "20260617000002",
+      "credential_store_config_check"
+    ],
+    [
+      "20260617000003",
+      "billing_pricing_credits"
+    ],
+    [
+      "20260617000004",
+      "billing_rollup_jobs"
+    ],
+    [
+      "20260618000001",
+      "sandbox_secret_proxy_token"
+    ],
+    [
+      "20260618000002",
+      "revoked_proxy_token"
+    ],
+    [
+      "20260618000003",
+      "billing_rollup_team_backfill_state"
+    ],
+    [
+      "20260620000001",
+      "sandbox_host_destroyed_index"
+    ],
+    [
+      "20260622000001",
+      "rbac_phase1"
+    ],
+    [
+      "20260622000002",
+      "rbac_phase2_indexes"
+    ],
+    [
+      "20260623000001",
+      "quota_alert_channel"
+    ],
+    [
+      "20260624000001",
+      "quota_count_active_only"
+    ],
+    [
+      "20260701000001",
+      "quota_exclude_pausing"
+    ],
+    [
+      "20260702000001",
+      "team_home_region"
+    ],
+    [
+      "20260705000001",
+      "sandbox_auto_delete"
+    ],
+    [
+      "20260705000002",
+      "snapshot_fk_on_delete_set_null"
+    ],
+    [
+      "20260710000001",
+      "raise_template_size_limits"
+    ],
+    [
+      "20260710000002",
+      "enable_tenant_usage_dashboard"
+    ],
+    [
+      "20260713000001",
+      "billing_period_credit_application"
+    ],
+    [
+      "20260720000001",
+      "raise_template_size_ceilings"
+    ],
+    [
+      "20260722000001",
+      "quota_sharded_counter"
+    ],
+    [
+      "20260727000001",
+      "preview_port_publication"
+    ],
+    [
+      "20260727000002",
+      "preview_port_access_policy"
+    ],
+    [
+      "20260727000003",
+      "preview_port_token_generation"
+    ],
+    [
+      "20260730000001",
+      "platform_billing_read"
+    ],
+    [
+      "20260730000002",
+      "grafana_readonly_role"
+    ],
+    [
+      "20260731000001",
+      "grafana_overview_views"
+    ],
+    [
+      "20260731000002",
+      "artifact_manifest"
+    ],
+    [
+      "20260731000004",
+      "snapshot_generations"
+    ],
+    [
+      "20260731000005",
+      "sandbox_base_path_index"
+    ],
+    [
+      "20260731000006",
+      "grafana_rank_views_time_range"
+    ],
+    [
+      "20260801000001",
+      "quota_shard_width"
+    ],
+    [
+      "20260804000001",
+      "billing_request_now"
+    ],
+    [
+      "20260812000001",
+      "grafana_live_and_failure_views"
+    ],
+    [
+      "20260812000002",
+      "backup_generation"
+    ],
+    [
+      "20260813000001",
+      "billing_exporting_state"
+    ],
+    [
+      "20260813000003",
+      "platform_billing_read_and_stripe_tables"
+    ],
+    [
+      "20260813000004",
+      "billing_stripe_correctness"
+    ],
+    [
+      "20260813000005",
+      "billing_storage_flag_seed"
+    ],
+    [
+      "20260813000006",
+      "billing_subscription_event_ordering"
+    ],
+    [
+      "20260816000001",
+      "sandbox_host_reconcile_covering_index"
+    ],
+    [
+      "20260817000001",
+      "sandbox_team_created_at_index"
+    ],
+    [
+      "20260817000002",
+      "billing_export_skipped_disabled"
+    ],
+    [
+      "20260817000003",
+      "billing_export_idempotency_key"
+    ],
+    [
+      "20260818000001",
+      "billing_trial_eligibility"
+    ],
+    [
+      "20260818000002",
+      "stripe_activation_credit"
+    ],
+    [
+      "20260819000001",
+      "sandbox_secrets_bound_marker"
+    ],
+    [
+      "20260819000002",
+      "host_provisioning_status"
+    ],
+    [
+      "20260819000003",
+      "host_identity_bound"
+    ],
+    [
+      "20260820000001",
+      "backup_generation_covered_snapshot"
+    ],
+    [
+      "20260820000002",
+      "telemetry_sampler_lease"
+    ],
+    [
+      "20260825000001",
+      "artifact_allocated_bytes"
+    ],
+    [
+      "20260825000002",
+      "storage_measurement_constraints"
+    ],
+    [
+      "20260825000003",
+      "artifact_manifest_template_path"
+    ],
+    [
+      "20260825000004",
+      "backfill_template_artifact_manifests"
+    ],
+    [
+      "20260825000005",
+      "sandbox_storage_interval_lookup_index"
+    ],
+    [
+      "20260826000001",
+      "abuse_control_plane"
+    ],
+    [
+      "20260826000002",
+      "host_pressure"
+    ],
+    [
+      "20260827000001",
+      "billing_commercial_anchor"
+    ],
+    [
+      "20260827000002",
+      "billing_trial_eligibility_cumulative"
+    ],
+    [
+      "20260903000001",
+      "billing_trial_balance"
+    ],
+    [
+      "20260909000001",
+      "sandbox_secret_env_marker"
+    ],
+    [
+      "20260910000001",
+      "sandbox_pause_operation"
+    ],
+    [
+      "20260914000001",
+      "host_peer_generation"
+    ],
+    [
+      "20260915000001",
+      "sandbox_migrating_status"
+    ],
+    [
+      "20260915000002",
+      "quota_exclude_migrating"
+    ],
+    [
+      "20260916000001",
+      "sandbox_teardown"
+    ],
+    [
+      "20260919000001",
+      "raise_template_disk_ceiling"
+    ],
+    [
+      "20260919000002",
+      "incremental_billing_events"
+    ],
+    [
+      "20260919000003",
+      "independent_billing_reconciliation"
+    ],
+    [
+      "20260919000004",
+      "billing_usage_corrections"
+    ],
+    [
+      "20260919000005",
+      "billing_export_expiry"
+    ],
+    [
+      "20260919000006",
+      "billing_measurement_cursors"
+    ],
+    [
+      "20260919000007",
+      "billing_accounting_cursors"
+    ],
+    [
+      "20260921152100",
+      "billing_export_review_fixes"
+    ],
+    [
+      "20260921190000",
+      "billing_export_enabled_by_default"
+    ],
+    [
+      "20260922000001",
+      "backup_generation_covered_index"
+    ],
+    [
+      "20260923000001",
+      "trial_credit_warning"
+    ],
+    [
+      "20260923000002",
+      "trial_credit_warning_state_indexes"
+    ],
+    [
+      "20260923000003",
+      "trial_credit_warning_recipients"
+    ],
+    [
+      "20260923000004",
+      "trial_credit_warning_rejections"
+    ],
+    [
+      "20260923000005",
+      "trial_balance_corrections"
+    ],
+    [
+      "20260923000006",
+      "trial_credit_warning_lifecycle"
+    ],
+    [
+      "20260923000007",
+      "billing_trial_balance"
+    ],
+    [
+      "20260923000008",
+      "trial_runway"
+    ],
+    [
+      "20260923000009",
+      "log_retention"
+    ],
+    [
+      "20260923000010",
+      "sandbox_proxy_router"
+    ],
+    [
+      "20260923000011",
+      "stripe_activation_reconciliation"
+    ],
+    [
+      "20260924000001",
+      "sandbox_snapshot"
+    ],
+    [
+      "20260924000002",
+      "sandbox_source_snapshot_fk_validate"
+    ],
+    [
+      "20260924000003",
+      "host_storage_reports"
+    ],
+    [
+      "20260924000004",
+      "storage_report_completeness_gate"
+    ],
+    [
+      "20260924000005",
+      "legacy_host_storage_reports"
+    ],
+    [
+      "20260924000006",
+      "storage_report_completeness_resolution"
+    ],
+    [
+      "20260924000007",
+      "retry_exhausted_storage_reports"
+    ],
+    [
+      "20260924000008",
+      "retry_exhausted_storage_report_index"
+    ],
+    [
+      "20260924000009",
+      "storage_report_payload_compaction"
+    ],
+    [
+      "20260924000010",
+      "storage_deletion_fence"
+    ],
+    [
+      "20260924000011",
+      "storage_report_processing_generation"
+    ],
+    [
+      "20260924000012",
+      "sandbox_compute_pause_candidates"
+    ],
+    [
+      "20260924000013",
+      "template_build_input"
+    ],
+    [
+      "20260924000014",
+      "template_build_execution"
+    ],
+    [
+      "20260925000001",
+      "backup_generation_purge"
+    ],
+    [
+      "20260925000002",
+      "backup_purge_indexes"
+    ],
+    [
+      "20260925000003",
+      "backup_walk"
+    ],
+    [
+      "20260925000004",
+      "sandbox_snapshot_sweep"
+    ],
+    [
+      "20260925195213",
+      "promotion_redemption_limits"
+    ],
+    [
+      "20260925195235",
+      "canonical_promotion_identity"
+    ],
+    [
+      "20260925195248",
+      "canonical_stripe_promotion_fences"
+    ],
+    [
+      "20260926000001",
+      "sandbox_secret_detached"
+    ],
+    [
+      "20260927000001",
+      "stripe_checkout_association_alerts"
+    ],
+    [
+      "20260927000002",
+      "stripe_checkout_association_discovery"
+    ],
+    [
+      "20260927000003",
+      "stripe_checkout_expiration_evidence"
+    ],
+    [
+      "20260927000004",
+      "stripe_checkout_retained_expiration_lookup"
+    ],
+    [
+      "20260927000005",
+      "stripe_checkout_association_retirement"
+    ],
+    [
+      "20260927003551",
+      "regional_promotion_device_authority"
+    ],
+    [
+      "20260927003604",
+      "fence_pending_stripe_device_reservations"
+    ],
+    [
+      "20260927003605",
+      "serialize_device_reservation_replay"
+    ],
+    [
+      "20260927003607",
+      "complete_denied_signup_device_claim"
+    ],
+    [
+      "20260927003608",
+      "resolve_late_signup_device_evidence"
+    ],
+    [
+      "20260927003610",
+      "atomic_stripe_device_decision"
+    ],
+    [
+      "20260927003611",
+      "serialize_signup_device_claim"
+    ],
+    [
+      "20260927003612",
+      "fence_legacy_stripe_device_reservations"
+    ],
+    [
+      "20260928035934",
+      "retain_stripe_promotion_device_attribution"
+    ],
+    [
+      "20260928043551",
+      "attribute_stripe_device_consumption_to_grant_actor"
+    ],
+    [
+      "20260928120000",
+      "stripe_activation_credit_revocation"
+    ],
+    [
+      "20260928220233",
+      "stripe_activation_revocation_redemption_guards"
+    ],
+    [
+      "20260928232900",
+      "billing_observation_meter_identity"
+    ],
+    [
+      "20260928233000",
+      "billing_close_reconciliation"
+    ],
+    [
+      "20260929000001",
+      "prospective_storage_billing"
+    ],
+    [
+      "20260929130000",
+      "backup_generation_snapshot_owner"
+    ],
+    [
+      "20260929203606",
+      "enforce_promotion_device_grants"
+    ],
+    [
+      "20260929203621",
+      "stripe_promotion_outcome"
+    ],
+    [
+      "20260929203623",
+      "settled_promotion_paid_activation"
+    ],
+    [
+      "20260929203624",
+      "trusted_team_promotion_attempt"
+    ],
+    [
+      "20260929203625",
+      "distinguish_stripe_redemption_denials"
+    ],
+    [
+      "20260929203627",
+      "retain_legacy_stripe_device_consumption"
+    ],
+    [
+      "20260929203628",
+      "reconcile_stripe_device_reservation_guards"
+    ],
+    [
+      "20260930000001",
+      "promotion_review_fixes"
+    ],
+    [
+      "20260930000002",
+      "durable_team_creation_recovery"
+    ],
+    [
+      "20260930000003",
+      "billing_bucket_precision"
+    ],
+    [
+      "20260930000004",
+      "team_creation_requests"
+    ],
+    [
+      "20260930000005",
+      "team_creation_signup_policy"
+    ],
+    [
+      "20261001202849",
+      "sandbox_routing_revocations"
+    ],
+    [
+      "20261001203744",
+      "billing_invoice_cent_reconciliation"
+    ],
+    [
+      "20261001212145",
+      "automatic_invoice_enrollment"
+    ],
+    [
+      "20261002000132",
+      "checkout_publication_decision"
+    ],
+    [
+      "20261002000201",
+      "checkout_publication_reservation_fence"
+    ]
+  ],
+  "sources": {
+    "20260403000001_profile.sql": "8e1de7d910f1bbe4c0a74fdf5b6cddcde3762e0445131a86466abba6b24c5d85",
+    "20260403000002_team.sql": "ffcddcea4c81e421259f77df580253befd6708d99148f6ad26bd23738f31131d",
+    "20260403000003_api_key.sql": "f8c01461ac5ce18bf51c3cca27a4e6d0c8f4840532c2fbcf81415b8e3f9725a0",
+    "20260403000004_sandbox.sql": "5c36dd713c35ec2e85de986a0831db3e963be5a03af90511518501bb78a0440b",
+    "20260403000005_snapshot.sql": "87c59a3cd96efb080ba71548dabe96e86166336d57624fd12cd413f8dc973c90",
+    "20260403000006_activity.sql": "59599955f676ebd44bb812503879ce1d503366587a2afa213accb9f4b76f36ed",
+    "20260403000007_device_code.sql": "e67d631c7e3e7c3e1a369667edfd98b5f8b10258e4083e6eaa2f5e5251f6b615",
+    "20260403000008_early_access_request.sql": "45525ebc4b9d3cc1ddf77e8f0bafdb104a2b4f829088271d6ae07bc8a5185a80",
+    "20260406000001_add_failed_status.sql": "7996b392f0664aabcd50fc27e9fd8bdf37088d700d0fad204c6e4759903293de",
+    "20260406000002_sandbox_network_config.sql": "3a74eaca9652159dd75e9b9feff16f732b5bc119d511bb3bd230858841c72dae",
+    "20260407000001_sandbox_timeout.sql": "42be3bf0f362ba0aa4da5194004ed8a587cc35c21649530c33967d01c7df2225",
+    "20260408000001_sandbox_metadata.sql": "a9857096d841721cde2b218b0747d00737e32a1cd6c98f05df906eea75c9dace",
+    "20260409000001_enable_rls_all_tables.sql": "290bea8848add1485595503af9b50f7f4e1c6183053f2d007fa362b925e09977",
+    "20260410000001_host_table.sql": "839cbd67581bbb274abe22e181c39b05e6196dd7f808802119fae0ab7bc4cf43",
+    "20260410000002_reconciler_log.sql": "29e77bae15793edc53e0c75a6fd8c03aa45f22c001279f6c3ae8e5b0a0ffeec0",
+    "20260414000001_snapshot_mem_path.sql": "b29f5c7eaba0b937a6724fa9afe114573fd63f3eca4cc9a17ebb320f818b0700",
+    "20260415000001_template.sql": "567567655bf0aadc2f73346b00538ba2ec9a4cf8227195a2a31d22c5c4bae00d",
+    "20260415000002_template_build.sql": "4f9eedd6cfe052d415c0f2c19fac1f2d15492ea08fc80ebfc4e1b8989ab5c67a",
+    "20260415000003_team_build_concurrency.sql": "297f425edc8c5af6b7b6f621aabccf9a7bada2afebf5ec3fee622dc39377a123",
+    "20260417000001_sandbox_host_index.sql": "d22e4a4822c5d906f7ffa44afc697ded267df197db55a6dc971be8e437dbeb9a",
+    "20260417000002_sandbox_host_active_index.sql": "0fe4385cc827e6bdcb443288c2b22fec867f402ff3e96ce3114fb6c0f4a40834",
+    "20260420000001_drop_last_activity.sql": "1c88c72e3e028e00620511ff4d7bd33f47f99fb9635313ed6cd4d821097d5710",
+    "20260420000002_rename_idle_to_paused.sql": "5b4fe79d0406a3a7dae0df575193611141871785c6399c8eb640935849da367b",
+    "20260421000001_snapshot_sandbox_live_unique.sql": "3514110be4b6f98e83921a162a0e1dd86526b3d00fd92f7525d642ba898e2c5f",
+    "20260421000002_add_resuming_status.sql": "0d0dd0d6a2689393f2d99a185109caa7241393f7a9e9f6103bf4f7671e5049f3",
+    "20260422000001_activity_generic.sql": "0588eff9937278fde2465dd6b25c65ab471a7e09b27a4b54c7176fff0309c49b",
+    "20260427000001_simplify_snapshot.sql": "64fcdb779437529fb5174114710f87e1579206b327a8b48fb4dc5f264bb8e546",
+    "20260429000001_template_alias_to_name.sql": "b25138ca86d21902e4c1f0eeca7c9b7046f4b126c5b7c9aad779b26c49020360",
+    "20260430000001_team_template_limits.sql": "e18c2bb728b6057c1ea08a026e5e2e70009f552ecdc3c685395182ff1193164c",
+    "20260505000001_template_overlay_paths.sql": "7226affbcef90ac7db50e7cb55b7cbc53e3d13757eabe1b4fd15cda50d258119",
+    "20260506000001_sandbox_artifact_paths.sql": "1e01a5cd84e61571aef25e3406525078e028c2f17fedca822e87914721366d1a",
+    "20260513000001_sandbox_quota_counter.sql": "897896e6619428d4903bc9108aeaf427414924a563eaf3932aab181757097601",
+    "20260529000001_sandbox_active_interval.sql": "619c2e444fe0d20ecb21ae95089a6289be0a2fbc3fd5843370ded32390019ba1",
+    "20260529000002_analytics_weekly_user_metrics.sql": "7fdbc56c020c208e8613e63a3f90e07c35af220865c063198ea1e95fa95266b3",
+    "20260605000001_raise_sandbox_default.sql": "07a134bbd00eb6668fec35612ed45bd950be5b9d06ca8f00002a1d557d14326b",
+    "20260605000002_quota_alert_state.sql": "15da8445fecc99d2cc2048e004e5dd8c0eb6e02bd99da699e11491ba27b341c9",
+    "20260607000001_quota_alert_state_rls.sql": "bdd6143b106d9c64bd4e867a3e565fc096ea77875f9cb4bd135d7a271a810134",
+    "20260608000001_sandbox_secrets.sql": "662a893e5790b00735be08d89bd06c487f0de4a7b1b800e773faf26238ae48be",
+    "20260608000002_sandbox_revocation.sql": "ea1a500714af13d93b82c25c46674ea686133f8b3a7cf9af5b4a114d19d2cabc",
+    "20260608000003_secret_auth_type_per_host.sql": "01e761e6c5360038c333a890ee3f3176654e09276c88663c4fd685efb76ddb8e",
+    "20260608000004_secret_fk_on_delete.sql": "c94f0cbdb376c601bf603d9e26c1e8321383bb119ab4937a4c40f7d102cbb635",
+    "20260608000005_activity_secret_events.sql": "b556bcaa51a2fc375000b113f23da8cf291ea2b8f141ab66eb9e9a9c29b476a5",
+    "20260608000006_net_flow.sql": "1d9aa1f98d6f75f31595a30cc6d7cfb46ad35cf2a574410b8e820ec60297c172",
+    "20260612000001_lower_default_limits.sql": "f33f010a1d883ddcd8014b581e2f388f1e307cacf136ee866a6edd1809db9dcf",
+    "20260615000001_sandbox_billing_usage.sql": "01bd11c1ef1b0b692d8d5a150fa5d96e0b57879c0413f69ecf73782392e90ad7",
+    "20260617000001_sandbox_secret_team_guard.sql": "b12f9a70b8ad6850b1c87c65ad5e057876a922fa6afeafd13c04d0b9ab02cc7b",
+    "20260617000002_credential_store_config_check.sql": "f7025f50ca24f74a17cf0313881c02a3324597bca025efa6c3997973e36a0739",
+    "20260617000003_billing_pricing_credits.sql": "8e32797b290ccf47fbfb3329137dfb16617d0b799c1b065ac64a5ceb866c81c3",
+    "20260617000004_billing_rollup_jobs.sql": "5a01241146672aa5ee0531b128a925e5c3f801a593ce6848ac40dbdad67d32c2",
+    "20260618000001_sandbox_secret_proxy_token.sql": "95e10137e04977584a703f90e4efee0cdb1b50fe85dba5cfaf984ff665770c08",
+    "20260618000002_revoked_proxy_token.sql": "504f70e1a34aed5c1c02b6c43a9051c309507a72ef933b32969832611c88855c",
+    "20260618000003_billing_rollup_team_backfill_state.sql": "74946c00632f5cd934a544fbed00c5cf386e0ea771b739ae9945fb1c572e023e",
+    "20260620000001_sandbox_host_destroyed_index.sql": "46800916a963642ba846c4176d78317b4de932dfa4c4731e85f4c1bdb0457a6a",
+    "20260622000001_rbac_phase1.sql": "afc5b01616223cf5a68d81513c9fd471de37e819546d4b00e47b9c7f74535406",
+    "20260622000002_rbac_phase2_indexes.sql": "68aecdb5c979df24d95ebe99188cd437ea0e01ac6cc58c83873f0d762448aa28",
+    "20260623000001_quota_alert_channel.sql": "159c57e2a4a09e92173efe8d862f99acc81ad3c0bad9b02e5f9e43da8b466740",
+    "20260624000001_quota_count_active_only.sql": "293ca08b75b1e94f9f0e38a8c92fd003fde4b0da1c23db644f555c6ba40dc2df",
+    "20260701000001_quota_exclude_pausing.sql": "c6a80b0f41bf8eda40bca266db6f15b270d32239a5d971618d0c17d00edb82f4",
+    "20260702000001_team_home_region.sql": "f4406bb761870f2efd5f3c00ab145e34d5b59320170926a6cea5f3986b9f9e45",
+    "20260705000001_sandbox_auto_delete.sql": "11ebc26015500a83997c551a9cc6461b15d547cb26588da58a7010cc418dcc48",
+    "20260705000002_snapshot_fk_on_delete_set_null.sql": "0c6d65cb681b9d2d7da954069733cfd3979ec18287a77b98bf838852695f210d",
+    "20260710000001_raise_template_size_limits.sql": "b6b903867e444739324bb4b67a1cf047b0048f0713695ad2f9e3178b5f36f085",
+    "20260710000002_enable_tenant_usage_dashboard.sql": "1d1172c20b4e0e4497dbca8e340ac49c80b6d04fe8f416f8ab66fdb6a956f1fc",
+    "20260713000001_billing_period_credit_application.sql": "bf8914d58317a373dd90e10d6a36d424f716e8a7d4ef048399ca5e1a6ec7e1df",
+    "20260720000001_raise_template_size_ceilings.sql": "bf1e67f22f9bbfc18a92b5c35752430edc5c1f09920f278108a2accbac5ded2c",
+    "20260722000001_quota_sharded_counter.sql": "57e2087c2390ec37cbeeb778bf60e11db9cd62b5fb55f5d1cee1db667753f77c",
+    "20260727000001_preview_port_publication.sql": "f2a4b0a36ce44f83fb492ed3724446b7cfa349003436604428076c6c09c82f42",
+    "20260727000002_preview_port_access_policy.sql": "e61aa0c9f2f82be599f277ff269e4cf1aa2f7b685c3a7be745cde2ab3006aee9",
+    "20260727000003_preview_port_token_generation.sql": "ce07082d088e939ae85a64255491d4cfc2fccd88376a4547e743d802df0e7143",
+    "20260730000001_platform_billing_read.sql": "c3d512450df9457adf59c3da1bfe2cee0bced25b3e4ea0f50b830d86d1ebd46d",
+    "20260730000002_grafana_readonly_role.sql": "10cb7a7949b18bccb9d6f31e9f14b78604fa0321026256044703342ca0b404f1",
+    "20260731000001_grafana_overview_views.sql": "f375f210bad0bc8405fb6508b04eb6db980ff11f1f2ca753c720ba6b654a08c6",
+    "20260731000002_artifact_manifest.sql": "a92b1b709616e8dd0390fa95496b56872a1f9664f51a121eebcb729bcfeb5260",
+    "20260731000004_snapshot_generations.sql": "fec3c2119a830a454822782904ef0f1b195fb6141d56c9b69badfe301aba3f3d",
+    "20260731000005_sandbox_base_path_index.sql": "b6207874fd14d2286ce6b813965fa84b0e1ac1733d6949b78714b1f2e7c6d75b",
+    "20260731000006_grafana_rank_views_time_range.sql": "78528c1bc2a9c31ab927f11d605c0f1a730d3aae9077b7f33960c8e4f03e0691",
+    "20260801000001_quota_shard_width.sql": "3e86e9c6253238f9a668a3137aa45d6e4e450ff73a041611e85cb9eaa19d998f",
+    "20260804000001_billing_request_now.sql": "16cb1920ad1d46106078b795d540e6d44675819886c74fa5424c6cfe3e03c9a9",
+    "20260812000001_grafana_live_and_failure_views.sql": "f0207d03939e3ce5d0acd5beffd18de95a1b669a2b53b73eddc52beffb699a0a",
+    "20260812000002_backup_generation.sql": "44a4004bbdf7b576f4f10a330a37cb85503691ca2d1fad5034debd2495b98b01",
+    "20260813000001_billing_exporting_state.sql": "292c12335928dba91e33513c95a3ea9695e366c768d988ddea9e26501258f256",
+    "20260813000003_platform_billing_read_and_stripe_tables.sql": "a7ddf1e5350ae49a09cdeaa2b024f2ea732f147b8af417314ec76ad9a5accd34",
+    "20260813000004_billing_stripe_correctness.sql": "1e80cfbdb279de4b894384e01886eb354c4c8a6d06e1b1fd6c318f2db9b2ddee",
+    "20260813000005_billing_storage_flag_seed.sql": "9c22363c2ec0038afb1de6d32fbf2773c34ced0cc72ec0b7fc663899e0347ce9",
+    "20260813000006_billing_subscription_event_ordering.sql": "11c37b939cc188e1994254d2b92f07e56a426b2bd86f67e885c343c4f2d7ab19",
+    "20260816000001_sandbox_host_reconcile_covering_index.sql": "b97baf69a186a678cb62cdb801aa8f7da61fe9cb24574de5a75427202e17e666",
+    "20260817000001_sandbox_team_created_at_index.sql": "54c18d8c1eab91389fe55d765d7d30486717379d316885371d310c94eb3924aa",
+    "20260817000002_billing_export_skipped_disabled.sql": "a2c25924081cd3b9e8ef4a7789f8ad50f85ada1a4a4be4f1987e037c67abd602",
+    "20260817000003_billing_export_idempotency_key.sql": "7a3e54830654cb7035347f80ba9985ea3cbc70f2340065e2ad43d31a1e91070a",
+    "20260818000001_billing_trial_eligibility.sql": "da762dc5fb8fb628e527f1ec933260e2d5d7de086a9682d7040d94643869f928",
+    "20260818000002_stripe_activation_credit.sql": "5247cbbdb8505581b7578ca25ea58c159ff1c76bddeb7fdf2397522ecf18da58",
+    "20260819000001_sandbox_secrets_bound_marker.sql": "5a55ce3db3b12b9535a438412c6fe4bef5249bd9f8dbe3bafb624a6e13f1072d",
+    "20260819000002_host_provisioning_status.sql": "f498f4a8f2ba4c27eb525d562562750a916c2ccefac6e90e2feb2b6496e163e7",
+    "20260819000003_host_identity_bound.sql": "c838ee6cb4be58474239983de861dbe53ee10c86dc61e07b7851351afc0cfec8",
+    "20260820000001_backup_generation_covered_snapshot.sql": "ccf92491afced8f886e707747b826a8a903290fca482af556be1229f74b65d51",
+    "20260820000002_telemetry_sampler_lease.sql": "d1060a9fd57114acc423ed6af2c664ad84efeb3fdab5e9da16d6e13fee0b0b6f",
+    "20260825000001_artifact_allocated_bytes.sql": "b9c5c714f6c1b200f4f03c965c9e95529e06726f3421f5fd1fd70f7644eac39b",
+    "20260825000002_storage_measurement_constraints.sql": "71ede641cc3c4557a4d2762a0724da00dd446d6da4783337b3a1b1e1089e6ca7",
+    "20260825000003_artifact_manifest_template_path.sql": "6f84c3bf329b112913184fc8b2d2ec13fc1f3fe7a573dc6eb263b522856b1087",
+    "20260825000004_backfill_template_artifact_manifests.sql": "b3379175b4490733bc31685be9466a36e2b650ec6a4518329719105a59bb6bfb",
+    "20260825000005_sandbox_storage_interval_lookup_index.sql": "07f8ede9b17a27cdeeeee6b6a268879035b8b577069b022ee35c530a7d3f959d",
+    "20260826000001_abuse_control_plane.sql": "09f276468242b5d56fab5fffa9d8a0cc11753fc2320378dbdfc18a2e8f5a8c6c",
+    "20260826000002_host_pressure.sql": "3bb71adaffedd6150c0907f4f948f7bd117d91b9a729e90a1790cc023588d5d4",
+    "20260827000001_billing_commercial_anchor.sql": "d3c36a90345499e3fb0bddae68b54f4e985f662e1845dbc8063f4f89670ea8af",
+    "20260827000002_billing_trial_eligibility_cumulative.sql": "650c79ca0955356d5e6a774a1783621869aac5d58cce03b8e718a29fed0091bf",
+    "20260903000001_billing_trial_balance.sql": "f7812dad7cb799ab44fb84d30015efa7d631904f846210b3827b007fc5bd838c",
+    "20260909000001_sandbox_secret_env_marker.sql": "623f70c2f594fd18178e2fcdda5a2c0db22480c6135db34864534034467e8884",
+    "20260910000001_sandbox_pause_operation.sql": "de384599e38c13c27cdc06db8795783676f806274cb2f80fe8b6c6f509b7af0d",
+    "20260914000001_host_peer_generation.sql": "6d10c3403955a0d782f7c1e84193c0d5bcc41c493abbbabda3b6a1cd2754d760",
+    "20260915000001_sandbox_migrating_status.sql": "281df5e9b8164d3b66b94d053d5c4735077bc8aa965d6f088499ea2fbfe7edba",
+    "20260915000002_quota_exclude_migrating.sql": "516b95eb5d641e7c3f9f6d6fef868b0aca1dd895b89baa284e41ec414f6a7555",
+    "20260916000001_sandbox_teardown.sql": "2b0ba84ac9f7b22baa8c6460755ecefe5119d9d723becb1b536f498b78ca7304",
+    "20260919000001_raise_template_disk_ceiling.sql": "7c97a82a11d8b873c248d53146785eec80729155fda8259f313dfa49fcb59691",
+    "20260919000002_incremental_billing_events.sql": "e259b952ffb59223c51af05aa0a2fb5877ab77b6dd1e4c6fc3c9db5a8218d0c3",
+    "20260919000003_independent_billing_reconciliation.sql": "a1871bd59cdc6a29a5f15f3ab598cc2492b31a995ed9dc995eacba1f4b655d31",
+    "20260919000004_billing_usage_corrections.sql": "59b40b0900b50ff61ba94f48b5af4307c4734e839550d007182fe41f1ea8f580",
+    "20260919000005_billing_export_expiry.sql": "1efa9d7eafb1631cd31a42eb6e591c387993280372a40db1d284aeb3516872d9",
+    "20260919000006_billing_measurement_cursors.sql": "a1722fb820fe8f9a3799005b6b519a7457782a734b6ae83b611139618c9977db",
+    "20260919000007_billing_accounting_cursors.sql": "fe0f6f43bb973955efec88b4a0a1a55dbdbc5a9473c81789d9da6af12890a216",
+    "20260921152100_billing_export_review_fixes.sql": "876d81460b3e82da44cd7f0ff2a97f24d89872264ec92ff96db518630053ad4f",
+    "20260921190000_billing_export_enabled_by_default.sql": "2c5b986c221125df74728a100d759e99cc7cb992e05dbe01cbd2b570cfb57661",
+    "20260922000001_backup_generation_covered_index.sql": "3e87d9eee58890b51fe40d656fbbeae224f6a4517b8be1a95bbf783c99e7e311",
+    "20260923000001_trial_credit_warning.sql": "fdf0e42a5c438ed7a71be7bc691ba2db5d8ae4ba150e184260377c9a20f89bff",
+    "20260923000002_trial_credit_warning_state_indexes.sql": "6c191ba5ce93b4e90845eb2f29629b5d8450778e847497b39effe37b1a56c69f",
+    "20260923000003_trial_credit_warning_recipients.sql": "02084e418f160429847af3a066cb3cb4b297d8547c0a85cc091ac4b16f893ea2",
+    "20260923000004_trial_credit_warning_rejections.sql": "46d1f3e6bbe29ec60825ab0b1dbaf01b819f55dbf8ab8148184ac6d3746d4c0d",
+    "20260923000005_trial_balance_corrections.sql": "4b8c664cb6d63fc2196dde383decb707513a2e6cd988f25a7f7094a837c81a0c",
+    "20260923000006_trial_credit_warning_lifecycle.sql": "41b8407b1ca1f1bcd8fa96bfb5be663787a4e1fab64e64caf9df6ab7a7b48412",
+    "20260923000007_billing_trial_balance.sql": "0574a3b74df1fe884c8d579dd695445f5eb67f31c6da4f1e73086c67d9f13401",
+    "20260923000008_trial_runway.sql": "dafe5077f4235dcbc883c6ad451bbd251f0250c8e04f6b488725cf3115204d2a",
+    "20260923000009_log_retention.sql": "c4f3bc77d1910f9fb6c8f86dbf31feae6cbae65084b65bf914f808869e8ee506",
+    "20260923000010_sandbox_proxy_router.sql": "56df0dc6d2e22200c74c2715fefd84617fc7c8dd3e57e06466cc3adfc166d471",
+    "20260923000011_stripe_activation_reconciliation.sql": "69c303588c2adc59813c09c6d2597b21439ba13fc43f281ee0dc3dbdeeddc9ad",
+    "20260924000001_sandbox_snapshot.sql": "4c832e2b51bfb88f5a738c96ec134e57dfdd89b15b9d361f4740b87578e128f4",
+    "20260924000002_sandbox_source_snapshot_fk_validate.sql": "74a1f24375afa3d1d6037f2505334cb36521f4e758f610990056d038f37b093e",
+    "20260924000003_host_storage_reports.sql": "bc6b636c8f845b0761672f0152e6758a5f02dca64e4ac9253bd57bbafbc72c45",
+    "20260924000004_storage_report_completeness_gate.sql": "34190f0f2c286e224c978a815b4e2dcebb3a4451ecc3f3fa2b763237c274fcd0",
+    "20260924000005_legacy_host_storage_reports.sql": "a969918345a0ec3ab94c5fa1abf232bfafc8f5c0e1488300035a614edeccfe6c",
+    "20260924000006_storage_report_completeness_resolution.sql": "1040f684de82d24170fa4a647764d22456cc71760d261a927e282d56259050ee",
+    "20260924000007_retry_exhausted_storage_reports.sql": "39ee6e6fe47bf72a7fd749fbdca8cae213df9f38561dadaa3c6244c889bd153d",
+    "20260924000008_retry_exhausted_storage_report_index.sql": "18e4d3db84c609966a3b0ace17b8ca0e497f9ad315086dc19dfab69acb744f0f",
+    "20260924000009_storage_report_payload_compaction.sql": "2451105a1bae3a128e7cb5ba25f4264933665e9e9f99b87a50fcb0506a29f115",
+    "20260924000010_storage_deletion_fence.sql": "a0e8eee0a73ea857f496b304576c4dd6d1e1569273adefd4b0203f93d7d090d7",
+    "20260924000011_storage_report_processing_generation.sql": "210ec121220155642c4753d9368ba921bd9037bd5ab377f197949b6817b41a0d",
+    "20260924000012_sandbox_compute_pause_candidates.sql": "350bc2f9136499f7760d2aa67d9f172d9488705fc731b14a1463c6c8a3140613",
+    "20260924000013_template_build_input.sql": "815b0d85ad35c697c01d45225059da61c0efe32560c8a521488b17e839963577",
+    "20260924000014_template_build_execution.sql": "0f4ee69e022d71c9ba92f26b228e700ba2c137ccac4f3b72f6fed32a31dcfa44",
+    "20260925000001_backup_generation_purge.sql": "b2170aea17eb56bbe6d4b2eebf7222c4b240b041e327fd25057fc9a4ed87df9a",
+    "20260925000002_backup_purge_indexes.sql": "7b50e05474697d2fd5bbb2cf69b78d12ce60defc5b967e96f070074ab7ea67b4",
+    "20260925000003_backup_walk.sql": "259dbfc51fb7e370ff6c269335787ef860301d155889acb01d73611fd6aa428c",
+    "20260925000004_sandbox_snapshot_sweep.sql": "e19fb0c4ed29cd736d8e0a57f36886394c0a24efde7c57d64a51f1d0b0b42eff",
+    "20260925195213_promotion_redemption_limits.sql": "5e5ac865368c2c7942114c9aae8389e5940434af79d5e671dac4f312065eb3b8",
+    "20260925195235_canonical_promotion_identity.sql": "602169e25fa4500b3016d403414a9b8d757623d1b35760d204d8c8472cb398b8",
+    "20260925195248_canonical_stripe_promotion_fences.sql": "01339ddc09916b2ef11570a3d2bf550f9d97049951f75c3de195e2184f7047cc",
+    "20260926000001_sandbox_secret_detached.sql": "6d9c7edddf2f3225edcbd0aa9b31232d04c05571184839b4b5bd5685fbb3229e",
+    "20260927000001_stripe_checkout_association_alerts.sql": "879c3f259c88ddfdc877feb16661a147eec716a895c047bf2453a4aa14696990",
+    "20260927000002_stripe_checkout_association_discovery.sql": "74323effb8a294859e4bdeebd5ff3ddf589f1e06b1cada05f08786c433d06252",
+    "20260927000003_stripe_checkout_expiration_evidence.sql": "bf7f896aa559ecb98ca9097f5872036be33c2430b30bf5bf09ca15a3dc999cbc",
+    "20260927000004_stripe_checkout_retained_expiration_lookup.sql": "9c05a522a3b12ff05bb008d79a2abb761e329a6852d5f197beb49224e05422a5",
+    "20260927000005_stripe_checkout_association_retirement.sql": "f0e7018b774ba28ff4d5660c2546b230ee48e52a220522faeabfab9be0563c74",
+    "20260927003551_regional_promotion_device_authority.sql": "19bb50d50fd6e848a16bc8e1ab1e66cb431588e2d91f5cfd31d6d9dc2cb4c579",
+    "20260927003604_fence_pending_stripe_device_reservations.sql": "fc5f3236363ba6e3d20360e8f6f9e3b9e40b2f2d05f85f6c6694a32c6d4bd02a",
+    "20260927003605_serialize_device_reservation_replay.sql": "e9ae08ea0bd34da20ad0128f6da4569c0256ff7495c9c3720992cb275de4bc62",
+    "20260927003607_complete_denied_signup_device_claim.sql": "4d0d95d8abe7ce20841ebff580e3951f9016a9b251c98a2331cc71ee084185cf",
+    "20260927003608_resolve_late_signup_device_evidence.sql": "92597baa9bba029c732a6652fe979eb359e7457b08b0a4f3db72355b70022a3d",
+    "20260927003610_atomic_stripe_device_decision.sql": "c16495ec88c43b301c513c245186e44c769fa0e9487873a5a39ac4173f935a95",
+    "20260927003611_serialize_signup_device_claim.sql": "37590a174e2f4f5f0f0bbb8cd505d19ffed0775a04e08abc8dab439339aa7b9b",
+    "20260927003612_fence_legacy_stripe_device_reservations.sql": "191f84478255f1371d563ab6c7a01d028a6cfec1f26608c0fd717e617dfb7d17",
+    "20260928035934_retain_stripe_promotion_device_attribution.sql": "284d74f6d8d11195d461a8352544e7672e97c464c09524c54376e094c41981f8",
+    "20260928043551_attribute_stripe_device_consumption_to_grant_actor.sql": "911b6ffa025a36fc2456a5dbca1593a3b21ee66231e7353e96c9082aed5f98f3",
+    "20260928120000_stripe_activation_credit_revocation.sql": "cdfc90b5746b98f4d4256ace795b4dcf7bdf555d54ebfd9db36a68c1ba5dc9ae",
+    "20260928220233_stripe_activation_revocation_redemption_guards.sql": "7179ff976cb72e68ba7d407957920ae0fc9e77125af49b825367ebbdf1776c60",
+    "20260928232900_billing_observation_meter_identity.sql": "04ba4e8115b6b5154f56f7fd4dbc8b40b3c0717d84260dce61b1df6e87fcf33e",
+    "20260928233000_billing_close_reconciliation.sql": "1b5496496ad88fa57dfcf029dda2b634c6daf3c0dee3816f24df5d2e076327a2",
+    "20260929000001_prospective_storage_billing.sql": "68f223647887692f7def74cfb4c84f9a9e0dcae19fdcc2ff468d15947e2eb4d1",
+    "20260929130000_backup_generation_snapshot_owner.sql": "ceb0be0f7b936068c445602115d253b98a4ec2b7a34579e5d3482352af0ec0fe",
+    "20260929203606_enforce_promotion_device_grants.sql": "3886caa39009e72fabdd6ee2292ff18c3be5d4b2ac7656605d9e9a1aa63e97e7",
+    "20260929203621_stripe_promotion_outcome.sql": "3c57f750caf9003e12291c1884281286b5e8adce788815369f4639fccbc69ca4",
+    "20260929203623_settled_promotion_paid_activation.sql": "7ea99e740310ae26c2dbcc6f5ebb2c9518484f4125cf7f8b9931dce34af60d2a",
+    "20260929203624_trusted_team_promotion_attempt.sql": "b3318e50991a03ab2801def8ac5c9ca861b9bd720e4c8cf5c075a104c56be46f",
+    "20260929203625_distinguish_stripe_redemption_denials.sql": "701ce5c008e4f33138f020eff600f14eafa85cc8ea6da67496f1966550d25f0d",
+    "20260929203627_retain_legacy_stripe_device_consumption.sql": "02c02d1aee3bfa6214fc46d6a14db3b06f35b36bc20abd12aae46f01913f75ad",
+    "20260929203628_reconcile_stripe_device_reservation_guards.sql": "046eb8c9fb59e96935da63e394a90330f4206aa53e92eef6a1ab151c524695dc",
+    "20260930000001_promotion_review_fixes.sql": "e039fa518d34a8d12a2a65411a7f4637bf91959fbeb705e30ccc01cdb9c25d8c",
+    "20260930000002_durable_team_creation_recovery.sql": "04454b019468a72aab99be688900d0033601e0e504869ae197dbbbf914bb22d9",
+    "20260930000003_billing_bucket_precision.sql": "a41dd6c9894c2136eef668b0b41d9754570a7eb960325ee837d72ab2057e3ee2",
+    "20260930000004_team_creation_requests.sql": "8e07d42702dd85f53997ec7a6b96f5e34485c0749ba5a668de002d2aea450951",
+    "20260930000005_team_creation_signup_policy.sql": "197eb0fc94075b7a32dd3a729ec3c20078c31fcf39cf3f4b6f0cde37b5047a17",
+    "20261001202849_sandbox_routing_revocations.sql": "d764bd3b7fac2022a033e28365c8e225d658a22760766758d769a0f14292a107",
+    "20261001203744_billing_invoice_cent_reconciliation.sql": "94dd43c9fe3e551d0eb22f64390da2cc5b4f727cbc89cdd5ed1817ef67dba2bc",
+    "20261001212145_automatic_invoice_enrollment.sql": "7f666b52d8c0d05820a99f17d8d5cbef7c8731a48cbd95057619b040735971bc",
+    "20261002000132_checkout_publication_decision.sql": "b05e6c956acb668ddc6598defb291410de484cb1df4c6a1535099b1decbc1463",
+    "20261002000201_checkout_publication_reservation_fence.sql": "306144b30d394221d5f4ca9ada70aeba4f121ba250e75770c1eea24664c8ae47",
+    "20261003010001_retained_physical_storage_intervals.sql": "d1bd98b639161001fa5e2b9cf2550b6513efa35eec68fa43089d949f3da70a35",
+    "20261003010002_fence_retained_storage_owner_creation.sql": "a932cc54de3aa43f7ed86bf8c61d6fa3ac6f5703ac803760bc51d4c70b972b75",
+    "20261003010003_retain_storage_review_fixes.sql": "224062338e495dbe7c63c28871669f87f8098a350dd62a8e7b88491ae4b91f72",
+    "20261003010004_mark_pending_retained_storage_owners.sql": "adb0cce31d5fd4bb5dd19b84e44699779a9c59a443710d017a10e87409ed2bf7",
+    "20261003010005_close_failed_snapshot_retained_storage.sql": "b2f6da691a5b7601e3bcfea5f4eb4a9bdd05694f8fca3af373aa73110cebc9d0",
+    "20261003010006_unify_payable_retained_storage.sql": "28fd22ff8b85ef16a5d4c0d27323fcfb3d866902ef04fb1a99070f2828fc79ca",
+    "20261003010007_scope_legacy_artifact_union_by_host.sql": "4f60ec7d210cc562d650c014a6cdd327fc15711657dca79a852a2af133128886",
+    "20261003010008_preserve_snapshot_retention_boundary.sql": "5dc115d40fb826d79c0c61bb0b113855ba6c4fecb9d8dd500136ef833aa128cc",
+    "20261003010009_fence_failed_snapshot_storage_reports.sql": "f274ec9b764aebedb92f7b7b42382a09f4529dff9c1073342e4bf38034b7d643",
+    "20261003010010_preserve_legacy_union_before_cutover.sql": "2b26e150779f09b647a40f862bc8691a77a347fa099fa5ff2aaae524df944539",
+    "20261003010011_reconcile_legacy_retained_union.sql": "d43200d2a48bfdc141d0943e827091e6fcde2cd497ba86bf936cac2615e3d39b",
+    "20261003010012_bind_legacy_baseline_to_persisted_generation.sql": "7c1e120760d126ad791fe28a286ca458e8c157c998d6f073a38e8d87920dc569",
+    "20261003010013_persist_retained_baseline_provenance.sql": "e5adcc1f492410c24bce71a69d249a0d6748e878b1c0718fcfe2bb53eefe942e",
+    "20261003010014_retained_measurement_obligations.sql": "58504b09581b1fe6753ddaea2a3d17b3459137f7a8739b6359092c49fa54415d",
+    "20261003010015_fence_unresolved_retained_measurements.sql": "728267138b1c0a55d687357aef5f8f761dc363f3f94531f1195d512ba840af61",
+    "20261003010016_unbilled_initial_retained_gap.sql": "fb3f5eb5524880275e6c4e0bae023d597e15df3c7b71837895353aa84e88768a",
+    "20261003010017_team_migration_identity.sql": "8d3ea25443fa7d9a051db29d0cf07f1776ed80cd1e064aab513255dcb5d6816e",
+    "20261003010018_guard_unknown_storage_export_cache.sql": "4cf0eefe6076f6907ba5d6700902eca78621f9c33b76f5b561d23969ed192f7d",
+    "20261003010019_fail_closed_trial_eligibility.sql": "fdb2d65015ce4426eb9ee6bf4dff8bffed4b85587dd8936d16b7d952fbd7b3ed",
+    "20261003010020_close_snapshot_obligations_on_failure.sql": "38936cf45e3ce780240b44b25584ae454e16af38019ca3f50e536bc5ad33b6c1",
+    "20261003010021_nonblocking_retained_owner_fence.sql": "6e8d4575dfb56735da9399eb002f86620b1992545d8aff9f2ff68d5b43282679",
+    "20261003010022_reconcile_retained_delta_upgrade.sql": "daf4921bc390a0670c267e78490eeee1d66cbf1de3d7d4b46070f2a19395bbcd",
+    "20261003010023_seed_known_full_copy_baselines.sql": "bede369fa70c347a15820b05d66613261eb4464cb7dcfbfd6ee987fffe9ff050",
+    "20261003010024_fence_retained_owner_lifetimes.sql": "7f5bf0c109749539834fbb416072811ccb9f4a450ed3e031ba9a908603b92d39"
+  }
+}

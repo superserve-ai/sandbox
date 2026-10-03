@@ -10,6 +10,12 @@ import time
 
 RECOVERY_PATHS = {
     "scripts/migrate_database.py",
+    "scripts/retained_storage_recovery.py",
+    "scripts/recovery_evidence.py",
+    "scripts/migration-requirements.txt",
+    "scripts/test_migration_recovery.py",
+    "scripts/test_recovery_evidence.py",
+    ".github/workflows/recovery-evidence.yml",
     ".github/workflows/cd.yml",
     ".github/workflows/deploy-api.yml",
     ".github/workflows/deploy-proxy.yml",
@@ -34,7 +40,7 @@ def recovery_hold(before, revision, event, *, run=subprocess.run):
         if result.returncode:
             return True
         return any(path in RECOVERY_PATHS or path.startswith(
-            ("supabase/shared-auth-history/", "supabase/shared-auth-migrations/"))
+            ("supabase/shared-auth-history/", "supabase/shared-auth-migrations/", "supabase/recovery/"))
             for path in result.stdout.split("\0"))
     except (OSError, subprocess.TimeoutExpired):
         return True
@@ -126,8 +132,12 @@ def wait_for_migration_baseline(repository, revision, event, *, attempts=60, int
                         {job["name"] for job in jobs["jobs"] if job["conclusion"] == "success"})
 
             def read_only(names):
-                return (names <= {"Verify migration release", "Preflight Staging", "Preflight Production"}
-                        and "Preflight Staging" in names)
+                return any(names <= pair | {"Verify migration release"}
+                           and any(name.endswith("Staging") for name in names & pair)
+                           for pair in (
+                               {"Preflight Staging", "Preflight Production"},
+                               {"Recovery Preflight Staging", "Recovery Preflight Production"},
+                           ))
 
             # Older runs can be rerun after newer ones. Classify named read-only
             # preflights before waiting on potentially mutating attempts.
@@ -142,8 +152,9 @@ def wait_for_migration_baseline(repository, revision, event, *, attempts=60, int
                     names, success = job_sets(item)
                     if read_only(names):
                         continue
-                    if (item["conclusion"] != "success"
-                            or not {"Migrate Staging", "Migrate Production"} <= success):
+                    if (item["conclusion"] != "success" or not any(pair <= success for pair in (
+                            {"Migrate Staging", "Migrate Production"},
+                            {"Recover Staging", "Recover Production"}))):
                         return False
                     baseline = item["head_sha"]
                     break

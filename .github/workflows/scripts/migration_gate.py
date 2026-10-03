@@ -58,11 +58,14 @@ def select_action(env):
         if api(repository, "git/ref/heads/main")["object"]["sha"] != revision:
             raise GateError("Main advanced; migration release must be re-evaluated")
         requested = env.get("MIGRATION_ACTION")
-        if requested not in ("preflight", "migrate") or env.get("MIGRATION_ENVIRONMENT") not in ("staging", "production"):
+        if requested not in ("preflight", "migrate", "recovery-preflight", "recover") or env.get("MIGRATION_ENVIRONMENT") not in ("staging", "production"):
             raise GateError("Select an explicit supported migration action and environment")
-        action = "preflight" if requested == "preflight" else "push"
+        action = "push" if requested == "migrate" else requested
         production = env["MIGRATION_ENVIRONMENT"] == "production"
-        if action == "push":
+        if production and action in ("recovery-preflight", "recover"):
+            if not re.fullmatch(r"[1-9][0-9]*", env.get("RECOVERY_EVIDENCE_RUN_ID", "")):
+                raise GateError("Recovery requires an authenticated evidence collection run")
+        if action in ("push", "recover"):
             run_id = env.get("PREFLIGHT_RUN_ID", "")
             if not re.fullmatch(r"[1-9][0-9]*", run_id):
                 raise GateError("Migration requires a successful same-revision preflight run")
@@ -72,7 +75,8 @@ def select_action(env):
                     or run.get("conclusion") != "success" or run.get("path") != ".github/workflows/cd.yml"):
                 raise GateError("Preflight run does not establish this revision's prerequisites")
             jobs = api(repository, f"actions/runs/{run_id}/jobs?filter=latest&per_page=100")
-            required = {"Preflight Staging", "Preflight Production"} if production else {"Preflight Staging"}
+            prefix = "Recovery Preflight" if action == "recover" else "Preflight"
+            required = {prefix + " Staging", prefix + " Production"} if production else {prefix + " Staging"}
             successful = {job.get("name") for job in jobs["jobs"] if job.get("conclusion") == "success"}
             if not required <= successful:
                 raise GateError("Preflight did not verify every requested environment")
