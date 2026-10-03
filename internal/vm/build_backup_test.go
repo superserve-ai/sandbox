@@ -598,3 +598,36 @@ func TestReconcileInFlightKeyIsTemplateScoped(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// The template sweep is what re-offers a build's generation every pass.
+// A generation whose objects cannot be vouched for abandons on every
+// attempt, so the sweep must stop offering it — and must say the work is
+// accounted for, since a false here makes the caller retry immediately.
+func TestTemplateEnqueueDeclinesAnUnvouchableGeneration(t *testing.T) {
+	dir := t.TempDir()
+	writeBuildFixture(t, dir)
+
+	var tasks []backup.Task
+	m := &Manager{}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		tasks = append(tasks, task)
+		return nil
+	})
+	unvouchable := false
+	m.SetBackupUnvouchable(func(backup.Task) (bool, error) { return unvouchable, nil })
+
+	// Vouchable: the generation is enqueued as usual.
+	m.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", nil, zerolog.Nop())
+	if len(tasks) != 1 {
+		t.Fatalf("enqueued %d tasks, want the generation queued", len(tasks))
+	}
+
+	// Marked: offered no more, and reported as accounted for.
+	unvouchable = true
+	second := t.TempDir()
+	writeBuildFixture(t, second)
+	m.backupBuildArtifacts(context.Background(), "tpl2", "build-tpl2", second, "", nil, zerolog.Nop())
+	if len(tasks) != 1 {
+		t.Fatalf("enqueued %d tasks, want the unvouchable generation declined", len(tasks))
+	}
+}

@@ -1202,9 +1202,10 @@ func main() {
 		if workers < 1 {
 			workers = 1
 		}
+		store := backup.NewGCSStore(gcsClient, bucket)
 		uploader := &backup.Uploader{
 			Journal:     journal,
-			Store:       backup.NewGCSStore(gcsClient, bucket),
+			Store:       store,
 			Limiter:     rate.NewLimiter(bytesPerSec, 32<<20),
 			Concurrency: workers,
 			Log:         log.With().Str("component", "backup").Logger(),
@@ -1382,6 +1383,13 @@ func main() {
 			// Coverage is per bucket: a completed generation elsewhere
 			// must not suppress uploading into this one.
 			return journal.Covered(bucket, t)
+		})
+		// A generation whose objects nothing here can vouch for completes
+		// for nobody. The template sweep uses this to stop re-offering one
+		// rather than abandoning an upload on every pass; scoped per
+		// bucket for the same reason coverage is.
+		mgr.SetBackupUnvouchable(func(t backup.Task) (bool, error) {
+			return journal.Unvouchable(store.Identity(), t, time.Now())
 		})
 		// Verified generations report back to the control plane so backup
 		// coverage is a DB query. Rides the uploader's durable outbox:

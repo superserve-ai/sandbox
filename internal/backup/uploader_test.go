@@ -778,7 +778,7 @@ func TestUploaderRefreshesVerificationOnRepeatedDedupe(t *testing.T) {
 	}
 	overlayObj := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4")
 	key := store.Identity() + "\x00" + overlayObj
-	if ok, err := j.WasVerified(key, fake); err != nil || !ok {
+	if ok, err := j.WasVerified(key); err != nil || !ok {
 		t.Fatalf("WasVerified immediately after first upload = %v (err %v), want valid", ok, err)
 	}
 
@@ -826,7 +826,7 @@ func TestUploaderRefreshesVerificationOnRepeatedDedupe(t *testing.T) {
 
 	// Direct check: the record reads valid at a time that is only within
 	// retention when measured from the refresh, not the original write.
-	if ok, err := j.WasVerified(key, fake); err != nil || !ok {
+	if ok, err := j.WasVerified(key); err != nil || !ok {
 		t.Fatalf("WasVerified after refresh = %v (err %v), want valid", ok, err)
 	}
 }
@@ -1789,12 +1789,12 @@ func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
 	if store.creates[baseObject] != 1 {
 		t.Fatalf("base Create calls = %d, want exactly the deduped attempt", store.creates[baseObject])
 	}
-	ok, err := j.WasVerified("test-bucket\x00"+baseObject, time.Now())
+	ok, err := j.WasVerified("test-bucket\x00" + baseObject)
 	if err != nil || !ok {
 		t.Fatalf("dedupe not recorded in verification history: ok=%v err=%v", ok, err)
 	}
 	// A different bucket's identity must not see this history.
-	other, err := j.WasVerified("other-bucket\x00"+baseObject, time.Now())
+	other, err := j.WasVerified("other-bucket\x00" + baseObject)
 	if err != nil || other {
 		t.Fatalf("verification history leaked across buckets: ok=%v err=%v", other, err)
 	}
@@ -1916,10 +1916,10 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	if err := j.MigrateVerificationScope("other-bucket"); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := j.WasVerified("other-bucket\x00"+object, time.Now()); err != nil || ok {
+	if ok, err := j.WasVerified("other-bucket\x00" + object); err != nil || ok {
 		t.Fatalf("bucket change saw migrated history: ok=%v err=%v", ok, err)
 	}
-	if ok, err := j.WasVerified(store.Identity()+"\x00"+object, time.Now()); err != nil || !ok {
+	if ok, err := j.WasVerified(store.Identity() + "\x00" + object); err != nil || !ok {
 		t.Fatalf("migrated record lost: ok=%v err=%v", ok, err)
 	}
 }
@@ -2530,7 +2530,7 @@ func TestUploadRetriesExhaustedAbandons(t *testing.T) {
 	if _, err := os.Stat(staged); !os.IsNotExist(err) {
 		t.Fatalf("staged dir still present (err %v), want removed on exhaustion", err)
 	}
-	if verified, err := j.WasVerified("gen-stuck", time.Unix(10, 0)); err != nil || verified {
+	if verified, err := j.WasVerified("gen-stuck"); err != nil || verified {
 		t.Fatalf("WasVerified = %v (err %v), want no completion recorded", verified, err)
 	}
 }
