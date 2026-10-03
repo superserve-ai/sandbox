@@ -92,7 +92,8 @@ on:
 # build supervisor with the same specs. In-progress runs complete before
 # the next one starts (no cancel — partial seeds would be worse).
 concurrency:
-  group: seed-templates
+  # Auxiliary runs must not replace a pending seed deployment.
+  group: ${{ github.event_name == 'workflow_dispatch' && (inputs.smoke_preflight || inputs.receiver_diagnostic || inputs.rollup_diagnostic || inputs.rollup_pause) && format('seed-auxiliary-{0}', github.run_id) || 'seed-templates' }}
   cancel-in-progress: false
 
 jobs:
