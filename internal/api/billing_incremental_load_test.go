@@ -595,6 +595,20 @@ func (s *olderPeriodFailureStripe) CountedMeterUsage(ctx context.Context, event,
 	return s.openPeriodStripe.CountedMeterUsage(ctx, event, customer, start, end)
 }
 
+// currentOpenPeriodClock returns a test clock and the start of the month it
+// falls in. The exporter declines a zero-length observation window, so during
+// the first hour of a month a clock truncated to the hour would sit exactly on
+// the open period's start and nothing would be exported. Hold the clock an hour
+// into the period so these cases always have elapsed usage to export.
+func currentOpenPeriodClock() (now, current time.Time) {
+	now = time.Now().UTC().Truncate(time.Hour)
+	current = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if !now.After(current) {
+		now = current.Add(time.Hour)
+	}
+	return now, current
+}
+
 func testOlderPeriodFailure(t *testing.T, pool *pgxpool.Pool, recovery bool) {
 	ctx := t.Context()
 	exec := func(sql string, args ...any) {
@@ -603,8 +617,7 @@ func testOlderPeriodFailure(t *testing.T, pool *pgxpool.Pool, recovery bool) {
 			t.Fatal(err)
 		}
 	}
-	now := time.Now().UTC().Truncate(time.Hour)
-	current := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	now, current := currentOpenPeriodClock()
 	anchor := current.AddDate(0, -1, 0)
 	provider := &olderPeriodFailureStripe{failedStart: anchor, recovery: recovery, failure: errors.New("example summary unavailable")}
 	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
@@ -657,8 +670,7 @@ func testPeriodAttemptFairness(t *testing.T, pool *pgxpool.Pool) {
 			t.Fatal(err)
 		}
 	}
-	now := time.Now().UTC().Truncate(time.Hour)
-	current := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	now, current := currentOpenPeriodClock()
 	anchor := current.AddDate(0, -3, 0)
 	provider := &olderPeriodFailureStripe{failedStart: current.AddDate(0, -1, 0), failure: errors.New("example summary unavailable")}
 	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
