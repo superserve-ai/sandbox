@@ -26,6 +26,9 @@ jobs:
           python3 scripts/test_migration_execution.py
           python3 scripts/test_migration_recovery.py
           python3 scripts/test_recovery_evidence.py
+          python3 scripts/test_recovery_database_binding.py
+          python3 scripts/test_collect_recovery_evidence.py
+          python3 scripts/test_recovery_guest_probe.py
 
   unit-tests:
     name: Unit Tests

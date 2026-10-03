@@ -35,6 +35,12 @@ on:
       - 'scripts/migrate_database.py'
       - 'scripts/retained_storage_recovery.py'
       - 'scripts/recovery_evidence.py'
+      - 'scripts/collect_recovery_evidence.py'
+      - 'scripts/recovery_database_binding.py'
+      - 'scripts/recovery_guest_probe.py'
+      - 'scripts/test_collect_recovery_evidence.py'
+      - 'scripts/test_recovery_database_binding.py'
+      - 'scripts/test_recovery_guest_probe.py'
       - 'scripts/migration-requirements.txt'
       - 'scripts/test_recovery_evidence.py'
       - 'supabase/recovery/**'
@@ -115,7 +121,7 @@ jobs:
     name: ${{ needs.gate.outputs.action == 'recovery-preflight' && 'Recovery Preflight Production' || needs.gate.outputs.action == 'recover' && 'Recover Production' || needs.gate.outputs.action == 'preflight' && 'Preflight Production' || 'Migrate Production' }}
     if: needs.gate.outputs.production == 'true'
     needs: [gate, migrate-staging]
-    runs-on: ubuntu-latest
+    runs-on: ${{ (inputs.action == 'recover' || inputs.action == 'recovery-preflight') && vars.RECOVERY_OBSERVER_RUNNER || 'ubuntu-latest' }}
     environment: production
     permissions:
       contents: read
@@ -124,6 +130,7 @@ jobs:
     env:
       RECOVERY_RECEIPT_DIR: ${{ github.workspace }}/recovery-receipts
       RECOVERY_EVIDENCE_RUN_ID: ${{ inputs.recovery_evidence_run_id }}
+      RECOVERY_SSH_USER: ${{ vars.RECOVERY_SSH_USER }}
     steps:
       - uses: actions/checkout@v4
       - uses: supabase/setup-cli@v1

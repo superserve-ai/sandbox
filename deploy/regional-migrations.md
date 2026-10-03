@@ -113,62 +113,105 @@ source/history, journal holes, active retained accounting or queued retained
 payloads fail closed. Never delete an unrelated index or manually mark a
 migration applied.
 
-## Operational evidence prerequisite (currently blocked)
+## Receiver evidence and operational prerequisites
 
-The verifier is an artifact contract, not a collector or an access provisioner.
-This repository does not yet supply `.github/workflows/recovery-evidence.yml`.
-Consequently production recovery cannot pass its evidence gate until a separately
-reviewed collector and existing authenticated host-observation route are available.
-Do not replace that requirement with an operator-authored JSON assertion.
+`.github/workflows/recovery-evidence.yml` collects schema 2 evidence using
+`scripts/collect_recovery_evidence.py`. It is manual-only and requires the exact
+reviewed main revision and an explicit named-operator coordination acknowledgment.
+It publishes only `evidence.json` in `retained-recovery-evidence-usw2` on success.
+The verifier authenticates the GitHub run and artifact digest and rechecks the
+cloud inventory and guest processes before each recovery phase. Observations
+expire after 120 seconds; a refreshed collection can reuse a preflight receipt
+only when the verified writer state is identical. Collector timestamps/run IDs
+and ordinary connection churn are excluded from that identity. Effective report
+origins, process identities and DNS/routing are still freshly checked.
 
-The collector must run from the exact approved main revision, using
-`workflow_dispatch`, and publish the unique artifact
-`retained-recovery-evidence-usw2` containing only `evidence.json`. The verifier
-checks the authenticated GitHub run, artifact digest, plan/database identity,
-full cloud inventory and an observation at most 120 seconds old before each
-phase. Test fixtures in `scripts/test_recovery_evidence.py` illustrate the schema;
-they are synthetic data, not acceptable operational evidence.
+Schema 2 permits audited retained-capable guest publishers only when every
+possible receiver is proved incapable of accepting their retained reports and
+the separate empty-accounting database guards pass. Sampling need not be disabled
+and guest spools need not be empty for this policy. Schema 1's producer-exclusion
+checks remain available for existing artifacts; its stricter spool requirements
+do not substitute for schema 2's receiver proof.
 
-The existing deployment identity is selected by `GCP_WORKLOAD_IDENTITY_PROVIDER`
-and `GCP_SERVICE_ACCOUNT`. Reusing those secret references does not establish
-that the identity has the needed permissions. An operator must establish these
-specific prerequisites without changing live configuration as part of recovery:
+### Coordinated window
 
-- GitHub `contents:read` and `actions:read` for the exact run/artifact, plus OIDC
-  `id-token:write` to use the existing GCP workload identity.
-- Existing cloud permissions for service metadata, all service revisions, all
-  project VM instances, and complete revision-deletion audit logs. The relevant
-  reads are `run.services.get`, `run.revisions.list`, `compute.instances.list`
-  and `logging.logEntries.list`. The verifier uses `gh`, Cloud SDK and Python.
-- An already authenticated, non-provisioning route to read every relevant host's
-  process inventory, executable hashes, installed restart units/drop-ins and
-  effective configuration, process start/incarnation/destination, and all report
-  spools. Do not invoke deployment scripts or let SSH register keys or metadata.
-  Configuration evidence must be hashed/redacted without exporting secrets.
-- Authenticated binary-to-source provenance. API build image archives can be
-  digest-compared with the observed image. Existing VMD deployment builds upload
-  binaries without a retained provenance artifact; those installed binaries need
-  authenticated historical build evidence or a verified reproducible build.
+`coordinated_assumption` records an operational assumption, not an enforced lock.
+Before acknowledging it, the coordinator must obtain the named operator's explicit
+agreement to a finite no-change window covering both regions, all receiver paths,
+and the recovery target. The window starts before collection and remains in force
+until recovery succeeds or is aborted **and** its work and sessions have ended.
+It excludes API/worker deploys and rollbacks, guest executable/service/restart
+configuration changes, routes/DNS/proxies, database-secret rotations, retained
+activation, manual or alternate writers, and already queued or in-flight mutation
+automation. The collector checks active workflows on every branch, but that check
+and fresh inventory detect changes; they do not prevent them or replace the
+operator's acknowledgment. No default or synthetic acknowledgment is valid.
 
-Coverage includes serving, tagged, zero-traffic/background and draining revisions,
-all project instances including standby hosts, installed restart executables and
-alternate producers. Sidecars, command overrides, unaudited builds, automatic
-binary downloads or unfinished rollouts prevent admission. Recent revision deletion
-must be excluded through complete audit coverage spanning at least ten minutes
-before collection. The admitted source is pinned in the verifier and was audited
-for both retained production and persisted replay behavior. A newer build with
-retained-report production or replay capability does not satisfy this policy,
-even with sampling disabled. It requires a separately reviewed exclusion policy
-and complete fresh evidence; do not add a source revision based on deploy success.
+If this agreement is violated between observations, a newly capable API could
+acknowledge a retained report before an older worker discards its unknown payload,
+losing the publisher's acknowledged measurement. A capable worker could also
+create retained state during recovery. Short SQL lock timeouts and evidence expiry
+do not close that race. On any change, stop recovery and coordinate termination;
+then review the new state and collect fresh evidence and preflight as required.
 
-Sampling disabled is insufficient: publishers can replay persisted payloads.
-Inspect `.storage-report-queue`, `.storage-report-queue.v2` and
-`.storage-report-queue.migrating/state.json`, plus both database report queues.
-Require an independently coordinated deployment/configuration hold for the whole
-recovery. Observe effective runtime and restart sources; a source label or a
-configuration checkbox is not evidence. Missing access or provenance blocks
-operations and must be routed to the deployment owner; this change grants no IAM,
-creates no observer, provisions no SSH access and performs no production trial.
+### Access and provenance
+
+This implementation does not establish that live access exists. Missing access
+must be resolved separately by the deployment owner before an operational run.
+Neither collection nor recovery provisions keys, IAM, routes, or guest services.
+Do not dispatch either workflow merely to discover whether production access works.
+
+- The collector and production recovery jobs use `RECOVERY_OBSERVER_RUNNER`
+  (default `ubuntu-latest`) and `RECOVERY_SSH_USER`. They require an existing
+  `~/.ssh/google_compute_engine` identity and verified `~/.ssh/known_hosts` entries
+  for aliases `rayai-prod.<zone>.<instance-id>`, IAP tunnel access and noninteractive
+  permission to execute the fixed probe with `sudo -n /usr/bin/python3 -`.
+  A fresh hosted runner normally lacks this route and fails closed. SSH checks
+  host keys strictly and never registers a key or updates metadata.
+- The existing `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT` references
+  select an identity; they do not demonstrate its permissions. Read access must
+  cover all services and revisions, jobs and active executions, worker pools,
+  project instances, DNS/routing components, registry artifacts and complete
+  receiver-deletion audit history. GitHub needs `contents:read`, `actions:read`
+  and OIDC `id-token:write`. Both jobs need Python, Cloud SDK, `gh`, and SSH.
+- Private database binding additionally requires version metadata and payload
+  access for only `database-url-usw2` and `database-url`. The helper privately
+  checks all versions that could have been loaded since the oldest active
+  receiver revision started, including versions since superseded by `latest`.
+  Missing version history or an unavailable possibly loaded version blocks
+  collection. Outputs contain version identities and project-match booleans,
+  never URL values, credentials, or provider error output. No SQL connection is
+  made by this collector. Operational payload access requires separate release.
+- Every receiver revision needs an authenticated successful main build artifact
+  whose image configuration matches its immutable registry image, with source on
+  the audited pre-retained first-parent lineage. Tags are lookup hints only.
+  Deleted revisions/jobs, unknown images, missing/expired build artifacts, sidecars,
+  command overrides and unknown consumers fail closed; elapsed time is not proof
+  that an old process or database session drained.
+- Guest binaries are reproduced from the exact reviewed source with Go 1.25.0
+  and the original build flags. Running and installed binaries, units, normal
+  drop-ins and restart guards must match that provenance. A new VMD rollout needs
+  source review and updated provenance followed by fresh evidence; changing a
+  source pin based only on deployment success is insufficient.
+
+The fixed guest probe reads process/environment and loaded systemd settings
+privately, emitting only executable/configuration hashes, process identities,
+credential-free control-plane origins, DNS addresses and established peers.
+For a separately authorized diagnostic, on each guest run exactly
+`sudo -n /usr/bin/python3 - < recovery_guest_probe.py` with the reviewed script
+provided through stdin by the existing authenticated route (the collector does
+this without copying a file onto the host). Manual output alone is not an
+authenticated, fresh hosted artifact.
+
+Existing socket addresses are diagnostics, not TLS hostname attribution. The
+audited VMD fixes the retained-report URL from its startup control-plane setting;
+persisted reports cannot override it. The audited receiver handlers and middleware
+do not redirect those requests. That source proof, effective origin, absence of
+report proxies, admitted historical receivers, current DNS/routing and coordinated
+window establish receiver exclusion. Normal GCS backup connections do not change
+report authority and do not require an IP allowlist or idle backups. Evidence of
+an actual alternative historical route requires review of that route; an IP match
+alone does not establish which service owns a socket.
 
 ## Validation
 
