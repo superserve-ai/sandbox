@@ -19,6 +19,7 @@ from migrate_database import MigrationError
 
 COLLECTOR_WORKFLOW = ".github/workflows/recovery-evidence.yml"
 MAX_AGE_SECONDS = 120
+MANUAL_MAX_AGE_SECONDS = 1800
 MAX_BYTES = 2_000_000
 # This source has neither the retained API receiver nor the retained publisher
 # field. Adding an admitted build requires source and persisted-replay review.
@@ -238,8 +239,37 @@ def receiver_state(document):
     return {'inventory_after': document['inventory_after'], 'provenance': document['receiver_provenance'],
             'hosts': sorted(map(stable_guest, document['hosts']), key=lambda h: h['instance_id']),
             'database_bindings': bindings, 'coordinated_assumption': assumption,
+            **({'manual_guests': document['manual_guests']} if 'manual_guests' in document else {}),
             **({'host_provenance': document['host_provenance'],
                 'canary_provenance': document['canary_provenance']} if document['schema'] == 3 else {})}
+
+
+def validate_manual_guests(manual, revision, plan_hash, current, now):
+    from pathlib import Path
+    require(manual.get('authority') == 'operator-supplied-coordinated-window'
+            and manual.get('revision') == revision and manual.get('plan_hash') == plan_hash
+            and manual.get('project') == PROJECT and manual.get('target') == 'usw2'
+            and manual.get('acknowledgment') == 'accepted' and manual.get('scope') == COORDINATION_SCOPE
+            and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', manual.get('operator', '')),
+            'Manual guest authority, recovery identity or continuity acknowledgment is invalid')
+    start, end = timestamp(manual['started_at']), timestamp(manual['completed_at'])
+    require(now-MANUAL_MAX_AGE_SECONDS <= start <= end <= now,
+            'Manual guest capture is stale or future dated; acknowledgment cannot reset capture time')
+    probe_hash = hashlib.sha256(Path(__file__).with_name('recovery_guest_probe.py').read_bytes()).hexdigest()
+    instances = {str(instance['id']): instance for instance in current['instances']}
+    hosts = manual.get('hosts', [])
+    require(len(hosts) == len(instances) == 2 and {h.get('instance_id') for h in hosts} == set(instances),
+            'Manual capture must cover both immutable host identities')
+    for host in hosts:
+        instance = instances[host['instance_id']]
+        require(host.get('instance_name') == instance['name'] and host.get('zone') == instance['zone']
+                and host.get('probe_sha256') == probe_hash and host.get('route') == 'operator-supplied'
+                and instance.get('status') == 'RUNNING'
+                and instance.get('lastStartTimestamp')
+                and timestamp(instance['lastStartTimestamp']) <= start
+                and host.get('instance_sha256') == sha(instance),
+                'Manual host identity, restart state, metadata or probe differs from current inventory')
+    return start + MANUAL_MAX_AGE_SECONDS
 
 
 def canary_configuration(spec, destinations):
@@ -253,6 +283,61 @@ def canary_configuration(spec, destinations):
             and not any(e['name'] == 'DATABASE_URL' or e['name'].startswith('PG') for e in env),
             'Canary destination or database configuration is not audited')
     return container
+
+
+def retired_receiver_history_safe(current):
+    from collect_recovery_evidence import RETIRED_RECEIVERS
+    events = current.get('deleted_receivers')
+    if events == []:
+        return True
+    if not isinstance(events, list) or len(events) > len(RETIRED_RECEIVERS['events']):
+        return False
+    seen = set()
+    for event in events:
+        if not isinstance(event, dict) or not isinstance(event.get('protoPayload'), dict):
+            return False
+        payload = event['protoPayload']
+        status = payload.get('status')
+        if not isinstance(status, dict) or type(status.get('code', 0)) is not int:
+            return False
+        identity = {'timestamp': event.get('timestamp'), 'receiveTimestamp': event.get('receiveTimestamp'),
+                    'method': payload.get('methodName'), 'resource': payload.get('resourceName'),
+                    'status_code': status.get('code', 0)}
+        if identity not in RETIRED_RECEIVERS['events'] or sha(identity) in seen:
+            return False
+        seen.add(sha(identity))
+        deleted_at = timestamp(identity['timestamp'])
+        if deleted_at >= timestamp(RETIRED_RECEIVERS['retained_introduction_at']):
+            return False
+        if identity['status_code'] == 5:
+            # Exact reviewed NOT_FOUND event: no deletion occurred.
+            continue
+        if identity['status_code'] != 0:
+            return False
+        name = identity['resource'].rsplit('/', 1)[-1]
+        if identity['method'].endswith('.Jobs.DeleteJob'):
+            rows = [(row, None) for row in current['jobs']]
+            rows += [(row, 'run.googleapis.com/job') for row in current['active_job_executions']]
+        elif identity['method'].endswith('.Services.DeleteService'):
+            rows = [(row, None) for row in current['services']]
+            rows += [(row, 'serving.knative.dev/service') for key, values in current.items()
+                     if key.startswith('revisions_') for row in values]
+        else:
+            return False
+        for row, owner_label in rows:
+            metadata = row.get('metadata', {})
+            actual = metadata.get('name', '').rsplit('/', 1)[-1]
+            labels = metadata.get('labels', {})
+            owner = labels.get(owner_label) if owner_label else None
+            matches = (actual == name if owner_label is None else
+                       owner == name if owner else actual.startswith(name+'-'))
+            if matches:
+                created = metadata.get('creationTimestamp')
+                if not metadata.get('uid') or not created or timestamp(created) <= deleted_at:
+                    return False
+                # New identities still pass the complete current source/config
+                # policy below; historical classification grants no runtime trust.
+    return True
 
 
 def validate_receivers(document, *, revision, plan_hash, database_project, current, now, provenance_only=False):
@@ -271,6 +356,20 @@ def validate_receivers(document, *, revision, plan_hash, database_project, curre
             'Receiver evidence is stale or future dated')
     require(document.get('inventory_before') == document.get('inventory_after') == sha(current),
             'Receiver, routing or binding inventory changed')
+    if 'deletion_history' in document:
+        from collect_recovery_evidence import RETIRED_RECEIVERS
+        history = document['deletion_history']
+        earliest = min(r['metadata']['creationTimestamp'] for region in CELLS for r in current['revisions_'+region])
+        require(history.get('earliest') == earliest and history.get('events') == current['deleted_receivers']
+                and timestamp(history['cutoff']) <= start
+                and history.get('catalog_sha256') == sha(RETIRED_RECEIVERS),
+                'Authenticated receiver history checkpoint differs from the reviewed policy')
+    if 'manual_guests' in document:
+        manual = document['manual_guests']
+        validate_manual_guests(manual, revision, plan_hash, current, now)
+        require(document['hosts'] == manual['hosts']
+                and manual['operator'] == document['coordinated_assumption']['actor'],
+                'Manual host authority differs from the authenticated collection input')
     assumption = document.get('coordinated_assumption', {})
     require(assumption.get('revision') == revision and assumption.get('plan_hash') == plan_hash
             and assumption.get('target') == 'usw2' and assumption.get('acknowledgment') == 'accepted'
@@ -284,7 +383,7 @@ def validate_receivers(document, *, revision, plan_hash, database_project, curre
     destinations = public_api_routes(current)
     require(current.get('workers') == [],
             'An alternate worker pool requires source and binding review')
-    require(current.get('deleted_receivers') == [],
+    require(retired_receiver_history_safe(current),
             'Deleted receiver history needs source provenance or affirmative termination review')
     certificates = document.get('receiver_provenance', {})
     for region, name in CELLS.items():
@@ -355,8 +454,9 @@ def validate_receivers(document, *, revision, plan_hash, database_project, curre
             'Guest observation must cover the complete host inventory')
     for guest in observed:
         host = hosts[guest['instance_id']]
+        expected_route = 'operator-supplied' if 'manual_guests' in document else 'existing-ssh-identity-over-iap'
         require(guest.get('instance_name') == host['name'] and guest.get('zone') == host['zone']
-                and guest.get('route') == 'existing-ssh-identity-over-iap', 'Guest identity or authenticated route changed')
+                and guest.get('route') == expected_route, 'Guest identity or declared observation authority changed')
         observation = guest['observation']
         require(observation.get('boot_id') and observation.get('additional_managed_reporters') == [],
                 'Guest process inventory is incomplete')
@@ -365,9 +465,14 @@ def validate_receivers(document, *, revision, plan_hash, database_project, curre
                 'Managed guest reporter inventory is incomplete')
         for entry in entries:
             build = document['host_provenance'][entry['binary']]
+            required_dropins, optional_dropins = build.get('dropins', {}), build.get('optional_dropins', {})
+            actual_dropins = entry.get('dropins', {})
+            dropins_match = (set(required_dropins) <= set(actual_dropins)
+                and set(actual_dropins) <= set(required_dropins) | set(optional_dropins)
+                and all(value == {**optional_dropins, **required_dropins}[name] for name, value in actual_dropins.items()))
             require(build.get('source') == HOST_SOURCE and entry['installed_sha256'] == build['binary']
                     and entry['process']['executable_sha256'] == build['binary'] and entry['unit_sha256'] == build['unit']
-                    and entry.get('dropins') == build.get('dropins') and entry.get('guards') == build.get('guards'),
+                    and dropins_match and entry.get('guards') == build.get('guards'),
                     'Running or restart guest executable/configuration is not audited')
             route = entry['process']['routing']
             require(route['origin'] in destinations and entry['restart_routing']['origin'] == route['origin'],
@@ -399,6 +504,7 @@ class Observation:
         self._artifact_digest = None
         self._consumer_identity = None
         self._identity = (repository, revision, run_id, plan_hash, database_project)
+        self._lease = None
 
     def api(self, path, binary=False):
         return command(["gh", "api", f"repos/{self.repository}/{path}"], self.deadline, binary=binary)
@@ -444,7 +550,15 @@ class Observation:
         return identity
 
     def verify(self):
+        try:
+            self._verify()
+        except Exception:
+            self.valid_until = self._lease = None
+            raise
+
+    def _verify(self):
         # A failed refresh cannot leave a previously issued lease usable.
+        previous_until = self.valid_until
         self.valid_until = None
         require(self._identity == (self.repository, self.revision, self.run_id, self.plan_hash, self.database_project),
                 "Recovery evidence identity changed")
@@ -455,10 +569,27 @@ class Observation:
             require(sha(document) == self._document_hash and digest == self._artifact_digest,
                     'Authenticated provenance changed during recovery')
         renewable = document.get('schema') == 3
+        mode = 'manual' if 'manual_guests' in document else 'automated'
+        require(os.environ.get('RECOVERY_GUEST_MODE', 'automated') == mode,
+                'Consumer guest authority mode differs from the authenticated collection')
         if renewable:
             consumer = self.consumer_identity()
             started = time.time()
-            observation_deadline = min(self.deadline, time.monotonic() + MAX_AGE_SECONDS)
+            mono = time.monotonic()
+            require(mono < self.deadline, 'Recovery evidence deadline exceeded')
+            if self._lease is not None:
+                wall_start, mono_start, wall_end, mono_end, last_wall = self._lease
+                require(started >= last_wall and mono >= mono_start,
+                        'Observation clock moved backwards')
+                require(previous_until is None or previous_until == wall_end,
+                        'Observation authorization changed')
+                require(self.state_digest == sha(receiver_state(document)), 'Observed writer state changed during recovery')
+                if min(wall_end-started, mono_end-mono, self.deadline-mono) >= 6:
+                    self._lease = (wall_start, mono_start, wall_end, mono_end, started)
+                    self.valid_until = wall_end
+                    return
+            self._lease = None
+            observation_deadline = min(self.deadline, mono + MAX_AGE_SECONDS)
             require(time.monotonic() < observation_deadline, 'Recovery evidence deadline exceeded')
         else:
             require(time.time() < timestamp(document["started_at"]) + MAX_AGE_SECONDS,
@@ -469,18 +600,23 @@ class Observation:
             reader = Reader(observation_deadline)
             if renewable:
                 active_mutations(reader, consumer[0])
-            current = receiver_inventory(reader)
+            history = document.get('deletion_history')
+            current = receiver_inventory(reader, history) if history else receiver_inventory(reader)
             if not renewable:
                 active_mutations(reader, os.environ.get('GITHUB_RUN_ID', ''))
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                guests = list(executor.map(lambda host: guest_observation(reader, host), current['instances']))
+            if 'manual_guests' in document:
+                validate_manual_guests(document['manual_guests'], self.revision, self.plan_hash, current, time.time())
+                guests = document['manual_guests']['hosts']
+            else:
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    guests = list(executor.map(lambda host: guest_observation(reader, host), current['instances']))
             require(sorted(map(stable_guest, guests), key=lambda h: h['instance_id']) ==
                     sorted(map(stable_guest, document['hosts']), key=lambda h: h['instance_id']),
                     'Guest process, executable or effective destination changed')
             require(document['coordinated_assumption']['run_id'] == self.run_id,
                     'Coordination acknowledgment belongs to another collection run')
             if renewable:
-                after = receiver_inventory(reader)
+                after = receiver_inventory(reader, history) if history else receiver_inventory(reader)
                 require(current == after, 'Receiver inventory changed during live observation')
                 active_mutations(reader, consumer[0])
                 require(self.consumer_identity() == consumer, 'Consumer coordination changed during observation')
@@ -503,6 +639,12 @@ class Observation:
                     'Live receiver observation expired; no authorization issued')
             self._consumer_identity = consumer
             self.valid_until = started + MAX_AGE_SECONDS
+            if 'manual_guests' in document:
+                self.valid_until = min(self.valid_until,
+                    timestamp(document['manual_guests']['started_at']) + MANUAL_MAX_AGE_SECONDS)
+            require(self.valid_until-time.time() >= 6, 'Manual snapshot or observation expires before mutation')
+            self._lease = (started, mono, self.valid_until,
+                           mono + self.valid_until-started, time.time())
         else:
             self.valid_until = timestamp(document["started_at"]) + MAX_AGE_SECONDS
         self.state_digest = state_digest

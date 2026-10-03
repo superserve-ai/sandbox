@@ -18,16 +18,35 @@ DROPINS = {'10-rollback-guard.conf': 'vmd-rollback-guard',
            '30-wake-floor-guard.conf': 'vmd-wake-floor-guard',
            '31-staged-intent-floor-guard.conf': 'vmd-staged-intent-floor-guard',
            '32-snapshot-backup-floor-guard.conf': 'vmd-snapshot-backup-floor-guard'}
+# Exact generated recipes from the audited host source. The West mount-only
+# variant was reconstructed and matched byte-for-byte by its observed SHA256.
+EXTRA_DROPINS = {
+    'identity.conf': '[Service]\nEnvironmentFile=/etc/sandbox/host-identity.env\n',
+    'dirty-session.conf': '[Service]\nEnvironment=VMD_DIRTY_TRACKING_SESSION=true\n',
+    'dbus.conf': '[Service]\nEnvironment=VMD_SYSTEMD_DBUS=true\n',
+    'tap-reset.conf': '[Service]\nEnvironment=VMD_RECYCLE_TAP_RESET=true\n',
+    'sandbox-localssd.conf': '[Unit]\nRequires=sandbox-localssd.service\nAfter=sandbox-localssd.service\n',
+    'sandbox-data.conf': '[Unit]\nRequires=sandbox-data.service\nAfter=sandbox-data.service\n',
+    '20-localssd-storage.conf': '[Unit]\nRequiresMountsFor=/var/lib/sandbox/snapshots /var/lib/sandbox/rundir\n',
+}
 
 CHECK = 'startup'
 SERVICE = None
+CHECKS = frozenset({'startup', 'boot-identity', 'loaded-service-properties',
+    'service-active-and-reconciled', 'loaded-dropins', 'loaded-environment', 'main-process',
+    'loaded-executable-command', 'process-identity', 'process-sockets', 'process-executable',
+    'process-routing', 'process-stability', 'installed-executable-match', 'restart-environment',
+    'restart-routing', 'restart-destination-match', 'unit-restart-settings',
+    'identity-routing-overrides', 'unit-and-guard-hashes', 'additional-reporters',
+    'reporter-and-boot-stability', 'final-process-stability'})
+ERROR_TYPES = frozenset({'ValueError', 'KeyError', 'FileNotFoundError', 'PermissionError',
+    'TimeoutExpired', 'AttributeError', 'UnicodeDecodeError', 'gaierror', 'OSError', 'OtherError'})
 
 
 def failure(error):
     # Never emit exception text: subprocess/configuration failures can contain secrets.
     kind = type(error).__name__
-    if kind not in {'ValueError', 'KeyError', 'FileNotFoundError', 'PermissionError',
-                    'TimeoutExpired', 'AttributeError', 'UnicodeDecodeError', 'gaierror', 'OSError'}:
+    if kind not in ERROR_TYPES:
         kind = 'OtherError'
     return {'error': 'Guest observation incomplete; no configuration values emitted',
             'check': CHECK, 'service': SERVICE, 'error_type': kind}
@@ -129,19 +148,46 @@ def probe():
         SERVICE = binary
         CHECK = 'loaded-service-properties'
         properties = command(['systemctl', 'show', unit, '--property=MainPID,InvocationID,ExecStart,Environment,EnvironmentFiles,DropInPaths,FragmentPath,ActiveState,NeedDaemonReload'])
-        fields = dict(line.split('=', 1) for line in properties.splitlines() if '=' in line)
+        fields = {}
+        for line in properties.splitlines():
+            if '=' not in line:
+                continue
+            name, value = line.split('=', 1)
+            # systemctl emits one EnvironmentFiles= line per file, including
+            # repeated files. Preserve their order instead of keeping only last.
+            if name == 'EnvironmentFiles' and name in fields:
+                fields[name] += ' ' + value
+            elif name in fields:
+                raise ValueError('ambiguous loaded service property')
+            else:
+                fields[name] = value
         CHECK = 'service-active-and-reconciled'
         if fields.get('ActiveState') != 'active' or fields.get('NeedDaemonReload') != 'no':
             raise ValueError('service inactive or loaded unit differs from disk')
         CHECK = 'loaded-dropins'
         dropins = shlex.split(fields.get('DropInPaths', ''))
-        expected_dropins = {'/etc/systemd/system/' + unit + '.d/' + name for name in DROPINS} if binary == 'vmd' else set()
-        if set(dropins) != expected_dropins or len(dropins) != len(expected_dropins):
+        directory = '/etc/systemd/system/' + unit + '.d/'
+        expected_dropins = {directory + name for name in DROPINS} if binary == 'vmd' else set()
+        permitted_extra = {directory + name for name in EXTRA_DROPINS} if binary == 'vmd' else set()
+        if (not expected_dropins <= set(dropins) or not set(dropins) <= expected_dropins | permitted_extra
+                or len(dropins) != len(set(dropins))):
             raise ValueError('unreviewed restart drop-in')
+        extras = {Path(path).name for path in set(dropins) - expected_dropins}
+        for name in extras:
+            if Path(directory + name).read_bytes() != EXTRA_DROPINS[name].encode():
+                raise ValueError('unreviewed restart drop-in contents')
         CHECK = 'loaded-environment'
-        loaded_files = re.findall(r'(\S+) \(ignore_errors=no\)', fields.get('EnvironmentFiles', ''))
         expected_files = [env_path, '/etc/sandbox/host-identity.env'] if binary == 'vmd' else [env_path]
-        if loaded_files != expected_files or fields.get('Environment', '') != ('HOST_IDENTITY_REQUIRED=1' if binary == 'vmd' else ''):
+        if 'identity.conf' in extras:
+            expected_files.append('/etc/sandbox/host-identity.env')
+        expected_file_tokens = [token for path in expected_files for token in (path, '(ignore_errors=no)')]
+        expected_environment = {'HOST_IDENTITY_REQUIRED=1'} if binary == 'vmd' else set()
+        for name in extras:
+            expected_environment.update(line.removeprefix('Environment=') for line in EXTRA_DROPINS[name].splitlines()
+                                        if line.startswith('Environment='))
+        loaded_environment = shlex.split(fields.get('Environment', ''))
+        if (shlex.split(fields.get('EnvironmentFiles', '')) != expected_file_tokens
+                or set(loaded_environment) != expected_environment or len(loaded_environment) != len(expected_environment)):
             raise ValueError('loaded environment override')
         CHECK = 'main-process'
         pid = int(fields['MainPID'])
@@ -171,7 +217,7 @@ def probe():
         unit_text = command(['systemctl', 'cat', unit])
         env_files = re.findall(r'^EnvironmentFile=(.*)$', unit_text, re.M)
         allowed = {env_path, '/etc/sandbox/host-identity.env'} if binary == 'vmd' else {env_path}
-        if set(env_files) != allowed or re.search(r'^Environment=.*(?:CONTROL_PLANE_URL|PROXY)', unit_text, re.M):
+        if env_files != expected_files or re.search(r'^Environment=.*(?:CONTROL_PLANE_URL|PROXY)', unit_text, re.M):
             raise ValueError('restart routing override')
         CHECK = 'identity-routing-overrides'
         for path in allowed - {env_path}:

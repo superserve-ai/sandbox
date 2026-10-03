@@ -51,7 +51,8 @@ class PushCIGateTests(unittest.TestCase):
             self.assertTrue(GATE.recovery_hold(head, renamed, "push", run=run))
 
     def test_recovery_changes_hold_complete_push_including_mixed_changes(self):
-        for path in GATE.RECOVERY_PATHS | {"supabase/shared-auth-history/setup.sql",
+        for path in GATE.RECOVERY_PATHS | {"scripts/recovery_retired_receivers.json",
+                                         "supabase/shared-auth-history/setup.sql",
                                          "supabase/shared-auth-migrations/setup.sql"}:
             with self.subTest(path=path):
                 run = Mock(side_effect=[SimpleNamespace(returncode=0),

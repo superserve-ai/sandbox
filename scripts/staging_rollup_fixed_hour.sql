@@ -27,7 +27,7 @@ WITH fixed_window AS MATERIALIZED (
  h.vcpu_seconds AS hourly_cpu,h.memory_mib_seconds AS hourly_memory,h.storage_mib_seconds AS hourly_storage,
  raw.team_id IS NOT NULL AS raw_ready,raw.vcpu_seconds AS raw_cpu,
  raw.memory_mib_seconds AS raw_memory,raw.storage_mib_seconds AS raw_storage,
- j.status AS job_status,j.attempt_count,j.locked_until
+ j.status AS job_status,j.attempt_count,j.locked_until,j.completed_at AS job_completed_at
  FROM bounded b
  LEFT JOIN team_billing_usage_hourly h ON h.team_id=b.team_id AND h.hour_start=b.hour_start
  LEFT JOIN billing_rollup_job j ON j.team_id=b.team_id AND j.hour_start=b.hour_start
@@ -139,6 +139,8 @@ SELECT (SELECT hour_start FROM fixed_window) AS fixed_hour_start,
  sum(abs(raw_memory-hourly_memory)) FILTER(WHERE raw_ready AND hourly_present) AS absolute_memory_difference,
  sum(abs(raw_storage-hourly_storage)) FILTER(WHERE raw_ready AND hourly_present) AS absolute_storage_difference,
  min(hourly_updated_at) FILTER(WHERE enabled) AS oldest_hourly_update,
+ max(job_completed_at + interval '1 hour') FILTER(WHERE job_status='completed') AS latest_completed_refresh_eligible_after,
+ count(*) FILTER(WHERE job_status='completed' AND job_completed_at<now()-interval '1 hour') AS completed_refresh_eligible_now,
  count(*) FILTER(WHERE job_status='pending') AS pending_jobs,
  count(*) FILTER(WHERE job_status='running') AS running_jobs,
  count(*) FILTER(WHERE job_status='failed') AS failed_jobs,

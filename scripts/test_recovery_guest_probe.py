@@ -54,7 +54,10 @@ class GuestProbeTest(unittest.TestCase):
             return hashlib.sha256(path(value).read_bytes()).hexdigest()
         def command(args):
             if args[1] == 'show':
-                return '\n'.join(k+'='+v for k, v in self.properties[args[2]].items())
+                # systemctl's array-of-struct printer repeats this property.
+                return '\n'.join(k+'='+v.replace(') ', ')\nEnvironmentFiles=')
+                                 if k == 'EnvironmentFiles' else k+'='+v
+                                 for k, v in self.properties[args[2]].items())
             return self.units[args[2]]
         def process(pid):
             binary = 'vmd' if pid == 1 else 'secretsproxy'
@@ -72,6 +75,53 @@ class GuestProbeTest(unittest.TestCase):
         self.assertEqual(len(result['services'][0]['guards']), 4)
         self.assertNotIn('private-value', repr(result))
         self.assertNotIn('DATABASE_URL', repr(result))
+
+    def add_extra(self, name):
+        unit = 'superserve-vmd.service'
+        path = '/etc/systemd/system/'+unit+'.d/'+name
+        (self.root/path.lstrip('/')).write_text(probe.EXTRA_DROPINS[name])
+        self.properties[unit]['DropInPaths'] += ' '+path
+        self.units[unit] += probe.EXTRA_DROPINS[name]
+        if name == 'identity.conf':
+            self.properties[unit]['EnvironmentFiles'] += ' /etc/sandbox/host-identity.env (ignore_errors=no)'
+        for line in probe.EXTRA_DROPINS[name].splitlines():
+            if line.startswith('Environment='):
+                self.properties[unit]['Environment'] += ' '+line.removeprefix('Environment=')
+
+    def test_observed_host_variants_require_exact_contents_and_loaded_settings(self):
+        for name in probe.EXTRA_DROPINS:
+            self.add_extra(name)
+        result = self.run_probe()
+        self.assertEqual(set(result['services'][0]['dropins']), set(probe.DROPINS) | set(probe.EXTRA_DROPINS))
+        unit = 'superserve-vmd.service'
+        original = copy.deepcopy(self.properties)
+        for field, suffix in [('Environment', ' CONTROL_PLANE_URL=private-value'),
+                              ('Environment', ' VMD_SYSTEMD_DBUS=false'),
+                              ('EnvironmentFiles', ' /etc/sandbox/host-identity.env (ignore_errors=no)')]:
+            self.properties = copy.deepcopy(original)
+            self.properties[unit][field] += suffix
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.run_probe()
+        self.properties = original
+        for name in probe.EXTRA_DROPINS:
+            path = self.root/'etc/systemd/system'/f'{unit}.d'/name
+            path.write_text(probe.EXTRA_DROPINS[name]+'Environment=CONTROL_PLANE_URL=private-value\n')
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.run_probe()
+            path.write_text(probe.EXTRA_DROPINS[name])
+
+    def test_actual_east_and_west_environment_file_and_flag_sets(self):
+        original_properties, original_units = copy.deepcopy(self.properties), copy.deepcopy(self.units)
+        for extras in (
+            ('20-localssd-storage.conf', 'dbus.conf', 'dirty-session.conf', 'identity.conf', 'tap-reset.conf'),
+            ('dirty-session.conf', 'identity.conf', 'sandbox-data.conf', 'sandbox-localssd.conf'),
+        ):
+            self.properties, self.units = copy.deepcopy(original_properties), copy.deepcopy(original_units)
+            for name in extras:
+                self.add_extra(name)
+            with self.subTest(extras=extras):
+                result = self.run_probe()
+                self.assertEqual(set(result['services'][0]['dropins']), set(probe.DROPINS) | set(extras))
 
     def test_loaded_override_pending_reload_and_extra_guard_reject(self):
         original = copy.deepcopy(self.properties)

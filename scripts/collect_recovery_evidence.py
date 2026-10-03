@@ -45,9 +45,21 @@ HOST_BINARIES = {
     'vmd': 'c935a32171af63ea99fd2c52d84ff355c2b750b318c7825007c2a87756f63bc3',
     'secretsproxy': '24dc59dc86b13ffa7780fa722a7e71052eb117b2a1598fac7fc1f2208e43351c',
 }
+# Reviewed metadata only; no historical command, environment or image payloads.
+RETIRED_RECEIVERS = json.loads(Path(__file__).with_name('recovery_retired_receivers.json').read_text())
 
 
-def receiver_inventory(reader):
+def deletion_history(reader, earliest, cutoff=None):
+    query = ('log_id("cloudaudit.googleapis.com/activity") AND protoPayload.serviceName="run.googleapis.com" '
+             'AND (protoPayload.methodName:"DeleteRevision" OR protoPayload.methodName:"DeleteService" '
+             'OR protoPayload.methodName:"DeleteJob") AND timestamp>="' + earliest + '"')
+    if cutoff:
+        query += ' AND (timestamp>="' + cutoff + '" OR receiveTimestamp>="' + cutoff + '")'
+    return reader.cloud('logging', 'read', query, '--limit=1000',
+                        fields='timestamp,receiveTimestamp,protoPayload.methodName,protoPayload.resourceName,protoPayload.status')
+
+
+def receiver_inventory(reader, history=None):
     queries = {
         'services': ('run', 'services', 'list', '--platform=managed', '--limit=1000'),
         'jobs': ('run', 'jobs', 'list', '--limit=1000'),
@@ -74,16 +86,18 @@ def receiver_inventory(reader):
     state['canary_image'] = reader.cloud('artifacts', 'docker', 'images', 'describe',
                                          CANARY_IMAGE + ':' + CANARY['source'])['image_summary']['digest']
     earliest = min(r['metadata']['creationTimestamp'] for region in CELLS for r in state['revisions_'+region])
-    state['deleted_receivers'] = reader.cloud('logging', 'read',
-        'log_id("cloudaudit.googleapis.com/activity") AND protoPayload.serviceName="run.googleapis.com" '
-        'AND (protoPayload.methodName:"DeleteRevision" OR protoPayload.methodName:"DeleteService" '
-        'OR protoPayload.methodName:"DeleteJob") '
-        'AND timestamp>="' + earliest + '"', '--limit=1000')
-    # Execution listing is regional even when jobs are listed globally. Derive
-    # every region from that complete inventory; deletion-history validation
-    # prevents deleted jobs from hiding executions from this enumeration.
+    if history is None:
+        state['deleted_receivers'] = deletion_history(reader, earliest)
+    else:
+        require(earliest == history['earliest'], 'Historical revision coverage changed')
+        delta = deletion_history(reader, earliest, history['cutoff'])
+        require(all(event in history['events'] for event in delta),
+                'New or late receiver deletion observed; recollect complete history')
+        state['deleted_receivers'] = history['events']
+    # Also enumerate the retired job's region even without a current job there.
     job_regions = {job.get('metadata', {}).get('labels', {}).get('cloud.googleapis.com/location', '')
                    for job in state['jobs']}
+    job_regions.add('us-central1')
     require(all(re.fullmatch(r'[a-z]+-[a-z]+[0-9]', region) for region in job_regions),
             'Job region is missing from the global inventory')
     def executions(region):
@@ -106,6 +120,21 @@ def receiver_inventory(reader):
     return state
 
 
+def guest_failure_reason(output):
+    from recovery_guest_probe import CHECKS, ERROR_TYPES
+    generic = 'Guest observation failed; inspect the fixed redacted probe requirements'
+    try:
+        value = json.loads(output)
+        require(isinstance(value, dict) and 'error' in value, generic)
+        check, service, kind = (value.get(name) for name in ('check', 'service', 'error_type'))
+        require(isinstance(check, str) and check in CHECKS
+                and (service is None or isinstance(service, str) and service in {'vmd', 'secretsproxy'})
+                and isinstance(kind, str) and kind in ERROR_TYPES, generic)
+        return 'Guest observation incomplete: ' + json.dumps({'check': check, 'service': service, 'error_type': kind})
+    except Exception:
+        return generic
+
+
 def guest_observation(reader, instance, *, project=PROJECT):
     require(project in {PROJECT, 'rayai-dev'}, 'Guest observation project is not allowed')
     name, zone = instance['name'], instance['zone'].rsplit('/', 1)[-1]
@@ -125,8 +154,9 @@ def guest_observation(reader, instance, *, project=PROJECT):
             '-o', 'UserKnownHostsFile=' + str(known), '-o', 'HostKeyAlias=' + alias,
             '-o', 'ProxyCommand=' + proxy, '-i', str(key), user + '@' + name,
             'sudo -n /usr/bin/python3 -']
-    observed = json.loads(reader.command(args, input=source))
-    require('error' not in observed, 'Guest observation failed; inspect the fixed redacted probe requirements')
+    output = reader.command(args, input=source, guest_diagnostic=True)
+    observed = json.loads(output)
+    require(isinstance(observed, dict) and 'error' not in observed, guest_failure_reason(output))
     return {'instance_id': str(instance['id']), 'instance_name': name, 'zone': instance['zone'],
             'route': 'existing-ssh-identity-over-iap', 'host_key_alias': alias,
             'probe_sha256': hashlib.sha256(source.encode()).hexdigest(), 'observation': observed}
@@ -145,8 +175,11 @@ def host_provenance(reader):
         result[binary] = {'source': HOST_SOURCE, 'binary': hashlib.sha256(data).hexdigest(),
                           'unit': hashlib.sha256(unit).hexdigest()}
         result[binary]['dropins'], result[binary]['guards'] = {}, {}
+        result[binary]['optional_dropins'] = {}
         if binary == 'vmd':
-            from recovery_guest_probe import DROPINS
+            from recovery_guest_probe import DROPINS, EXTRA_DROPINS
+            result[binary]['optional_dropins'] = {name: hashlib.sha256(text.encode()).hexdigest()
+                                                  for name, text in EXTRA_DROPINS.items()}
             for name, guard in DROPINS.items():
                 suffix = name.split('-', 1)[1]
                 path = source / 'deploy' / ('superserve-vmd-' + suffix)
@@ -168,21 +201,36 @@ def active_mutations(reader, own_run):
 
 
 def collect(reader, revision, env):
+    # Checkpoint precedes the full scan. Later reads include late-arriving events
+    # by receiveTimestamp; an acknowledged hold still covers audit delivery lag.
+    cutoff = utc()
     preliminary = receiver_inventory(reader)
+    history = {'cutoff': cutoff,
+               'catalog_sha256': evidence.sha(RETIRED_RECEIVERS),
+               'earliest': min(r['metadata']['creationTimestamp'] for region in CELLS
+                               for r in preliminary['revisions_'+region]),
+               'events': preliminary['deleted_receivers']}
     revisions = sum((preliminary['revisions_' + region] for region in CELLS), [])
     provenance = receiver_provenance(reader, revisions)
     canary = verify_canary(reader)
     hosts = host_provenance(reader)
     # Access prerequisites are checked before requesting either URL payload.
-    require(os.environ.get('RECOVERY_SSH_USER') and (Path.home()/'.ssh/google_compute_engine').is_file()
+    manual = load_manual_guests(env)
+    require(manual is not None or os.environ.get('RECOVERY_SSH_USER') and (Path.home()/'.ssh/google_compute_engine').is_file()
             and (Path.home()/'.ssh/known_hosts').is_file(), 'Existing hosted guest read route has not been established')
     active_mutations(reader, env['GITHUB_RUN_ID'])
     started = utc()
     reader.deadline = min(reader.deadline, time.monotonic() + evidence.MAX_AGE_SECONDS)
-    before = receiver_inventory(reader)
+    before = receiver_inventory(reader, history)
     require(before == preliminary, 'Inventory changed during provenance preparation; recollect')
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        guests = list(executor.map(lambda instance: guest_observation(reader, instance), before['instances']))
+    if manual is not None:
+        guests = manual['hosts']
+        evidence.validate_manual_guests(manual, revision, evidence.sha(json.loads(
+            (ROOT/'supabase/recovery/retained-storage-v1.json').read_text())), before, time.time())
+        require(manual['operator'] == env['GITHUB_ACTOR'], 'Manual capture operator must dispatch collection')
+    else:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            guests = list(executor.map(lambda instance: guest_observation(reader, instance), before['instances']))
     bindings = {}
     for region, secret in [('us-west2', 'database-url-usw2'), ('us-east4', 'database-url')]:
         # All historical executables are proved incapable. Bind every active
@@ -192,7 +240,7 @@ def collect(reader, revision, env):
         require(active, 'No active receiver was observed')
         earliest = min(r['metadata']['creationTimestamp'] for r in active)
         bindings[secret] = private_binding(reader, secret, earliest, utc())
-    after = receiver_inventory(reader)
+    after = receiver_inventory(reader, history)
     require(after == before, 'Inventory changed during observation; no evidence issued')
     verify_dispatch(reader, env)
     active_mutations(reader, env['GITHUB_RUN_ID'])
@@ -205,13 +253,28 @@ def collect(reader, revision, env):
                 'inventory_before': evidence.sha(before), 'inventory_after': evidence.sha(after),
                 'receiver_provenance': provenance, 'canary_provenance': canary,
                 'host_provenance': hosts, 'hosts': guests, 'database_bindings': bindings,
+                'deletion_history': history,
                 'coordinated_assumption': {'actor': env['GITHUB_ACTOR'], 'run_id': env['GITHUB_RUN_ID'],
                     'revision': revision, 'target': 'usw2', 'plan_hash': evidence.sha(manifest),
                     'acknowledgment': 'accepted', 'started_at': started,
                     'scope': evidence.COORDINATION_SCOPE}}
+    if manual is not None:
+        document['manual_guests'] = manual
     evidence.validate_receivers(document, revision=revision, plan_hash=document['plan_hash'],
                                 database_project=PROJECTS['usw2'], current=after, now=time.time())
     return document
+
+
+def load_manual_guests(env):
+    raw, digest = env.get('MANUAL_GUESTS_JSON', ''), env.get('MANUAL_GUESTS_SHA256', '')
+    if not raw and not digest:
+        return None
+    require(0 < len(raw.encode()) <= 60000 and re.fullmatch(r'[a-f0-9]{64}', digest)
+            and hashlib.sha256(raw.encode()).hexdigest() == digest,
+            'Manual guest input is missing, oversized or differs from the approved digest')
+    value = json.loads(raw)
+    require(isinstance(value, dict), 'Manual guest input must be an object')
+    return value
 
 
 def require(ok, reason):
@@ -228,7 +291,7 @@ class Reader:
         self.deadline = deadline
         self._registry_token = None
 
-    def command(self, args, *, binary=False, input=None, reject_stderr=False):
+    def command(self, args, *, binary=False, input=None, reject_stderr=False, guest_diagnostic=False):
         remaining = self.deadline - time.monotonic()
         require(remaining > 0, "Collection deadline expired")
         try:
@@ -237,6 +300,9 @@ class Reader:
                              CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR='false')
             result = subprocess.run(args, input=input, capture_output=True, env=child_env,
                                     timeout=min(60, remaining), text=not binary)
+            require(len(result.stdout) <= MAX_ARCHIVE, "Read-only provider output exceeded its bound")
+            if result.returncode != 0 and guest_diagnostic:
+                raise MigrationError(guest_failure_reason(result.stdout))
             require(result.returncode == 0, "Read-only provider failed; provider output suppressed")
             require(not reject_stderr or not result.stderr,
                     "Cloud inventory reported a warning; completeness is unproved and provider output suppressed")
@@ -245,11 +311,12 @@ class Reader:
         except (OSError, subprocess.TimeoutExpired):
             raise MigrationError("Read-only provider unavailable or timed out") from None
 
-    def cloud(self, *args):
+    def cloud(self, *args, fields=None):
         # Both Cloud Run and Compute can return successful partial inventories
         # with only a warning. Require all-or-nothing Compute responses above,
         # and reject diagnostics for every cloud read before accepting its rows.
-        value = json.loads(self.command(["gcloud", *args, "--project=" + PROJECT, "--format=json", "--quiet",
+        output_format = 'json(' + fields + ')' if fields else 'json'
+        value = json.loads(self.command(["gcloud", *args, "--project=" + PROJECT, "--format=" + output_format, "--quiet",
                                          "--verbosity=warning"], reject_stderr=True))
         if isinstance(value, list):
             require(len(value) < MAX_ITEMS, "Cloud inventory reached its completeness bound")

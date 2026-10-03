@@ -33,6 +33,12 @@ on:
         type: choice
         default: not-approved
         options: [not-approved, accepted]
+      recovery_guest_mode:
+        description: Must match the authenticated evidence artifact; manual accepts bounded operator continuity
+        required: false
+        type: choice
+        default: automated
+        options: [automated, manual]
   push:
     branches: [main]
     paths:
@@ -44,6 +50,7 @@ on:
       - 'scripts/collect_recovery_evidence.py'
       - 'scripts/recovery_database_binding.py'
       - 'scripts/recovery_guest_probe.py'
+      - 'scripts/recovery_retired_receivers.json'
       - 'scripts/test_collect_recovery_evidence.py'
       - 'scripts/test_recovery_database_binding.py'
       - 'scripts/test_recovery_guest_probe.py'
@@ -128,7 +135,7 @@ jobs:
     name: ${{ needs.gate.outputs.action == 'recovery-preflight' && 'Recovery Preflight Production' || needs.gate.outputs.action == 'recover' && 'Recover Production' || needs.gate.outputs.action == 'preflight' && 'Preflight Production' || 'Migrate Production' }}
     if: needs.gate.outputs.production == 'true'
     needs: [gate, migrate-staging]
-    runs-on: ${{ (inputs.action == 'recover' || inputs.action == 'recovery-preflight') && vars.RECOVERY_OBSERVER_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.recovery_guest_mode != 'manual' && (inputs.action == 'recover' || inputs.action == 'recovery-preflight') && vars.RECOVERY_OBSERVER_RUNNER || 'ubuntu-latest' }}
     environment: production
     permissions:
       contents: read
@@ -138,6 +145,7 @@ jobs:
       RECOVERY_RECEIPT_DIR: ${{ github.workspace }}/recovery-receipts
       RECOVERY_EVIDENCE_RUN_ID: ${{ inputs.recovery_evidence_run_id }}
       RECOVERY_SSH_USER: ${{ vars.RECOVERY_SSH_USER }}
+      RECOVERY_GUEST_MODE: ${{ inputs.recovery_guest_mode || 'automated' }}
       RECOVERY_COORDINATION_ACK: ${{ inputs.recovery_coordination_ack }}
     steps:
       - uses: actions/checkout@v4

@@ -15,6 +15,7 @@ RECOVERY_PATHS = {
     "scripts/collect_recovery_evidence.py",
     "scripts/recovery_database_binding.py",
     "scripts/recovery_guest_probe.py",
+    "scripts/recovery_retired_receivers.json",
     "scripts/test_collect_recovery_evidence.py",
     "scripts/test_recovery_database_binding.py",
     "scripts/test_recovery_guest_probe.py",

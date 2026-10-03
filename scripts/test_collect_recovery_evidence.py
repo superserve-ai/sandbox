@@ -120,6 +120,28 @@ class CollectorTest(unittest.TestCase):
                 with self.assertRaisesRegex(MigrationError, 'source checkout'):
                     collector.host_provenance(reader)
 
+    def test_failed_ssh_preserves_only_allowlisted_guest_diagnostics(self):
+        safe = {'error': 'private-value', 'check': 'loaded-dropins', 'service': 'vmd',
+                'error_type': 'ValueError', 'extra': 'private-value'}
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home/'.ssh').mkdir()
+            for name in ('google_compute_engine', 'known_hosts'):
+                (home/'.ssh'/name).write_text('fixture')
+            for code in (0, 1, 255):
+                for payload in (safe, dict(safe, check='private-value'), dict(safe, service=['private-value']),
+                                dict(safe, error_type='private-value'), 'private-value'):
+                    with self.subTest(code=code, payload=payload), patch.object(Path, 'home', return_value=home), \
+                         patch.dict(os.environ, RECOVERY_SSH_USER='operator'), \
+                         patch.object(collector.subprocess, 'run', return_value=SimpleNamespace(
+                             returncode=code, stdout=json.dumps(payload), stderr='private-value')):
+                        with self.assertRaises(MigrationError) as caught:
+                            collector.guest_observation(collector.Reader(time.monotonic()+30),
+                                {'name': 'host', 'zone': 'zones/us-west2-a', 'id': '1'})
+                    message = str(caught.exception)
+                    self.assertNotIn('private-value', message)
+                    self.assertEqual('loaded-dropins' in message, payload == safe)
+
     def test_complete_receiver_proof_accepts_capable_publisher_without_spool_assertions(self):
         self.validate()
         self.assertNotIn('spools', self.doc['hosts'][0])
@@ -141,6 +163,70 @@ class CollectorTest(unittest.TestCase):
             doc['inventory_before'] = doc['inventory_after'] = evidence.sha(state)
             with self.subTest(name=name), self.assertRaises(MigrationError):
                 self.validate(doc, state)
+
+    def test_only_exact_pre_retained_deleted_job_is_classified_terminated(self):
+        known = collector.RETIRED_RECEIVERS['events'][0]
+        event = {'timestamp': known['timestamp'], 'receiveTimestamp': known['receiveTimestamp'],
+                 'protoPayload': {'methodName': known['method'], 'resourceName': known['resource'], 'status': {}}}
+        state = copy.deepcopy(self.state)
+        state['deleted_receivers'] = [event]
+        doc = copy.deepcopy(self.doc)
+        doc['inventory_before'] = doc['inventory_after'] = evidence.sha(state)
+        self.validate(doc, state)
+        cases = [lambda s: s['deleted_receivers'][0].update(timestamp='2026-10-03T00:00:00Z'),
+                 lambda s: s['deleted_receivers'][0]['protoPayload'].update(status={'code': 7}),
+                 lambda s: s['deleted_receivers'][0]['protoPayload'].update(resourceName='other'),
+                 lambda s: s['deleted_receivers'][0]['protoPayload'].update(methodName='google.cloud.run.v2.Services.DeleteService'),
+                 lambda s: s['deleted_receivers'].append(copy.deepcopy(event)),
+                 lambda s: s['jobs'].append({'metadata': {'name': known['resource'].rsplit('/', 1)[-1]}}),
+                 lambda s: s['active_job_executions'].append({'metadata': {'name': known['resource'].rsplit('/', 1)[-1]+'-execution'}})]
+        for mutate in cases:
+            changed = copy.deepcopy(state)
+            mutate(changed)
+            self.assertFalse(evidence.retired_receiver_history_safe(changed))
+
+    def test_catalog_covers_pre_capability_events_but_recreated_objects_need_new_identity(self):
+        state = copy.deepcopy(self.state)
+        for row in state['jobs'] + state['services'] + state['revisions_us-west2'] + state['revisions_us-east4']:
+            row['metadata'].update(uid='new-object', creationTimestamp='2026-10-03T00:00:00Z')
+        state['deleted_receivers'] = [
+            {'timestamp': e['timestamp'], 'receiveTimestamp': e['receiveTimestamp'],
+             'protoPayload': {'methodName': e['method'], 'resourceName': e['resource'],
+                              'status': {'code': e['status_code']} if e['status_code'] else {}}}
+            for e in collector.RETIRED_RECEIVERS['events']]
+        self.assertTrue(evidence.retired_receiver_history_safe(state))
+        state['jobs'][0]['metadata']['creationTimestamp'] = '2026-07-01T00:00:00Z'
+        self.assertFalse(evidence.retired_receiver_history_safe(state))
+        state['jobs'][0]['metadata']['creationTimestamp'] = '2026-10-03T00:00:00Z'
+        del state['jobs'][0]['metadata']['uid']
+        self.assertFalse(evidence.retired_receiver_history_safe(state))
+
+    def test_verified_direct_service_origin_does_not_require_its_own_load_balancer(self):
+        state, doc = copy.deepcopy(self.state), copy.deepcopy(self.doc)
+        origin = state['services'][0]['status']['url']
+        state['service_dns'][origin] = ['203.0.113.10']
+        for entry in doc['hosts'][0]['observation']['services']:
+            for route in (entry['process']['routing'], entry['restart_routing']):
+                route.update(origin=origin, resolved_addresses=['203.0.113.10'])
+        doc['inventory_before'] = doc['inventory_after'] = evidence.sha(state)
+        self.validate(doc, state)
+        doc['hosts'][0]['observation']['services'][0]['process']['routing']['origin'] = 'https://unverified.run.app'
+        with self.assertRaises(MigrationError):
+            self.validate(doc, state)
+
+    def test_optional_dropin_hashes_do_not_admit_unknown_or_missing_required_files(self):
+        doc = copy.deepcopy(self.doc)
+        build = doc['host_provenance']['vmd']
+        build['dropins'] = {'required.conf': '1'*64}
+        build['optional_dropins'] = {'identity.conf': '2'*64}
+        entry = doc['hosts'][0]['observation']['services'][0]
+        entry['dropins'] = {'required.conf': '1'*64, 'identity.conf': '2'*64}
+        self.validate(doc)
+        for actual in ({'identity.conf': '2'*64}, {'required.conf': '1'*64, 'identity.conf': '3'*64},
+                       {'required.conf': '1'*64, 'other.conf': '2'*64}):
+            entry['dropins'] = actual
+            with self.assertRaises(MigrationError):
+                self.validate(doc)
 
     def test_guest_split_dns_destination_restart_and_unit_changes_reject(self):
         cases = [lambda e: e['process']['routing'].update(resolved_addresses=['203.0.113.8']),
@@ -253,7 +339,7 @@ class CollectorTest(unittest.TestCase):
 
     def test_inventory_lists_alternate_consumers_across_all_regions(self):
         reader = Mock()
-        def cloud(*args):
+        def cloud(*args, **kwargs):
             if args[:3] == ('artifacts', 'docker', 'images'):
                 return {'image_summary': {'digest': collector.CANARY['image']}}
             if args[:3] == ('run', 'revisions', 'list'):
@@ -272,11 +358,49 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertFalse(any(arg.startswith('--region=') for arg in calls[0]))
         calls = [call.args for call in reader.cloud.call_args_list if call.args[:4] == ('run', 'jobs', 'executions', 'list')]
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 4)
         self.assertEqual({arg for call in calls for arg in call if arg.startswith('--region=')},
-                         {'--region=us-west2', '--region=us-east4', '--region=europe-west1'})
+                         {'--region=us-west2', '--region=us-east4', '--region=europe-west1', '--region=us-central1'})
         audit = [call.args for call in reader.cloud.call_args_list if call.args[:2] == ('logging', 'read')]
         self.assertIn('DeleteJob', audit[0][2])
+
+    def test_history_delta_query_includes_late_old_events_and_only_metadata(self):
+        reader = Mock()
+        reader.cloud.return_value = []
+        collector.deletion_history(reader, '2026-07-01T00:00:00Z', '2026-10-03T07:00:00Z')
+        call = reader.cloud.call_args
+        self.assertIn('timestamp>="2026-07-01T00:00:00Z"', call.args[2])
+        self.assertIn('(timestamp>="2026-10-03T07:00:00Z" OR receiveTimestamp>="2026-10-03T07:00:00Z")', call.args[2])
+        self.assertEqual(call.kwargs['fields'], 'timestamp,receiveTimestamp,protoPayload.methodName,protoPayload.resourceName,protoPayload.status')
+
+    def test_history_cache_reuses_exact_rows_but_rejects_late_unknown_event(self):
+        reader = Mock()
+        def cloud(*args, **kwargs):
+            if args[:3] == ('artifacts', 'docker', 'images'):
+                return {'image_summary': {'digest': collector.CANARY['image']}}
+            if args[:3] == ('run', 'revisions', 'list'):
+                return [{'metadata': {'creationTimestamp': '2026-07-01T00:00:00Z'}}]
+            return []
+        reader.cloud.side_effect = cloud
+        event = {'timestamp': '2026-07-02T00:00:00Z', 'receiveTimestamp': '2026-07-02T00:01:00Z'}
+        history = {'earliest': '2026-07-01T00:00:00Z', 'cutoff': '2026-10-03T07:00:00Z', 'events': [event]}
+        with patch.object(collector, 'deletion_history', return_value=[event]) as delta, \
+             patch.object(collector.socket, 'getaddrinfo', return_value=[(0, 0, 0, 0, ('192.0.2.1', 443))]):
+            self.assertEqual(collector.receiver_inventory(reader, history)['deleted_receivers'], [event])
+            delta.assert_called_once_with(reader, history['earliest'], history['cutoff'])
+            delta.return_value = [dict(event, receiveTimestamp='2026-10-03T07:00:01Z')]
+            with self.assertRaisesRegex(MigrationError, 'late receiver deletion'):
+                collector.receiver_inventory(reader, history)
+            self.assertEqual(history['cutoff'], '2026-10-03T07:00:00Z')
+
+    def test_manual_input_transport_is_exact_and_bounded(self):
+        raw = '{"operator":"operator"}'
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        self.assertEqual(collector.load_manual_guests({'MANUAL_GUESTS_JSON': raw, 'MANUAL_GUESTS_SHA256': digest}), json.loads(raw))
+        self.assertIsNone(collector.load_manual_guests({}))
+        for value, hashed in [(raw+' ', digest), (raw, ''), ('', digest), ('x'*60001, digest)]:
+            with self.assertRaises(MigrationError):
+                collector.load_manual_guests({'MANUAL_GUESTS_JSON': value, 'MANUAL_GUESTS_SHA256': hashed})
 
     def test_cloud_inventory_rejects_successful_partial_results_without_disclosing_warning(self):
         reader = collector.Reader(time.monotonic()+60)
@@ -363,7 +487,7 @@ class CollectorTest(unittest.TestCase):
             stack.enter_context(patch.object(collector, 'host_provenance', return_value=self.doc['host_provenance']))
             stack.enter_context(patch.object(collector, 'active_mutations'))
             calls = []
-            def inventory(_):
+            def inventory(_, history=None):
                 calls.append('inventory')
                 return copy.deepcopy(self.state)
             def guest(*_):
@@ -464,7 +588,7 @@ class ConsumerFreshnessTest(unittest.TestCase):
     def stamp(value):
         return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).isoformat()
 
-    def test_old_provenance_requires_live_checks_and_each_refresh_renews_only_live_lease(self):
+    def test_old_provenance_gets_fixed_lease_reused_until_renewal(self):
         # A historical artifact alone is still not a fresh authorization.
         with self.assertRaisesRegex(MigrationError, 'stale'):
             evidence.validate(self.doc, revision='a'*40, plan_hash='b'*64,
@@ -472,7 +596,7 @@ class ConsumerFreshnessTest(unittest.TestCase):
         self.observation.verify()
         self.assertEqual(self.observation.valid_until, self.now+120)
         state, digest = self.observation.state_digest, self.observation.artifact_digest
-        for delta in (60, 180, 360):
+        for delta in (180, 360, 540):
             self.clock.return_value = self.now+delta
             self.observation.verify()
             self.assertEqual(self.observation.valid_until, self.now+delta+120)
@@ -483,6 +607,133 @@ class ConsumerFreshnessTest(unittest.TestCase):
         self.assertEqual(self.mutations.call_count, 8)
         self.assertTrue(all(call.args[1] == '99' for call in self.mutations.call_args_list))
         self.assertEqual(self.doc['started_at'], self.stamp(self.now-610))
+
+    def test_32_phase_boundaries_reuse_one_non_sliding_observation(self):
+        self.observation.verify()
+        for delta in range(1, 97, 3):
+            self.clock.return_value = self.now+delta
+            self.observation.verify()
+            self.assertEqual(self.observation.valid_until, self.now+120)
+        self.assertEqual(self.inventory.call_count, 2)
+        self.assertEqual(self.guest.call_count, 1)
+        self.assertEqual(self.mutations.call_count, 2)
+        self.clock.return_value = self.now+115
+        self.observation.verify()
+        self.assertEqual(self.inventory.call_count, 4)
+        self.assertEqual(self.observation.valid_until, self.now+235)
+
+    def test_backward_wall_clock_revokes_lease(self):
+        self.observation.verify()
+        self.clock.return_value = self.now-1
+        with self.assertRaisesRegex(MigrationError, 'clock moved backwards'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
+        self.assertIsNone(self.observation._lease)
+
+    def test_monotonic_expiry_renews_even_if_wall_clock_has_not_advanced(self):
+        with patch.object(evidence.time, 'monotonic', return_value=10):
+            self.observation.verify()
+        with patch.object(evidence.time, 'monotonic', return_value=131):
+            self.observation.verify()
+        self.assertEqual(self.inventory.call_count, 4)
+
+    def make_manual(self, age=60):
+        instance = self.state['instances'][0]
+        instance.update(status='RUNNING', lastStartTimestamp=self.stamp(self.now-3600), metadata={'fingerprint': 'original'})
+        other = dict(instance, id='2', name='other', zone='zones/us-east4-a')
+        self.state['instances'].append(other)
+        self.doc['hosts'].append(copy.deepcopy(self.doc['hosts'][0]))
+        probe = hashlib.sha256(Path(collector.__file__).with_name('recovery_guest_probe.py').read_bytes()).hexdigest()
+        for host, item in zip(self.doc['hosts'], self.state['instances']):
+            host.update(instance_id=item['id'], instance_name=item['name'], zone=item['zone'],
+                        route='operator-supplied', probe_sha256=probe, instance_sha256=evidence.sha(item))
+        manual = dict(authority='operator-supplied-coordinated-window', revision='a'*40, plan_hash='b'*64,
+                      project=collector.PROJECT, target='usw2', acknowledgment='accepted',
+                      scope=evidence.COORDINATION_SCOPE, operator='operator',
+                      started_at=self.stamp(self.now-age), completed_at=self.stamp(self.now-age+1), hosts=self.doc['hosts'])
+        self.doc['manual_guests'] = manual
+        self.doc['inventory_before'] = self.doc['inventory_after'] = evidence.sha(self.state)
+        self.stack.enter_context(patch.dict(os.environ, {'RECOVERY_GUEST_MODE': 'manual'}))
+        return manual
+
+    def test_manual_consumer_uses_snapshot_and_caps_lease_at_original_expiry(self):
+        self.make_manual(age=1700)
+        self.observation.verify()
+        self.assertAlmostEqual(self.observation.valid_until, self.now+100, places=5)
+        self.clock.return_value = self.now+90
+        self.observation.verify()
+        self.assertAlmostEqual(self.observation.valid_until, self.now+100, places=5)
+        self.assertEqual(self.inventory.call_count, 2)
+        self.guest.assert_not_called()
+        self.clock.return_value = self.now+101
+        with self.assertRaisesRegex(MigrationError, 'stale'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
+
+    def test_manual_capture_rejects_identity_metadata_reboot_probe_actor_and_mode_changes(self):
+        manual = self.make_manual()
+        for field, value in [('revision', 'c'*40), ('operator', 'other'), ('acknowledgment', ''),
+                             ('started_at', self.stamp(self.now-1801))]:
+            saved = manual[field]
+            manual[field] = value
+            with self.subTest(field=field), self.assertRaises(MigrationError):
+                self.observation.verify()
+            manual[field] = saved
+        host = manual['hosts'][0]
+        for field in ('probe_sha256', 'instance_sha256', 'instance_id'):
+            saved = host[field]
+            host[field] = 'wrong'
+            with self.subTest(field=field), self.assertRaises(MigrationError):
+                self.observation.verify()
+            host[field] = saved
+        instance = self.state['instances'][0]
+        for field, value in [('lastStartTimestamp', self.stamp(self.now-5)), ('status', 'STOPPING'),
+                             ('metadata', {'fingerprint': 'changed'})]:
+            saved = instance[field]
+            instance[field] = value
+            with self.subTest(field=field), self.assertRaises(MigrationError):
+                self.observation.verify()
+            instance[field] = saved
+        with patch.dict(os.environ, {'RECOVERY_GUEST_MODE': 'automated'}), self.assertRaises(MigrationError):
+            self.observation.verify()
+        self.observation.verify()
+        self.guest.assert_not_called()
+
+    def test_manual_input_flows_through_real_collector_without_ssh(self):
+        manual = self.make_manual()
+        manual['plan_hash'] = evidence.sha({})
+        raw = json.dumps(manual)
+        env = dict(self.env, GITHUB_ACTOR='operator', COORDINATION_ACK='accepted',
+                   MANUAL_GUESTS_JSON=raw, MANUAL_GUESTS_SHA256=hashlib.sha256(raw.encode()).hexdigest())
+        reader = Mock(deadline=time.monotonic()+1800)
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            root = Path(temporary)
+            (root/'supabase/recovery').mkdir(parents=True)
+            (root/'supabase/recovery/retained-storage-v1.json').write_text('{}')
+            stack.enter_context(patch.object(collector, 'ROOT', root))
+            stack.enter_context(patch.object(collector, 'verify_dispatch'))
+            for function, key in [('receiver_provenance', 'receiver_provenance'),
+                                  ('verify_canary', 'canary_provenance'), ('host_provenance', 'host_provenance')]:
+                stack.enter_context(patch.object(collector, function, return_value=self.doc[key]))
+            def private(_, secret, start, end):
+                return dict(self.doc['database_bindings'][secret], observed_at=end)
+            bindings = stack.enter_context(patch.object(collector, 'private_binding', side_effect=private))
+            stack.enter_context(patch.object(collector, 'utc', return_value=self.stamp(self.now)))
+            output = collector.collect(reader, 'a'*40, env)
+            self.assertEqual(output['manual_guests'], manual)
+            self.assertEqual(output['hosts'], manual['hosts'])
+            self.assertEqual(bindings.call_count, 2)
+            self.guest.assert_not_called()
+            self.assertEqual(len(self.inventory.call_args_list[0].args), 1)
+            for call in self.inventory.call_args_list[1:]:
+                self.assertEqual(call.args[1], output['deletion_history'])
+
+    def test_manual_capture_expiring_during_observation_issues_no_lease(self):
+        self.make_manual(age=1790)
+        self.clock.side_effect = [self.now, self.now+11]
+        with self.assertRaisesRegex(MigrationError, 'stale'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
 
     def test_schema_one_and_two_cannot_renew_an_old_artifact(self):
         for schema in (1, 2):
@@ -519,6 +770,7 @@ class ConsumerFreshnessTest(unittest.TestCase):
 
     def test_inventory_and_secret_changes_before_or_during_observation_reject(self):
         self.observation.verify()
+        self.clock.return_value = self.now+180
         for field in ('instances', 'versions_database-url-usw2', 'versions_database-url'):
             changed = copy.deepcopy(self.state)
             changed[field].append({'unexpected': True})
@@ -532,6 +784,7 @@ class ConsumerFreshnessTest(unittest.TestCase):
 
     def test_guest_change_and_second_mutation_check_failure_reject(self):
         self.observation.verify()
+        self.clock.return_value = self.now+180
         changed = copy.deepcopy(self.doc['hosts'][0])
         changed['observation']['services'][0]['process']['start_ticks'] = '200'
         self.guest.return_value = changed
@@ -548,11 +801,12 @@ class ConsumerFreshnessTest(unittest.TestCase):
         self.observation.verify()
         # Download/authentication precede this timer; the live window itself
         # includes both cloud snapshots and guest observations.
-        self.clock.side_effect = [self.now, self.now+121, self.now+121]
+        self.clock.side_effect = [self.now+180, self.now+301, self.now+301]
         with self.assertRaisesRegex(MigrationError, 'expired'):
             self.observation.verify()
         self.assertIsNone(self.observation.valid_until)
         self.clock.side_effect = None
+        self.clock.return_value = self.now+301
         self.observation.deadline = time.monotonic()-1
         with self.assertRaisesRegex(MigrationError, 'deadline exceeded'):
             self.observation.verify()
