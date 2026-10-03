@@ -1,0 +1,285 @@
+{
+  "terraform_version": "1.16.1",
+  "cases": {
+    "identity_only": {
+      "known": {
+        "artifact": {
+          "actions": [
+            "no-op"
+          ],
+          "before": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      },
+      "replacement": {
+        "artifact": {
+          "actions": [
+            "update"
+          ],
+          "before": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "migration": {
+          "actions": [
+            "update"
+          ],
+          "before": {
+            "input": {
+              "baseline": "logging: {}",
+              "deadline": "2099-01-01T00:00:00Z",
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                "123456"
+              ],
+              "legacy_policy_name": "legacy-policy",
+              "phase": "preserve",
+              "retired": "{}",
+              "verified_instance_ids": []
+            }
+          },
+          "after": {
+            "input": {
+              "baseline": "logging: {}",
+              "deadline": "2099-01-01T00:00:00Z",
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                null
+              ],
+              "legacy_policy_name": "legacy-policy",
+              "phase": "preserve",
+              "retired": "{}",
+              "verified_instance_ids": []
+            }
+          },
+          "after_unknown": {
+            "input": {
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                true
+              ],
+              "verified_instance_ids": []
+            }
+          }
+        }
+      }
+    },
+    "phase_change": {
+      "known": {
+        "artifact": {
+          "actions": [
+            "update"
+          ],
+          "before": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"overlap\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      },
+      "replacement": {
+        "artifact": {
+          "actions": [
+            "update"
+          ],
+          "before": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "migration": {
+          "actions": [
+            "update"
+          ],
+          "before": {
+            "input": {
+              "baseline": "logging: {}",
+              "deadline": "2099-01-01T00:00:00Z",
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                "123456"
+              ],
+              "legacy_policy_name": "legacy-policy",
+              "phase": "preserve",
+              "retired": "{}",
+              "verified_instance_ids": []
+            }
+          },
+          "after": {
+            "input": {
+              "baseline": "logging: {}",
+              "deadline": "2099-01-01T00:00:00Z",
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                null
+              ],
+              "legacy_policy_name": "legacy-policy",
+              "phase": "preserve",
+              "retired": "{}",
+              "verified_instance_ids": []
+            }
+          },
+          "after_unknown": {
+            "input": {
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                true
+              ],
+              "verified_instance_ids": []
+            }
+          }
+        }
+      }
+    },
+    "deadline_change": {
+      "known": {
+        "artifact": {
+          "actions": [
+            "update"
+          ],
+          "before": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-02-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      },
+      "replacement": {
+        "artifact": {
+          "actions": [
+            "update"
+          ],
+          "before": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "migration": {
+          "actions": [
+            "update"
+          ],
+          "before": {
+            "input": {
+              "baseline": "logging: {}",
+              "deadline": "2099-01-01T00:00:00Z",
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                "123456"
+              ],
+              "legacy_policy_name": "legacy-policy",
+              "phase": "preserve",
+              "retired": "{}",
+              "verified_instance_ids": []
+            }
+          },
+          "after": {
+            "input": {
+              "baseline": "logging: {}",
+              "deadline": "2099-01-01T00:00:00Z",
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                null
+              ],
+              "legacy_policy_name": "legacy-policy",
+              "phase": "preserve",
+              "retired": "{}",
+              "verified_instance_ids": []
+            }
+          },
+          "after_unknown": {
+            "input": {
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                true
+              ],
+              "verified_instance_ids": []
+            }
+          }
+        }
+      }
+    },
+    "baseline_change": {
+      "known": {
+        "artifact": {
+          "actions": [
+            "update"
+          ],
+          "before": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after": "{\"baseline\":\"logging: {receivers: {}}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      },
+      "replacement": {
+        "artifact": {
+          "actions": [
+            "update"
+          ],
+          "before": "{\"baseline\":\"logging: {}\",\"deadline\":\"2099-01-01T00:00:00Z\",\"drained_instance_ids\":[],\"initialize_instance_ids\":[],\"instance_ids\":[\"123456\"],\"legacy_policy_name\":\"legacy-policy\",\"phase\":\"preserve\",\"retired\":\"{}\",\"verified_instance_ids\":[]}",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "migration": {
+          "actions": [
+            "update"
+          ],
+          "before": {
+            "input": {
+              "baseline": "logging: {}",
+              "deadline": "2099-01-01T00:00:00Z",
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                "123456"
+              ],
+              "legacy_policy_name": "legacy-policy",
+              "phase": "preserve",
+              "retired": "{}",
+              "verified_instance_ids": []
+            }
+          },
+          "after": {
+            "input": {
+              "baseline": "logging: {}",
+              "deadline": "2099-01-01T00:00:00Z",
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                null
+              ],
+              "legacy_policy_name": "legacy-policy",
+              "phase": "preserve",
+              "retired": "{}",
+              "verified_instance_ids": []
+            }
+          },
+          "after_unknown": {
+            "input": {
+              "drained_instance_ids": [],
+              "initialize_instance_ids": [],
+              "instance_ids": [
+                true
+              ],
+              "verified_instance_ids": []
+            }
+          }
+        }
+      }
+    }
+  }
+}

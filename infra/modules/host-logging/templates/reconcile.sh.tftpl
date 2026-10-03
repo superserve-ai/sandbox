@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -euo pipefail
+state_dir='${state_dir}'
+candidate='${candidate_config_path}'
+service_candidate='${candidate_service_path}'
+active_config=/etc/superserve/host-logging/otel-logs.yaml
+active_service=/etc/systemd/system/superserve-otel-logs.service
+identity_file=/etc/sandbox/host-identity.json
+identity_env=/etc/sandbox/host-logging-identity.env
+binary='${otel_binary_path}'
+cursor='${cursor_dir}'
+queue='${queue_dir}'
+dropin=/etc/systemd/journald.conf.d/30-superserve-host-logging.conf
+heartbeat_service=/etc/systemd/system/superserve-host-logging-heartbeat.service
+heartbeat_timer=/etc/systemd/system/superserve-host-logging-heartbeat.timer
+metrics_dropin=/etc/systemd/system/superserve-otel-collector.service.d/30-host-logging-priority.conf
+legacy_enabled=${legacy_enabled}
+legacy_helper="$state_dir/legacy-migration.py"
+check=0
+[ "$${1:-}" != --check ] || check=1
+
+if [ "$legacy_enabled" -eq 1 ]; then
+  chmod 0600 "$state_dir/legacy-migration.json"
+  python3 "$legacy_helper" --preflight
+  phase=$(python3 "$legacy_helper" --phase)
+  if [ "$phase" = preserve ] || [ "$phase" = rollback ]; then
+    if [ "$check" -eq 1 ]; then exec python3 "$legacy_helper" --check; fi
+    exec python3 "$legacy_helper" --enforce
+  fi
+fi
+
+# A missing or corrupt authoritative identity is an error, never a new identity.
+identity=$(python3 - "$identity_file" <<'PY'
+import json, re, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for name, key in [('HOST_ID','host_id'), ('INSTANCE_ID','instance_id'), ('INCARNATION_ID','incarnation_id')]:
+    value = data.get(key)
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
+        raise SystemExit('invalid host identity')
+    print(f'{name}={value}')
+PY
+) || exit 1
+if [ "$check" -eq 1 ] && [ ! -d "$state_dir" ]; then exit 101; fi
+mkdir -p "$state_dir"
+chmod 0700 "$state_dir"
+exec 9>"$state_dir/reconcile.lock"
+flock -n 9 || exit 1
+# Interrupted attempts contain only candidate archives and backups, never delivery state.
+if [ "$check" -eq 0 ]; then
+  find "$state_dir" -mindepth 1 -maxdepth 1 -type d -name '.attempt.*' -exec rm -rf -- {} +
+fi
+attempt=$(mktemp -d "$state_dir/.attempt.XXXXXX")
+trap 'rm -rf -- "$attempt"' EXIT
+printf '%s\n' "$identity" > "$attempt/identity.env"
+set -a
+. "$attempt/identity.env"
+set +a
+
+cat > "$attempt/journald.conf" <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=${journal_max_use_bytes}B
+SystemKeepFree=${journal_keep_free_bytes}B
+EOF
+cat > "$attempt/heartbeat.service" <<'EOF'
+[Unit]
+Description=Superserve host logging heartbeat
+[Service]
+Type=oneshot
+ExecStart=/bin/echo host-logging-heartbeat
+StandardOutput=journal
+EOF
+cat > "$attempt/heartbeat.timer" <<'EOF'
+[Unit]
+Description=Superserve host logging heartbeat timer
+[Timer]
+OnBootSec=${heartbeat_interval_seconds}s
+OnUnitActiveSec=${heartbeat_interval_seconds}s
+Unit=superserve-host-logging-heartbeat.service
+[Install]
+WantedBy=timers.target
+EOF
+cat > "$attempt/metrics.conf" <<'EOF'
+[Service]
+CPUWeight=1
+IOWeight=1
+OOMScoreAdjust=800
+TimeoutStartSec=15s
+TimeoutStopSec=15s
+MemoryHigh=192M
+MemoryMax=256M
+EOF
+
+sources=("$candidate" "$service_candidate" "$attempt/identity.env" "$attempt/journald.conf" "$attempt/heartbeat.service" "$attempt/heartbeat.timer" "$attempt/metrics.conf")
+targets=("$active_config" "$active_service" "$identity_env" "$dropin" "$heartbeat_service" "$heartbeat_timer" "$metrics_dropin")
+modes=(644 644 600 644 644 644 644)
+changed=0
+if [ "$legacy_enabled" -eq 1 ]; then
+  python3 "$legacy_helper" --check && rc=0 || rc=$?
+  [ "$rc" -eq 100 ] || changed=1
+fi
+for i in "$${!targets[@]}"; do
+  cmp -s "$${sources[$i]}" "$${targets[$i]}" || changed=1
+  [ "$(stat -c '%a' "$${targets[$i]}" 2>/dev/null || true)" = "$${modes[$i]}" ] || changed=1
+done
+binary_current=0
+if [ -x "$binary" ] && [ "$("$binary" --version)" = 'otelcol-contrib version ${otel_release_version}' ]; then binary_current=1; fi
+[ "$binary_current" -eq 1 ] || changed=1
+for directory in "$cursor" "$queue"; do
+  [ "$(stat -c '%a' "$directory" 2>/dev/null || true)" = 700 ] || changed=1
+done
+for unit in superserve-otel-logs.service superserve-host-logging-heartbeat.timer; do
+  systemctl is-enabled --quiet "$unit" && systemctl is-active --quiet "$unit" || changed=1
+done
+metrics_oom_matches() {
+  local pid score
+  pid=$(systemctl show superserve-otel-collector.service --property=MainPID --value) || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  score=$(cat "/proc/$pid/oom_score_adj") || return 1
+  [ "$score" = "$1" ] && [ "$pid" = "$(systemctl show superserve-otel-collector.service --property=MainPID --value)" ]
+}
+wait_metrics_oom() {
+  for retry in {1..20}; do
+    if systemctl is-active --quiet superserve-otel-collector.service && metrics_oom_matches "$1"; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+if systemctl is-active --quiet superserve-otel-collector.service; then
+  metrics_oom_matches 800 || changed=1
+fi
+if [ "$check" -eq 1 ]; then
+  [ "$changed" -eq 0 ] || exit 101
+  "$binary" validate --config "$active_config" >/dev/null 2>&1 || exit 101
+  exit 100
+fi
+[ "$changed" -ne 0 ] || exit 100
+
+# Budget the archive, extracted binary, rollback backup, and atomic install copy.
+# The durable database cap is enforced by file_storage, not this preflight.
+free=$(df -Pk "$state_dir" | awk 'NR==2 {printf "%.0f", $4 * 1024}')
+reserve=$(( ${journal_keep_free_bytes} + ${otel_queue_max_bytes} + 2147483648 ))
+[ -n "$free" ] && [ "$free" -ge "$reserve" ]
+staged_binary="$binary"
+if [ "$binary_current" -eq 0 ]; then
+  timeout '${package_operation_timeout_seconds}s' curl --fail --location --silent --show-error --max-filesize 536870912 --proto '=https' --tlsv1.2 '${otel_release_url}' -o "$attempt/release.tar.gz"
+  echo '${otel_release_sha256}  '"$attempt/release.tar.gz" | sha256sum -c - >/dev/null
+  mkdir "$attempt/release"
+  tar -xzf "$attempt/release.tar.gz" -C "$attempt/release" otelcol-contrib
+  staged_binary="$attempt/release/otelcol-contrib"
+fi
+"$staged_binary" validate --config "$candidate"
+sed "s|^ExecStart=$binary |ExecStart=$staged_binary |" "$service_candidate" > "$attempt/superserve-otel-logs.service"
+systemd-analyze verify "$attempt/superserve-otel-logs.service" "$attempt/heartbeat.service" "$attempt/heartbeat.timer"
+
+# Capture service state and every activation target before changing any file.
+sources+=("$staged_binary")
+targets+=("$binary")
+modes+=(755)
+was_active=0
+systemctl is-active --quiet superserve-otel-logs.service && was_active=1 || true
+heartbeat_active=0
+systemctl is-active --quiet superserve-host-logging-heartbeat.timer && heartbeat_active=1 || true
+journal_changed=0
+cmp -s "$attempt/journald.conf" "$dropin" || journal_changed=1
+metrics_runtime_properties=()
+metrics_runtime_changed=0
+metrics_restart_started=0
+metrics_dropin_changed=0
+cmp -s "$attempt/metrics.conf" "$metrics_dropin" || metrics_dropin_changed=1
+if systemctl is-active --quiet superserve-otel-collector.service; then
+  properties=$(systemctl show superserve-otel-collector.service --property=CPUWeight --property=IOWeight --property=MemoryHigh --property=MemoryMax)
+  while IFS='=' read -r key value; do
+    case "$key" in
+      CPUWeight|IOWeight)
+        if [ "$value" = 18446744073709551615 ]; then value=; else [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 10000 ]; fi
+        ;;
+      MemoryHigh|MemoryMax) [[ "$value" =~ ^[0-9]+$|^infinity$ ]] ;;
+      *) exit 1 ;;
+    esac
+    metrics_runtime_properties+=("$key=$value")
+  done <<< "$properties"
+  [ "$${#metrics_runtime_properties[@]}" -eq 4 ]
+fi
+activation_started=0
+activation_committed=0
+changed_targets=()
+for i in "$${!targets[@]}"; do
+  if [ -e "$${targets[$i]}" ]; then cp -a "$${targets[$i]}" "$attempt/backup.$i"; fi
+done
+rollback() {
+  rc=$?
+  trap - EXIT INT TERM
+  if [ "$activation_committed" -ne 1 ]; then
+    for i in "$${changed_targets[@]}"; do
+      if [ -e "$attempt/backup.$i" ]; then
+        cp -a "$attempt/backup.$i" "$${targets[$i]}.rollback"
+        mv -f "$${targets[$i]}.rollback" "$${targets[$i]}"
+      else rm -f "$${targets[$i]}"; fi
+    done
+    systemctl daemon-reload || true
+    if [ "$metrics_runtime_changed" -eq 1 ]; then
+      systemctl set-property --runtime superserve-otel-collector.service "$${metrics_runtime_properties[@]}" || true
+    fi
+    if [ "$${#metrics_runtime_properties[@]}" -eq 4 ] && { [ "$metrics_restart_started" -eq 1 ] || [ "$metrics_dropin_changed" -eq 1 ]; }; then
+      # Restore configured behavior, including any preexisting live-process drift.
+      systemctl restart superserve-otel-collector.service || true
+      restored_score=$(systemctl show superserve-otel-collector.service --property=OOMScoreAdjust --value) || restored_score=
+      wait_metrics_oom "$restored_score" || echo 'Metrics OOM priority rollback verification failed.' >&2
+    fi
+    if [ "$activation_started" -eq 1 ]; then
+      if [ "$was_active" -eq 1 ]; then systemctl restart superserve-otel-logs.service || true; else systemctl disable --now superserve-otel-logs.service || true; fi
+      if [ "$heartbeat_active" -eq 0 ]; then systemctl disable --now superserve-host-logging-heartbeat.timer || true; fi
+      if [ "$journal_changed" -eq 1 ]; then systemctl restart systemd-journald.service || true; fi
+    fi
+  fi
+  rm -rf -- "$attempt"
+  exit "$rc"
+}
+trap rollback EXIT
+trap 'exit 1' INT TERM
+mkdir -p "$cursor" "$queue"
+chmod 0700 "$cursor" "$queue"
+for i in "$${!targets[@]}"; do
+  if ! cmp -s "$${sources[$i]}" "$${targets[$i]}" || [ "$(stat -c '%a' "$${targets[$i]}" 2>/dev/null || true)" != "$${modes[$i]}" ]; then
+    mkdir -p "$(dirname "$${targets[$i]}")"
+    install -m "$${modes[$i]}" "$${sources[$i]}" "$${targets[$i]}.candidate"
+    changed_targets+=("$i")
+    mv -f "$${targets[$i]}.candidate" "$${targets[$i]}"
+  fi
+done
+systemctl daemon-reload
+activation_started=1
+if [ "$journal_changed" -eq 1 ]; then
+  systemctl restart systemd-journald.service
+  journalctl --flush
+fi
+if [ "$legacy_enabled" -eq 1 ] && [ "$phase" != retire ]; then
+  python3 "$legacy_helper" --enforce && rc=0 || rc=$?
+  [ "$rc" -eq 100 ]
+fi
+systemctl enable --now superserve-host-logging-heartbeat.timer
+systemctl enable superserve-otel-logs.service
+systemctl restart superserve-otel-logs.service
+sleep 2
+systemctl is-active --quiet superserve-otel-logs.service
+systemctl is-active --quiet superserve-host-logging-heartbeat.timer
+# Restore the previous runtime properties if this or the legacy cutover fails.
+if [ "$${#metrics_runtime_properties[@]}" -eq 4 ]; then
+  metrics_runtime_changed=1
+  systemctl set-property --runtime superserve-otel-collector.service CPUWeight=1 IOWeight=1 MemoryHigh=192M MemoryMax=256M
+  # Execution properties do not update an already-running process on daemon-reload.
+  if ! metrics_oom_matches 800; then
+    metrics_restart_started=1
+    systemctl restart superserve-otel-collector.service
+    wait_metrics_oom 800
+  fi
+fi
+if [ "$legacy_enabled" -eq 1 ]; then
+  python3 "$legacy_helper" --enforce && rc=0 || rc=$?
+  [ "$rc" -eq 100 ]
+fi
+activation_committed=1
+exit 100

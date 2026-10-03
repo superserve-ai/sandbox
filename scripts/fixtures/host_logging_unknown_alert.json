@@ -1,0 +1,137 @@
+{
+  "terraform_version": "1.16.1",
+  "cases": {
+    "identity_only": {
+      "known": {
+        "filter": {
+          "actions": [
+            "no-op"
+          ],
+          "before": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"true\"",
+          "after": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"true\"",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "query": {
+          "actions": [
+            "no-op"
+          ],
+          "before": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[5m])) or vector(0)) == 0",
+          "after": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[5m])) or vector(0)) == 0",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      },
+      "replacement": {
+        "filter": {
+          "actions": [
+            "update"
+          ],
+          "before": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"true\"",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "query": {
+          "actions": [
+            "update"
+          ],
+          "before": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[5m])) or vector(0)) == 0",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      }
+    },
+    "window_change": {
+      "known": {
+        "filter": {
+          "actions": [
+            "no-op"
+          ],
+          "before": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"true\"",
+          "after": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"true\"",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "query": {
+          "actions": [
+            "update"
+          ],
+          "before": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[5m])) or vector(0)) == 0",
+          "after": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[60m])) or vector(0)) == 0",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      },
+      "replacement": {
+        "filter": {
+          "actions": [
+            "update"
+          ],
+          "before": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"true\"",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "query": {
+          "actions": [
+            "update"
+          ],
+          "before": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[5m])) or vector(0)) == 0",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      }
+    },
+    "predicate_change": {
+      "known": {
+        "filter": {
+          "actions": [
+            "update"
+          ],
+          "before": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"true\"",
+          "after": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"false\"",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "query": {
+          "actions": [
+            "no-op"
+          ],
+          "before": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[5m])) or vector(0)) == 0",
+          "after": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[5m])) or vector(0)) == 0",
+          "after_unknown": false,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      },
+      "replacement": {
+        "filter": {
+          "actions": [
+            "update"
+          ],
+          "before": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123456\" AND labels.host_logging_heartbeat=\"true\"",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        },
+        "query": {
+          "actions": [
+            "update"
+          ],
+          "before": "(sum(sum_over_time({\"collector_host_id\" = \"123456\"}[5m])) or vector(0)) == 0",
+          "after_unknown": true,
+          "before_sensitive": false,
+          "after_sensitive": false
+        }
+      }
+    }
+  }
+}
