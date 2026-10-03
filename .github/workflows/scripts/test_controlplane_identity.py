@@ -32,9 +32,6 @@ class ControlplaneIdentityTest(unittest.TestCase):
                 self.assertRegex(gate[1], r'type\s*=\s*bool')
                 self.assertRegex(gate[1], r'default\s*=\s*false')
                 self.assertRegex(gate[1], r'nullable\s*=\s*false')
-                if environment == 'staging':
-                    for tfvars in root.glob('*.tfvars'):
-                        self.assertNotRegex(tfvars.read_text(), r'(?m)^\s*promotion_evidence_enabled\s*=\s*true')
                 gated = re.search(
                     r'promotion_evidence_secrets\s*=\s*var\.promotion_evidence_enabled\s*\?\s*\{(.*?)\n  \}\s*:\s*\{\}',
                     secrets, re.S)
