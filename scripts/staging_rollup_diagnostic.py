@@ -371,6 +371,16 @@ def main():
             except Exception as error:
                 result[name] = {'status': 'unknown', 'reason': diagnostic_category(error)}
                 result['capabilities'][name] = 'unknown'
+        fixed_hour = os.environ.get('ROLLUP_FIXED_HOUR', '')
+        if fixed_hour:
+            try:
+                if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z', fixed_hour):
+                    raise DiagnosticError('invalid_fixed_hour')
+                dt.datetime.fromisoformat(fixed_hour.replace('Z', '+00:00'))
+                query = Path(__file__).with_name('staging_rollup_fixed_hour.sql').read_text().replace('__FIXED_HOUR_START_UTC__', fixed_hour).strip().rstrip(';')
+                result['fixed_hour'] = sql(reader, 'SELECT row_to_json(comparison) FROM ('+query+') comparison')
+            except Exception as error:
+                result['fixed_hour'] = {'status': 'unknown', 'reason': diagnostic_category(error)}
         result['status'] = 'observed' if all(v == 'observed' for v in result['capabilities'].values()) else 'partial'
     except Exception:
         result['reason'] = 'Staging dispatch gate failed; diagnostics suppressed'

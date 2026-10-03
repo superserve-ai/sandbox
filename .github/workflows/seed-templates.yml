@@ -65,6 +65,10 @@ on:
         type: choice
         default: not-approved
         options: [not-approved, accepted]
+      rollup_fixed_hour:
+        description: Optional closed UTC hour for read-only raw versus hourly comparison
+        required: false
+        type: string
       receiver_revision:
         description: 'Exact reviewed branch commit for the staging receiver diagnostic'
         required: false
@@ -155,6 +159,7 @@ jobs:
       FORCE_REBUILD: ${{ inputs.force_rebuild }}
       RECEIVER_DIAGNOSTIC: ${{ inputs.receiver_diagnostic }}
       ROLLUP_DIAGNOSTIC: ${{ inputs.rollup_diagnostic }}
+      ROLLUP_FIXED_HOUR: ${{ inputs.rollup_fixed_hour }}
       APPROVED_REVISION: ${{ inputs.receiver_revision }}
     steps:
       - uses: actions/checkout@v4
