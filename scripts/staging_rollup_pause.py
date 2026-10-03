@@ -100,7 +100,15 @@ def wait_ready(reader, expected, original, desired_flag):
     for _ in range(30):
         current = service(reader)
         require(same_configuration(current, original) and flag(current) == desired_flag, 'configuration_drift')
-        if ready(current, expected):
+        revision = diagnostic.cloud(reader, 'run', 'revisions', 'describe', expected, '--region='+REGION)
+        status = revision.get('status', {})
+        # An unrouted revision can be ready but retired. The service's latest
+        # ready pointer need not move until this revision receives traffic.
+        if (current['status'].get('latestCreatedRevisionName') == expected
+                and current['metadata'].get('generation') == current['status'].get('observedGeneration')
+                and revision['metadata'].get('generation') == status.get('observedGeneration')
+                and status.get('imageDigest') == IMAGE
+                and any(c.get('type') == 'Ready' and c.get('status') == 'True' for c in status.get('conditions', []))):
             return current
         time.sleep(2)
     raise diagnostic.DiagnosticError('revision_readiness_timeout')
@@ -115,7 +123,8 @@ def change(reader, original, desired_flag, suffix):
     wait_ready(reader, expected, original, desired_flag)
     mutate(reader, 'update-traffic', SERVICE, '--to-revisions='+expected+'=100')
     current = service(reader)
-    require(route_is(current, expected) and same_configuration(current, original), 'traffic_transition_failed')
+    require(ready(current, expected) and route_is(current, expected)
+            and same_configuration(current, original), 'traffic_transition_failed')
     with urlopen(current['status']['url']+'/health', timeout=15) as response:
         require(response.status == 200, 'serving_health_failed')
     return expected
