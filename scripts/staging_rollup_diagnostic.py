@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -24,6 +25,8 @@ SETTINGS = (
     'BILLING_HOURLY_ROLLUP_WORKER_POLL', 'BILLING_HOURLY_ROLLUP_LOCK_DURATION',
     'BILLING_HOURLY_ROLLUP_LEASE_DURATION', 'BILLING_HOURLY_ROLLUP_MAX_ATTEMPTS',
     'BILLING_HOURLY_ROLLUP_LOOKBACK_HOURS', 'BILLING_HOURLY_ROLLUP_WORKERS',
+    'BILLING_HOURLY_ROLLUP_BACKFILL_LOOKBACK_HOURS',
+    'BILLING_HOURLY_ROLLUP_BACKFILL_BATCH_HOURS', 'BILLING_HOURLY_ROLLUP_BATCH_SIZE',
 )
 TABLES = {
     'billing_rollup_scheduler_lease', 'billing_rollup_job',
@@ -46,9 +49,94 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+class DiagnosticError(Exception):
+    """Carries only a fixed, non-sensitive failure category."""
+
+
+def diagnostic_category(error):
+    if isinstance(error, DiagnosticError):
+        return error.args[0]
+    if isinstance(error, HTTPError):
+        return 'http_'+str(int(error.code))
+    if isinstance(error, (subprocess.TimeoutExpired, TimeoutError)):
+        return 'timeout'
+    if isinstance(error, FileNotFoundError):
+        return 'command_unavailable'
+    if isinstance(error, json.JSONDecodeError):
+        return 'output_parse_failed'
+    if isinstance(error, (URLError, ConnectionError)):
+        return 'network_unavailable'
+    return 'observation_unavailable'
+
+
+def classify_stderr(stderr):
+    # Match locally; never serialize provider diagnostics or their arguments.
+    text = stderr.lower()
+    patterns = (
+        ('unsupported startup parameter', 'unsupported_startup_parameter'),
+        ('invalid uri query parameter', 'invalid_uri_query_parameter'),
+        ('tenant or user not found', 'database_tenant_or_user_not_found'),
+        ('password authentication failed', 'database_authentication_failed'),
+        ('permission denied', 'permission_denied'),
+        ('permission_denied', 'permission_denied'),
+        ('does not have permission', 'permission_denied'),
+        ('insufficient privilege', 'permission_denied'),
+        ('access denied', 'permission_denied'),
+        ('unrecognized arguments', 'command_arguments_rejected'),
+        ('invalid choice', 'command_arguments_rejected'),
+        ('network is unreachable', 'network_unreachable'),
+        ('could not translate host name', 'hostname_resolution_failed'),
+        ('name or service not known', 'hostname_resolution_failed'),
+        ('connection refused', 'connection_refused'),
+        ('connection timed out', 'connection_timeout'),
+        ('timeout', 'timeout'),
+        ('timed out', 'timeout'),
+        ('does not exist', 'database_object_missing'),
+        ('invalid connection option', 'invalid_connection_option'),
+        ('invalid uri', 'invalid_connection_uri'),
+    )
+    return next((category for needle, category in patterns if needle in text), 'command_failed')
+
+
+def command(reader, args, *, env=None, timeout=60, reject_stderr=False):
+    remaining = reader.deadline-time.monotonic()
+    if remaining <= 0:
+        raise DiagnosticError('collection_deadline_expired')
+    try:
+        result = subprocess.run(args, env=env, capture_output=True, text=True,
+                                timeout=min(timeout, remaining))
+    except FileNotFoundError:
+        raise DiagnosticError('psql_unavailable' if args[0] == 'psql' else 'gcloud_unavailable') from None
+    if result.returncode:
+        raise DiagnosticError(classify_stderr(result.stderr))
+    if reject_stderr and result.stderr:
+        category = classify_stderr(result.stderr)
+        raise DiagnosticError(category if category != 'command_failed' else 'provider_warning_completeness_unknown')
+    if len(result.stdout) > 2_000_000:
+        raise DiagnosticError('output_bound_exceeded')
+    return result.stdout
+
+
 def cloud(reader, *args):
-    return json.loads(reader.command(['gcloud', *args, '--project='+PROJECT,
-                                     '--format=json', '--quiet', '--verbosity=warning'], reject_stderr=True))
+    env = dict(os.environ, CLOUDSDK_CORE_LOG_HTTP='false', CLOUDSDK_CORE_DISABLE_FILE_LOGGING='true',
+               CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR='false')
+    return json.loads(command(reader, ['gcloud', *args, '--project='+PROJECT,
+                                      '--format=json', '--quiet', '--verbosity=warning'],
+                              env=env, reject_stderr=True))
+
+
+def safe_scaling(resource):
+    annotations = resource.get('metadata', {}).get('annotations', {})
+    result = {}
+    for key in ('run.googleapis.com/minScale', 'run.googleapis.com/maxScale',
+                'autoscaling.knative.dev/minScale', 'autoscaling.knative.dev/maxScale'):
+        if key not in annotations:
+            result[key] = {'presence': 'absent'}
+        elif re.fullmatch(r'[0-9]{1,9}', str(annotations[key])):
+            result[key] = {'presence': 'literal', 'value': str(annotations[key])}
+        else:
+            result[key] = {'presence': 'unrecognized', 'value': None}
+    return result
 
 
 def safe_settings(container):
@@ -80,11 +168,15 @@ def service_baseline(reader):
         # Only immutable container references leave this process.
         immutable = image if re.fullmatch(r'[A-Za-z0-9./_:-]+@sha256:[a-f0-9]{64}', image) else None
         summaries.append({'revision': revision['metadata']['name'], 'immutable_image': immutable,
-                          'config_sha256': digest(spec), 'container_count': len(containers),
+                          'config_sha256': digest({'spec': spec, 'annotations': revision.get('metadata', {}).get('annotations', {})}),
+                          'scaling_annotations': safe_scaling(revision), 'container_count': len(containers),
                           'rollup_settings': safe_settings(containers[0]) if len(containers) == 1 else None,
                           'ready': next((c.get('status') for c in status.get('conditions', [])
                                          if c.get('type') == 'Ready'), None)})
-    return {'status': 'observed', 'config_sha256': digest(service.get('spec', {})),
+    return {'status': 'observed',
+            'config_sha256': digest({'spec': service.get('spec', {}), 'annotations': service.get('metadata', {}).get('annotations', {})}),
+            'service_scaling_annotations': safe_scaling(service),
+            'template_scaling_annotations': safe_scaling(service.get('spec', {}).get('template', {})),
             'latest_ready_revision': service.get('status', {}).get('latestReadyRevisionName'),
             'traffic': [{k: t[k] for k in ('revisionName', 'percent', 'latestRevision', 'tag') if k in t}
                         for t in service.get('status', {}).get('traffic', [])],
@@ -93,7 +185,8 @@ def service_baseline(reader):
 
 
 def monitoring(reader, started, ended):
-    token = reader.command(['gcloud', 'auth', 'print-access-token']).strip()
+    token = command(reader, ['gcloud', 'auth', 'print-access-token'], env=dict(
+        os.environ, CLOUDSDK_CORE_LOG_HTTP='false', CLOUDSDK_CORE_DISABLE_FILE_LOGGING='true')).strip()
     query = {'filter': 'metric.type="run.googleapis.com/container/instance_count" '
                        'AND resource.type="cloud_run_revision" '
                        'AND resource.labels.service_name="'+SERVICE+'" '
@@ -159,13 +252,10 @@ def sql(reader, statement):
         raise ValueError('deadline')
     env = dict(os.environ, PGCONNECT_TIMEOUT='10', PGOPTIONS='')
     env['PGDATABASE'] = env.pop('DATABASE_URL')
-    result = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c',
+    output = command(reader, ['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c',
                              "BEGIN READ ONLY; SET LOCAL statement_timeout='10s'; SET LOCAL lock_timeout='250ms'; "
-                             +statement+'; COMMIT;'], env=env, capture_output=True, text=True,
-                            timeout=min(25, remaining))
-    if result.returncode or len(result.stdout) > 1_000_000:
-        raise ValueError('database observation unavailable; diagnostics suppressed')
-    return json.loads(result.stdout)
+                             +statement+'; COMMIT;'], env=env, timeout=25)
+    return json.loads(output)
 
 
 def database(reader):
@@ -206,8 +296,8 @@ def database(reader):
         try:
             result['observations'][table] = {'status': 'observed', 'aggregate': sql(reader,
                 'SELECT '+expression+' FROM public.'+table)}
-        except Exception:
-            result['observations'][table] = {'status': 'unknown_query_unavailable'}
+        except Exception as error:
+            result['observations'][table] = {'status': 'unknown_query_unavailable', 'reason': diagnostic_category(error)}
     try:
         result['activity'] = sql(reader, "SELECT json_build_object('query_text_visibility',"
             "(SELECT rolsuper OR pg_has_role(current_user,'pg_read_all_stats','MEMBER') FROM pg_roles WHERE rolname=current_user),"
@@ -216,8 +306,8 @@ def database(reader):
             "'unclassified_hidden',count(*) FILTER (WHERE query='<insufficient privilege>'),"
             "'oldest_rollup_query',min(query_start) FILTER (WHERE state='active' AND query ~* 'billing_rollup|team_billing_usage_hourly')) "
             "FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()")
-    except Exception:
-        result['activity'] = {'status': 'unknown_query_unavailable'}
+    except Exception as error:
+        result['activity'] = {'status': 'unknown_query_unavailable', 'reason': diagnostic_category(error)}
     if any(item.get('status') != 'observed' for item in result['observations'].values()) or result['activity'].get('status') == 'unknown_query_unavailable':
         result['status'] = 'partial'
     result['active_usage_proven'] = False
@@ -250,8 +340,8 @@ def main():
             try:
                 result[name] = operation()
                 result['capabilities'][name] = result[name].get('status', 'observed')
-            except Exception:
-                result[name] = {'status': 'unknown', 'reason': 'Read capability unavailable; provider diagnostics suppressed'}
+            except Exception as error:
+                result[name] = {'status': 'unknown', 'reason': diagnostic_category(error)}
                 result['capabilities'][name] = 'unknown'
         result['status'] = 'observed' if all(v == 'observed' for v in result['capabilities'].values()) else 'partial'
     except Exception:
