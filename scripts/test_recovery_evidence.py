@@ -6,8 +6,9 @@ import hashlib
 import io
 import json
 import time
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import zipfile
 
 import recovery_evidence as evidence
@@ -110,10 +111,12 @@ class EvidenceTest(unittest.TestCase):
                                   'expired': False, 'size_in_bytes': len(data),
                                   'digest': 'sha256:' + hashlib.sha256(data).hexdigest()}]})
             return data if binary else json.dumps(run)
-        with patch.object(evidence, 'inventory', return_value=self.current):
+        with patch.object(evidence, 'inventory', return_value=self.current) as inventory:
             first = self.observation()
-            first.api = api
+            first.api = Mock(side_effect=api)
             first.verify()
+            self.assertEqual(first.api.call_count, 3)
+            first_digest, first_expiry = first.artifact_digest, first.valid_until
             self.document['completed_at'] = datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc).isoformat()
             self.document['revision_lifecycle_audit']['completed_at'] = self.document['completed_at']
             data = archive()
@@ -121,15 +124,61 @@ class EvidenceTest(unittest.TestCase):
             refreshed.api = api
             refreshed.verify()
             self.assertEqual(first.state_digest, refreshed.state_digest)
-            with self.assertRaisesRegex(MigrationError, 'integrity changed'):
+            # The already verified bytes remain pinned even if a later run's
+            # artifact is different. Every reuse still obtains live inventory.
+            for _ in range(30):
+                first.verify()
+            self.assertEqual(first.api.call_count, 3)
+            self.assertEqual(inventory.call_count, 32)
+            self.assertEqual((first.artifact_digest, first.valid_until), (first_digest, first_expiry))
+            changed = copy.deepcopy(self.current)
+            changed['service']['changed'] = True
+            inventory.return_value = changed
+            with self.assertRaisesRegex(MigrationError, 'inventory changed'):
+                first.verify()
+            inventory.return_value = self.current
+            with patch.object(evidence.time, 'time', side_effect=[self.now, first_expiry + 1]), self.assertRaisesRegex(
+                    MigrationError, 'stale'):
+                first.verify()
+            calls = inventory.call_count
+            with patch.object(evidence.time, 'time', return_value=first_expiry + 1), self.assertRaisesRegex(
+                    MigrationError, 'stale'):
+                first.verify()
+            self.assertEqual(inventory.call_count, calls)
+            first.run_id = '99'
+            with self.assertRaisesRegex(MigrationError, 'identity changed'):
                 first.verify()
             for key, wrong in [('head_sha', '1' * 40), ('path', '.github/workflows/other.yml'),
                                ('conclusion', 'failure'), ('repository', {'full_name': 'other/project'})]:
                 original = run[key]
                 run[key] = wrong
                 with self.subTest(key=key), self.assertRaises(MigrationError):
-                    refreshed.verify()
+                    unverified = self.observation()
+                    unverified.api = api
+                    unverified.verify()
                 run[key] = original
+
+    def test_live_inventory_reads_are_parallel_and_failure_is_not_cached(self):
+        barrier = threading.Barrier(3)
+        def command(args, deadline):
+            barrier.wait(timeout=5)
+            if 'services' in args:
+                return json.dumps(self.current['service'])
+            if 'revisions' in args:
+                return json.dumps(self.current['revisions'])
+            return json.dumps(self.current['instances'])
+        with patch.object(evidence, 'command', side_effect=command) as commands:
+            self.assertEqual(evidence.inventory(time.monotonic() + 10), self.current)
+            self.assertEqual(commands.call_count, 3)
+        observation = self.observation()
+        with patch.object(observation, 'load_artifact', return_value=(self.document, 'verified-digest')) as load:
+            with patch.object(evidence, 'inventory', side_effect=MigrationError('inventory unavailable')):
+                with self.assertRaisesRegex(MigrationError, 'inventory unavailable'):
+                    observation.verify()
+            self.assertIsNone(observation._document)
+            with patch.object(evidence, 'inventory', return_value=self.current):
+                observation.verify()
+            self.assertEqual(load.call_count, 2)
 
 
 if __name__ == '__main__':

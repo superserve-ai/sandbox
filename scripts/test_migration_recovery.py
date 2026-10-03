@@ -206,9 +206,13 @@ class RecoveryTest(fixture.MigrationCLITest):
         self.assertEqual(state["prefix"], 0)
         self.assertEqual(list(state["receipts"]), ["host"])
         self.runner.observation.valid_until = time.time() + 120
+        self.runner.observation.verify.reset_mock()
         self.runner.run(self.project, state)
         self.assertEqual(self.inspect()["prefix"], 24)
         self.assertTrue(self.inspect()["journal"][2])
+        # Five remaining preparations, 24 CLI transactions and completion.
+        # Read-only loop inspections must not fetch a redundant inventory.
+        self.assertEqual(self.runner.observation.verify.call_count, 30)
 
     def test_index_physical_state_change_requires_a_new_receipt(self):
         self.initialize()

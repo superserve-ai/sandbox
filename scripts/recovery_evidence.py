@@ -12,6 +12,7 @@ import re
 import subprocess
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 from migrate_database import MigrationError
 
@@ -53,12 +54,15 @@ def inventory(deadline):
     # Inspect every revision, including tagged, draining and zero-traffic ones.
     # The conservative admission below requires every observed revision to be
     # an audited incapable build, rather than inferring absence from traffic.
-    service = json.loads(command(["gcloud", "run", "services", "describe", SERVICE,
-                                  "--project", PROJECT, "--region", REGION, "--format=json"], deadline))
-    revisions = json.loads(command(["gcloud", "run", "revisions", "list", "--service", SERVICE,
-                                    "--project", PROJECT, "--region", REGION, "--format=json"], deadline))
-    hosts = json.loads(command(["gcloud", "compute", "instances", "list", "--project", PROJECT,
-                               "--format=json"], deadline))
+    queries = [
+        ["gcloud", "run", "services", "describe", SERVICE,
+         "--project", PROJECT, "--region", REGION, "--format=json"],
+        ["gcloud", "run", "revisions", "list", "--service", SERVICE,
+         "--project", PROJECT, "--region", REGION, "--format=json"],
+        ["gcloud", "compute", "instances", "list", "--project", PROJECT, "--format=json"],
+    ]
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        service, revisions, hosts = list(executor.map(lambda args: json.loads(command(args, deadline)), queries))
     require(isinstance(service, dict) and isinstance(revisions, list) and revisions and isinstance(hosts, list),
             "Cloud observation is incomplete")
     # Use the complete project instance inventory so an unlabelled/standby host
@@ -153,11 +157,13 @@ class Observation:
         self.artifact_digest = None
         self.state_digest = None
         self.valid_until = None
+        self._document = None
+        self._identity = (repository, revision, run_id, plan_hash, database_project)
 
     def api(self, path, binary=False):
         return command(["gh", "api", f"repos/{self.repository}/{path}"], self.deadline, binary=binary)
 
-    def verify(self):
+    def load_artifact(self):
         run = json.loads(self.api(f"actions/runs/{self.run_id}"))
         require(run.get("head_sha") == self.revision and run.get("head_branch") == "main"
                 and run.get("path") == COLLECTOR_WORKFLOW and run.get("event") == "workflow_dispatch"
@@ -173,12 +179,25 @@ class Observation:
         data = self.api(f"actions/artifacts/{int(artifact['id'])}/zip", binary=True)
         require(len(data) <= MAX_BYTES, "Recovery evidence download is oversized")
         digest = "sha256:" + hashlib.sha256(data).hexdigest()
-        require(digest == artifact.get("digest") and (self.artifact_digest is None or digest == self.artifact_digest),
+        require(digest == artifact.get("digest"),
                 "Recovery evidence artifact integrity changed")
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             require(archive.namelist() == ["evidence.json"] and archive.getinfo("evidence.json").file_size <= MAX_BYTES,
                     "Recovery evidence archive shape is invalid")
             document = json.loads(archive.read("evidence.json"))
+        return document, digest
+
+    def verify(self):
+        require(self._identity == (self.repository, self.revision, self.run_id, self.plan_hash, self.database_project),
+                "Recovery evidence identity changed")
+        # Keep the authenticated bytes only for this Observation. A fresh run
+        # requires a new instance; mutable cloud inventory is never cached.
+        if self._document is None:
+            document, digest = self.load_artifact()
+        else:
+            document, digest = self._document, self.artifact_digest
+        require(time.time() < timestamp(document["started_at"]) + MAX_AGE_SECONDS,
+                "Deployment evidence is stale")
         current = inventory(self.deadline)
         validate(document, revision=self.revision, plan_hash=self.plan_hash, database_project=self.database_project,
                  current=current, now=time.time())
@@ -189,3 +208,4 @@ class Observation:
         self.valid_until = timestamp(document["started_at"]) + MAX_AGE_SECONDS
         self.state_digest = state_digest
         self.artifact_digest = digest
+        self._document = document

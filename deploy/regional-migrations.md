@@ -77,6 +77,13 @@ Fresh evidence may replace an expired collection only when its verified writer
 state and inventory match the preflight receipt. Any changed database or writer
 state requires a new preflight and release decision.
 
+Each invocation authenticates and caches its immutable evidence artifact once.
+Before each mutating phase it refreshes the complete service, revision and host
+inventories in parallel and revalidates evidence age afterward. Read-only loop
+inspections do not fetch a second inventory before the same CLI mutation. These
+checks still depend on cloud latency; local recovery timings use mocked cloud
+observations and do not prove a hosted run can finish within the validity window.
+
 Execution retains the 250ms lock acquisition, 2s transaction and 60s command
 limits. The complete recovery has a separate 180s deadline, chosen as roughly
 three times the 59s disposable full-path regression duration. Evidence still

@@ -514,8 +514,6 @@ INSERT INTO migration_recovery.authorization(version,backend_pid,backend_start,e
         while True:
             self.command_deadline()
             with self.connection() as conn:
-                if self.target == "usw2":
-                    self.observe()
                 state = self.inspect(conn)
                 if pushed:
                     # The CLI released its mutex after committing exactly one
@@ -533,14 +531,21 @@ INSERT INTO migration_recovery.authorization(version,backend_pid,backend_start,e
                             "Recovery state changed since the approved preflight or previous phase")
                 if state["prefix"] == 24:
                     if state["journal"] and not state["journal"][2]:
+                        self.observe()
                         self.guard_mutation(conn)
                         conn.execute("UPDATE migration_recovery.plan SET complete=true WHERE singleton")
                     return
                 if not state["journal"]:
+                    self.observe()
                     self.initialize(conn, state)
                     state = self.inspect(conn)
+                    observed = True
+                else:
+                    observed = False
                 name = self.next_preparation(state)
                 if name:
+                    if not observed:
+                        self.observe()
                     self.prepare(conn, state, name)
                     expected = self.approved_state(self.inspect(conn))
                     pushed = False
