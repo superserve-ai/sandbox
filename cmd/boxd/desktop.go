@@ -86,10 +86,22 @@ const (
 	// maxScreenshotBytes of buffer) across unary screenshots and stream
 	// frames, so concurrent viewers cannot exhaust the sandbox.
 	maxConcurrentCaptures = 4
-	maxDesktopDimension   = 8192
-	minDesktopWidth       = 320
-	minDesktopHeight      = 200
+	// maxDesktopMessageBytes caps a decoded request message. The edge proxy
+	// caps the encoded body at the same size, but a compressed body can
+	// expand past that inside boxd, before the action-count and text-length
+	// checks run. Sized like the proxy cap: a 64-action batch of 64KiB text
+	// under worst-case JSON escaping, plus headroom.
+	maxDesktopMessageBytes = 32 << 20
+	maxDesktopDimension    = 8192
+	minDesktopWidth        = 320
+	minDesktopHeight       = 200
 )
+
+// desktopHandlerOptions are applied wherever the DesktopService handler is
+// mounted, so tests exercise the same limits as boxd itself.
+func desktopHandlerOptions() []connect.HandlerOption {
+	return []connect.HandlerOption{connect.WithReadMaxBytes(maxDesktopMessageBytes)}
+}
 
 func newDesktopService(ctx *sandboxContext) *desktopService {
 	if ctx == nil {

@@ -742,7 +742,7 @@ func TestResize_ValidationErrorNeverShellsOut(t *testing.T) {
 func newDesktopTestServer(t *testing.T) boxdpbconnect.DesktopServiceClient {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.Handle(boxdpbconnect.NewDesktopServiceHandler(newDesktopService(nil)))
+	mux.Handle(boxdpbconnect.NewDesktopServiceHandler(newDesktopService(nil), desktopHandlerOptions()...))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return boxdpbconnect.NewDesktopServiceClient(srv.Client(), srv.URL)
@@ -1228,5 +1228,16 @@ func TestCaptureScreenshot_BoundedConcurrency(t *testing.T) {
 	}
 	if got := len(s.captureSlots); got != maxConcurrentCaptures-1 {
 		t.Fatalf("slots held after capture = %d, want %d (slot released)", got, maxConcurrentCaptures-1)
+	}
+}
+
+// A request larger than the decoded-message cap is refused before any of the
+// service's own validation runs, so it cannot be buffered in full.
+func TestDesktopHandler_RejectsOversizedMessage(t *testing.T) {
+	client := newDesktopTestServer(t)
+	huge := strings.Repeat("a", maxDesktopMessageBytes+1)
+	_, err := client.SendKey(context.Background(), connect.NewRequest(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: huge}}))
+	if connect.CodeOf(err) != connect.CodeResourceExhausted {
+		t.Fatalf("SendKey with %d-byte text: code %v (%v), want resource_exhausted", len(huge), connect.CodeOf(err), err)
 	}
 }
