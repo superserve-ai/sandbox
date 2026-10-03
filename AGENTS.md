@@ -29,6 +29,24 @@ repository, upstream project issues, and public documentation.
 - Test fixtures use invented data only: generated UUIDs, neutral names,
   RFC-reserved IPs and example domains.
 
+## Test scope and review discipline
+
+These rules apply to implementation, initial reviews, and delegated or automated
+reviews, including test-audit work.
+
+- Recommend or add a test only when you can name a concrete failure mode, explain
+  why existing coverage misses it, and justify the test's maintenance cost.
+- Do not request tests that merely restate configuration or implementation details,
+  duplicate existing behavioral coverage, or amount to generic "more coverage"
+  suggestions. A hypothetical future edit alone is not sufficient justification.
+- Respect explicitly requested scope and test deletions. Do not add or request a
+  replacement assertion unless there is evidence of a material behavioral gap;
+  explain that gap rather than silently expanding scope.
+- Apply the same bar to non-blocking suggestions: labeling a test request optional
+  does not make speculative coverage useful.
+- "No additional tests needed" is a valid review outcome. Preserve independent
+  behavioral coverage; this is not permission for unrelated test deletion or cleanup.
+
 ## Sandbox lifecycle performance
 
 Sandbox startup and resume latency are critical product paths.
