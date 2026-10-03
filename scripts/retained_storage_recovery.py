@@ -317,7 +317,9 @@ class Recovery:
         else:
             require(not conn.execute("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')").fetchone()[0],
                     "Unrecognized recovery schema")
-            require(prefix == 24 or self.target == "usw2" and prefix == 0, "Recovery initialization is ineligible")
+            require(self.target == "usw2" and prefix == 0
+                    or self.target in ("staging", "use4") and prefix == 24,
+                    "Recovery initialization is ineligible")
         kind = "overlay" if journal else "canonical"
         for row in retained:
             require(digest(row) == self.manifest["history"][kind][row[0]], "Recovery executed-history mismatch")

@@ -555,6 +555,23 @@ class RecoveryTest(fixture.MigrationCLITest):
                 self.assertEqual(self.history(), before)
                 self.assertEqual(self.sql("SELECT to_regnamespace('migration_recovery') IS NULL"), "t")
 
+    def test_canonical_west_without_journal_refuses_both_recovery_entrypoints(self):
+        self.copy_migrations()
+        self.push()
+        before = self.history()
+        receipts = self.project / "canonical-west-receipts"
+        observation = Mock(state_digest="stable-writers", valid_until=time.time() + 120)
+        with patch.object(migration, "verify_connection_identity"), \
+                patch("recovery_evidence.Observation", return_value=observation), \
+                patch.dict(os.environ, {"GITHUB_SHA": "a" * 40, "RECOVERY_RECEIPT_DIR": str(receipts)}):
+            for action in ("recovery-preflight", "recover"):
+                with self.subTest(action=action), self.assertRaisesRegex(
+                        migration.MigrationError, "Recovery initialization is ineligible"):
+                    migration.migrate("usw2", action, self.url, cli=fixture.CLI)
+                self.assertFalse((receipts / "usw2.json").exists())
+                self.assertEqual(self.history(), before)
+                self.assertEqual(self.sql("SELECT to_regnamespace('migration_recovery') IS NULL"), "t")
+
     def test_recovery_entrypoint_rejects_unplanned_pending_sources(self):
         self.copy_migrations()
         self.push()
