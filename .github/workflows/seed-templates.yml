@@ -54,6 +54,17 @@ on:
         required: false
         type: boolean
         default: false
+      rollup_pause:
+        description: Bounded staging-only same-image hourly rollup pause and restoration
+        required: false
+        type: boolean
+        default: false
+      rollup_pause_ack:
+        description: Explicit staging pause and restore authorization
+        required: false
+        type: choice
+        default: not-approved
+        options: [not-approved, accepted]
       receiver_revision:
         description: 'Exact reviewed branch commit for the staging receiver diagnostic'
         required: false
@@ -81,8 +92,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  rollup-pause:
+    if: github.event_name == 'workflow_dispatch' && inputs.rollup_pause
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 20
+    concurrency:
+      group: control-plane-deploy
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+      GCP_PROJECT: rayai-dev
+      SMOKE_PREFLIGHT: ${{ inputs.smoke_preflight }}
+      FORCE_REBUILD: ${{ inputs.force_rebuild }}
+      RECEIVER_DIAGNOSTIC: ${{ inputs.receiver_diagnostic }}
+      ROLLUP_DIAGNOSTIC: ${{ inputs.rollup_diagnostic }}
+      ROLLUP_PAUSE: ${{ inputs.rollup_pause }}
+      ROLLUP_PAUSE_ACK: ${{ inputs.rollup_pause_ack }}
+      APPROVED_REVISION: ${{ inputs.receiver_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check exact staging-only pause authorization
+        run: python3 scripts/staging_rollup_pause.py --check-dispatch
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Pause briefly, verify drain and restore the same staging image
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+        run: python3 scripts/staging_rollup_pause.py
+      - name: Ensure original staging configuration restored
+        if: always()
+        run: python3 scripts/staging_rollup_pause.py --restore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-rollup-pause
+          path: staging-rollup-pause/result.json
+          if-no-files-found: ignore
+          retention-days: 1
+
   rollup-diagnostic:
-    if: github.event_name == 'workflow_dispatch' && inputs.rollup_diagnostic
+    if: github.event_name == 'workflow_dispatch' && inputs.rollup_diagnostic && !inputs.rollup_pause
     runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 8
@@ -121,7 +180,7 @@ jobs:
           retention-days: 1
 
   receiver-diagnostic:
-    if: github.event_name == 'workflow_dispatch' && inputs.receiver_diagnostic && !inputs.rollup_diagnostic
+    if: github.event_name == 'workflow_dispatch' && inputs.receiver_diagnostic && !inputs.rollup_diagnostic && !inputs.rollup_pause && !inputs.rollup_pause
     runs-on: ${{ vars.STAGING_RECOVERY_OBSERVER_RUNNER || 'ubuntu-latest' }}
     environment: staging
     timeout-minutes: 10
@@ -158,7 +217,7 @@ jobs:
           retention-days: 1
 
   smoke-preflight:
-    if: github.event_name == 'workflow_dispatch' && inputs.smoke_preflight && !inputs.receiver_diagnostic && !inputs.rollup_diagnostic && inputs.environment == 'staging'
+    if: github.event_name == 'workflow_dispatch' && inputs.smoke_preflight && !inputs.receiver_diagnostic && !inputs.rollup_diagnostic && !inputs.rollup_pause && inputs.environment == 'staging'
     runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 5
@@ -180,7 +239,7 @@ jobs:
         run: python3 scripts/template-build-preflight.py
 
   seed-staging:
-    if: ${{ !inputs.smoke_preflight && !inputs.receiver_diagnostic && !inputs.rollup_diagnostic }}
+    if: ${{ !inputs.smoke_preflight && !inputs.receiver_diagnostic && !inputs.rollup_diagnostic && !inputs.rollup_pause }}
     name: Seed Staging
     runs-on: ubuntu-latest
     environment: staging
@@ -256,7 +315,7 @@ jobs:
 
   seed-prod:
     name: Seed Production
-    if: ${{ !inputs.smoke_preflight && !inputs.receiver_diagnostic && !inputs.rollup_diagnostic && (github.event_name == 'push' || inputs.environment == 'production') }}
+    if: ${{ !inputs.smoke_preflight && !inputs.receiver_diagnostic && !inputs.rollup_diagnostic && !inputs.rollup_pause && (github.event_name == 'push' || inputs.environment == 'production') }}
     runs-on: ubuntu-latest
     environment: production
     # Two blocking seeder invocations (primary, then the usw cell), each with
