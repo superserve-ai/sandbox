@@ -134,10 +134,11 @@ def safe_scaling(resource):
     annotations = resource.get('metadata', {}).get('annotations', {})
     result = {}
     for key in ('run.googleapis.com/minScale', 'run.googleapis.com/maxScale',
-                'autoscaling.knative.dev/minScale', 'autoscaling.knative.dev/maxScale'):
+                'autoscaling.knative.dev/minScale', 'autoscaling.knative.dev/maxScale',
+                'run.googleapis.com/scalingMode', 'run.googleapis.com/manualInstanceCount'):
         if key not in annotations:
             result[key] = {'presence': 'absent'}
-        elif re.fullmatch(r'[0-9]{1,9}', str(annotations[key])):
+        elif re.fullmatch(r'(?:[0-9]{1,9}|automatic|manual)', str(annotations[key])):
             result[key] = {'presence': 'literal', 'value': str(annotations[key])}
         else:
             result[key] = {'presence': 'unrecognized', 'value': None}
@@ -175,12 +176,21 @@ def service_baseline(reader):
         summaries.append({'revision': revision['metadata']['name'], 'immutable_image': immutable,
                           'config_sha256': digest({'spec': spec, 'annotations': revision.get('metadata', {}).get('annotations', {})}),
                           'scaling_annotations': safe_scaling(revision), 'container_count': len(containers),
+                          'generation': revision.get('metadata', {}).get('generation'),
+                          'observed_generation': status.get('observedGeneration'),
+                          'created_at': revision.get('metadata', {}).get('creationTimestamp'),
+                          'conditions': [{k: c[k] for k in ('type', 'status', 'reason', 'lastTransitionTime') if k in c}
+                                         for c in status.get('conditions', [])],
                           'rollup_settings': safe_settings(containers[0]) if len(containers) == 1 else None,
                           'ready': next((c.get('status') for c in status.get('conditions', [])
                                          if c.get('type') == 'Ready'), None)})
     return {'status': 'observed',
             'config_sha256': digest({'spec': service.get('spec', {}), 'annotations': service.get('metadata', {}).get('annotations', {})}),
             'service_scaling_annotations': safe_scaling(service),
+            'generation': service.get('metadata', {}).get('generation'),
+            'observed_generation': service.get('status', {}).get('observedGeneration'),
+            'desired_traffic': [{k: t[k] for k in ('revisionName', 'percent', 'latestRevision', 'tag') if k in t}
+                                for t in service.get('spec', {}).get('traffic', [])],
             'template_scaling_annotations': safe_scaling(service.get('spec', {}).get('template', {})),
             'latest_ready_revision': service.get('status', {}).get('latestReadyRevisionName'),
             'traffic': [{k: t[k] for k in ('revisionName', 'percent', 'latestRevision', 'tag') if k in t}
