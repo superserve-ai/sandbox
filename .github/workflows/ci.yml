@@ -53,6 +53,23 @@ jobs:
 
   integration-tests:
     name: Integration Tests
+    needs: [integration-suite, proxy-database-contracts, billing-storage-contracts, physical-retained-storage]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every integration contract to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" != success ]; then
+              echo "::error::An integration contract failed, was cancelled, or was skipped."
+              exit 1
+            fi
+          done
+
+  integration-suite:
+    name: Full Integration Suite
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -88,7 +105,7 @@ jobs:
           cleanup() {
             status=$?
             if mountpoint -q "$RETAINED_STORAGE_TEST_DIR"; then
-              sudo umount "$RETAINED_STORAGE_TEST_DIR" || status=1
+              sudo umount "$RETAINED_STORAGE_TEST_DIR" || exit 1
             fi
             rm -rf "$storage_test_root" || status=1
             exit "$status"
