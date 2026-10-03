@@ -104,6 +104,16 @@ class MigrationBaselineTests(unittest.TestCase):
         self.jobs[2] = {"Preflight Staging": "success", "Preflight Production": "success"}
         self.check(True)
 
+    def test_failed_read_only_preflight_does_not_invalidate_migration_success(self):
+        self.runs = [self.record(2, self.b), self.record(1, self.a)]
+        self.jobs[2] = {"Verify migration release": "success", "Preflight Staging": "failure",
+                        "Preflight Production": "skipped"}
+        for conclusion in ("failure", "cancelled", "timed_out"):
+            self.runs[0]["conclusion"] = conclusion
+            self.check(True)
+        self.jobs[2]["Migrate Production"] = "failure"
+        self.check(False)
+
     def test_newer_failed_or_running_attempt_invalidates_older_success(self):
         self.runs = [self.record(2, self.a), self.record(1, self.a)]
         # Creation order is deliberately different from attempt completion order.

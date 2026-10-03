@@ -131,11 +131,10 @@ def wait_for_migration_baseline(repository, revision, event, *, attempts=60, int
                         return False
                     names = {job["name"] for job in jobs["jobs"]}
                     success = {job["name"] for job in jobs["jobs"] if job["conclusion"] == "success"}
-                    # A complete read-only preflight cannot establish or invalidate
+                    # A named read-only preflight cannot establish or invalidate
                     # a migration baseline. Everything ambiguous holds deployment.
-                    if (item["conclusion"] == "success"
-                            and names <= {"Verify migration release", "Preflight Staging", "Preflight Production"}
-                            and "Preflight Staging" in success):
+                    if (names <= {"Verify migration release", "Preflight Staging", "Preflight Production"}
+                            and "Preflight Staging" in names):
                         continue
                     if (item["conclusion"] != "success"
                             or not {"Migrate Staging", "Migrate Production"} <= success):
