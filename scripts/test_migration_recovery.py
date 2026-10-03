@@ -555,6 +555,24 @@ class RecoveryTest(fixture.MigrationCLITest):
                 self.assertEqual(self.history(), before)
                 self.assertEqual(self.sql("SELECT to_regnamespace('migration_recovery') IS NULL"), "t")
 
+    def test_recovery_entrypoint_rejects_unplanned_pending_sources(self):
+        self.copy_migrations()
+        self.push()
+        before = self.history()
+        root = self.project / "extra-source"
+        shutil.copytree(fixture.ROOT / "supabase", root / "supabase")
+        for version in ("20261004000001", "20261003000001"):
+            extra = root / "supabase/migrations" / (version + "_extra.sql")
+            extra.write_text("CREATE TABLE unplanned_migration(id integer);\n")
+            for action in ("recovery-preflight", "recover"):
+                with self.subTest(version=version, action=action), \
+                        patch.object(migration, "verify_connection_identity"), \
+                        self.assertRaisesRegex(migration.MigrationError, "exactly the pinned migration source set"):
+                    migration.migrate("staging", action, self.url, root=root, cli=fixture.CLI)
+            self.assertEqual(self.history(), before)
+            self.assertEqual(self.sql("SELECT to_regclass('unplanned_migration') IS NULL"), "t")
+            extra.unlink()
+
     def test_source_drift_and_retained_report_admission(self):
         root = self.project / "changed-source"
         shutil.copytree(fixture.ROOT / "supabase", root / "supabase")

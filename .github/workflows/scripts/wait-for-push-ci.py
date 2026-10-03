@@ -132,8 +132,12 @@ def wait_for_migration_baseline(repository, revision, event, *, attempts=60, int
                         {job["name"] for job in jobs["jobs"] if job["conclusion"] == "success"})
 
             def read_only(names):
-                return (names <= {"Verify migration release", "Preflight Staging", "Preflight Production"}
-                        and "Preflight Staging" in names)
+                return any(names <= pair | {"Verify migration release"}
+                           and any(name.endswith("Staging") for name in names & pair)
+                           for pair in (
+                               {"Preflight Staging", "Preflight Production"},
+                               {"Recovery Preflight Staging", "Recovery Preflight Production"},
+                           ))
 
             # Older runs can be rerun after newer ones. Classify named read-only
             # preflights before waiting on potentially mutating attempts.
@@ -148,8 +152,9 @@ def wait_for_migration_baseline(repository, revision, event, *, attempts=60, int
                     names, success = job_sets(item)
                     if read_only(names):
                         continue
-                    if (item["conclusion"] != "success"
-                            or not {"Migrate Staging", "Migrate Production"} <= success):
+                    if (item["conclusion"] != "success" or not any(pair <= success for pair in (
+                            {"Migrate Staging", "Migrate Production"},
+                            {"Recover Staging", "Recover Production"}))):
                         return False
                     baseline = item["head_sha"]
                     break

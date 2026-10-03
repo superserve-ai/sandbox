@@ -274,6 +274,9 @@ class Recovery:
                     "Pending retained reports prevent recovery")
 
     def inspect(self, conn, *, ordinary=False):
+        if not ordinary:
+            require({path.name for path in (self.root / "supabase/migrations").glob("*.sql")}
+                    == set(self.manifest["sources"]), "Recovery requires exactly the pinned migration source set")
         history = self.history(conn)
         auth = [row for row in history if row[0] == migration.VERSION]
         expected_auth = [[migration.VERSION, migration.NAME, [migration.verified_aggregate(self.root).decode()]]]
