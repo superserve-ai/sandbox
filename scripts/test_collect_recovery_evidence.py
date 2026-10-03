@@ -405,5 +405,157 @@ class CollectorTest(unittest.TestCase):
             collector.receiver_provenance(reader_for(config_value=overridden), revisions)
 
 
+class ConsumerFreshnessTest(unittest.TestCase):
+    def setUp(self):
+        self.now, self.state, self.doc = fixture()
+        self.doc['schema'] = 3
+        for key in ('started_at', 'completed_at'):
+            self.doc[key] = self.stamp(evidence.timestamp(self.doc[key])-600)
+        self.doc['coordinated_assumption']['started_at'] = self.doc['started_at']
+        for proof in self.doc['database_bindings'].values():
+            proof['observed_at'] = self.stamp(evidence.timestamp(proof['observed_at'])-600)
+        self.env = {'RECOVERY_COORDINATION_ACK': 'accepted', 'GITHUB_ACTIONS': 'true',
+                    'GITHUB_REPOSITORY': 'example/project', 'GITHUB_SHA': 'a'*40,
+                    'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+                    'GITHUB_RUN_ID': '99', 'GITHUB_ACTOR': 'current-operator'}
+        self.observation = evidence.Observation(repository='example/project', revision='a'*40, run_id='12',
+            plan_hash='b'*64, database_project=PROJECTS['usw2'], deadline=time.monotonic()+1800)
+        self.observation.load_artifact = Mock(return_value=(self.doc, 'authenticated-archive-digest'))
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.dict(os.environ, self.env))
+        self.clock = self.stack.enter_context(patch.object(evidence.time, 'time', return_value=self.now))
+        self.inventory = self.stack.enter_context(patch.object(collector, 'receiver_inventory', return_value=self.state))
+        self.mutations = self.stack.enter_context(patch.object(collector, 'active_mutations'))
+        self.guest = self.stack.enter_context(patch.object(collector, 'guest_observation', return_value=self.doc['hosts'][0]))
+
+    @staticmethod
+    def stamp(value):
+        return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).isoformat()
+
+    def test_old_provenance_requires_live_checks_and_each_refresh_renews_only_live_lease(self):
+        # A historical artifact alone is still not a fresh authorization.
+        with self.assertRaisesRegex(MigrationError, 'stale'):
+            evidence.validate(self.doc, revision='a'*40, plan_hash='b'*64,
+                              database_project=PROJECTS['usw2'], current=self.state, now=self.now)
+        self.observation.verify()
+        self.assertEqual(self.observation.valid_until, self.now+120)
+        state, digest = self.observation.state_digest, self.observation.artifact_digest
+        for delta in (60, 180, 360):
+            self.clock.return_value = self.now+delta
+            self.observation.verify()
+            self.assertEqual(self.observation.valid_until, self.now+delta+120)
+            self.assertEqual((self.observation.state_digest, self.observation.artifact_digest), (state, digest))
+        self.assertEqual(self.observation.load_artifact.call_count, 1)
+        self.assertEqual(self.inventory.call_count, 8)
+        self.assertEqual(self.guest.call_count, 4)
+        self.assertEqual(self.mutations.call_count, 8)
+        self.assertTrue(all(call.args[1] == '99' for call in self.mutations.call_args_list))
+        self.assertEqual(self.doc['started_at'], self.stamp(self.now-610))
+
+    def test_schema_one_and_two_cannot_renew_an_old_artifact(self):
+        for schema in (1, 2):
+            self.doc['schema'] = schema
+            with self.subTest(schema=schema), self.assertRaisesRegex(MigrationError, 'stale'):
+                self.observation.verify()
+            self.assertIsNone(self.observation.valid_until)
+        self.inventory.assert_not_called()
+
+    def test_missing_or_changed_consumer_acknowledgment_never_authorizes(self):
+        for key in self.env:
+            with self.subTest(key=key), patch.dict(os.environ, {key: ''}), self.assertRaises(MigrationError):
+                self.observation.verify()
+            self.assertIsNone(self.observation.valid_until)
+        self.inventory.assert_not_called()
+        self.observation.verify()
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '100'}), self.assertRaisesRegex(MigrationError, 'identity changed'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
+
+    def test_failed_refresh_revokes_prior_lease_and_does_not_replace_provenance(self):
+        self.observation.verify()
+        before = (self.observation.state_digest, self.observation.artifact_digest)
+        self.clock.return_value = self.now+180
+        for target in (self.inventory, self.guest, self.mutations):
+            target.side_effect = MigrationError('live read failed')
+            with self.subTest(target=target), self.assertRaisesRegex(MigrationError, 'live read failed'):
+                self.observation.verify()
+            self.assertIsNone(self.observation.valid_until)
+            self.assertEqual((self.observation.state_digest, self.observation.artifact_digest), before)
+            target.side_effect = None
+        self.observation.verify()
+        self.assertEqual(self.observation.valid_until, self.now+300)
+
+    def test_inventory_and_secret_changes_before_or_during_observation_reject(self):
+        self.observation.verify()
+        for field in ('instances', 'versions_database-url-usw2', 'versions_database-url'):
+            changed = copy.deepcopy(self.state)
+            changed[field].append({'unexpected': True})
+            for snapshots in ([changed, changed], [self.state, changed]):
+                with self.subTest(field=field, during=snapshots[0] is self.state):
+                    self.inventory.side_effect = snapshots
+                    with self.assertRaises(MigrationError):
+                        self.observation.verify()
+                    self.assertIsNone(self.observation.valid_until)
+        self.inventory.side_effect = None
+
+    def test_guest_change_and_second_mutation_check_failure_reject(self):
+        self.observation.verify()
+        changed = copy.deepcopy(self.doc['hosts'][0])
+        changed['observation']['services'][0]['process']['start_ticks'] = '200'
+        self.guest.return_value = changed
+        with self.assertRaisesRegex(MigrationError, 'Guest process'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
+        self.guest.return_value = self.doc['hosts'][0]
+        self.mutations.side_effect = [None, MigrationError('another deploy started')]
+        with self.assertRaisesRegex(MigrationError, 'another deploy started'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
+
+    def test_collection_runtime_and_overall_recovery_deadline_bound_renewal(self):
+        self.observation.verify()
+        # Download/authentication precede this timer; the live window itself
+        # includes both cloud snapshots and guest observations.
+        self.clock.side_effect = [self.now, self.now+121, self.now+121]
+        with self.assertRaisesRegex(MigrationError, 'expired'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
+        self.clock.side_effect = None
+        self.observation.deadline = time.monotonic()-1
+        with self.assertRaisesRegex(MigrationError, 'deadline exceeded'):
+            self.observation.verify()
+        self.assertIsNone(self.observation.valid_until)
+
+    def test_authenticated_provenance_cannot_be_changed_between_refreshes(self):
+        for field in ('host_provenance', 'canary_provenance', 'receiver_provenance'):
+            with self.subTest(field=field):
+                self.observation.verify()
+                saved = copy.deepcopy(self.doc[field])
+                self.doc[field]['tampered'] = True
+                with self.assertRaisesRegex(MigrationError, 'Authenticated provenance changed'):
+                    self.observation.verify()
+                self.assertIsNone(self.observation.valid_until)
+                self.doc[field] = saved
+        self.observation.verify()
+        self.observation.artifact_digest = 'other-artifact'
+        with self.assertRaisesRegex(MigrationError, 'Authenticated provenance changed'):
+            self.observation.verify()
+
+    def test_writer_identity_protects_provenance_without_collection_clock_or_run(self):
+        original = evidence.sha(evidence.receiver_state(self.doc))
+        refreshed = copy.deepcopy(self.doc)
+        refreshed['started_at'] = refreshed['completed_at'] = self.stamp(self.now)
+        refreshed['coordinated_assumption']['started_at'] = refreshed['started_at']
+        refreshed['coordinated_assumption']['run_id'] = '13'
+        for proof in refreshed['database_bindings'].values():
+            proof['observed_at'] = refreshed['completed_at']
+        self.assertEqual(evidence.sha(evidence.receiver_state(refreshed)), original)
+        for field in ('host_provenance', 'canary_provenance', 'receiver_provenance'):
+            changed = copy.deepcopy(refreshed)
+            changed[field]['changed'] = True
+            self.assertNotEqual(evidence.sha(evidence.receiver_state(changed)), original)
+
+
 if __name__ == '__main__':
     unittest.main()

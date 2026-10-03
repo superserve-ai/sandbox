@@ -24,9 +24,15 @@ on:
         required: false
         type: string
       recovery_evidence_run_id:
-        description: 'Production recovery: fresh authenticated read-only collector run'
+        description: 'Production recovery: authenticated read-only provenance collection run'
         required: false
         type: string
+      recovery_coordination_ack:
+        description: Operator has established the coordinated window for this consumer run
+        required: false
+        type: choice
+        default: not-approved
+        options: [not-approved, accepted]
   push:
     branches: [main]
     paths:
@@ -79,6 +85,7 @@ jobs:
           MIGRATION_ENVIRONMENT: ${{ inputs.environment }}
           PREFLIGHT_RUN_ID: ${{ inputs.preflight_run_id }}
           RECOVERY_EVIDENCE_RUN_ID: ${{ inputs.recovery_evidence_run_id }}
+          RECOVERY_COORDINATION_ACK: ${{ inputs.recovery_coordination_ack }}
 
   migrate-staging:
     name: ${{ needs.gate.outputs.action == 'recovery-preflight' && 'Recovery Preflight Staging' || needs.gate.outputs.action == 'recover' && 'Recover Staging' || needs.gate.outputs.action == 'preflight' && 'Preflight Staging' || 'Migrate Staging' }}
@@ -131,6 +138,7 @@ jobs:
       RECOVERY_RECEIPT_DIR: ${{ github.workspace }}/recovery-receipts
       RECOVERY_EVIDENCE_RUN_ID: ${{ inputs.recovery_evidence_run_id }}
       RECOVERY_SSH_USER: ${{ vars.RECOVERY_SSH_USER }}
+      RECOVERY_COORDINATION_ACK: ${{ inputs.recovery_coordination_ack }}
     steps:
       - uses: actions/checkout@v4
       - uses: supabase/setup-cli@v1

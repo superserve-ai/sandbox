@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import io
 import json
+import os
 import re
 import subprocess
 import time
@@ -74,7 +75,7 @@ def inventory(deadline):
 
 
 def validate(document, *, revision, plan_hash, database_project, current, now):
-    if document.get('schema') == 2:
+    if document.get('schema') in (2, 3):
         return validate_receivers(document, revision=revision, plan_hash=plan_hash,
                                   database_project=database_project, current=current, now=now)
     require(document.get("schema") == 1 and document.get("target") == "usw2"
@@ -236,7 +237,9 @@ def receiver_state(document):
                 for name, proof in document['database_bindings'].items()}
     return {'inventory_after': document['inventory_after'], 'provenance': document['receiver_provenance'],
             'hosts': sorted(map(stable_guest, document['hosts']), key=lambda h: h['instance_id']),
-            'database_bindings': bindings, 'coordinated_assumption': assumption}
+            'database_bindings': bindings, 'coordinated_assumption': assumption,
+            **({'host_provenance': document['host_provenance'],
+                'canary_provenance': document['canary_provenance']} if document['schema'] == 3 else {})}
 
 
 def canary_configuration(spec, destinations):
@@ -252,15 +255,20 @@ def canary_configuration(spec, destinations):
     return container
 
 
-def validate_receivers(document, *, revision, plan_hash, database_project, current, now):
+def validate_receivers(document, *, revision, plan_hash, database_project, current, now, provenance_only=False):
     from collect_recovery_evidence import CANARY, CANARY_IMAGE, CELLS, HOST_SOURCE
     from recovery_database_binding import BINDINGS, candidate_versions
-    require(document.get('schema') == 2 and document.get('policy') == 'incapable-receivers-v1'
+    require(document.get('schema') in (2, 3) and document.get('policy') == 'incapable-receivers-v1'
             and document.get('target') == 'usw2' and document.get('database_project') == database_project
             and document.get('recovery_revision') == document.get('collector_revision') == revision
             and document.get('plan_hash') == plan_hash, 'Receiver evidence identity mismatch')
     start, end = timestamp(document['started_at']), timestamp(document['completed_at'])
-    require(now-MAX_AGE_SECONDS <= start <= end <= now, 'Receiver evidence is stale or future dated')
+    require(start <= end <= now and end-start <= MAX_AGE_SECONDS,
+            'Receiver collection window is invalid')
+    # Only schema 3 separates authenticated provenance from live authorization.
+    # This mode validates historical facts and never grants a mutation lease.
+    require((provenance_only and document['schema'] == 3) or now-MAX_AGE_SECONDS <= start,
+            'Receiver evidence is stale or future dated')
     require(document.get('inventory_before') == document.get('inventory_after') == sha(current),
             'Receiver, routing or binding inventory changed')
     assumption = document.get('coordinated_assumption', {})
@@ -387,6 +395,9 @@ class Observation:
         self.state_digest = None
         self.valid_until = None
         self._document = None
+        self._document_hash = None
+        self._artifact_digest = None
+        self._consumer_identity = None
         self._identity = (repository, revision, run_id, plan_hash, database_project)
 
     def api(self, path, binary=False):
@@ -416,23 +427,51 @@ class Observation:
             document = json.loads(archive.read("evidence.json"))
         return document, digest
 
+    def consumer_identity(self):
+        env = os.environ
+        require(env.get('RECOVERY_COORDINATION_ACK') == 'accepted'
+                and env.get('GITHUB_ACTIONS') == 'true'
+                and env.get('GITHUB_REPOSITORY') == self.repository
+                and env.get('GITHUB_SHA') == self.revision
+                and env.get('GITHUB_REF') == 'refs/heads/main'
+                and env.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+                and env.get('GITHUB_ACTOR')
+                and re.fullmatch(r'[1-9][0-9]*', env.get('GITHUB_RUN_ID', '')),
+                'Fresh consumer coordination acknowledgment and workflow identity are required')
+        identity = (env['GITHUB_RUN_ID'], env['GITHUB_ACTOR'])
+        require(self._consumer_identity is None or self._consumer_identity == identity,
+                'Consumer coordination identity changed during recovery')
+        return identity
+
     def verify(self):
+        # A failed refresh cannot leave a previously issued lease usable.
+        self.valid_until = None
         require(self._identity == (self.repository, self.revision, self.run_id, self.plan_hash, self.database_project),
                 "Recovery evidence identity changed")
-        # Keep the authenticated bytes only for this Observation. A fresh run
-        # requires a new instance; mutable cloud inventory is never cached.
         if self._document is None:
             document, digest = self.load_artifact()
         else:
             document, digest = self._document, self.artifact_digest
-        require(time.time() < timestamp(document["started_at"]) + MAX_AGE_SECONDS,
-                "Deployment evidence is stale")
-        if document.get('schema') == 2:
+            require(sha(document) == self._document_hash and digest == self._artifact_digest,
+                    'Authenticated provenance changed during recovery')
+        renewable = document.get('schema') == 3
+        if renewable:
+            consumer = self.consumer_identity()
+            started = time.time()
+            observation_deadline = min(self.deadline, time.monotonic() + MAX_AGE_SECONDS)
+            require(time.monotonic() < observation_deadline, 'Recovery evidence deadline exceeded')
+        else:
+            require(time.time() < timestamp(document["started_at"]) + MAX_AGE_SECONDS,
+                    "Deployment evidence is stale")
+            observation_deadline = self.deadline
+        if document.get('schema') in (2, 3):
             from collect_recovery_evidence import Reader, receiver_inventory, guest_observation, active_mutations
-            reader = Reader(self.deadline)
+            reader = Reader(observation_deadline)
+            if renewable:
+                active_mutations(reader, consumer[0])
             current = receiver_inventory(reader)
-            import os
-            active_mutations(reader, os.environ.get('GITHUB_RUN_ID', ''))
+            if not renewable:
+                active_mutations(reader, os.environ.get('GITHUB_RUN_ID', ''))
             with ThreadPoolExecutor(max_workers=4) as executor:
                 guests = list(executor.map(lambda host: guest_observation(reader, host), current['instances']))
             require(sorted(map(stable_guest, guests), key=lambda h: h['instance_id']) ==
@@ -440,18 +479,33 @@ class Observation:
                     'Guest process, executable or effective destination changed')
             require(document['coordinated_assumption']['run_id'] == self.run_id,
                     'Coordination acknowledgment belongs to another collection run')
+            if renewable:
+                after = receiver_inventory(reader)
+                require(current == after, 'Receiver inventory changed during live observation')
+                active_mutations(reader, consumer[0])
+                require(self.consumer_identity() == consumer, 'Consumer coordination changed during observation')
             fresh = dict(document, hosts=guests)
             validate_receivers(fresh, revision=self.revision, plan_hash=self.plan_hash,
-                               database_project=self.database_project, current=current, now=time.time())
+                               database_project=self.database_project, current=current, now=time.time(),
+                               provenance_only=renewable)
         else:
             current = inventory(self.deadline)
-        validate(document, revision=self.revision, plan_hash=self.plan_hash, database_project=self.database_project,
-                 current=current, now=time.time())
-        state_digest = sha(receiver_state(document)) if document.get('schema') == 2 else sha({key: document[key] for key in (
+        if not renewable:
+            validate(document, revision=self.revision, plan_hash=self.plan_hash, database_project=self.database_project,
+                     current=current, now=time.time())
+        state_digest = sha(receiver_state(document)) if document.get('schema') in (2, 3) else sha({key: document[key] for key in (
             "inventory_after", "revisions", "hosts", "alternate_producers", "deployment_and_toggle_hold")})
         require(self.state_digest is None or self.state_digest == state_digest,
                 "Observed writer state changed during recovery")
-        self.valid_until = timestamp(document["started_at"]) + MAX_AGE_SECONDS
+        if renewable:
+            require(started <= time.time() < started + MAX_AGE_SECONDS
+                    and time.monotonic() < observation_deadline,
+                    'Live receiver observation expired; no authorization issued')
+            self._consumer_identity = consumer
+            self.valid_until = started + MAX_AGE_SECONDS
+        else:
+            self.valid_until = timestamp(document["started_at"]) + MAX_AGE_SECONDS
         self.state_digest = state_digest
-        self.artifact_digest = digest
+        self.artifact_digest = self._artifact_digest = digest
+        self._document_hash = sha(document)
         self._document = document

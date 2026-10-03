@@ -63,6 +63,8 @@ def select_action(env):
         action = "push" if requested == "migrate" else requested
         production = env["MIGRATION_ENVIRONMENT"] == "production"
         if production and action in ("recovery-preflight", "recover"):
+            if env.get("RECOVERY_COORDINATION_ACK") != "accepted":
+                raise GateError("Recovery requires an explicit coordinated window for this consumer run")
             if not re.fullmatch(r"[1-9][0-9]*", env.get("RECOVERY_EVIDENCE_RUN_ID", "")):
                 raise GateError("Recovery requires an authenticated evidence collection run")
         if action in ("push", "recover"):

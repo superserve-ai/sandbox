@@ -115,23 +115,32 @@ migration applied.
 
 ## Receiver evidence and operational prerequisites
 
-`.github/workflows/recovery-evidence.yml` collects schema 2 evidence using
+`.github/workflows/recovery-evidence.yml` collects schema 3 provenance evidence using
 `scripts/collect_recovery_evidence.py`. It is manual-only and requires the exact
 reviewed main revision and an explicit named-operator coordination acknowledgment.
 It publishes only `evidence.json` in `retained-recovery-evidence-usw2` on success.
-The verifier authenticates the GitHub run and artifact digest and rechecks the
-cloud inventory and guest processes before each recovery phase. Observations
-expire after 120 seconds; a refreshed collection can reuse a preflight receipt
-only when the verified writer state is identical. Collector timestamps/run IDs
-and ordinary connection churn are excluded from that identity. Effective report
-origins, process identities and DNS/routing are still freshly checked.
+The verifier authenticates the GitHub run and artifact digest. Schema 3 retains
+immutable provenance across queue/setup delays; it does not grant a mutation
+lease. Inside each consuming West job, a complete new observation brackets guest
+reads with matching cloud inventories and workflow checks. Receiver configuration,
+secret-version metadata and effective guest state must still match the authenticated
+artifact. Changed state requires a new collection and preflight.
 
-Schema 2 permits audited retained-capable guest publishers only when every
+Each successful observation authorizes at most 120 seconds from the **start** of
+its live reads. Every refresh repeats those checks; failed or overlong observations
+issue no lease. Existing SQL admission and total recovery deadlines still apply.
+Schema 1/2 artifacts retain their original collector-start expiry. Preflight
+identity excludes observation times/run IDs and ordinary connection churn, but
+includes authenticated provenance and effective writer state. After partial
+committed recovery, obtain a new read-only preflight and approve its exact database
+state; the old receipt must fail rather than silently accepting progress.
+
+Schemas 2 and 3 permit audited retained-capable guest publishers only when every
 possible receiver is proved incapable of accepting their retained reports and
 the separate empty-accounting database guards pass. Sampling need not be disabled
 and guest spools need not be empty for this policy. Schema 1's producer-exclusion
 checks remain available for existing artifacts; its stricter spool requirements
-do not substitute for schema 2's receiver proof.
+do not substitute for the receiver proof.
 
 ### Coordinated window
 
@@ -145,7 +154,10 @@ configuration changes, routes/DNS/proxies, database-secret rotations, retained
 activation, manual or alternate writers, and already queued or in-flight mutation
 automation. The collector checks active workflows on every branch, but that check
 and fresh inventory detect changes; they do not prevent them or replace the
-operator's acknowledgment. No default or synthetic acknowledgment is valid.
+operator's acknowledgment. Each production recovery preflight or recovery dispatch
+also requires `recovery_coordination_ack=accepted` for that consumer run. An old
+collector acknowledgment does not establish the current window. No default or
+synthetic acknowledgment is valid.
 
 If this agreement is violated between observations, a newly capable API could
 acknowledge a retained report before an older worker discards its unknown payload,

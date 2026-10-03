@@ -194,7 +194,7 @@ def collect(reader, revision, env):
     active_mutations(reader, env['GITHUB_RUN_ID'])
     completed = utc()
     manifest = json.loads((ROOT/'supabase/recovery/retained-storage-v1.json').read_text())
-    document = {'schema': 2, 'policy': 'incapable-receivers-v1', 'target': 'usw2',
+    document = {'schema': 3, 'policy': 'incapable-receivers-v1', 'target': 'usw2',
                 'recovery_revision': revision, 'collector_revision': revision,
                 'plan_hash': evidence.sha(manifest), 'database_project': PROJECTS['usw2'],
                 'started_at': started, 'completed_at': completed,
