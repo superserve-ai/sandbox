@@ -46,7 +46,8 @@ def fixture():
         state['routes'].append({'selfLink': 'map'+short, 'defaultService': 'backend'+short})
         state['backends'].append({'selfLink': 'backend'+short, 'backends': [{'group': 'neg'+short}]})
         state['negs'].append({'selfLink': 'neg'+short, 'networkEndpointType': 'SERVERLESS', 'cloudRun': {'service': name}})
-        state['forwarders'].append({'IPAddress': address, 'target': 'proxy'+short})
+        state['forwarders'].append({'IPAddress': address, 'target': 'proxy'+short,
+                                    'IPProtocol': 'TCP', 'portRange': '443-443'})
         state['https_proxies'].append({'selfLink': 'proxy'+short, 'urlMap': 'map'+short})
         version = {'name': f'projects/rayai-prod/secrets/{secret}/versions/1', 'state': 'ENABLED', 'createTime': stamp(-7200)}
         state['versions_'+secret] = [version]
@@ -122,6 +123,31 @@ class CollectorTest(unittest.TestCase):
             with self.assertRaises(MigrationError):
                 self.validate(doc)
 
+    def test_report_forwarder_must_uniquely_cover_tcp_443(self):
+        for ports in ({'portRange': '443-443'}, {'portRange': '400-500'}, {'ports': ['80', '443']}, {'allPorts': True}):
+            state = copy.deepcopy(self.state)
+            state['forwarders'][0].pop('portRange')
+            state['forwarders'][0].update(ports)
+            self.assertEqual(evidence.public_api_routes(state)['https://api-usw.superserve.ai'], 'superserve-api-usw2')
+        for rule in ({'IPProtocol': 'TCP', 'portRange': '8443-8443'},
+                     {'IPProtocol': 'UDP', 'portRange': '443-443'},
+                     {'IPProtocol': 'TCP'}, {'portRange': '443'},
+                     {'IPProtocol': 'TCP', 'portRange': 'bad'},
+                     {'IPProtocol': 'TCP', 'portRange': '443', 'allPorts': True}):
+            state = copy.deepcopy(self.state)
+            state['forwarders'][0] = dict(rule, IPAddress='192.0.2.1', target='proxy0')
+            with self.subTest(rule=rule), self.assertRaises(MigrationError):
+                evidence.public_api_routes(state)
+        for audited_port in ('443', '8443'):
+            state = copy.deepcopy(self.state)
+            state['forwarders'][0]['portRange'] = audited_port
+            state['forwarders'].append({'IPAddress': '192.0.2.1', 'IPProtocol': 'TCP',
+                                        'portRange': '443', 'target': 'unaudited-tcp-or-ssl-proxy'})
+            doc = copy.deepcopy(self.doc)
+            doc['inventory_before'] = doc['inventory_after'] = evidence.sha(state)
+            with self.subTest(audited_port=audited_port), self.assertRaises(MigrationError):
+                self.validate(doc, state)
+
     def test_fresh_cross_run_evidence_preserves_receipt_writer_identity(self):
         def observation(doc, run):
             obj = evidence.Observation(repository='example/project', revision='a'*40, run_id=run,
@@ -186,18 +212,44 @@ class CollectorTest(unittest.TestCase):
         audit = [call.args for call in reader.cloud.call_args_list if call.args[:2] == ('logging', 'read')]
         self.assertIn('DeleteJob', audit[0][2])
 
-    def test_global_inventory_rejects_successful_partial_results_without_disclosing_warning(self):
+    def test_cloud_inventory_rejects_successful_partial_results_without_disclosing_warning(self):
         reader = collector.Reader(time.monotonic()+60)
-        for resource in ('services', 'jobs', 'worker-pools'):
-            with self.subTest(resource=resource), patch.object(collector.subprocess, 'run') as run:
+        commands = [('run', resource, 'list') for resource in ('services', 'jobs', 'worker-pools')]
+        commands += [('compute', resource, 'list') for resource in ('instances', 'url-maps', 'backend-services',
+                     'network-endpoint-groups', 'forwarding-rules', 'target-https-proxies')]
+        for args in commands:
+            with self.subTest(command=args), patch.object(collector.subprocess, 'run') as run:
                 run.return_value = SimpleNamespace(returncode=0, stdout='[]',
                                                    stderr='WARNING: unreachable region, private-provider-detail')
                 with self.assertRaises(MigrationError) as caught:
-                    reader.cloud('run', resource, 'list', '--limit=1000')
+                    reader.cloud(*args, '--limit=1000')
                 self.assertNotIn('private-provider-detail', str(caught.exception))
                 self.assertIn('--verbosity=warning', run.call_args.args[0])
+                self.assertEqual(run.call_args.kwargs['env']['CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR'], 'false')
                 run.return_value.stderr = ''
-                self.assertEqual(reader.cloud('run', resource, 'list', '--limit=1000'), [])
+                self.assertEqual(reader.cloud(*args, '--limit=1000'), [])
+
+    def test_identical_partial_compute_snapshots_cannot_collect_or_refresh_evidence(self):
+        partial = copy.deepcopy(self.state)
+        partial['instances'] = []
+        document = copy.deepcopy(self.doc)
+        document['hosts'] = []
+        document['inventory_before'] = document['inventory_after'] = evidence.sha(partial)
+        def transport(args, **kwargs):
+            warning = 'WARNING: omitted-zone private-provider-detail' if args[1:4] == ['compute', 'instances', 'list'] else ''
+            return SimpleNamespace(returncode=0, stdout='[]', stderr=warning)
+        with patch.object(collector.subprocess, 'run', side_effect=transport), \
+             patch.object(collector, 'private_binding') as private, patch.object(collector, 'guest_observation') as guest:
+            for _ in range(2):
+                with self.assertRaisesRegex(MigrationError, 'completeness is unproved'):
+                    collector.collect(collector.Reader(time.monotonic()+60), 'a'*40, {})
+                observation = evidence.Observation(repository='example/project', revision='a'*40, run_id='12',
+                    plan_hash='b'*64, database_project=PROJECTS['usw2'], deadline=time.monotonic()+60)
+                observation.load_artifact = Mock(return_value=(document, 'synthetic-authenticated-digest'))
+                with self.assertRaisesRegex(MigrationError, 'completeness is unproved'):
+                    observation.verify()
+            private.assert_not_called()
+            guest.assert_not_called()
 
     def test_dispatch_requires_actual_operator_ack_and_current_main(self):
         reader = Mock()

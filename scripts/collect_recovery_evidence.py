@@ -228,25 +228,24 @@ class Reader:
         require(remaining > 0, "Collection deadline expired")
         try:
             child_env = dict(os.environ, CLOUDSDK_CORE_LOG_HTTP='false',
-                             CLOUDSDK_CORE_DISABLE_FILE_LOGGING='true', CLOUDSDK_CORE_VERBOSITY='error')
+                             CLOUDSDK_CORE_DISABLE_FILE_LOGGING='true', CLOUDSDK_CORE_VERBOSITY='error',
+                             CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR='false')
             result = subprocess.run(args, input=input, capture_output=True, env=child_env,
                                     timeout=min(60, remaining), text=not binary)
             require(result.returncode == 0, "Read-only provider failed; provider output suppressed")
             require(not reject_stderr or not result.stderr,
-                    "Global inventory reported a warning; completeness is unproved and provider output suppressed")
+                    "Cloud inventory reported a warning; completeness is unproved and provider output suppressed")
             require(len(result.stdout) <= MAX_ARCHIVE, "Read-only provider output exceeded its bound")
             return result.stdout
         except (OSError, subprocess.TimeoutExpired):
             raise MigrationError("Read-only provider unavailable or timed out") from None
 
     def cloud(self, *args):
-        global_inventory = args[:3] in {('run', 'services', 'list'), ('run', 'jobs', 'list'),
-                                       ('run', 'worker-pools', 'list')}
-        # Cloud SDK returns success with partial global rows when a region is
-        # unreachable. It exposes that omission only through warning output.
-        flags = ['--verbosity=warning'] if global_inventory else []
-        value = json.loads(self.command(["gcloud", *args, "--project=" + PROJECT, "--format=json", "--quiet", *flags],
-                                        reject_stderr=global_inventory))
+        # Both Cloud Run and Compute can return successful partial inventories
+        # with only a warning. Require all-or-nothing Compute responses above,
+        # and reject diagnostics for every cloud read before accepting its rows.
+        value = json.loads(self.command(["gcloud", *args, "--project=" + PROJECT, "--format=json", "--quiet",
+                                         "--verbosity=warning"], reject_stderr=True))
         if isinstance(value, list):
             require(len(value) < MAX_ITEMS, "Cloud inventory reached its completeness bound")
         return value

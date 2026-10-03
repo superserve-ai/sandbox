@@ -152,6 +152,31 @@ def validate(document, *, revision, plan_hash, database_project, current, now):
             "The separately coordinated deployment and configuration hold is missing")
 
 
+def forwards_https(rule):
+    protocol = rule.get('IPProtocol')
+    require(protocol in {'TCP', 'UDP', 'ESP', 'AH', 'SCTP', 'ICMP', 'ICMPV6', 'L3_DEFAULT'},
+            'Forwarding-rule protocol is missing or unknown')
+    if protocol not in {'TCP', 'L3_DEFAULT'}:
+        return False
+    selectors = [key for key in ('portRange', 'ports', 'allPorts') if rule.get(key)]
+    require(len(selectors) == 1, 'Forwarding-rule port coverage is ambiguous')
+    if selectors[0] == 'allPorts':
+        require(rule['allPorts'] is True, 'Forwarding-rule allPorts is invalid')
+        return True
+    if selectors[0] == 'ports':
+        ports = rule['ports']
+        require(isinstance(ports, list) and all(isinstance(port, str) and re.fullmatch(r'[0-9]{1,5}', port)
+                                               and 1 <= int(port) <= 65535 for port in ports),
+                'Forwarding-rule ports are invalid')
+        return any(int(port) == 443 for port in ports)
+    value = rule['portRange']
+    match = re.fullmatch(r'([0-9]{1,5})(?:-([0-9]{1,5}))?', value) if isinstance(value, str) else None
+    require(match is not None, 'Forwarding-rule port range is invalid')
+    first, last = int(match[1]), int(match[2] or match[1])
+    require(1 <= first <= last <= 65535, 'Forwarding-rule port range is invalid')
+    return first <= 443 <= last
+
+
 def public_api_routes(current):
     """Resolve the two report hostnames through the observed load-balancer graph."""
     from collect_recovery_evidence import CELLS
@@ -164,9 +189,9 @@ def public_api_routes(current):
         require(addresses, 'Report hostname has no observed destination')
         matched = []
         for address in addresses:
-            forwarders = [f for f in current['forwarders'] if f.get('IPAddress') == address
-                          and f.get('target') in proxies]
-            require(len(forwarders) == 1, 'Report hostname does not resolve to one audited HTTPS route')
+            forwarders = [f for f in current['forwarders'] if f.get('IPAddress') == address and forwards_https(f)]
+            require(len(forwarders) == 1 and forwarders[0].get('target') in proxies,
+                    'Report hostname does not resolve to one audited TCP port 443 route')
             route = maps[proxies[forwarders[0]['target']]['urlMap']]
             require(not route.get('routeRules') and not route.get('defaultUrlRedirect'), 'Unknown report routing rule')
             matches = [r for r in route.get('hostRules', []) if any(
