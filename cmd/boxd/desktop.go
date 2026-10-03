@@ -693,32 +693,30 @@ func (s *desktopService) runXdotool(ctx context.Context, args ...string) error {
 // sandbox user substitute a helper and run it with boxd's privileges.
 var desktopHelperPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-// commandContext gives desktop tools the sandbox's effective environment.
-// In particular, DISPLAY is supplied by the desktop template through /init;
-// boxd itself starts before template defaults are applied and therefore does
-// not inherit that value in its process environment.
+// commandContext runs a desktop helper with a minimal environment: PATH and
+// DISPLAY only. The helpers run with boxd's privileges, so nothing else from
+// the sandbox's environment may reach them — LD_PRELOAD or an ImageMagick
+// config override would otherwise run sandbox-controlled code as root.
+// DISPLAY comes from the desktop template through /init; boxd itself starts
+// before template defaults are applied and does not have it in its own
+// environment.
 func (s *desktopService) commandContext(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
 	envVars, _, _ := s.ctx.snapshot()
 
-	display := os.Getenv("DISPLAY")
+	display := envVars["DISPLAY"]
+	if display == "" {
+		display = os.Getenv("DISPLAY")
+	}
 	if display == "" {
 		display = defaultDesktopDisplay
 	}
-
-	env := append(os.Environ(), "DISPLAY="+display)
-	for key, value := range envVars {
-		env = append(env, key+"="+value)
-	}
-	// Last PATH wins for the child as well, so a helper's own subprocesses
-	// resolve from the same trusted set.
-	env = append(env, "PATH="+desktopHelperPath)
 
 	resolved, err := lookPathIn(name, desktopHelperPath)
 	if err != nil {
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, resolved, args...)
-	cmd.Env = env
+	cmd.Env = []string{"PATH=" + desktopHelperPath, "DISPLAY=" + display}
 	return cmd, nil
 }
 

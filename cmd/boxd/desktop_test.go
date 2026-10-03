@@ -1183,3 +1183,29 @@ func TestCaptureScreenshot_RejectsOversizeFrame(t *testing.T) {
 		t.Fatalf("captureScreenshot: err = %v, want size-limit error", err)
 	}
 }
+
+// Only PATH and DISPLAY reach a helper: the sandbox's environment is under
+// the sandbox user's control and the helper runs with boxd's privileges.
+func TestDesktopCommandDropsSandboxEnv(t *testing.T) {
+	withFakeBin(t, map[string]string{
+		"xdotool": `printf '%s|%s|%s' "$LD_PRELOAD" "$MAGICK_CONFIGURE_PATH" "$DISPLAY"
+`,
+	})
+	sandboxCtx := &sandboxContext{}
+	sandboxCtx.merge(map[string]string{
+		"DISPLAY":               ":77",
+		"LD_PRELOAD":            "/tmp/evil.so",
+		"MAGICK_CONFIGURE_PATH": "/tmp/magick",
+	}, "", "")
+	cmd, err := newDesktopService(sandboxCtx).commandContext(context.Background(), "xdotool")
+	if err != nil {
+		t.Fatalf("commandContext: %v", err)
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := string(out); got != "||:77" {
+		t.Fatalf("helper env = %q, want only DISPLAY to pass through", got)
+	}
+}
