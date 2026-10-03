@@ -201,7 +201,7 @@ jobs:
       # The helper owns a disposable privileged Linux container and XFS loop
       # mount; no database is needed for the physical-only selector.
       - name: Run physical retained-storage race contracts
-        run: bash scripts/validate-retained-docker.sh --physical-only test -race -count=1 ./internal/vm -run '^TestRetainedPhysical'
+        run: bash scripts/validate-retained-docker.sh --physical-only test -race -count=1 -timeout 5m ./internal/vm -run '^TestRetainedPhysical'
 
   build:
     name: Build
