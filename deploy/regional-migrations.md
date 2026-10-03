@@ -4,11 +4,14 @@ Install `scripts/migration-requirements.txt` and use Supabase CLI 2.119.0.
 All remote actions go through `scripts/migrate_database.py`; `make migrate-local`
 is only for disposable databases. Targets are `staging`, `use4`, and `usw2`.
 The wrapper accepts the selected project's direct endpoint or a Supabase session
-pooler on port 5432 with the exact `postgres.<project>` login. Transaction poolers
-are rejected. Both paths require PostgreSQL 17+ and verified startup/reset defaults
-of 250ms lock timeout and 2s transaction timeout. Session pooling is usable only
-if those defaults survive the pooler; endpoint acceptance alone is not proof.
-The hosted runner must verify connectivity and settings before migration.
+pooler on port 5432 with the exact `postgres.<project>` login. For a validated
+session-pooler input, the runner constructs an in-memory direct connection to
+`db.<selected-project>.supabase.co:5432` as `postgres`, preserving the encoded
+password and allowed query parameters. The shared secret is unchanged. Transaction
+poolers and other projects are rejected before conversion; there is no fallback.
+All migration sessions require PostgreSQL 17+ and verified startup/reset defaults
+of 250ms lock timeout and 2s transaction timeout. The hosted runner must verify
+direct connectivity, authentication, and settings before migration.
 Never print `DATABASE_URL` or include it in a command transcript. Connection
 rejections report fixed categories without URL, host, username or password values.
 A pooler rejection describes the migration contract, not invalid credentials.

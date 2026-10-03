@@ -76,6 +76,42 @@ class ConnectionIdentityTest(unittest.TestCase):
             with self.assertRaises(migration.MigrationError):
                 migration.preflight(CLI, "unused", ROOT, None)
 
+    def test_migration_connection_preserves_encoded_password_and_parameters(self):
+        for target, project in migration.PROJECTS.items():
+            for credentials in ("", ":", ":example%40%3A%2f%25%23%3F+word", ":example:word"):
+                for port in ("", ":5432"):
+                    query = "?sslmode=require&connect_timeout=10&application_name=migration%20check"
+                    source = f"postgresql://postgres.{project}{credentials}@aws-0-us-west-1.pooler.supabase.com{port}/postgres{query}"
+                    expected = f"postgresql://postgres{credentials}@db.{project}.supabase.co:5432/postgres{query}"
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        actual = migration.migration_connection_url(source, target)
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("transaction_timeout", migration.bounded_url(actual))
+                    self.assertIn("lock_timeout", migration.bounded_url(actual))
+            direct = f"postgres://postgres:example%40word@db.{project}.supabase.co/postgres?sslmode=require"
+            self.assertEqual(migration.migration_connection_url(direct, target), direct)
+
+    def test_preflight_receives_bounded_direct_connection(self):
+        project = migration.PROJECTS["usw2"]
+        source = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
+        version = subprocess.CompletedProcess([], 0, migration.CLI_VERSION, "")
+        with patch.object(migration, "run_cli", return_value=version), patch.object(migration, "preflight") as preflight, contextlib.redirect_stdout(io.StringIO()) as output:
+            migration.migrate("usw2", "preflight", source)
+        expected = migration.bounded_url(f"postgres://postgres:private-example@db.{project}.supabase.co:5432/postgres")
+        self.assertEqual(preflight.call_args.args[1], expected)
+        self.assertNotIn("private-example", output.getvalue())
+
+    def test_migration_connection_rejects_input_before_conversion(self):
+        project = migration.PROJECTS["usw2"]
+        source = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
+        for invalid in (source.replace(":5432", ":6543"), source.replace(project, "otherproject"),
+                        source + "?host=private.example", source.replace("pooler.supabase.com", "private.example")):
+            with self.assertRaises(migration.MigrationError) as error:
+                migration.migration_connection_url(invalid, "usw2")
+            self.assertNotIn("private-example", str(error.exception))
+            self.assertNotIn("private.example", str(error.exception))
+
     def test_direct_projects(self):
         for target, project in migration.PROJECTS.items():
             for url in (

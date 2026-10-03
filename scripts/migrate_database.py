@@ -95,6 +95,18 @@ def verify_connection_identity(database_url, target):
         raise MigrationError(f"Migration connection rejected: {reason}")
 
 
+def migration_connection_url(database_url, target):
+    """Use a direct migration session without changing the shared connection secret."""
+    verify_connection_identity(database_url, target)
+    url = urlsplit(database_url)
+    if re.fullmatch(r"aws-\d+-[a-z0-9-]+\.pooler\.supabase\.com", url.hostname or ""):
+        # Keep the password's original encoding; only the validated route changes.
+        _, separator, password = url.netloc.rsplit("@", 1)[0].partition(":")
+        credentials = "postgres" + separator + password
+        return urlunsplit(url._replace(netloc=f"{credentials}@db.{PROJECTS[target]}.supabase.co:5432"))
+    return database_url
+
+
 def bounded_url(database_url):
     url = urlsplit(database_url)
     params = parse_qsl(url.query, keep_blank_values=True)
@@ -250,8 +262,7 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
     deadline = time.monotonic() + COMMAND_TIMEOUT
     if action not in ("preflight", "recovery-preflight", "recover", "push", "list", "dry-run"):
         raise MigrationError("Unsupported migration action")
-    verify_connection_identity(database_url, target)
-    database_url = bounded_url(database_url)
+    database_url = bounded_url(migration_connection_url(database_url, target))
     version = invoke_cli([cli, "--version"], deadline, "cli_version")
     if version.returncode or version.stdout.strip() != CLI_VERSION:
         raise MigrationError(f"stage=cli_version category=version_mismatch expected={CLI_VERSION} version_ok=false")
