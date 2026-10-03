@@ -86,6 +86,9 @@ func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceI
 			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, X-Superserve-Routing-Hint, Content-Type, Connect-Protocol-Version, Connect-Timeout-Ms, X-User-Agent")
 			w.Header().Set("Access-Control-Max-Age", "3600")
 		}
+		// The allowed origin is echoed per request, so a shared cache must
+		// key the response on it (and on the preflight request headers).
+		w.Header().Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
