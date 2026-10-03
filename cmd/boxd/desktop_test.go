@@ -1209,3 +1209,24 @@ func TestDesktopCommandDropsSandboxEnv(t *testing.T) {
 		t.Fatalf("helper env = %q, want only DISPLAY to pass through", got)
 	}
 }
+
+func TestCaptureScreenshot_BoundedConcurrency(t *testing.T) {
+	withFakeBin(t, map[string]string{"import": `printf 'FAKEPNGDATA'
+`})
+	s := newDesktopService(&sandboxContext{})
+	for i := 0; i < maxConcurrentCaptures; i++ {
+		s.captureSlots <- struct{}{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := s.captureScreenshot(ctx); err == nil {
+		t.Fatal("capture ran with every slot taken")
+	}
+	<-s.captureSlots
+	if _, err := s.captureScreenshot(context.Background()); err != nil {
+		t.Fatalf("capture after a slot freed: %v", err)
+	}
+	if got := len(s.captureSlots); got != maxConcurrentCaptures-1 {
+		t.Fatalf("slots held after capture = %d, want %d (slot released)", got, maxConcurrentCaptures-1)
+	}
+}

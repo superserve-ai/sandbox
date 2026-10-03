@@ -30,9 +30,10 @@ import (
 // to the request context via exec.CommandContext.
 type desktopService struct {
 	boxdpbconnect.UnimplementedDesktopServiceHandler
-	ctx        *sandboxContext
-	mutationMu sync.Mutex
-	streamSlot chan struct{}
+	ctx          *sandboxContext
+	mutationMu   sync.Mutex
+	streamSlot   chan struct{}
+	captureSlots chan struct{}
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,10 @@ const (
 	maxModifiers          = 8
 	maxModifierLength     = 32
 	maxScreenshotBytes    = 32 * 1024 * 1024
+	// maxConcurrentCaptures bounds simultaneous `import` processes (each up to
+	// maxScreenshotBytes of buffer) across unary screenshots and stream
+	// frames, so concurrent viewers cannot exhaust the sandbox.
+	maxConcurrentCaptures = 4
 	maxDesktopDimension   = 8192
 	minDesktopWidth       = 320
 	minDesktopHeight      = 200
@@ -91,8 +96,9 @@ func newDesktopService(ctx *sandboxContext) *desktopService {
 		ctx = &sandboxContext{}
 	}
 	return &desktopService{
-		ctx:        ctx,
-		streamSlot: make(chan struct{}, 1),
+		ctx:          ctx,
+		streamSlot:   make(chan struct{}, 1),
+		captureSlots: make(chan struct{}, maxConcurrentCaptures),
 	}
 }
 
@@ -233,6 +239,12 @@ func (s *desktopService) Screenshot(ctx context.Context, req *connect.Request[pb
 // returns the PNG bytes written to stdout. Bound to a per-capture timeout
 // derived from ctx so one wedged capture can't stall the stream forever.
 func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) {
+	select {
+	case s.captureSlots <- struct{}{}:
+		defer func() { <-s.captureSlots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	capCtx, cancel := context.WithTimeout(ctx, screenshotTimeout)
 	defer cancel()
 
