@@ -309,19 +309,24 @@ func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) 
 		return nil, ctx.Err()
 	}
 	var encoded []byte
-	if s.withX11(ctx, func(b *x11Backend) error {
+	attempted, err := s.runX11(ctx, func(b *x11Backend) error {
 		frame, err := b.Capture()
 		if err != nil {
 			return err
 		}
 		encoded, err = encodeFramePNG(frame)
 		return err
-	}) {
+	})
+	if attempted && err == nil {
 		if len(encoded) > maxScreenshotBytes {
 			return nil, fmt.Errorf("screenshot is %d bytes, limit is %d", len(encoded), maxScreenshotBytes)
 		}
 		return encoded, nil
 	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	// A read is safe to redo through the shell path.
 
 	capCtx, cancel := context.WithTimeout(ctx, screenshotTimeout)
 	defer cancel()
@@ -362,11 +367,14 @@ func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) 
 // displayGeometry queries the virtual display's current resolution — via the
 // persistent connection when available, else xdotool.
 func (s *desktopService) displayGeometry(ctx context.Context) (width, height uint32, err error) {
-	if s.withX11(ctx, func(b *x11Backend) error {
+	if attempted, x11Err := s.runX11(ctx, func(b *x11Backend) error {
 		width, height, err = b.Geometry()
 		return err
-	}) {
+	}); attempted && x11Err == nil {
 		return width, height, nil
+	}
+	if ctx.Err() != nil {
+		return 0, 0, ctx.Err()
 	}
 
 	geomCtx, cancel := context.WithTimeout(ctx, xdotoolTimeout)
@@ -447,23 +455,25 @@ func pointerArgs(x, y int32, button pb.PointerButton, action pb.PointerAction) (
 	}
 }
 
-// execPointer delivers a validated pointer event: persistent backend first,
-// xdotool args as the fallback. Callers hold mutationMu.
+// execPointer delivers a validated pointer event: persistent backend when
+// reachable, xdotool only when no backend was available. Once the backend
+// has been asked, its error is returned as is; replaying through xdotool
+// could deliver a click twice. Callers hold mutationMu.
 func (s *desktopService) execPointer(ctx context.Context, ev *pb.PointerEvent, fallbackArgs []string) error {
-	if s.withX11(ctx, func(b *x11Backend) error {
+	if attempted, err := s.runX11(ctx, func(b *x11Backend) error {
 		return b.Pointer(ev.GetX(), ev.GetY(), ev.GetButton(), ev.GetAction())
-	}) {
-		return nil
+	}); attempted {
+		return err
 	}
 	return s.runXdotool(ctx, fallbackArgs...)
 }
 
-// execScroll delivers a validated scroll event; same backend/fallback split.
+// execScroll delivers a validated scroll event; same backend/fallback rule.
 func (s *desktopService) execScroll(ctx context.Context, ev *pb.ScrollEvent, fallbackCmds [][]string) error {
-	if s.withX11(ctx, func(b *x11Backend) error {
+	if attempted, err := s.runX11(ctx, func(b *x11Backend) error {
 		return b.Scroll(ev.GetDx(), ev.GetDy())
-	}) {
-		return nil
+	}); attempted {
+		return err
 	}
 	for _, args := range fallbackCmds {
 		if err := s.runXdotool(ctx, args...); err != nil {

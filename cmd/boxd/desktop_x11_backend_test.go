@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"image"
 	"testing"
 	"time"
@@ -152,5 +153,76 @@ exit 1
 		if stream.Msg().GetKeepalive() == nil {
 			t.Fatalf("event %d = %+v, want keepalive", i, stream.Msg())
 		}
+	}
+}
+
+func TestRawFrameTooLarge(t *testing.T) {
+	cases := map[[2]uint16]bool{
+		{1280, 800}:  false,
+		{3840, 2160}: false, // 4K, ~33 MiB
+		{4096, 4096}: false, // exactly the cap
+		{4097, 4096}: true,
+		{8192, 8192}: true, // 256 MiB raw
+	}
+	for dims, want := range cases {
+		if got := rawFrameTooLarge(dims[0], dims[1]); got != want {
+			t.Errorf("rawFrameTooLarge(%dx%d) = %v, want %v", dims[0], dims[1], got, want)
+		}
+	}
+}
+
+// A backend with no connection: the ops below never touch it, so these
+// tests exercise runX11's control flow alone.
+func withFakeBackend(s *desktopService) *x11Backend {
+	b := &x11Backend{}
+	s.x11.backend = b
+	return b
+}
+
+func TestRunX11_OpErrorIsReturnedAndDropsTheBackend(t *testing.T) {
+	s := newDesktopService(&sandboxContext{})
+	withFakeBackend(s)
+	attempted, err := s.runX11(context.Background(), func(*x11Backend) error {
+		return errors.New("sync failed")
+	})
+	if !attempted || err == nil || err.Error() != "sync failed" {
+		t.Fatalf("attempted=%v err=%v, want attempted with the op's error", attempted, err)
+	}
+	if s.x11.backend != nil {
+		t.Fatal("failed backend was not dropped")
+	}
+}
+
+func TestRunX11_CancellationReleasesABlockedOp(t *testing.T) {
+	s := newDesktopService(&sandboxContext{})
+	withFakeBackend(s)
+	release := make(chan struct{})
+	defer close(release)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	attempted, err := s.runX11(ctx, func(*x11Backend) error {
+		<-release // stands in for a reply that never comes
+		return nil
+	})
+	if !attempted || !errors.Is(err, context.Canceled) {
+		t.Fatalf("attempted=%v err=%v, want context.Canceled", attempted, err)
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatal("runX11 did not return promptly after cancellation")
+	}
+	if s.x11.backend != nil {
+		t.Fatal("backend was not dropped on cancellation")
+	}
+}
+
+func TestRunX11_NoBackendIsNotAttempted(t *testing.T) {
+	s := newTestDesktopService(nil)
+	attempted, err := s.runX11(context.Background(), func(*x11Backend) error { return nil })
+	if attempted || err != nil {
+		t.Fatalf("attempted=%v err=%v, want not attempted", attempted, err)
 	}
 }

@@ -32,6 +32,16 @@ import (
 // per interval, not per RPC.
 const x11ReprobeInterval = 30 * time.Second
 
+// maxRawFrameBytes bounds one GetImage reply (4 bytes per pixel): the raw
+// frame is held in memory for conversion and PNG encoding, and up to
+// maxConcurrentCaptures of them may exist at once. 64 MiB covers 4K; a
+// larger display falls back to `import`, whose memory is its own process.
+const maxRawFrameBytes = 64 << 20
+
+// errFrameTooLarge is returned by Capture for a display above
+// maxRawFrameBytes; the caller falls back to the shell path.
+var errFrameTooLarge = fmt.Errorf("display exceeds %d bytes of raw frame", maxRawFrameBytes)
+
 type x11Backend struct {
 	conn      *xgb.Conn
 	root      xproto.Window
@@ -62,7 +72,9 @@ func newX11Backend(display string) (*x11Backend, error) {
 }
 
 func (b *x11Backend) Close() {
-	b.conn.Close()
+	if b.conn != nil {
+		b.conn.Close()
+	}
 }
 
 // sync round-trips to the X server so buffered events are known-delivered
@@ -205,6 +217,9 @@ func (b *x11Backend) Capture() (*image.RGBA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("root geometry: %w", err)
 	}
+	if rawFrameTooLarge(geom.Width, geom.Height) {
+		return nil, errFrameTooLarge
+	}
 	img, err := xproto.GetImage(b.conn, xproto.ImageFormatZPixmap, xproto.Drawable(b.root),
 		0, 0, geom.Width, geom.Height, 0xffffffff).Reply()
 	if err != nil {
@@ -226,22 +241,26 @@ func (b *x11Backend) Capture() (*image.RGBA, error) {
 	return frame, nil
 }
 
+// rawFrameTooLarge reports whether a display's raw frame would exceed
+// maxRawFrameBytes.
+func rawFrameTooLarge(width, height uint16) bool {
+	return int(width)*int(height)*4 > maxRawFrameBytes
+}
+
 // bgrxToRGBA converts a little-endian ZPixmap (depth 24/32: B,G,R,X bytes
-// per pixel) into an RGBA image.
+// per pixel) into an RGBA image in place: the returned frame shares `data`,
+// so a capture holds one copy of the pixels, not two.
 func bgrxToRGBA(data []byte, width, height int) (*image.RGBA, error) {
-	if len(data) < width*height*4 {
+	n := width * height * 4
+	if len(data) < n {
 		return nil, fmt.Errorf("short pixmap: got %d bytes for %dx%d", len(data), width, height)
 	}
-	frame := image.NewRGBA(image.Rect(0, 0, width, height))
-	for i := 0; i < width*height; i++ {
-		src := i * 4
-		dst := i * 4
-		frame.Pix[dst+0] = data[src+2]
-		frame.Pix[dst+1] = data[src+1]
-		frame.Pix[dst+2] = data[src+0]
-		frame.Pix[dst+3] = 0xff
+	pix := data[:n]
+	for i := 0; i < n; i += 4 {
+		pix[i], pix[i+2] = pix[i+2], pix[i]
+		pix[i+3] = 0xff
 	}
-	return frame, nil
+	return &image.RGBA{Pix: pix, Stride: width * 4, Rect: image.Rect(0, 0, width, height)}, nil
 }
 
 // compositeCursor alpha-blends an XFixes cursor (premultiplied ARGB words)
@@ -323,17 +342,38 @@ func (h *x11Holder) drop(backend *x11Backend) {
 	}
 }
 
-// withX11 runs op on the persistent backend if one is available; a call-time
-// error drops the connection and reports "not handled" so the caller falls
-// back to the shell path for this call.
-func (s *desktopService) withX11(_ context.Context, op func(*x11Backend) error) bool {
+// runX11 runs op on the persistent backend when one is available.
+// attempted=false means no backend was reachable and nothing was sent, so
+// the caller may use the shell path. Once attempted, the op's error is the
+// caller's to handle: for input it must not be retried through the shell,
+// since the X server may already have applied part of it.
+//
+// A failing op drops the connection so the next call re-probes. If ctx ends
+// while the op is blocked on a reply, the connection is closed (which
+// releases the pending reply) and ctx's error is returned, so request
+// timeouts and client cancellation still free the capture slot and the
+// mutation lock.
+func (s *desktopService) runX11(ctx context.Context, op func(*x11Backend) error) (attempted bool, err error) {
 	backend := s.x11.get(s.displayName())
 	if backend == nil {
-		return false
+		return false, nil
 	}
-	if err := op(backend); err != nil {
+	done := make(chan error, 1)
+	go func() { done <- op(backend) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			s.x11.drop(backend)
+		}
+		return true, err
+	case <-ctx.Done():
 		s.x11.drop(backend)
-		return false
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			// The op is parked in the X library; it ends on its own once
+			// the closed socket surfaces, and this backend is already gone.
+		}
+		return true, ctx.Err()
 	}
-	return true
 }
