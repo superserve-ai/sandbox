@@ -38,7 +38,8 @@ verified caller-identity contract.
 
 Queries, arbitrary path parameters, headers, credentials, command arguments,
 environment, terminal frames, file contents and error-body snippets are omitted.
-The API's `path` may retain validated UUID parameters; region-prefixed sandbox
+The API's `path` may retain validated UUIDs only in known identifier parameters;
+tenant-chosen names stay redacted even when UUID-shaped. Region-prefixed sandbox
 IDs are normalized to the same UUID used in `sandbox_id`. Use `route` for grouping.
 Existing API client-IP behavior is unchanged; it is not identity evidence.
 

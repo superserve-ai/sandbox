@@ -122,6 +122,7 @@ func TestRequestAttributionAuthOutcomes(t *testing.T) {
 func TestRequestAttributionRedactsTargetsAndPanics(t *testing.T) {
 	buf := captureRequestLogs(t)
 	const secret = "SYNTHETIC_PRIVATE_MARKER"
+	const uuidSecretName = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 	r := gin.New()
 	r.Use(RequestLogger(), ErrorHandler())
 	r.POST("/secrets/:name", func(c *gin.Context) { c.Status(204) })
@@ -131,6 +132,7 @@ func TestRequestAttributionRedactsTargetsAndPanics(t *testing.T) {
 		status         int
 	}{
 		{"POST", "/secrets/" + secret + "?token=" + secret, 204},
+		{"POST", "/secrets/" + uuidSecretName, 204},
 		{"GET", "/unknown/" + secret + "?token=" + secret, 404},
 		{"GET", "/panic?key=" + secret, 500},
 	} {
@@ -143,7 +145,7 @@ func TestRequestAttributionRedactsTargetsAndPanics(t *testing.T) {
 		if w.Code != tc.status {
 			t.Fatal(w.Code)
 		}
-		if strings.Contains(buf.String(), secret) {
+		if strings.Contains(buf.String(), secret) || strings.Contains(buf.String(), uuidSecretName) {
 			t.Fatalf("secret in logs: %s", buf)
 		}
 		got := lastRequestLog(t, buf)

@@ -47,8 +47,8 @@ func logHumanIdentity(c *gin.Context, userID string) {
 	c.Set(logIdentityKey, i)
 }
 
-// Only route literals and validated UUIDs are safe path material. Names, file
-// paths, unknown routes and query values can contain tenant secrets.
+// Only known identifier parameters may retain validated UUIDs. Tenant-chosen
+// names can also look like UUIDs, so shape alone does not make them safe.
 func requestLogPath(c *gin.Context) (string, string) {
 	route := c.FullPath()
 	if route == "" {
@@ -57,6 +57,13 @@ func requestLogPath(c *gin.Context) (string, string) {
 	parts := strings.Split(route, "/")
 	for n, part := range parts {
 		if strings.HasPrefix(part, ":") {
+			switch part {
+			case ":sandbox_id", ":template_id", ":build_id", ":snapshot_id",
+				":team_id", ":user_id", ":host_id", ":assignment_id", ":period_id",
+				":event_id", ":correction_id", ":restriction_id", ":identity_id":
+			default:
+				continue
+			}
 			raw := c.Param(part[1:])
 			id, err := uuid.Parse(raw)
 			if part == ":sandbox_id" {
