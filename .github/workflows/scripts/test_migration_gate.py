@@ -50,6 +50,9 @@ class MigrationGateTest(unittest.TestCase):
             with self.assertRaises(gate.GateError):
                 gate.select_action(self.env)
             self.env["RECOVERY_EVIDENCE_RUN_ID"] = "456"
+            with self.assertRaises(gate.GateError):
+                gate.select_action(self.env)
+            self.env["RECOVERY_COORDINATION_ACK"] = "accepted"
             self.assertEqual(gate.select_action(self.env), ("recovery-preflight", True))
             self.env["MIGRATION_ACTION"] = "recover"
             with self.assertRaises(gate.GateError):

@@ -1,0 +1,98 @@
+name: Collect recovery receiver evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      approved_revision:
+        description: Exact reviewed main revision for the collection and recovery
+        required: true
+        type: string
+      coordination_ack:
+        description: Named operator has established the documented coordinated no-change window
+        required: true
+        type: choice
+        default: not-approved
+        options: [not-approved, accepted]
+      manual_guests_json:
+        description: Optional operator-supplied host capture with original times and coordinated continuity acknowledgment
+        required: false
+        type: string
+      manual_guests_sha256:
+        description: SHA256 of the exact approved manual_guests_json input bytes
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: recovery-evidence
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/collect_recovery_evidence.py --check-dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVED_REVISION: ${{ inputs.approved_revision }}
+          COORDINATION_ACK: ${{ inputs.coordination_ack }}
+
+  collect:
+    needs: gate
+    environment: production
+    # A fresh hosted runner has no guest SSH identity. An existing authorized
+    # observer route must be established separately; this workflow creates none.
+    runs-on: ${{ inputs.manual_guests_json != '' && 'ubuntu-latest' || vars.RECOVERY_OBSERVER_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: b7ea7b9b2f663f2e1ba318a92d8d511c6542acb6
+          path: audited-host-source
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - name: Reproduce audited host executables
+        working-directory: audited-host-source
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+          GOTOOLCHAIN: local
+        run: |
+          go build -ldflags '-s -w' -trimpath -o bin/vmd ./cmd/vmd
+          go build -ldflags '-s -w' -trimpath -o bin/secretsproxy ./cmd/secretsproxy
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Collect and privately verify receiver evidence
+        run: python3 scripts/collect_recovery_evidence.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVED_REVISION: ${{ inputs.approved_revision }}
+          COORDINATION_ACK: ${{ inputs.coordination_ack }}
+          RECOVERY_SSH_USER: ${{ vars.RECOVERY_SSH_USER }}
+          MANUAL_GUESTS_JSON: ${{ inputs.manual_guests_json }}
+          MANUAL_GUESTS_SHA256: ${{ inputs.manual_guests_sha256 }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: retained-recovery-evidence-usw2
+          path: recovery-evidence/evidence.json
+          if-no-files-found: error
+          retention-days: 1

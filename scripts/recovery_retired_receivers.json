@@ -1,0 +1,97 @@
+{
+  "retained_introduction_source": "8710ea8cd6e6c06aae5a7b52bd31b2f02436b740",
+  "retained_introduction_at": "2026-10-02T18:28:51Z",
+  "events": [
+    {
+      "timestamp": "2026-08-10T19:35:30.940723Z",
+      "receiveTimestamp": "2026-08-10T19:35:31.790154300Z",
+      "method": "google.cloud.run.v2.Jobs.DeleteJob",
+      "resource": "projects/rayai-prod/locations/us-central1/jobs/api-canary-production-us-central1",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-08-10T19:35:25.809106Z",
+      "receiveTimestamp": "2026-08-10T19:35:26.215528675Z",
+      "method": "google.cloud.run.v2.Jobs.DeleteJob",
+      "resource": "projects/rayai-prod/locations/us-central1/jobs/api-canary-janitor-production-us-central1",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-23T19:13:32.233386Z",
+      "receiveTimestamp": "2026-07-23T19:13:32.981527623Z",
+      "method": "google.cloud.run.v1.Services.DeleteService",
+      "resource": "namespaces/rayai-prod/services/superserve-api",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T19:59:33.580680Z",
+      "receiveTimestamp": "2026-07-22T19:59:34.444198288Z",
+      "method": "google.cloud.run.v2.Jobs.DeleteJob",
+      "resource": "projects/rayai-prod/locations/us-east4/jobs/api-canary-janitor-production-us-east4",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T19:59:33.577763Z",
+      "receiveTimestamp": "2026-07-22T19:59:34.526682031Z",
+      "method": "google.cloud.run.v2.Jobs.DeleteJob",
+      "resource": "projects/rayai-prod/locations/us-east4/jobs/api-canary-production-us-east4",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T19:11:07.026946Z",
+      "receiveTimestamp": "2026-07-22T19:11:08.014691828Z",
+      "method": "google.cloud.run.v1.Jobs.DeleteJob",
+      "resource": "namespaces/rayai-prod/jobs/api-canary-janitor-production-us-central1",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T19:11:02.816570Z",
+      "receiveTimestamp": "2026-07-22T19:11:03.155029689Z",
+      "method": "google.cloud.run.v1.Jobs.DeleteJob",
+      "resource": "namespaces/rayai-prod/jobs/api-canary-janitor-production",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T00:20:38.192355Z",
+      "receiveTimestamp": "2026-07-22T00:20:38.833799509Z",
+      "method": "google.cloud.run.v1.Jobs.DeleteJob",
+      "resource": "namespaces/rayai-prod/jobs/api-canary-janitor-production-us-west2",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T00:20:34.805044Z",
+      "receiveTimestamp": "2026-07-22T00:20:35.708843819Z",
+      "method": "google.cloud.run.v1.Jobs.DeleteJob",
+      "resource": "namespaces/rayai-prod/jobs/api-canary-production-us-west2",
+      "status_code": 5
+    },
+    {
+      "timestamp": "2026-07-22T00:20:31.533686Z",
+      "receiveTimestamp": "2026-07-22T00:20:31.919033447Z",
+      "method": "google.cloud.run.v1.Jobs.DeleteJob",
+      "resource": "namespaces/rayai-prod/jobs/api-canary-production-us-central1",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T00:18:31.023698Z",
+      "receiveTimestamp": "2026-07-22T00:18:31.363416396Z",
+      "method": "google.cloud.run.v1.Jobs.DeleteJob",
+      "resource": "namespaces/rayai-prod/jobs/api-canary-production-us-west2",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T00:18:19.402360Z",
+      "receiveTimestamp": "2026-07-22T00:18:19.647313475Z",
+      "method": "google.cloud.run.v1.Jobs.DeleteJob",
+      "resource": "namespaces/rayai-prod/jobs/api-canary-janitor-production-us-west2",
+      "status_code": 0
+    },
+    {
+      "timestamp": "2026-07-22T00:16:13.924726Z",
+      "receiveTimestamp": "2026-07-22T00:16:14.500346769Z",
+      "method": "google.cloud.run.v1.Jobs.DeleteJob",
+      "resource": "namespaces/rayai-prod/jobs/api-canary-production-us-central1",
+      "status_code": 0
+    }
+  ]
+}

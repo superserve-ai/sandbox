@@ -93,11 +93,13 @@ state and inventory match the preflight receipt. Any changed database or writer
 state requires a new preflight and release decision.
 
 Each invocation authenticates and caches its immutable evidence artifact once.
-Before each mutating phase it refreshes the complete service, revision and host
-inventories in parallel and revalidates evidence age afterward. Read-only loop
-inspections do not fetch a second inventory before the same CLI mutation. These
-checks still depend on cloud latency; local recovery timings use mocked cloud
-observations and do not prove a hosted run can finish within the validity window.
+Before mutation it obtains a bracketed live observation. Subsequent phases reuse
+that fixed 120-second lease while checking artifact/plan/consumer identity, wall
+and monotonic clocks, and at least six seconds of remaining validity. Reuse never
+extends expiry. Renewal repeats the complete mutable inventories and workflow
+checks, revoking the previous lease before any reads. Database inspection and
+admission still run for every phase. Cloud latency can still stop a renewal;
+synthetic timings do not prove hosted runtime.
 
 Execution retains the 250ms lock acquisition, 2s transaction and 60s command
 limits. The complete recovery has a separate 180s deadline, chosen as roughly
@@ -128,62 +130,250 @@ source/history, journal holes, active retained accounting or queued retained
 payloads fail closed. Never delete an unrelated index or manually mark a
 migration applied.
 
-## Operational evidence prerequisite (currently blocked)
+## Receiver evidence and operational prerequisites
 
-The verifier is an artifact contract, not a collector or an access provisioner.
-This repository does not yet supply `.github/workflows/recovery-evidence.yml`.
-Consequently production recovery cannot pass its evidence gate until a separately
-reviewed collector and existing authenticated host-observation route are available.
-Do not replace that requirement with an operator-authored JSON assertion.
+`.github/workflows/recovery-evidence.yml` collects schema 3 provenance evidence using
+`scripts/collect_recovery_evidence.py`. It is manual-only and requires the exact
+reviewed main revision and an explicit named-operator coordination acknowledgment.
+It publishes only `evidence.json` in `retained-recovery-evidence-usw2` on success.
+The verifier authenticates the GitHub run and artifact digest. Schema 3 retains
+immutable provenance across queue/setup delays; it does not grant a mutation
+lease. Inside each consuming West job, a complete new observation brackets guest
+reads with matching cloud inventories and workflow checks. Receiver configuration,
+secret-version metadata and effective guest state must still match the authenticated
+artifact. Changed state requires a new collection and preflight.
 
-The collector must run from the exact approved main revision, using
-`workflow_dispatch`, and publish the unique artifact
-`retained-recovery-evidence-usw2` containing only `evidence.json`. The verifier
-checks the authenticated GitHub run, artifact digest, plan/database identity,
-full cloud inventory and an observation at most 120 seconds old before each
-phase. Test fixtures in `scripts/test_recovery_evidence.py` illustrate the schema;
-they are synthetic data, not acceptable operational evidence.
+Each successful observation authorizes at most 120 seconds from the **start** of
+its live reads. Phase boundaries may reuse the unexpired lease under the explicit
+coordination hold; this does not detect external changes immediately. Every renewal
+repeats mutable checks; failed or overlong observations issue no lease. Existing SQL admission and total recovery deadlines still apply.
+Schema 1/2 artifacts retain their original collector-start expiry. Preflight
+identity excludes observation times/run IDs and ordinary connection churn, but
+includes authenticated provenance and effective writer state. After partial
+committed recovery, obtain a new read-only preflight and approve its exact database
+state; the old receipt must fail rather than silently accepting progress.
 
-The existing deployment identity is selected by `GCP_WORKLOAD_IDENTITY_PROVIDER`
-and `GCP_SERVICE_ACCOUNT`. Reusing those secret references does not establish
-that the identity has the needed permissions. An operator must establish these
-specific prerequisites without changing live configuration as part of recovery:
+Schemas 2 and 3 permit audited retained-capable guest publishers only when every
+possible receiver is proved incapable of accepting their retained reports and
+the separate empty-accounting database guards pass. Sampling need not be disabled
+and guest spools need not be empty for this policy. Schema 1's producer-exclusion
+checks remain available for existing artifacts; its stricter spool requirements
+do not substitute for the receiver proof.
 
-- GitHub `contents:read` and `actions:read` for the exact run/artifact, plus OIDC
-  `id-token:write` to use the existing GCP workload identity.
-- Existing cloud permissions for service metadata, all service revisions, all
-  project VM instances, and complete revision-deletion audit logs. The relevant
-  reads are `run.services.get`, `run.revisions.list`, `compute.instances.list`
-  and `logging.logEntries.list`. The verifier uses `gh`, Cloud SDK and Python.
-- An already authenticated, non-provisioning route to read every relevant host's
-  process inventory, executable hashes, installed restart units/drop-ins and
-  effective configuration, process start/incarnation/destination, and all report
-  spools. Do not invoke deployment scripts or let SSH register keys or metadata.
-  Configuration evidence must be hashed/redacted without exporting secrets.
-- Authenticated binary-to-source provenance. API build image archives can be
-  digest-compared with the observed image. Existing VMD deployment builds upload
-  binaries without a retained provenance artifact; those installed binaries need
-  authenticated historical build evidence or a verified reproducible build.
+Deletion history admits only the reviewed metadata catalog in
+`scripts/recovery_retired_receivers.json`, predating the October 2 retained
+producer, receiver, and schema introduction on main. Job deletion terminates
+executions; service deletion removes its revisions and remains listed until
+complete. The single cataloged NotFound failure performed no deletion. Recreated
+objects require later creation timestamps and current identities, then pass the
+full current source/configuration policy. Unknown events still reject. This is a
+source/deployment and termination argument, not proof against arbitrary
+out-of-band historical code. The collector reads full history once and binds its
+original lower bound, rows, catalog digest and pre-query cutoff into the artifact.
+Each observation runs one mandatory delta query concurrently with opening mutable
+inventory and guest work, awaits it, then takes the closing inventory and workflow
+checks. The delta query uses `(timestamp >= cutoff OR receiveTimestamp >= cutoff)`
+within that original history range; unknown or changed rows stop recovery. The
+cutoff never advances, so delayed older events remain eligible. Cloud Logging has
+no assumed ingestion watermark: absence of a delivered event is not proof that no
+transient change occurred. The coordination hold covers that gap. See [jobs](https://docs.cloud.google.com/run/docs/managing/jobs)
+and [services](https://docs.cloud.google.com/run/docs/managing/services).
 
-Coverage includes serving, tagged, zero-traffic/background and draining revisions,
-all project instances including standby hosts, installed restart executables and
-alternate producers. Sidecars, command overrides, unaudited builds, automatic
-binary downloads or unfinished rollouts prevent admission. Recent revision deletion
-must be excluded through complete audit coverage spanning at least ten minutes
-before collection. The admitted source is pinned in the verifier and was audited
-for both retained production and persisted replay behavior. A newer build with
-retained-report production or replay capability does not satisfy this policy,
-even with sampling disabled. It requires a separately reviewed exclusion policy
-and complete fresh evidence; do not add a source revision based on deploy success.
+Guest configuration checks require all five deployment guards and exact hashes
+for reviewed optional drop-ins. The observed West mount dependency is matched by
+exact content; the other recipes derive from the audited source. Inline flags and
+the duplicated identity environment-file entry must match the admitted files.
+Ordinary pasted probe output is diagnostic. The explicit manual mode below accepts
+a hash-bound, attributed capture under a finite operator continuity assumption;
+it still requires authenticated hosted cloud collection and private binding checks.
 
-Sampling disabled is insufficient: publishers can replay persisted payloads.
-Inspect `.storage-report-queue`, `.storage-report-queue.v2` and
-`.storage-report-queue.migrating/state.json`, plus both database report queues.
-Require an independently coordinated deployment/configuration hold for the whole
-recovery. Observe effective runtime and restart sources; a source label or a
-configuration checkbox is not evidence. Missing access or provenance blocks
-operations and must be routed to the deployment owner; this change grants no IAM,
-creates no observer, provisions no SSH access and performs no production trial.
+### Operator-supplied host capture
+
+Manual mode reuses the existing hosted production identity. It needs no observer
+runner or new SSH access. Its authority is the named operator's explicit continuity
+acknowledgment, **not** workflow authentication of the earlier SSH session. The
+operator who captured the hosts must dispatch collection. Release approval must
+explicitly accept this evidence policy, including the 30-minute maximum age from
+original capture start through the last mutation. Approval, fresh cloud reads and
+lease renewal never reset that clock. Do not reuse an old conversation attachment
+by inventing its capture time or immutable instance identity.
+
+The capture binds both immutable instance IDs, full instance metadata hashes,
+original start/end times, probe hash, revision, plan and operator. Current cloud
+observations must still match, with both instances RUNNING and lastStartTimestamp
+no later than capture start. A full VM reboot invalidates the capture: audited
+boot/startup scripts can rewrite unit/drop-in configuration even without an Actions
+deployment. Normal service restarts into unchanged installed configuration and
+credential-refresh/maintenance-notice timers do not invalidate the routing argument.
+The hold must also cover relevant external OS Config/patch jobs and already queued
+configuration changes; an empty Actions queue alone does not establish that hold.
+
+After code approval, merge, successful main CI and explicit operational release,
+run this single capture from the clean approved checkout using the operator's
+**already working** gcloud SSH route, with `RECOVERY_SSH_USER` set to its existing
+Linux username (the verified current operator uses `alejandro_superserve_ai`). `--plain` suppresses gcloud key creation/registration; explicit
+SSH flags require the existing key and verified host entry. It neither dispatches collection nor reads
+database secret payloads. If the route needs key registration or new access, stop.
+Do not accept an interactive key-registration/host-key prompt. The timestamps and
+identity envelope are captured here, not reconstructed afterward:
+
+```sh
+python3 - <<'CAPTURE'
+import datetime, hashlib, json, os, re, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+import recovery_evidence as evidence
+
+def read(args, source=None, metadata=False):
+    result = subprocess.run(args, input=source, capture_output=True, text=True, timeout=60)
+    if result.returncode or metadata and result.stderr:
+        raise SystemExit('Capture failed; no input issued. Inspect the existing route privately.')
+    return result.stdout
+
+def inventory():
+    rows = json.loads(read(['gcloud', 'compute', 'instances', 'list', '--project=rayai-prod',
+                            '--limit=1000', '--format=json', '--quiet', '--verbosity=warning'], metadata=True))
+    if len(rows) != 2:
+        raise SystemExit('Expected exactly the two reviewed production hosts')
+    return sorted(rows, key=lambda row: str(row['id']))
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+revision = read(['git', 'rev-parse', 'HEAD']).strip()
+operator = json.loads(read(['gh', 'api', 'user']))['login']
+probe = Path('scripts/recovery_guest_probe.py').read_text()
+ssh_user = os.environ.get('RECOVERY_SSH_USER', '')
+key, known = Path.home()/'.ssh/google_compute_engine', Path.home()/'.ssh/google_compute_known_hosts'
+if not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', ssh_user) or not key.is_file() or not known.is_file():
+    raise SystemExit('Set the existing Linux SSH username; existing key and gcloud known-host file are required')
+started = now()
+before = inventory()
+hosts = []
+for host in before:
+    observed = json.loads(read(['gcloud', 'compute', 'ssh', ssh_user+'@'+host['name'], '--project=rayai-prod',
+        '--zone='+host['zone'].rsplit('/', 1)[-1], '--tunnel-through-iap', '--quiet', '--plain',
+        '--ssh-flag=-F/dev/null', '--ssh-flag=-i'+str(key), '--ssh-flag=-oIdentitiesOnly=yes',
+        '--ssh-flag=-oBatchMode=yes', '--ssh-flag=-oStrictHostKeyChecking=yes',
+        '--ssh-flag=-oUpdateHostKeys=no', '--ssh-flag=-oControlMaster=no',
+        '--ssh-flag=-oUserKnownHostsFile='+str(known), '--ssh-flag=-oHostKeyAlias=compute.'+str(host['id']),
+        '--command=sudo -n /usr/bin/python3 -'], source=probe))
+    if 'error' in observed:
+        raise SystemExit('Guest probe incomplete; no input issued')
+    hosts.append(evidence.stable_guest(dict(instance_id=str(host['id']), instance_name=host['name'],
+        zone=host['zone'], instance_sha256=evidence.sha(host), route='operator-supplied',
+        probe_sha256=hashlib.sha256(probe.encode()).hexdigest(), observation=observed)))
+if inventory() != before:
+    raise SystemExit('Host identity or metadata changed during capture')
+manual = dict(authority='operator-supplied-coordinated-window', revision=revision,
+    plan_hash=evidence.sha(json.loads(Path('supabase/recovery/retained-storage-v1.json').read_text())),
+    project='rayai-prod', target='usw2', operator=operator, acknowledgment='accepted',
+    scope=evidence.COORDINATION_SCOPE, started_at=started, completed_at=now(), hosts=hosts)
+evidence.validate_manual_guests(manual, revision, manual['plan_hash'], {'instances': before},
+                                datetime.datetime.now(datetime.timezone.utc).timestamp())
+raw = json.dumps(manual, sort_keys=True, separators=(',', ':'))
+if len(raw.encode()) > 60000:
+    raise SystemExit('Capture exceeds the workflow input bound')
+Path('/tmp/recovery-manual-guests.json').write_text(raw)
+print('Input SHA256:', hashlib.sha256(raw.encode()).hexdigest())
+CAPTURE
+```
+
+Review that input and its printed digest, then pass its **exact bytes** as
+`manual_guests_json` and the digest as `manual_guests_sha256` to the existing
+collection workflow with the approved revision and `coordination_ack=accepted`.
+Use structured JSON input to dispatch; never interpolate capture text into shell
+code. This selects `ubuntu-latest` and bypasses only automated guest SSH.
+The workflow authenticates and records the supplied authority alongside its fresh
+cloud evidence. Then use the resulting evidence run ID for recovery preflight and
+recover, both with `recovery_guest_mode=manual` and a fresh consumer acknowledgment.
+Both use the existing hosted production identity and retain the database/receipt
+checks. Finish inside the original capture's 30 minutes or abort and coordinate a
+fresh capture/preflight. No private binding or migration run is authorized merely
+by preparing this input.
+
+### Coordinated window
+
+`coordinated_assumption` records an operational assumption, not an enforced lock.
+Before acknowledging it, the coordinator must obtain the named operator's explicit
+agreement to a finite no-change window covering both regions, all receiver paths,
+and the recovery target. The window starts before collection and remains in force
+until recovery succeeds or is aborted **and** its work and sessions have ended.
+It excludes API/worker deploys and rollbacks, guest executable/service/restart
+configuration changes, routes/DNS/proxies, database-secret rotations, retained
+activation, manual or alternate writers, and already queued or in-flight mutation
+automation. The collector checks active workflows on every branch, but that check
+and fresh inventory detect changes; they do not prevent them or replace the
+operator's acknowledgment. Each production recovery preflight or recovery dispatch
+also requires `recovery_coordination_ack=accepted` for that consumer run. An old
+collector acknowledgment does not establish the current window. No default or
+synthetic acknowledgment is valid.
+
+If this agreement is violated between observations, a newly capable API could
+acknowledge a retained report before an older worker discards its unknown payload,
+losing the publisher's acknowledged measurement. A capable worker could also
+create retained state during recovery. Short SQL lock timeouts and evidence expiry
+do not close that race. On any change, stop recovery and coordinate termination;
+then review the new state and collect fresh evidence and preflight as required.
+
+### Access and provenance
+
+This implementation does not establish that live access exists. Missing access
+must be resolved separately by the deployment owner before an operational run.
+Neither collection nor recovery provisions keys, IAM, routes, or guest services.
+Do not dispatch either workflow merely to discover whether production access works.
+
+- In automated guest mode, the collector and production recovery jobs use `RECOVERY_OBSERVER_RUNNER`
+  (default `ubuntu-latest`) and `RECOVERY_SSH_USER`. They require an existing
+  `~/.ssh/google_compute_engine` identity and verified `~/.ssh/known_hosts` entries
+  for aliases `rayai-prod.<zone>.<instance-id>`, IAP tunnel access and noninteractive
+  permission to execute the fixed probe with `sudo -n /usr/bin/python3 -`.
+  A fresh hosted runner normally lacks this route and fails closed. SSH checks
+  host keys strictly and never registers a key or updates metadata.
+- The existing `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT` references
+  select an identity; they do not demonstrate its permissions. Read access must
+  cover all services and revisions, jobs and active executions, worker pools,
+  project instances, DNS/routing components, registry artifacts and complete
+  receiver-deletion audit history. GitHub needs `contents:read`, `actions:read`
+  and OIDC `id-token:write`. Both jobs need Python, Cloud SDK, `gh`, and SSH.
+- Private database binding additionally requires version metadata and payload
+  access for only `database-url-usw2` and `database-url`. The helper privately
+  checks all versions that could have been loaded since the oldest active
+  receiver revision started, including versions since superseded by `latest`.
+  Missing version history or an unavailable possibly loaded version blocks
+  collection. Outputs contain version identities and project-match booleans,
+  never URL values, credentials, or provider error output. No SQL connection is
+  made by this collector. Operational payload access requires separate release.
+- Every receiver revision needs an authenticated successful main build artifact
+  whose image configuration matches its immutable registry image, with source on
+  the audited pre-retained first-parent lineage. Tags are lookup hints only.
+  Deleted revisions/jobs, unknown images, missing/expired build artifacts, sidecars,
+  command overrides and unknown consumers fail closed; elapsed time is not proof
+  that an old process or database session drained.
+- Guest binaries are reproduced from the exact reviewed source with Go 1.25.0
+  and the original build flags. Running and installed binaries, units, normal
+  drop-ins and restart guards must match that provenance. A new VMD rollout needs
+  source review and updated provenance followed by fresh evidence; changing a
+  source pin based only on deployment success is insufficient.
+
+The fixed guest probe reads process/environment and loaded systemd settings
+privately, emitting only executable/configuration hashes, process identities,
+credential-free control-plane origins, DNS addresses and established peers.
+For a separately authorized diagnostic, on each guest run exactly
+`sudo -n /usr/bin/python3 - < recovery_guest_probe.py` with the reviewed script
+provided through stdin by the existing authenticated route (the collector does
+this without copying a file onto the host). Manual output alone is not an
+authenticated, fresh hosted artifact.
+
+Existing socket addresses are diagnostics, not TLS hostname attribution. The
+audited VMD fixes the retained-report URL from its startup control-plane setting;
+persisted reports cannot override it. The audited receiver handlers and middleware
+do not redirect those requests. That source proof, effective origin, absence of
+report proxies, admitted historical receivers, current DNS/routing and coordinated
+window establish receiver exclusion. Normal GCS backup connections do not change
+report authority and do not require an IP allowlist or idle backups. Evidence of
+an actual alternative historical route requires review of that route; an IP match
+alone does not establish which service owns a socket.
 
 ## Failure diagnostics
 
