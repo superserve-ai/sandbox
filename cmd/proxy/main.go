@@ -251,7 +251,7 @@ func run() error {
 			log.Fatal().Err(err).Msg("local peer target bind failed")
 		}
 		// Peer traffic terminates at the local handler, never the public router.
-		localSrv = proxy.NewServer(target, localMux)
+		localSrv = proxy.NewServer(target, proxy.PeerRequestLogging(localMux))
 		localConnections = proxy.NewDrainConnections()
 		localSrv.ConnState = localConnections.ConnState
 		localErrCh := make(chan error, 1)

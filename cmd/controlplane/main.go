@@ -54,7 +54,7 @@ const retryUnavailableWindow = 15 * time.Second
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	multi := zerolog.MultiLevelWriter(
-		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
+		os.Stdout,
 		&sentrylog.Writer{},
 	)
 	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
