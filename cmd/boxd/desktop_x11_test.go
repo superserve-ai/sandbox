@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,4 +71,48 @@ func startXvnc(t *testing.T, width, height int) string {
 	}
 	t.Fatalf("Xvnc on %s did not come up", display)
 	return ""
+}
+
+// The persistent backend against a real server: capture via GetImage and
+// pointer injection via XTest, verified from outside with xdotool.
+func TestDesktopX11Backend_RealXServer(t *testing.T) {
+	for _, bin := range []string{"Xvnc", "xdotool"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	display := startXvnc(t, 640, 480)
+	t.Setenv("DISPLAY", display)
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	shot, err := s.Screenshot(ctx, connect.NewRequest(&pb.ScreenshotRequest{}))
+	if err != nil {
+		t.Fatalf("Screenshot: %v", err)
+	}
+	if shot.Msg.GetWidth() != 640 || shot.Msg.GetHeight() != 480 || len(shot.Msg.GetImage()) == 0 {
+		t.Fatalf("screenshot = %dx%d, %d bytes; want 640x480 with data", shot.Msg.GetWidth(), shot.Msg.GetHeight(), len(shot.Msg.GetImage()))
+	}
+	if s.x11.backend == nil {
+		t.Fatal("screenshot did not go through the X11 backend")
+	}
+
+	_, err = s.SendPointer(ctx, connect.NewRequest(&pb.PointerEvent{
+		X: 123, Y: 45,
+		Button: pb.PointerButton_POINTER_BUTTON_LEFT,
+		Action: pb.PointerAction_POINTER_ACTION_CLICK,
+	}))
+	if err != nil {
+		t.Fatalf("SendPointer: %v", err)
+	}
+	probe := exec.Command("xdotool", "getmouselocation")
+	probe.Env = append(os.Environ(), "DISPLAY="+display)
+	out, err := probe.Output()
+	if err != nil {
+		t.Fatalf("xdotool getmouselocation: %v", err)
+	}
+	if got := string(out); !strings.HasPrefix(got, "x:123 y:45 ") {
+		t.Fatalf("pointer after XTest click: %q, want x:123 y:45", got)
+	}
 }
