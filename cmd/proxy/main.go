@@ -25,6 +25,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/proxy"
+	"github.com/superserve-ai/sandbox/internal/requestlog"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
@@ -39,7 +40,7 @@ func main() {
 func run() error {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})
-	log := zerolog.New(multi).With().
+	log := zerolog.New(multi).Hook(requestlog.CloudSeverityHook{}).With().
 		Timestamp().
 		Str("service", "proxy").
 		Logger()

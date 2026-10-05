@@ -174,3 +174,26 @@ func TestRequestAttributionIncludesGlobalRateLimitRejection(t *testing.T) {
 	}
 	t.Fatal("rate limit did not reject test burst")
 }
+
+func TestRequestAttributionPublicSandboxIDs(t *testing.T) {
+	buf := captureRequestLogs(t)
+	id := uuid.NewString()
+	r := gin.New()
+	r.Use(RequestLogger())
+	r.POST("/sandboxes/:sandbox_id/pause", func(c *gin.Context) { c.Status(http.StatusForbidden) })
+	for _, raw := range []string{id, "sb-use-" + id, "PRIVATE_MARKER"} {
+		buf.Reset()
+		r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/sandboxes/"+raw+"/pause", nil))
+		event := lastRequestLog(t, buf)
+		if raw == "PRIVATE_MARKER" {
+			if event["sandbox_id"] != nil || strings.Contains(buf.String(), raw) {
+				t.Fatal("unvalidated sandbox target leaked")
+			}
+		} else if event["sandbox_id"] != id || event["path"] != "/sandboxes/"+id+"/pause" {
+			t.Fatalf("lost sandbox target: %v", event)
+		}
+		if event["route"] != "/sandboxes/:sandbox_id/pause" || event["auth_outcome"] != "not_evaluated" {
+			t.Fatalf("target became identity or changed grouping: %v", event)
+		}
+	}
+}

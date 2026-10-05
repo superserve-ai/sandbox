@@ -38,7 +38,8 @@ verified caller-identity contract.
 
 Queries, arbitrary path parameters, headers, credentials, command arguments,
 environment, terminal frames, file contents and error-body snippets are omitted.
-The API's `path` may retain validated UUID parameters; use `route` for grouping.
+The API's `path` may retain validated UUID parameters; region-prefixed sandbox
+IDs are normalized to the same UUID used in `sandbox_id`. Use `route` for grouping.
 Existing API client-IP behavior is unchanged; it is not identity evidence.
 
 ## Events and measurement
@@ -69,7 +70,8 @@ existing `-1` sentinel. No events are emitted per frame or content chunk.
 
 ## Locate the deployed sink first
 
-Control API stdout is collected by Cloud Run into Cloud Logging. Proxy stdout
+Control API stdout is collected by Cloud Run into Cloud Logging. Both services
+emit the recognized `severity` field alongside the existing `level`. Proxy stdout
 goes to journald (`proxy.service` or `proxy-<generation>.service`). Cloud Logging
 queries for proxy records require the host's existing log collector to forward
 and parse that JSON. Confirm one known request from **each** plane reaches the

@@ -242,6 +242,9 @@ func RequestLogger() gin.HandlerFunc {
 		if identity.CredentialID != "" && c.GetString("api_key_id") == identity.CredentialID {
 			evt.Str("api_key_id", identity.CredentialID)
 		}
+		if id, err := parsePublicSandboxID(c.Param("sandbox_id")); err == nil {
+			evt.Str("sandbox_id", id.String())
+		}
 		identity.Log(evt).
 			Str("service", "sandbox-api").Str("plane", "control").Str("event_type", "request").Str("route", route).
 			Str("method", method).

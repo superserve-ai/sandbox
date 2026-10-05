@@ -57,7 +57,12 @@ func requestLogPath(c *gin.Context) (string, string) {
 	parts := strings.Split(route, "/")
 	for n, part := range parts {
 		if strings.HasPrefix(part, ":") {
-			if id, err := uuid.Parse(c.Param(part[1:])); err == nil {
+			raw := c.Param(part[1:])
+			id, err := uuid.Parse(raw)
+			if part == ":sandbox_id" {
+				id, err = parsePublicSandboxID(raw)
+			}
+			if err == nil {
 				parts[n] = id.String()
 			}
 		}
