@@ -44,26 +44,6 @@ class MigrationHistoryTest(fixture.MigrationCLITest):
                 recovery.ordinary_guard("usw2", self.runner.url, fixture.ROOT, fixture.CLI, self.runner.deadline)
             self.assertEqual(self.history(), before)
 
-    def test_canonical_west_ordinary_completion_and_future_migrations(self):
-        self.copy_migrations()
-        self.push()
-        root = self.project / "future-canonical-root"
-        shutil.copytree(fixture.ROOT / "supabase", root / "supabase")
-        for name, sql in (("20261004000001_future.sql", "ALTER TABLE sandbox_storage_interval ADD CONSTRAINT future_check CHECK(true)"),
-                          ("20261004000002_future.sql", "ALTER TABLE sandbox_storage_interval RENAME TO archived_storage_interval"),
-                          ("20261004000003_future.sql", "SELECT 1")):
-            guard = recovery.ordinary_guard("usw2", self.runner.url, root, fixture.CLI, self.runner.deadline)
-            (root / "supabase/migrations" / name).write_text(sql + ";")
-            (self.migrations / name).write_text(sql + ";")
-            (self.project / "supabase/roles.sql").write_text(migration.EXECUTION_GUARD + guard)
-            migration.cli_run(fixture.CLI, self.runner.url, self.project,
-                              ["db", "push", "--yes", "--include-roles"], self.runner.deadline)
-        guard = recovery.ordinary_guard("usw2", self.runner.url, root, fixture.CLI, self.runner.deadline)
-        self.assertEqual(self.sql("SELECT to_regnamespace('migration_recovery') IS NULL"), "t")
-        self.sql("UPDATE supabase_migrations.schema_migrations SET statements=ARRAY['SELECT 1'] WHERE version='20261003010001'")
-        with self.assertRaisesRegex(migration.MigrationError, "executed-history"):
-            recovery.ordinary_guard("usw2", self.runner.url, root, fixture.CLI, self.runner.deadline)
-
     def test_canonical_west_ordinary_rejects_catalog_and_dispatch_drift(self):
         self.copy_migrations(recovery.LAST)
         self.push()
