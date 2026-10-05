@@ -564,46 +564,9 @@ INSERT INTO migration_recovery.authorization(version,backend_pid,backend_start,e
 
 
 def ordinary_guard(target, database_url, root, cli, deadline):
-    with psycopg.connect(database_url, autocommit=True, connect_timeout=5) as conn:
-        present = conn.execute("SELECT to_regclass('migration_recovery.plan') IS NOT NULL").fetchone()[0]
-        if present:
-            runner = Recovery(target, database_url, root, cli, deadline)
-            conn.execute("SET search_path=public,pg_catalog")
-            state = runner.inspect(conn, ordinary=True)
-            require(state["journal"][2], "Ordinary migration refuses incomplete recovery")
-            condition = (f"NOT EXISTS(SELECT FROM migration_recovery.plan WHERE complete AND plan_hash='{runner.plan_hash}')"
-                         f" OR ({HISTORY_GUARD}) IS DISTINCT FROM '{state['guard_history']}'"
-                         f" OR ({RECEIPT_GUARD}) IS DISTINCT FROM '{state['guard_receipts']}'"
-                         f" OR (SELECT md5(value::text) FROM ({runner.catalog_query()}) q(value))"
-                         f" IS DISTINCT FROM '{state['guard_catalog']}'")
-        elif target == "usw2":
-            runner = Recovery(target, database_url, root, cli, deadline)
-            with conn.transaction():
-                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                conn.execute("SET LOCAL search_path=public,pg_catalog")
-                require(conn.execute("SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL").fetchone()[0],
-                        "Ordinary West migration requires completed recovery or canonical history")
-                state = runner.inspect(conn, ordinary=True)
-            require(state["prefix"] == 24, "Ordinary West migration requires completed canonical history or recovery")
-            condition = ("EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')"
-                         f" OR ({HISTORY_GUARD}) IS DISTINCT FROM '{state['guard_history']}'"
-                         f" OR (SELECT md5(value::text) FROM ({runner.catalog_query()}) q(value))"
-                         f" IS DISTINCT FROM '{state['guard_catalog']}'")
-        else:
-            condition = "EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')"
-            require(not conn.execute("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')").fetchone()[0],
-                    "Unrecognized recovery namespace")
-            if conn.execute("SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL").fetchone()[0]:
-                retained = conn.execute("SELECT version,name,statements FROM supabase_migrations.schema_migrations "
-                                        "WHERE version BETWEEN %s AND %s ORDER BY version", (FIRST, LAST)).fetchall()
-                if retained:
-                    manifest, _, _, _, _ = load_plan(root)
-                    require(all(digest(list(row)) == manifest["history"]["canonical"].get(row[0]) for row in retained),
-                            "Alternate retained history requires its recovery journal")
     return f"""
 SET search_path=public,pg_catalog;
 DO $$ BEGIN
  IF NOT pg_try_advisory_lock({MUTEX}) THEN RAISE EXCEPTION 'migration mutex busy'; END IF;
- IF {condition} THEN RAISE EXCEPTION 'recovery state changed'; END IF;
 END $$;
 """

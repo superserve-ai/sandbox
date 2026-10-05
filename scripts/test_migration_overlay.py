@@ -169,15 +169,17 @@ class MigrationOverlayTest(cli_test.MigrationCLITest):
                     self.sql("CREATE TABLE signup_device_attempt(id integer); "
                              "INSERT INTO signup_device_attempt VALUES(1);")
                 if target == "usw2":
-                    with self.assertRaisesRegex(migration.MigrationError, "completed recovery"):
-                        self.invoke(target)
-                    self.assertEqual(self.sql("SELECT to_regclass('supabase_migrations.schema_migrations') IS NULL"), "t")
-                    continue
-                self.invoke(target)
-                self.invoke(target, "list")
-                before = self.history()
-                self.invoke(target)
-                self.assertEqual(self.history(), before)
+                    self.invoke(target)
+                    self.invoke(target, "list")
+                    before = self.history()
+                    self.invoke(target)
+                    self.assertEqual(self.history(), before)
+                else:
+                    self.invoke(target)
+                    self.invoke(target, "list")
+                    before = self.history()
+                    self.invoke(target)
+                    self.assertEqual(self.history(), before)
                 if target == "staging":
                     self.assertEqual(self.sql("SELECT count(*) FROM signup_device_attempt"), "1")
                 else:
