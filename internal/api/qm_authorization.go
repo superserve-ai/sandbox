@@ -35,8 +35,17 @@ func (a qmAuthority) Resolve(ctx context.Context, key string) (qmKeyIdentity, er
 	var out qmKeyIdentity
 	var owner pgtype.UUID
 	sum := sha256.Sum256([]byte(key))
-	err := a.h.Pool.QueryRow(ctx, `SELECT id,team_id,created_by,name FROM api_key
- WHERE key_hash=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())`, hex.EncodeToString(sum[:])).Scan(&out.KeyID, &out.TeamID, &owner, &out.Name)
+	// Resolve and throttle the audit timestamp in one database round trip.
+	err := a.h.Pool.QueryRow(ctx, `WITH verified_key AS (
+ SELECT id,team_id,created_by,name FROM api_key
+ WHERE key_hash=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())
+), usage AS (
+ UPDATE api_key SET last_used_at=now()
+ WHERE id=(SELECT id FROM verified_key)
+   AND (last_used_at IS NULL OR last_used_at<now()-interval '1 minute')
+ RETURNING id
+)
+SELECT id,team_id,created_by,name FROM verified_key`, hex.EncodeToString(sum[:])).Scan(&out.KeyID, &out.TeamID, &owner, &out.Name)
 	if owner.Valid {
 		out.OwnerID = uuid.UUID(owner.Bytes)
 	}
