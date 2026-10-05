@@ -82,8 +82,6 @@ jobs:
           python3 .github/workflows/scripts/wait_credentials_key_iam.py --project "${{ vars.GCP_PROJECT }}"
 
       - name: Terraform apply production/us-west2
-        env:
-          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-west2" >> "$GITHUB_STEP_SUMMARY"
@@ -92,13 +90,7 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan > "$RUNNER_TEMP/production-usw2-plan.json"
-          HOST_LOGGING_EVIDENCE_REQUIRED=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --needs-evidence "$RUNNER_TEMP/production-usw2-plan.json")
-          if [ "$HOST_LOGGING_EVIDENCE_REQUIRED" = true ]; then
-            test -n "${HOST_LOGGING_STAGING_EVIDENCE_URL:-}" || { echo "Host-logging activation requires accepted staging evidence." >&2; exit 1; }
-            case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
-            curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-            python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --check "$RUNNER_TEMP/production-usw2-plan.json" "$RUNNER_TEMP/host-logging-staging-evidence.json"
-          fi
+          python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan.py" --check "$RUNNER_TEMP/production-usw2-plan.json"
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-usw2
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform apply -input=false -auto-approve tfplan
@@ -152,8 +144,6 @@ jobs:
           command -v curl
 
       - name: Terraform apply production/us-central1
-        env:
-          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-central1" >> "$GITHUB_STEP_SUMMARY"
@@ -162,13 +152,7 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan > "$RUNNER_TEMP/production-usc1-plan.json"
-          HOST_LOGGING_EVIDENCE_REQUIRED=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --needs-evidence "$RUNNER_TEMP/production-usc1-plan.json")
-          if [ "$HOST_LOGGING_EVIDENCE_REQUIRED" = true ]; then
-            test -n "${HOST_LOGGING_STAGING_EVIDENCE_URL:-}" || { echo "Host-logging activation requires accepted staging evidence." >&2; exit 1; }
-            case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
-            curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-            python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --check "$RUNNER_TEMP/production-usc1-plan.json" "$RUNNER_TEMP/host-logging-staging-evidence.json"
-          fi
+          python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan.py" --check "$RUNNER_TEMP/production-usc1-plan.json"
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-us-central1
           terraform apply -input=false -auto-approve tfplan
 

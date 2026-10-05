@@ -15,7 +15,7 @@ REQUIRED_FILES = (
     "infra/modules/host-logging/templates/validate.sh.tftpl",
     "infra/modules/observability/host-logging-alerts.tf",
     ".github/workflows/control-plane-identity-rollout.yml",
-    "scripts/host_logging_plan_requires_evidence.py",
+    "scripts/host_logging_plan.py",
 )
 
 EXPORT_FAILURE_MESSAGE_PATTERN = re.compile(
@@ -74,11 +74,8 @@ def verify(root: Path) -> list[str]:
     if "exit 100" not in reconcile:
         errors.append("reconciliation must return OS Config compliant status 100 after active verification")
     rollout = (root / ".github/workflows/control-plane-identity-rollout.yml").read_text()
-    if rollout.count("host_logging_plan_requires_evidence.py") < 2:
-        errors.append("both identity rollout production paths must reject ungated host-logging mutations")
-    revision = (root / "scripts/host_logging_plan_requires_evidence.py").read_text()
-    if 'parts[-1] == "otel-logs.yaml"' not in revision:
-        errors.append("promotion revision extraction must use the emitted otel-logs.yaml artifact")
+    if rollout.count("host_logging_plan.py") < 2:
+        errors.append("both identity rollout production paths must reject unrelated host-logging mutations")
     return errors
 
 

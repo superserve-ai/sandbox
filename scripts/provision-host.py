@@ -454,7 +454,7 @@ def validate_host_logging_update(change, vm_change, config, host, region):
     # artifacts, and IAM bindings may update only when the selected VM identity
     # is the sole changed input. This applies to both create recovery and
     # replacement; creating a policy or grant here would bypass its independent
-    # functional review and staging evidence.
+    # functional review.
     require(actions in (['no-op'], ['read'], ['update']),
             'Host logging policy/artifact creation or replacement is unsupported during provisioning')
     before = change['change'].get('before')

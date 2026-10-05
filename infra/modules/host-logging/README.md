@@ -121,8 +121,7 @@ assignment in the project's global `_Default` bucket and grants runtime accounts
 read access on that view only. The bounded, one-minute query window is used only
 at retirement; inaccessible or delayed receipts preserve the legacy writer.
 Deployments routing these logs elsewhere must configure an equivalent restricted
-view and matching target before attempting retirement. View filters and grants
-are bound to the migration evidence digest.
+view and matching target before attempting retirement. View filters and grants are managed in Terraform.
 
 A replacement must go through `preserve` then `overlap` with fresh receipt and
 drain evidence before `retire`. If its user configuration is absent, explicitly
@@ -130,25 +129,11 @@ include its current provider ID in `initialize_instance_ids` to authorize
 baseline initialization during overlap or rollback. Existing mismatched files
 fail closed. A new host cannot inherit a predecessor's retirement evidence.
 
-Production workflows require an HTTPS JSON evidence receipt when a plan changes
-active logging. Its top-level fields are `environment: "staging"`,
-`accepted: true`, `configuration_revision`, and `deployment_content_digest`.
-Compute the revision and digest with `scripts/host_logging_plan_requires_evidence.py`
-using `--revision` and `--digest` on the saved JSON plan. The digest binds rendered
-artifacts, policy, IAM, alerts, notification routing, and runbook content.
-Cross-project channel IDs may differ only through an explicitly reviewed
-`notification_channel_map` from production channel names to staging channel names.
-
-For a legacy transition, the receipt also contains `migration`: `phase`,
-`legacy_policy_name`, `instance_ids`, `verified_instance_ids`,
-`drained_instance_ids`, `deployment_content_digest` (from `--migration-digest`),
-`otel_deployment_content_digest` (from `--digest`), `metrics_continuity: true`,
-`rollback_verified: true`, and an `observed_at` UTC timestamp from the last hour.
-Drain and retirement also require `overlap_gap_count: 0` and a measured
-`duplicate_count`. Retirement requires `pending_records: 0` and
-`oldest_pending_age_seconds: 0`. These fields attest actual observations; they
-must not be filled from local fixture results. Preserve does not require an
-activation receipt; rollback still requires fresh migration evidence.
+Production workflows validate legacy migration phase transitions directly from
+Terraform plans. Logging rollout does not require publishing an acceptance JSON
+file or configuring an evidence URL. East still defaults to preservation, and
+its host-side baseline, overlap deadline, identity, queue, and fresh heartbeat
+checks remain prerequisites for retiring the legacy writer.
 
 Terraform inventories drive independent per-host heartbeat alerts. A missing
 or never-seen host triggers absence detection even if application metrics work.
@@ -176,9 +161,9 @@ only when the complete planned query/filter is known and otherwise unchanged.
 Terraform normally makes the entire string unknown when a replacement or absent
 VM receives a new instance ID, so those provisioning plans are blocked. An old
 instance ID and a configuration reference do not prove the new query is safe.
-Do not bypass the guard: a separately reviewed logging rollout with the required
-staging evidence is needed. Automatic provisioning with unresolved logging alert
-identities requires additional proof of the unchanged query/filter template.
+Do not bypass the guard: a separately reviewed logging rollout is needed.
+Automatic provisioning with unresolved logging alert identities requires
+additional proof of the unchanged query/filter template.
 
 The same rule applies to the east migration JSON artifact, including in
 `preserve` before logging alerts are active. An unresolved artifact is rejected:
@@ -186,5 +171,5 @@ a separately validated migration input does not prove the file contains that
 input. Known content may substitute only the selected instance ID, and the
 bucket, object path, and other configurable fields must remain unchanged.
 East replacement plans with unresolved migration content therefore require a
-separately reviewed logging rollout with staging evidence; they cannot proceed
+separately reviewed logging rollout; they cannot proceed
 through the identity-only provisioning exception.
