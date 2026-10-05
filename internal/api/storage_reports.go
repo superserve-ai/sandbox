@@ -334,7 +334,7 @@ func startStorageReportWorker(ctx context.Context, pool *pgxpool.Pool, interval 
 		return
 	}
 	go func() {
-		ticker := time.NewTicker(storageReportPoll)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
