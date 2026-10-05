@@ -24,7 +24,6 @@ jobs:
           python3 scripts/test_migration_cli.py
           python3 scripts/test_migration_overlay.py
           python3 scripts/test_migration_execution.py
-          python3 scripts/test_migration_history.py
 
   unit-tests:
     name: Unit Tests

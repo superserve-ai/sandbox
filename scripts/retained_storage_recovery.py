@@ -276,10 +276,9 @@ class Recovery:
             require(not conn.execute(f"SELECT EXISTS(SELECT FROM {table} WHERE payload @? '$[*].retained')").fetchone()[0],
                     "Pending retained reports prevent recovery")
 
-    def inspect(self, conn, *, ordinary=False):
-        if not ordinary:
-            require({path.name for path in (self.root / "supabase/migrations").glob("*.sql")}
-                    == set(self.manifest["sources"]), "Recovery requires exactly the pinned migration source set")
+    def inspect(self, conn):
+        require({path.name for path in (self.root / "supabase/migrations").glob("*.sql")}
+                == set(self.manifest["sources"]), "Recovery requires exactly the pinned migration source set")
         history = self.history(conn)
         auth = [row for row in history if row[0] == migration.VERSION]
         expected_auth = [[migration.VERSION, migration.NAME, [migration.verified_aggregate(self.root).decode()]]]
@@ -290,7 +289,7 @@ class Recovery:
         retained = [r for r in history if FIRST <= r[0] <= LAST]
         prefix = len(retained)
         require([r[0] for r in retained] == sorted(self.names)[:prefix], "Recovery history is not a contiguous prefix")
-        require(ordinary or all(r[0] <= LAST or r[0] == migration.VERSION for r in history),
+        require(all(r[0] <= LAST or r[0] == migration.VERSION for r in history),
                 "Unrecognized migrations after the recovery plan")
         present = conn.execute("SELECT to_regclass('migration_recovery.plan') IS NOT NULL").fetchone()[0]
         journal, receipts = None, {}
@@ -301,7 +300,6 @@ class Recovery:
             rows = conn.execute("SELECT plan_hash,predecessor_hash,complete FROM migration_recovery.plan").fetchall()
             require(len(rows) == 1, "Recovery journal is missing or ambiguous")
             journal = list(rows[0])
-            require(not ordinary or journal[2], "Ordinary migration refuses incomplete recovery")
             require(journal[:2] == [self.plan_hash, digest(predecessors)], "Recovery journal provenance mismatch")
             receipts = {name: (state, data) for name, state, data in conn.execute(
                 "SELECT name,state,evidence FROM migration_recovery.preparation").fetchall()}
@@ -312,7 +310,7 @@ class Recovery:
                         "Recovery preparation provenance mismatch")
                 require(set(data) == ({"plan_hash", "table_oid"} if name in INDEXES else {"plan_hash"}),
                         "Recovery preparation evidence has unexpected fields")
-                if name in INDEXES and not (ordinary and journal[2] and any(r[0] > LAST for r in history)):
+                if name in INDEXES:
                     require(data["table_oid"] == conn.execute("SELECT %s::regclass::oid", (INDEXES[name][1],)).fetchone()[0],
                             "Index intent table identity changed")
                 require(state == "ready" or name in INDEXES and name == PREPARATIONS[len(receipts)-1],
@@ -320,7 +318,7 @@ class Recovery:
         else:
             require(not conn.execute("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')").fetchone()[0],
                     "Unrecognized recovery schema")
-            require(self.target == "usw2" and (prefix == 0 or ordinary and prefix == 24)
+            require(self.target == "usw2" and prefix == 0
                     or self.target in ("staging", "use4") and prefix == 24,
                     "Recovery initialization is ineligible")
         kind = "overlay" if journal else "canonical"
@@ -350,19 +348,8 @@ class Recovery:
                     catalog["index:" + index] = None
                     stage = {"storage_index":"host", "owner_index":"13", "snapshot_index":"owner_index"}[name]
             require(not journal[2] or prefix == 24 and len(receipts) == 6, "Invalid completed recovery receipt")
-        future = [r for r in history if r[0] > LAST]
-        if ordinary and (journal and journal[2] or not journal and self.target == "usw2" and prefix == 24) and future:
-            # Later ordinary migrations may deliberately evolve this catalog.
-            # Require their versions/names to remain represented in this checkout;
-            # the CLI continues to own their ordinary statement/history contract.
-            names = {p.name.split("_", 1)[0]: p.stem.split("_", 1)[1]
-                     for p in (self.root / "supabase/migrations").glob("*.sql")}
-            require(all(names.get(row[0]) == row[1] for row in future),
-                    "Unrecognized migration after completed recovery")
-        else:
-            require(digest(catalog) == self.manifest["catalog_hashes"][stage], "Recovery catalog mismatch at " + stage)
-        if not ordinary or journal and not journal[2]:
-            self.writer_check(conn, prefix)
+        require(digest(catalog) == self.manifest["catalog_hashes"][stage], "Recovery catalog mismatch at " + stage)
+        self.writer_check(conn, prefix)
         return {"prefix": prefix, "journal": journal, "receipts": receipts,
                 "history": history, "catalog": catalog, "stage": stage,
                 "predecessor_hash": digest(predecessors),
@@ -564,46 +551,9 @@ INSERT INTO migration_recovery.authorization(version,backend_pid,backend_start,e
 
 
 def ordinary_guard(target, database_url, root, cli, deadline):
-    with psycopg.connect(database_url, autocommit=True, connect_timeout=5) as conn:
-        present = conn.execute("SELECT to_regclass('migration_recovery.plan') IS NOT NULL").fetchone()[0]
-        if present:
-            runner = Recovery(target, database_url, root, cli, deadline)
-            conn.execute("SET search_path=public,pg_catalog")
-            state = runner.inspect(conn, ordinary=True)
-            require(state["journal"][2], "Ordinary migration refuses incomplete recovery")
-            condition = (f"NOT EXISTS(SELECT FROM migration_recovery.plan WHERE complete AND plan_hash='{runner.plan_hash}')"
-                         f" OR ({HISTORY_GUARD}) IS DISTINCT FROM '{state['guard_history']}'"
-                         f" OR ({RECEIPT_GUARD}) IS DISTINCT FROM '{state['guard_receipts']}'"
-                         f" OR (SELECT md5(value::text) FROM ({runner.catalog_query()}) q(value))"
-                         f" IS DISTINCT FROM '{state['guard_catalog']}'")
-        elif target == "usw2":
-            runner = Recovery(target, database_url, root, cli, deadline)
-            with conn.transaction():
-                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                conn.execute("SET LOCAL search_path=public,pg_catalog")
-                require(conn.execute("SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL").fetchone()[0],
-                        "Ordinary West migration requires completed recovery or canonical history")
-                state = runner.inspect(conn, ordinary=True)
-            require(state["prefix"] == 24, "Ordinary West migration requires completed canonical history or recovery")
-            condition = ("EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')"
-                         f" OR ({HISTORY_GUARD}) IS DISTINCT FROM '{state['guard_history']}'"
-                         f" OR (SELECT md5(value::text) FROM ({runner.catalog_query()}) q(value))"
-                         f" IS DISTINCT FROM '{state['guard_catalog']}'")
-        else:
-            condition = "EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')"
-            require(not conn.execute("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')").fetchone()[0],
-                    "Unrecognized recovery namespace")
-            if conn.execute("SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL").fetchone()[0]:
-                retained = conn.execute("SELECT version,name,statements FROM supabase_migrations.schema_migrations "
-                                        "WHERE version BETWEEN %s AND %s ORDER BY version", (FIRST, LAST)).fetchall()
-                if retained:
-                    manifest, _, _, _, _ = load_plan(root)
-                    require(all(digest(list(row)) == manifest["history"]["canonical"].get(row[0]) for row in retained),
-                            "Alternate retained history requires its recovery journal")
     return f"""
 SET search_path=public,pg_catalog;
 DO $$ BEGIN
  IF NOT pg_try_advisory_lock({MUTEX}) THEN RAISE EXCEPTION 'migration mutex busy'; END IF;
- IF {condition} THEN RAISE EXCEPTION 'recovery state changed'; END IF;
 END $$;
 """

@@ -63,7 +63,7 @@ all 24 canonical entries and remain read-only. Source files and applied history
 are never rewritten. All 24 new West entries truthfully record a stable
 authorization prelude followed by the executed migration body. Bodies 01/03/14
 also contain the bounded recovery substitutions below. Earlier intermediate
-histories without this prelude are not admitted or rewritten.
+histories without this prelude are not admitted or rewritten by the explicit recovery actions.
 
 The runner first installs nullable host attribution and its stamping trigger
 without backfilling old intervals. It builds three indexes concurrently outside
@@ -72,16 +72,13 @@ swapping it into place. A private database journal binds the exact plan,
 predecessor history, preparation state and index table identities. Each phase
 checks the expected catalog and ledger under the same session mutex used for
 mutation. The approved receipt is rechecked under that mutex, and each next
-phase must match this invocation's own progress. Ordinary West migrations
-require either a completed recovery journal or all 24 exact canonical entries
-with no recovery namespace. Empty, partial and alternate unjournaled histories
-remain blocked. Canonical completion checks predecessor/Auth history and the
-completed catalog in one consistent read snapshot, then rechecks history and
-catalog under the execution session's mutex. Subsequent ordinary migrations may
-evolve that catalog; their recorded versions and names must belong to the checkout.
-Neither path rewrites history or fabricates a recovery journal. This admission
-rule does not authorize an initial canonical migration attempt or change the
-separate recovery entrypoint requirements.
+phase must match this invocation's own progress. Ordinary migrations acquire
+the shared advisory mutex and rely on the generic Supabase history, ordering,
+connection, and shared-Auth checks; they no longer inspect retained-storage
+recovery journals, historical prefixes, catalog snapshots, or fingerprints.
+The explicit `recovery-preflight` and `recover` actions retain their separate
+journal, authorization, catalog, and history validation. Neither path rewrites
+history or fabricates a recovery journal.
 
 Use the distinct `recovery-preflight` and `recover` actions. Production requires
 an authenticated evidence run ID described below. Recovery preflight reads the
@@ -201,10 +198,10 @@ the execution `RESET ALL` check, or release authorization.
 ## Validation
 
 Regression tests use the actual pinned CLI against disposable Docker PostgreSQL 17.6:
-`test_migration_cli.py`, `test_migration_overlay.py`, `test_migration_execution.py`
-and `test_migration_history.py`. These retain ordinary migration, history,
-regional isolation, and completed-recovery upgrade coverage. The historical
-recovery crash and evidence-fixture suites have been retired; the recovery
+`test_migration_cli.py`, `test_migration_overlay.py`, and
+`test_migration_execution.py`. These retain fresh-database/no-op migration,
+history, regional isolation, timeout, rollback, and process-cleanup coverage.
+The dedicated historical ordinary-path tests have been retired; the recovery
 actions and their runtime safeguards remain. Release-gate tests still verify
 revision, CI, regional completion, and manual preflight requirements. These tests
 do not establish hosted connectivity or production writer exclusion.
