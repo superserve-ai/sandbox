@@ -1188,7 +1188,7 @@ func TestCaptureScreenshot_RejectsOversizeFrame(t *testing.T) {
 // the sandbox user's control and the helper runs with boxd's privileges.
 func TestDesktopCommandDropsSandboxEnv(t *testing.T) {
 	withFakeBin(t, map[string]string{
-		"xdotool": `printf '%s|%s|%s' "$LD_PRELOAD" "$MAGICK_CONFIGURE_PATH" "$DISPLAY"
+		"xdotool": `printf '%s|%s|%s|%s' "$LD_PRELOAD" "$MAGICK_CONFIGURE_PATH" "$DISPLAY" "$LC_CTYPE"
 `,
 	})
 	sandboxCtx := &sandboxContext{}
@@ -1205,8 +1205,8 @@ func TestDesktopCommandDropsSandboxEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if got := string(out); got != "||:77" {
-		t.Fatalf("helper env = %q, want only DISPLAY to pass through", got)
+	if got := string(out); got != "||:77|C.UTF-8" {
+		t.Fatalf("helper env = %q, want DISPLAY from the sandbox and a UTF-8 LC_CTYPE, nothing else", got)
 	}
 }
 

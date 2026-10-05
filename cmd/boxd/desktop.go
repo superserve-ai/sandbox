@@ -717,8 +717,8 @@ func (s *desktopService) runXdotool(ctx context.Context, args ...string) error {
 // sandbox user substitute a helper and run it with boxd's privileges.
 var desktopHelperPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-// commandContext runs a desktop helper with a minimal environment: PATH and
-// DISPLAY only. The helpers run with boxd's privileges, so nothing else from
+// commandContext runs a desktop helper with a minimal environment: PATH,
+// DISPLAY and a UTF-8 LC_CTYPE only. The helpers run with boxd's privileges, so nothing else from
 // the sandbox's environment may reach them — LD_PRELOAD or an ImageMagick
 // config override would otherwise run sandbox-controlled code as root.
 // DISPLAY comes from the desktop template through /init; boxd itself starts
@@ -740,7 +740,9 @@ func (s *desktopService) commandContext(ctx context.Context, name string, args .
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, resolved, args...)
-	cmd.Env = []string{"PATH=" + desktopHelperPath, "DISPLAY=" + display}
+	// LC_CTYPE: xdotool converts typed text through the current locale, and
+	// the C locale rejects anything beyond ASCII. C.UTF-8 is built into glibc.
+	cmd.Env = []string{"PATH=" + desktopHelperPath, "DISPLAY=" + display, "LC_CTYPE=C.UTF-8"}
 	return cmd, nil
 }
 
