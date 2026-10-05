@@ -3,11 +3,18 @@
 Install `scripts/migration-requirements.txt` and use Supabase CLI 2.119.0.
 All remote actions go through `scripts/migrate_database.py`; `make migrate-local`
 is only for disposable databases. Targets are `staging`, `use4`, and `usw2`.
-The wrapper requires the selected project's direct port 5432 endpoint and
-PostgreSQL 17+, with startup/reset defaults of 250ms lock timeout and 2s
-transaction timeout. Session poolers are not accepted. The hosted runner must
-have a working route to the direct endpoint; DNS alone does not prove access.
-Never print `DATABASE_URL` or include it in a command transcript.
+The wrapper accepts the selected project's direct endpoint or a Supabase session
+pooler on port 5432 with the exact `postgres.<project>` login. For a validated
+session-pooler input, the runner constructs an in-memory direct connection to
+`db.<selected-project>.supabase.co:5432` as `postgres`, preserving the encoded
+password and allowed query parameters. The shared secret is unchanged. Transaction
+poolers and other projects are rejected before conversion; there is no fallback.
+All migration sessions require PostgreSQL 17+ and verified startup/reset defaults
+of 250ms lock timeout and 2s transaction timeout. The hosted runner must verify
+direct connectivity, authentication, and settings before migration.
+Never print `DATABASE_URL` or include it in a command transcript. Connection
+rejections report fixed categories without URL, host, username or password values.
+A pooler rejection describes the migration contract, not invalid credentials.
 
 ## Shared Auth history
 
@@ -32,9 +39,11 @@ includes mixed SQL/control changes and unverified push ranges. A held CD run
 is not successful migration evidence. CI still runs.
 
 After a separately approved merge, verify successful push CI at the exact main
-revision. Dispatch CD Migrate with `action=preflight` for a read-only direct
+revision. Dispatch CD Migrate with `action=preflight` for a read-only
 connection/settings check. `action=migrate` is a separate release and requires
 a successful same-revision preflight run covering all selected environments.
+All hosted migration actions, including preflight, require the exact approved
+main revision and successful push CI.
 Staging runs first, then East and West. Each regional action rechecks main after
 protected-environment approval, immediately before database access. If main
 advances, stop and reassess the release. A code approval does not authorize
@@ -64,9 +73,15 @@ predecessor history, preparation state and index table identities. Each phase
 checks the expected catalog and ledger under the same session mutex used for
 mutation. The approved receipt is rechecked under that mutex, and each next
 phase must match this invocation's own progress. Ordinary West migrations
-require a completed journal, including on an empty or canonical partial ledger.
-Completed recovery
-preserves its historical receipts while allowing subsequent ordinary migrations.
+require either a completed recovery journal or all 24 exact canonical entries
+with no recovery namespace. Empty, partial and alternate unjournaled histories
+remain blocked. Canonical completion checks predecessor/Auth history and the
+completed catalog in one consistent read snapshot, then rechecks history and
+catalog under the execution session's mutex. Subsequent ordinary migrations may
+evolve that catalog; their recorded versions and names must belong to the checkout.
+Neither path rewrites history or fabricates a recovery journal. This admission
+rule does not authorize an initial canonical migration attempt or change the
+separate recovery entrypoint requirements.
 
 Use the distinct `recovery-preflight` and `recover` actions. Production requires
 an authenticated evidence run ID described below. Recovery preflight reads the
@@ -169,6 +184,20 @@ recovery. Observe effective runtime and restart sources; a source label or a
 configuration checkbox is not evidence. Missing access or provenance blocks
 operations and must be routed to the deployment owner; this change grants no IAM,
 creates no observer, provisions no SSH access and performs no production trial.
+
+## Failure diagnostics
+
+The runner reports a fixed stage and category for CLI invocation, connection/query,
+JSON parsing, settings checks, and migration/history failures. Nonzero CLI exits
+include the exit code, allowlisted SQLSTATEs, and fixed text markers. Markers only
+identify text observed in CLI output; they do not prove a root cause. Raw command
+output and connection details are never printed.
+
+Preflight reports separate booleans for PostgreSQL 17+, the presence of each
+required timeout, and its current and reset values. Both transaction timeout
+values must equal 2000 ms and both lock timeout values must equal 250 ms. A missing
+or malformed result still fails closed. Diagnostics do not change these guards,
+the execution `RESET ALL` check, or release authorization.
 
 ## Validation
 

@@ -397,7 +397,7 @@ func TestPromotionWhileTaskInFlight(t *testing.T) {
 		if got.Priority != PriorityPause {
 			t.Fatalf("row priority = %d, want the promotion kept", got.Priority)
 		}
-		if verified, err := j.WasVerified("obj-1", reclaimAt); err != nil || !verified {
+		if verified, err := j.WasVerified("obj-1"); err != nil || !verified {
 			t.Fatalf("WasVerified = %v (err %v), want the history recorded", verified, err)
 		}
 	})
@@ -756,7 +756,7 @@ func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
 	if err := j.RecordVerification(stale, "bucket\x00obj", now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
 		t.Fatalf("stale RecordVerification = %v, want errClaimStolen", err)
 	}
-	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL)); err != nil || !verified {
+	if verified, err := j.WasVerified("bucket\x00obj"); err != nil || !verified {
 		t.Fatalf("WasVerified after refused stale record = %v/%v, want history preserved", verified, err)
 	}
 	// The full attack chain stays closed: the follow-up stale Ack is
@@ -775,7 +775,7 @@ func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
 	if err := j.RecordVerification(redo, "bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil || !verified {
+	if verified, err := j.WasVerified("bucket\x00obj"); err != nil || !verified {
 		t.Fatalf("WasVerified = %v/%v after live-claim record", verified, err)
 	}
 }
@@ -1146,5 +1146,128 @@ func TestMergeAllocationsKeepsARealZero(t *testing.T) {
 	}
 	if queued[1].AllocatedBytes != 8192 {
 		t.Fatalf("the missing measurement = %d, want the incoming one", queued[1].AllocatedBytes)
+	}
+}
+
+// A verification record is the only proof a write-only host has that an
+// object already in the bucket holds the bytes a manifest claims. Expire
+// one whose generation is still queued and that generation can never be
+// completed: every retry meets its own objects as a dedupe nothing can
+// vouch for, and abandons.
+func TestPruneKeepsProofWhileItsGenerationIsQueued(t *testing.T) {
+	j, _ := testJournal(t)
+	stale := time.Now().Add(-15 * 24 * time.Hour)
+
+	// Still queued, and deliberately less urgent so the ack below does not
+	// claim it out of the queue.
+	waiting := Task{
+		SandboxID: "sb-waiting", Generation: "gen-waiting", EnqueuedAt: stale,
+		Priority: PriorityCheckpoint,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 1}},
+	}
+	if err := j.Enqueue(waiting); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		queuedProof  = "test-bucket\x00sandboxes/sb-waiting/gen-waiting/rootfs.ext4.p0000"
+		settledProof = "test-bucket\x00sandboxes/sb-settled/gen-settled/rootfs.ext4.p0000"
+		sharedProof  = "test-bucket\x00bases/" + "0000000000000000000000000000000000000000000000000000000000000000" + ".p0000"
+	)
+	for _, object := range []string{queuedProof, settledProof, sharedProof} {
+		if err := j.RecordVerification(waiting, object, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Any ack runs the bounded prune; this one is more urgent, so Next
+	// takes it rather than the record under test.
+	driver := Task{
+		SandboxID: "sb-driver", Generation: "gen-driver", EnqueuedAt: time.Now(),
+		Priority: PriorityPause,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d2", Size: 1}},
+	}
+	if err := j.Enqueue(driver); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(time.Now())
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	if claimed.SandboxID != driver.SandboxID {
+		t.Fatalf("claimed %s, want the driver so the queued record stays queued", claimed.SandboxID)
+	}
+	if _, err := j.Ack(claimed, "test-bucket", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Asked as of the moment it was recorded, so the answer is presence
+	// rather than freshness.
+	for _, tc := range []struct {
+		name   string
+		object string
+		want   bool
+	}{
+		{"a queued generation keeps its proof", queuedProof, true},
+		{"a settled generation's proof expires", settledProof, false},
+		{"a shared base's history is only a shortcut", sharedProof, false},
+	} {
+		got, err := j.WasVerified(tc.object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: present = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A generation whose objects nothing here can vouch for is recorded so
+// its re-offerer can stop handing out work that always abandons. Paced
+// rather than foreclosed: the object name carries a packing fingerprint
+// the generation key does not, so a relaid artifact may upload cleanly
+// under a name that does not exist yet.
+func TestUnvouchableMarkIsPacedAndScoped(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Now()
+	stuck := Task{
+		TemplateID: "tpl-a", BuildID: "build-a", Generation: "gen-stuck", EnqueuedAt: now,
+		Priority: PriorityCheckpoint,
+		Files:    []TaskFile{{Name: "mem.snap", Path: "/mem", SHA256: "m", Size: 1}},
+	}
+
+	if marked, err := j.Unvouchable("test-bucket", stuck, now); err != nil || marked {
+		t.Fatalf("unmarked generation = %v (%v)", marked, err)
+	}
+	if err := j.MarkUnvouchable("test-bucket", stuck, now); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		scope string
+		at    time.Time
+		want  bool
+	}{
+		{"within the cooldown", "test-bucket", now.Add(time.Hour), true},
+		{"past the cooldown", "test-bucket", now.Add(unvouchableCooldown + time.Minute), false},
+		{"another bucket has met nothing", "other-bucket", now.Add(time.Hour), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marked, err := j.Unvouchable(tc.scope, stuck, tc.at)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if marked != tc.want {
+				t.Fatalf("marked = %v, want %v", marked, tc.want)
+			}
+		})
+	}
+
+	// A rebuild keys differently and is never held.
+	rebuilt := stuck
+	rebuilt.Generation = "gen-rebuilt"
+	if marked, err := j.Unvouchable("test-bucket", rebuilt, now.Add(time.Hour)); err != nil || marked {
+		t.Fatalf("rebuilt generation = %v (%v)", marked, err)
 	}
 }

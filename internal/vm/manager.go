@@ -508,6 +508,9 @@ type Manager struct {
 	// pendingInFlight guards one pending-backup worker per VM across the
 	// startup recovery and the periodic sweep.
 	pendingInFlight sync.Map
+	// backupUnvouchable probes whether a generation's objects are in the
+	// bucket with nothing here able to vouch for them.
+	backupUnvouchable func(backup.Task) (bool, error)
 	// pendingSweepCursor is the last record a sweep pass offered a turn,
 	// so the next pass resumes after it instead of re-offering the head
 	// of a key-ordered listing. Sweep-goroutine only, and deliberately

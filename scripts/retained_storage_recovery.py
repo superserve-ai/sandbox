@@ -30,7 +30,10 @@ CATALOG_SQL = """
 WITH objects AS (
  SELECT 'column:'||c.relname||'.'||a.attname key,
  jsonb_build_array(format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attidentity,
-                  pg_get_expr(d.adbin,d.adrelid),a.attgenerated) value
+                  CASE WHEN pg_get_expr(d.adbin,d.adrelid)='gen_random_uuid()'
+                         AND to_regprocedure('gen_random_uuid()')='pg_catalog.gen_random_uuid()'::regprocedure
+                       THEN 'pg_catalog.gen_random_uuid()'
+                       ELSE pg_get_expr(d.adbin,d.adrelid) END,a.attgenerated) value
  FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
  JOIN pg_namespace n ON n.oid=c.relnamespace
  LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
@@ -317,7 +320,7 @@ class Recovery:
         else:
             require(not conn.execute("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')").fetchone()[0],
                     "Unrecognized recovery schema")
-            require(self.target == "usw2" and prefix == 0
+            require(self.target == "usw2" and (prefix == 0 or ordinary and prefix == 24)
                     or self.target in ("staging", "use4") and prefix == 24,
                     "Recovery initialization is ineligible")
         kind = "overlay" if journal else "canonical"
@@ -348,7 +351,7 @@ class Recovery:
                     stage = {"storage_index":"host", "owner_index":"13", "snapshot_index":"owner_index"}[name]
             require(not journal[2] or prefix == 24 and len(receipts) == 6, "Invalid completed recovery receipt")
         future = [r for r in history if r[0] > LAST]
-        if ordinary and journal and journal[2] and future:
+        if ordinary and (journal and journal[2] or not journal and self.target == "usw2" and prefix == 24) and future:
             # Later ordinary migrations may deliberately evolve this catalog.
             # Require their versions/names to remain represented in this checkout;
             # the CLI continues to own their ordinary statement/history contract.
@@ -573,8 +576,20 @@ def ordinary_guard(target, database_url, root, cli, deadline):
                          f" OR ({RECEIPT_GUARD}) IS DISTINCT FROM '{state['guard_receipts']}'"
                          f" OR (SELECT md5(value::text) FROM ({runner.catalog_query()}) q(value))"
                          f" IS DISTINCT FROM '{state['guard_catalog']}'")
+        elif target == "usw2":
+            runner = Recovery(target, database_url, root, cli, deadline)
+            with conn.transaction():
+                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                conn.execute("SET LOCAL search_path=public,pg_catalog")
+                require(conn.execute("SELECT to_regclass('supabase_migrations.schema_migrations') IS NOT NULL").fetchone()[0],
+                        "Ordinary West migration requires completed recovery or canonical history")
+                state = runner.inspect(conn, ordinary=True)
+            require(state["prefix"] == 24, "Ordinary West migration requires completed canonical history or recovery")
+            condition = ("EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')"
+                         f" OR ({HISTORY_GUARD}) IS DISTINCT FROM '{state['guard_history']}'"
+                         f" OR (SELECT md5(value::text) FROM ({runner.catalog_query()}) q(value))"
+                         f" IS DISTINCT FROM '{state['guard_catalog']}'")
         else:
-            require(target != "usw2", "Ordinary West migration requires completed recovery")
             condition = "EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')"
             require(not conn.execute("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='migration_recovery')").fetchone()[0],
                     "Unrecognized recovery namespace")

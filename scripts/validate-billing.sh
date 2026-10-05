@@ -38,12 +38,4 @@ else
 fi
 suite billing-integration-race go test -v -race -tags integration -count=1 -timeout 10m -run 'Billing|Incremental|RetainedStorage|StorageReportReceiptFencesSettlement|StripeAssociationMonitor' ./internal/integration
 
-# Generate into a temporary directory so a failed drift check preserves the tree.
-sqlc_dir="$(mktemp -d)"
-trap 'rm -rf "$sqlc_dir"' EXIT
-cp sqlc.yaml "$sqlc_dir/sqlc.yaml"
-cp -R db supabase "$sqlc_dir/"
-mkdir -p "$sqlc_dir/internal/db"
-suite billing-sqlc-generate sqlc generate -f "$sqlc_dir/sqlc.yaml"
-# The DB package also contains handwritten helpers.
-suite billing-sqlc-drift diff -ru --exclude='*_test.go' --exclude='host_capabilities.go' --exclude='billing_lock.go' --exclude='stripe_checkout_association_alerts.go' --exclude='template_build_execution.go' --exclude='template_build_input.go' --exclude='routing_records.go' internal/db "$sqlc_dir/internal/db"
+suite billing-sqlc-drift scripts/verify-sqlc.sh

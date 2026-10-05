@@ -1,3 +1,5 @@
+promotion_evidence_enabled = true
+
 project_id                            = "rayai-dev"
 environment                           = "staging"
 region                                = "us-central1"

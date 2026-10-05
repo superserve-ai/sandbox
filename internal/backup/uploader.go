@@ -648,6 +648,20 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 		mf, obj, n, err := u.uploadFile(ctx, task, file, renew)
 		streamed += n
 		if err != nil {
+			if errors.Is(err, errUnvouchable) {
+				// Permanent for this content address: the object is in the
+				// bucket, nothing here can vouch for it, and no later event
+				// writes the proof — only an upload does, and create-only
+				// refuses. Recorded so the generation stops being offered,
+				// or every sweep re-enqueues work that cannot finish. A
+				// rebuild or a changed artifact is a different generation
+				// and unaffected.
+				if merr := u.Journal.MarkUnvouchable(u.Store.Identity(), *task, u.clock()); merr != nil {
+					task.logOwner(u.Log.Warn().Err(merr)).
+						Msg("generation left offerable: its unvouchable dedupe was not recorded")
+				}
+				return false, nil, streamed, nil
+			}
 			if os.IsNotExist(err) || errors.Is(err, errSourceChanged) || errors.Is(err, ErrTruncatedSource) {
 				// The artifact vanished or mutated between enqueue and
 				// upload (sandbox deleted or resumed, local GC won the
@@ -899,6 +913,12 @@ func (u *Uploader) lossEvent(task *Task) *zerolog.Event {
 	return u.Log.Warn()
 }
 
+// errUnvouchable reports a dedupe this host cannot vouch for: the object
+// is in the bucket and no verification record covers it, so the bytes
+// behind the name are unproven. Permanent for the content address, unlike
+// a source that changed or vanished, which is why it is distinguished.
+var errUnvouchable = errors.New("deduped object has no verification history")
+
 // errSourceChanged marks a source file whose current content no longer
 // matches the digest recorded at pause time: the sandbox resumed and
 // mutated the disk before the upload drained. Shipping those bytes under
@@ -923,11 +943,14 @@ func (u *Uploader) verificationKey(object string) string {
 // scoped: pre-upgrade records are claimed for the then-configured
 // bucket once at startup (MigrateVerificationScope), so a later bucket
 // change correctly misses everything.
+//
+// History is not aged out here: a record's claim is about bytes already
+// streamed and verified, which no amount of time undoes.
 func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
 	if task.HasVerified(u.verificationKey(object)) {
 		return true, nil
 	}
-	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
+	return u.Journal.WasVerified(u.verificationKey(object))
 }
 
 // claimRenewer returns the task's renewal gate: callable as often as a
@@ -1189,7 +1212,7 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile, re
 		// more, which is an error an alert has to see, not a warning.
 		task.logOwner(u.lossEvent(task).Str("object", object)).
 			Msg("deduped object has no verification history; abandoning generation")
-		return ManifestFile{}, "", 0, errSourceChanged
+		return ManifestFile{}, "", 0, errUnvouchable
 	} else {
 		// Verified within retention, but the record's clock has run since
 		// the object's ORIGINAL write and is never touched again on a

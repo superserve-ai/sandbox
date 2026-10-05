@@ -46,11 +46,72 @@ class HistoryResponseTest(unittest.TestCase):
                 with self.subTest(data=response.stdout, history_query=history_query):
                     results = ([self.response([{"present": True}])] if history_query else []) + [response]
                     with patch.object(migration, "run_cli", side_effect=results):
-                        with self.assertRaisesRegex(migration.MigrationError, "Unrecognized CLI history response"):
+                        with self.assertRaisesRegex(migration.MigrationError, "category=(invalid_json|output_shape)"):
                             migration.history_row(CLI, "unused", ROOT)
 
 
 class ConnectionIdentityTest(unittest.TestCase):
+    def test_rejections_are_categorical_and_do_not_expose_values(self):
+        project = migration.PROJECTS["usw2"]
+        url = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:6543/postgres"
+        with self.assertRaises(migration.MigrationError) as error:
+            migration.verify_connection_identity(url, "usw2")
+        self.assertEqual(str(error.exception), "Migration connection rejected: transaction_pooler_not_supported")
+        for url, reason in (("", "missing_url"),
+                            ("postgres://user:private-example@[bad", "malformed_url"),
+                            (f"postgres://user:private-example@db.{project}.supabase.co/postgres?private-example=x", "unsupported_query_parameter")):
+            self.assertEqual(migration.connection_rejection(url, "usw2"), reason)
+
+    def test_session_pooler_requires_exact_project_and_retains_timeout_options(self):
+        for target, project in migration.PROJECTS.items():
+            for port in ("", ":5432"):
+                url = f"postgres://postgres.{project}:example@aws-0-us-west-1.pooler.supabase.com{port}/postgres?sslmode=require"
+                migration.verify_connection_identity(url, target)
+                self.assertIn("transaction_timeout", migration.bounded_url(url))
+                self.assertIn("lock_timeout", migration.bounded_url(url))
+                for other in migration.PROJECTS.keys() - {target}:
+                    with self.assertRaises(migration.MigrationError):
+                        migration.verify_connection_identity(url, other)
+        with patch.object(migration, "run_cli", return_value=subprocess.CompletedProcess([], 0, stdout='[{"ready":false}]')):
+            with self.assertRaises(migration.MigrationError):
+                migration.preflight(CLI, "unused", ROOT, None)
+
+    def test_migration_connection_preserves_encoded_password_and_parameters(self):
+        for target, project in migration.PROJECTS.items():
+            for credentials in ("", ":", ":example%40%3A%2f%25%23%3F+word", ":example:word"):
+                for port in ("", ":5432"):
+                    query = "?sslmode=require&connect_timeout=10&application_name=migration%20check"
+                    source = f"postgresql://postgres.{project}{credentials}@aws-0-us-west-1.pooler.supabase.com{port}/postgres{query}"
+                    expected = f"postgresql://postgres{credentials}@db.{project}.supabase.co:5432/postgres{query}"
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        actual = migration.migration_connection_url(source, target)
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("transaction_timeout", migration.bounded_url(actual))
+                    self.assertIn("lock_timeout", migration.bounded_url(actual))
+            direct = f"postgres://postgres:example%40word@db.{project}.supabase.co/postgres?sslmode=require"
+            self.assertEqual(migration.migration_connection_url(direct, target), direct)
+
+    def test_preflight_receives_bounded_direct_connection(self):
+        project = migration.PROJECTS["usw2"]
+        source = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
+        version = subprocess.CompletedProcess([], 0, migration.CLI_VERSION, "")
+        with patch.object(migration, "run_cli", return_value=version), patch.object(migration, "preflight") as preflight, contextlib.redirect_stdout(io.StringIO()) as output:
+            migration.migrate("usw2", "preflight", source)
+        expected = migration.bounded_url(f"postgres://postgres:private-example@db.{project}.supabase.co:5432/postgres")
+        self.assertEqual(preflight.call_args.args[1], expected)
+        self.assertNotIn("private-example", output.getvalue())
+
+    def test_migration_connection_rejects_input_before_conversion(self):
+        project = migration.PROJECTS["usw2"]
+        source = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
+        for invalid in (source.replace(":5432", ":6543"), source.replace(project, "otherproject"),
+                        source + "?host=private.example", source.replace("pooler.supabase.com", "private.example")):
+            with self.assertRaises(migration.MigrationError) as error:
+                migration.migration_connection_url(invalid, "usw2")
+            self.assertNotIn("private-example", str(error.exception))
+            self.assertNotIn("private.example", str(error.exception))
+
     def test_direct_projects(self):
         for target, project in migration.PROJECTS.items():
             for url in (
@@ -70,7 +131,7 @@ class ConnectionIdentityTest(unittest.TestCase):
             valid.replace("supabase.co", "supabase.co.example.com"),
             valid.replace("postgres:example", "postgres.otherproject:example"),
             valid.replace("/postgres", ":6543/postgres"),
-            f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com:5432/postgres",
+            f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com.example.com:5432/postgres",
             f"postgres://postgres.{project}:example@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
             valid + "?hostaddr=127.0.0.1",
             valid + "?host=other",
