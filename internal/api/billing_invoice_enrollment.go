@@ -297,6 +297,13 @@ func (h *Handlers) validateInvoiceEnrollment(ctx context.Context, team uuid.UUID
 }
 
 func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription) error {
+	var anchor time.Time
+	if err := h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor); err != nil {
+		return err
+	}
+	if err := invoiceCalendarCompatible(anchor, sub, a.Price); err != nil {
+		return err
+	}
 	storage, err := h.billingStorageBillingEnabledForWindow(ctx, team, time.Now())
 	if err != nil {
 		return err

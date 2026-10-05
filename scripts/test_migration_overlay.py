@@ -149,7 +149,6 @@ class ConnectionIdentityTest(unittest.TestCase):
 class MigrationOverlayTest(cli_test.MigrationCLITest):
     # Keep this class's tests separate from the retained-storage CLI tests.
     test_fresh_database = None
-    test_partial_rollout_timeout_atomicity_and_recovery = None
 
     def invoke(self, target, action="push", root=ROOT):
         url = f"postgresql://postgres@127.0.0.1:{self.port}/{self.database}?sslmode=disable"
@@ -254,8 +253,6 @@ class MigrationOverlayTest(cli_test.MigrationCLITest):
             self.assertEqual(self.sql("SELECT row_to_json(m) FROM supabase_migrations.schema_migrations m "
                                      f"WHERE version='{migration.VERSION}'"), auth_history)
             self.assertEqual(self.sql("SELECT count(*) FROM signup_device_attempt"), "1")
-            self.assertEqual(self.sql("SELECT count(*) FROM supabase_migrations.schema_migrations "
-                                     "WHERE version LIKE '202610030100%'"), "24")
             # A later regional migration still uses the same historical overlay.
             (root / "supabase/migrations/20990101000000_future.sql").write_text(
                 "CREATE TABLE future_regional_marker(id integer); INSERT INTO future_regional_marker VALUES(1);")

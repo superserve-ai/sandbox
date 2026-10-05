@@ -8,7 +8,7 @@ import subprocess
 import time
 
 
-RECOVERY_PATHS = {
+MIGRATION_BASELINE_PATHS = {
     "scripts/migrate_database.py",
     "scripts/retained_storage_recovery.py",
     "scripts/recovery_evidence.py",
@@ -22,28 +22,6 @@ RECOVERY_PATHS = {
     ".github/workflows/terraform-cd.yml",
     ".github/workflows/scripts/wait-for-push-ci.py",
 }
-
-
-def recovery_hold(before, revision, event, *, run=subprocess.run):
-    if event != "push":
-        return False
-    if (not re.fullmatch(r"[0-9a-f]{40}", before or "") or before == "0" * 40
-            or not re.fullmatch(r"[0-9a-f]{40}", revision or "")):
-        return True
-    try:
-        result = run(["git", "fetch", "--quiet", "--no-tags", "--depth=1", "origin", before],
-                     capture_output=True, text=True, timeout=30)
-        if result.returncode:
-            return True
-        result = run(["git", "diff", "--name-only", "-z", "--no-renames", before, revision, "--"],
-                     capture_output=True, text=True, timeout=30)
-        if result.returncode:
-            return True
-        return any(path in RECOVERY_PATHS or path.startswith(
-            ("supabase/shared-auth-history/", "supabase/shared-auth-migrations/", "supabase/recovery/"))
-            for path in result.stdout.split("\0"))
-    except (OSError, subprocess.TimeoutExpired):
-        return True
 
 
 def wait_for_ci(repository, revision, event, *, attempts=60, interval=20,
@@ -162,7 +140,7 @@ def wait_for_migration_baseline(repository, revision, event, *, attempts=60, int
                     return False
                 command(["git", "fetch", "--quiet", "--no-tags", "--depth=1000", "origin", revision, baseline])
                 command(["git", "merge-base", "--is-ancestor", baseline, revision])
-                protected = sorted(RECOVERY_PATHS | {
+                protected = sorted(MIGRATION_BASELINE_PATHS | {
                     "supabase/migrations", "supabase/shared-auth-history", "supabase/shared-auth-migrations",
                     "supabase/recovery", ".github/workflows/scripts/migration_gate.py",
                 })
@@ -185,11 +163,6 @@ def wait_for_migration_baseline(repository, revision, event, *, attempts=60, int
 
 
 if __name__ == "__main__":
-    if recovery_hold(os.environ.get("PUSH_BEFORE", ""), os.environ["GITHUB_SHA"],
-                     os.environ["GITHUB_EVENT_NAME"]):
-        raise SystemExit("Intentional rollout hold: migration composition or deployment controls changed, "
-                         "or the complete push diff could not be verified. CI and migrations may proceed; "
-                         "target deployment requires a coordinated manual release.")
     if not wait_for_ci(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"],
                        os.environ["GITHUB_EVENT_NAME"]):
         raise SystemExit("Required same-revision push CI did not succeed; refusing deployment.")

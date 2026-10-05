@@ -130,7 +130,7 @@ func TestIntegration_InvoiceAutomaticEnrollment(t *testing.T) {
 			if sub.inactivePrice {
 				cpu["active"] = false
 			}
-			items := []any{map[string]any{"id": "si_cpu", "price": cpu}}
+			items := []any{map[string]any{"id": "si_cpu", "current_period_start": time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Unix(), "current_period_end": time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC).Unix(), "price": cpu}}
 			if sub.item {
 				items = append(items, map[string]any{"id": "si_round", "price": price("price_round", "mtr_round", "1")})
 			}
@@ -141,7 +141,7 @@ func TestIntegration_InvoiceAutomaticEnrollment(t *testing.T) {
 			if status == "" {
 				status = "active"
 			}
-			out = map[string]any{"id": id, "customer": customer, "status": status, "items": map[string]any{"data": items, "has_more": false}}
+			out = map[string]any{"id": id, "billing_cycle_anchor": time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Unix(), "customer": customer, "status": status, "items": map[string]any{"data": items, "has_more": false}}
 			if sub.held {
 				out.(map[string]any)["pause_collection"] = map[string]any{"behavior": "keep_as_draft", "resumes_at": sub.resumesAt}
 			}

@@ -196,7 +196,11 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 	err = h.Pool.QueryRow(ctx, `SELECT invoice_id,state,plan,first_adjustment_at FROM billing_invoice_close WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End).Scan(&invoiceID, &state, &raw, &firstAdjustment)
 	var plan billing.InvoiceClosePlan
 	if errors.Is(err, pgx.ErrNoRows) {
-		inv, e := client.billingCycleInvoice(ctx, a, p.Start.Unix(), p.End.Unix())
+		invoicePeriod, e := h.ensureInvoiceCalendar(ctx, p, a, client)
+		if e != nil {
+			return e
+		}
+		inv, e := client.billingCycleInvoice(ctx, a, invoicePeriod.Start.Unix(), invoicePeriod.End.Unix())
 		if e != nil {
 			return e
 		}
@@ -222,6 +226,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 	} else if err = json.Unmarshal(raw, &plan); err != nil {
 		return err
 	}
+	invoicePeriod := invoicePlanPeriod(p, plan)
 	if plan.Customer != a.Customer || plan.Subscription != a.Subscription {
 		return fmt.Errorf("saved invoice scope differs")
 	}
@@ -250,10 +255,10 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		if e != nil {
 			return e
 		}
-		if e = validateInvoiceDocument(final, p, a, plan); e != nil {
+		if e = validateInvoiceDocument(final, invoicePeriod, a, plan); e != nil {
 			return e
 		}
-		remaining, e := client.invoiceCreditLedger(ctx, a.Customer, p.End.Unix())
+		remaining, e := client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
 		if e != nil {
 			return e
 		}
@@ -276,7 +281,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 	if err != nil {
 		return err
 	}
-	if err = validateInvoiceDocument(inv, p, a, plan); err != nil {
+	if err = validateInvoiceDocument(inv, invoicePeriod, a, plan); err != nil {
 		return err
 	}
 	if inv.AutoAdvance || inv.Customer != a.Customer || inv.BillingReason != "subscription_cycle" {
@@ -287,7 +292,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 			return fmt.Errorf("invoice finalized before its correction plan was applied")
 		}
 		if plan.AdjustmentCents > 0 {
-			counted, e := client.CountedMeterUsage(ctx, a.Event, a.Customer, p.Start, p.End)
+			counted, e := client.CountedMeterUsage(ctx, a.Event, a.Customer, invoicePeriod.Start, invoicePeriod.End)
 			if e != nil {
 				return e
 			}
@@ -323,7 +328,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		}
 	}
 	if state == "adjusted" {
-		credits, e := client.invoiceCreditLedger(ctx, a.Customer, p.End.Unix())
+		credits, e := client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
 		if e != nil {
 			return e
 		}
@@ -346,11 +351,11 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		if e != nil {
 			return e
 		}
-		if e = validateInvoiceDocument(current, p, a, plan); e != nil {
+		if e = validateInvoiceDocument(current, invoicePeriod, a, plan); e != nil {
 			return e
 		}
 		if current.Status == "draft" {
-			credits, e := client.invoiceCreditLedger(ctx, a.Customer, p.End.Unix())
+			credits, e := client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
 			if e != nil {
 				return e
 			}
@@ -360,7 +365,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 			if plan.AdjustmentCents < 0 && len(current.Discounts) != 1 {
 				return fmt.Errorf("rounding discount missing before finalization")
 			}
-			counted, e := client.CountedMeterUsage(ctx, a.Event, a.Customer, p.Start, p.End)
+			counted, e := client.CountedMeterUsage(ctx, a.Event, a.Customer, invoicePeriod.Start, invoicePeriod.End)
 			if e != nil {
 				return e
 			}
@@ -373,11 +378,11 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		if e != nil {
 			return e
 		}
-		remaining, e := client.invoiceCreditLedger(ctx, a.Customer, p.End.Unix())
+		remaining, e := client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
 		if e != nil {
 			return e
 		}
-		if e = validateInvoiceDocument(final, p, a, plan); e != nil {
+		if e = validateInvoiceDocument(final, invoicePeriod, a, plan); e != nil {
 			return e
 		}
 		if e = VerifyBillingInvoiceSettlement(final, plan.ExpectedCents, plan.CreditBeforeCents, remaining); e != nil {
@@ -401,6 +406,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 }
 
 func (h *Handlers) validateInvoicePlan(ctx context.Context, p billing.ExportPeriod, a invoiceAccount, plan billing.InvoiceClosePlan, client *stripeHTTPClient) error {
+	invoicePeriod := invoicePlanPeriod(p, plan)
 	current, ok, err := h.invoiceAccountForPeriod(ctx, p)
 	if err != nil {
 		return err
@@ -414,6 +420,15 @@ func (h *Handlers) validateInvoicePlan(ctx context.Context, p billing.ExportPeri
 	sub, err := client.invoiceSubscription(ctx, a.Subscription)
 	if err != nil {
 		return err
+	}
+	if plan.InvoiceStart != 0 || plan.InvoiceEnd != 0 {
+		var matches bool
+		if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_invoice_calendar WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND customer_id=$4 AND subscription_id=$5 AND invoice_start=$6 AND invoice_end=$7 AND billing_cycle_anchor=$8)`, p.TeamID, p.Start, p.End, a.Customer, a.Subscription, invoicePeriod.Start, invoicePeriod.End, sub.BillingCycleAnchor).Scan(&matches); err != nil {
+			return err
+		}
+		if !matches {
+			return fmt.Errorf("invoice calendar changed after planning")
+		}
 	}
 	prices := map[string]string{a.Price: a.Meter}
 	for _, r := range plan.Resources {
@@ -448,7 +463,7 @@ func (h *Handlers) validateInvoicePlan(ctx context.Context, p billing.ExportPeri
 		if meter != r.MeterID {
 			return fmt.Errorf("invoice resource meter changed")
 		}
-		quantity, err := client.CountedMeterUsage(ctx, r.EventName, a.Customer, p.Start, p.End)
+		quantity, err := client.CountedMeterUsage(ctx, r.EventName, a.Customer, invoicePeriod.Start, invoicePeriod.End)
 		if err != nil {
 			return err
 		}
@@ -462,7 +477,8 @@ func (h *Handlers) validateInvoicePlan(ctx context.Context, p billing.ExportPeri
 }
 
 func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPeriod, a invoiceAccount, inv StripeInvoiceAmounts, client *stripeHTTPClient) (billing.InvoiceClosePlan, error) {
-	plan := billing.InvoiceClosePlan{Customer: a.Customer, Subscription: a.Subscription}
+	plan := billing.InvoiceClosePlan{Customer: a.Customer, Subscription: a.Subscription, InvoiceStart: inv.PeriodStart, InvoiceEnd: inv.PeriodEnd}
+	invoicePeriod := invoicePlanPeriod(p, plan)
 	var closed bool
 	if err := h.Pool.QueryRow(ctx, `SELECT status='exporting' AND period_end<=now() AND finalized_at IS NULL FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End).Scan(&closed); err != nil {
 		return plan, err
@@ -569,7 +585,7 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 			return plan, e
 		}
 		var invalid bool
-		if e = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_export_allocation x LEFT JOIN billing_export_event v ON v.allocation_id=x.id AND v.active WHERE x.team_id=$1 AND x.period_start=$2 AND x.period_end=$3 AND x.resource_type=$4 AND (v.id IS NULL OR v.status NOT IN ('submitted','adopted') OR v.customer_id<>$5 OR v.event_name<>$6 OR v.event_timestamp<$7 OR v.event_timestamp>=$8))`, p.TeamID, p.Start, p.End, item.ResourceType, a.Customer, event, p.Start.Unix(), p.End.Unix()).Scan(&invalid); e != nil {
+		if e = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_export_allocation x LEFT JOIN billing_export_event v ON v.allocation_id=x.id AND v.active WHERE x.team_id=$1 AND x.period_start=$2 AND x.period_end=$3 AND x.resource_type=$4 AND (v.id IS NULL OR v.status NOT IN ('submitted','adopted') OR v.customer_id<>$5 OR v.event_name<>$6 OR v.event_timestamp<$7 OR v.event_timestamp>=$8))`, p.TeamID, p.Start, p.End, item.ResourceType, a.Customer, event, invoicePeriod.Start.Unix(), invoicePeriod.End.Unix()).Scan(&invalid); e != nil {
 			return plan, e
 		}
 		if invalid {
@@ -582,7 +598,7 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 		if meter != price.Recurring.Meter {
 			return plan, fmt.Errorf("invoice price meter mismatch")
 		}
-		counted, e := client.CountedMeterUsage(ctx, event, a.Customer, p.Start, p.End)
+		counted, e := client.CountedMeterUsage(ctx, event, a.Customer, invoicePeriod.Start, invoicePeriod.End)
 		if e != nil {
 			return plan, e
 		}
@@ -649,10 +665,10 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if len(plan.Resources) == 0 || len(plan.Resources) > 3 {
 		return plan, fmt.Errorf("unsupported invoice resource set")
 	}
-	if err = validateInvoiceDocument(inv, p, a, plan); err != nil {
+	if err = validateInvoiceDocument(inv, invoicePeriod, a, plan); err != nil {
 		return plan, err
 	}
-	adjustment, e := client.CountedMeterUsage(ctx, a.Event, a.Customer, p.Start, p.End)
+	adjustment, e := client.CountedMeterUsage(ctx, a.Event, a.Customer, invoicePeriod.Start, invoicePeriod.End)
 	if e != nil {
 		return plan, e
 	}
@@ -664,7 +680,7 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if plan.AdjustmentCents > int64(len(items)) || plan.AdjustmentCents < -int64(len(items)) {
 		return plan, fmt.Errorf("invoice difference exceeds supported rounding correction")
 	}
-	plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, p.End.Unix())
+	plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
 	return plan, err
 }
 
@@ -724,7 +740,18 @@ func (h *Handlers) verifyInvoiceExportHold(ctx context.Context, p billing.Export
 		return err
 	}
 	_, err = client.ensureInvoiceSubscription(ctx, a, false, frozen)
-	return err
+	if err != nil {
+		return err
+	}
+	mapped, err := h.ensureInvoiceCalendar(ctx, p, a, client)
+	if err != nil {
+		return err
+	}
+	queryStart, _ := meterObservationWindow(mapped.Start, mapped.End)
+	if !h.nowUTC().Truncate(time.Hour).After(queryStart) {
+		return fmt.Errorf("waiting for mapped invoice cycle to begin before exporting usage")
+	}
+	return nil
 }
 
 func validateInvoiceDocument(inv StripeInvoiceAmounts, p billing.ExportPeriod, a invoiceAccount, plan billing.InvoiceClosePlan) error {

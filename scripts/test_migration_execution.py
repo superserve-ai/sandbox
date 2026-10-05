@@ -30,7 +30,6 @@ class ProcessCleanupTest(unittest.TestCase):
 
 class MigrationExecutionTest(cli_test.MigrationCLITest):
     test_fresh_database = None
-    test_partial_rollout_timeout_atomicity_and_recovery = None
 
     def setUp(self):
         super().setUp()

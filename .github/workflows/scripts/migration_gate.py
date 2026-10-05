@@ -13,14 +13,6 @@ import subprocess
 spec = importlib.util.spec_from_file_location("push_ci", Path(__file__).with_name("wait-for-push-ci.py"))
 push_ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(push_ci)
-push_ci.RECOVERY_PATHS.update({
-    ".github/workflows/ci.yml",
-    ".github/workflows/scripts/migration_gate.py",
-    ".github/workflows/scripts/test_migration_gate.py",
-    "scripts/test_migration_cli.py",
-    "scripts/test_migration_overlay.py",
-    "scripts/test_migration_execution.py",
-})
 
 
 class GateError(Exception):
@@ -49,8 +41,6 @@ def select_action(env):
         raise GateError("Migration execution requires an exact main revision")
     event = env["GITHUB_EVENT_NAME"]
     if event == "push":
-        if push_ci.recovery_hold(env.get("PUSH_BEFORE", ""), revision, event):
-            raise GateError("Intentional migration hold: runner or controls changed, or push diff is unverified")
         action, production = "push", True
     elif event == "workflow_dispatch":
         if env.get("APPROVED_REVISION") != revision:
