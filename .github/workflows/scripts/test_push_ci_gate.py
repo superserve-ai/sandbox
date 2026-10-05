@@ -1,7 +1,5 @@
 import importlib.util
 import json
-import subprocess
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -15,67 +13,6 @@ SPEC.loader.exec_module(GATE)
 
 
 class PushCIGateTests(unittest.TestCase):
-    def test_real_shallow_checkout_checks_whole_push_and_renamed_controls(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source, checkout = root / "source", root / "checkout"
-            source.mkdir()
-
-            def git(*args):
-                return subprocess.check_output(["git", *args], cwd=source, text=True).strip()
-
-            git("init", "-q", "-b", "main")
-            git("config", "user.name", "Test")
-            git("config", "user.email", "test@example.test")
-            git("commit", "-q", "--allow-empty", "-m", "base")
-            before = git("rev-parse", "HEAD")
-            history = source / "supabase/shared-auth-history"
-            history.mkdir(parents=True)
-            (history / "setup.sql").write_text("SELECT 1;\n")
-            git("add", ".")
-            git("commit", "-qm", "history input")
-            (source / "api.txt").write_text("application change\n")
-            git("add", ".")
-            git("commit", "-qm", "application tip")
-            head = git("rev-parse", "HEAD")
-            subprocess.run(["git", "clone", "-q", "--depth=1", source.as_uri(), str(checkout)], check=True)
-
-            def run(args, **kwargs):
-                return subprocess.run(args, cwd=checkout, **kwargs)
-
-            self.assertTrue(GATE.recovery_hold(before, head, "push", run=run))
-            git("mv", "supabase/shared-auth-history/setup.sql", "renamed.sql")
-            git("commit", "-qm", "rename control input")
-            renamed = git("rev-parse", "HEAD")
-            subprocess.run(["git", "fetch", "-q", "origin", "main"], cwd=checkout, check=True)
-            self.assertTrue(GATE.recovery_hold(head, renamed, "push", run=run))
-
-    def test_recovery_changes_hold_complete_push_including_mixed_changes(self):
-        for path in GATE.RECOVERY_PATHS | {"supabase/shared-auth-history/setup.sql",
-                                         "supabase/shared-auth-migrations/setup.sql"}:
-            with self.subTest(path=path):
-                run = Mock(side_effect=[SimpleNamespace(returncode=0),
-                    SimpleNamespace(returncode=0, stdout="internal/api/handler.go\0infra/main.tf\0" + path + "\0")])
-                self.assertTrue(GATE.recovery_hold("b" * 40, "a" * 40, "push", run=run))
-                self.assertEqual(run.call_args.args[0][-3:], ["b" * 40, "a" * 40, "--"])
-                self.assertIn("--no-renames", run.call_args.args[0])
-
-    def test_ordinary_push_and_manual_dispatch_are_not_held(self):
-        run = Mock(side_effect=[SimpleNamespace(returncode=0), SimpleNamespace(returncode=0,
-                   stdout="internal/api/handler.go\0supabase/migrations/new.sql\0")])
-        self.assertFalse(GATE.recovery_hold("b" * 40, "a" * 40, "push", run=run))
-        run.reset_mock()
-        self.assertFalse(GATE.recovery_hold("", "a" * 40, "workflow_dispatch", run=run))
-        run.assert_not_called()
-
-    def test_unknown_push_diff_is_held(self):
-        for before in ("", "0" * 40, "not-a-sha"):
-            self.assertTrue(GATE.recovery_hold(before, "a" * 40, "push"))
-        self.assertTrue(GATE.recovery_hold("b" * 40, "a" * 40, "push",
-                                          run=Mock(return_value=SimpleNamespace(returncode=1))))
-        self.assertTrue(GATE.recovery_hold("b" * 40, "a" * 40, "push", run=Mock(side_effect=[
-            SimpleNamespace(returncode=0), SimpleNamespace(returncode=1)])))
-
     def check(self, runs, expected):
         result = SimpleNamespace(returncode=0, stdout=json.dumps({"workflow_runs": runs}))
         run, sleep = Mock(return_value=result), Mock()

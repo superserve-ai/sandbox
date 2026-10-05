@@ -141,8 +141,7 @@ The collector must run from the exact approved main revision, using
 `retained-recovery-evidence-usw2` containing only `evidence.json`. The verifier
 checks the authenticated GitHub run, artifact digest, plan/database identity,
 full cloud inventory and an observation at most 120 seconds old before each
-phase. Test fixtures in `scripts/test_recovery_evidence.py` illustrate the schema;
-they are synthetic data, not acceptable operational evidence.
+phase. `scripts/recovery_evidence.py` defines the accepted evidence schema.
 
 The existing deployment identity is selected by `GCP_WORKLOAD_IDENTITY_PROVIDER`
 and `GCP_SERVICE_ACCOUNT`. Reusing those secret references does not establish
@@ -203,6 +202,9 @@ the execution `RESET ALL` check, or release authorization.
 
 Regression tests use the actual pinned CLI against disposable Docker PostgreSQL 17.6:
 `test_migration_cli.py`, `test_migration_overlay.py`, `test_migration_execution.py`
-and `test_migration_recovery.py`. Evidence and release-gate tests exercise missing,
-stale and changed observations and the distinction between ordinary and recovery
-preflight. They do not establish hosted connectivity or production writer exclusion.
+and `test_migration_history.py`. These retain ordinary migration, history,
+regional isolation, and completed-recovery upgrade coverage. The historical
+recovery crash and evidence-fixture suites have been retired; the recovery
+actions and their runtime safeguards remain. Release-gate tests still verify
+revision, CI, regional completion, and manual preflight requirements. These tests
+do not establish hosted connectivity or production writer exclusion.

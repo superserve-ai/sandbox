@@ -107,10 +107,9 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Check rollout hold and same-SHA push CI
+      - name: Check same-SHA push CI and migration baseline
         env:
           GH_TOKEN: ${{ github.token }}
-          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           git checkout "$GITHUB_SHA" -- .github/workflows/scripts/wait-for-push-ci.py
           python3 .github/workflows/scripts/wait-for-push-ci.py

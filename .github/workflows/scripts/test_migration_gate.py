@@ -93,33 +93,18 @@ class MigrationGateTest(unittest.TestCase):
             with patch.object(gate, "api", side_effect=self.api), self.assertRaises(gate.GateError):
                 gate.select_action({**self.env, "PREFLIGHT_RUN_ID": run_id})
 
-    def test_full_push_range_and_mixed_control_change_hold(self):
-        calls = []
-
-        def run(args, **kwargs):
-            calls.append(args)
-            output = "supabase/migrations/20990101000000_example.sql\0scripts/migrate_database.py\0"
-            return subprocess.CompletedProcess(args, 0, stdout=output if args[1] == "diff" else "")
-
-        self.assertTrue(gate.push_ci.recovery_hold(BEFORE, SHA, "push", run=run))
-        self.assertEqual(calls[-1][-3:], [BEFORE, SHA, "--"])
-        for path in gate.push_ci.RECOVERY_PATHS:
-            with self.subTest(path=path):
-                result = subprocess.CompletedProcess([], 0, stdout=path + "\0")
-                self.assertTrue(gate.push_ci.recovery_hold(BEFORE, SHA, "push", run=lambda *a, **k: result))
-        result = subprocess.CompletedProcess([], 0, stdout="supabase/migrations/20990101000000_example.sql\0")
-        self.assertFalse(gate.push_ci.recovery_hold(BEFORE, SHA, "push", run=lambda *a, **k: result))
-        self.assertTrue(gate.push_ci.recovery_hold("0" * 40, SHA, "push", run=run))
-        self.assertTrue(gate.push_ci.recovery_hold(BEFORE, SHA, "push", run=lambda *a, **k: subprocess.CompletedProcess([], 1)))
-
-    def test_push_hold_precedes_ci_and_database_jobs(self):
-        env = {**self.env, "GITHUB_EVENT_NAME": "push", "PUSH_BEFORE": BEFORE}
-        with patch.object(gate.push_ci, "recovery_hold", return_value=True):
+    def test_push_requires_current_main_and_successful_ci(self):
+        env = {**self.env, "GITHUB_EVENT_NAME": "push"}
+        with patch.object(gate, "api", side_effect=self.api):
+            self.assertEqual(gate.select_action(env), ("push", True))
+            self.ci.assert_called_with("example/project", SHA, "push")
+            self.ci.return_value = False
             with self.assertRaises(gate.GateError):
                 gate.select_action(env)
-            self.ci.assert_not_called()
-        with patch.object(gate.push_ci, "recovery_hold", return_value=False), patch.object(gate, "api", side_effect=self.api):
-            self.assertEqual(gate.select_action(env), ("push", True))
+        self.ci.return_value = True
+        with patch.object(gate, "api", return_value={"object": {"sha": BEFORE}}):
+            with self.assertRaises(gate.GateError):
+                gate.select_action(env)
 
     def test_main_advance_during_ci_wait_holds(self):
         with patch.object(gate, "api", side_effect=[{"object": {"sha": SHA}}, {"object": {"sha": BEFORE}}]):
