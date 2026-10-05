@@ -180,6 +180,7 @@ func TestRawFrameTooLarge(t *testing.T) {
 func withFakeBackend(s *desktopService) *x11Backend {
 	b := &x11Backend{}
 	s.x11.backend = b
+	s.x11.display = s.displayName()
 	return b
 }
 
