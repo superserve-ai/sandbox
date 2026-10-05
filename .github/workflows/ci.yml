@@ -180,7 +180,7 @@ jobs:
       - name: Initialize migrated billing and storage database
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
-        run: go test -v -tags integration -count=1 -run '^$' ./internal/integration
+        run: go run -tags integration ./cmd/setup-integration-db
 
       - name: Run billing worker load race contract
         env:
