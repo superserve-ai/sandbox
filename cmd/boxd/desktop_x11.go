@@ -50,7 +50,11 @@ const maxRawFrameBytes = 64 << 20
 var errFrameTooLarge = fmt.Errorf("display exceeds %d bytes of raw frame", maxRawFrameBytes)
 
 type x11Backend struct {
-	conn      *xgb.Conn
+	conn *xgb.Conn
+	// sock is the connection's socket, kept so Close can force it shut:
+	// xgb's own Close is graceful and finishes with a round trip, which
+	// never completes against a server that has stopped replying.
+	sock      net.Conn
 	root      xproto.Window
 	hasXfixes bool
 }
@@ -114,7 +118,12 @@ func newX11Backend(conn *xgb.Conn, screen int) (*x11Backend, error) {
 	return b, nil
 }
 
+// Close shuts the backend down even if the server is unresponsive: closing
+// the socket first fails any pending reply and lets xgb's goroutines exit.
 func (b *x11Backend) Close() {
+	if b.sock != nil {
+		_ = b.sock.Close()
+	}
 	if b.conn != nil {
 		b.conn.Close()
 	}
@@ -345,8 +354,12 @@ func compositeCursor(frame *image.RGBA, cursor []uint32, width, height, originX,
 // cooldown after failures, so the shell fallback keeps working when no X
 // server is reachable (non-desktop sandboxes, or X restarting).
 type x11Holder struct {
-	mu        sync.Mutex
-	backend   *x11Backend
+	mu      sync.Mutex
+	backend *x11Backend
+	// display is the DISPLAY the backend (or the last probe) was for. The
+	// sandbox env can change it after startup, and a cached connection to
+	// the old server, or a cooldown from probing it, must not outlive that.
+	display   string
 	lastProbe time.Time
 	probing   bool // a dial is in flight; concurrent callers use the shell path
 	disabled  bool // tests force the shell path
@@ -381,12 +394,14 @@ func dialX11(ctx context.Context, display string) (*x11Backend, error) {
 	backend, err := newX11Backend(conn, screen)
 	if err != nil {
 		stop()
+		_ = netConn.Close()
 		conn.Close()
 		return nil, err
 	}
+	backend.sock = netConn
 	if !stop() {
 		// ctx ended during init and the socket is already closed.
-		conn.Close()
+		backend.Close()
 		return nil, ctx.Err()
 	}
 	_ = netConn.SetDeadline(time.Time{})
@@ -403,15 +418,20 @@ func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 		h.mu.Unlock()
 		return nil
 	}
+	if h.backend != nil && h.display != display {
+		h.backend.Close()
+		h.backend = nil
+	}
 	if h.backend != nil {
 		backend := h.backend
 		h.mu.Unlock()
 		return backend
 	}
-	if time.Since(h.lastProbe) < x11ReprobeInterval {
+	if h.display == display && time.Since(h.lastProbe) < x11ReprobeInterval {
 		h.mu.Unlock()
 		return nil
 	}
+	h.display = display
 	h.lastProbe = time.Now()
 	h.probing = true
 	h.mu.Unlock()

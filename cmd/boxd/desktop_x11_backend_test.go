@@ -347,3 +347,43 @@ func TestRunX11_OpRunsUnderTheCallerDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestX11Backend_CloseForcesTheSocketShut(t *testing.T) {
+	ours, theirs := net.Pipe()
+	b := &x11Backend{sock: ours}
+	b.Close()
+	_ = theirs.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := theirs.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("peer still open after Close (read err = %v)", err)
+	}
+}
+
+func TestX11Holder_DisplayChangeDropsTheCachedBackendAndItsCooldown(t *testing.T) {
+	ours, theirs := net.Pipe()
+	var h x11Holder
+	h.backend = &x11Backend{sock: ours}
+	h.display = "/old/sock:1"
+
+	// A new DISPLAY must not be served by the old server's connection.
+	if b := h.get(context.Background(), "/nonexistent-new:1"); b != nil {
+		t.Fatal("got a backend for the new display from the old connection")
+	}
+	if h.backend != nil {
+		t.Fatal("old backend still cached after the display changed")
+	}
+	_ = theirs.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := theirs.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("old connection was not closed")
+	}
+
+	// A failed probe's cooldown is per display: a different DISPLAY probes at once.
+	probed := h.lastProbe
+	if h.get(context.Background(), "/nonexistent-new:1") != nil || h.lastProbe != probed {
+		t.Fatal("same display re-probed inside the cooldown")
+	}
+	time.Sleep(time.Millisecond)
+	_ = h.get(context.Background(), "/nonexistent-other:1")
+	if h.lastProbe == probed || h.display != "/nonexistent-other:1" {
+		t.Fatal("a new display did not get its own probe")
+	}
+}
