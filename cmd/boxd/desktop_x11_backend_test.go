@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"image"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -83,18 +87,18 @@ func TestScrollSteps(t *testing.T) {
 func TestX11Holder_DisabledAndCooldown(t *testing.T) {
 	var h x11Holder
 	h.disabled = true
-	if h.get(":1") != nil {
+	if h.get(context.Background(), ":1") != nil {
 		t.Fatal("disabled holder must never return a backend")
 	}
 
 	h = x11Holder{}
 	// An unconnectable display: first get probes and fails...
-	if h.get("/nonexistent-display:99") != nil {
+	if h.get(context.Background(), "/nonexistent-display:99") != nil {
 		t.Fatal("expected probe failure")
 	}
 	probed := h.lastProbe
 	// ...and the next get inside the cooldown must not re-dial.
-	if h.get("/nonexistent-display:99") != nil {
+	if h.get(context.Background(), "/nonexistent-display:99") != nil {
 		t.Fatal("expected fallback inside cooldown")
 	}
 	if h.lastProbe != probed {
@@ -102,7 +106,7 @@ func TestX11Holder_DisabledAndCooldown(t *testing.T) {
 	}
 	// After the cooldown, it probes again.
 	h.lastProbe = time.Now().Add(-2 * x11ReprobeInterval)
-	_ = h.get("/nonexistent-display:99")
+	_ = h.get(context.Background(), "/nonexistent-display:99")
 	if h.lastProbe == probed {
 		t.Error("expected a fresh probe after the cooldown")
 	}
@@ -224,5 +228,64 @@ func TestRunX11_NoBackendIsNotAttempted(t *testing.T) {
 	attempted, err := s.runX11(context.Background(), func(*x11Backend) error { return nil })
 	if attempted || err != nil {
 		t.Fatalf("attempted=%v err=%v, want not attempted", attempted, err)
+	}
+}
+
+// A server that accepts the socket but never completes the handshake: the
+// dial must give up on its own, and callers arriving meanwhile must fall
+// back immediately instead of queueing behind the holder lock.
+func TestX11Holder_HungHandshakeIsBoundedAndDoesNotBlockOthers(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "x11hang") // short path: unix socket limit
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	display := filepath.Join(dir, "x:0") // xgb dials "<socket>:<n>" for a "/" display
+	ln, err := net.Listen("unix", display)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		mu.Lock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c) // held open, never answered
+			mu.Unlock()
+		}
+	}()
+
+	var h x11Holder
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	first := make(chan *x11Backend, 1)
+	start := time.Now()
+	go func() { first <- h.get(ctx, display) }()
+	time.Sleep(50 * time.Millisecond)
+
+	t0 := time.Now()
+	if h.get(context.Background(), display) != nil {
+		t.Fatal("second caller got a backend from a hung dial")
+	}
+	if time.Since(t0) > 100*time.Millisecond {
+		t.Fatal("second caller waited behind the hung dial")
+	}
+	if b := <-first; b != nil {
+		t.Fatal("hung dial produced a backend")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("hung dial was not bounded by the context")
 	}
 }

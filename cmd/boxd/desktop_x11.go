@@ -32,6 +32,10 @@ import (
 // per interval, not per RPC.
 const x11ReprobeInterval = 30 * time.Second
 
+// x11DialTimeout bounds the initial handshake and extension queries, which
+// otherwise block without observing any request context.
+const x11DialTimeout = 5 * time.Second
+
 // maxRawFrameBytes bounds one GetImage reply (4 bytes per pixel): the raw
 // frame is held in memory for conversion and PNG encoding, and up to
 // maxConcurrentCaptures of them may exist at once. 64 MiB covers 4K; a
@@ -77,35 +81,46 @@ func (b *x11Backend) Close() {
 	}
 }
 
-// sync round-trips to the X server so buffered events are known-delivered
-// before the RPC returns.
+// sync round-trips to the X server so every queued event is known-delivered
+// before the RPC returns, then surfaces any error the server raised for
+// them. Events are sent unchecked, so one round trip covers a whole action
+// instead of one per event.
 func (b *x11Backend) sync() error {
-	_, err := xproto.GetInputFocus(b.conn).Reply()
-	return err
+	if _, err := xproto.GetInputFocus(b.conn).Reply(); err != nil {
+		return err
+	}
+	for {
+		ev, xerr := b.conn.PollForEvent()
+		if xerr != nil {
+			return fmt.Errorf("x server rejected input: %v", xerr)
+		}
+		if ev == nil {
+			return nil
+		}
+	}
 }
 
-func (b *x11Backend) fakeInput(typ byte, detail byte, x, y int16) error {
-	return xtest.FakeInputChecked(b.conn, typ, detail, xproto.TimeCurrentTime, b.root, x, y, 0).Check()
+// fakeInput queues one XTEST event; delivery is confirmed by sync.
+func (b *x11Backend) fakeInput(typ byte, detail byte, x, y int16) {
+	xtest.FakeInput(b.conn, typ, detail, xproto.TimeCurrentTime, b.root, x, y, 0)
 }
 
-func (b *x11Backend) move(x, y int16) error {
+func (b *x11Backend) move(x, y int16) {
 	// Detail 0 = absolute coordinates on the root window's screen.
-	return b.fakeInput(xproto.MotionNotify, 0, x, y)
+	b.fakeInput(xproto.MotionNotify, 0, x, y)
 }
 
-func (b *x11Backend) button(press bool, button byte) error {
+func (b *x11Backend) button(press bool, button byte) {
 	typ := byte(xproto.ButtonRelease)
 	if press {
 		typ = xproto.ButtonPress
 	}
-	return b.fakeInput(typ, button, 0, 0)
+	b.fakeInput(typ, button, 0, 0)
 }
 
-func (b *x11Backend) click(button byte) error {
-	if err := b.button(true, button); err != nil {
-		return err
-	}
-	return b.button(false, button)
+func (b *x11Backend) click(button byte) {
+	b.button(true, button)
+	b.button(false, button)
 }
 
 // x11PointerButton maps the proto button to the X11 core button number.
@@ -127,33 +142,24 @@ func (b *x11Backend) Pointer(x, y int32, button pb.PointerButton, action pb.Poin
 	if err != nil {
 		return err
 	}
-	if err := b.move(int16(x), int16(y)); err != nil {
-		return err
-	}
 	switch action {
-	case pb.PointerAction_POINTER_ACTION_UNSPECIFIED, pb.PointerAction_POINTER_ACTION_MOVE:
-		// Move only.
-	case pb.PointerAction_POINTER_ACTION_DOWN:
-		if err := b.button(true, btn); err != nil {
-			return err
-		}
-	case pb.PointerAction_POINTER_ACTION_UP:
-		if err := b.button(false, btn); err != nil {
-			return err
-		}
-	case pb.PointerAction_POINTER_ACTION_CLICK:
-		if err := b.click(btn); err != nil {
-			return err
-		}
-	case pb.PointerAction_POINTER_ACTION_DOUBLE_CLICK:
-		if err := b.click(btn); err != nil {
-			return err
-		}
-		if err := b.click(btn); err != nil {
-			return err
-		}
+	case pb.PointerAction_POINTER_ACTION_UNSPECIFIED, pb.PointerAction_POINTER_ACTION_MOVE,
+		pb.PointerAction_POINTER_ACTION_DOWN, pb.PointerAction_POINTER_ACTION_UP,
+		pb.PointerAction_POINTER_ACTION_CLICK, pb.PointerAction_POINTER_ACTION_DOUBLE_CLICK:
 	default:
 		return fmt.Errorf("unknown pointer action %v", action)
+	}
+	b.move(int16(x), int16(y))
+	switch action {
+	case pb.PointerAction_POINTER_ACTION_DOWN:
+		b.button(true, btn)
+	case pb.PointerAction_POINTER_ACTION_UP:
+		b.button(false, btn)
+	case pb.PointerAction_POINTER_ACTION_CLICK:
+		b.click(btn)
+	case pb.PointerAction_POINTER_ACTION_DOUBLE_CLICK:
+		b.click(btn)
+		b.click(btn)
 	}
 	return b.sync()
 }
@@ -194,9 +200,7 @@ func scrollSteps(dx, dy int32) []struct {
 func (b *x11Backend) Scroll(dx, dy int32) error {
 	for _, step := range scrollSteps(dx, dy) {
 		for i := 0; i < step.Count; i++ {
-			if err := b.click(step.Button); err != nil {
-				return err
-			}
+			b.click(step.Button)
 		}
 	}
 	return b.sync()
@@ -305,25 +309,65 @@ type x11Holder struct {
 	mu        sync.Mutex
 	backend   *x11Backend
 	lastProbe time.Time
+	probing   bool // a dial is in flight; concurrent callers use the shell path
 	disabled  bool // tests force the shell path
 }
 
+// dialX11 connects under ctx and x11DialTimeout. A dial that finishes after
+// the caller gave up is closed rather than leaked.
+func dialX11(ctx context.Context, display string) (*x11Backend, error) {
+	ctx, cancel := context.WithTimeout(ctx, x11DialTimeout)
+	defer cancel()
+	type result struct {
+		backend *x11Backend
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		backend, err := newX11Backend(display)
+		done <- result{backend, err}
+	}()
+	select {
+	case r := <-done:
+		return r.backend, r.err
+	case <-ctx.Done():
+		go func() {
+			if r := <-done; r.backend != nil {
+				r.backend.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
 // get returns the live backend, dialing if needed. A nil return means "use
-// the shell fallback".
-func (h *x11Holder) get(display string) *x11Backend {
+// the shell fallback". The lock is not held across the dial: a server that
+// accepts the connection but never completes the handshake must not stall
+// every other desktop call behind it.
+func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.disabled {
+	if h.disabled || h.probing {
+		h.mu.Unlock()
 		return nil
 	}
 	if h.backend != nil {
-		return h.backend
+		backend := h.backend
+		h.mu.Unlock()
+		return backend
 	}
 	if time.Since(h.lastProbe) < x11ReprobeInterval {
+		h.mu.Unlock()
 		return nil
 	}
 	h.lastProbe = time.Now()
-	backend, err := newX11Backend(display)
+	h.probing = true
+	h.mu.Unlock()
+
+	backend, err := dialX11(ctx, display)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.probing = false
 	if err != nil {
 		return nil
 	}
@@ -354,7 +398,7 @@ func (h *x11Holder) drop(backend *x11Backend) {
 // timeouts and client cancellation still free the capture slot and the
 // mutation lock.
 func (s *desktopService) runX11(ctx context.Context, op func(*x11Backend) error) (attempted bool, err error) {
-	backend := s.x11.get(s.displayName())
+	backend := s.x11.get(ctx, s.displayName())
 	if backend == nil {
 		return false, nil
 	}
