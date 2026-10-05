@@ -186,7 +186,7 @@ func withFakeBackend(s *desktopService) *x11Backend {
 func TestRunX11_OpErrorIsReturnedAndDropsTheBackend(t *testing.T) {
 	s := newDesktopService(&sandboxContext{})
 	withFakeBackend(s)
-	attempted, err := s.runX11(context.Background(), func(*x11Backend) error {
+	attempted, err := s.runX11(context.Background(), func(context.Context, *x11Backend) error {
 		return errors.New("sync failed")
 	})
 	if !attempted || err == nil || err.Error() != "sync failed" {
@@ -208,7 +208,7 @@ func TestRunX11_CancellationReleasesABlockedOp(t *testing.T) {
 		cancel()
 	}()
 	start := time.Now()
-	attempted, err := s.runX11(ctx, func(*x11Backend) error {
+	attempted, err := s.runX11(ctx, func(context.Context, *x11Backend) error {
 		<-release // stands in for a reply that never comes
 		return nil
 	})
@@ -225,7 +225,7 @@ func TestRunX11_CancellationReleasesABlockedOp(t *testing.T) {
 
 func TestRunX11_NoBackendIsNotAttempted(t *testing.T) {
 	s := newTestDesktopService(nil)
-	attempted, err := s.runX11(context.Background(), func(*x11Backend) error { return nil })
+	attempted, err := s.runX11(context.Background(), func(context.Context, *x11Backend) error { return nil })
 	if attempted || err != nil {
 		t.Fatalf("attempted=%v err=%v, want not attempted", attempted, err)
 	}
@@ -287,5 +287,63 @@ func TestX11Holder_HungHandshakeIsBoundedAndDoesNotBlockOthers(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("hung dial was not bounded by the context")
+	}
+	// Giving up must close our end, so nothing stays parked on the socket.
+	mu.Lock()
+	accepted := append([]net.Conn(nil), conns...)
+	mu.Unlock()
+	if len(accepted) == 0 {
+		t.Fatal("server never saw the connection")
+	}
+	_ = accepted[0].SetReadDeadline(time.Now().Add(2 * time.Second))
+	// The client sends its setup request first; drain that, then expect EOF.
+	buf := make([]byte, 4096)
+	var rerr error
+	for rerr == nil {
+		_, rerr = accepted[0].Read(buf)
+	}
+	if errors.Is(rerr, os.ErrDeadlineExceeded) {
+		t.Fatal("client side still open after the dial gave up")
+	}
+}
+
+func TestParseDisplay(t *testing.T) {
+	cases := []struct {
+		in, network, address string
+		screen               int
+	}{
+		{":1", "unix", "/tmp/.X11-unix/X1", 0},
+		{":1.2", "unix", "/tmp/.X11-unix/X1", 2},
+		{"unix:3", "unix", "/tmp/.X11-unix/X3", 0},
+		{"/run/x/sock:4", "unix", "/run/x/sock:4", 0},
+		{"host.example:1", "tcp", "host.example:6001", 0},
+		{"tcp/host.example:2.1", "tcp", "host.example:6002", 1},
+	}
+	for _, c := range cases {
+		network, address, screen, err := parseDisplay(c.in)
+		if err != nil || network != c.network || address != c.address || screen != c.screen {
+			t.Errorf("parseDisplay(%q) = %q %q %d %v, want %q %q %d", c.in, network, address, screen, err, c.network, c.address, c.screen)
+		}
+	}
+	for _, bad := range []string{"", "nocolon", ":", ":x", ":1.y", ":-1"} {
+		if _, _, _, err := parseDisplay(bad); err == nil {
+			t.Errorf("parseDisplay(%q) accepted", bad)
+		}
+	}
+}
+
+func TestRunX11_OpRunsUnderTheCallerDeadline(t *testing.T) {
+	s := newDesktopService(&sandboxContext{})
+	withFakeBackend(s)
+	ctx, cancel := context.WithTimeout(context.Background(), screenshotTimeout)
+	defer cancel()
+	_, err := s.runX11(ctx, func(opCtx context.Context, _ *x11Backend) error {
+		if _, ok := opCtx.Deadline(); !ok {
+			t.Error("op ran without a deadline")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

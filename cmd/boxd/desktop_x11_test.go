@@ -116,3 +116,22 @@ func TestDesktopX11Backend_RealXServer(t *testing.T) {
 		t.Fatalf("pointer after XTest click: %q, want x:123 y:45", got)
 	}
 }
+
+// A reachable display with a screen it does not have must be an init error
+// and a shell fallback, not a panic in boxd.
+func TestX11Backend_RejectsMissingScreen(t *testing.T) {
+	if _, err := exec.LookPath("Xvnc"); err != nil {
+		t.Skip("Xvnc not installed")
+	}
+	display := startXvnc(t, 320, 240)
+	var h x11Holder
+	if b := h.get(context.Background(), display+".5"); b != nil {
+		t.Fatal("got a backend for a screen the server does not have")
+	}
+	h.lastProbe = time.Time{} // past the cooldown of the failed probe
+	b := h.get(context.Background(), display)
+	if b == nil {
+		t.Fatal("valid display did not connect")
+	}
+	h.drop(b)
+}

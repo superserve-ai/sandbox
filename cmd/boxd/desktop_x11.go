@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,18 +55,54 @@ type x11Backend struct {
 	hasXfixes bool
 }
 
-func newX11Backend(display string) (*x11Backend, error) {
-	conn, err := xgb.NewConnDisplay(display)
-	if err != nil {
-		return nil, fmt.Errorf("connect to display %q: %w", display, err)
+// parseDisplay resolves a DISPLAY value to the socket to dial and the screen
+// number, for the forms an X client accepts: ":1", ":1.0", "/path/sock:1",
+// "host:1" and "protocol/host:1".
+func parseDisplay(display string) (network, address string, screen int, err error) {
+	colon := strings.LastIndex(display, ":")
+	if colon < 0 {
+		return "", "", 0, fmt.Errorf("bad display %q", display)
 	}
+	number, screenStr, _ := strings.Cut(display[colon+1:], ".")
+	n, err := strconv.Atoi(number)
+	if err != nil || n < 0 {
+		return "", "", 0, fmt.Errorf("bad display %q", display)
+	}
+	if screenStr != "" {
+		if screen, err = strconv.Atoi(screenStr); err != nil || screen < 0 {
+			return "", "", 0, fmt.Errorf("bad display %q", display)
+		}
+	}
+	head := display[:colon]
+	switch {
+	case strings.HasPrefix(head, "/"):
+		return "unix", head + ":" + number, screen, nil
+	case head == "" || head == "unix":
+		return "unix", "/tmp/.X11-unix/X" + number, screen, nil
+	}
+	network = "tcp"
+	if proto, host, ok := strings.Cut(head, "/"); ok {
+		network, head = proto, host
+	}
+	return network, net.JoinHostPort(head, strconv.Itoa(6000+n)), screen, nil
+}
+
+// newX11Backend initialises a backend on an established connection. The
+// caller owns conn on error.
+func newX11Backend(conn *xgb.Conn, screen int) (*x11Backend, error) {
+	setup := xproto.Setup(conn)
+	// DefaultScreen indexes Roots unchecked; DISPLAY comes from the sandbox
+	// environment, so a bad screen must be an error, not a panic.
+	if screen >= len(setup.Roots) {
+		return nil, fmt.Errorf("display has %d screen(s), no screen %d", len(setup.Roots), screen)
+	}
+	conn.DefaultScreen = screen
 	if err := xtest.Init(conn); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("XTEST extension: %w", err)
 	}
 	b := &x11Backend{
 		conn: conn,
-		root: xproto.Setup(conn).DefaultScreen(conn).Root,
+		root: setup.Roots[screen].Root,
 	}
 	// Cursor compositing is best-effort: without XFixes, frames simply have
 	// no pointer drawn in them.
@@ -313,31 +352,45 @@ type x11Holder struct {
 	disabled  bool // tests force the shell path
 }
 
-// dialX11 connects under ctx and x11DialTimeout. A dial that finishes after
-// the caller gave up is closed rather than leaked.
+// dialX11 connects under ctx and x11DialTimeout. The socket is opened here
+// rather than by the X library so the handshake and extension queries are
+// bounded by a socket deadline and aborted by closing the socket: a server
+// that accepts but never answers leaves nothing parked behind.
 func dialX11(ctx context.Context, display string) (*x11Backend, error) {
+	network, address, screen, err := parseDisplay(display)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, x11DialTimeout)
 	defer cancel()
-	type result struct {
-		backend *x11Backend
-		err     error
+	var dialer net.Dialer
+	netConn, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, fmt.Errorf("connect to display %q: %w", display, err)
 	}
-	done := make(chan result, 1)
-	go func() {
-		backend, err := newX11Backend(display)
-		done <- result{backend, err}
-	}()
-	select {
-	case r := <-done:
-		return r.backend, r.err
-	case <-ctx.Done():
-		go func() {
-			if r := <-done; r.backend != nil {
-				r.backend.Close()
-			}
-		}()
+	deadline, _ := ctx.Deadline()
+	_ = netConn.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { _ = netConn.Close() })
+
+	conn, err := xgb.NewConnNet(netConn)
+	if err != nil {
+		stop()
+		_ = netConn.Close()
+		return nil, fmt.Errorf("x11 handshake with %q: %w", display, err)
+	}
+	backend, err := newX11Backend(conn, screen)
+	if err != nil {
+		stop()
+		conn.Close()
+		return nil, err
+	}
+	if !stop() {
+		// ctx ended during init and the socket is already closed.
+		conn.Close()
 		return nil, ctx.Err()
 	}
+	_ = netConn.SetDeadline(time.Time{})
+	return backend, nil
 }
 
 // get returns the live backend, dialing if needed. A nil return means "use
@@ -397,13 +450,13 @@ func (h *x11Holder) drop(backend *x11Backend) {
 // releases the pending reply) and ctx's error is returned, so request
 // timeouts and client cancellation still free the capture slot and the
 // mutation lock.
-func (s *desktopService) runX11(ctx context.Context, op func(*x11Backend) error) (attempted bool, err error) {
+func (s *desktopService) runX11(ctx context.Context, op func(context.Context, *x11Backend) error) (attempted bool, err error) {
 	backend := s.x11.get(ctx, s.displayName())
 	if backend == nil {
 		return false, nil
 	}
 	done := make(chan error, 1)
-	go func() { done <- op(backend) }()
+	go func() { done <- op(ctx, backend) }()
 	select {
 	case err := <-done:
 		if err != nil {
