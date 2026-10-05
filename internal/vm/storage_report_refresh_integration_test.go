@@ -87,7 +87,7 @@ func TestIntegration_StorageReportPeriodicRefresh(t *testing.T) {
 					t.Fatal("activation must open its logical interval after the first report receipt")
 				}
 			}
-			api.StartStorageReportWorker(ctx, pool)
+			api.StartStorageReportWorkerWithInterval(ctx, pool, 25*time.Millisecond)
 			waitStorageRefresh(t, "first report processing", func() bool {
 				var state string
 				if err := pool.QueryRow(ctx, `SELECT state FROM host_storage_report WHERE report_id=$1`, first.reportID).Scan(&state); err != nil {

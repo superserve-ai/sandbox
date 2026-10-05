@@ -8,12 +8,19 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestStorageReportPollDefaultRemainsFiveSeconds(t *testing.T) {
+	if storageReportPoll != 5*time.Second {
+		t.Fatalf("storageReportPoll = %v, want 5s", storageReportPoll)
+	}
+}
 
 func TestStorageReportErrorIsTerminal(t *testing.T) {
 	tests := []struct {
