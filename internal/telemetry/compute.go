@@ -19,8 +19,8 @@ type ComputeReconcileRecorder interface {
 }
 
 func (r *OTelRecorder) RecordComputeReconciliation(ctx context.Context, outcome string) {
-	outcome = computeLabel(outcome, "run", "matched", "attempted", "completed", "pending", "failure", "would_pause", "no_op_trusted", "no_op_off", "no_op_unrestricted", "no_op_state", "deferred_transition")
-	r.computeReconciles.Add(ctx, 1, metric.WithAttributes(attribute.String("source", "config"), attribute.String("outcome", outcome)))
+	outcome = computeLabel(outcome, "run", "matched", "attempted", "completed", "pending", "failure", "would_pause", "no_op_trusted", "no_op_off", "no_op_unrestricted", "no_op_state", "deferred_transition", "policy_unavailable", "no_op_current_policy")
+	r.computeReconciles.Add(ctx, 1, metric.WithAttributes(attribute.String("source", r.computeSource), attribute.String("outcome", outcome)))
 }
 
 type SignupRecorder interface {
@@ -39,7 +39,7 @@ func (r *OTelRecorder) RecordComputeDecision(ctx context.Context, action, mode, 
 	mode = computeLabel(mode, "off", "observe", "enforce")
 	outcome = computeLabel(outcome, "allowed", "would_deny", "blocked")
 	subject = computeLabel(subject, "none", "team", "user")
-	r.computeDecisions.Add(ctx, 1, metric.WithAttributes(attribute.String("source", "config"), attribute.String("action", action), attribute.String("mode", mode), attribute.String("outcome", outcome), attribute.String("subject_type", subject)))
+	r.computeDecisions.Add(ctx, 1, metric.WithAttributes(attribute.String("source", r.computeSource), attribute.String("action", action), attribute.String("mode", mode), attribute.String("outcome", outcome), attribute.String("subject_type", subject)))
 }
 func (r *OTelRecorder) RecordComputeRefresh(ctx context.Context, result string) {
 	result = computeLabel(result, "success", "read_error", "invalid_content", "owners_error")

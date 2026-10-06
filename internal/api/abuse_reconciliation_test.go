@@ -953,3 +953,103 @@ func testComputeSchedulerTeamAdmission(t *testing.T, scenario string) {
 	waitComputeSignal(t, done)
 	waitComputeSignal(t, sweepDone)
 }
+
+type notifiedComputeSource struct {
+	abuse.RefreshingComputeSource
+	changes   chan struct{}
+	refreshes int
+}
+
+func (s *notifiedComputeSource) Changes() <-chan struct{} { return s.changes }
+func (s *notifiedComputeSource) Refresh(ctx context.Context) {
+	s.refreshes++
+	s.RefreshingComputeSource.Refresh(ctx)
+}
+func TestComputeSchedulerWakesOnPolicyPublicationWithoutTick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		source := &notifiedComputeSource{RefreshingComputeSource: abuse.NewConfigComputeSource("", nil, nil), changes: make(chan struct{}, 1)}
+		started := make(chan struct{}, 4)
+		release := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		calls := 0
+		go func() {
+			defer close(done)
+			(&Handlers{}).runComputeReconciliation(ctx, source, nil, func(ctx context.Context, updates <-chan *abuse.ComputeSnapshot) {
+				calls++
+				started <- struct{}{}
+				if calls == 1 {
+					<-release
+				} else {
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-updates:
+						}
+					}
+				}
+			})
+		}()
+		waitComputeSignal(t, started)
+		close(release)
+		synctest.Wait()
+		// One bounded wake is enough, and an event storm remains coalesced.
+		for n := 0; n < 100; n++ {
+			select {
+			case source.changes <- struct{}{}:
+			default:
+			}
+		}
+		waitComputeSignal(t, started)
+		synctest.Wait()
+		if calls != 2 {
+			t.Fatalf("overlapping/redundant sweeps: %d", calls)
+		}
+		if source.refreshes != 0 {
+			t.Fatalf("notification duplicated owned background refresh: %d", source.refreshes)
+		}
+		cancel()
+		waitComputeSignal(t, done)
+	})
+}
+
+type authoritativeComputeSource struct {
+	abuse.ComputeSource
+	policy abuse.TeamPolicy
+	err    error
+	reads  int
+}
+
+func (s *authoritativeComputeSource) CurrentTeamPolicy(context.Context, uuid.UUID) (abuse.TeamPolicy, error) {
+	s.reads++
+	return s.policy, s.err
+}
+func TestComputeReconciliationRechecksCurrentAuthorityBeforePause(t *testing.T) {
+	team := uuid.New()
+	path := filepath.Join(t.TempDir(), "policy.json")
+	writeComputePolicy(t, path, "enforce", []uuid.UUID{team}, nil)
+	base := abuse.NewConfigComputeSource(path, nil, nil)
+	base.Refresh(context.Background())
+	for _, test := range []struct {
+		name   string
+		policy abuse.TeamPolicy
+		err    error
+	}{
+		{name: "trusted", policy: abuse.TeamPolicy{Known: true, Trusted: true, Restricted: true, Mode: abuse.ModeEnforce}},
+		{name: "released", policy: abuse.TeamPolicy{Known: true, Mode: abuse.ModeEnforce}},
+		{name: "off", policy: abuse.TeamPolicy{Known: true, Restricted: true, Mode: abuse.ModeOff}},
+		{name: "unavailable", err: errors.New("offline")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source := &authoritativeComputeSource{ComputeSource: base, policy: test.policy, err: test.err}
+			h := &Handlers{ComputeRestrictions: &abuse.ComputeEvaluator{Source: source}}
+			// Nil DB deliberately makes any attempted lifecycle claim fail the test.
+			h.reconcileComputeCandidate(context.Background(), db.ListComputePauseCandidatesRow{ID: uuid.New(), TeamID: team, Status: db.SandboxStatusActive})
+			if source.reads != 1 {
+				t.Fatal("no current-policy check")
+			}
+		})
+	}
+}

@@ -93,12 +93,13 @@ func run() error {
 	recorder := telemetry.NewNoopRecorder()
 	if cfg.OTelMetricsEnabled {
 		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
-			ServiceName:    cfg.OTelServiceName,
-			ServiceVersion: cfg.OTelServiceVersion,
-			Environment:    cfg.OTelEnvironment,
-			Endpoint:       cfg.OTelEndpoint,
-			Insecure:       cfg.OTelInsecure,
-			ExportInterval: cfg.OTelExportInterval,
+			ComputeRestrictionsSource: cfg.ComputeRestrictionsSource,
+			ServiceName:               cfg.OTelServiceName,
+			ServiceVersion:            cfg.OTelServiceVersion,
+			Environment:               cfg.OTelEnvironment,
+			Endpoint:                  cfg.OTelEndpoint,
+			Insecure:                  cfg.OTelInsecure,
+			ExportInterval:            cfg.OTelExportInterval,
 		})
 		if err != nil {
 			log.Warn().Err(err).Msg("otel metrics init failed; continuing with noop recorder")
@@ -306,9 +307,20 @@ func run() error {
 		}
 	})
 	computeSource.Refresh(ctx)
-	handlers.ComputeRestrictions = &abuse.ComputeEvaluator{Source: computeSource}
 	handlers.SignupRestrictions = &abuse.SignupEvaluator{Source: computeSource}
-	go handlers.RunComputeReconciliation(ctx, computeSource)
+	var enforcementSource abuse.RefreshingComputeSource = computeSource
+	if cfg.ComputeRestrictionsSource == "database" {
+		source := abuse.NewAuthoritativeSource(dbPool, abuse.AuthoritativeOptions{
+			Report: telemetry.NewAbusePolicyReporter(ctx, log.Logger, recorder),
+		})
+		enforcementSource = source
+		go source.Run(ctx)
+		// Signup retains the independent file source while compute policy moves
+		// to the authoritative backend.
+		go computeSource.Run(ctx)
+	}
+	handlers.ComputeRestrictions = &abuse.ComputeEvaluator{Source: enforcementSource}
+	go handlers.RunComputeReconciliation(ctx, enforcementSource)
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 

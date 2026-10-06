@@ -33,7 +33,7 @@ type abuseRestrictionInput struct {
 // All abuse mutations serialize state-change ID allocation with commit order.
 // Without this, a later transaction can commit a larger sequence value first,
 // causing generation readers to miss the earlier transaction when it commits.
-const abuseMutationLockKey int64 = 0x53534142555345
+const abuseMutationLockKey int64 = abuse.MutationLockKey
 
 func (h *Handlers) withAbuseMutation(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := h.Pool.Begin(ctx)
@@ -212,6 +212,10 @@ func (h *Handlers) CreatePlatformAbuseRestriction(c *gin.Context) {
 		}
 		in.SubjectValue = in.TeamID.String()
 	case "ip":
+		if in.Action == "create" || in.Action == "resume" {
+			respondErrorMsg(c, "bad_request", "IP restrictions support signup only; use a team or canonical user for compute restrictions", http.StatusBadRequest)
+			return
+		}
 		var err error
 		in.SubjectValue, err = abuse.NormalizeIP(in.SubjectValue)
 		if err != nil {
@@ -300,14 +304,17 @@ func (h *Handlers) ReleasePlatformAbuseRestriction(c *gin.Context) {
 		return
 	}
 	err = h.withAbuseMutation(c, func(tx pgx.Tx) error {
-		result, err := tx.Exec(c, `UPDATE abuse_restrictions SET released_at=now(),released_by=$2,updated_at=now() WHERE id=$1 AND released_at IS NULL`, id, actor)
+		var teamID *uuid.UUID
+		err := tx.QueryRow(c, `UPDATE abuse_restrictions SET released_at=now(),released_by=$2,updated_at=now() WHERE id=$1 AND released_at IS NULL RETURNING subject_team_id`, id, actor).Scan(&teamID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrConflict
+		}
 		if err != nil {
 			return err
 		}
-		if result.RowsAffected() != 1 {
-			return ErrConflict
-		}
-		if _, err := tx.Exec(c, `INSERT INTO abuse_state_changes(reason) VALUES('restriction released')`); err != nil {
+		// A team release fences queued observations for that team. Other subject
+		// releases conservatively fence all observations from an older generation.
+		if _, err := tx.Exec(c, `INSERT INTO abuse_state_changes(team_id,reason) VALUES($1,'restriction released')`, teamID); err != nil {
 			return err
 		}
 		auditValue, err := json.Marshal(struct {

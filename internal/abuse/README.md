@@ -77,3 +77,61 @@ and no visitor ID. `compute_restriction_refresh_total` reports success,
 read errors, invalid content, and owner-resolution errors. Refresh failures also
 emit an error log without subject or policy values. An owner-resolution error
 can accompany successful publication of the remaining config state.
+
+# Authoritative compute policy
+
+Set `COMPUTE_RESTRICTIONS_SOURCE=database` on **every** control-plane replica
+and cell to select the authoritative database projection. The default `file`
+retains the behavior above. These are alternative compute authorities; they
+are never merged. Signup continues using the file source in either case.
+Database policy starts in `off`. Eligible platform abuse administrators can
+read or update `/internal/abuse/mode` with `{"mode":"observe"}` or
+`{"mode":"enforce"}`. Mode changes use the existing transactional audit and
+change record boundary.
+
+The database background writer performs a complete coherent projection every
+two seconds, with a ten-second query deadline. The published generation is the
+snapshot's maximum committed change ID. Complete replacement handles updates,
+release/invalidation, expiry, account membership, and trust revocation without
+relying on a gap-free incremental cursor. Only this writer publishes snapshots;
+operator mutations write durable state, never a parallel cache. Publication wakes the existing pause reconciler; its five-minute sweep
+also catches transitions that finish afterward. At the start of each pause attempt,
+the worker rechecks current authoritative team policy. A concurrent operator
+edit after that check may race with the normal pause claim. Existing pause claim,
+lease, and finalization semantics are preserved. An operation already started
+may finish; trust, release, or mode changes never automatically resume a VM.
+
+Explicitly verified teams win over every compute deny. A canonical account
+with active membership in a verified team may transfer that exemption to teams
+where it has an active canonical `team_owner` role and active membership.
+Corporate trust requires a runtime association and Google provider identity
+with verified email and matching hosted-domain evidence in `auth.identities`.
+Caller-supplied provider/domain strings, editable user metadata, payment status,
+and similar email addresses are not proof. When the auth identity table is
+absent, corporate inference is unavailable; explicit and confirmed membership
+trust still work. Email-domain restrictions use exact normalized owner email
+domains, independently of destination domains. A create or resume row blocks
+both compute actions. The union of active restrictions applies until every
+matching restriction is released or expires. Exact IP subjects remain supported
+for signup administration; compute/IP creation is rejected because there is no
+authoritative account-to-client-IP mapping. Existing compute/IP rows must be
+replaced with confirmed team/user restrictions before this backend is enabled.
+
+Admission retains the existing immutable in-memory lookup, with no new work
+in create/resume/start/restore/reattach. The cache admits at most 16,384 denied
+teams and retains existing denies before new admissions under pressure. Trust
+is outside that eviction budget. Unavailable initial policy and capacity misses
+fail open. Failed refreshes preserve the last valid state until authoritative
+expiry or one hour since the last successful projection, whichever applies
+first. Background maintenance then removes denies and marks negative trust
+unknown; sticky positive trust remains exempt until a successful replacement.
+This freshness TTL does not delete database quarantine or extend on requests.
+
+Background metrics `abuse_policy_sync_total` and `abuse_policy_cache` report
+refresh outcomes, readiness, cache size/capacity, and age of last success with
+bounded labels. Failure logs are coalesced and recovery is explicit. Existing
+compute metrics label the selected source; signup/file metrics retain `config`.
+
+The shared interfaces also define host observation and receipt contracts.
+Host detection and durable incident delivery are separate follow-up changes;
+this foundation does not activate mining automation.
