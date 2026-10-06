@@ -516,6 +516,7 @@ const (
 	DesktopService_Screenshot_FullMethodName  = "/superserve.boxd.v1.DesktopService/Screenshot"
 	DesktopService_Stream_FullMethodName      = "/superserve.boxd.v1.DesktopService/Stream"
 	DesktopService_SendActions_FullMethodName = "/superserve.boxd.v1.DesktopService/SendActions"
+	DesktopService_Step_FullMethodName        = "/superserve.boxd.v1.DesktopService/Step"
 	DesktopService_SendPointer_FullMethodName = "/superserve.boxd.v1.DesktopService/SendPointer"
 	DesktopService_SendKey_FullMethodName     = "/superserve.boxd.v1.DesktopService/SendKey"
 	DesktopService_Scroll_FullMethodName      = "/superserve.boxd.v1.DesktopService/Scroll"
@@ -543,6 +544,12 @@ type DesktopServiceClient interface {
 	// so no other input can interleave mid-batch. Execution stops at the first
 	// failing action; the error names its index, and later actions never run.
 	SendActions(ctx context.Context, in *ActionBatch, opts ...grpc.CallOption) (*ActionBatchResponse, error)
+	// Step executes an ordered action batch exactly as SendActions does, then
+	// captures the frame before releasing the input lock, so an agent turn is
+	// one round trip and the frame reflects exactly this batch. The frame is
+	// captured even when the batch stops at a failing action, so the caller
+	// can see the state its input left behind.
+	Step(ctx context.Context, in *StepRequest, opts ...grpc.CallOption) (*StepResponse, error)
 	// SendPointer moves the pointer and/or presses/releases/clicks a button.
 	SendPointer(ctx context.Context, in *PointerEvent, opts ...grpc.CallOption) (*PointerResponse, error)
 	// SendKey presses a key (optionally with modifiers) or types literal text.
@@ -596,6 +603,16 @@ func (c *desktopServiceClient) SendActions(ctx context.Context, in *ActionBatch,
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ActionBatchResponse)
 	err := c.cc.Invoke(ctx, DesktopService_SendActions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *desktopServiceClient) Step(ctx context.Context, in *StepRequest, opts ...grpc.CallOption) (*StepResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StepResponse)
+	err := c.cc.Invoke(ctx, DesktopService_Step_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -663,6 +680,12 @@ type DesktopServiceServer interface {
 	// so no other input can interleave mid-batch. Execution stops at the first
 	// failing action; the error names its index, and later actions never run.
 	SendActions(context.Context, *ActionBatch) (*ActionBatchResponse, error)
+	// Step executes an ordered action batch exactly as SendActions does, then
+	// captures the frame before releasing the input lock, so an agent turn is
+	// one round trip and the frame reflects exactly this batch. The frame is
+	// captured even when the batch stops at a failing action, so the caller
+	// can see the state its input left behind.
+	Step(context.Context, *StepRequest) (*StepResponse, error)
 	// SendPointer moves the pointer and/or presses/releases/clicks a button.
 	SendPointer(context.Context, *PointerEvent) (*PointerResponse, error)
 	// SendKey presses a key (optionally with modifiers) or types literal text.
@@ -691,6 +714,9 @@ func (UnimplementedDesktopServiceServer) Stream(*FrameConfig, grpc.ServerStreami
 }
 func (UnimplementedDesktopServiceServer) SendActions(context.Context, *ActionBatch) (*ActionBatchResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SendActions not implemented")
+}
+func (UnimplementedDesktopServiceServer) Step(context.Context, *StepRequest) (*StepResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Step not implemented")
 }
 func (UnimplementedDesktopServiceServer) SendPointer(context.Context, *PointerEvent) (*PointerResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SendPointer not implemented")
@@ -768,6 +794,24 @@ func _DesktopService_SendActions_Handler(srv interface{}, ctx context.Context, d
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DesktopServiceServer).SendActions(ctx, req.(*ActionBatch))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DesktopService_Step_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StepRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DesktopServiceServer).Step(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DesktopService_Step_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DesktopServiceServer).Step(ctx, req.(*StepRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -858,6 +902,10 @@ var DesktopService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SendActions",
 			Handler:    _DesktopService_SendActions_Handler,
+		},
+		{
+			MethodName: "Step",
+			Handler:    _DesktopService_Step_Handler,
 		},
 		{
 			MethodName: "SendPointer",
