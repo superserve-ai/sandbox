@@ -51,6 +51,42 @@ func incidentDigest(i MiningIncident) (string, error) {
 }
 
 func (s *IncidentStore) RecordIncident(ctx context.Context, i MiningIncident) (IncidentReceipt, error) {
+	return s.recordIncident(ctx, i, "")
+}
+
+// CaptureObservation validates a host observation before the trusted local
+// spool persists it. The versioned digest binds that validation to the exact
+// body; it is not a credential and must never be accepted from tenants or RPCs.
+func (s *IncidentStore) CaptureObservation(i MiningIncident) (string, error) {
+	digest, err := incidentDigest(i)
+	if err != nil {
+		return "", err
+	}
+	if s.hostID == "" || i.HostID != s.hostID || s.assignments == nil {
+		return "", ErrInvalidIncident
+	}
+	p, ok := s.assignments.MiningPolicy(i.SandboxID, i.HostIP)
+	if !ok || !p.Known || p.Trusted || p.Mode != ModeEnforce || p.SandboxID != i.SandboxID || p.TeamID != i.TeamID || p.HostID != i.HostID || p.HostIP != i.HostIP || p.Assignment != i.Assignment || i.Generation > p.Generation {
+		return "", fmt.Errorf("%w: observation not currently attributed", ErrInvalidIncident)
+	}
+	return "v1:" + digest, nil
+}
+
+// RecordCapturedIncident is exclusively for owner-only host spool replay after
+// CaptureObservation. Current assignment retirement must not erase previously
+// validated evidence. Unmarked/legacy observations use RecordIncident instead.
+func (s *IncidentStore) RecordCapturedIncident(ctx context.Context, i MiningIncident, capture string) (IncidentReceipt, error) {
+	digest, err := incidentDigest(i)
+	if err != nil {
+		return IncidentReceipt{}, err
+	}
+	if capture != "v1:"+digest {
+		return IncidentReceipt{}, fmt.Errorf("%w: captured body changed or unsupported version", ErrInvalidIncident)
+	}
+	return s.recordIncident(ctx, i, capture)
+}
+
+func (s *IncidentStore) recordIncident(ctx context.Context, i MiningIncident, capture string) (IncidentReceipt, error) {
 	digest, err := incidentDigest(i)
 	if err != nil {
 		return IncidentReceipt{}, err
@@ -81,33 +117,47 @@ func (s *IncidentStore) RecordIncident(ctx context.Context, i MiningIncident) (I
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return IncidentReceipt{}, err
 	}
-	// A reused ID on another host is rejected by the global primary key as well.
-	if s.assignments == nil {
-		return IncidentReceipt{}, ErrInvalidIncident
-	}
-	assignment, ok := s.assignments.MiningPolicy(i.SandboxID, i.HostIP)
-	if !ok {
-		if source, supportsRetirement := s.assignments.(interface{ AssignmentRetired(MiningIncident) bool }); supportsRetirement && source.AssignmentRetired(i) {
-			return IncidentReceipt{}, fmt.Errorf("%w: retired assignment", ErrInvalidIncident)
-		}
-		// Startup reattachment and expired trust can temporarily hide a valid
-		// assignment. Keep its durable observation until authority becomes known.
-		return IncidentReceipt{}, errors.New("mining attribution temporarily unavailable")
-	}
-	if assignment.TeamID != i.TeamID || assignment.HostID != i.HostID || assignment.Assignment != i.Assignment {
-		return IncidentReceipt{}, fmt.Errorf("%w: stale assignment", ErrInvalidIncident)
-	}
 	var team uuid.UUID
-	var host string
-	err = tx.QueryRow(ctx, `SELECT team_id,host_id FROM sandbox WHERE id=$1 AND destroyed_at IS NULL FOR SHARE`, i.SandboxID).Scan(&team, &host)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return IncidentReceipt{}, fmt.Errorf("%w: sandbox no longer assigned", ErrInvalidIncident)
-	}
-	if err != nil {
-		return IncidentReceipt{}, err
-	}
-	if team != i.TeamID || host != s.hostID {
-		return IncidentReceipt{}, fmt.Errorf("%w: foreign sandbox", ErrInvalidIncident)
+	if capture != "" {
+		// A tombstone retains immutable ownership after deletion. A migrated
+		// sandbox may have a new host, but the capture binds the original host.
+		err = tx.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1 FOR SHARE`, i.SandboxID).Scan(&team)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && team != i.TeamID) {
+			// Missing or contradictory history is not proof that the original
+			// observation was invalid. Retain it in the bounded spool for repair.
+			return IncidentReceipt{}, errors.New("captured mining ownership history unavailable")
+		}
+		if err != nil {
+			return IncidentReceipt{}, err
+		}
+	} else {
+		// A reused ID on another host is rejected by the global primary key as well.
+		if s.assignments == nil {
+			return IncidentReceipt{}, ErrInvalidIncident
+		}
+		assignment, ok := s.assignments.MiningPolicy(i.SandboxID, i.HostIP)
+		if !ok {
+			if source, supportsRetirement := s.assignments.(interface{ AssignmentRetired(MiningIncident) bool }); supportsRetirement && source.AssignmentRetired(i) {
+				return IncidentReceipt{}, fmt.Errorf("%w: retired assignment", ErrInvalidIncident)
+			}
+			// Startup reattachment and expired trust can temporarily hide a valid
+			// assignment. Keep its durable observation until authority becomes known.
+			return IncidentReceipt{}, errors.New("mining attribution temporarily unavailable")
+		}
+		if assignment.TeamID != i.TeamID || assignment.HostID != i.HostID || assignment.Assignment != i.Assignment {
+			return IncidentReceipt{}, fmt.Errorf("%w: stale assignment", ErrInvalidIncident)
+		}
+		var host string
+		err = tx.QueryRow(ctx, `SELECT team_id,host_id FROM sandbox WHERE id=$1 AND destroyed_at IS NULL FOR SHARE`, i.SandboxID).Scan(&team, &host)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return IncidentReceipt{}, fmt.Errorf("%w: sandbox no longer assigned", ErrInvalidIncident)
+		}
+		if err != nil {
+			return IncidentReceipt{}, err
+		}
+		if team != i.TeamID || host != s.hostID {
+			return IncidentReceipt{}, fmt.Errorf("%w: foreign sandbox", ErrInvalidIncident)
+		}
 	}
 	policy, err := ResolveTeamPolicy(ctx, tx, team)
 	if err != nil {

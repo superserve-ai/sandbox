@@ -33,9 +33,17 @@ const maxRecordBytes = 8192
 
 type ReceiptHandler func(context.Context, abuse.MiningIncident, abuse.IncidentReceipt) error
 
+// Only the trusted host store implements this boundary. The capture marker is
+// local provenance, not authentication for a remote or tenant-supplied request.
+type captureStore interface {
+	CaptureObservation(abuse.MiningIncident) (string, error)
+	RecordCapturedIncident(context.Context, abuse.MiningIncident, string) (abuse.IncidentReceipt, error)
+}
+
 type entry struct {
 	Incident abuse.MiningIncident   `json:"incident"`
 	Receipt  *abuse.IncidentReceipt `json:"receipt,omitempty"`
+	Capture  string                 `json:"capture,omitempty"`
 	next     time.Time
 	attempts int
 }
@@ -144,6 +152,16 @@ func (d *Delivery) Submit(i abuse.MiningIncident) error {
 		return ErrSpoolFull
 	}
 	e := &entry{Incident: i}
+	if store, ok := d.store.(captureStore); ok {
+		capture, err := store.CaptureObservation(i)
+		if err != nil {
+			return err
+		}
+		if capture == "" {
+			return errors.New("missing mining capture provenance")
+		}
+		e.Capture = capture
+	}
 	if err := d.write(e); err != nil {
 		// Rename may have succeeded before directory fsync failed. Account for
 		// that file so repeated storage failures cannot exceed the spool bound.
@@ -261,7 +279,13 @@ func (d *Delivery) deliver(ctx context.Context) {
 		var receipt abuse.IncidentReceipt
 		var err error
 		if e.Receipt == nil {
-			receipt, err = d.store.RecordIncident(callCtx, e.Incident)
+			if e.Capture == "" {
+				receipt, err = d.store.RecordIncident(callCtx, e.Incident)
+			} else if store, ok := d.store.(captureStore); ok {
+				receipt, err = store.RecordCapturedIncident(callCtx, e.Incident, e.Capture)
+			} else {
+				err = errors.New("mining store cannot replay captured observations")
+			}
 		} else {
 			receipt, err = d.store.IncidentStatus(callCtx, id)
 		}

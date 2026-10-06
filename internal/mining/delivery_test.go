@@ -239,3 +239,100 @@ func TestDeliveryRetiresOnlyLocalSpoolAfterConfirmedAssignmentRetirement(t *test
 		t.Fatalf("retired entry still consumes host capacity: %v", err)
 	}
 }
+
+type captureTestStore struct {
+	fakeStore
+	allowCapture bool
+	captures     int
+	proofs       []string
+	observations []abuse.MiningIncident
+}
+
+func (s *captureTestStore) CaptureObservation(abuse.MiningIncident) (string, error) {
+	s.captures++
+	if !s.allowCapture {
+		return "", abuse.ErrInvalidIncident
+	}
+	return "v1:validated-local-observation", nil
+}
+func (s *captureTestStore) RecordCapturedIncident(_ context.Context, i abuse.MiningIncident, proof string) (abuse.IncidentReceipt, error) {
+	s.proofs = append(s.proofs, proof)
+	s.observations = append(s.observations, i)
+	if s.fail {
+		return abuse.IncidentReceipt{}, errors.New("ownership history unavailable")
+	}
+	return abuse.IncidentReceipt{IncidentID: i.ID, Disposition: s.disposition}, nil
+}
+
+func TestDeliveryPersistsCaptureBeforeRetirementAndReplaysAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := &captureTestStore{fakeStore: fakeStore{disposition: abuse.IncidentApplied}}
+	callback := func(context.Context, abuse.MiningIncident, abuse.IncidentReceipt) error {
+		return ErrLocalCleanupComplete
+	}
+	d, err := NewDelivery(dir, 1, store, callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := testIncident()
+	if err := d.Submit(i); !errors.Is(err, abuse.ErrInvalidIncident) {
+		t.Fatalf("invalid capture: %v", err)
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 0 || d.Pending() != 0 {
+		t.Fatal("unvalidated observation persisted")
+	}
+	store.allowCapture = true
+	if err := d.Submit(i); err != nil {
+		t.Fatal(err)
+	}
+	store.allowCapture = false // assignment retires before any database delivery
+	if err := d.Submit(i); err != nil {
+		t.Fatalf("identical durable retry revalidated retirement: %v", err)
+	}
+	store.fail = true
+	d, err = NewDelivery(dir, 1, store, callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.deliver(ctx)
+	if d.Pending() != 1 || !d.degraded {
+		t.Fatal("unavailable history lost observation or failure visibility")
+	}
+	if err := d.Submit(testIncident()); !errors.Is(err, ErrSpoolFull) {
+		t.Fatal("retry exceeded spool bound")
+	}
+	store.fail = false
+	ready(d)
+	d.deliver(ctx)
+	if d.Pending() != 0 || len(store.calls) != 0 || store.captures != 2 || len(store.proofs) != 2 {
+		t.Fatal("replay lost capture boundary or retirement cleanup")
+	}
+	for n, proof := range store.proofs {
+		if proof != "v1:validated-local-observation" || store.observations[n] != i {
+			t.Fatal("restart altered validated capture")
+		}
+	}
+}
+
+func TestDeliveryLegacyObservationDoesNotAcquireCaptureOnReplay(t *testing.T) {
+	dir := t.TempDir()
+	callback := func(context.Context, abuse.MiningIncident, abuse.IncidentReceipt) error { return nil }
+	d, err := NewDelivery(dir, 1, &fakeStore{}, callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Submit(testIncident()); err != nil {
+		t.Fatal(err)
+	}
+	store := &captureTestStore{fakeStore: fakeStore{disposition: abuse.IncidentIgnored}}
+	d, err = NewDelivery(dir, 1, store, callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.deliver(context.Background())
+	if len(store.calls) != 1 || len(store.proofs) != 0 || store.captures != 0 || d.Pending() != 0 {
+		t.Fatal("legacy unvalidated record crossed historical replay boundary")
+	}
+}

@@ -189,7 +189,15 @@ The incident spool is bounded to host slot capacity, uses owner-only access,
 and persists under `mining-incidents` beside the configured run directory.
 Preserve it across daemon restarts. Successfully delivered incidents whose
 network session has authoritatively ended release their local spool capacity;
-the database restriction remains. A failed/full/corrupt spool, unavailable
+the database restriction remains. New observations are locally validated against
+the exact host assignment before persistence and carry a versioned body digest.
+This provenance is trusted only inside the owner-only spool, never as a tenant
+or remote credential. Replay can quarantine the original team after pause,
+deletion, or migration, provided the retained sandbox row confirms that team;
+current trust, mode, and release generation still take precedence. Missing or
+contradictory ownership history keeps the observation pending with degradation.
+Legacy records without capture provenance retain strict current-assignment
+validation and can be rejected after retirement. A failed/full/corrupt spool, unavailable
 attribution, missing policy, or unavailable packet gate disables or rolls back
 escalation and reports degradation. Pending incidents retry with bounded
 backoff. Correct configuration/spool errors or lost packet-listener failures

@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/superserve-ai/sandbox/internal/abuse"
+	"github.com/superserve-ai/sandbox/internal/mining"
 )
 
 type miningAssignments struct{ policy abuse.SandboxPolicy }
@@ -257,5 +258,157 @@ func TestMiningReleaseFencesUndeliveredOlderObservation(t *testing.T) {
 	renewed, err := store.RecordIncident(ctx, fresh)
 	if err != nil || renewed.Disposition != abuse.IncidentApplied {
 		t.Fatalf("fresh post-refresh observation was suppressed: %+v %v", renewed, err)
+	}
+}
+
+// This source represents a replacement network session after the durable
+// observation was captured; receipts must never contain its different owner.
+type retiredMiningAssignment struct{ miningAssignments }
+
+func (a retiredMiningAssignment) AssignmentRetired(abuse.MiningIncident) bool { return true }
+
+func TestMiningCapturedReplaySurvivesLifecycleAndHonorsCurrentPolicy(t *testing.T) {
+	ctx := context.Background()
+	for _, transition := range []string{"pause", "delete", "migrate", "delete-trust", "delete-release", "delete-off"} {
+		t.Run(transition, func(t *testing.T) {
+			if _, err := testPool.Exec(ctx, `UPDATE abuse_runtime_settings SET mode='enforce'`); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { testPool.Exec(ctx, `UPDATE abuse_runtime_settings SET mode='off'`) })
+			team := mustCreateTeam(t, ctx, "capture-"+uuid.NewString()[:8])
+			replacementTeam := mustCreateTeam(t, ctx, "replacement-"+uuid.NewString()[:8])
+			sandbox := seedActiveSandbox(t, team, "capture-synthetic")
+			generation := currentMiningGeneration(t)
+			p := abuse.SandboxPolicy{TeamPolicy: abuse.TeamPolicy{TeamID: team, Known: true, Mode: abuse.ModeEnforce, Generation: generation}, SandboxID: sandbox, HostID: testDefaultHostID, HostIP: "192.0.2.19", Assignment: "captured-session"}
+			i := abuse.MiningIncident{ID: uuid.New(), TeamID: team, SandboxID: sandbox, HostID: p.HostID, HostIP: p.HostIP, Assignment: p.Assignment, Generation: generation, ObservedAt: time.Now().UTC(), Evidence: abuse.MiningEvidence{Kind: "domain", Indicator: "pool.invalid"}}
+			store := abuse.NewIncidentStore(testPool, p.HostID, miningAssignments{p})
+			var releaseID uuid.UUID
+			if transition == "delete-release" {
+				prior := i
+				prior.ID = uuid.New()
+				r, err := store.RecordIncident(ctx, prior)
+				if err != nil || r.Disposition != abuse.IncidentApplied {
+					t.Fatalf("initial restriction: %+v %v", r, err)
+				}
+				releaseID = r.RestrictionID
+			}
+			dir := t.TempDir()
+			delivery, err := mining.NewDelivery(dir, 1, store, func(context.Context, abuse.MiningIncident, abuse.IncidentReceipt) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := delivery.Submit(i); err != nil {
+				t.Fatalf("capture: %v", err)
+			}
+
+			var sql string
+			switch transition {
+			case "pause":
+				sql = `UPDATE sandbox SET status='paused' WHERE id=$1`
+			case "migrate":
+				sql = `UPDATE sandbox SET host_id='migrated-synthetic-host' WHERE id=$1`
+			default:
+				sql = `UPDATE sandbox SET destroyed_at=now() WHERE id=$1`
+			}
+			if _, err := testPool.Exec(ctx, sql, sandbox); err != nil {
+				t.Fatal(err)
+			}
+			want := abuse.IncidentApplied
+			switch transition {
+			case "delete-trust":
+				if _, err := testPool.Exec(ctx, `INSERT INTO abuse_team_trust(team_id,verified) VALUES($1,true)`, team); err != nil {
+					t.Fatal(err)
+				}
+				want = abuse.IncidentExempt
+			case "delete-release":
+				actor := seedPlatformAdminProfile(t)
+				response := doInternal(newInternalRouter(t), http.MethodPost, "/internal/abuse/restrictions/"+releaseID.String()+"/release", actor.String(), "")
+				if response.Code != http.StatusNoContent {
+					t.Fatalf("release: %d %s", response.Code, response.Body.String())
+				}
+				want = abuse.IncidentIgnored
+			case "delete-off":
+				if _, err := testPool.Exec(ctx, `UPDATE abuse_runtime_settings SET mode='off'`); err != nil {
+					t.Fatal(err)
+				}
+				want = abuse.IncidentIgnored
+			}
+			replacement := p
+			replacement.SandboxID, replacement.TeamID, replacement.Assignment = uuid.New(), replacementTeam, "replacement-session"
+			source := retiredMiningAssignment{miningAssignments{replacement}}
+			store = abuse.NewIncidentStore(testPool, p.HostID, source)
+			// The same fresh, unmarked claim must still fail after retirement.
+			if _, err := store.RecordIncident(ctx, i); !errors.Is(err, abuse.ErrInvalidIncident) {
+				t.Fatalf("fresh retired claim accepted: %v", err)
+			}
+			received := make(chan abuse.IncidentReceipt, 1)
+			delivery, err = mining.NewDelivery(dir, 1, store, func(ctx context.Context, got abuse.MiningIncident, r abuse.IncidentReceipt) error {
+				if got != i {
+					return errors.New("durable body changed")
+				}
+				received <- r
+				return mining.ErrLocalCleanupComplete
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			runCtx, cancel := context.WithCancel(ctx)
+			done := make(chan struct{})
+			go func() { defer close(done); delivery.Run(runCtx) }()
+			t.Cleanup(func() { cancel(); <-done })
+			var receipt abuse.IncidentReceipt
+			select {
+			case receipt = <-received:
+			case <-time.After(10 * time.Second):
+				t.Fatal("captured observation did not replay")
+			}
+			cancel()
+			<-done
+			if receipt.Disposition != want {
+				t.Fatalf("replay disposition %+v, want %s", receipt, want)
+			}
+			if delivery.Pending() != 0 {
+				t.Fatal("historical receipt leaked retired spool capacity")
+			}
+			var victim uuid.UUID
+			if err := testPool.QueryRow(ctx, `SELECT team_id FROM abuse_mining_incidents WHERE id=$1`, i.ID).Scan(&victim); err != nil || victim != team {
+				t.Fatalf("original victim lost: %s %v", victim, err)
+			}
+			var active, replacementRestrictions int
+			if err := testPool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE subject_team_id=$1 AND released_at IS NULL),count(*) FILTER (WHERE subject_team_id=$2) FROM abuse_restrictions WHERE subject_team_id IN ($1,$2)`, team, replacementTeam).Scan(&active, &replacementRestrictions); err != nil {
+				t.Fatal(err)
+			}
+			wantActive := 0
+			if want == abuse.IncidentApplied {
+				wantActive = 1
+			}
+			if active != wantActive || replacementRestrictions != 0 {
+				t.Fatalf("wrong quarantine victims: original=%d replacement=%d", active, replacementRestrictions)
+			}
+		})
+	}
+}
+
+func TestMiningCapturedReplayRetainsContradictoryOwnership(t *testing.T) {
+	ctx := context.Background()
+	team := mustCreateTeam(t, ctx, "capture-owner-"+uuid.NewString()[:8])
+	otherTeam := mustCreateTeam(t, ctx, "capture-other-"+uuid.NewString()[:8])
+	sandbox := seedActiveSandbox(t, team, "capture-owner")
+	p := abuse.SandboxPolicy{TeamPolicy: abuse.TeamPolicy{TeamID: team, Known: true, Mode: abuse.ModeEnforce}, SandboxID: sandbox, HostID: testDefaultHostID, HostIP: "192.0.2.20", Assignment: "original"}
+	i := abuse.MiningIncident{ID: uuid.New(), TeamID: team, SandboxID: sandbox, HostID: p.HostID, HostIP: p.HostIP, Assignment: p.Assignment, ObservedAt: time.Now(), Evidence: abuse.MiningEvidence{Kind: "domain", Indicator: "pool.invalid"}}
+	store := abuse.NewIncidentStore(testPool, p.HostID, miningAssignments{p})
+	capture, err := store.CaptureObservation(i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET team_id=$2 WHERE id=$1`, sandbox, otherTeam); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordCapturedIncident(ctx, i, capture); err == nil || errors.Is(err, abuse.ErrInvalidIncident) {
+		t.Fatalf("contradictory history acknowledged or permanently discarded: %v", err)
+	}
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM abuse_mining_incidents WHERE id=$1`, i.ID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("contradiction created a receipt: %d %v", count, err)
 	}
 }
