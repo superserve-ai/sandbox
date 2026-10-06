@@ -251,14 +251,16 @@ func (p *keyPlanner) scratch(ks uint32) (xproto.Keycode, bool) {
 
 // stroke resolves ks to a keystroke: natively when the layout has it (with
 // Shift only when the layout has a Shift key), else through a scratch
-// keycode.
-func (p *keyPlanner) stroke(ks uint32) (keystroke, error) {
+// keycode. For literal text, Caps Lock is compensated: it flips the case of
+// every alphabetic key, layout or scratch (XKB types a single cased keysym
+// as alphabetic too), and Shift flips it back. A symbolic key keeps the
+// lock's effect, as it does for xdotool.
+func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
 	_, hasShift := p.km.direct[keysymShiftL]
-	// Caps Lock flips the case of every alphabetic key, layout or scratch
-	// (XKB types a single cased keysym as alphabetic too), and Shift flips
-	// it back.
-	invert := p.capsLock && hasShift && casedLetter(ks)
-	if st, ok := p.km.direct[ks]; ok && (!st.shift || hasShift) {
+	invert := literal && p.capsLock && hasShift && casedLetter(ks)
+	// Keypad keys share a keycode between two symbols that Num Lock, not
+	// Shift, chooses between; a scratch keycode has a single level.
+	if st, ok := p.km.direct[ks]; ok && (!st.shift || hasShift) && !keypad(ks) {
 		st.shift = st.shift != invert
 		return st, nil
 	}
@@ -267,6 +269,11 @@ func (p *keyPlanner) stroke(ks uint32) (keystroke, error) {
 		return keystroke{}, fmt.Errorf("no spare keycode for keysym 0x%x: %w", ks, errBackendKept)
 	}
 	return keystroke{code: code, shift: invert}, nil
+}
+
+// keypad reports whether ks is in keysymdef's keypad block.
+func keypad(ks uint32) bool {
+	return ks >= 0xff80 && ks <= 0xffbd
 }
 
 // casedLetter reports whether ks is a letter with distinct cases, for the
@@ -298,7 +305,7 @@ func (p *keyPlanner) tap(st keystroke) {
 
 func (p *keyPlanner) text(text string) error {
 	for _, r := range text {
-		st, err := p.stroke(keysymFromRune(r))
+		st, err := p.stroke(keysymFromRune(r), true)
 		if err != nil {
 			return err
 		}
@@ -333,7 +340,7 @@ func (p *keyPlanner) chord(modifiers []string, key string) error {
 	if !ok {
 		return fmt.Errorf("unknown key name %q: %w", last, errBackendKept)
 	}
-	st, err := p.stroke(ks)
+	st, err := p.stroke(ks, false)
 	if err != nil {
 		return err
 	}

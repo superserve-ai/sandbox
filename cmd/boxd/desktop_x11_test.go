@@ -287,6 +287,36 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	expect("with Caps Lock", "Mixed Case 42!\n")
 	toggleCaps()
 
+	// Num Lock on: keypad digits must still be digits (they go through a
+	// single-level scratch keycode rather than the shared KP_End/KP_1 key).
+	toggleNum := func() {
+		t.Helper()
+		num := exec.Command("xdotool", "key", "Num_Lock")
+		num.Env = append(os.Environ(), "DISPLAY="+display)
+		if out, err := num.CombinedOutput(); err != nil {
+			t.Fatalf("xdotool key Num_Lock: %v: %s", err, out)
+		}
+	}
+	toggleNum()
+	for _, name := range []string{"KP_1", "KP_2", "KP_Enter"} {
+		send(&pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: name}})
+	}
+	want += "12\n"
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if out, err := os.ReadFile(typed); err == nil {
+			got = string(out)
+			if got == want {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	toggleNum()
+	if got != want {
+		t.Fatalf("with Num Lock the terminal received %q, want %q", got, want)
+	}
+
 	// A second group made active: the X11 path declines (its keycodes
 	// would type the other group's symbols) and xdotool, which locks the
 	// group per keysym, types the text.

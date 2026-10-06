@@ -18,7 +18,7 @@ import (
 // 8 a/A, 9 u/U, 10 1/!, 11 space, 12 Return, 13 Shift_L, 14 Control_L,
 // then `spares` empty keycodes.
 func testKeymap(spares int) *x11Keymap {
-	rows := [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}}
+	rows := [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}}
 	var syms []xproto.Keysym
 	for _, r := range rows {
 		syms = append(syms, r[0], r[1])
@@ -37,6 +37,7 @@ const (
 	kcReturn
 	kcShift
 	kcControl
+	kcKeypad1
 	kcSpare0
 	kcSpare1
 )
@@ -232,8 +233,8 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	}
 	// A reload after an external MappingNotify sees our scratch keycode with
 	// a keysym now; it must stay scratch, not become a layout key for é.
-	syms := make([]xproto.Keysym, 0, 9*2)
-	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xe9, 0}, {0, 0}} {
+	syms := make([]xproto.Keysym, 0, 10*2)
+	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xe9, 0}, {0, 0}} {
 		syms = append(syms, r[0], r[1])
 	}
 	reloaded := buildKeymap(8, 2, syms, km.bound)
@@ -246,11 +247,11 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 
 	// A reload that no longer types é on that keycode drops the binding:
 	// cleared, it is spare again; rewritten, it is a layout key.
-	cleared := append(append([]xproto.Keysym{}, syms[:14]...), 0, 0, 0, 0)
+	cleared := append(append([]xproto.Keysym{}, syms[:16]...), 0, 0, 0, 0)
 	if r := buildKeymap(8, 2, cleared, km.bound); len(r.bound) != 0 || len(r.spare) != 2 {
 		t.Errorf("cleared row: bound = %v, spare = %v; want no binding and two spares", r.bound, r.spare)
 	}
-	rewritten := append(append([]xproto.Keysym{}, syms[:14]...), 'z', 'Z', 0, 0)
+	rewritten := append(append([]xproto.Keysym{}, syms[:16]...), 'z', 'Z', 0, 0)
 	r := buildKeymap(8, 2, rewritten, km.bound)
 	if len(r.bound) != 0 || r.direct['z'].code != kcSpare0 || len(r.spare) != 1 {
 		t.Errorf("rewritten row: bound = %v, direct[z] = %v, spare = %v; want z on %d and one spare", r.bound, r.direct['z'], r.spare, kcSpare0)
@@ -297,6 +298,28 @@ func TestPlanKey_CapsLockInvertsShiftForLettersOnly(t *testing.T) {
 	want = append(want, shiftedTap(kcSpare0)...) // é is a cased letter on a scratch key
 	want = append(want, tapEvents(kcSpare1)...)  // € is not
 	eventsEqual(t, segs[0].events, want)
+}
+
+func TestPlanKey_CapsLockLeavesSymbolicKeysAlone(t *testing.T) {
+	km := testKeymap(1)
+	segs, err := planKey(km, xkbState{capsLock: true}, chordEvent("a", "ctrl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsEqual(t, segs[0].events, events(kcControl, true, kcA, true, kcA, false, kcControl, false))
+}
+
+// KP_1 shares its key with KP_End and Num Lock picks between them, so it
+// must never go through that key with Shift: a scratch keycode instead.
+func TestPlanKey_KeypadKeysUseScratchKeycodes(t *testing.T) {
+	km := testKeymap(1)
+	for _, name := range []string{"KP_1", "KP_End"} {
+		segs, err := planKey(km, xkbState{}, chordEvent(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventsEqual(t, segs[0].events, tapEvents(kcSpare0))
+	}
 }
 
 func TestXkbStateFromReply(t *testing.T) {
