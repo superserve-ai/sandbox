@@ -48,6 +48,7 @@ const (
 // Config is the schema of the operator-supplied config file
 // (VMD_EGRESS_BLOCKLIST_CONFIG). All fields are optional.
 type Config struct {
+	mining bool
 	// DomainFeeds are URLs (http/https) or local file paths to plain-text
 	// feeds: one entry per line, '#' starts a comment. Entries may be
 	// domains, IPs, IP:port pairs, or CIDRs.
@@ -71,7 +72,13 @@ type Config struct {
 }
 
 // LoadConfig reads and validates the YAML config at path.
-func LoadConfig(path string) (*Config, error) {
+func LoadConfig(path string) (*Config, error) { return loadConfig(path, false) }
+
+// LoadMiningConfig isolates mining evidence and its persisted state from the
+// ordinary denylist, even when both config files live in the same directory.
+func LoadMiningConfig(path string) (*Config, error) { return loadConfig(path, true) }
+
+func loadConfig(path string, mining bool) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read blocklist config: %w", err)
@@ -104,8 +111,15 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("blocked_egress_ports must not contain %d: web ports are enforced via the egress proxy and domain rules, not port drops", p)
 		}
 	}
+	cfg.mining = mining
+	if mining && len(cfg.BlockedEgressPorts) > 0 {
+		return nil, fmt.Errorf("mining policy cannot use port-only indicators")
+	}
 	if cfg.StatePath == "" {
 		cfg.StatePath = filepath.Join(filepath.Dir(path), "blocklist.state")
+		if mining {
+			cfg.StatePath = path + ".mining.state"
+		}
 	}
 	return &cfg, nil
 }
@@ -124,8 +138,9 @@ func (c *Config) refreshInterval() time.Duration {
 // blocklistSnapshot is an immutable merged view of all sources. Swapped
 // atomically on refresh so lookups never take a lock.
 type blocklistSnapshot struct {
-	domains map[string]struct{}
-	nets    []netip.Prefix
+	revision string
+	domains  map[string]struct{}
+	nets     []netip.Prefix
 }
 
 // Blocklist holds the current snapshot and refreshes it from the configured
@@ -169,14 +184,14 @@ func New(cfg *Config, log zerolog.Logger) *Blocklist {
 
 	seed := newSnapshotBuilder()
 	seed.addConfigEntries(cfg)
-	if raw, err := os.ReadFile(cfg.StatePath); err == nil {
+	if raw, err := os.ReadFile(cfg.StatePath); err == nil && (!cfg.mining || strings.HasPrefix(string(raw), miningStateHeader)) {
 		n, perr := seed.addFeedText(string(raw))
 		if perr != nil {
 			b.log.Warn().Err(perr).Str("path", cfg.StatePath).Msg("persisted state parse incomplete")
 		}
 		b.log.Info().Int("entries", n).Str("path", cfg.StatePath).Msg("seeded blocklist from persisted state")
 	}
-	b.cur.Store(seed.snapshot())
+	b.publishSnapshot(seed.snapshot())
 	return b
 }
 
@@ -221,7 +236,7 @@ func (b *Blocklist) Reload(path string) {
 // host firewall by refresh); blocked egress ports and refresh_interval are
 // applied once at startup and still need a restart to change.
 func (b *Blocklist) reloadConfig(ctx context.Context, path string) {
-	cfg, err := LoadConfig(path)
+	cfg, err := loadConfig(path, b.cfg.mining)
 	if err != nil {
 		b.log.Error().Err(err).Str("path", path).Msg("blocklist reload failed; keeping current config")
 		return
@@ -305,6 +320,9 @@ func (b *Blocklist) refresh(ctx context.Context) {
 	fetched, cached, failed := 0, 0, 0
 	degraded := false
 	var stateText strings.Builder
+	if b.cfg.mining {
+		stateText.WriteString(miningStateHeader)
+	}
 	for _, src := range b.cfg.DomainFeeds {
 		text, err := b.fetchFeed(ctx, src)
 		fromCache := false
@@ -356,7 +374,7 @@ func (b *Blocklist) refresh(ctx context.Context) {
 	}
 
 	snap := builder.snapshot()
-	b.cur.Store(snap)
+	b.publishSnapshot(snap)
 	b.log.Info().
 		Int("domains", len(snap.domains)).
 		Int("cidrs", len(snap.nets)).
@@ -516,6 +534,15 @@ func (sb *snapshotBuilder) snapshot() *blocklistSnapshot {
 	return &blocklistSnapshot{domains: sb.domains, nets: nets}
 }
 
+func (b *Blocklist) publishSnapshot(s *blocklistSnapshot) {
+	// Only published mining policies need evidence revisions. Ordinary startup
+	// and intermediate feed snapshots must not sort and hash the full corpus.
+	if b.cfg.mining {
+		s.revision = snapshotRevision(s)
+	}
+	b.cur.Store(s)
+}
+
 // normalizeDomain lowercases and validates a domain-ish entry. Returns ""
 // for entries that cannot be a DNS name (so junk feed lines are dropped
 // instead of polluting the set).
@@ -552,12 +579,20 @@ func parseCIDROrIP(s string) (netip.Prefix, error) {
 }
 
 func writeFileAtomic(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".blocklist-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	defer os.Remove(f.Name())
+	if _, err = f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }

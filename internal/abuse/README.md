@@ -135,3 +135,17 @@ compute metrics label the selected source; signup/file metrics retain `config`.
 The shared interfaces also define host observation and receipt contracts.
 Host detection and durable incident delivery are separate follow-up changes;
 this foundation does not activate mining automation.
+
+# Host containment components
+
+The host library provides a separate private mining-policy loader, background
+assignment/trust projection, an interface-bound packet gate, and proxy stream
+tracking. Confirmed untrusted mining matches can close existing connections
+and contain subsequent destinations; ordinary egress denials never escalate.
+Trust, mode, current VM incarnation, and registration identity are checked
+before containment. Missing attribution and observer failure remain fail open.
+
+These components require a durable incident submitter and explicit daemon
+wiring. That activation is provided by the subsequent delivery change; this
+library change alone does not enable host mining enforcement. Private policy
+files and state must remain outside source control and tenant mounts.

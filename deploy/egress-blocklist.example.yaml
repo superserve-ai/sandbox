@@ -37,3 +37,12 @@ refresh_interval: 6h
 # Where the last good merged list is persisted. Defaults to
 # "blocklist.state" next to this config file.
 state_path: /var/lib/sandbox/blocklist.state
+
+# Mining escalation uses a SEPARATE file with this schema, selected by
+# VMD_MINING_POLICY_CONFIG. Its entries are private mining indicators, not
+# customer egress rules or identity email domains. Keep that file and its
+# state_path out of source control. Configure only domain_feeds, custom_domains,
+# custom_cidrs, refresh_interval and state_path there; port-only denials do not
+# establish a mining incident. State files are written with owner-only access.
+# Destination denial remains independent of automated escalation mode. Only
+# known, untrusted teams in authoritative enforce mode can be contained.
