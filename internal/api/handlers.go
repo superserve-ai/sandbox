@@ -1517,7 +1517,10 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 	if sandbox == nil {
 		return
 	}
-	resp := h.sandboxResponseForRequest(c, *sandbox, c.GetTime("routing_observed_at"))
+	resp, ok := h.machineResponseForRequest(c, *sandbox, c.GetTime("routing_observed_at"))
+	if !ok {
+		return
+	}
 	resp.PreviewAccess = previewAccess
 	c.JSON(http.StatusOK, resp)
 }
@@ -1661,13 +1664,19 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		"id":     formatSandboxID(sandboxID),
 		"status": string(db.SandboxStatusActive),
 	}
+	if _, machine := machineCallerFromContext(c); machine && (h.Config == nil || h.Config.SandboxAccessTokenSeed == nil) {
+		respondErrorMsg(c, "machine_capability_unavailable", "machine capability unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
 		// The token HMAC stays keyed on the bare UUID for human sandboxes; a
 		// machine caller receives only a lineage-bound capability.
-		if machineResp := h.sandboxResponseForRequest(c, sandbox, c.GetTime("routing_observed_at")); machineResp.AccessToken != "" {
+		if machineResp, ok := h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at")); ok && machineResp.AccessToken != "" {
 			resp["access_token"] = machineResp.AccessToken
 		} else if _, machine := machineCallerFromContext(c); !machine {
 			resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
+		} else {
+			return
 		}
 		resp["routing_hint"] = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, sandboxID.String(), sandbox.HostID, h.Config.EdgeProxyDomain, c.GetTime("routing_observed_at"), sandbox.RoutingVersion)
 	}
@@ -2367,6 +2376,19 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 	return h.sandboxToResponseWithToken(s, observedAt)
 }
 
+// machineResponseForRequest makes capability derivation an explicit response
+// gate. A machine request must never receive a successful payload without a
+// reconnect capability when authority, ownership, signing, or audience data
+// is unavailable.
+func (h *Handlers) machineResponseForRequest(c *gin.Context, s db.Sandbox, observedAt time.Time) (sandboxResponse, bool) {
+	resp := h.sandboxResponseForRequest(c, s, observedAt)
+	if _, machine := machineCallerFromContext(c); machine && resp.AccessToken == "" {
+		respondErrorMsg(c, "machine_capability_unavailable", "machine capability unavailable", http.StatusServiceUnavailable)
+		return sandboxResponse{}, false
+	}
+	return resp, true
+}
+
 // decodeMetadata unmarshals the jsonb bytes column into a string→string map.
 // On any decode error (which should be impossible because the column is
 // constrained to objects we wrote ourselves) we return an empty map rather
@@ -2636,7 +2658,11 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	resp := h.sandboxToResponse(sandbox)
 	resp.PreviewAccess = row.Access
 	if _, machine := machineCallerFromContext(c); machine {
-		resp = h.sandboxResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
+		var ok bool
+		resp, ok = h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
+		if !ok {
+			return
+		}
 		resp.PreviewAccess = row.Access
 	} else {
 		canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
@@ -3815,7 +3841,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	sandbox.Status = db.SandboxStatusActive
 	c.Set("routing_observed_at", routingObservedAt)
-	resp := h.sandboxResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
+	resp, ok := h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
+	if !ok {
+		return
+	}
 	resp.PreviewAccess = previewAccess
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		// Echo the normalized rules, not the raw request, so the create

@@ -229,6 +229,9 @@ func (h *Handler) RevokeMachineCredential(credentialID uuid.UUID, generation uin
 	if h == nil || h.sessions == nil {
 		return 0
 	}
+	if h.machineAuthorityInvalidator != nil {
+		h.machineAuthorityInvalidator.InvalidateCredential(credentialID)
+	}
 	return h.sessions.RevokeCredential(credentialID, generation)
 }
 
@@ -237,6 +240,9 @@ func (h *Handler) RevokeMachineCredential(credentialID uuid.UUID, generation uin
 func (h *Handler) RevokeMachinePrincipal(principalID uuid.UUID, generation uint64) int {
 	if h == nil || h.sessions == nil {
 		return 0
+	}
+	if h.machineAuthorityInvalidator != nil {
+		h.machineAuthorityInvalidator.InvalidatePrincipal(principalID)
 	}
 	return h.sessions.RevokePrincipal(principalID, generation)
 }

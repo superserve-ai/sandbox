@@ -283,9 +283,11 @@ func (s RevocationState) Allows(capability MachineCapability, now time.Time) boo
 // disconnect decisions independent of stream activity. Unregister is safe to
 // call from every exit path, including cancellation and handshake failure.
 type SessionRegistry struct {
-	mu       sync.Mutex
-	max      int
-	sessions map[string]sessionEntry
+	mu               sync.Mutex
+	max              int
+	sessions         map[string]sessionEntry
+	credentialFences map[uuid.UUID]uint64
+	principalFences  map[uuid.UUID]uint64
 }
 
 type sessionEntry struct {
@@ -299,7 +301,7 @@ func NewSessionRegistry(max int) *SessionRegistry {
 	if max < 1 {
 		max = 1
 	}
-	return &SessionRegistry{max: max, sessions: make(map[string]sessionEntry)}
+	return &SessionRegistry{max: max, sessions: make(map[string]sessionEntry), credentialFences: make(map[uuid.UUID]uint64), principalFences: make(map[uuid.UUID]uint64)}
 }
 
 func (r *SessionRegistry) Register(id string, state RevocationState) error {
@@ -320,6 +322,12 @@ func (r *SessionRegistry) register(id string, state RevocationState, cancel cont
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if fence := r.credentialFences[state.CredentialID]; fence >= state.RevocationGeneration {
+		return ErrMachineCapabilityDenied
+	}
+	if fence := r.principalFences[state.PrincipalID]; fence >= state.RevocationGeneration {
+		return ErrMachineCapabilityDenied
+	}
 	if _, exists := r.sessions[id]; !exists && len(r.sessions) >= r.max {
 		return ErrSessionLimit
 	}
@@ -369,6 +377,9 @@ func (r *SessionRegistry) RevokeCredential(credentialID uuid.UUID, generation ui
 		return 0
 	}
 	r.mu.Lock()
+	if generation > r.credentialFences[credentialID] {
+		r.credentialFences[credentialID] = generation
+	}
 	removed := 0
 	var cancels []context.CancelFunc
 	for id, entry := range r.sessions {
@@ -392,6 +403,9 @@ func (r *SessionRegistry) RevokePrincipal(principalID uuid.UUID, generation uint
 		return 0
 	}
 	r.mu.Lock()
+	if generation > r.principalFences[principalID] {
+		r.principalFences[principalID] = generation
+	}
 	removed := 0
 	var cancels []context.CancelFunc
 	for id, entry := range r.sessions {
@@ -540,4 +554,15 @@ type PrincipalLifecycle interface {
 	RevokeCredential(context.Context, uuid.UUID, string) error
 	DisablePrincipal(context.Context, uuid.UUID, string) error
 	RestorePrincipal(context.Context, uuid.UUID, string) (MachineCredential, error)
+}
+
+// FencedPrincipalLifecycle is the production form of the handoff. The
+// expected generation and operation identity are mandatory for every
+// mutating request; callers may not replay a completed transition against a
+// newer disable/restore generation.
+type FencedPrincipalLifecycle interface {
+	PrincipalLifecycle
+	IssueCredentialFenced(context.Context, uuid.UUID, string, int64, uuid.UUID) (MachineCredential, error)
+	RotateCredentialFenced(context.Context, uuid.UUID, uuid.UUID, string, int64, uuid.UUID) (MachineCredential, error)
+	RestorePrincipalFenced(context.Context, uuid.UUID, string, int64, uuid.UUID) (MachineCredential, error)
 }

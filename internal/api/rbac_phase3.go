@@ -1,5 +1,7 @@
 package api
 
+import "net/http"
+
 import (
 	"fmt"
 
@@ -93,8 +95,12 @@ func (h *Handlers) requireTeamSandboxWrite(c *gin.Context, teamID uuid.UUID) boo
 		}
 		if _, machine := machineCallerFromContext(c); machine {
 			if raw := c.Param("sandbox_id"); raw != "" {
-				id, err := uuid.Parse(raw)
-				if err != nil || !h.requireMachineSandboxOwner(c, id, teamID) {
+				id, err := parsePublicSandboxID(raw)
+				if err != nil {
+					respondErrorMsg(c, "invalid_sandbox_id", "invalid sandbox id", http.StatusBadRequest)
+					return false
+				}
+				if !h.requireMachineSandboxOwner(c, id, teamID) {
 					return false
 				}
 			}
@@ -110,8 +116,12 @@ func (h *Handlers) requireMachineSandboxOwnerForRead(c *gin.Context, operation a
 		return true
 	}
 	if raw := c.Param("sandbox_id"); raw != "" {
-		id, err := uuid.Parse(raw)
-		return err == nil && h.requireMachineSandboxOwner(c, id, teamID)
+		id, err := parsePublicSandboxID(raw)
+		if err != nil {
+			respondErrorMsg(c, "invalid_sandbox_id", "invalid sandbox id", http.StatusBadRequest)
+			return false
+		}
+		return h.requireMachineSandboxOwner(c, id, teamID)
 	}
 	return true
 }

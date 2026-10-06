@@ -43,8 +43,17 @@ func (h *Handler) WithAuth(seedKey []byte) *Handler {
 // WithMachineAuthority installs the durable revocation resolver used for
 // lineage-bound machine capabilities. Omitting it keeps ordinary sandbox
 // tokens working but makes every machine capability fail closed.
-func (h *Handler) WithMachineAuthority(authority auth.RevocationAuthority) *Handler {
-	h.machineAuthority = authority
+func (h *Handler) WithMachineAuthority(authority any) *Handler {
+	switch value := authority.(type) {
+	case auth.RevocationAuthority:
+		h.machineAuthority = value
+	case *CachedMachineAuthority:
+		h.machineAuthority = value.Lookup
+		h.machineAuthorityInvalidator = value
+	default:
+		h.machineAuthority = nil
+		h.machineAuthorityInvalidator = nil
+	}
 	return h
 }
 

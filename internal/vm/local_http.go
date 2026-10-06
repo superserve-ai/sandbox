@@ -105,6 +105,8 @@ type instanceResponse struct {
 	StartedAt                int64             `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
 	TeamID                   string            `json:"team_id,omitempty"`
 	OwnerID                  string            `json:"owner_id,omitempty"`
+	MachineOwned             bool              `json:"machine_owned"`
+	MachineOwnerPrincipalID  string            `json:"machine_owner_principal_id,omitempty"`
 	PreviewAccess            string            `json:"preview_access,omitempty"`
 	PreviewPorts             map[string]bool   `json:"preview_ports,omitempty"`
 	PreviewPortAccess        map[string]string `json:"preview_port_access,omitempty"`
@@ -169,6 +171,8 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		StartedAt:                info.CreatedAt.UnixNano(),
 		TeamID:                   info.TeamID,
 		OwnerID:                  info.OwnerID,
+		MachineOwned:             info.MachineOwned,
+		MachineOwnerPrincipalID:  info.MachineOwnerPrincipalID,
 		PreviewAccess:            info.PreviewAccess,
 		PreviewPorts:             previewPortsToJSON(info.PreviewPorts),
 		PreviewPortAccess:        previewPortAccessToJSON(info.PreviewPorts),

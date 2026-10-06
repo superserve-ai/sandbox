@@ -280,8 +280,10 @@ type VMRecord struct {
 	// not use it to mutate the VM's existing overlay.
 	DeltaDir string `json:"delta_dir,omitempty"`
 	// Persisted so usage attribution survives a vmd restart.
-	TeamID  string `json:"team_id,omitempty"`
-	OwnerID string `json:"owner_id,omitempty"`
+	TeamID                  string `json:"team_id,omitempty"`
+	OwnerID                 string `json:"owner_id,omitempty"`
+	MachineOwned            bool   `json:"machine_owned,omitempty"`
+	MachineOwnerPrincipalID string `json:"machine_owner_principal_id,omitempty"`
 	// PausedAt marks when a sandbox last entered the paused state. Zero on
 	// records written before the field existed; callers needing an ordering
 	// key fall back to CreatedAt.
@@ -1153,6 +1155,8 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		DeltaDir:                   inst.Config.DeltaDir,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
+		MachineOwned:               inst.MachineOwned,
+		MachineOwnerPrincipalID:    inst.MachineOwnerPrincipalID,
 		PausedAt:                   inst.PausedAt,
 		Supervision:                inst.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
@@ -1263,6 +1267,8 @@ func toInstance(rec VMRecord) *VMInstance {
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,
 		OwnerID:                    rec.OwnerID,
+		MachineOwned:               rec.MachineOwned,
+		MachineOwnerPrincipalID:    rec.MachineOwnerPrincipalID,
 		PausedAt:                   rec.PausedAt,
 		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),

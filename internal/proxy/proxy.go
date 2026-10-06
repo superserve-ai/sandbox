@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/telemetry"
@@ -81,7 +82,11 @@ type Handler struct {
 	// machineAuthority is the bounded-freshness durable revocation resolver.
 	// Machine capabilities fail closed when a proxy has not been configured
 	// with it; legacy tokens remain available only to ordinary sandboxes.
-	machineAuthority auth.RevocationAuthority
+	machineAuthority            auth.RevocationAuthority
+	machineAuthorityInvalidator interface {
+		InvalidateCredential(uuid.UUID)
+		InvalidatePrincipal(uuid.UUID)
+	}
 	// sessions is the bounded active-stream registry. It is deliberately
 	// local to a serving instance; durable authority refresh/invalidation
 	// calls RevokeCredential/RevokePrincipal and the registered cancel funcs

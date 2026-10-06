@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -42,6 +43,13 @@ func MachineCredentialAuth(resolver MachineCredentialResolver) gin.HandlerFunc {
 			return
 		}
 		caller, err := resolver.ResolveMachineCredential(c.Request.Context(), raw)
+		if errors.Is(err, ErrMachineAuthorityUnavailable) {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
+			respondErrorMsg(c, "service_unavailable", "Machine authority is not ready.", http.StatusServiceUnavailable)
+			c.Abort()
+			return
+		}
 		if err != nil || caller.ValidateAt(time.Now()) != nil {
 			c.Set("auth_duration", time.Since(authStart))
 			recordMachineAuthFailure(c, authStart)

@@ -147,6 +147,10 @@ type VMInstance struct {
 	Metadata         map[string]string
 	TeamID           string // owning team; carried for data-plane usage attribution
 	OwnerID          string // creating user; empty when unknown
+	// Machine ownership is an explicit control-plane attestation. Empty
+	// principal means ownership is unknown and proxies must fail closed.
+	MachineOwned            bool
+	MachineOwnerPrincipalID string
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -6269,11 +6273,13 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 
 // InstanceInfo is a snapshot of a VM's address and status for proxy lookups.
 type InstanceInfo struct {
-	VMIP      string
-	Status    VMStatus
-	CreatedAt time.Time
-	TeamID    string
-	OwnerID   string
+	VMIP                    string
+	Status                  VMStatus
+	CreatedAt               time.Time
+	TeamID                  string
+	OwnerID                 string
+	MachineOwned            bool
+	MachineOwnerPrincipalID string
 
 	PreviewAccess string
 	PreviewPorts  map[int32]PreviewPortPolicy
@@ -6298,11 +6304,13 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 	)
 	previewAccess := restrictivePreviewAccess(inst.PreviewAccess, previewPorts)
 	info := InstanceInfo{
-		VMIP:      inst.IP,
-		Status:    inst.Status,
-		CreatedAt: inst.CreatedAt,
-		TeamID:    inst.TeamID,
-		OwnerID:   inst.OwnerID,
+		VMIP:                    inst.IP,
+		Status:                  inst.Status,
+		CreatedAt:               inst.CreatedAt,
+		TeamID:                  inst.TeamID,
+		OwnerID:                 inst.OwnerID,
+		MachineOwned:            inst.MachineOwned,
+		MachineOwnerPrincipalID: inst.MachineOwnerPrincipalID,
 
 		PreviewAccess: previewAccess,
 		PreviewPorts:  previewPorts,

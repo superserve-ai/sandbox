@@ -101,6 +101,10 @@ func run() error {
 	if dbPool != nil {
 		defer dbPool.Close()
 		ownership = proxy.NewCachedOwnershipResolver(workCtx, proxy.NewDBOwnershipResolver(dbPool, localHostID))
+		// Capability admission uses one bounded local authority snapshot for
+		// requests and stream registration; durable revocation notifications
+		// invalidate this snapshot through the handler hook.
+		proxyHandler.WithMachineAuthority(proxy.NewCachedMachineAuthority(dbPool, 5*time.Second))
 	}
 	var routingRecorder telemetry.RoutingOutcomeRecorder
 	var peerTelemetry proxy.RecorderPeerTelemetry
