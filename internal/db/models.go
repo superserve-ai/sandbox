@@ -170,6 +170,12 @@ type AbuseRestriction struct {
 	ReleasedBy    pgtype.UUID        `json:"released_by"`
 }
 
+type AbuseRuntimeSetting struct {
+	Singleton bool      `json:"singleton"`
+	Mode      string    `json:"mode"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type AbuseStateChange struct {
 	ID         int64       `json:"id"`
 	TeamID     pgtype.UUID `json:"team_id"`
