@@ -78,17 +78,14 @@ func (b *x11Backend) xkbGetState() (xkbState, error) {
 	return xkbStateFromReply(reply), nil
 }
 
-// xkbLockShift sets or clears the Shift lock: XkbLatchLockState with
-// affectModLocks = Shift.
-func (b *x11Backend) xkbLockShift(on bool) error {
+// xkbSetLocks sets the modifier locks in affect to locks:
+// XkbLatchLockState(affectModLocks, modLocks).
+func (b *x11Backend) xkbSetLocks(affect, locks byte) error {
 	req := make([]byte, 16)
 	req[0], req[1] = b.xkbOpcode, 5
 	xgb.Put16(req[2:], 4)
 	xgb.Put16(req[4:], 0x100)
-	req[6] = xproto.ModMaskShift
-	if on {
-		req[7] = xproto.ModMaskShift
-	}
+	req[6], req[7] = affect, locks
 	cookie := b.conn.NewCookie(true, false)
 	b.conn.NewRequest(req, cookie)
 	if err := cookie.Check(); err != nil {
@@ -217,13 +214,16 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifier
 			}
 			continue
 		}
-		if ks := uint32(row[0]); ks != 0 {
+		// A modifier keycode is usable as the modifier it carries (Shift_L,
+		// Control_L) and nothing else: pressing it for a character would
+		// also toggle that modifier.
+		if ks := uint32(row[0]); ks != 0 && (!modifier[code] || modifierKeysym(ks)) {
 			if _, dup := km.direct[ks]; !dup {
 				km.direct[ks] = keystroke{code: code}
 			}
 		}
 		if perCode > 1 {
-			if ks := uint32(row[1]); ks != 0 {
+			if ks := uint32(row[1]); ks != 0 && (!modifier[code] || modifierKeysym(ks)) {
 				if _, dup := km.direct[ks]; !dup {
 					km.direct[ks] = keystroke{code: code, shift: true}
 				}
@@ -243,6 +243,12 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifier
 		}
 	}
 	return km
+}
+
+// modifierKeysym reports whether ks is a modifier key (Shift, Control,
+// Alt, Super, Hyper, Meta, the locks, Mode_switch, ISO_Level3_Shift).
+func modifierKeysym(ks uint32) bool {
+	return (ks >= 0xffe1 && ks <= 0xffee) || ks == 0xff7e || ks == 0xff7f || ks == 0xfe03
 }
 
 // scratchRowIntact reports whether a fetched row is still the single-keysym
@@ -291,9 +297,7 @@ func (b *x11Backend) keymap() (*x11Keymap, error) {
 // keyPlanner lowers one key request to keycodes against a copy of the
 // scratch state, so a declined request leaves the keymap untouched.
 type keyPlanner struct {
-	km *x11Keymap
-	// capsLock inverts Shift for cased letters typed through the layout.
-	capsLock bool
+	km       *x11Keymap
 	spare    []xproto.Keycode
 	bound    map[xproto.Keycode]uint32
 	used     map[xproto.Keycode]bool
@@ -301,8 +305,8 @@ type keyPlanner struct {
 	cur      keySegment
 }
 
-func newKeyPlanner(km *x11Keymap, state xkbState) *keyPlanner {
-	p := &keyPlanner{km: km, capsLock: state.capsLock, spare: append([]xproto.Keycode(nil), km.spare...),
+func newKeyPlanner(km *x11Keymap) *keyPlanner {
+	p := &keyPlanner{km: km, spare: append([]xproto.Keycode(nil), km.spare...),
 		bound: make(map[xproto.Keycode]uint32, len(km.bound)), used: map[xproto.Keycode]bool{}}
 	for code, ks := range km.bound {
 		p.bound[code] = ks
@@ -347,19 +351,15 @@ func (p *keyPlanner) scratch(ks uint32) (xproto.Keycode, bool) {
 
 // stroke resolves ks to a keystroke: natively when the layout has it (with
 // Shift only when the layout has a Shift key), else through a scratch
-// keycode. For literal text, Caps Lock is compensated: it flips the case of
-// every alphabetic key, layout or scratch (XKB types a single cased keysym
-// as alphabetic too), and Shift flips it back. A symbolic key keeps the
-// lock's effect, as it does for xdotool.
-func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
+// keycode. Locks are not compensated here: Key clears them around literal
+// text, and a symbolic key keeps their effect as it does for xdotool.
+func (p *keyPlanner) stroke(ks uint32) (keystroke, error) {
 	_, hasShift := p.km.shift()
-	invert := literal && p.capsLock && hasShift && casedLetter(ks)
 	// The layout's second column is only known to be Shift-selected for
 	// printable symbols. Keypad keys are chosen by Num Lock, and keys such
 	// as Break (on Pause) or Sys_Req (on Print) by Control or Alt, so those
 	// go through a single-level scratch keycode instead.
 	if st, ok := p.km.direct[ks]; ok && (!st.shift || hasShift) && !keypad(ks) && (!st.shift || printable(ks)) {
-		st.shift = st.shift != invert
 		return st, nil
 	}
 	// A one-keysym alphabetic key becomes a lower/upper pair on the server,
@@ -381,7 +381,7 @@ func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
 	if !ok {
 		return keystroke{}, fmt.Errorf("no spare keycode for keysym 0x%x: %w", ks, errBackendKept)
 	}
-	return keystroke{code: code, shift: shift != invert}, nil
+	return keystroke{code: code, shift: shift}, nil
 }
 
 // lowerKeysym reports whether ks is an uppercase letter and, when its
@@ -447,7 +447,7 @@ func (p *keyPlanner) tap(st keystroke) {
 
 func (p *keyPlanner) text(text string) error {
 	for _, r := range text {
-		st, err := p.stroke(keysymFromRune(r), true)
+		st, err := p.stroke(keysymFromRune(r))
 		if err != nil {
 			return err
 		}
@@ -482,7 +482,7 @@ func (p *keyPlanner) chord(modifiers []string, key string) error {
 	if !ok {
 		return fmt.Errorf("unknown key name %q: %w", last, errBackendKept)
 	}
-	st, err := p.stroke(ks, false)
+	st, err := p.stroke(ks)
 	if err != nil {
 		return err
 	}
@@ -513,7 +513,7 @@ func planKey(km *x11Keymap, state xkbState, ev *pb.KeyEvent) ([]keySegment, erro
 	if state.group != 0 {
 		return nil, fmt.Errorf("keyboard group %d is active: %w", state.group+1, errBackendKept)
 	}
-	p := newKeyPlanner(km, state)
+	p := newKeyPlanner(km)
 	var err error
 	switch in := ev.GetInput().(type) {
 	case *pb.KeyEvent_Key:
@@ -557,14 +557,23 @@ func (b *x11Backend) Key(ev *pb.KeyEvent) error {
 	if err != nil {
 		return err
 	}
-	// A locked Shift cannot be undone per key (Shift is not a toggle), so
-	// literal text is typed with the lock cleared and the lock put back
-	// afterwards; a symbolic key keeps it, as it does for xdotool.
-	if _, literal := ev.GetInput().(*pb.KeyEvent_Text); literal && state.shiftLock {
-		if err := b.xkbLockShift(false); err != nil {
-			return err
+	// Caps Lock and Shift Lock change what a keycode types and cannot be
+	// undone per key, so literal text is typed with them cleared and they
+	// are put back afterwards; a symbolic key keeps them, as for xdotool.
+	if _, literal := ev.GetInput().(*pb.KeyEvent_Text); literal {
+		var locks byte
+		if state.capsLock {
+			locks |= xproto.ModMaskLock
 		}
-		defer func() { _ = b.xkbLockShift(true) }()
+		if state.shiftLock {
+			locks |= xproto.ModMaskShift
+		}
+		if locks != 0 {
+			if err := b.xkbSetLocks(locks, 0); err != nil {
+				return err
+			}
+			defer func() { _ = b.xkbSetLocks(locks, locks) }()
+		}
 	}
 	for _, seg := range segments {
 		if len(seg.binds) > 0 {

@@ -274,7 +274,8 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 		t.Fatalf("%s: terminal received %q, want %q", label, got, want)
 	}
 
-	// Caps Lock on: the X11 path must invert Shift for letters, nothing else.
+	// Caps Lock on: literal text is typed with the lock cleared and the lock
+	// is back afterwards.
 	toggleCaps := func() {
 		t.Helper()
 		caps := exec.Command("xdotool", "key", "Caps_Lock")
@@ -285,6 +286,9 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	}
 	toggleCaps()
 	expect("with Caps Lock", "Mixed Case 42!\n")
+	if state, err := s.x11.backend.xkbGetState(); err != nil || !state.capsLock {
+		t.Fatalf("Caps Lock was not restored: %+v, %v", state, err)
+	}
 	toggleCaps()
 
 	// Num Lock on: keypad digits must still be digits (they go through a

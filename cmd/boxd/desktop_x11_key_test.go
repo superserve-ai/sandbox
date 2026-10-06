@@ -448,20 +448,18 @@ func TestExecKey_DeclineFallsBackWithoutDroppingTheBackend(t *testing.T) {
 	}
 }
 
-func TestPlanKey_CapsLockInvertsShiftForLettersOnly(t *testing.T) {
-	km := testKeymap(2)
-	segs, err := planKey(km, xkbState{capsLock: true}, textEvent("aA1!é€"))
+// Locks are cleared around literal text by Key, so the plan is the same
+// with or without them.
+func TestPlanKey_LocksDoNotChangeThePlan(t *testing.T) {
+	plain, err := planKey(testKeymap(2), xkbState{}, textEvent("aA1!é€"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var want []keyEvent
-	want = append(want, shiftedTap(kcA)...)      // a needs Shift under Caps Lock
-	want = append(want, tapEvents(kcA)...)       // A does not
-	want = append(want, tapEvents(kc1)...)       // digits are unaffected
-	want = append(want, shiftedTap(kc1)...)      // and so is !
-	want = append(want, shiftedTap(kcSpare0)...) // é is a cased letter on a scratch key
-	want = append(want, tapEvents(kcSpare1)...)  // € is not
-	eventsEqual(t, segs[0].events, want)
+	locked, err := planKey(testKeymap(2), xkbState{capsLock: true, shiftLock: true}, textEvent("aA1!é€"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsEqual(t, locked[0].events, plain[0].events)
 }
 
 // An uppercase letter the layout lacks is bound lowercase and typed with
@@ -478,14 +476,7 @@ func TestPlanKey_UppercaseScratchLettersAreShifted(t *testing.T) {
 	want = append(want, tapEvents(kcSpare0)...)
 	eventsEqual(t, segs[0].events, want)
 
-	// Caps Lock inverts that for literal text, not for a symbolic key.
-	segs, err = planKey(km, xkbState{capsLock: true}, textEvent("Éé"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want = append(tapEvents(kcSpare0), shiftedTap(kcSpare0)...)
-	eventsEqual(t, segs[0].events, want)
-	segs, err = planKey(km, xkbState{capsLock: true}, chordEvent("É"))
+	segs, err = planKey(km, xkbState{}, chordEvent("É"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,13 +503,20 @@ func TestPlanKey_UppercaseWithoutRoundTripKeepsItsKeysym(t *testing.T) {
 	}
 }
 
-func TestPlanKey_CapsLockLeavesSymbolicKeysAlone(t *testing.T) {
-	km := testKeymap(1)
-	segs, err := planKey(km, xkbState{capsLock: true}, chordEvent("a", "ctrl"))
-	if err != nil {
-		t.Fatal(err)
+// A keycode in the modifier map offers its modifier keysym and nothing
+// else, even if its row also carries a character.
+func TestBuildKeymap_ModifierKeycodesOfferOnlyModifierKeysyms(t *testing.T) {
+	var syms []xproto.Keysym
+	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0xe9, 0xc9}, {0, 0}, {0, 0}} {
+		syms = append(syms, r[0], r[1])
 	}
-	eventsEqual(t, segs[0].events, events(kcControl, true, kcA, true, kcA, false, kcControl, false))
+	km := buildKeymap(8, 2, syms, []xproto.Keycode{kcShift, kcSpare0}, nil)
+	if _, ok := km.direct[keysymShiftL]; !ok {
+		t.Error("Shift_L on a modifier keycode must stay usable")
+	}
+	if st, ok := km.direct[0xe9]; ok {
+		t.Errorf("é on modifier keycode %d was offered as a layout key", st.code)
+	}
 }
 
 // KP_1 shares its key with KP_End and Num Lock picks between them, so it
