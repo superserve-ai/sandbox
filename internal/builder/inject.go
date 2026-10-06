@@ -378,19 +378,17 @@ exec /usr/local/bin/tini -- /usr/bin/boxd
 // /sys/fs/cgroup; v1 because a cgroup2 mount there would hide boxd's freezer.
 const initCgroupBlock = `# cgroup v1 tree: container runtimes refuse to start without these controllers.
 mount -t tmpfs cgroup_root /sys/fs/cgroup 2>/dev/null
-for c in cpu cpuacct cpuset memory devices pids blkio net_cls net_prio hugetlb perf_event; do
+for c in cpu cpuacct cpuset memory devices freezer pids blkio net_cls net_prio hugetlb perf_event; do
   mkdir -p /sys/fs/cgroup/$c
   mount -t cgroup -o $c $c /sys/fs/cgroup/$c 2>/dev/null || rmdir /sys/fs/cgroup/$c
 done
 
 `
 
-// initFreezerBlock mounts the workload freezer. Only an image built to freeze
-// its workload carries it; without the mount boxd runs commands unwrapped, so
+// initFreezerBlock creates the workload freezer cgroup. Only an image built to
+// freeze its workload carries it; without it boxd runs commands unwrapped, so
 // an image built with the switch off behaves exactly as before it existed.
 const initFreezerBlock = `# Freezer cgroup for the workload, so a snapshot can be taken with it stopped.
-mkdir -p /sys/fs/cgroup/freezer
-mount -t cgroup -o freezer freezer /sys/fs/cgroup/freezer 2>/dev/null
 mkdir -p /sys/fs/cgroup/freezer/workload
 # A process joins the cgroup itself, as whatever user it runs as.
 chmod 666 /sys/fs/cgroup/freezer/workload/cgroup.procs /sys/fs/cgroup/freezer/workload/tasks 2>/dev/null
