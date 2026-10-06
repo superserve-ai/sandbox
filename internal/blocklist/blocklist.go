@@ -67,7 +67,8 @@ type Config struct {
 	RefreshInterval string `yaml:"refresh_interval"`
 
 	// StatePath is where the last good merged list is persisted. Default:
-	// "<config dir>/blocklist.state".
+	// "<config dir>/blocklist.state". Changing it requires a restart;
+	// reload rejects the entire config if this path changes.
 	StatePath string `yaml:"state_path"`
 }
 
@@ -184,7 +185,7 @@ func New(cfg *Config, log zerolog.Logger) *Blocklist {
 
 	seed := newSnapshotBuilder()
 	seed.addConfigEntries(cfg)
-	if raw, err := os.ReadFile(cfg.StatePath); err == nil && (!cfg.mining || strings.HasPrefix(string(raw), miningStateHeader)) {
+	if raw, err := os.ReadFile(cfg.StatePath); err == nil && cfg.mining == strings.HasPrefix(string(raw), miningStateHeader) {
 		n, perr := seed.addFeedText(string(raw))
 		if perr != nil {
 			b.log.Warn().Err(perr).Str("path", cfg.StatePath).Msg("persisted state parse incomplete")
@@ -234,11 +235,16 @@ func (b *Blocklist) Reload(path string) {
 // the cached feeds. Fail-safe: a bad config is logged and the current blocklist
 // is kept, never dropped. Domains and CIDRs are updated (CIDRs re-pushed to the
 // host firewall by refresh); blocked egress ports and refresh_interval are
-// applied once at startup and still need a restart to change.
+// applied once at startup and still need a restart to change. A changed state
+// path rejects the entire reload to preserve mining/generic state separation.
 func (b *Blocklist) reloadConfig(ctx context.Context, path string) {
 	cfg, err := loadConfig(path, b.cfg.mining)
 	if err != nil {
 		b.log.Error().Err(err).Str("path", path).Msg("blocklist reload failed; keeping current config")
+		return
+	}
+	if cfg.StatePath != b.cfg.StatePath {
+		b.log.Error().Str("path", path).Msg("blocklist state_path change requires restart; keeping current config")
 		return
 	}
 	b.cfg = cfg

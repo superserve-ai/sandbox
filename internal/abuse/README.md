@@ -132,7 +132,10 @@ Host mining detection is opt-in through `VMD_MINING_POLICY_CONFIG`, a **separate
 private** file using the schema in `deploy/egress-blocklist.example.yaml`.
 Do not include port-only indicators. Mining state defaults to
 `<config-path>.mining.state`, carries a mining-only format marker, and must not
-share the generic blocklist state file. Keep production indicators, feed locations,
+share the generic blocklist state file. State-path changes require a restart for
+both policy types; a reload with a different path retains the previous config
+and snapshot. Generic blocklists reject mining-marked persisted state.
+Keep production indicators, feed locations,
 state files, and incident spools outside source control and tenant mounts.
 Existing global destination blocks and customer egress rules do not create
 mining incidents. Private mining destinations are still denied in off/observe
