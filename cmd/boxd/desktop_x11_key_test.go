@@ -64,6 +64,13 @@ func chordEvent(key string, modifiers ...string) *pb.KeyEvent {
 	return &pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: key}, Modifiers: modifiers}
 }
 
+func bindsEqual(t *testing.T, got, want []keyBind) {
+	t.Helper()
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("binds = %v\nwant    %v", got, want)
+	}
+}
+
 func eventsEqual(t *testing.T, got, want []keyEvent) {
 	t.Helper()
 	if fmt.Sprint(got) != fmt.Sprint(want) {
@@ -298,6 +305,34 @@ func TestPlanKey_CapsLockInvertsShiftForLettersOnly(t *testing.T) {
 	want = append(want, shiftedTap(kcSpare0)...) // é is a cased letter on a scratch key
 	want = append(want, tapEvents(kcSpare1)...)  // € is not
 	eventsEqual(t, segs[0].events, want)
+}
+
+// An uppercase letter the layout lacks is bound lowercase and typed with
+// Shift; the lowercase form shares the keycode.
+func TestPlanKey_UppercaseScratchLettersAreShifted(t *testing.T) {
+	km := testKeymap(2)
+	segs, err := planKey(km, xkbState{}, textEvent("Éé"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindsEqual(t, segs[0].binds, []keyBind{{kcSpare0, 0xe9}})
+	var want []keyEvent
+	want = append(want, shiftedTap(kcSpare0)...)
+	want = append(want, tapEvents(kcSpare0)...)
+	eventsEqual(t, segs[0].events, want)
+
+	// Caps Lock inverts that for literal text, not for a symbolic key.
+	segs, err = planKey(km, xkbState{capsLock: true}, textEvent("Éé"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(tapEvents(kcSpare0), shiftedTap(kcSpare0)...)
+	eventsEqual(t, segs[0].events, want)
+	segs, err = planKey(km, xkbState{capsLock: true}, chordEvent("É"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsEqual(t, segs[0].events, shiftedTap(kcSpare0))
 }
 
 func TestPlanKey_CapsLockLeavesSymbolicKeysAlone(t *testing.T) {

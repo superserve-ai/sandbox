@@ -264,11 +264,31 @@ func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
 		st.shift = st.shift != invert
 		return st, nil
 	}
+	// A one-keysym alphabetic key becomes a lower/upper pair on the server,
+	// so a cased letter is bound by its lowercase form and typed shifted
+	// when uppercase; one scratch keycode then serves both cases.
+	shift := false
+	if lower, upper := lowerKeysym(ks); hasShift && upper {
+		ks, shift = lower, true
+	}
 	code, ok := p.scratch(ks)
 	if !ok {
 		return keystroke{}, fmt.Errorf("no spare keycode for keysym 0x%x: %w", ks, errBackendKept)
 	}
-	return keystroke{code: code, shift: invert}, nil
+	return keystroke{code: code, shift: shift != invert}, nil
+}
+
+// lowerKeysym returns the lowercase form of a cased letter keysym and
+// whether ks was uppercase; other keysyms come back unchanged.
+func lowerKeysym(ks uint32) (lower uint32, upper bool) {
+	if !casedLetter(ks) {
+		return ks, false
+	}
+	r := rune(ks)
+	if ks >= 0x01000000 {
+		r = rune(ks & 0x00ffffff)
+	}
+	return keysymFromRune(unicode.ToLower(r)), unicode.IsUpper(r)
 }
 
 // keypad reports whether ks is in keysymdef's keypad block.

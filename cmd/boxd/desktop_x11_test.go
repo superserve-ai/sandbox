@@ -207,11 +207,11 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	}
 	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "discarded"}})
 	send(&pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: "u"}, Modifiers: []string{"ctrl"}})
-	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "Hello, World! 123 café €\n"}})
+	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "Hello, World! 123 café Été €\n"}})
 	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "second line"}})
 	send(&pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: "Return"}})
 
-	want := "Hello, World! 123 café €\nsecond line\n"
+	want := "Hello, World! 123 café Été €\nsecond line\n"
 	deadline := time.Now().Add(10 * time.Second)
 	var got string
 	for time.Now().Before(deadline) {
