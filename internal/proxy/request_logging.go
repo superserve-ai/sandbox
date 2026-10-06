@@ -13,6 +13,7 @@ import (
 	"github.com/felixge/httpsnoop"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/requestlog"
 )
 
@@ -247,6 +248,22 @@ func logRequestOutcome(ctx context.Context, outcome string) {
 		if s.outcome != "process_exited" {
 			s.outcome = outcome
 		}
+		s.mu.Unlock()
+	}
+}
+
+func logVerifiedCaller(ctx context.Context, caller auth.CallerContext) {
+	if s := requestRecordFrom(ctx); s != nil {
+		s.mu.Lock()
+		s.identity = requestlog.VerifiedCaller(caller)
+		s.mu.Unlock()
+	}
+}
+
+func logResourceTeam(ctx context.Context, team string) {
+	if s := requestRecordFrom(ctx); s != nil {
+		s.mu.Lock()
+		s.identity.ResourceTeamID = team
 		s.mu.Unlock()
 	}
 }

@@ -80,14 +80,31 @@ func (h *Handler) authorizeSandboxRequest(
 
 	var verifiedCapability *auth.MachineCapability
 	if strings.HasPrefix(token, "mcap.") {
+		var authorityErr error
 		capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
 		if err == nil && !capability.IsTeamCapability() {
 			if h.machineAuthority == nil {
+				logSandboxAuth(ctx, "error", "")
 				return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}
 			}
-			capability, err = auth.VerifyMachineCapabilityWithAuthority(ctx, token, h.seedKey, time.Now(), h.machineAuthority)
+			capability, err = auth.VerifyMachineCapabilityWithAuthority(ctx, token, h.seedKey, time.Now(), func(ctx context.Context, principal, credential uuid.UUID) (uint64, error) {
+				generation, lookupErr := h.machineAuthority(ctx, principal, credential)
+				authorityErr = lookupErr
+				return generation, lookupErr
+			})
 		}
-		if err != nil || capability.SandboxID.String() != requestSandboxID || capability.Audience != "sandbox-proxy" {
+		if err != nil || capability.Audience != "sandbox-proxy" {
+			outcome := "invalid"
+			if authorityErr != nil {
+				// The authority currently has no typed denial/error distinction.
+				// Do not infer invalid credentials from a failed authority lookup.
+				outcome = "error"
+			}
+			logSandboxAuth(ctx, outcome, "")
+			return InstanceInfo{}, &authzFailure{Status: http.StatusUnauthorized, Message: "invalid machine capability"}
+		}
+		logVerifiedCaller(ctx, *callerContextFromCapability(capability))
+		if capability.SandboxID.String() != requestSandboxID {
 			return InstanceInfo{}, &authzFailure{Status: http.StatusUnauthorized, Message: "invalid machine capability"}
 		}
 		verifiedCapability = &capability
@@ -123,9 +140,7 @@ func (h *Handler) authorizeSandboxRequest(
 			Caller:  verifiedCaller,
 		}
 	}
-	if verifiedCapability == nil {
-		logSandboxAuth(ctx, "authenticated", info.TeamID)
-	}
+	logResourceTeam(ctx, info.TeamID)
 	ownershipState := info.OwnershipState
 	if ownershipState == "" {
 		if info.MachineOwned && info.MachineOwnerPrincipalID != "" {

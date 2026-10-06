@@ -38,8 +38,8 @@ Legacy sandbox access tokens prove sandbox access only. They emit
 or caller-team ID. Resource-team context is present after the existing resolver
 succeeds. A requested sandbox ID can also appear on failed authentication and
 must not be treated as verified resource ownership. No extra lookup is made
-for logging. Exact key/person attribution on this path requires a future
-verified caller-identity contract.
+for logging. Exact key/person attribution on this path requires the verified capability
+contract below; legacy tokens do not acquire it retroactively.
 
 Queries, arbitrary path parameters, headers, credentials, command arguments,
 environment, terminal frames, file contents and error-body snippets are omitted.
@@ -197,3 +197,133 @@ Record control-plane key attribution and data-plane sandbox-only observations
 as separate evidence. This baseline does not establish final machine attribution
 or human QM-management attribution, and local tests do not replace this deployed
 workload verification.
+
+
+## Verified machine integration
+
+The logging adapter consumes the identity authority's `CallerContext` only
+following credential/capability verification. See the
+[machine identity contract](../docs/runbooks/hosted-machine-identity.md) for
+issuance, expiry, revocation and authorization. Logging does not add an
+authority lookup or change permission checks, HTTP responses or stream limits.
+
+The integration is preparatory until that authority's consumer contract and
+rollout are accepted. In particular, the current capability kind `human` does
+not establish session provenance: its producer can use an API key's creator.
+For those capabilities, logs use the verified parent credential as an
+`api_key` actor, omit `user_id`, and never substitute the target machine owner.
+Missing required identity references produce `attribution_status=error`.
+A separately verified human discriminator must come from the identity owner
+before these data-plane records may claim human attribution.
+
+| Observation | Log interpretation |
+| --- | --- |
+| Machine authentication succeeds | `actor_type=machine`, stable principal in `actor_id`, originating credential record in `credential_id`, authenticated caller `team_id` |
+| Credential rotates | Same `actor_id`; newly used credential has a different `credential_id` |
+| Verified caller fails route scope or sandbox ownership | Retain caller metadata and `auth_outcome=authenticated`; record actual rejection status and separately resolved `resource_team_id` |
+| Signature, expiry, audience or current generation fails verification | Do not copy claimed principal/credential/team into logs |
+| Authority lookup fails | `actor_type=unknown`, `auth_outcome=error`, `attribution_status=error`; no claimed caller IDs |
+| Stream ends after credential expiry/revocation | Completion retains the identity verified at establishment; it does not assert that the credential remains valid |
+| Peer edge checks only a capability signature to route it | Forwarding event has no verified machine caller; the owner verifies current authority and emits the primary record |
+
+The current proxy authority interface returns untyped errors for both some
+revocation denials and infrastructure failures. These failed lookups are
+conservatively logged as `error`; the logger does not inspect error strings
+or invent a distinction. A returned generation mismatch is `invalid`.
+The final authority handoff must resolve this distinction before final
+acceptance. A valid, current capability used for another sandbox retains its
+verified caller in the rejection record; its requested sandbox is still only
+the attempted target. HTTP rejection codes remain owned by authentication.
+
+### Rotation and denied-request inventory
+
+Use the same environment and UTC bounds for control and data-plane exports.
+Add this identity predicate to the Cloud Logging query above, keeping all
+four event types for correlation:
+
+```text
+jsonPayload.actor_type = "machine"
+jsonPayload.actor_id = "PRINCIPAL_ID"
+```
+
+Run once with the old credential and once with its replacement. Group the
+primary events by `credential_id`, `service`, `plane`, `method`, `route` and
+`status`. Confirm both credentials belong to the same stable principal.
+Do not require revoked/invalid attempts to match the principal filter: the
+verifier may legitimately discard those claims. Find those attempts using
+the controlled workload window, requested sandbox and captured trusted
+request IDs, and inspect the unfiltered authentication-outcome export.
+
+For the inverse query, retain the shared `service`, `plane`, event and time
+filters and constrain a route plus caller team:
+
+```text
+jsonPayload.route = "/files"
+jsonPayload.team_id = "CALLER_TEAM_ID"
+```
+
+Group by principal and credential. Query `resource_team_id` separately when
+investigating the target team's requests; never merge that field with caller
+team. The primary-event/deduplication procedure above applies to both queries.
+A forward-only record cannot prove the final verified caller or owner result.
+
+### QM management service
+
+QM management logs are a separate collection surface. The
+[QM API runbook](https://github.com/superserve-ai/qm-deployments/blob/304fd561f2490172fa70776af6538485e5bb2459/docs/qm-api.md)
+documents its authority and deployment contract. The configured sink is
+CloudWatch Logs in `us-west-2`, log group `/qm/api` in the selected QM AWS
+account. Verify the actual deployed account, image and log streams first;
+a configured sink or merged code is not evidence of delivery.
+
+Use CloudWatch Logs Insights with the same UTC workload interval:
+
+```text
+fields @timestamp, request_id, actor_type, actor_id, credential_id, user_id, team_id, method, route, status, auth_outcome, attribution_status
+| filter event_type = "request" and service = "qm-api" and plane = "management"
+| filter actor_id = "PRINCIPAL_ID" or credential_id = "CREDENTIAL_ID"
+| sort @timestamp asc
+```
+
+For route/team to callers, replace the identity predicate with:
+
+```text
+| filter route = "/v1/qm/tenants/{id}/admin-link" and team_id = "CALLER_TEAM_ID"
+```
+
+For the verified-human acceptance example, use the console's authenticated
+session adapter and filter by `user_id` and captured request IDs. Require
+`actor_type=human` and `delegated_by=api_key`, keeping the underlying
+`credential_id`. A direct key-only request proves the key and team, not a
+logged-in human. Do not forge a proof or equate a fixture's signed JWT with
+real console-session integration. Use create/delete/admin-link attempts and
+a permission denial; admin-link success depends on its separately enabled
+broker. Never retain a minted link or response body in evidence.
+
+Cloud Logging and CloudWatch request IDs are service-local. No cross-service
+causal trace is implied merely because actor IDs or timestamps match.
+
+### Final evidence checklist
+
+Retain evidence privately, with exact serving revisions, every serving
+host/generation, sink/account, UTC interval and non-secret identity references:
+
+1. The initial legacy workload inventory, explicitly marked sandbox-only.
+2. A real machine-backed QM turn, command/process, file and lifecycle workload
+   with principal/key inventory in both planes. Include local and peer paths,
+   session establishment and closure/cancellation, and comparison against the
+   workload's observed operations.
+3. Same-team cross-sandbox and other-team denials preserving a verified caller
+   where authentication succeeded; invalid/revoked attempts carry no invented
+   caller. Keep caller and resource context distinct.
+4. Credential rotation with stable principal and changed credential, plus the
+   identity owner's expiry/revocation evidence. Logging is not proof of
+   enforcement or of termination of already-started background processes.
+5. A real console human action in the QM sink and matching denial semantics.
+6. Representative full sink records checked privately for synthetic credential,
+   cookie, admin-link, command, file and stream markers. An allowlisted export
+   alone cannot demonstrate absence of leaks in other fields or diagnostics.
+
+Local regression tests validate log behavior, not deployed workload coverage.
+Do not mark final verification complete while any producer, serving revision,
+sink, inventory or identity-authority prerequisite remains unverified.

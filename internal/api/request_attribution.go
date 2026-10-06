@@ -12,6 +12,9 @@ const logIdentityKey = "request_log_identity"
 const logAuthorizationOutcomeKey = "request_log_authorization_outcome"
 
 func logIdentity(c *gin.Context) requestlog.Identity {
+	if caller, ok := VerifiedMachineCallerFromContext(c); ok {
+		return requestlog.VerifiedCaller(caller)
+	}
 	i, _ := c.Get(logIdentityKey)
 	identity, _ := i.(requestlog.Identity)
 	return identity
