@@ -730,6 +730,9 @@ func main() {
 	signal.Notify(hupCh, syscall.SIGHUP)
 
 	lc := newLifecycle(log)
+	if err := network.RemoveMiningGate(); err != nil {
+		log.Warn().Err(err).Msg("stale mining gate cleanup failed; queue bypass remains fail open")
+	}
 
 	// ---- Egress blocklist (optional) ----
 	// VMD_EGRESS_BLOCKLIST_CONFIG points at the operator-supplied config
@@ -1045,6 +1048,9 @@ func main() {
 		log,
 	)
 	egressProxy.SetHostID(cfg.HostID)
+	if os.Getenv("VMD_MINING_POLICY_CONFIG") != "" {
+		egressProxy.EnableMiningStreamTracking()
+	}
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
 	st.mark("vm_manager_init", true, -1)
@@ -1842,6 +1848,7 @@ func main() {
 	// logging. If DATABASE_URL is unset, the reconciler falls back to a
 	// BoltDB ↔ systemd comparison only.
 	var reconcilerDB *dbq.Queries
+	var reloadMiningPolicy func()
 	if cfg.DatabaseURL != "" {
 		dbCfg, dbErr := pgxpool.ParseConfig(cfg.DatabaseURL)
 		if dbErr != nil {
@@ -1885,6 +1892,7 @@ func main() {
 			return nil
 		})
 		log.Info().Msg("reconciler DB connection ready")
+		reloadMiningPolicy = startMiningProtection(ctx, cfg, dbPool, egressProxy, lc, log, recorder, mgr)
 
 		// Per-connection egress logging. Drops on a full buffer rather than
 		// back-pressuring the proxy's data path.
@@ -2125,6 +2133,9 @@ func main() {
 		for {
 			select {
 			case <-hupCh:
+				if reloadMiningPolicy != nil {
+					reloadMiningPolicy()
+				}
 				if blockList != nil && blocklistPath != "" {
 					log.Info().Msg("SIGHUP: reloading egress blocklist config")
 					blockList.Reload(blocklistPath)
