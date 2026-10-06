@@ -317,6 +317,18 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 		t.Fatalf("with Num Lock the terminal received %q, want %q", got, want)
 	}
 
+	// Shift locked: literal text is typed with the lock cleared and the
+	// lock is back afterwards.
+	xkbLatchLockState(t, display, xproto.ModMaskShift, xproto.ModMaskShift, false, 0)
+	if state, err := s.x11.backend.xkbGetState(); err != nil || !state.shiftLock {
+		t.Fatalf("state after Shift lock = %+v, %v; want shiftLock", state, err)
+	}
+	expect("with Shift Lock", "1a\n")
+	if state, err := s.x11.backend.xkbGetState(); err != nil || !state.shiftLock {
+		t.Fatalf("Shift lock was not restored: %+v, %v", state, err)
+	}
+	xkbLatchLockState(t, display, xproto.ModMaskShift, 0, false, 0)
+
 	// A second group made active: the X11 path declines (its keycodes
 	// would type the other group's symbols) and xdotool, which locks the
 	// group per keysym, types the text.
@@ -328,7 +340,7 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	if out, err := layout.CombinedOutput(); err != nil {
 		t.Fatalf("setxkbmap: %v: %s", err, out)
 	}
-	xkbLockGroup(t, display, 1)
+	xkbLatchLockState(t, display, 0, 0, true, 1)
 	if state, err := s.x11.backend.xkbGetState(); err != nil || state.group != 1 {
 		t.Fatalf("state after lock = %+v, %v; want group 1", state, err)
 	}
@@ -339,9 +351,10 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	}
 }
 
-// xkbLockGroup locks the keyboard group from a connection of its own:
-// XkbUseExtension(1.0), then XkbLatchLockState(XkbUseCoreKbd, lockGroup).
-func xkbLockGroup(t *testing.T, display string, group byte) {
+// xkbLatchLockState sends XkbLatchLockState(XkbUseCoreKbd, ...) from a
+// connection of its own, after XkbUseExtension(1.0): modifier locks and,
+// when lockGroup is set, the group lock.
+func xkbLatchLockState(t *testing.T, display string, affectModLocks, modLocks byte, lockGroup bool, group byte) {
 	t.Helper()
 	conn, err := xgb.NewConnDisplay(display)
 	if err != nil {
@@ -365,7 +378,10 @@ func xkbLockGroup(t *testing.T, display string, group byte) {
 	lock[0], lock[1] = ext.MajorOpcode, 5
 	xgb.Put16(lock[2:], 4)
 	xgb.Put16(lock[4:], 0x100)
-	lock[8], lock[9] = 1, group // lockGroup, groupLock
+	lock[6], lock[7] = affectModLocks, modLocks
+	if lockGroup {
+		lock[8], lock[9] = 1, group
+	}
 	cookie = conn.NewCookie(true, false)
 	conn.NewRequest(lock, cookie)
 	if err := cookie.Check(); err != nil {

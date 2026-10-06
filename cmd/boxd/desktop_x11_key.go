@@ -78,6 +78,25 @@ func (b *x11Backend) xkbGetState() (xkbState, error) {
 	return xkbStateFromReply(reply), nil
 }
 
+// xkbLockShift sets or clears the Shift lock: XkbLatchLockState with
+// affectModLocks = Shift.
+func (b *x11Backend) xkbLockShift(on bool) error {
+	req := make([]byte, 16)
+	req[0], req[1] = b.xkbOpcode, 5
+	xgb.Put16(req[2:], 4)
+	xgb.Put16(req[4:], 0x100)
+	req[6] = xproto.ModMaskShift
+	if on {
+		req[7] = xproto.ModMaskShift
+	}
+	cookie := b.conn.NewCookie(true, false)
+	b.conn.NewRequest(req, cookie)
+	if err := cookie.Check(); err != nil {
+		return fmt.Errorf("XkbLatchLockState: %w", err)
+	}
+	return nil
+}
+
 func (b *x11Backend) xkbRequest(req []byte) ([]byte, error) {
 	cookie := b.conn.NewCookie(true, true)
 	b.conn.NewRequest(req, cookie)
@@ -487,16 +506,12 @@ func (p *keyPlanner) chord(modifiers []string, key string) error {
 // planKey lowers a validated KeyEvent for the given keyboard state. On
 // success the keymap's scratch state is updated to what the plan will bind.
 //
-// Two states are declined outright: the core map describes the first group
-// only, so under another group a layout keycode types that group's symbol;
-// and a locked Shift would shift every keycode sent. xdotool handles both
-// (it locks groups per keysym), so it keeps those cases.
+// Another active group is declined outright: the core map describes the
+// first group only, so a layout keycode would type that group's symbol.
+// xdotool locks groups per keysym, so it keeps that case.
 func planKey(km *x11Keymap, state xkbState, ev *pb.KeyEvent) ([]keySegment, error) {
 	if state.group != 0 {
 		return nil, fmt.Errorf("keyboard group %d is active: %w", state.group+1, errBackendKept)
-	}
-	if state.shiftLock {
-		return nil, fmt.Errorf("shift lock is active: %w", errBackendKept)
 	}
 	p := newKeyPlanner(km, state)
 	var err error
@@ -541,6 +556,15 @@ func (b *x11Backend) Key(ev *pb.KeyEvent) error {
 	segments, err := planKey(km, state, ev)
 	if err != nil {
 		return err
+	}
+	// A locked Shift cannot be undone per key (Shift is not a toggle), so
+	// literal text is typed with the lock cleared and the lock put back
+	// afterwards; a symbolic key keeps it, as it does for xdotool.
+	if _, literal := ev.GetInput().(*pb.KeyEvent_Text); literal && state.shiftLock {
+		if err := b.xkbLockShift(false); err != nil {
+			return err
+		}
+		defer func() { _ = b.xkbLockShift(true) }()
 	}
 	for _, seg := range segments {
 		if len(seg.binds) > 0 {

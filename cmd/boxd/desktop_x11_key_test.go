@@ -342,12 +342,15 @@ func TestPlanKey_UsesShiftRWhenShiftLIsAbsent(t *testing.T) {
 }
 
 func TestPlanKey_DeclinesForKeyboardStateItCannotHonor(t *testing.T) {
-	for name, state := range map[string]xkbState{"second group": {group: 1}, "shift lock": {shiftLock: true}} {
-		km := testKeymap(1)
-		if _, err := planKey(km, state, textEvent("1")); !errors.Is(err, errBackendKept) {
-			t.Errorf("%s: err = %v, want errBackendKept", name, err)
-		}
+	if _, err := planKey(testKeymap(1), xkbState{group: 1}, textEvent("1")); !errors.Is(err, errBackendKept) {
+		t.Errorf("second group: err = %v, want errBackendKept", err)
 	}
+	// Shift Lock is cleared around literal text by Key, not planned around.
+	segs, err := planKey(testKeymap(1), xkbState{shiftLock: true}, textEvent("1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsEqual(t, segs[0].events, tapEvents(kc1))
 }
 
 func TestPlanKey_DeclinesBeforeTouchingTheServer(t *testing.T) {
