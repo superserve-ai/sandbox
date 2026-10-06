@@ -18,3 +18,5 @@ BEGIN
         GRANT SELECT, INSERT, UPDATE, DELETE ON abuse_runtime_settings TO service_role;
     END IF;
 END $$;
+
+CREATE INDEX idx_profile_abuse_email_domain ON profile (lower(split_part(email, '@', 2)));

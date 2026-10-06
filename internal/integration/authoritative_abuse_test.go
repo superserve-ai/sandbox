@@ -173,6 +173,11 @@ func TestAuthoritativeAbuseCorporateProof(t *testing.T) {
 		if err != nil || policy.Trusted != tc.trusted || policy.Restricted == tc.trusted {
 			t.Fatalf("proof=%s policy=%+v err=%v", tc.data, policy, err)
 		}
+		source := abuse.NewAuthoritativeSource(tx, abuse.AuthoritativeOptions{})
+		source.Refresh(ctx)
+		if !source.Stats().Ready || source.TeamPolicy(team).Trusted != tc.trusted || source.TeamPolicy(team).Restricted == tc.trusted {
+			t.Fatalf("proof=%s cached policy=%+v", tc.data, source.TeamPolicy(team))
+		}
 	}
 	if _, err = tx.Exec(ctx, `UPDATE abuse_trusted_identities SET revoked_at=now() WHERE domain='corporate.example'`); err != nil {
 		t.Fatal(err)
@@ -180,5 +185,53 @@ func TestAuthoritativeAbuseCorporateProof(t *testing.T) {
 	policy, err := abuse.ResolveTeamPolicy(ctx, tx, team)
 	if err != nil || policy.Trusted || !policy.Restricted {
 		t.Fatalf("revoked association: %+v %v", policy, err)
+	}
+}
+
+func TestAuthoritativeAbuseIdentityRestrictions(t *testing.T) {
+	ctx := context.Background()
+	owner := seedRBACProfile(t)
+	otherOwner := seedRBACProfile(t)
+	owned := mustCreateTeam(t, ctx, "owned-"+uuid.NewString()[:8])
+	other := mustCreateTeam(t, ctx, "other-"+uuid.NewString()[:8])
+	for team, user := range map[uuid.UUID]uuid.UUID{owned: owner, other: otherOwner} {
+		seedMembership(t, ctx, team, user)
+		seedTeamRoleAssignment(t, ctx, user, mustRoleID(t, ctx, "team_owner"), team)
+	}
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	domain := uuid.NewString() + ".example"
+	if _, err := tx.Exec(ctx, `UPDATE profile SET email=$1 WHERE id=$2`, "owner@"+domain, owner); err != nil {
+		t.Fatal(err)
+	}
+	for _, subject := range []string{"user", "domain"} {
+		var restriction uuid.UUID
+		if subject == "user" {
+			err = tx.QueryRow(ctx, `INSERT INTO abuse_restrictions(subject_type,subject_value,subject_user_id,action,source,reason) VALUES('user',$1,$2,'create','test','synthetic') RETURNING id`, owner.String(), owner).Scan(&restriction)
+		} else {
+			err = tx.QueryRow(ctx, `INSERT INTO abuse_restrictions(subject_type,subject_value,action,source,reason) VALUES('domain',$1,'resume','test','synthetic') RETURNING id`, domain).Scan(&restriction)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, released := range []bool{false, true} {
+			if released {
+				if _, err := tx.Exec(ctx, `UPDATE abuse_restrictions SET released_at=now() WHERE id=$1`, restriction); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source := abuse.NewAuthoritativeSource(tx, abuse.AuthoritativeOptions{})
+			source.Refresh(ctx)
+			if !source.Stats().Ready || source.TeamPolicy(owned).Restricted == released || source.TeamPolicy(other).Restricted {
+				t.Fatalf("%s released=%v: owned=%+v other=%+v", subject, released, source.TeamPolicy(owned), source.TeamPolicy(other))
+			}
+			current, err := abuse.ResolveTeamPolicy(ctx, tx, owned)
+			if err != nil || current.Restricted == released {
+				t.Fatalf("%s released=%v: current=%+v err=%v", subject, released, current, err)
+			}
+		}
 	}
 }
