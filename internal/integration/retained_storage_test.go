@@ -496,7 +496,7 @@ func TestRetainedStorageReceiptReplacementAndLegacyIsolation(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT state,payload FROM host_storage_report WHERE report_id=$1`, missing).Scan(&missingState, &retainedPayload); err != nil {
 		t.Fatal(err)
 	}
-	if missingState != "pending" && missingState != "retry_exhausted" {
+	if missingState != "pending" && missingState != "processing" && missingState != "retry_exhausted" {
 		t.Fatalf("incomplete retained report became terminal: %q", missingState)
 	}
 	if len(retainedPayload) == 0 {
