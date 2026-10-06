@@ -28,7 +28,7 @@ func testKeymap(spares int) *x11Keymap {
 	for i := 0; i < spares+1; i++ {
 		syms = append(syms, 0, 0)
 	}
-	return buildKeymap(8, 2, syms, nil)
+	return buildKeymap(8, 2, syms, nil, nil)
 }
 
 func TestBuildKeymap_ReservesOneKeycodeForTheFallback(t *testing.T) {
@@ -270,6 +270,33 @@ func TestX11Holder_DisplayChangeForgetsBindingsWithoutABackend(t *testing.T) {
 	}
 }
 
+// An empty row that is still a modifier (say, Lock) is not scratch.
+func TestBuildKeymap_ExcludesModifierKeycodesFromThePool(t *testing.T) {
+	var syms []xproto.Keysym
+	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0, 0}, {0, 0}, {0, 0}} {
+		syms = append(syms, r[0], r[1])
+	}
+	km := buildKeymap(8, 2, syms, []xproto.Keycode{kcShift, kcSpare0, 0, 0}, nil)
+	if fmt.Sprint(km.spare) != fmt.Sprint([]xproto.Keycode{kcSpare1}) {
+		t.Errorf("spare = %v, want only %d (%d is a modifier, %d reserved)", km.spare, kcSpare1, kcSpare0, kcSpare1+1)
+	}
+}
+
+// A layout with only Shift_R still shifts.
+func TestPlanKey_UsesShiftRWhenShiftLIsAbsent(t *testing.T) {
+	var syms []xproto.Keysym
+	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftR, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0, 0}, {0, 0}} {
+		syms = append(syms, r[0], r[1])
+	}
+	km := buildKeymap(8, 2, syms, nil, nil)
+	segs, err := planKey(km, xkbState{}, textEvent("AÉ"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(shiftedTap(kcA), shiftedTap(kcSpare0)...)
+	eventsEqual(t, segs[0].events, want)
+}
+
 func TestPlanKey_DeclinesBeforeTouchingTheServer(t *testing.T) {
 	cases := map[string]struct {
 		spares int
@@ -307,7 +334,7 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0xe9, 0}, {0, 0}, {0, 0}} {
 		syms = append(syms, r[0], r[1])
 	}
-	reloaded := buildKeymap(8, 2, syms, km)
+	reloaded := buildKeymap(8, 2, syms, nil, km)
 	if _, direct := reloaded.direct[0xe9]; direct {
 		t.Error("scratch keycode was promoted to a layout key")
 	}
@@ -318,11 +345,11 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	// A reload that no longer types é on that keycode drops the binding:
 	// cleared, it is spare again; rewritten, it is a layout key.
 	cleared := append(append([]xproto.Keysym{}, syms[:18]...), 0, 0, 0, 0, 0, 0)
-	if r := buildKeymap(8, 2, cleared, km); len(r.bound) != 0 || len(r.spare) != 2 {
+	if r := buildKeymap(8, 2, cleared, nil, km); len(r.bound) != 0 || len(r.spare) != 2 {
 		t.Errorf("cleared row: bound = %v, spare = %v; want no binding and two spares", r.bound, r.spare)
 	}
 	rewritten := append(append([]xproto.Keysym{}, syms[:18]...), 'z', 'Z', 0, 0, 0, 0)
-	r := buildKeymap(8, 2, rewritten, km)
+	r := buildKeymap(8, 2, rewritten, nil, km)
 	if len(r.bound) != 0 || r.direct['z'].code != kcSpare0 || len(r.spare) != 1 {
 		t.Errorf("rewritten row: bound = %v, direct[z] = %v, spare = %v; want z on %d and one spare", r.bound, r.direct['z'], r.spare, kcSpare0)
 	}
@@ -330,11 +357,11 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	// The server exports a bound cased letter as its lower/upper pair:
 	// still ours. Any other symbol on the row means another client owns it.
 	paired := append(append([]xproto.Keysym{}, syms[:18]...), 0xe9, 0xc9, 0, 0, 0, 0)
-	if r := buildKeymap(8, 2, paired, km); r.bound[kcSpare0] != 0xe9 {
+	if r := buildKeymap(8, 2, paired, nil, km); r.bound[kcSpare0] != 0xe9 {
 		t.Errorf("paired row: bound = %v, want é kept on %d", r.bound, kcSpare0)
 	}
 	foreign := append(append([]xproto.Keysym{}, syms[:18]...), 0xe9, 'x', 0, 0, 0, 0)
-	if r := buildKeymap(8, 2, foreign, km); len(r.bound) != 0 || r.direct['x'].code != kcSpare0 {
+	if r := buildKeymap(8, 2, foreign, nil, km); len(r.bound) != 0 || r.direct['x'].code != kcSpare0 {
 		t.Errorf("foreign row: bound = %v, direct[x] = %v; want the binding dropped and x on %d", r.bound, r.direct['x'], kcSpare0)
 	}
 }
@@ -495,7 +522,7 @@ func TestBuildKeymap_KeepsLRUOrderAcrossRebuilds(t *testing.T) {
 		syms = append(syms, r[0], r[1])
 	}
 	for i := 0; i < 20; i++ {
-		rebuilt := buildKeymap(8, 2, syms, km)
+		rebuilt := buildKeymap(8, 2, syms, nil, km)
 		if fmt.Sprint(rebuilt.spare) != fmt.Sprint(km.spare) {
 			t.Fatalf("rebuild %d reordered the pool: %v, was %v", i, rebuilt.spare, km.spare)
 		}
@@ -528,7 +555,7 @@ func TestX11Holder_ReconnectInheritsScratchBindings(t *testing.T) {
 	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0xe9, 0xc9}, {0, 0}, {0, 0}} {
 		syms = append(syms, r[0], r[1])
 	}
-	rebuilt := buildKeymap(8, 2, syms, s.x11.keys)
+	rebuilt := buildKeymap(8, 2, syms, nil, s.x11.keys)
 	if rebuilt.bound[kcSpare0] != 0xe9 {
 		t.Errorf("bound = %v, want é still owned on %d after the reconnect", rebuilt.bound, kcSpare0)
 	}

@@ -17,7 +17,10 @@ import (
 // keycode. The connection stays up and the caller may use xdotool instead.
 var errBackendKept = errors.New("x11 key path declined")
 
-const keysymShiftL = 0xffe1
+const (
+	keysymShiftL = 0xffe1
+	keysymShiftR = 0xffe2
+)
 
 type xkbProbe uint8
 
@@ -111,6 +114,17 @@ type keystroke struct {
 	shift bool
 }
 
+// shift is the keycode that holds Shift: the left key when the layout has
+// it, else the right one.
+func (km *x11Keymap) shift() (xproto.Keycode, bool) {
+	for _, ks := range []uint32{keysymShiftL, keysymShiftR} {
+		if st, ok := km.direct[ks]; ok && !st.shift {
+			return st.code, true
+		}
+	}
+	return 0, false
+}
+
 type keyEvent struct {
 	code  xproto.Keycode
 	press bool
@@ -134,12 +148,13 @@ type keySegment struct {
 	events []keyEvent
 }
 
-// buildKeymap lowers a core keyboard mapping to lookup tables. prev is the
-// map built last time, if any: its scratch keycodes stay bound only if the
+// buildKeymap lowers a core keyboard mapping to lookup tables. modifiers
+// are the keycodes of the server's modifier map. prev is the map built last
+// time, if any: its scratch keycodes stay bound only if the
 // fetched row is still the single-keysym key that was installed (otherwise
 // the row decides), and they rejoin the pool in its order so the least
 // recently used one is still evicted first.
-func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, prev *x11Keymap) *x11Keymap {
+func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifiers []xproto.Keycode, prev *x11Keymap) *x11Keymap {
 	km := &x11Keymap{perCode: perCode, direct: map[uint32]keystroke{}, bound: map[xproto.Keycode]uint32{}}
 	var bound map[xproto.Keycode]uint32
 	if prev != nil {
@@ -147,6 +162,14 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, prev *x1
 	}
 	if perCode < 1 {
 		return km
+	}
+	// A keycode can sit in the modifier map with no keysyms at all;
+	// pressing it would still toggle that modifier, so it is never scratch.
+	modifier := map[xproto.Keycode]bool{}
+	for _, code := range modifiers {
+		if code != 0 {
+			modifier[code] = true
+		}
 	}
 	for i := 0; (i+1)*perCode <= len(syms); i++ {
 		code := xproto.Keycode(int(min) + i)
@@ -163,7 +186,9 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, prev *x1
 			}
 		}
 		if empty {
-			km.spare = append(km.spare, code)
+			if !modifier[code] {
+				km.spare = append(km.spare, code)
+			}
 			continue
 		}
 		if ks := uint32(row[0]); ks != 0 {
@@ -222,11 +247,18 @@ func scratchRowIntact(row []xproto.Keysym, ks uint32) bool {
 func (b *x11Backend) keymap() (*x11Keymap, error) {
 	setup := xproto.Setup(b.conn)
 	count := int(setup.MaxKeycode) - int(setup.MinKeycode) + 1
-	reply, err := xproto.GetKeyboardMapping(b.conn, setup.MinKeycode, byte(count)).Reply()
+	// Both requests are in flight before either reply is read: one trip.
+	keysCookie := xproto.GetKeyboardMapping(b.conn, setup.MinKeycode, byte(count))
+	modsCookie := xproto.GetModifierMapping(b.conn)
+	reply, err := keysCookie.Reply()
 	if err != nil {
 		return nil, fmt.Errorf("keyboard mapping: %w", err)
 	}
-	b.keys = buildKeymap(setup.MinKeycode, int(reply.KeysymsPerKeycode), reply.Keysyms, b.keys)
+	mods, err := modsCookie.Reply()
+	if err != nil {
+		return nil, fmt.Errorf("modifier mapping: %w", err)
+	}
+	b.keys = buildKeymap(setup.MinKeycode, int(reply.KeysymsPerKeycode), reply.Keysyms, mods.Keycodes, b.keys)
 	return b.keys, nil
 }
 
@@ -294,7 +326,7 @@ func (p *keyPlanner) scratch(ks uint32) (xproto.Keycode, bool) {
 // as alphabetic too), and Shift flips it back. A symbolic key keeps the
 // lock's effect, as it does for xdotool.
 func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
-	_, hasShift := p.km.direct[keysymShiftL]
+	_, hasShift := p.km.shift()
 	invert := literal && p.capsLock && hasShift && casedLetter(ks)
 	// The layout's second column is only known to be Shift-selected for
 	// printable symbols. Keypad keys are chosen by Num Lock, and keys such
@@ -368,13 +400,14 @@ func (p *keyPlanner) emit(code xproto.Keycode, press bool) {
 }
 
 func (p *keyPlanner) tap(st keystroke) {
+	shift, _ := p.km.shift()
 	if st.shift {
-		p.emit(p.km.direct[keysymShiftL].code, true)
+		p.emit(shift, true)
 	}
 	p.emit(st.code, true)
 	p.emit(st.code, false)
 	if st.shift {
-		p.emit(p.km.direct[keysymShiftL].code, false)
+		p.emit(shift, false)
 	}
 }
 
@@ -422,9 +455,9 @@ func (p *keyPlanner) chord(modifiers []string, key string) error {
 	for _, code := range mods {
 		p.emit(code, true)
 	}
-	if shift, ok := p.km.direct[keysymShiftL]; ok && st.shift {
+	if shift, ok := p.km.shift(); ok && st.shift {
 		for _, code := range mods {
-			if code == shift.code {
+			if code == shift {
 				st.shift = false
 			}
 		}
