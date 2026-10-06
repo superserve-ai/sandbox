@@ -41,6 +41,9 @@ jobs:
       - name: Run deploy-script tests
         run: python3 -m unittest discover -s .github/workflows/scripts -p 'test_*.py'
 
+      - name: Run storage catalog provisioning tests
+        run: python3 -m unittest discover -s scripts -p 'test_provision_storage_stripe.py'
+
       - name: Run host identity provisioning tests
         run: python3 -m unittest discover -v -s deploy -p 'test_host_identity.py'
 

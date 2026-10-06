@@ -95,7 +95,7 @@ func TestMain(m *testing.M) {
 	stopSetup()
 
 	workerCtx, stopStorageWorker := context.WithCancel(context.Background())
-	api.StartStorageReportWorker(workerCtx, testPool)
+	api.StartStorageReportWorkerWithInterval(workerCtx, testPool, 25*time.Millisecond)
 	code := m.Run()
 	stopStorageWorker()
 	if _, err := lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, integrationSchemaLockKey); err != nil {

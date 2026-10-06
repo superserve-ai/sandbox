@@ -1,4 +1,9 @@
 import {
+  to = google_secret_manager_secret.operator_api_token
+  id = "projects/rayai-dev/secrets/operator-api-token-staging"
+}
+
+import {
   to = module.network.google_compute_network.this[0]
   id = "projects/rayai-dev/global/networks/superserve-network-3cb2c3b"
 }
