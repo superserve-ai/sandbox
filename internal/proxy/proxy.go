@@ -83,6 +83,9 @@ type Handler struct {
 	// Machine capabilities fail closed when a proxy has not been configured
 	// with it; legacy tokens remain available only to ordinary sandboxes.
 	machineAuthority            auth.RevocationAuthority
+	machineAuthoritySnapshotter interface {
+		LookupSnapshot(context.Context, uuid.UUID, uuid.UUID) (uint64, time.Time, error)
+	}
 	machineAuthorityInvalidator interface {
 		InvalidateCredential(uuid.UUID)
 		InvalidatePrincipal(uuid.UUID)

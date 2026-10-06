@@ -53,6 +53,13 @@ CREATE TABLE machine_lifecycle_operation (
     operation_id uuid NOT NULL,
     operation_kind text NOT NULL CHECK (operation_kind IN ('issue','rotate','restore')),
     expected_generation bigint NOT NULL CHECK (expected_generation > 0),
+    input_digest bytea NOT NULL DEFAULT decode('', 'hex'),
+    lineage_id uuid NOT NULL DEFAULT gen_random_uuid(),
+    credential_digest bytea,
+    replacement_credential_id uuid,
+    expires_at timestamptz NOT NULL DEFAULT now() + interval '24 hours',
+    permissions text[] NOT NULL DEFAULT ARRAY['sandbox:read'],
+    audience text NOT NULL DEFAULT 'sandbox-api',
     result_credential_id uuid REFERENCES machine_credential(id),
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (principal_id, operation_id)

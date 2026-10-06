@@ -35,6 +35,10 @@ type InstanceInfo struct {
 	// MachineOwned is set by a resolver that has loaded the durable owner
 	// record. Legacy sandbox-only tokens are rejected for such instances.
 	MachineOwned bool
+	// OwnershipState is an attested classification. Empty/unknown never
+	// becomes ordinary by inference; legacy callers must receive an explicit
+	// ordinary attestation from a capable producer.
+	OwnershipState auth.OwnershipState
 	// MachineOwnerPrincipalID is the durable owner attestation returned by
 	// the control plane/VMD for machine-owned sandboxes. It is required for
 	// machine capability authorization; an absent value fails closed.
@@ -209,12 +213,13 @@ type vmdResponse struct {
 	OwnerID   string `json:"owner_id"`
 	// MachineOwned is an explicit control-plane/VMD attestation. The proxy
 	// never infers machine ownership from OwnerID or caller-provided metadata.
-	MachineOwned             bool              `json:"machine_owned"`
-	MachineOwnerPrincipalID  string            `json:"machine_owner_principal_id"`
-	PreviewAccess            string            `json:"preview_access"`
-	PreviewPorts             map[string]bool   `json:"preview_ports"`
-	PreviewPortAccess        map[string]string `json:"preview_port_access"`
-	PreviewPortTokenVersions map[string]int64  `json:"preview_port_token_versions"`
+	MachineOwned             bool                `json:"machine_owned"`
+	MachineOwnerPrincipalID  string              `json:"machine_owner_principal_id"`
+	OwnershipState           auth.OwnershipState `json:"ownership_state"`
+	PreviewAccess            string              `json:"preview_access"`
+	PreviewPorts             map[string]bool     `json:"preview_ports"`
+	PreviewPortAccess        map[string]string   `json:"preview_port_access"`
+	PreviewPortTokenVersions map[string]int64    `json:"preview_port_token_versions"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64) (InstanceInfo, error) {
@@ -255,10 +260,15 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 		return InstanceInfo{}, fmt.Errorf("resolver: decode response: %w", err)
 	}
 
+	ownershipState := raw.OwnershipState
+	if ownershipState == "" {
+		ownershipState = auth.OwnershipUnknown
+	}
 	info := InstanceInfo{
 		VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt,
 		TeamID: raw.TeamID, OwnerID: raw.OwnerID, MachineOwned: raw.MachineOwned,
 		MachineOwnerPrincipalID:  raw.MachineOwnerPrincipalID,
+		OwnershipState:           ownershipState,
 		PreviewAccess:            raw.PreviewAccess,
 		PreviewPorts:             decodePreviewPorts(raw.PreviewPorts),
 		PreviewPortAccess:        decodePreviewPortAccess(raw.PreviewPorts, raw.PreviewPortAccess),

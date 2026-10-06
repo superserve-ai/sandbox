@@ -1120,6 +1120,19 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return "", false
 		}
 	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		if publisher, ok := vmd.(interface {
+			PublishSandboxOwnership(context.Context, string, uuid.UUID, uuid.UUID) error
+		}); ok {
+			if publishErr := publisher.PublishSandboxOwnership(c.Request.Context(), sandboxID.String(), caller.PrincipalID, teamID); publishErr != nil {
+				l.Error().Err(publishErr).Msg("publish machine sandbox ownership attestation after resume failed")
+				markRevert()
+				revertToPaused()
+				respondError(c, ErrInternal)
+				return "", false
+			}
+		}
+	}
 	tPostStart = time.Now()
 
 	// Older vmd builds may return 0 for vcpu/mem on both the Resume and
@@ -1491,6 +1504,9 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 
 // ownerIDFromContext returns the actor's UUID as a string, or "" when unknown.
 func ownerIDFromContext(c *gin.Context) string {
+	if caller, machine := machineCallerFromContext(c); machine {
+		return "machine:" + caller.PrincipalID.String()
+	}
 	if a := actorIDFromContext(c); a != nil {
 		return a.String()
 	}
@@ -2359,7 +2375,16 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 		if h.Config == nil || h.Config.SandboxAccessTokenSeed == nil || caller.Audience != "sandbox-proxy" {
 			return resp
 		}
-		ownership := auth.SandboxOwnership{SandboxID: s.ID, OwnerPrincipalID: caller.PrincipalID, TeamID: caller.TeamID}
+		if h.DB == nil {
+			return resp
+		}
+		owner, err := h.DB.GetMachineSandboxOwner(c.Request.Context(), s.ID, caller.TeamID)
+		if err != nil || owner.OwnerPrincipalID != caller.PrincipalID || owner.TeamID != caller.TeamID {
+			// Ownership is authoritative durable state. A missing/unknown row is
+			// not ordinary ownership and must not produce a usable capability.
+			return resp
+		}
+		ownership := auth.SandboxOwnership{SandboxID: owner.SandboxID, OwnerPrincipalID: owner.OwnerPrincipalID, TeamID: owner.TeamID}
 		now := timeNow(h)
 		capability, err := auth.DeriveCapability(caller, ownership, s.ID, "sandbox-proxy", caller.Permissions, caller.ExpiresAt, now)
 		if err != nil {
@@ -2673,7 +2698,36 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 				Str("sandbox_id", sandboxID.String()).
 				Msg("RBAC sandbox token permission check failed")
 		} else if canWrite {
-			resp = h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
+			// Machine-owned sandboxes never fall back to creator-derived legacy
+			// tokens. An authorized human receives a typed child capability that
+			// carries the verified actor and team instead of impersonating the
+			// machine owner.
+			if h.DB != nil {
+				if owner, ownerErr := h.DB.GetMachineSandboxOwner(c.Request.Context(), sandbox.ID, teamID); ownerErr == nil {
+					if actor := actorIDFromContext(c); actor != nil && owner.TeamID == teamID {
+						now := timeNow(h)
+						parentID, _ := uuid.Parse(c.GetString("api_key_id"))
+						capability, capErr := auth.DeriveHumanCapabilityWithParent(*actor, parentID, teamID, sandbox.ID, "sandbox-proxy", []auth.MachineOperation{
+							auth.MachineOperationRead, auth.MachineOperationReconnect,
+							auth.MachineOperationCommandRun, auth.MachineOperationCommandRead, auth.MachineOperationCommandWrite, auth.MachineOperationCommandSignal,
+							auth.MachineOperationFileRead, auth.MachineOperationFileWrite,
+						}, now.Add(15*time.Minute), now)
+						if capErr == nil && h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+							if token, signErr := auth.SignMachineCapability(capability, h.Config.SandboxAccessTokenSeed, now); signErr == nil {
+								resp.AccessToken = token
+								resp.RoutingHint = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, sandbox.ID.String(), sandbox.HostID, h.Config.EdgeProxyDomain, c.GetTime("routing_observed_at"), sandbox.RoutingVersion)
+							}
+						}
+					}
+				}
+			}
+			if resp.AccessToken == "" && h.DB != nil {
+				// Ordinary sandboxes retain legacy compatibility only after the
+				// ownership lookup positively establishes that no machine row exists.
+				if _, ownerErr := h.DB.GetMachineSandboxOwner(c.Request.Context(), sandbox.ID, teamID); ownerErr != nil {
+					resp = h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
+				}
+			}
 			resp.PreviewAccess = row.Access
 		}
 	}
@@ -3356,6 +3410,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		if err == nil && tx != nil {
 			err = tx.Commit(insertCtx)
+		}
+		if err == nil && machineRequest {
+			if publisher, ok := vmd.(interface {
+				PublishSandboxOwnership(context.Context, string, uuid.UUID, uuid.UUID) error
+			}); ok {
+				// Publication happens only after the sandbox/owner transaction
+				// commits; a failed attestation cannot yield a usable token.
+				err = publisher.PublishSandboxOwnership(insertCtx, sb.ID.String(), machineCaller.PrincipalID, teamID)
+			}
 		}
 		tInsertEnd = time.Now()
 		insertCh <- insertResult{sandbox: sb, err: err}

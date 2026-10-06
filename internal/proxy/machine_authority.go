@@ -9,16 +9,19 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 )
 
 // CachedMachineAuthority provides the bounded local freshness boundary used by
 // request and stream admission. Revoked/disabled rows are misses; an outage
 // never extends an expired snapshot and no frame performs durable I/O.
 type CachedMachineAuthority struct {
-	pool  *pgxpool.Pool
-	ttl   time.Duration
-	mu    sync.Mutex
-	items map[machineAuthorityKey]machineAuthorityEntry
+	pool   *pgxpool.Pool
+	ttl    time.Duration
+	mu     sync.Mutex
+	items  map[machineAuthorityKey]machineAuthorityEntry
+	epoch  uint64
+	flight singleflight.Group
 }
 
 type machineAuthorityKey struct{ principal, credential uuid.UUID }
@@ -26,6 +29,8 @@ type machineAuthorityEntry struct {
 	generation uint64
 	expiresAt  time.Time
 }
+
+var errAuthoritySnapshotExpired = errors.New("machine authority snapshot expired")
 
 func NewCachedMachineAuthority(pool *pgxpool.Pool, ttl time.Duration) *CachedMachineAuthority {
 	if ttl <= 0 {
@@ -36,39 +41,77 @@ func NewCachedMachineAuthority(pool *pgxpool.Pool, ttl time.Duration) *CachedMac
 }
 
 func (a *CachedMachineAuthority) Lookup(ctx context.Context, principalID, credentialID uuid.UUID) (uint64, error) {
+	generation, _, err := a.LookupSnapshot(ctx, principalID, credentialID)
+	return generation, err
+}
+
+// LookupSnapshot returns the generation and an absolute freshness deadline.
+// The deadline is based on when the durable observation began, not when a
+// slow query happened to complete. In-flight fills are coalesced and an
+// invalidation epoch prevents late results from re-entering the cache.
+func (a *CachedMachineAuthority) LookupSnapshot(ctx context.Context, principalID, credentialID uuid.UUID) (uint64, time.Time, error) {
 	if a == nil || a.pool == nil || principalID == uuid.Nil || credentialID == uuid.Nil {
-		return 0, errors.New("machine authority unavailable")
+		return 0, time.Time{}, errors.New("machine authority unavailable")
 	}
 	now := time.Now()
 	key := machineAuthorityKey{principal: principalID, credential: credentialID}
 	a.mu.Lock()
 	if entry, ok := a.items[key]; ok && now.Before(entry.expiresAt) {
 		a.mu.Unlock()
-		return entry.generation, nil
+		return entry.generation, entry.expiresAt, nil
 	}
+	epoch := a.epoch
 	a.mu.Unlock()
-
-	var generation int64
-	err := a.pool.QueryRow(ctx, `SELECT c.revocation_generation FROM machine_credential c JOIN machine_principal p ON p.id=c.principal_id WHERE c.id=$1 AND c.principal_id=$2 AND c.state='active' AND c.expires_at>now() AND p.status='active' AND c.revocation_generation=p.generation`, credentialID, principalID).Scan(&generation)
-	if err != nil {
-		a.mu.Lock()
-		delete(a.items, key)
-		a.mu.Unlock()
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, errors.New("machine authority denied")
+	v, err, _ := a.flight.Do(keyString(key), func() (any, error) {
+		observedAt := time.Now()
+		var generation int64
+		err := a.pool.QueryRow(ctx, `SELECT c.revocation_generation FROM machine_credential c JOIN machine_principal p ON p.id=c.principal_id WHERE c.id=$1 AND c.principal_id=$2 AND c.state='active' AND c.expires_at>now() AND p.status='active' AND c.revocation_generation=p.generation`, credentialID, principalID).Scan(&generation)
+		deadline := observedAt.Add(a.ttl)
+		if err != nil {
+			a.mu.Lock()
+			delete(a.items, key)
+			a.mu.Unlock()
+			if errors.Is(err, pgx.ErrNoRows) {
+				return authoritySnapshot{}, errors.New("machine authority denied")
+			}
+			return authoritySnapshot{}, err
 		}
-		return 0, err
+		if !time.Now().Before(deadline) {
+			return authoritySnapshot{}, errAuthoritySnapshotExpired
+		}
+		a.mu.Lock()
+		if a.epoch != epoch {
+			a.mu.Unlock()
+			return authoritySnapshot{}, errors.New("machine authority invalidated")
+		}
+		a.items[key] = machineAuthorityEntry{generation: uint64(generation), expiresAt: deadline}
+		a.trimLocked()
+		a.mu.Unlock()
+		return authoritySnapshot{generation: uint64(generation), expiresAt: deadline}, nil
+	})
+	if err != nil {
+		return 0, time.Time{}, err
 	}
-	a.mu.Lock()
-	if len(a.items) >= 4096 {
+	snapshot := v.(authoritySnapshot)
+	return snapshot.generation, snapshot.expiresAt, nil
+}
+
+type authoritySnapshot struct {
+	generation uint64
+	expiresAt  time.Time
+}
+
+func keyString(key machineAuthorityKey) string {
+	return key.principal.String() + ":" + key.credential.String()
+}
+
+func (a *CachedMachineAuthority) trimLocked() {
+	for len(a.items) > 4096 {
 		for k := range a.items {
 			delete(a.items, k)
 			break
 		}
 	}
-	a.items[key] = machineAuthorityEntry{generation: uint64(generation), expiresAt: now.Add(a.ttl)}
-	a.mu.Unlock()
-	return uint64(generation), nil
 }
 
 func (a *CachedMachineAuthority) InvalidateCredential(credentialID uuid.UUID) {
@@ -76,6 +119,7 @@ func (a *CachedMachineAuthority) InvalidateCredential(credentialID uuid.UUID) {
 		return
 	}
 	a.mu.Lock()
+	a.epoch++
 	defer a.mu.Unlock()
 	for key := range a.items {
 		if key.credential == credentialID {
@@ -89,6 +133,7 @@ func (a *CachedMachineAuthority) InvalidatePrincipal(principalID uuid.UUID) {
 		return
 	}
 	a.mu.Lock()
+	a.epoch++
 	defer a.mu.Unlock()
 	for key := range a.items {
 		if key.principal == principalID {

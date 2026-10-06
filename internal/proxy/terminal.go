@@ -47,11 +47,14 @@ func (h *Handler) WithMachineAuthority(authority any) *Handler {
 	switch value := authority.(type) {
 	case auth.RevocationAuthority:
 		h.machineAuthority = value
+		h.machineAuthoritySnapshotter = nil
 	case *CachedMachineAuthority:
 		h.machineAuthority = value.Lookup
+		h.machineAuthoritySnapshotter = value
 		h.machineAuthorityInvalidator = value
 	default:
 		h.machineAuthority = nil
+		h.machineAuthoritySnapshotter = nil
 		h.machineAuthorityInvalidator = nil
 	}
 	return h

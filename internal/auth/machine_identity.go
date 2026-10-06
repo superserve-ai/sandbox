@@ -92,8 +92,11 @@ type CallerContext struct {
 	Permissions          []MachineOperation
 	Policy               MachinePolicy
 	Audience             string
+	AllowedAudiences     []string
 	ExpiresAt            time.Time
 	RevocationGeneration uint64
+	CallerKind           string
+	ActorID              uuid.UUID
 	// ApprovedTemplateID is server-resolved policy state. A nil value is not
 	// an invitation to accept a client-selected template: machine creation
 	// must fail closed when the control plane has not supplied one.
@@ -108,6 +111,33 @@ type SandboxOwnership struct {
 	TeamID           uuid.UUID
 }
 
+// OwnershipState is an attested serving classification. Unknown is distinct
+// from ordinary: old records, unsupported producers, and lookup failures must
+// not silently regain legacy access.
+type OwnershipState string
+
+const (
+	OwnershipUnknown  OwnershipState = "unknown"
+	OwnershipOrdinary OwnershipState = "ordinary"
+	OwnershipMachine  OwnershipState = "machine"
+)
+
+// IssuancePolicy is the trusted parent policy used when a control-plane
+// credential is turned into a resource capability. Child audiences are
+// explicit; callers cannot select arbitrary audiences or permissions.
+type IssuancePolicy struct {
+	Operations       []MachineOperation
+	AllowedAudiences []string
+}
+
+func (p IssuancePolicy) AllowsAudience(audience string) bool {
+	return audience != "" && slices.Contains(p.AllowedAudiences, audience)
+}
+
+func (p IssuancePolicy) Allows(operation MachineOperation) bool {
+	return slices.Contains(p.Operations, operation) && isKnownMachineOperation(operation)
+}
+
 // MachineCapability is a server-issued, lineage-bound capability for a
 // sandbox operation. Legacy sandbox-only tokens cannot be represented here.
 type MachineCapability struct {
@@ -120,6 +150,12 @@ type MachineCapability struct {
 	Audience             string             `json:"audience"`
 	ExpiresAt            time.Time          `json:"expires_at"`
 	RevocationGeneration uint64             `json:"revocation_generation"`
+	// CallerKind is "machine" for lineage-bound machine authority and
+	// "human" for a separately verified human parent session. Human claims
+	// never impersonate the machine owner.
+	CallerKind         string    `json:"caller_kind,omitempty"`
+	ActorID            uuid.UUID `json:"actor_id,omitempty"`
+	ParentCredentialID uuid.UUID `json:"parent_credential_id,omitempty"`
 }
 
 var (
@@ -171,6 +207,24 @@ func (c CallerContext) ValidateAt(now time.Time) error {
 	return nil
 }
 
+// NewTrustedIssuancePolicy narrows the sandbox API root to the operations and
+// audiences explicitly supplied by the control-plane adapter.
+func NewTrustedIssuancePolicy(operations []MachineOperation, audiences ...string) IssuancePolicy {
+	validOps := make([]MachineOperation, 0, len(operations))
+	for _, op := range operations {
+		if isKnownMachineOperation(op) && !slices.Contains(validOps, op) {
+			validOps = append(validOps, op)
+		}
+	}
+	validAudiences := make([]string, 0, len(audiences))
+	for _, audience := range audiences {
+		if audience != "" && !slices.Contains(validAudiences, audience) {
+			validAudiences = append(validAudiences, audience)
+		}
+	}
+	return IssuancePolicy{Operations: validOps, AllowedAudiences: validAudiences}
+}
+
 func (o SandboxOwnership) Validate() error {
 	if o.SandboxID == uuid.Nil || o.OwnerPrincipalID == uuid.Nil || o.TeamID == uuid.Nil {
 		return fmt.Errorf("%w: sandbox ownership is incomplete", ErrInvalidMachineIdentity)
@@ -179,7 +233,8 @@ func (o SandboxOwnership) Validate() error {
 }
 
 func (c MachineCapability) ValidateAt(now time.Time) error {
-	if c.PrincipalID == uuid.Nil || c.CredentialID == uuid.Nil || c.LineageID == uuid.Nil || c.TeamID == uuid.Nil || c.SandboxID == uuid.Nil || c.RevocationGeneration == 0 || c.Audience == "" || c.ExpiresAt.IsZero() || !now.Before(c.ExpiresAt) || len(c.Operations) == 0 {
+	human := c.CallerKind == "human" && c.ActorID != uuid.Nil
+	if (!human && (c.PrincipalID == uuid.Nil || c.CredentialID == uuid.Nil || c.LineageID == uuid.Nil || c.RevocationGeneration == 0)) || c.TeamID == uuid.Nil || c.SandboxID == uuid.Nil || c.Audience == "" || c.ExpiresAt.IsZero() || !now.Before(c.ExpiresAt) || len(c.Operations) == 0 {
 		return ErrMachineCapabilityDenied
 	}
 	for _, operation := range c.Operations {
@@ -188,6 +243,30 @@ func (c MachineCapability) ValidateAt(now time.Time) error {
 		}
 	}
 	return nil
+}
+
+// DeriveHumanCapability creates a typed child claim from an already verified
+// human session. It carries the actor explicitly and can never be mistaken
+// for machine-owner lineage.
+func DeriveHumanCapability(actorID, teamID, sandboxID uuid.UUID, audience string, operations []MachineOperation, expiresAt, now time.Time) (MachineCapability, error) {
+	if actorID == uuid.Nil || teamID == uuid.Nil || sandboxID == uuid.Nil || audience == "" || len(operations) == 0 || expiresAt.IsZero() || !now.Before(expiresAt) {
+		return MachineCapability{}, ErrMachineCapabilityDenied
+	}
+	for _, op := range operations {
+		if !isKnownMachineOperation(op) {
+			return MachineCapability{}, ErrMachineCapabilityDenied
+		}
+	}
+	return MachineCapability{TeamID: teamID, SandboxID: sandboxID, Operations: slices.Clone(operations), Audience: audience, ExpiresAt: expiresAt, CallerKind: "human", ActorID: actorID}, nil
+}
+
+func DeriveHumanCapabilityWithParent(actorID, parentCredentialID, teamID, sandboxID uuid.UUID, audience string, operations []MachineOperation, expiresAt, now time.Time) (MachineCapability, error) {
+	capability, err := DeriveHumanCapability(actorID, teamID, sandboxID, audience, operations, expiresAt, now)
+	if err != nil || parentCredentialID == uuid.Nil {
+		return MachineCapability{}, ErrMachineCapabilityDenied
+	}
+	capability.ParentCredentialID = parentCredentialID
+	return capability, nil
 }
 
 // VerifyMachineCapability checks a signed, server-issued capability. The
@@ -288,6 +367,7 @@ type SessionRegistry struct {
 	sessions         map[string]sessionEntry
 	credentialFences map[uuid.UUID]uint64
 	principalFences  map[uuid.UUID]uint64
+	epoch            uint64
 }
 
 type sessionEntry struct {
@@ -316,12 +396,40 @@ func (r *SessionRegistry) RegisterWithCancel(id string, state RevocationState, c
 	return r.register(id, state, cancel)
 }
 
+// CurrentEpoch and RegisterWithCancelEpoch fence the verify/register race:
+// an invalidation that wins between durable verification and registration
+// makes the stale registration fail closed.
+func (r *SessionRegistry) CurrentEpoch() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.epoch
+}
+
+func (r *SessionRegistry) RegisterWithCancelEpoch(id string, state RevocationState, cancel context.CancelFunc, epoch uint64) error {
+	if r == nil {
+		return ErrMachineCapabilityDenied
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.registerLocked(id, state, cancel, epoch)
+}
+
 func (r *SessionRegistry) register(id string, state RevocationState, cancel context.CancelFunc) error {
 	if r == nil || id == "" || state.PrincipalID == uuid.Nil || state.CredentialID == uuid.Nil {
 		return ErrMachineCapabilityDenied
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.registerLocked(id, state, cancel, r.epoch)
+}
+
+func (r *SessionRegistry) registerLocked(id string, state RevocationState, cancel context.CancelFunc, epoch uint64) error {
+	if epoch != r.epoch {
+		return ErrMachineCapabilityDenied
+	}
 	if fence := r.credentialFences[state.CredentialID]; fence >= state.RevocationGeneration {
 		return ErrMachineCapabilityDenied
 	}
@@ -377,8 +485,17 @@ func (r *SessionRegistry) RevokeCredential(credentialID uuid.UUID, generation ui
 		return 0
 	}
 	r.mu.Lock()
+	r.epoch++
 	if generation > r.credentialFences[credentialID] {
 		r.credentialFences[credentialID] = generation
+	}
+	if len(r.credentialFences)+len(r.principalFences) > 4096 {
+		// Fence retention is bounded, while the epoch makes every verification
+		// that began before this compaction fail registration. A fresh authority
+		// lookup is therefore required before an old generation can re-enter.
+		r.epoch++
+		r.credentialFences = make(map[uuid.UUID]uint64)
+		r.principalFences = make(map[uuid.UUID]uint64)
 	}
 	removed := 0
 	var cancels []context.CancelFunc
@@ -403,8 +520,14 @@ func (r *SessionRegistry) RevokePrincipal(principalID uuid.UUID, generation uint
 		return 0
 	}
 	r.mu.Lock()
+	r.epoch++
 	if generation > r.principalFences[principalID] {
 		r.principalFences[principalID] = generation
+	}
+	if len(r.credentialFences)+len(r.principalFences) > 4096 {
+		r.epoch++
+		r.credentialFences = make(map[uuid.UUID]uint64)
+		r.principalFences = make(map[uuid.UUID]uint64)
 	}
 	removed := 0
 	var cancels []context.CancelFunc
@@ -435,7 +558,7 @@ func DeriveCapability(caller CallerContext, ownership SandboxOwnership, sandboxI
 	if err := caller.ValidateAt(now); err != nil {
 		return MachineCapability{}, err
 	}
-	if err := ownership.Validate(); err != nil || ownership.SandboxID != sandboxID || ownership.OwnerPrincipalID != caller.PrincipalID || ownership.TeamID != caller.TeamID || audience == "" || audience != caller.Audience || len(operations) == 0 || sandboxID == uuid.Nil {
+	if err := ownership.Validate(); err != nil || ownership.SandboxID != sandboxID || ownership.OwnerPrincipalID != caller.PrincipalID || ownership.TeamID != caller.TeamID || audience == "" || audience != caller.Audience && !slices.Contains(caller.AllowedAudiences, audience) || len(operations) == 0 || sandboxID == uuid.Nil {
 		return MachineCapability{}, ErrMachineCapabilityDenied
 	}
 	if expiresAt.IsZero() || expiresAt.After(caller.ExpiresAt) || !now.Before(expiresAt) {

@@ -34,9 +34,25 @@ func authorizedControlPlane(ctx context.Context) bool {
 // payloads are hashed at the boundary and only the digest is compared in the
 // durable store; callers receive verified identity, never stored secret data.
 type DBMachineAuthority struct {
-	Queries *db.Queries
-	Now     func() time.Time
-	enabled atomic.Bool
+	Queries     *db.Queries
+	Now         func() time.Time
+	enabled     atomic.Bool
+	eligibility atomic.Value // AuthorityEligibility
+}
+
+// AuthorityEligibility is the explicit, fail-closed activation input. Schema
+// presence alone never enables authority-producing writes.
+type AuthorityEligibility struct {
+	ContractRevision string
+	Environment      string
+	SchemaReady      bool
+	OwnershipReady   bool
+	VerifierReady    bool
+	OperatorReady    bool
+}
+
+func (e AuthorityEligibility) Valid() bool {
+	return e.ContractRevision != "" && e.Environment != "" && e.SchemaReady && e.OwnershipReady && e.VerifierReady && e.OperatorReady
 }
 
 var ErrMachineAuthorityUnavailable = errors.New("machine authority unavailable")
@@ -56,6 +72,30 @@ func (a *DBMachineAuthority) Enable() {
 	if a != nil {
 		a.enabled.Store(true)
 	}
+}
+
+func (a *DBMachineAuthority) SetEligibility(eligibility AuthorityEligibility) {
+	if a != nil {
+		a.eligibility.Store(eligibility)
+	}
+}
+
+func (a *DBMachineAuthority) IssuanceReady() bool {
+	if a == nil {
+		return false
+	}
+	v := a.eligibility.Load()
+	if v == nil {
+		return false
+	}
+	return v.(AuthorityEligibility).Valid()
+}
+
+func (a *DBMachineAuthority) requireIssuanceReady() error {
+	if !a.enabled.Load() || !a.IssuanceReady() {
+		return ErrMachineAuthorityUnavailable
+	}
+	return nil
 }
 func (a *DBMachineAuthority) Disable() {
 	if a != nil {
@@ -101,7 +141,8 @@ func (a *DBMachineAuthority) ResolveMachineCredential(ctx context.Context, raw s
 		LineageID: row.Credential.LineageID, TeamID: row.Principal.TeamID,
 		HostedTenantID: row.Principal.HostedTenantID, Permissions: permissions,
 		Policy: auth.NewMachinePolicy(permissions...), Audience: row.Credential.Audience,
-		ExpiresAt: row.Credential.ExpiresAt, RevocationGeneration: uint64(row.Credential.RevocationGeneration),
+		AllowedAudiences: trustedChildAudiences(row.Credential.Audience),
+		ExpiresAt:        row.Credential.ExpiresAt, RevocationGeneration: uint64(row.Credential.RevocationGeneration),
 		ApprovedTemplateID: approved,
 	}
 	if err := caller.ValidateAt(now); err != nil {
@@ -110,9 +151,45 @@ func (a *DBMachineAuthority) ResolveMachineCredential(ctx context.Context, raw s
 	return caller, nil
 }
 
+func trustedChildAudiences(root string) []string {
+	switch root {
+	case "sandbox-api":
+		return []string{"sandbox-api", "sandbox-proxy"}
+	case "sandbox-proxy":
+		return []string{"sandbox-proxy"}
+	default:
+		return nil
+	}
+}
+
+func trustedMachineOperations() []string {
+	return []string{
+		string(auth.MachineOperationCreate), string(auth.MachineOperationList), string(auth.MachineOperationRead),
+		string(auth.MachineOperationPause), string(auth.MachineOperationResume), string(auth.MachineOperationActivate),
+		string(auth.MachineOperationDelete), string(auth.MachineOperationPatch), string(auth.MachineOperationReconnect),
+		string(auth.MachineOperationCommandRun), string(auth.MachineOperationCommandRead), string(auth.MachineOperationCommandWrite),
+		string(auth.MachineOperationCommandSignal), string(auth.MachineOperationFileRead), string(auth.MachineOperationFileWrite),
+		string(auth.MachineOperationFileList),
+	}
+}
+
+func lifecycleLineage(operationID uuid.UUID) uuid.UUID {
+	return uuid.NewSHA1(uuid.Nil, []byte("machine-lineage:"+operationID.String()))
+}
+
+func lifecycleExpiry(now time.Time) time.Time {
+	// Round the server-generated expiry to a stable hour so response-loss
+	// retries reuse the same persisted authority inputs.
+	base := now.Add(24 * time.Hour)
+	return base.Truncate(time.Hour).Add(time.Hour)
+}
+
 func (a *DBMachineAuthority) EnsurePrincipal(ctx context.Context, teamID, tenantID, templateID uuid.UUID, _ string) (auth.MachinePrincipal, error) {
 	if !authorizedControlPlane(ctx) {
 		return auth.MachinePrincipal{}, auth.ErrMachineCapabilityDenied
+	}
+	if err := a.requireIssuanceReady(); err != nil {
+		return auth.MachinePrincipal{}, err
 	}
 	row, err := a.Queries.EnsureMachinePrincipal(ctx, teamID, tenantID, uuidToPG(templateID))
 	if err != nil {
@@ -129,8 +206,11 @@ func (a *DBMachineAuthority) IssueCredentialFenced(ctx context.Context, principa
 	if !authorizedControlPlane(ctx) {
 		return auth.MachineCredential{}, auth.ErrMachineCapabilityDenied
 	}
+	if err := a.requireIssuanceReady(); err != nil {
+		return auth.MachineCredential{}, err
+	}
 	digest := sha256.Sum256([]byte(rawSecret))
-	row, err := a.Queries.IssueMachineCredentialFenced(ctx, principalID, uuid.New(), digest[:], time.Now().Add(24*time.Hour), []string{string(auth.MachineOperationRead)}, "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	row, err := a.Queries.IssueMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(time.Now()), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}
@@ -145,8 +225,11 @@ func (a *DBMachineAuthority) RotateCredentialFenced(ctx context.Context, princip
 	if !authorizedControlPlane(ctx) {
 		return auth.MachineCredential{}, auth.ErrMachineCapabilityDenied
 	}
+	if err := a.requireIssuanceReady(); err != nil {
+		return auth.MachineCredential{}, err
+	}
 	digest := sha256.Sum256([]byte(rawSecret))
-	row, err := a.Queries.RotateMachineCredentialTargeted(ctx, principalID, replacementID, uuid.New(), digest[:], time.Now().Add(24*time.Hour), []string{string(auth.MachineOperationRead)}, "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	row, err := a.Queries.RotateMachineCredentialTargeted(ctx, principalID, replacementID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(time.Now()), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}
@@ -175,8 +258,11 @@ func (a *DBMachineAuthority) RestorePrincipalFenced(ctx context.Context, princip
 	if !authorizedControlPlane(ctx) {
 		return auth.MachineCredential{}, auth.ErrMachineCapabilityDenied
 	}
+	if err := a.requireIssuanceReady(); err != nil {
+		return auth.MachineCredential{}, err
+	}
 	digest := sha256.Sum256([]byte(rawSecret))
-	row, err := a.Queries.RestoreMachineCredentialFenced(ctx, principalID, uuid.New(), digest[:], time.Now().Add(24*time.Hour), []string{string(auth.MachineOperationRead)}, "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	row, err := a.Queries.RestoreMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(time.Now()), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}

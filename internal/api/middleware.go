@@ -76,6 +76,11 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		// A verified hosted machine credential is a separate authority. Do not
 		// force it through human API-key/creator lookup or synthesize actor_id.
 		if _, machine := machineCallerFromContext(c); machine {
+			defer func() {
+				if _, owned := c.Get(phaseSeriesOwnedKey); owned { return }
+				op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath()); if !ok { return }
+				RecordLatencyPhases(c.Request.Context(), op, "", map[string]time.Duration{"auth": time.Since(startedAt), "total": time.Since(startedAt)})
+			}()
 			c.Set("auth_ms", time.Since(startedAt).Milliseconds())
 			c.Set("auth_duration", time.Since(startedAt))
 			c.Next()

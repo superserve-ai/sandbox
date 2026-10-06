@@ -3799,6 +3799,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		PreviewPolicyRevision:      previewPolicyRevision,
 		PreviewTokenPolicyRevision: inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision),
 	}
+	if principalID, ok := strings.CutPrefix(ownerID, "machine:"); ok && principalID != "" {
+		if _, err := uuid.Parse(principalID); err == nil {
+			inst.MachineOwned = true
+			inst.MachineOwnerPrincipalID = principalID
+			inst.OwnerID = ""
+		}
+	}
 	m.vms[vmID] = inst
 	m.indexVM(vmID, inst)
 	m.mu.Unlock()

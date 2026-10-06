@@ -107,10 +107,21 @@ type instanceResponse struct {
 	OwnerID                  string            `json:"owner_id,omitempty"`
 	MachineOwned             bool              `json:"machine_owned"`
 	MachineOwnerPrincipalID  string            `json:"machine_owner_principal_id,omitempty"`
+	OwnershipState           string            `json:"ownership_state,omitempty"`
 	PreviewAccess            string            `json:"preview_access,omitempty"`
 	PreviewPorts             map[string]bool   `json:"preview_ports,omitempty"`
 	PreviewPortAccess        map[string]string `json:"preview_port_access,omitempty"`
 	PreviewPortTokenVersions map[string]int64  `json:"preview_port_token_versions,omitempty"`
+}
+
+func ownershipState(machineOwned bool, principalID, ownerID string) string {
+	if machineOwned && principalID != "" {
+		return "machine"
+	}
+	if ownerID != "" {
+		return "ordinary"
+	}
+	return "unknown"
 }
 
 // handleInstance handles GET /instances/{instanceID}.
@@ -173,6 +184,7 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		OwnerID:                  info.OwnerID,
 		MachineOwned:             info.MachineOwned,
 		MachineOwnerPrincipalID:  info.MachineOwnerPrincipalID,
+		OwnershipState:           ownershipState(info.MachineOwned, info.MachineOwnerPrincipalID, info.OwnerID),
 		PreviewAccess:            info.PreviewAccess,
 		PreviewPorts:             previewPortsToJSON(info.PreviewPorts),
 		PreviewPortAccess:        previewPortAccessToJSON(info.PreviewPorts),

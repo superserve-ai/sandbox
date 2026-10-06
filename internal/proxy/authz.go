@@ -50,7 +50,13 @@ func (h *Handler) authorizeSandboxRequest(
 		if h.machineAuthority == nil {
 			return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}
 		}
-		capability, err := auth.VerifyMachineCapabilityWithAuthority(ctx, token, h.seedKey, time.Now(), h.machineAuthority)
+		capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
+		if err == nil && capability.CallerKind != "human" {
+			if h.machineAuthority == nil {
+				return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}
+			}
+			capability, err = auth.VerifyMachineCapabilityWithAuthority(ctx, token, h.seedKey, time.Now(), h.machineAuthority)
+		}
 		if err != nil || capability.SandboxID.String() != requestSandboxID || capability.Audience != "sandbox-proxy" {
 			return InstanceInfo{}, &authzFailure{Status: http.StatusUnauthorized, Message: "invalid machine capability"}
 		}
@@ -77,7 +83,18 @@ func (h *Handler) authorizeSandboxRequest(
 			Code:    "sandbox_unavailable",
 		}
 	}
-	if info.MachineOwned && !strings.HasPrefix(token, "mcap.") {
+	ownershipState := info.OwnershipState
+	if ownershipState == "" {
+		if info.MachineOwned && info.MachineOwnerPrincipalID != "" {
+			ownershipState = auth.OwnershipMachine
+		} else {
+			// Direct in-process resolvers predating the attestation field are
+			// retained for ordinary sandboxes. The HTTP VMD contract emits an
+			// explicit "unknown" state for records that lack proof.
+			ownershipState = auth.OwnershipOrdinary
+		}
+	}
+	if ownershipState != auth.OwnershipOrdinary && !strings.HasPrefix(token, "mcap.") {
 		return InstanceInfo{}, &authzFailure{Status: http.StatusUnauthorized, Message: "machine sandbox requires a machine capability"}
 	}
 	if verifiedCapability != nil {
@@ -86,15 +103,24 @@ func (h *Handler) authorizeSandboxRequest(
 		// machine principal and team. Missing attestation fails closed rather
 		// than falling back to the human owner or public headers.
 		capabilityTeam := verifiedCapability.TeamID.String()
-		if !info.MachineOwned || info.TeamID == "" || capabilityTeam != info.TeamID || info.MachineOwnerPrincipalID == "" || info.MachineOwnerPrincipalID != verifiedCapability.PrincipalID.String() {
+		if verifiedCapability.CallerKind == "human" {
+			if info.TeamID == "" || capabilityTeam != info.TeamID || ownershipState == auth.OwnershipUnknown {
+				return InstanceInfo{}, &authzFailure{Status: http.StatusForbidden, Message: "sandbox ownership could not be verified"}
+			}
+		} else if ownershipState != auth.OwnershipMachine || info.TeamID == "" || capabilityTeam != info.TeamID || info.MachineOwnerPrincipalID == "" || info.MachineOwnerPrincipalID != verifiedCapability.PrincipalID.String() {
 			return InstanceInfo{}, &authzFailure{Status: http.StatusForbidden, Message: "machine sandbox ownership could not be verified"}
 		}
+		credentialID := verifiedCapability.CredentialID
+		if verifiedCapability.CallerKind == "human" {
+			credentialID = verifiedCapability.ParentCredentialID
+		}
 		info.MachineCaller = &auth.CallerContext{
-			PrincipalID: verifiedCapability.PrincipalID, CredentialID: verifiedCapability.CredentialID,
+			PrincipalID: verifiedCapability.PrincipalID, CredentialID: credentialID,
 			LineageID: verifiedCapability.LineageID, TeamID: verifiedCapability.TeamID,
 			Permissions: append([]auth.MachineOperation(nil), verifiedCapability.Operations...),
 			Policy:      auth.NewMachinePolicy(verifiedCapability.Operations...), Audience: verifiedCapability.Audience,
 			ExpiresAt: verifiedCapability.ExpiresAt, RevocationGeneration: verifiedCapability.RevocationGeneration,
+			CallerKind: verifiedCapability.CallerKind, ActorID: verifiedCapability.ActorID,
 		}
 	}
 	if info.Status != "running" {
@@ -157,12 +183,29 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 	if !strings.HasPrefix(token, "mcap.") {
 		return parent, func() {}, true
 	}
+	capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
+	if err != nil {
+		return parent, func() {}, false
+	}
+	if capability.CallerKind == "human" {
+		// Human child claims are bounded by their verified parent session and
+		// carry no machine credential lineage to register in the machine fence.
+		return parent, func() {}, true
+	}
 	if h.machineAuthority == nil || h.sessions == nil {
 		return parent, func() {}, false
 	}
-	capability, err := auth.VerifyMachineCapabilityWithAuthority(parent, token, h.seedKey, time.Now(), h.machineAuthority)
-	if err != nil {
+	registrationEpoch := h.sessions.CurrentEpoch()
+	freshUntil := time.Now().Add(5 * time.Second)
+	generation, observedUntil, err := h.lookupMachineAuthority(parent, capability)
+	if err != nil || generation != capability.RevocationGeneration {
 		return parent, func() {}, false
+	}
+	if observedUntil.Before(freshUntil) {
+		freshUntil = observedUntil
+	}
+	if capability.ExpiresAt.Before(freshUntil) {
+		freshUntil = capability.ExpiresAt
 	}
 	ctx, cancel := context.WithCancel(parent)
 	id := uuid.NewString()
@@ -171,20 +214,70 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 		LineageID: capability.LineageID, RevocationGeneration: capability.RevocationGeneration,
 		ExpiresAt: capability.ExpiresAt,
 	}
-	if err := h.sessions.RegisterWithCancel(id, state, cancel); err != nil {
+	if err := h.sessions.RegisterWithCancelEpoch(id, state, cancel, registrationEpoch); err != nil {
 		cancel()
 		return parent, func() {}, false
 	}
-	// Expiry is enforced for established streams as well as reconnects. The
-	// timer is bounded by the registry's session cap and exits as soon as the
-	// request or an explicit revocation cancels the stream.
+	// Expiry and continuing authority freshness are enforced for established
+	// streams as well as reconnects. A refresh failure closes at the absolute
+	// freshness deadline; it never extends access and does not depend on frame
+	// activity or a notification producer.
 	go func() {
-		timer := time.NewTimer(time.Until(capability.ExpiresAt))
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			h.sessions.Expire(id)
-		case <-ctx.Done():
+		for {
+			deadline := freshUntil
+			if capability.ExpiresAt.Before(deadline) {
+				deadline = capability.ExpiresAt
+			}
+			wait := time.Until(deadline) - 100*time.Millisecond
+			if wait > time.Second {
+				wait = time.Second
+			}
+			if wait < 0 {
+				wait = 0
+			}
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+				// A refresh is only useful if it completes before the old
+				// snapshot's deadline. Bound the lookup independently of the
+				// stream context so a hung store cannot keep the stream alive.
+				type refreshResult struct {
+					generation uint64
+					until      time.Time
+					err        error
+				}
+				resultCh := make(chan refreshResult, 1)
+				refreshCtx, refreshCancel := context.WithTimeout(context.Background(), time.Second)
+				go func() {
+					generation, nextUntil, refreshErr := h.lookupMachineAuthority(refreshCtx, capability)
+					resultCh <- refreshResult{generation: generation, until: nextUntil, err: refreshErr}
+				}()
+				hardDeadline := time.NewTimer(time.Until(deadline))
+				var result refreshResult
+				select {
+				case result = <-resultCh:
+					hardDeadline.Stop()
+				case <-hardDeadline.C:
+					refreshCancel()
+					h.sessions.Expire(id)
+					return
+				case <-ctx.Done():
+					refreshCancel()
+					return
+				}
+				refreshCancel()
+				generation, nextUntil, refreshErr := result.generation, result.until, result.err
+				if refreshErr != nil || generation != capability.RevocationGeneration || !time.Now().Before(deadline) {
+					h.sessions.Expire(id)
+					return
+				}
+				freshUntil = nextUntil
+				if capability.ExpiresAt.Before(freshUntil) {
+					freshUntil = capability.ExpiresAt
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 	var once sync.Once
@@ -195,6 +288,14 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 		})
 	}
 	return ctx, cleanup, true
+}
+
+func (h *Handler) lookupMachineAuthority(ctx context.Context, capability auth.MachineCapability) (uint64, time.Time, error) {
+	if h.machineAuthoritySnapshotter != nil {
+		return h.machineAuthoritySnapshotter.LookupSnapshot(ctx, capability.PrincipalID, capability.CredentialID)
+	}
+	generation, err := h.machineAuthority(ctx, capability.PrincipalID, capability.CredentialID)
+	return generation, time.Now().Add(5 * time.Second), err
 }
 
 func (h *Handler) bindMachineRequest(r *http.Request, token string) (*http.Request, func(), bool) {

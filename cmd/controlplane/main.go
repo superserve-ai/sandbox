@@ -207,6 +207,17 @@ func run() error {
 	if err := machineAuthority.Ready(ctx); err != nil {
 		log.Warn().Err(err).Msg("machine identity authority is not ready; hosted issuance remains disabled")
 	} else {
+		// Issuance remains disabled until the deployment owner supplies all
+		// explicit compatibility/readiness predicates. Table existence alone is
+		// not an activation signal.
+		machineAuthority.SetEligibility(api.AuthorityEligibility{
+			ContractRevision: os.Getenv("QM_MACHINE_AUTH_CONTRACT_REVISION"),
+			Environment:      os.Getenv("QM_MACHINE_AUTH_ENVIRONMENT"),
+			SchemaReady:      true,
+			OwnershipReady:   os.Getenv("QM_MACHINE_AUTH_OWNERSHIP_READY") == "true",
+			VerifierReady:    os.Getenv("QM_MACHINE_AUTH_VERIFIER_READY") == "true",
+			OperatorReady:    os.Getenv("QM_MACHINE_AUTH_OPERATOR_READY") == "true",
+		})
 		machineAuthority.Enable()
 	}
 	handlers.MachineCredentials = machineAuthority
