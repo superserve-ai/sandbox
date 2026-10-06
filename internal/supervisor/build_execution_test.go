@@ -6,10 +6,10 @@ import (
 	"time"
 )
 
-func TestExecutionBudgetDoesNotResetForRetryOrPublication(t *testing.T) {
+func TestExecutionBudgetDoesNotResetForRetry(t *testing.T) {
 	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
 	first := now.Add(-30 * time.Minute)
-	for _, reason := range []string{"waiting for eligible host/capacity", "waiting for verified durable publication"} {
+	for _, reason := range []string{"waiting for eligible host/capacity", "running on admitted host"} {
 		e := db.BuildExecution{FirstStartedAt: &first, Reason: reason, Attempts: 2}
 		if executionExpired(e, now.Add(-time.Hour), now) == "" {
 			t.Fatalf("%s reset deadline", reason)
