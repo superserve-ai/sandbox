@@ -58,12 +58,13 @@ type x11Backend struct {
 	sock      net.Conn
 	root      xproto.Window
 	hasXfixes bool
-	// keys is the keyboard mapping (desktop_x11_key.go), fetched lazily;
-	// keysDirty is set by a MappingNotify this backend did not cause, and
-	// ownRemaps counts the ones it did and has not yet seen back.
-	keys      *x11Keymap
-	keysDirty bool
-	ownRemaps int
+	// keys is the last keyboard mapping fetched (desktop_x11_key.go); it
+	// is refreshed on every key request and kept only for the scratch
+	// bindings it records.
+	keys *x11Keymap
+	// xkb is whether the XKEYBOARD extension was found, with its opcode.
+	xkb       xkbProbe
+	xkbOpcode byte
 }
 
 // parseDisplay resolves a DISPLAY value to the socket to dial and the screen
@@ -141,10 +142,6 @@ func (b *x11Backend) Close() {
 // them. Events are sent unchecked, so one round trip covers a whole action
 // instead of one per event.
 func (b *x11Backend) sync() error {
-	// A backend without a connection (tests) has nothing to sync.
-	if b.conn == nil {
-		return nil
-	}
 	if _, err := xproto.GetInputFocus(b.conn).Reply(); err != nil {
 		return err
 	}
@@ -152,8 +149,7 @@ func (b *x11Backend) sync() error {
 }
 
 // drainEvents consumes everything the server has already sent, without a
-// round trip: errors for unchecked requests, and keyboard mapping changes
-// made by other clients (our own remaps are expected and counted down).
+// round trip, surfacing errors raised for unchecked requests.
 func (b *x11Backend) drainEvents() error {
 	for {
 		ev, xerr := b.conn.PollForEvent()
@@ -162,13 +158,6 @@ func (b *x11Backend) drainEvents() error {
 		}
 		if ev == nil {
 			return nil
-		}
-		if m, ok := ev.(xproto.MappingNotifyEvent); ok && m.Request == xproto.MappingKeyboard {
-			if b.ownRemaps > 0 {
-				b.ownRemaps--
-			} else {
-				b.keysDirty = true
-			}
 		}
 	}
 }

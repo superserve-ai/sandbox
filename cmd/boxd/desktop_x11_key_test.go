@@ -103,7 +103,7 @@ func TestNormalizeKeyText(t *testing.T) {
 
 func TestPlanKey_TextUsesTheLayoutAndShift(t *testing.T) {
 	km := testKeymap(2)
-	segs, err := planKey(km, textEvent("aA1! \n"))
+	segs, err := planKey(km, xkbState{}, textEvent("aA1! \n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestPlanKey_TextUsesTheLayoutAndShift(t *testing.T) {
 
 func TestPlanKey_UnmappedCharactersBindScratchKeycodesOnce(t *testing.T) {
 	km := testKeymap(2)
-	segs, err := planKey(km, textEvent("é€é"))
+	segs, err := planKey(km, xkbState{}, textEvent("é€é"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestPlanKey_UnmappedCharactersBindScratchKeycodesOnce(t *testing.T) {
 	eventsEqual(t, segs[0].events, want)
 
 	// The bindings persist: typing é again needs no bind at all.
-	segs, err = planKey(km, textEvent("é"))
+	segs, err = planKey(km, xkbState{}, textEvent("é"))
 	if err != nil || len(segs) != 1 || len(segs[0].binds) != 0 {
 		t.Fatalf("second plan = %+v, %v; want no binds", segs, err)
 	}
@@ -152,7 +152,7 @@ func TestPlanKey_UnmappedCharactersBindScratchKeycodesOnce(t *testing.T) {
 
 func TestPlanKey_ExhaustedPoolRebindsInANewSegment(t *testing.T) {
 	km := testKeymap(1)
-	segs, err := planKey(km, textEvent("éàé"))
+	segs, err := planKey(km, xkbState{}, textEvent("éàé"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestPlanKey_Chords(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			segs, err := planKey(km, tc.ev)
+			segs, err := planKey(km, xkbState{}, tc.ev)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -212,7 +212,7 @@ func TestPlanKey_DeclinesBeforeTouchingTheServer(t *testing.T) {
 	for name, tc := range cases {
 		km := testKeymap(tc.spares)
 		before := len(km.bound)
-		_, err := planKey(km, tc.ev)
+		_, err := planKey(km, xkbState{}, tc.ev)
 		if !errors.Is(err, errBackendKept) {
 			t.Errorf("%s: err = %v, want errBackendKept", name, err)
 		}
@@ -220,14 +220,14 @@ func TestPlanKey_DeclinesBeforeTouchingTheServer(t *testing.T) {
 			t.Errorf("%s: a declined plan changed the scratch state", name)
 		}
 	}
-	if _, err := planKey(testKeymap(1), textEvent("a\x01")); err == nil || errors.Is(err, errBackendKept) {
+	if _, err := planKey(testKeymap(1), xkbState{}, textEvent("a\x01")); err == nil || errors.Is(err, errBackendKept) {
 		t.Errorf("control character: err = %v, want a validation error, not a fallback", err)
 	}
 }
 
 func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	km := testKeymap(2)
-	if _, err := planKey(km, textEvent("é")); err != nil {
+	if _, err := planKey(km, xkbState{}, textEvent("é")); err != nil {
 		t.Fatal(err)
 	}
 	// A reload after an external MappingNotify sees our scratch keycode with
@@ -257,14 +257,14 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	}
 }
 
-// A declined plan must fall back to xdotool and keep the connection: the
-// fake backend has a keymap but no socket, so any emission would panic.
+// A decline must fall back to xdotool and keep the connection: the fake
+// backend has no socket, so Key declines before touching it, and any
+// emission or drop would show.
 func TestExecKey_DeclineFallsBackWithoutDroppingTheBackend(t *testing.T) {
 	logFile := filepath.Join(t.TempDir(), "args.log")
 	withFakeBin(t, map[string]string{"xdotool": fmt.Sprintf("echo \"$@\" >> %q\nexit 0\n", logFile)})
 	s := newDesktopService(&sandboxContext{})
 	b := withFakeBackend(s)
-	b.keys = testKeymap(1)
 
 	ev := chordEvent("XF86AudioPlay")
 	args, err := keyArgs(ev)
@@ -280,5 +280,34 @@ func TestExecKey_DeclineFallsBackWithoutDroppingTheBackend(t *testing.T) {
 	got, _ := os.ReadFile(logFile)
 	if !strings.Contains(string(got), "key -- XF86AudioPlay") {
 		t.Errorf("xdotool log = %q, want the chord delivered through xdotool", got)
+	}
+}
+
+func TestPlanKey_CapsLockInvertsShiftForLettersOnly(t *testing.T) {
+	km := testKeymap(2)
+	segs, err := planKey(km, xkbState{capsLock: true}, textEvent("aA1!é€"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []keyEvent
+	want = append(want, shiftedTap(kcA)...)      // a needs Shift under Caps Lock
+	want = append(want, tapEvents(kcA)...)       // A does not
+	want = append(want, tapEvents(kc1)...)       // digits are unaffected
+	want = append(want, shiftedTap(kc1)...)      // and so is !
+	want = append(want, shiftedTap(kcSpare0)...) // é is a cased letter on a scratch key
+	want = append(want, tapEvents(kcSpare1)...)  // € is not
+	eventsEqual(t, segs[0].events, want)
+}
+
+func TestXkbStateFromReply(t *testing.T) {
+	reply := make([]byte, 32)
+	reply[0], reply[1] = 1, 3 // reply, deviceID
+	reply[11] = xproto.ModMaskLock
+	reply[12] = 1
+	if got := xkbStateFromReply(reply); got != (xkbState{group: 1, capsLock: true}) {
+		t.Errorf("state = %+v, want group 1 with Caps Lock", got)
+	}
+	if got := xkbStateFromReply(reply[:8]); got != (xkbState{}) {
+		t.Errorf("short reply = %+v, want zero state", got)
 	}
 }

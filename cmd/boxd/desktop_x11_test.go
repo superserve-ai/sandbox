@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jezek/xgb"
+	"github.com/jezek/xgb/xproto"
 
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
@@ -252,6 +254,92 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("after an external remap the terminal received %q, want %q", got, want)
+	}
+	t.Logf("spare keycodes on this server: %d", len(s.x11.backend.keys.spare))
+
+	expect := func(label, text string) {
+		t.Helper()
+		send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: text}})
+		want += text
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if out, err := os.ReadFile(typed); err == nil {
+				got = string(out)
+				if got == want {
+					return
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("%s: terminal received %q, want %q", label, got, want)
+	}
+
+	// Caps Lock on: the X11 path must invert Shift for letters, nothing else.
+	toggleCaps := func() {
+		t.Helper()
+		caps := exec.Command("xdotool", "key", "Caps_Lock")
+		caps.Env = append(os.Environ(), "DISPLAY="+display)
+		if out, err := caps.CombinedOutput(); err != nil {
+			t.Fatalf("xdotool key Caps_Lock: %v: %s", err, out)
+		}
+	}
+	toggleCaps()
+	expect("with Caps Lock", "Mixed Case 42!\n")
+	toggleCaps()
+
+	// A second group made active: the X11 path declines (its keycodes
+	// would type the other group's symbols) and xdotool, which locks the
+	// group per keysym, types the text.
+	if _, err := exec.LookPath("setxkbmap"); err != nil {
+		t.Skip("setxkbmap not installed; group check skipped")
+	}
+	layout := exec.Command("setxkbmap", "-layout", "us,ru")
+	layout.Env = append(os.Environ(), "DISPLAY="+display)
+	if out, err := layout.CombinedOutput(); err != nil {
+		t.Fatalf("setxkbmap: %v: %s", err, out)
+	}
+	xkbLockGroup(t, display, 1)
+	if state, err := s.x11.backend.xkbGetState(); err != nil || state.group != 1 {
+		t.Fatalf("state after lock = %+v, %v; want group 1", state, err)
+	}
+	desktopHelperPath = old
+	expect("under group 2", "plain\n")
+	if s.x11.backend == nil {
+		t.Fatal("declining for the active group dropped the backend")
+	}
+}
+
+// xkbLockGroup locks the keyboard group from a connection of its own:
+// XkbUseExtension(1.0), then XkbLatchLockState(XkbUseCoreKbd, lockGroup).
+func xkbLockGroup(t *testing.T, display string, group byte) {
+	t.Helper()
+	conn, err := xgb.NewConnDisplay(display)
+	if err != nil {
+		t.Fatalf("xkb test connection: %v", err)
+	}
+	defer conn.Close()
+	ext, err := xproto.QueryExtension(conn, 9, "XKEYBOARD").Reply()
+	if err != nil || !ext.Present {
+		t.Fatalf("XKEYBOARD extension: %v", err)
+	}
+	use := make([]byte, 8)
+	use[0], use[1] = ext.MajorOpcode, 0
+	xgb.Put16(use[2:], 2)
+	xgb.Put16(use[4:], 1)
+	cookie := conn.NewCookie(true, true)
+	conn.NewRequest(use, cookie)
+	if _, err := cookie.Reply(); err != nil {
+		t.Fatalf("XkbUseExtension: %v", err)
+	}
+	lock := make([]byte, 16)
+	lock[0], lock[1] = ext.MajorOpcode, 5
+	xgb.Put16(lock[2:], 4)
+	xgb.Put16(lock[4:], 0x100)
+	lock[8], lock[9] = 1, group // lockGroup, groupLock
+	cookie = conn.NewCookie(true, false)
+	conn.NewRequest(lock, cookie)
+	if err := cookie.Check(); err != nil {
+		t.Fatalf("XkbLatchLockState: %v", err)
 	}
 }
 

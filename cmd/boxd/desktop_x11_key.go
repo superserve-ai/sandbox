@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
+	"github.com/jezek/xgb"
 	"github.com/jezek/xgb/xproto"
 
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
@@ -16,6 +18,75 @@ import (
 var errBackendKept = errors.New("x11 key path declined")
 
 const keysymShiftL = 0xffe1
+
+type xkbProbe uint8
+
+const (
+	xkbUnprobed xkbProbe = iota
+	xkbPresent
+	xkbAbsent
+)
+
+// xkbState is what the core keyboard map cannot show: the active group and
+// the locked modifiers (Caps Lock).
+type xkbState struct {
+	group    int
+	capsLock bool
+}
+
+// xkbGetState asks the server for the keyboard state; a server without the
+// extension reports the first group and no locks. Hand-encoded: xgb ships
+// no XKB bindings and this is the one XKB request the key path needs.
+func (b *x11Backend) xkbGetState() (xkbState, error) {
+	if b.xkb == xkbUnprobed {
+		ext, err := xproto.QueryExtension(b.conn, 9, "XKEYBOARD").Reply()
+		if err != nil {
+			return xkbState{}, fmt.Errorf("query XKEYBOARD: %w", err)
+		}
+		if !ext.Present {
+			b.xkb = xkbAbsent
+			return xkbState{}, nil
+		}
+		b.xkbOpcode = ext.MajorOpcode
+		// XkbUseExtension(1.0) must precede any other XKB request.
+		req := make([]byte, 8)
+		req[0], req[1] = b.xkbOpcode, 0
+		xgb.Put16(req[2:], 2)
+		xgb.Put16(req[4:], 1)
+		if _, err := b.xkbRequest(req); err != nil {
+			return xkbState{}, fmt.Errorf("XkbUseExtension: %w", err)
+		}
+		b.xkb = xkbPresent
+	}
+	if b.xkb == xkbAbsent {
+		return xkbState{}, nil
+	}
+	// XkbGetState(XkbUseCoreKbd).
+	req := make([]byte, 8)
+	req[0], req[1] = b.xkbOpcode, 4
+	xgb.Put16(req[2:], 2)
+	xgb.Put16(req[4:], 0x100)
+	reply, err := b.xkbRequest(req)
+	if err != nil {
+		return xkbState{}, fmt.Errorf("XkbGetState: %w", err)
+	}
+	return xkbStateFromReply(reply), nil
+}
+
+func (b *x11Backend) xkbRequest(req []byte) ([]byte, error) {
+	cookie := b.conn.NewCookie(true, true)
+	b.conn.NewRequest(req, cookie)
+	return cookie.Reply()
+}
+
+// xkbStateFromReply reads a raw XkbGetState reply: after the 8-byte header
+// come mods, baseMods, latchedMods, lockedMods, then the effective group.
+func xkbStateFromReply(reply []byte) xkbState {
+	if len(reply) < 13 {
+		return xkbState{}
+	}
+	return xkbState{group: int(reply[12]), capsLock: reply[11]&xproto.ModMaskLock != 0}
+}
 
 // x11Keymap is the server's core keyboard mapping plus the scratch keycodes
 // this backend has bound for characters the layout cannot type.
@@ -102,18 +173,11 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound ma
 	return km
 }
 
-// keymap returns the current mapping, fetching it on first use and after a
-// MappingNotify this backend did not cause. A round trip comes first: the
-// server sends that notification before it answers any later request, so
-// a change another client made before this call is in the queue by the
-// time the cache is consulted.
+// keymap fetches the current mapping. It is refetched on every key request
+// rather than cached against MappingNotify: a few kilobytes over the local
+// socket, and the one way to be current no matter which client changed the
+// layout or how (an XKB client stops receiving core MappingNotify at all).
 func (b *x11Backend) keymap() (*x11Keymap, error) {
-	if err := b.sync(); err != nil {
-		return nil, err
-	}
-	if b.keys != nil && !b.keysDirty {
-		return b.keys, nil
-	}
 	setup := xproto.Setup(b.conn)
 	count := int(setup.MaxKeycode) - int(setup.MinKeycode) + 1
 	reply, err := xproto.GetKeyboardMapping(b.conn, setup.MinKeycode, byte(count)).Reply()
@@ -125,14 +189,15 @@ func (b *x11Backend) keymap() (*x11Keymap, error) {
 		bound = b.keys.bound
 	}
 	b.keys = buildKeymap(setup.MinKeycode, int(reply.KeysymsPerKeycode), reply.Keysyms, bound)
-	b.keysDirty = false
 	return b.keys, nil
 }
 
 // keyPlanner lowers one key request to keycodes against a copy of the
 // scratch state, so a declined request leaves the keymap untouched.
 type keyPlanner struct {
-	km       *x11Keymap
+	km *x11Keymap
+	// capsLock inverts Shift for cased letters typed through the layout.
+	capsLock bool
 	spare    []xproto.Keycode
 	bound    map[xproto.Keycode]uint32
 	used     map[xproto.Keycode]bool
@@ -140,8 +205,8 @@ type keyPlanner struct {
 	cur      keySegment
 }
 
-func newKeyPlanner(km *x11Keymap) *keyPlanner {
-	p := &keyPlanner{km: km, spare: append([]xproto.Keycode(nil), km.spare...),
+func newKeyPlanner(km *x11Keymap, state xkbState) *keyPlanner {
+	p := &keyPlanner{km: km, capsLock: state.capsLock, spare: append([]xproto.Keycode(nil), km.spare...),
 		bound: make(map[xproto.Keycode]uint32, len(km.bound)), used: map[xproto.Keycode]bool{}}
 	for code, ks := range km.bound {
 		p.bound[code] = ks
@@ -189,14 +254,31 @@ func (p *keyPlanner) scratch(ks uint32) (xproto.Keycode, bool) {
 // keycode.
 func (p *keyPlanner) stroke(ks uint32) (keystroke, error) {
 	_, hasShift := p.km.direct[keysymShiftL]
+	// Caps Lock flips the case of every alphabetic key, layout or scratch
+	// (XKB types a single cased keysym as alphabetic too), and Shift flips
+	// it back.
+	invert := p.capsLock && hasShift && casedLetter(ks)
 	if st, ok := p.km.direct[ks]; ok && (!st.shift || hasShift) {
+		st.shift = st.shift != invert
 		return st, nil
 	}
 	code, ok := p.scratch(ks)
 	if !ok {
 		return keystroke{}, fmt.Errorf("no spare keycode for keysym 0x%x: %w", ks, errBackendKept)
 	}
-	return keystroke{code: code}, nil
+	return keystroke{code: code, shift: invert}, nil
+}
+
+// casedLetter reports whether ks is a letter with distinct cases, for the
+// Latin-1 and Unicode keysym ranges.
+func casedLetter(ks uint32) bool {
+	r := rune(ks)
+	if ks >= 0x01000000 {
+		r = rune(ks & 0x00ffffff)
+	} else if ks > 0xff {
+		return false
+	}
+	return unicode.IsLetter(r) && unicode.ToUpper(r) != unicode.ToLower(r)
 }
 
 func (p *keyPlanner) emit(code xproto.Keycode, press bool) {
@@ -272,10 +354,10 @@ func (p *keyPlanner) chord(modifiers []string, key string) error {
 	return nil
 }
 
-// planKey lowers a validated KeyEvent. On success the keymap's scratch
-// state is updated to what the plan will bind.
-func planKey(km *x11Keymap, ev *pb.KeyEvent) ([]keySegment, error) {
-	p := newKeyPlanner(km)
+// planKey lowers a validated KeyEvent for the given keyboard state. On
+// success the keymap's scratch state is updated to what the plan will bind.
+func planKey(km *x11Keymap, state xkbState, ev *pb.KeyEvent) ([]keySegment, error) {
+	p := newKeyPlanner(km, state)
 	var err error
 	switch in := ev.GetInput().(type) {
 	case *pb.KeyEvent_Key:
@@ -296,15 +378,29 @@ func planKey(km *x11Keymap, ev *pb.KeyEvent) ([]keySegment, error) {
 }
 
 // Key delivers one KeyEvent through XTest: scratch bindings, a sync so the
-// server (and every client's MappingNotify) is ahead of the presses, then
+// server has applied them (and told every client) before the presses, then
 // the strokes and one sync per segment. A plan failure happens before any
 // request is sent; after that, errors are returned without replay.
 func (b *x11Backend) Key(ev *pb.KeyEvent) error {
+	// A backend without a connection (tests) cannot type.
+	if b.conn == nil {
+		return fmt.Errorf("no X11 connection: %w", errBackendKept)
+	}
 	km, err := b.keymap()
 	if err != nil {
 		return err
 	}
-	segments, err := planKey(km, ev)
+	state, err := b.xkbGetState()
+	if err != nil {
+		return err
+	}
+	// The core map describes the first group only; under another group a
+	// layout keycode types that group's symbol. xdotool locks groups per
+	// keysym, so it keeps that case.
+	if state.group != 0 {
+		return fmt.Errorf("keyboard group %d is active: %w", state.group+1, errBackendKept)
+	}
+	segments, err := planKey(km, state, ev)
 	if err != nil {
 		return err
 	}
@@ -314,7 +410,6 @@ func (b *x11Backend) Key(ev *pb.KeyEvent) error {
 			for _, bind := range seg.binds {
 				row[0] = xproto.Keysym(bind.keysym)
 				xproto.ChangeKeyboardMapping(b.conn, 1, bind.code, byte(km.perCode), row)
-				b.ownRemaps++
 			}
 			if err := b.sync(); err != nil {
 				return err
