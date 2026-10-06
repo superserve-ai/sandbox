@@ -386,11 +386,12 @@ func testStreamAttemptLogsReconnectsWithReplay(t *testing.T, firstCallNotFound b
 	}
 }
 
-// Consumers render every non-terminal event in the log body, so each one has
-// to carry the timestamp that body shows.
-func TestStreamAttemptLogsStampsEveryRenderedEvent(t *testing.T) {
+// Scheduling state belongs to the build status endpoint. The log body is the
+// user's own build output, and the stream stays open without writing to it.
+func TestStreamAttemptLogsKeepsSchedulingStateOutOfTheLogBody(t *testing.T) {
 	buildID, templateID, teamID := uuid.New(), uuid.New(), uuid.New()
 	attempt, incarnationID := uuid.New(), uuid.New()
+	const reason = "waiting for eligible host/capacity"
 	q := &mockDBTX{queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 		return &mockRow{scanFn: func(dest ...any) error {
 			switch {
@@ -406,7 +407,7 @@ func TestStreamAttemptLogsStampsEveryRenderedEvent(t *testing.T) {
 				*dest[0].(*uuid.UUID) = buildID
 				a := attempt
 				*dest[1].(**uuid.UUID) = &a
-				*dest[4].(*string) = "waiting for eligible host/capacity"
+				*dest[4].(*string) = reason
 			case strings.Contains(sql, "FROM template_build_attempt a JOIN template_build b"):
 				*dest[0].(*uuid.UUID) = attempt
 				*dest[1].(*uuid.UUID) = buildID
@@ -423,7 +424,7 @@ func TestStreamAttemptLogsStampsEveryRenderedEvent(t *testing.T) {
 		}}
 	}}
 	h := &Handlers{DB: db.New(q), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) { return &stubVMD{}, nil }}}
-	w := &logNotifyWriter{ResponseRecorder: httptest.NewRecorder(), seen: make(chan struct{}), match: "waiting for eligible host/capacity"}
+	w := &logNotifyWriter{ResponseRecorder: httptest.NewRecorder(), seen: make(chan struct{}), match: ":\n\n"}
 	c, _ := gin.CreateTestContext(w)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -436,15 +437,17 @@ func TestStreamAttemptLogsStampsEveryRenderedEvent(t *testing.T) {
 	select {
 	case <-w.seen:
 	case <-time.After(5 * time.Second):
-		t.Fatal("execution status event never emitted")
+		t.Fatal("stream never held the connection open")
 	}
 	cancel()
 	<-done
-	events := 0
 	for _, line := range strings.Split(w.Body.String(), "\n") {
 		payload, ok := strings.CutPrefix(line, "data: ")
 		if !ok {
 			continue
+		}
+		if strings.Contains(payload, reason) {
+			t.Fatalf("scheduling state reached the log body: %s", payload)
 		}
 		var ev struct {
 			Timestamp string `json:"timestamp"`
@@ -457,9 +460,5 @@ func TestStreamAttemptLogsStampsEveryRenderedEvent(t *testing.T) {
 		if !ev.Finished && ev.Timestamp == "" {
 			t.Fatalf("rendered event carries no timestamp: %s", payload)
 		}
-		events++
-	}
-	if events == 0 {
-		t.Fatal("no events captured")
 	}
 }
