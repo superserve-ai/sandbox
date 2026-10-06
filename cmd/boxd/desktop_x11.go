@@ -377,6 +377,9 @@ type x11Holder struct {
 	lastProbe time.Time
 	probing   bool // a dial is in flight; concurrent callers use the shell path
 	disabled  bool // tests force the shell path
+	// keys is the last backend's keymap, kept so its scratch bindings (which
+	// live on in the server) stay recognized as ours after a reconnect.
+	keys *x11Keymap
 }
 
 // dialX11 connects under ctx and x11DialTimeout. The socket is opened here
@@ -435,6 +438,7 @@ func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 	if h.backend != nil && h.display != display {
 		h.backend.Close()
 		h.backend = nil
+		h.keys = nil // a different server, different bindings
 	}
 	if h.backend != nil {
 		backend := h.backend
@@ -458,6 +462,7 @@ func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 	if err != nil {
 		return nil
 	}
+	backend.keys = h.keys
 	h.backend = backend
 	return backend
 }
@@ -470,6 +475,9 @@ func (h *x11Holder) drop(backend *x11Backend) {
 	if h.backend == backend && backend != nil {
 		backend.Close()
 		h.backend = nil
+		if backend.keys != nil {
+			h.keys = backend.keys
+		}
 	}
 }
 

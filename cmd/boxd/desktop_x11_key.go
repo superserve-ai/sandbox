@@ -129,12 +129,17 @@ type keySegment struct {
 	events []keyEvent
 }
 
-// buildKeymap lowers a core keyboard mapping to lookup tables. Keycodes in
-// bound are scratch keycodes from an earlier map; one stays bound only if
-// the fetched row is still the single-keysym key that was installed,
-// otherwise the row decides.
-func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound map[xproto.Keycode]uint32) *x11Keymap {
+// buildKeymap lowers a core keyboard mapping to lookup tables. prev is the
+// map built last time, if any: its scratch keycodes stay bound only if the
+// fetched row is still the single-keysym key that was installed (otherwise
+// the row decides), and they rejoin the pool in its order so the least
+// recently used one is still evicted first.
+func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, prev *x11Keymap) *x11Keymap {
 	km := &x11Keymap{perCode: perCode, direct: map[uint32]keystroke{}, bound: map[xproto.Keycode]uint32{}}
+	var bound map[xproto.Keycode]uint32
+	if prev != nil {
+		bound = prev.bound
+	}
 	if perCode < 1 {
 		return km
 	}
@@ -172,9 +177,14 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound ma
 	if len(km.spare) > 0 {
 		km.spare = km.spare[:len(km.spare)-1] // reserved for xdotool
 	}
-	// Previously bound scratch keycodes rejoin the pool as most recently used.
-	for code := range km.bound {
-		km.spare = append(km.spare, code)
+	// Bound scratch keycodes rejoin the pool after the empty ones, in the
+	// order they were last used.
+	if prev != nil {
+		for _, code := range prev.spare {
+			if _, ok := km.bound[code]; ok {
+				km.spare = append(km.spare, code)
+			}
+		}
 	}
 	return km
 }
@@ -213,11 +223,7 @@ func (b *x11Backend) keymap() (*x11Keymap, error) {
 	if err != nil {
 		return nil, fmt.Errorf("keyboard mapping: %w", err)
 	}
-	var bound map[xproto.Keycode]uint32
-	if b.keys != nil {
-		bound = b.keys.bound
-	}
-	b.keys = buildKeymap(setup.MinKeycode, int(reply.KeysymsPerKeycode), reply.Keysyms, bound)
+	b.keys = buildKeymap(setup.MinKeycode, int(reply.KeysymsPerKeycode), reply.Keysyms, b.keys)
 	return b.keys, nil
 }
 
