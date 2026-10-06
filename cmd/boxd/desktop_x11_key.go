@@ -129,7 +129,8 @@ type keySegment struct {
 
 // buildKeymap lowers a core keyboard mapping to lookup tables. Keycodes in
 // bound are scratch keycodes from an earlier map; one stays bound only if
-// the fetched row still types its keysym, otherwise the row decides.
+// the fetched row is still the single-keysym key that was installed,
+// otherwise the row decides.
 func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound map[xproto.Keycode]uint32) *x11Keymap {
 	km := &x11Keymap{perCode: perCode, direct: map[uint32]keystroke{}, bound: map[xproto.Keycode]uint32{}}
 	if perCode < 1 {
@@ -138,7 +139,7 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound ma
 	for i := 0; (i+1)*perCode <= len(syms); i++ {
 		code := xproto.Keycode(int(min) + i)
 		row := syms[i*perCode : (i+1)*perCode]
-		if ks, ours := bound[code]; ours && uint32(row[0]) == ks {
+		if ks, ours := bound[code]; ours && scratchRowIntact(row, ks) {
 			km.bound[code] = ks
 			continue
 		}
@@ -171,6 +172,29 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound ma
 		km.spare = append(km.spare, code)
 	}
 	return km
+}
+
+// scratchRowIntact reports whether a fetched row is still the single-keysym
+// key bound to ks: the server exports a cased letter back as its
+// lower/upper pair, so those are the only symbols allowed besides NoSymbol.
+func scratchRowIntact(row []xproto.Keysym, ks uint32) bool {
+	if len(row) == 0 || uint32(row[0]) != ks {
+		return false
+	}
+	upper := ks
+	if casedLetter(ks) {
+		r := rune(ks)
+		if ks >= 0x01000000 {
+			r = rune(ks & 0x00ffffff)
+		}
+		upper = keysymFromRune(unicode.ToUpper(r))
+	}
+	for _, sym := range row[1:] {
+		if s := uint32(sym); s != 0 && s != ks && s != upper {
+			return false
+		}
+	}
+	return true
 }
 
 // keymap fetches the current mapping. It is refetched on every key request

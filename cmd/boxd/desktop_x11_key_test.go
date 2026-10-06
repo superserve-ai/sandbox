@@ -263,6 +263,17 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	if len(r.bound) != 0 || r.direct['z'].code != kcSpare0 || len(r.spare) != 1 {
 		t.Errorf("rewritten row: bound = %v, direct[z] = %v, spare = %v; want z on %d and one spare", r.bound, r.direct['z'], r.spare, kcSpare0)
 	}
+
+	// The server exports a bound cased letter as its lower/upper pair:
+	// still ours. Any other symbol on the row means another client owns it.
+	paired := append(append([]xproto.Keysym{}, syms[:16]...), 0xe9, 0xc9, 0, 0)
+	if r := buildKeymap(8, 2, paired, km.bound); r.bound[kcSpare0] != 0xe9 {
+		t.Errorf("paired row: bound = %v, want é kept on %d", r.bound, kcSpare0)
+	}
+	foreign := append(append([]xproto.Keysym{}, syms[:16]...), 0xe9, 'x', 0, 0)
+	if r := buildKeymap(8, 2, foreign, km.bound); len(r.bound) != 0 || r.direct['x'].code != kcSpare0 {
+		t.Errorf("foreign row: bound = %v, direct[x] = %v; want the binding dropped and x on %d", r.bound, r.direct['x'], kcSpare0)
+	}
 }
 
 // A decline must fall back to xdotool and keep the connection: the fake
