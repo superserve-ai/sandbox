@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,11 +18,58 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vm"
 )
 
-func startMiningProtection(ctx context.Context, cfg Config, pool *pgxpool.Pool, proxy *network.EgressProxy, lc *lifecycle, log zerolog.Logger, recorder telemetry.Recorder, manager *vm.Manager) func() {
+func startMiningProtection(ctx context.Context, ready <-chan struct{}, cfg Config, pool *pgxpool.Pool, proxy *network.EgressProxy, lc *lifecycle, log zerolog.Logger, recorder telemetry.Recorder, manager *vm.Manager) func() {
 	path := os.Getenv("VMD_MINING_POLICY_CONFIG")
 	if path == "" {
 		return nil
 	}
+	return startBackgroundMiningProtection(ctx, ready, lc, func(ctx context.Context, reloads <-chan struct{}) error {
+		return runMiningProtection(ctx, reloads, path, cfg, pool, proxy, log, recorder, manager)
+	})
+}
+
+// Register cleanup before starting initialization: lifecycle shutdown snapshots
+// closers, so a background initializer must never register a late closer.
+func startBackgroundMiningProtection(ctx context.Context, ready <-chan struct{}, lc *lifecycle, run func(context.Context, <-chan struct{}) error) func() {
+	miningCtx, cancel := context.WithCancel(ctx)
+	reloads := make(chan struct{}, 1)
+	done := make(chan struct{})
+	var cleanupErr error
+	lc.addCloser("mining protection", func(closeCtx context.Context) error {
+		cancel()
+		select {
+		case <-done:
+			return cleanupErr
+		case <-closeCtx.Done():
+			return closeCtx.Err()
+		}
+	})
+	lc.start("mining protection", func() error {
+		defer close(done)
+		defer cancel()
+		select {
+		case <-miningCtx.Done():
+			return nil
+		case <-ready:
+		}
+		if miningCtx.Err() != nil {
+			return nil
+		}
+		cleanupErr = run(miningCtx, reloads)
+		// Disabled/failed optional initialization must not stop the daemon. The
+		// registered closer still owns cancellation and any cleanup failure.
+		<-miningCtx.Done()
+		return nil
+	})
+	return func() {
+		select {
+		case reloads <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func runMiningProtection(ctx context.Context, reloads <-chan struct{}, path string, cfg Config, pool *pgxpool.Pool, proxy *network.EgressProxy, log zerolog.Logger, recorder telemetry.Recorder, manager *vm.Manager) (cleanupErr error) {
 	policyConfig, err := blocklist.LoadMiningConfig(path)
 	if err != nil {
 		log.Error().Err(err).Msg("mining policy unavailable; escalation disabled")
@@ -41,10 +89,16 @@ func startMiningProtection(ctx context.Context, cfg Config, pool *pgxpool.Pool, 
 		}
 	}
 	policy := blocklist.New(policyConfig, log)
+	if ctx.Err() != nil {
+		return nil
+	}
 	gate, err := network.NewMiningPacketGate(log)
 	if err != nil {
 		log.Error().Err(err).Msg("mining packet gate unavailable; escalation disabled")
 		return nil
+	}
+	if ctx.Err() != nil {
+		return gate.Close()
 	}
 	source := abuse.NewAuthoritativeSource(pool, abuse.AuthoritativeOptions{Report: telemetry.NewAbusePolicyReporter(ctx, log, recorder)})
 	assignments := network.NewHostMiningSource(pool, source, proxy, cfg.HostID, cfg.IncarnationID)
@@ -61,21 +115,41 @@ func startMiningProtection(ctx context.Context, cfg Config, pool *pgxpool.Pool, 
 		return controller.Receipt(ctx, i, r)
 	})
 	if err != nil {
-		_ = gate.Close()
+		cleanupErr = gate.Close()
 		log.Error().Err(err).Msg("mining incident spool unavailable; escalation disabled")
+		return cleanupErr
+	}
+	var workers sync.WaitGroup
+	start := func(fn func()) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			fn()
+		}()
+	}
+	defer func() {
+		proxy.SetMiningPolicy(nil, nil)
+		assignments.Disable()
+		workers.Wait()
+		if err := gate.Close(); err != nil {
+			cleanupErr = err
+		}
+	}()
+	// Cancellation can arrive during non-cancellable kernel/spool recovery.
+	// Never publish enforcement or start dependent workers after it does.
+	if ctx.Err() != nil {
 		return nil
 	}
 	controller = network.NewMiningContainment(assignments, gate, delivery, log)
 	proxy.SetMiningPolicy(policy, controller)
-	lc.addCloser("mining packet gate", func(context.Context) error { return gate.Close() })
 	policy.SetCIDRSink(func(cidrs []string) {
 		if err := gate.UpdateCIDRs(cidrs); err != nil {
 			log.Error().Err(err).Msg("mining destination synchronization failed; retaining previous kernel policy")
 		}
 	})
-	lc.start("mining policy", func() error { return policy.Start(ctx) })
-	lc.start("mining team policy", func() error { source.Run(ctx); return nil })
-	lc.start("mining packet observer", func() error {
+	start(func() { _ = policy.Start(ctx) })
+	start(func() { source.Run(ctx) })
+	start(func() {
 		if err := gate.Run(ctx, policy, controller); err != nil && ctx.Err() == nil {
 			// Closing the listener makes queue bypass immediate. Other daemon services
 			// remain healthy; a packet observer failure must not stop sandbox compute.
@@ -85,9 +159,8 @@ func startMiningProtection(ctx context.Context, cfg Config, pool *pgxpool.Pool, 
 			log.Error().Err(err).Msg("mining packet observer failed open")
 			<-ctx.Done()
 		}
-		return nil
 	})
-	lc.start("mining assignments", func() error {
+	start(func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		degraded := false
@@ -111,14 +184,21 @@ func startMiningProtection(ctx context.Context, cfg Config, pool *pgxpool.Pool, 
 			degraded = err != nil
 			if err == nil && source.Stats().Ready && !deliveryStarted {
 				deliveryStarted = true
-				lc.start("mining incident delivery", func() error { delivery.Run(ctx); return nil })
+				start(func() { delivery.Run(ctx) })
 			}
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			case <-ticker.C:
 			}
 		}
 	})
-	return func() { policy.Reload(path) }
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-reloads:
+			policy.Reload(path)
+		}
+	}
 }

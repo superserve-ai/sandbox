@@ -1892,7 +1892,7 @@ func main() {
 			return nil
 		})
 		log.Info().Msg("reconciler DB connection ready")
-		reloadMiningPolicy = startMiningProtection(ctx, cfg, dbPool, egressProxy, lc, log, recorder, mgr)
+		reloadMiningPolicy = startMiningProtection(ctx, postReady, cfg, dbPool, egressProxy, lc, log, recorder, mgr)
 
 		// Per-connection egress logging. Drops on a full buffer rather than
 		// back-pressuring the proxy's data path.

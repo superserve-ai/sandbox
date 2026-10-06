@@ -138,6 +138,8 @@ Existing global destination blocks and customer egress rules do not create
 mining incidents. Private mining destinations are still denied in off/observe
 mode and for trusted teams; those modes and exemptions prevent escalation.
 Only a current attributed, untrusted sandbox in enforce mode can escalate.
+Kernel setup and spool recovery start in the background after host readiness;
+escalation remains disabled until initialization and attribution complete.
 Assignments refresh every two seconds in the background. A newly registered
 sandbox can attempt a blocked destination before attribution is published;
 escalation then fails open, so a mirror may succeed in that initial window.
@@ -145,9 +147,12 @@ Proxy destination denials still apply, but an unattributed direct packet also
 bypasses the private mining gate. Existing global firewall denials remain. Outages and queue overflow can also leave coverage gaps.
 This is the explicit tradeoff of fail-open attribution without lifecycle I/O.
 
-A mining match first contains the observing sandbox's outbound traffic and
-closes tracked proxy streams, then durably spools the incident locally. Delivery
-runs independently of best-effort flow audit. The host-bound writer validates
+A mining match first tentatively contains the observing sandbox's outbound
+traffic, then durably spools the incident locally before closing tracked proxy
+streams. Failed persistence clears the tentative gate and leaves those streams
+open. Raw packet observations use a bounded persistence worker so slow storage
+does not stop verdicts for unrelated sandboxes. Delivery runs independently of
+best-effort flow audit. The host-bound writer validates
 assignment and team ownership and atomically records the incident, team
 restriction, audit, and change. Other control planes then deny new compute and
 wake the pause reconciler. Incident IDs and recorded disposition make retries
