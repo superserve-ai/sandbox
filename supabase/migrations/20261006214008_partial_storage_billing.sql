@@ -64,17 +64,12 @@ ALTER TABLE team_billing_usage ADD COLUMN storage_complete boolean;
 
 CREATE FUNCTION storage_usage_detail(p_team uuid,p_start timestamptz,p_end timestamptz,p_floor_legacy_artifacts boolean DEFAULT true)
 RETURNS TABLE(known_mib_seconds numeric,complete boolean,blocked boolean) LANGUAGE sql STABLE AS $$
-WITH sandbox_refs AS MATERIALIZED (
- SELECT s.id,s.team_id,s.template_id,s.snapshot_id,s.destroyed_at,
-  refs->>'base' base_path,refs->>'delta' delta_path,refs->>'rootfs_fallback' rootfs_ref
- FROM sandbox s CROSS JOIN LATERAL (SELECT legacy_storage_reference(s.template_id,s.base_path,s.delta_path,s.legacy_storage_refs,s.snapshot_path,s.mem_path) refs) capture
- WHERE s.team_id=p_team
-), bounds AS MATERIALIZED (
+WITH bounds AS MATERIALIZED (
  SELECT LEAST(p_end,billing_request_now()) period_end,billing_request_now() request_now
 ), legacy_source AS MATERIALIZED (
  SELECT i.sandbox_id,i.team_id,i.host_id,i.disk_mib,i.started_at,i.ended_at,i.end_reason,
   s.destroyed_at,c.started_at team_cutover,b.period_end,b.request_now
- FROM sandbox_storage_interval i JOIN sandbox_refs s ON s.id=i.sandbox_id
+ FROM sandbox_storage_interval i JOIN sandbox s ON s.id=i.sandbox_id AND s.team_id=p_team
  CROSS JOIN bounds b
  LEFT JOIN LATERAL (
    SELECT CASE WHEN i.host_id IS NULL THEN MIN(c.started_at)
@@ -102,6 +97,13 @@ WITH sandbox_refs AS MATERIALIZED (
       AND r.owner_id=i.sandbox_id AND r.started_at>=i.started_at),
    i.period_end) started_at) boundary
  WHERE i.started_at<boundary.started_at
+), sandbox_refs AS MATERIALIZED (
+ SELECT s.id,s.team_id,s.template_id,s.snapshot_id,s.destroyed_at,
+  refs->>'base' base_path,refs->>'delta' delta_path,refs->>'rootfs_fallback' rootfs_ref
+ FROM (SELECT DISTINCT sandbox_id FROM legacy_intervals) owners
+ JOIN sandbox s ON s.id=owners.sandbox_id
+ CROSS JOIN LATERAL (SELECT legacy_storage_reference(s.template_id,s.base_path,s.delta_path,s.legacy_storage_refs,s.snapshot_path,s.mem_path) refs) capture
+ WHERE s.team_id=p_team
 ), legacy_segments AS MATERIALIZED (
  SELECT s.id,s.template_id,s.snapshot_id,s.base_path,s.delta_path,s.rootfs_ref,
   i.host_id interval_host_id,

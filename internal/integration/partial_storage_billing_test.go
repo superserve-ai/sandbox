@@ -377,3 +377,69 @@ func TestIntegration_UncapturedLegacyReferenceRequiresOriginalBuild(t *testing.T
 		})
 	}
 }
+
+func TestIntegration_StorageReferenceWorkExcludesIrrelevantHistory(t *testing.T) {
+	team, _ := seedTeamAndKey(t)
+	start := time.Now().UTC().Truncate(time.Hour).Add(-4 * time.Hour)
+	end := start.Add(time.Hour)
+	path := "/templates/" + team.String() + "/retained-base.ext4"
+	tpl := partialTemplate(t, team, &path)
+	storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256) VALUES($1,'base.ext4',$2,1048576,1048576,repeat('0',64))`, tpl, path)
+	seedHistoricalTemplateEvidence(t, tpl, path, start.Add(-3*time.Hour))
+	owner := partialOwner(t, team, tpl, &path, 9, start.Add(-2*time.Hour), end)
+	// The private overlay ended before the requested window, but its shared
+	// artifact is still retained until the owner's destruction at window end.
+	storageExec(t, `UPDATE sandbox_storage_interval SET ended_at=$2 WHERE sandbox_id=$1`, owner, start.Add(-time.Hour))
+	storageExec(t, `INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id,template_id,base_path,created_at,destroyed_at)
+ SELECT gen_random_uuid(),$1,'irrelevant-storage-history','deleted',1,1024,'default',$2,$3,$4::timestamptz-interval '2 days',$4::timestamptz-interval '1 day'
+ FROM generate_series(1,500)`, team, tpl, path, start)
+	storageExec(t, `INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at,ended_at,end_reason)
+ SELECT id,team_id,'default',9,created_at,destroyed_at,'deleted' FROM sandbox WHERE team_id=$1 AND name='irrelevant-storage-history'`, team)
+	check := func(wantOwners int, wantComplete bool) {
+		t.Helper()
+		var known pgtype.Numeric
+		var complete, blocked bool
+		if err := testPool.QueryRow(t.Context(), `SELECT * FROM storage_usage_detail($1,$2,$3,false)`, team, start, end).Scan(&known, &complete, &blocked); err != nil {
+			t.Fatal(err)
+		}
+		if numericFloat64(t, known) != 3600 || complete != wantComplete || blocked {
+			t.Fatalf("closed overlay lost its retained reference: known=%v complete=%v blocked=%v", known, complete, blocked)
+		}
+		var plan []byte
+		if err := testPool.QueryRow(t.Context(), `EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM storage_usage_detail($1,$2,$3,false)`, team, start, end).Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		var decoded any
+		if err := json.Unmarshal(plan, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		var inspect func(any)
+		inspect = func(value any) {
+			switch node := value.(type) {
+			case []any:
+				for _, child := range node {
+					inspect(child)
+				}
+			case map[string]any:
+				if node["Subplan Name"] == "CTE sandbox_refs" {
+					found = true
+					if node["Actual Rows"] != float64(wantOwners) || node["Actual Loops"] != float64(1) {
+						t.Fatalf("reference evaluation scaled with irrelevant history: %s", plan)
+					}
+				}
+				for _, child := range node {
+					inspect(child)
+				}
+			}
+		}
+		inspect(decoded)
+		if !found {
+			t.Fatalf("reference evaluation plan missing: %s", plan)
+		}
+	}
+	check(1, true)
+	missing := path + ".unmeasured"
+	partialOwner(t, team, tpl, &missing, 0, start, end)
+	check(2, false)
+}
