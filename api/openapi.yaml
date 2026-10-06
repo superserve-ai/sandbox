@@ -2946,8 +2946,9 @@ components:
       required: [usage, cost_usd, tracked, billable]
       properties:
         usage:
-          type: number
+          type: [number, "null"]
           format: double
+          description: Null when tracked storage measurements are incomplete. Costs remain complete; unknown billable usage returns 503.
         cost_usd:
           type: number
           format: double
@@ -3284,8 +3285,9 @@ components:
         display_unit:
           type: string
         usage:
-          type: number
+          type: [number, "null"]
           format: double
+          description: Null when tracked storage measurements are incomplete. Charges remain complete; unknown billable usage returns 503.
         tracked:
           type: boolean
         billable:
