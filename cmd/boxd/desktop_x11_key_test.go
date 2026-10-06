@@ -282,6 +282,28 @@ func TestBuildKeymap_ExcludesModifierKeycodesFromThePool(t *testing.T) {
 	}
 }
 
+// A bound scratch keycode that another client made a modifier is given up,
+// even though its symbol row is unchanged.
+func TestBuildKeymap_DropsABindingThatBecameAModifier(t *testing.T) {
+	km := testKeymap(2)
+	if _, err := planKey(km, xkbState{}, textEvent("é")); err != nil {
+		t.Fatal(err)
+	}
+	var syms []xproto.Keysym
+	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0xe9, 0xc9}, {0, 0}, {0, 0}} {
+		syms = append(syms, r[0], r[1])
+	}
+	r := buildKeymap(8, 2, syms, []xproto.Keycode{kcSpare0}, km)
+	if len(r.bound) != 0 {
+		t.Errorf("bound = %v, want the binding dropped once %d is a modifier", r.bound, kcSpare0)
+	}
+	for _, code := range r.spare {
+		if code == kcSpare0 {
+			t.Errorf("modifier keycode %d is back in the scratch pool", kcSpare0)
+		}
+	}
+}
+
 // A layout with only Shift_R still shifts.
 func TestPlanKey_UsesShiftRWhenShiftLIsAbsent(t *testing.T) {
 	var syms []xproto.Keysym

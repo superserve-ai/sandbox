@@ -180,7 +180,7 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifier
 	for i := 0; (i+1)*perCode <= len(syms); i++ {
 		code := xproto.Keycode(int(min) + i)
 		row := syms[i*perCode : (i+1)*perCode]
-		if ks, ours := bound[code]; ours && scratchRowIntact(row, ks) {
+		if ks, ours := bound[code]; ours && !modifier[code] && scratchRowIntact(row, ks) {
 			km.bound[code] = ks
 			continue
 		}
