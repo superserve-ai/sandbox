@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"net"
@@ -57,6 +58,12 @@ type x11Backend struct {
 	sock      net.Conn
 	root      xproto.Window
 	hasXfixes bool
+	// keys is the keyboard mapping (desktop_x11_key.go), fetched lazily;
+	// keysDirty is set by a MappingNotify this backend did not cause, and
+	// ownRemaps counts the ones it did and has not yet seen back.
+	keys      *x11Keymap
+	keysDirty bool
+	ownRemaps int
 }
 
 // parseDisplay resolves a DISPLAY value to the socket to dial and the screen
@@ -144,6 +151,13 @@ func (b *x11Backend) sync() error {
 		}
 		if ev == nil {
 			return nil
+		}
+		if m, ok := ev.(xproto.MappingNotifyEvent); ok && m.Request == xproto.MappingKeyboard {
+			if b.ownRemaps > 0 {
+				b.ownRemaps--
+			} else {
+				b.keysDirty = true
+			}
 		}
 	}
 }
@@ -479,7 +493,7 @@ func (s *desktopService) runX11(ctx context.Context, op func(context.Context, *x
 	go func() { done <- op(ctx, backend) }()
 	select {
 	case err := <-done:
-		if err != nil {
+		if err != nil && !errors.Is(err, errBackendKept) {
 			s.x11.drop(backend)
 		}
 		return true, err

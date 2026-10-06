@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -159,6 +160,72 @@ func TestDesktopStep_RealXServer(t *testing.T) {
 	}
 	if got := string(out); !strings.HasPrefix(got, "x:321 y:54 ") {
 		t.Fatalf("pointer after Step: %q, want x:321 y:54", got)
+	}
+}
+
+// Keyboard input against a real server, read back through a terminal: the
+// desktop helpers are hidden so only the XTest path can deliver it.
+func TestDesktopKeys_RealXServer(t *testing.T) {
+	for _, bin := range []string{"Xvnc", "xdotool", "xterm"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	display := startXvnc(t, 640, 480)
+	t.Setenv("DISPLAY", display)
+	typed := filepath.Join(t.TempDir(), "typed.txt")
+	term := exec.Command("xterm", "-geometry", "80x24+0+0", "-e", "sh", "-c", "cat > "+typed)
+	term.Env = append(os.Environ(), "DISPLAY="+display, "LC_ALL=C.UTF-8", "LANG=C.UTF-8")
+	if err := term.Start(); err != nil {
+		t.Fatalf("start xterm: %v", err)
+	}
+	t.Cleanup(func() { _ = term.Process.Kill(); _ = term.Wait() })
+	wait := exec.Command("xdotool", "search", "--sync", "--class", "xterm")
+	wait.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := wait.Run(); err != nil {
+		t.Fatalf("xterm window did not appear: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	old := desktopHelperPath
+	desktopHelperPath = t.TempDir()
+	t.Cleanup(func() { desktopHelperPath = old })
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// Focus follows the pointer without a window manager.
+	if _, err := s.SendPointer(ctx, connect.NewRequest(&pb.PointerEvent{X: 100, Y: 100, Action: pb.PointerAction_POINTER_ACTION_CLICK})); err != nil {
+		t.Fatalf("SendPointer: %v", err)
+	}
+	send := func(ev *pb.KeyEvent) {
+		t.Helper()
+		if _, err := s.SendKey(ctx, connect.NewRequest(ev)); err != nil {
+			t.Fatalf("SendKey(%v): %v", ev, err)
+		}
+	}
+	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "discarded"}})
+	send(&pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: "u"}, Modifiers: []string{"ctrl"}})
+	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "Hello, World! 123 café €\n"}})
+	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "second line"}})
+	send(&pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: "Return"}})
+
+	want := "Hello, World! 123 café €\nsecond line\n"
+	deadline := time.Now().Add(10 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		if out, err := os.ReadFile(typed); err == nil {
+			got = string(out)
+			if got == want {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got != want {
+		t.Fatalf("terminal received %q, want %q", got, want)
+	}
+	if s.x11.backend == nil {
+		t.Fatal("keys did not go through the X11 backend")
 	}
 }
 
