@@ -191,18 +191,16 @@ func TestStagePendingAbandonsAClonePastTheDeadline(t *testing.T) {
 	dir := t.TempDir()
 	disk := writeDisk(t, dir, "rootfs.ext4", 4096)
 	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	stubClone(t, func(dst, src *os.File) error {
+		cancel()
 		<-release
 		return errors.New("abandoned")
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		cancel()
-	}()
 	if _, _, err := StagePending(ctx, root, "sb", "tok", "", map[string]string{"rootfs.ext4": disk}); !errors.Is(err, ErrStageTooLarge) {
 		t.Fatalf("err = %v, want the marker-only fallback", err)
 	}

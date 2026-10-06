@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Outer-runner entry point. DATABASE_URL must be a disposable integration DB:
-# the existing integration TestMain drops public and reapplies every migration.
+# the setup command drops the test schemas and reapplies every migration.
 set -euo pipefail
 : "${DATABASE_URL:?Set DATABASE_URL to the disposable integration database}"
 cd "$(dirname "$0")/.."
@@ -21,7 +21,7 @@ suite() {
 suite billing-unit-race go test -v -race -short -count=1 ./internal/billing ./internal/api
 suite billing-controlplane-startup go test -v -race -short -count=1 -run '^TestControlplaneStartsStripeCheckoutAssociationMonitor$' ./cmd/controlplane
 suite sentrylog-unit go test -v -count=1 ./internal/sentrylog
-suite billing-migrations go test -v -tags integration -count=1 -run '^$' ./internal/integration
+suite billing-migrations go run -tags integration ./cmd/setup-integration-db
 suite R16-billing-worker-load-race go test -v -race -tags integration -count=1 -timeout 5m -run '^TestIntegration_IncrementalWorkerLoad$' ./internal/api
 suite retained-storage-api-race go test -v -race -tags integration -count=1 -timeout 2m -run '^TestIntegration_Retained' ./internal/api
 suite storage-report-lease-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_StorageReport(Lease|Reclaim|ChunkTimeout)' ./internal/api

@@ -36,14 +36,14 @@ import (
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/integrationdb"
 	"github.com/superserve-ai/sandbox/internal/preview"
-	"github.com/superserve-ai/sandbox/internal/promotiontest"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-const testDefaultHostID = "default"
+const testDefaultHostID = integrationdb.DefaultHostID
 
-const integrationSchemaLockKey int64 = 0x5355504552534552
+const integrationSchemaLockKey = integrationdb.SchemaLockKey
 
 var (
 	testPool         *pgxpool.Pool
@@ -86,30 +86,12 @@ func TestMain(m *testing.M) {
 	}
 	setupCtx, stopSetup := context.WithTimeout(context.Background(), 30*time.Second)
 
-	if err := resetTestSchema(setupCtx, testPool); err != nil {
-		fmt.Fprintf(os.Stderr, "reset test schema: %v\n", err)
+	testSystemTeamID, err = integrationdb.Reset(setupCtx, testPool)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "initialize integration database: %v\n", err)
 		os.Exit(1)
 	}
-
-	if err := applyMigrations(setupCtx, testPool); err != nil {
-		fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
-		os.Exit(1)
-	}
-	if err := promotiontest.Install(setupCtx, testPool); err != nil {
-		fmt.Fprintf(os.Stderr, "install trusted identity fixture: %v\n", err)
-		os.Exit(1)
-	}
-
 	testQueries = db.New(testPool)
-
-	if err := seedSystemTemplate(setupCtx, testQueries); err != nil {
-		fmt.Fprintf(os.Stderr, "seed system template: %v\n", err)
-		os.Exit(1)
-	}
-	if err := seedPreviewCapableHost(setupCtx, testQueries); err != nil {
-		fmt.Fprintf(os.Stderr, "seed preview-capable host: %v\n", err)
-		os.Exit(1)
-	}
 	stopSetup()
 
 	workerCtx, stopStorageWorker := context.WithCancel(context.Background())
@@ -125,92 +107,6 @@ func TestMain(m *testing.M) {
 		code = 1
 	}
 	os.Exit(code)
-}
-
-func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS promotion_auth CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
-	return err
-}
-
-// seedSystemTemplate creates the system team + a ready `superserve/base`
-// template so CreateSandbox's default from_template lookup resolves. Every
-// integration test that POSTs /sandboxes without an explicit from_template
-// relies on this.
-func seedSystemTemplate(ctx context.Context, q *db.Queries) error {
-	team, err := q.CreateTeam(ctx, "superserve-system")
-	if err != nil {
-		return fmt.Errorf("create system team: %w", err)
-	}
-	testSystemTeamID = team.ID
-
-	tpl, err := q.CreateTemplate(ctx, db.CreateTemplateParams{
-		TeamID:    team.ID,
-		Name:      "superserve/base",
-		BuildSpec: []byte(`{"from":"test","steps":[]}`),
-		Vcpu:      1,
-		MemoryMib: 1024,
-		DiskMib:   4096,
-	})
-	if err != nil {
-		return fmt.Errorf("create superserve/base: %w", err)
-	}
-
-	// Flip to 'ready' with plausible paths so handlers.go's ready-check
-	// passes. The stubVMD ignores these values.
-	_, err = testPool.Exec(ctx,
-		`UPDATE template SET status = 'ready',
-		   rootfs_path = '/tmp/test/rootfs.ext4',
-		   snapshot_path = '/tmp/test/vmstate.snap',
-		   mem_path = '/tmp/test/mem.snap',
-		   size_bytes = 0,
-		   built_at = now()
-		 WHERE id = $1`, tpl.ID)
-	if err != nil {
-		return fmt.Errorf("mark superserve/base ready: %w", err)
-	}
-	return nil
-}
-
-// seedPreviewCapableHost creates the fallback host selected by integration
-// routers and binds its preview capability to the current heartbeat. Strict
-// sandbox creation intentionally rejects hosts without this live attestation.
-func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
-	if _, err := q.CreateHost(ctx, db.CreateHostParams{
-		ID:                testDefaultHostID,
-		VmdAddr:           "localhost:0",
-		ProxyAddr:         "localhost:0",
-		Region:            "test",
-		CapacityMemoryMib: 1024,
-		CapacityVcpus:     1,
-	}); err != nil {
-		return fmt.Errorf("create default host: %w", err)
-	}
-	if _, err := q.UpdateHostHeartbeat(ctx, testDefaultHostID); err != nil {
-		return fmt.Errorf("heartbeat default host: %w", err)
-	}
-	capabilities := []string{
-		preview.HostCapabilityPorts,
-		preview.HostCapabilityPortAccess,
-		preview.HostCapabilityPortTokens,
-		preview.HostCapabilityPortBrowserAuth,
-	}
-	if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
-		HostID: testDefaultHostID, Capabilities: capabilities,
-	}); err != nil {
-		return fmt.Errorf("advertise capabilities: %w", err)
-	}
-
-	capable, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		AllowedStatuses: []string{"active"},
-		HostID:          testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
-	})
-	if err != nil {
-		return fmt.Errorf("verify preview capability: %w", err)
-	}
-	if !capable {
-		return fmt.Errorf("preview capability is not bound to the current heartbeat")
-	}
-	return nil
 }
 
 func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
@@ -289,50 +185,11 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 }
 
 func findMigrationsDir() (string, error) {
-	// Walk up from the test file to the repo root (contains supabase/).
-	dir, _ := os.Getwd()
-	for {
-		migrationsDir := filepath.Join(dir, "supabase", "migrations")
-		if _, err := os.Stat(migrationsDir); err == nil {
-			return migrationsDir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("could not find supabase/migrations from %s", dir)
-		}
-		dir = parent
-	}
+	return integrationdb.FindMigrationsDir()
 }
 
-// applyMigrations reads SQL files from supabase/migrations/ and executes them
-// in order against the test database. Uses IF NOT EXISTS / OR REPLACE so it is
-// safe to run repeatedly against the same database.
 func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	migrationsDir, err := findMigrationsDir()
-	if err != nil {
-		return err
-	}
-
-	entries, err := os.ReadDir(migrationsDir)
-	if err != nil {
-		return fmt.Errorf("read migrations dir: %w", err)
-	}
-
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".sql") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(migrationsDir, e.Name()))
-		if err != nil {
-			return fmt.Errorf("read %s: %w", e.Name(), err)
-		}
-		if _, err := pool.Exec(ctx, string(data)); err != nil {
-			return fmt.Errorf("exec %s: %w", e.Name(), err)
-		}
-	}
-	return nil
+	return integrationdb.ApplyMigrations(ctx, pool)
 }
 
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible
