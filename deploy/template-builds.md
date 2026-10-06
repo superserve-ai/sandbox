@@ -8,7 +8,10 @@ incarnation, rejection/failure reason, and cleanup obligation.
 
 Bounds are fixed for the new protocol: two minutes before the first dispatch,
 60 seconds for registration, three total execution attempts, and 30 minutes
-from first dispatch through publication. Admission rejection consumes no
+from first dispatch through the producer's reported artifacts. The artifact
+upload carries no deadline: it rides checkpoint priority behind pause
+generations, so its completion time reflects fleet load rather than this
+build's health. Admission rejection consumes no
 attempt and restores the original queue budget if nothing was admitted.
 Replacement waiting never resets the execution budget. Seed waits 35 minutes.
 A lost heartbeat, replaced incarnation, or confirmed missing execution after
@@ -56,11 +59,16 @@ shutdown.
 The authenticated backup endpoint persists a `template_build_publication`
 scoped to template, logical build, attempt, team, cell, submission revision,
 bucket, and generation. `accepted_at IS NOT NULL` identifies accepted versions;
-consumers can rescan this table after restart. Acceptance atomically changes
-the logical status and template paths/resources. Submission revision prevents
-an older completion from replacing a newer accepted version. No publication
-means no new `ready`, even if VMD reports local success. Historical ready rows
-without publications retain their historical meaning. The existing cross-cell
+consumers can rescan this table after restart. Submission revision prevents
+an older completion from replacing a newer one, promoted or accepted. Readiness and
+durability are separate facts: the producer's reported artifacts promote the
+template and set its paths/resources, while acceptance banks durability and
+replaces the placeholder artifact hashes with verified ones. A report that
+arrives after promotion banks durability in the same statement, because the
+reconcile loop no longer tracks a ready build. Promotion requires the current
+attempt to be finalized, which only the finalizer and acceptance do, so an
+older binary writing `template_build` directly still cannot promote a build.
+Historical ready rows without publications retain their historical meaning. The existing cross-cell
 team migration command refuses teams with new execution records, because its
 copy protocol does not yet transfer attempt/publication authority. Copying only
 the mutable template row would lose this producer contract.
@@ -131,7 +139,8 @@ and the database integration tests in `template_build_execution_test.go` and
 
 Use the existing compatible active staging host for initial live validation.
 Submit disposable 1/2/8-vCPU templates through the seed/build interfaces and
-require an accepted durable publication before each becomes ready. Seed
+require each to become ready on its reported artifacts and to reach an accepted
+durable publication afterwards. Seed
 unchanged twice, change one spec, change one resource shape, then force rebuild;
 expect zero, one, one, then all targeted logical builds. A failed/cancelled
 rebuild must leave previous ready paths and resources usable. Record build and

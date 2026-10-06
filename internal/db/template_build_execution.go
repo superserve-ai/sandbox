@@ -16,6 +16,7 @@ type BuildExecution struct {
 	Reason         string     `json:"reason"`
 	Attempts       int        `json:"attempt_count"`
 	Publication    bool       `json:"publication_verified"`
+	Finalized      bool       `json:"finalized"`
 	RetryReason    string     `json:"retry_reason,omitempty"`
 }
 
@@ -35,8 +36,9 @@ func (q *Queries) GetBuildExecution(ctx context.Context, id uuid.UUID) (BuildExe
 	err := q.db.QueryRow(ctx, `SELECT e.build_id,e.current_attempt,e.cell,e.first_started_at,e.reason,
  (SELECT count(*) FROM template_build_attempt WHERE build_id=e.build_id AND state<>'rejected'),
  EXISTS(SELECT 1 FROM template_build_publication WHERE build_id=e.build_id AND attempt_id=e.current_attempt),
- COALESCE((SELECT reason FROM template_build_attempt WHERE build_id=e.build_id AND state IN ('failed','fenced') ORDER BY claimed_at DESC LIMIT 1),'')
- FROM template_build_execution e WHERE e.build_id=$1`, id).Scan(&b.BuildID, &b.CurrentAttempt, &b.Cell, &b.FirstStartedAt, &b.Reason, &b.Attempts, &b.Publication, &b.RetryReason)
+ COALESCE((SELECT reason FROM template_build_attempt WHERE build_id=e.build_id AND state IN ('failed','fenced') ORDER BY claimed_at DESC LIMIT 1),''),
+ EXISTS(SELECT 1 FROM template_build WHERE id=e.build_id AND status='ready')
+ FROM template_build_execution e WHERE e.build_id=$1`, id).Scan(&b.BuildID, &b.CurrentAttempt, &b.Cell, &b.FirstStartedAt, &b.Reason, &b.Attempts, &b.Publication, &b.RetryReason, &b.Finalized)
 	return b, err
 }
 func (q *Queries) ClaimBuildAttempt(ctx context.Context, id uuid.UUID, cell string, limit int32) (*uuid.UUID, error) {
@@ -64,6 +66,14 @@ func (q *Queries) TransitionBuildAttempt(ctx context.Context, id uuid.UUID, atte
 func (q *Queries) AcceptBuildPublication(ctx context.Context, id, attempt uuid.UUID) (bool, error) {
 	var ok bool
 	err := q.db.QueryRow(ctx, `SELECT accept_template_publication($1,$2)`, id, attempt).Scan(&ok)
+	return ok, err
+}
+// FinalizeTemplateBuild records readiness from the producer's own report. The
+// upload is a separate obligation, tracked by accepted_at.
+func (q *Queries) FinalizeTemplateBuild(ctx context.Context, id, attempt uuid.UUID, runtime json.RawMessage, rootfsAllocated, baseAllocated, deltaAllocated int64) (bool, error) {
+	var ok bool
+	err := q.db.QueryRow(ctx, `SELECT finalize_template_build($1,$2,$3,$4,$5,$6)`,
+		id, attempt, runtime, rootfsAllocated, baseAllocated, deltaAllocated).Scan(&ok)
 	return ok, err
 }
 func (q *Queries) RecordBuildPublication(ctx context.Context, attempt uuid.UUID, host, bucket, generation, manifest string, files, runtime json.RawMessage, verified time.Time) (bool, error) {
@@ -139,6 +149,9 @@ func (q *Queries) ListResilientBuildIDs(ctx context.Context, limit int32) ([]uui
 	rows, err := q.db.Query(ctx, `WITH due AS (
  SELECT e.build_id FROM template_build_execution e JOIN template_build b ON b.id=e.build_id
  WHERE b.status IN ('pending','building','snapshotting')
+    OR (b.status='ready' AND b.finalized_at>now()-interval '24 hours'
+        AND NOT EXISTS(SELECT 1 FROM template_build_publication p
+                       WHERE p.build_id=e.build_id AND p.accepted_at IS NOT NULL))
  ORDER BY e.reconcile_checked_at NULLS FIRST,b.created_at,b.id LIMIT $1 FOR UPDATE OF e SKIP LOCKED
 ), checked AS (
  UPDATE template_build_execution e SET reconcile_checked_at=clock_timestamp()
