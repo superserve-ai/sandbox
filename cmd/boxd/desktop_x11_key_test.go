@@ -320,6 +320,12 @@ func TestPlanKey_DeclinesUppercaseScratchWithoutShift(t *testing.T) {
 	}
 }
 
+func TestPlanKey_DeclinesTitlecaseLetters(t *testing.T) {
+	if _, err := planKey(testKeymap(2), xkbState{}, textEvent("ǅ")); !errors.Is(err, errBackendKept) {
+		t.Errorf("err = %v, want errBackendKept", err)
+	}
+}
+
 // A layout with only Shift_R still shifts.
 func TestPlanKey_UsesShiftRWhenShiftLIsAbsent(t *testing.T) {
 	var syms []xproto.Keysym

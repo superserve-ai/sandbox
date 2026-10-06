@@ -346,6 +346,11 @@ func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
 	// A one-keysym alphabetic key becomes a lower/upper pair on the server,
 	// so a cased letter is bound by its lowercase form and typed shifted
 	// when uppercase; one scratch keycode then serves both cases.
+	// A titlecase digraph (ǅ) is neither case the server would pair a
+	// one-symbol key into, so no scratch binding can type it.
+	if casedLetter(ks) && unicode.IsTitle(keysymRune(ks)) {
+		return keystroke{}, fmt.Errorf("titlecase keysym 0x%x: %w", ks, errBackendKept)
+	}
 	shift := false
 	if lower, upper := lowerKeysym(ks); upper {
 		if !hasShift {
