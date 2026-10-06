@@ -38,9 +38,10 @@ type xkbState struct {
 	shiftLock bool
 }
 
-// xkbGetState asks the server for the keyboard state; a server without the
-// extension reports the first group and no locks. Hand-encoded: xgb ships
-// no XKB bindings and this is the one XKB request the key path needs.
+// xkbGetState asks the server for the keyboard state. Without the
+// extension the state cannot be known, so the key path declines and
+// xdotool keeps that server. Hand-encoded: xgb ships no XKB bindings and
+// this is the one XKB request the key path needs.
 func (b *x11Backend) xkbGetState() (xkbState, error) {
 	if b.xkb == xkbUnprobed {
 		ext, err := xproto.QueryExtension(b.conn, 9, "XKEYBOARD").Reply()
@@ -49,7 +50,7 @@ func (b *x11Backend) xkbGetState() (xkbState, error) {
 		}
 		if !ext.Present {
 			b.xkb = xkbAbsent
-			return xkbState{}, nil
+			return xkbState{}, fmt.Errorf("server has no XKEYBOARD extension: %w", errBackendKept)
 		}
 		b.xkbOpcode = ext.MajorOpcode
 		// XkbUseExtension(1.0) must precede any other XKB request.
@@ -63,7 +64,7 @@ func (b *x11Backend) xkbGetState() (xkbState, error) {
 		b.xkb = xkbPresent
 	}
 	if b.xkb == xkbAbsent {
-		return xkbState{}, nil
+		return xkbState{}, fmt.Errorf("server has no XKEYBOARD extension: %w", errBackendKept)
 	}
 	// XkbGetState(XkbUseCoreKbd).
 	req := make([]byte, 8)
@@ -346,7 +347,10 @@ func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
 	// so a cased letter is bound by its lowercase form and typed shifted
 	// when uppercase; one scratch keycode then serves both cases.
 	shift := false
-	if lower, upper := lowerKeysym(ks); hasShift && upper {
+	if lower, upper := lowerKeysym(ks); upper {
+		if !hasShift {
+			return keystroke{}, fmt.Errorf("no Shift key to select uppercase 0x%x: %w", ks, errBackendKept)
+		}
 		ks, shift = lower, true
 	}
 	code, ok := p.scratch(ks)
