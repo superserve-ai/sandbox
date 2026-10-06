@@ -199,9 +199,11 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 			Msg("backup report permanently rejected; dropping its coverage row")
 		return nil
 	}
-	// The control plane is still finalizing this sandbox's pause and will
-	// take the report once it has: only this entry waits, not the outbox.
-	if status == http.StatusServiceUnavailable && bytes.Contains(msg, []byte("finalize_in_flight")) {
+	// This entry alone is unsettled — a pause finalizing, or a lock race the
+	// control plane lost — and redelivery takes it. The rest of the outbox is
+	// unaffected, so neither reads as an outage.
+	if status == http.StatusServiceUnavailable &&
+		(bytes.Contains(msg, []byte("finalize_in_flight")) || bytes.Contains(msg, []byte("lock_contention"))) {
 		return fmt.Errorf("backup report deferred: %s: %w", statusLine, backup.ErrNotificationDeferred)
 	}
 	return fmt.Errorf("backup report rejected: %s: %s", statusLine, msg)

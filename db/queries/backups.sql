@@ -167,7 +167,7 @@ LIMIT 1;
 -- a fast upload's report arriving in that window must retry rather than
 -- silently miss its size sync. A pause operation on the row says the
 -- transition is still being worked (see finalizeInFlight).
-SELECT id, status, updated_at, pause_op_id
+SELECT id, status, updated_at, pause_op_id, destroyed_at
 FROM sandbox WHERE id = $1 FOR UPDATE;
 
 -- name: LatestSnapshotManifest :many
