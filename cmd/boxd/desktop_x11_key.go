@@ -282,9 +282,11 @@ func (p *keyPlanner) scratch(ks uint32) (xproto.Keycode, bool) {
 func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
 	_, hasShift := p.km.direct[keysymShiftL]
 	invert := literal && p.capsLock && hasShift && casedLetter(ks)
-	// Keypad keys share a keycode between two symbols that Num Lock, not
-	// Shift, chooses between; a scratch keycode has a single level.
-	if st, ok := p.km.direct[ks]; ok && (!st.shift || hasShift) && !keypad(ks) {
+	// The layout's second column is only known to be Shift-selected for
+	// printable symbols. Keypad keys are chosen by Num Lock, and keys such
+	// as Break (on Pause) or Sys_Req (on Print) by Control or Alt, so those
+	// go through a single-level scratch keycode instead.
+	if st, ok := p.km.direct[ks]; ok && (!st.shift || hasShift) && !keypad(ks) && (!st.shift || printable(ks)) {
 		st.shift = st.shift != invert
 		return st, nil
 	}
@@ -313,6 +315,12 @@ func lowerKeysym(ks uint32) (lower uint32, upper bool) {
 		r = rune(ks & 0x00ffffff)
 	}
 	return keysymFromRune(unicode.ToLower(r)), unicode.IsUpper(r)
+}
+
+// printable reports whether ks is a character rather than a function,
+// cursor, keypad or modifier key (keysymdef's 0xfe00+ blocks).
+func printable(ks uint32) bool {
+	return ks < 0xfe00 || ks >= 0x01000000
 }
 
 // keypad reports whether ks is in keysymdef's keypad block.
