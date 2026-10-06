@@ -33,9 +33,39 @@ jobs:
           set -euo pipefail
           [[ "$TARGET_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
           cp .github/workflows/scripts/diagnose-migration-baseline.py "$RUNNER_TEMP/diagnose-migration-baseline.py"
-          git fetch --no-tags --depth=2 origin "$TARGET_MAIN_SHA"
-          git checkout --detach "$TARGET_MAIN_SHA"
+      - name: Fresh target checkout matching the automatic deployment
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+          path: proof-target
+      - name: Verify the fresh checkout is the failed main revision
+        working-directory: proof-target
+        env:
+          TARGET_MAIN_SHA: ${{ inputs.target_main_sha }}
+        run: test "$(git rev-parse HEAD)" = "$TARGET_MAIN_SHA"
+      - name: Trace exact original commands without header formatting
+        working-directory: proof-target
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_MAIN_SHA: ${{ inputs.target_main_sha }}
+        run: python3 -u "$RUNNER_TEMP/diagnose-migration-baseline.py" --target "$TARGET_MAIN_SHA" --repository "$GITHUB_REPOSITORY" --plain-gh
+      - name: Fresh independent checkout for the original control
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+          path: control-target
+      - name: Run original uninstrumented entrypoint for comparison
+        working-directory: control-target
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_MAIN_SHA: ${{ inputs.target_main_sha }}
+        run: test "$(git rev-parse HEAD)" = "$TARGET_MAIN_SHA" && GITHUB_SHA="$TARGET_MAIN_SHA" GITHUB_EVENT_NAME=push python3 -u .github/workflows/scripts/wait-for-push-ci.py
       - name: Run exact target check with safe diagnostics
+        working-directory: proof-target
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_MAIN_SHA: ${{ inputs.target_main_sha }}

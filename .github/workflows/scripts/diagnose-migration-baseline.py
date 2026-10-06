@@ -44,13 +44,16 @@ def summarize(payload):
     return {k: payload[k] for k in ('message', 'status') if k in payload}
 
 
+INCLUDE_HEADERS = True
+
+
 def observed_run(args, **kwargs):
     allowed = args[:2] == ['gh', 'api'] or (args[0] == 'git' and args[1] in ('fetch', 'merge-base', 'log'))
     if not allowed or any(x in args for x in ('--method', '-X', '--field', '-f', '-F', '--input')):
         raise RuntimeError('Diagnostic wrapper permits only the original read-only proof commands')
     emit('command_start', args=args, timeout=kwargs.get('timeout'))
     started = time.monotonic()
-    actual = [*args, '--include'] if args[:2] == ['gh', 'api'] else args
+    actual = [*args, '--include'] if INCLUDE_HEADERS and args[:2] == ['gh', 'api'] else args
     try:
         result = subprocess.run(actual, **kwargs)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -82,7 +85,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--target', required=True)
     parser.add_argument('--repository', required=True)
+    parser.add_argument('--plain-gh', action='store_true')
     args = parser.parse_args()
+    global INCLUDE_HEADERS
+    INCLUDE_HEADERS = not args.plain_gh
     if not re.fullmatch('[0-9a-f]{40}', args.target) or args.repository != 'superserve-ai/sandbox':
         raise SystemExit('Expected an exact sandbox repository target')
     path = Path('.github/workflows/scripts/wait-for-push-ci.py').resolve()
@@ -95,7 +101,7 @@ def main():
         raise SystemExit('Proof source differs from the target commit')
     shallow = subprocess.check_output(['git', 'rev-parse', '--is-shallow-repository'], text=True).strip()
     emit('context', target=args.target, checkout=head, proof_sha256=hashlib.sha256(source).hexdigest(), shallow=shallow,
-         dispatch_sha=os.environ.get('GITHUB_SHA'), actual_event=os.environ.get('GITHUB_EVENT_NAME'), proof_event='push', python=sys.version.split()[0])
+         dispatch_sha=os.environ.get('GITHUB_SHA'), actual_event=os.environ.get('GITHUB_EVENT_NAME'), proof_event='push', include_headers=INCLUDE_HEADERS, python=sys.version.split()[0])
     spec = importlib.util.spec_from_file_location('target_release_proof', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
