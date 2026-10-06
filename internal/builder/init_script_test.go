@@ -23,3 +23,17 @@ func TestInitScriptFreezerGated(t *testing.T) {
 		}
 	}
 }
+
+// The controller tree container runtimes need rides in every image, and the
+// freezer mounts into it rather than before it.
+func TestInitScriptMountsCgroupControllers(t *testing.T) {
+	for _, s := range []string{initScriptFor(false), initScriptFor(true)} {
+		if !strings.Contains(s, "for c in cpu cpuacct cpuset memory devices pids blkio") || !strings.Contains(s, "mount -t cgroup -o $c $c /sys/fs/cgroup/$c") {
+			t.Error("cgroup v1 controllers not mounted")
+		}
+	}
+	on := initScriptFor(true)
+	if strings.Index(on, "mount -t tmpfs cgroup_root /sys/fs/cgroup") > strings.Index(on, "mount -t cgroup -o freezer") {
+		t.Error("freezer mounted before the cgroup tmpfs exists")
+	}
+}

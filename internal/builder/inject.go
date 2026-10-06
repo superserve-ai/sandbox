@@ -374,11 +374,21 @@ mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 exec /usr/local/bin/tini -- /usr/bin/boxd
 `
 
+// initCgroupBlock mounts the v1 controllers container runtimes expect under
+// /sys/fs/cgroup; v1 because a cgroup2 mount there would hide boxd's freezer.
+const initCgroupBlock = `# cgroup v1 tree: container runtimes refuse to start without these controllers.
+mount -t tmpfs cgroup_root /sys/fs/cgroup 2>/dev/null
+for c in cpu cpuacct cpuset memory devices pids blkio net_cls net_prio hugetlb perf_event; do
+  mkdir -p /sys/fs/cgroup/$c
+  mount -t cgroup -o $c $c /sys/fs/cgroup/$c 2>/dev/null || rmdir /sys/fs/cgroup/$c
+done
+
+`
+
 // initFreezerBlock mounts the workload freezer. Only an image built to freeze
 // its workload carries it; without the mount boxd runs commands unwrapped, so
 // an image built with the switch off behaves exactly as before it existed.
 const initFreezerBlock = `# Freezer cgroup for the workload, so a snapshot can be taken with it stopped.
-mount -t tmpfs cgroup_root /sys/fs/cgroup 2>/dev/null
 mkdir -p /sys/fs/cgroup/freezer
 mount -t cgroup -o freezer freezer /sys/fs/cgroup/freezer 2>/dev/null
 mkdir -p /sys/fs/cgroup/freezer/workload
@@ -390,9 +400,9 @@ export BOXD_WORKLOAD_FREEZER=/sys/fs/cgroup/freezer/workload
 `
 
 func initScriptFor(freezeWorkload bool) string {
-	block := ""
+	block := initCgroupBlock
 	if freezeWorkload {
-		block = initFreezerBlock
+		block += initFreezerBlock
 	}
 	return fmt.Sprintf(initScriptTemplate, block)
 }
