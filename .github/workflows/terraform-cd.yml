@@ -29,65 +29,14 @@ env:
 
 jobs:
   wait-for-migrations:
-    runs-on: ubuntu-latest
+    uses: ./.github/workflows/deployment-migrations.yml
     permissions:
-      actions: read
       contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - name: Check rollout hold and same-SHA push CI
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PUSH_BEFORE: ${{ github.event.before }}
-        run: |
-          git checkout "$GITHUB_SHA" -- .github/workflows/scripts/wait-for-push-ci.py
-          python3 .github/workflows/scripts/wait-for-push-ci.py
-
-      - name: Wait for same-SHA CD Migrate to succeed
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          BEFORE="${{ github.event.before }}"
-          MIGRATIONS_CHANGED=unknown
-          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] &&
-             git fetch --quiet --depth=1 origin "$BEFORE" 2>/dev/null; then
-            if git diff --name-only "$BEFORE" HEAD | grep -Eq '^(supabase/(migrations|shared-auth-history)/|scripts/migrate_database[.]py$|[.]github/workflows/cd[.]yml$)'; then
-              MIGRATIONS_CHANGED=yes
-            else
-              MIGRATIONS_CHANGED=no
-            fi
-          fi
-
-          if [ "$MIGRATIONS_CHANGED" = "no" ]; then
-            echo "No migration changes in ${BEFORE}..${{ github.sha }}; skipping gate."
-            exit 0
-          fi
-
-          echo "migrations_changed=$MIGRATIONS_CHANGED — checking CD Migrate for ${{ github.sha }}"
-          for i in $(seq 1 60); do
-            run=$(gh api "repos/${{ github.repository }}/actions/workflows/cd.yml/runs?head_sha=${{ github.sha }}&event=push" \
-              --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
-            status=${run% *}; conclusion=${run#* }
-            echo "attempt $i: status=$status conclusion=$conclusion"
-            if [ "$status" = "absent" ] && [ "$MIGRATIONS_CHANGED" = "unknown" ] && [ "$i" -ge 6 ]; then
-              echo "No CD Migrate run appeared in ~2 min — push touched no migrations; proceeding."
-              exit 0
-            fi
-            if [ "$status" = "completed" ]; then
-              if [ "$conclusion" = "success" ]; then
-                echo "CD Migrate succeeded; proceeding."
-                exit 0
-              fi
-              echo "CD Migrate concluded '$conclusion' — refusing rollout against an unmigrated schema."
-              exit 1
-            fi
-            sleep 20
-          done
-          echo "Timed out waiting for CD Migrate; refusing rollout."
-          exit 1
+      actions: read
+    with:
+      revision: ${{ github.sha }}
+      production: true
+    secrets: inherit
 
   build-api-image:
     name: Build API image once

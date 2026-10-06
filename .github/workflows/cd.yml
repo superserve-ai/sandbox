@@ -27,23 +27,6 @@ on:
         description: 'Production recovery: fresh authenticated read-only collector run'
         required: false
         type: string
-  push:
-    branches: [main]
-    paths:
-      - 'supabase/migrations/**'
-      - 'supabase/shared-auth-history/**'
-      - 'scripts/migrate_database.py'
-      - 'scripts/retained_storage_recovery.py'
-      - 'scripts/recovery_evidence.py'
-      - 'scripts/migration-requirements.txt'
-      - 'supabase/recovery/**'
-      - '.github/workflows/recovery-evidence.yml'
-      - 'scripts/test_migration_*.py'
-      - '.github/workflows/cd.yml'
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/scripts/migration_gate.py'
-      - '.github/workflows/scripts/test_migration_gate.py'
-      - '.github/workflows/scripts/wait-for-push-ci.py'
 
 permissions:
   contents: read
@@ -51,6 +34,7 @@ permissions:
 
 concurrency:
   group: database-migrations
+  queue: max
   cancel-in-progress: false
 
 jobs:
