@@ -88,7 +88,10 @@ func (h *Handlers) streamAttemptLogs(c *gin.Context, initial db.TemplateBuild) {
 		if err != nil {
 			return true
 		}
-		write(gin.H{"stream": "system", "text": e.Reason, "status": string(b.Status), "finished": false, "execution": e})
+		// Stamped like any other line: consumers render non-terminal events in
+		// the log body, where a missing timestamp has nothing to fall back on.
+		write(gin.H{"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "stream": "system",
+			"text": e.Reason, "status": string(b.Status), "finished": false, "execution": e})
 		next := uuid.Nil
 		if e.CurrentAttempt != nil {
 			next = *e.CurrentAttempt

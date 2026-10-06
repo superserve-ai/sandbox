@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
@@ -382,5 +383,83 @@ func testStreamAttemptLogsReconnectsWithReplay(t *testing.T, firstCallNotFound b
 	}
 	if n := strings.Count(w.Body.String(), "third log"); n != 1 {
 		t.Fatalf("third log forwarded %d times, want once", n)
+	}
+}
+
+// Consumers render every non-terminal event in the log body, so each one has
+// to carry the timestamp that body shows.
+func TestStreamAttemptLogsStampsEveryRenderedEvent(t *testing.T) {
+	buildID, templateID, teamID := uuid.New(), uuid.New(), uuid.New()
+	attempt, incarnationID := uuid.New(), uuid.New()
+	q := &mockDBTX{queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		return &mockRow{scanFn: func(dest ...any) error {
+			switch {
+			case strings.Contains(sql, "-- name: GetTemplateBuild"):
+				*dest[0].(*uuid.UUID) = buildID
+				*dest[1].(*uuid.UUID) = templateID
+				*dest[2].(*uuid.UUID) = teamID
+				*dest[3].(*db.TemplateBuildStatus) = db.TemplateBuildStatusBuilding
+				*dest[4].(*string) = "hash"
+				*dest[10].(*time.Time) = time.Now()
+				*dest[11].(*time.Time) = time.Now()
+			case strings.Contains(sql, "FROM template_build_execution e"):
+				*dest[0].(*uuid.UUID) = buildID
+				a := attempt
+				*dest[1].(**uuid.UUID) = &a
+				*dest[4].(*string) = "waiting for eligible host/capacity"
+			case strings.Contains(sql, "FROM template_build_attempt a JOIN template_build b"):
+				*dest[0].(*uuid.UUID) = attempt
+				*dest[1].(*uuid.UUID) = buildID
+				*dest[2].(*uuid.UUID) = templateID
+				*dest[3].(*string) = "host"
+				*dest[4].(*uuid.UUID) = incarnationID
+				*dest[5].(*string) = "vm"
+			case strings.Contains(sql, "SELECT NOT EXISTS(SELECT 1 FROM host"):
+				*dest[0].(*bool) = false
+			default:
+				t.Errorf("unexpected query: %s", sql)
+			}
+			return nil
+		}}
+	}}
+	h := &Handlers{DB: db.New(q), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) { return &stubVMD{}, nil }}}
+	w := &logNotifyWriter{ResponseRecorder: httptest.NewRecorder(), seen: make(chan struct{}), match: "waiting for eligible host/capacity"}
+	c, _ := gin.CreateTestContext(w)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.Request = httptest.NewRequest("GET", "/", nil).WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.streamAttemptLogs(c, db.TemplateBuild{ID: buildID, TemplateID: templateID, TeamID: teamID})
+	}()
+	select {
+	case <-w.seen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("execution status event never emitted")
+	}
+	cancel()
+	<-done
+	events := 0
+	for _, line := range strings.Split(w.Body.String(), "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		var ev struct {
+			Timestamp string `json:"timestamp"`
+			Finished  bool   `json:"finished"`
+		}
+		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+			t.Fatal(err)
+		}
+		// A terminal event closes the stream instead of being rendered.
+		if !ev.Finished && ev.Timestamp == "" {
+			t.Fatalf("rendered event carries no timestamp: %s", payload)
+		}
+		events++
+	}
+	if events == 0 {
+		t.Fatal("no events captured")
 	}
 }
