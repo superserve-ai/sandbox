@@ -954,6 +954,40 @@ func (q *Queries) CountActiveSandboxesAtBasePath(ctx context.Context, basePath *
 	return column_1, err
 }
 
+const countSandboxesByMachineOwner = `-- name: CountSandboxesByMachineOwner :one
+SELECT COUNT(*)::bigint
+FROM sandbox s
+JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
+WHERE s.team_id = $1
+  AND o.owner_principal_id = $2
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $3
+  AND ($4::text IS NULL OR s.status::text = $4::text)
+  AND ($5::text IS NULL
+       OR s.name ILIKE '%' || $5::text || '%')
+`
+
+type CountSandboxesByMachineOwnerParams struct {
+	TeamID           uuid.UUID `json:"team_id"`
+	OwnerPrincipalID uuid.UUID `json:"owner_principal_id"`
+	Metadata         []byte    `json:"metadata"`
+	Status           *string   `json:"status"`
+	NameSearch       *string   `json:"name_search"`
+}
+
+func (q *Queries) CountSandboxesByMachineOwner(ctx context.Context, arg CountSandboxesByMachineOwnerParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countSandboxesByMachineOwner,
+		arg.TeamID,
+		arg.OwnerPrincipalID,
+		arg.Metadata,
+		arg.Status,
+		arg.NameSearch,
+	)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const countSandboxesByTeamPaged = `-- name: CountSandboxesByTeamPaged :one
 SELECT COUNT(*) FROM sandbox
 WHERE team_id = $1
@@ -2865,6 +2899,121 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 	for rows.Next() {
 		var i ListSandboxesByHostRow
 		if err := rows.Scan(&i.ID, &i.Status, &i.SnapshotID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSandboxesByMachineOwner = `-- name: ListSandboxesByMachineOwner :many
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1
+  AND o.owner_principal_id = $2
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $3
+  AND ($4::text IS NULL OR s.status::text = $4::text)
+  AND ($5::text IS NULL
+       OR s.name ILIKE '%' || $5::text || '%')
+ORDER BY
+  CASE WHEN $6::text = 'name' AND $7::text = 'asc' THEN s.name END ASC,
+  CASE WHEN $6::text = 'name' AND $7::text = 'desc' THEN s.name END DESC,
+  CASE WHEN $6::text = 'status' AND $7::text = 'asc' THEN s.status::text END ASC,
+  CASE WHEN $6::text = 'status' AND $7::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN $6::text = 'created_at' AND $7::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
+LIMIT $9::bigint
+OFFSET COALESCE($8::bigint, 0)
+`
+
+type ListSandboxesByMachineOwnerParams struct {
+	TeamID           uuid.UUID `json:"team_id"`
+	OwnerPrincipalID uuid.UUID `json:"owner_principal_id"`
+	Metadata         []byte    `json:"metadata"`
+	Status           *string   `json:"status"`
+	NameSearch       *string   `json:"name_search"`
+	SortBy           string    `json:"sort_by"`
+	SortDir          string    `json:"sort_dir"`
+	RowOffset        *int64    `json:"row_offset"`
+	RowLimit         *int64    `json:"row_limit"`
+}
+
+type ListSandboxesByMachineOwnerRow struct {
+	Sandbox       Sandbox `json:"sandbox"`
+	PreviewAccess string  `json:"preview_access"`
+}
+
+// Machine callers query their owner relation before pagination. This keeps
+// page contents, totals, and work bounded by the requested page rather than
+// materializing every historical ownership row in the handler.
+func (q *Queries) ListSandboxesByMachineOwner(ctx context.Context, arg ListSandboxesByMachineOwnerParams) ([]ListSandboxesByMachineOwnerRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxesByMachineOwner,
+		arg.TeamID,
+		arg.OwnerPrincipalID,
+		arg.Metadata,
+		arg.Status,
+		arg.NameSearch,
+		arg.SortBy,
+		arg.SortDir,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxesByMachineOwnerRow{}
+	for rows.Next() {
+		var i ListSandboxesByMachineOwnerRow
+		if err := rows.Scan(
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
+			&i.Sandbox.DiskMib,
+			&i.Sandbox.AutoDeleteSeconds,
+			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
+			&i.Sandbox.HadSecretBindings,
+			&i.Sandbox.SecretEnvFingerprint,
+			&i.Sandbox.SecretEnvIp,
+			&i.Sandbox.SecretEnvInjectedAt,
+			&i.Sandbox.SecretEnvExpiresAt,
+			&i.Sandbox.PauseOpID,
+			&i.Sandbox.PauseOpStartedAt,
+			&i.Sandbox.PauseOpLeaseUntil,
+			&i.Sandbox.PauseOpLeaseVersion,
+			&i.Sandbox.PauseOpAttentionAt,
+			&i.Sandbox.PauseOpTrigger,
+			&i.Sandbox.PauseOpActorID,
+			&i.Sandbox.RoutingVersion,
+			&i.Sandbox.SourceSnapshotID,
+			&i.PreviewAccess,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

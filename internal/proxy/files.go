@@ -121,6 +121,7 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 // controlled headers, and reverse-proxies the request to boxd's
 // internal /files handler.
 func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID string) {
+	token := r.Header.Get(accessTokenHeader)
 	if !h.filesEnabled {
 		// The proxy was started without WithFiles — either this is a
 		// legacy deployment that doesn't have the feature on yet or a
@@ -190,6 +191,13 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	if !ok {
 		return
 	}
+	boundRequest, cleanup, sessionOK := h.bindMachineRequest(r, token)
+	if !sessionOK {
+		(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
+		return
+	}
+	defer cleanup()
+	r = boundRequest
 	fileEvent := "file_read" // only GET/POST reach here; POST is a write
 	if r.Method == http.MethodPost {
 		fileEvent = "file_write"

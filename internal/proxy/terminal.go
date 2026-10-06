@@ -207,6 +207,13 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted"}).write(w)
 		return
 	}
+	bridgeCtx, cleanup, ok := h.machineSessionContext(r.Context(), token)
+	if !ok {
+		(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
+		return
+	}
+	defer cleanup()
+	bridgeCtx = withMachineCapability(bridgeCtx, token, h.seedKey)
 	h.captureUsage(instanceID, "terminal_opened", info)
 
 	// From here on, errors go back through the WebSocket (if the upgrade
@@ -256,8 +263,7 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 
 	// Tie the bridge lifetime to the request context so shutdowns
 	// propagate cleanly. The WS will be closed in bridgeTerminal.
-	ctx := r.Context()
-	h.bridgeTerminal(ctx, ws, procClient, instanceID)
+	h.bridgeTerminal(bridgeCtx, ws, procClient, instanceID)
 }
 
 // bridgeTerminal is the long-lived function that pumps bytes between the
@@ -414,6 +420,11 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 
 			switch typ {
 			case websocket.MessageBinary:
+				if !machineOperationAllowed(bridgeCtx, auth.MachineOperationCommandWrite) {
+					l.Warn().Msg("terminal: input denied by machine capability")
+					cancel()
+					return
+				}
 				_, err := procClient.SendInput(bridgeCtx, connect.NewRequest(&pb.SendInputRequest{
 					Pid:  pid,
 					Data: data,
@@ -458,6 +469,10 @@ func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect
 		}
 
 	case "signal":
+		if !machineOperationAllowed(ctx, auth.MachineOperationCommandSignal) {
+			l.Warn().Msg("terminal: signal denied by machine capability")
+			return
+		}
 		signum, ok := signalNameToNumber(msg.Name)
 		if !ok {
 			l.Warn().Str("name", msg.Name).Msg("terminal: unknown signal name")

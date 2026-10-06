@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -105,14 +106,20 @@ func (q *Queries) RestoreMachinePrincipal(ctx context.Context, id uuid.UUID) err
 
 func (q *Queries) RestoreMachineCredential(ctx context.Context, principalID, lineageID uuid.UUID, expiresAt time.Time, permissions []string, audience string) (MachineCredentialRow, error) {
 	var row MachineCredentialRow
-	err := q.db.QueryRow(ctx, `WITH restored AS (UPDATE machine_principal SET status='active',generation=generation+1,updated_at=now() WHERE id=$1 AND status='disabled' RETURNING id,generation), issued AS (INSERT INTO machine_credential(principal_id,lineage_id,expires_at,revocation_generation,permissions,audience) SELECT id,$2,$3,generation,$4,$5 FROM restored RETURNING id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at) SELECT * FROM issued`, principalID, lineageID, expiresAt, permissions, audience).Scan(
+	err := q.db.QueryRow(ctx, `WITH restored AS (UPDATE machine_principal SET status='active',generation=generation+1,restore_until=NULL,updated_at=now() WHERE id=$1 AND status='disabled' AND restore_until IS NOT NULL AND restore_until > now() RETURNING id,generation), issued AS (INSERT INTO machine_credential(principal_id,lineage_id,expires_at,revocation_generation,permissions,audience) SELECT id,$2,$3,generation,$4,$5 FROM restored RETURNING id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at) SELECT * FROM issued`, principalID, lineageID, expiresAt, permissions, audience).Scan(
 		&row.ID, &row.PrincipalID, &row.LineageID, &row.State, &row.ExpiresAt, &row.RevocationGeneration, &row.Permissions, &row.Audience, &row.IssuedAt, &row.RevokedAt)
 	return row, err
 }
 
 func (q *Queries) CreateMachineSandboxOwner(ctx context.Context, sandboxID, principalID, teamID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, `INSERT INTO sandbox_machine_owner(sandbox_id,owner_principal_id,team_id) VALUES($1,$2,$3) ON CONFLICT(sandbox_id) DO UPDATE SET team_id=sandbox_machine_owner.team_id WHERE sandbox_machine_owner.owner_principal_id=EXCLUDED.owner_principal_id AND sandbox_machine_owner.team_id=EXCLUDED.team_id`, sandboxID, principalID, teamID)
-	return err
+	result, err := q.db.Exec(ctx, `INSERT INTO sandbox_machine_owner(sandbox_id,owner_principal_id,team_id) VALUES($1,$2,$3) ON CONFLICT(sandbox_id) DO UPDATE SET owner_principal_id=sandbox_machine_owner.owner_principal_id, team_id=sandbox_machine_owner.team_id WHERE sandbox_machine_owner.owner_principal_id=EXCLUDED.owner_principal_id AND sandbox_machine_owner.team_id=EXCLUDED.team_id`, sandboxID, principalID, teamID)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("machine sandbox ownership conflict for %s", sandboxID)
+	}
+	return nil
 }
 
 func (q *Queries) GetMachineSandboxOwner(ctx context.Context, sandboxID, teamID uuid.UUID) (MachineSandboxOwnerRow, error) {

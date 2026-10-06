@@ -24,26 +24,54 @@ type MachineCredentialResolver interface {
 
 func MachineCredentialAuth(resolver MachineCredentialResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Start the shared auth phase before resolving the durable machine
+		// authority so machine lookup latency and failure paths remain visible
+		// to lifecycle instrumentation.
+		authStart := time.Now()
+		c.Set("auth_start", authStart)
 		raw := strings.TrimSpace(c.GetHeader("X-QM-Machine-Credential"))
 		if raw == "" {
 			c.Next()
 			return
 		}
 		if resolver == nil {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
 			respondError(c, ErrUnauthorized)
 			c.Abort()
 			return
 		}
 		caller, err := resolver.ResolveMachineCredential(c.Request.Context(), raw)
 		if err != nil || caller.ValidateAt(time.Now()) != nil {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
 			respondError(c, ErrUnauthorized)
+			c.Abort()
+			return
+		}
+		op, mapped := auth.OperationForHTTP(c.Request.Method, c.Request.URL.Path)
+		if !mapped || !caller.Policy.Allows(op) || !containsMachinePermission(caller.Permissions, op) {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
+			respondError(c, ErrForbidden)
 			c.Abort()
 			return
 		}
 		setMachineCaller(c, caller)
 		c.Set("team_id", caller.TeamID.String())
+		c.Set("auth_duration", time.Since(authStart))
 		c.Next()
 	}
+}
+
+func recordMachineAuthFailure(c *gin.Context, started time.Time) {
+	op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath())
+	if !ok {
+		return
+	}
+	RecordLatencyPhases(c.Request.Context(), op, "", map[string]time.Duration{
+		"auth": time.Since(started), "total": time.Since(started),
+	})
 }
 
 func setMachineCaller(c *gin.Context, caller auth.CallerContext) {

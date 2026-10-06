@@ -233,6 +233,44 @@ ORDER BY
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
+-- Machine callers query their owner relation before pagination. This keeps
+-- page contents, totals, and work bounded by the requested page rather than
+-- materializing every historical ownership row in the handler.
+-- name: ListSandboxesByMachineOwner :many
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND o.owner_principal_id = @owner_principal_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY
+  CASE WHEN @sort_by::text = 'name' AND @sort_dir::text = 'asc' THEN s.name END ASC,
+  CASE WHEN @sort_by::text = 'name' AND @sort_dir::text = 'desc' THEN s.name END DESC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc' THEN s.status::text END ASC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
+LIMIT sqlc.narg('row_limit')::bigint
+OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
+
+-- name: CountSandboxesByMachineOwner :one
+SELECT COUNT(*)::bigint
+FROM sandbox s
+JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
+WHERE s.team_id = @team_id
+  AND o.owner_principal_id = @owner_principal_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%');
+
 -- name: CountSandboxesByTeamPaged :one
 -- Total rows matching the same filters as ListSandboxesByTeamPaged (ignoring
 -- pagination + sort). Backs the X-Total-Count response header.

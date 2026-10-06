@@ -27,6 +27,11 @@ Verifiers reject unknown versions/fields, invalid signatures, expired values,
 and generations that are no longer current. Peer forwarding carries this
 verified capability, never an actor or team header.
 
+The proxy resolver/VMD attestation for a machine-owned sandbox must include
+`machine_owned`, the durable `machine_owner_principal_id`, and `team_id`.
+Machine capabilities are rejected when any binding is absent or mismatched;
+the proxy never infers ownership from a human `owner_id`.
+
 ## Durable lifecycle handoff
 
 The authorized control-plane/provisioning actor owns these fenced operations:
@@ -71,3 +76,27 @@ seconds of durable commit, authority-refresh failure behavior, creator
 offboarding, rotation, same-tenant restore, safe logs, and downgrade refusal.
 Credential revocation does not replace the lifecycle owner's workload
 quarantine/stop procedure.
+
+## Compatibility and activation gate
+
+The supported serving revision is `machine-identity-v1`: the schema migration
+`20261006000200_hosted_machine_identity.sql`, the API `CallerContext` resolver
+and route gate, the `mcap.v1` verifier, and the proxy session registry must be
+deployed as one compatible set. A serving instance is **ready** only when its
+health/readiness check reports all four surfaces present, the authority lookup
+is available, and the proxy is configured with the machine revocation resolver.
+Issuance and activation remain disabled until every serving instance in the
+deployment reports that revision and the recreate-without-backfill plan has
+completed.
+
+Rollback is permitted only to another revision that rejects legacy machine
+capabilities and creator-derived hosted issuance. A downgrade that lacks the
+route gate, owner relation, generation checks, or active-stream cancellation
+must fail its readiness check and cannot receive newly issued credentials.
+The provisioning, secret-delivery, lifecycle-containment, QM client, and
+attribution owners must each provide their issue/rotate/revoke/disable/restore,
+delivery, shutdown, client-version, and verified-caller readiness evidence
+before activation. Staging measurements for active-stream revocation,
+authority-refresh failure, restore/rotation, sandbox recreation, and safe
+attribution remain required pre-production gates; this local checkpoint does
+not claim those measurements passed.

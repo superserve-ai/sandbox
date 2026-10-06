@@ -1517,7 +1517,7 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 	if sandbox == nil {
 		return
 	}
-	resp := h.sandboxToResponseWithToken(*sandbox, c.GetTime("routing_observed_at"))
+	resp := h.sandboxResponseForRequest(c, *sandbox, c.GetTime("routing_observed_at"))
 	resp.PreviewAccess = previewAccess
 	c.JSON(http.StatusOK, resp)
 }
@@ -1662,9 +1662,13 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		"status": string(db.SandboxStatusActive),
 	}
 	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
-		// The token HMAC stays keyed on the bare UUID: the proxy normalizes
-		// public IDs before verification.
-		resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
+		// The token HMAC stays keyed on the bare UUID for human sandboxes; a
+		// machine caller receives only a lineage-bound capability.
+		if machineResp := h.sandboxResponseForRequest(c, sandbox, c.GetTime("routing_observed_at")); machineResp.AccessToken != "" {
+			resp["access_token"] = machineResp.AccessToken
+		} else if _, machine := machineCallerFromContext(c); !machine {
+			resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
+		}
 		resp["routing_hint"] = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, sandboxID.String(), sandbox.HostID, h.Config.EdgeProxyDomain, c.GetTime("routing_observed_at"), sandbox.RoutingVersion)
 	}
 	c.JSON(http.StatusOK, resp)
@@ -2337,6 +2341,32 @@ func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox, observedAt time.Time
 	return resp
 }
 
+// sandboxResponseForRequest never emits a legacy sandbox-only token for a
+// machine-owned request.  Those tokens have no principal, lineage, scope, or
+// revocation generation and therefore cannot cross the machine boundary.
+func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, observedAt time.Time) sandboxResponse {
+	if caller, machine := machineCallerFromContext(c); machine {
+		resp := h.sandboxToResponse(s)
+		if h.Config == nil || h.Config.SandboxAccessTokenSeed == nil || caller.Audience != "sandbox-proxy" {
+			return resp
+		}
+		ownership := auth.SandboxOwnership{SandboxID: s.ID, OwnerPrincipalID: caller.PrincipalID, TeamID: caller.TeamID}
+		now := timeNow(h)
+		capability, err := auth.DeriveCapability(caller, ownership, s.ID, "sandbox-proxy", caller.Permissions, caller.ExpiresAt, now)
+		if err != nil {
+			return resp
+		}
+		token, err := auth.SignMachineCapability(capability, h.Config.SandboxAccessTokenSeed, now)
+		if err != nil {
+			return resp
+		}
+		resp.AccessToken = token
+		resp.RoutingHint = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, s.ID.String(), s.HostID, h.Config.EdgeProxyDomain, observedAt, s.RoutingVersion)
+		return resp
+	}
+	return h.sandboxToResponseWithToken(s, observedAt)
+}
+
 // decodeMetadata unmarshals the jsonb bytes column into a string→string map.
 // On any decode error (which should be impossible because the column is
 // constrained to objects we wrote ourselves) we return an empty map rather
@@ -2432,6 +2462,7 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 	nameSearch := searchTerm(c.Query("q"))
 
 	ctx := c.Request.Context()
+	caller, machine := machineCallerFromContext(c)
 	// The default created_at sort is the hot path (and the only sort
 	// unpaginated SDK callers use), so it goes through the static-ORDER BY
 	// queries the planner can serve from idx_sandbox_team_created_active
@@ -2444,50 +2475,63 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		previewAccess string
 	}
 	var sandboxes []listRow
-	switch {
-	case pg.SortBy == "created_at" && pg.SortDir == "asc":
-		var rows []db.ListSandboxesByTeamCreatedAscRow
-		rows, err = h.DB.ListSandboxesByTeamCreatedAsc(ctx, db.ListSandboxesByTeamCreatedAscParams{
-			TeamID:     teamID,
-			Metadata:   metadataJSON,
-			Status:     statusFilter,
-			NameSearch: nameSearch,
-			RowOffset:  pg.Offset,
-			RowLimit:   pg.Limit,
+	if machine {
+		rows, ownerErr := h.DB.ListSandboxesByMachineOwner(ctx, db.ListSandboxesByMachineOwnerParams{
+			TeamID: teamID, OwnerPrincipalID: caller.PrincipalID, Metadata: metadataJSON,
+			Status: statusFilter, NameSearch: nameSearch, SortBy: pg.SortBy, SortDir: pg.SortDir,
+			RowOffset: pg.Offset, RowLimit: pg.Limit,
 		})
+		err = ownerErr
 		sandboxes = make([]listRow, len(rows))
 		for i, r := range rows {
 			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
 		}
-	case pg.SortBy == "created_at":
-		var rows []db.ListSandboxesByTeamCreatedDescRow
-		rows, err = h.DB.ListSandboxesByTeamCreatedDesc(ctx, db.ListSandboxesByTeamCreatedDescParams{
-			TeamID:     teamID,
-			Metadata:   metadataJSON,
-			Status:     statusFilter,
-			NameSearch: nameSearch,
-			RowOffset:  pg.Offset,
-			RowLimit:   pg.Limit,
-		})
-		sandboxes = make([]listRow, len(rows))
-		for i, r := range rows {
-			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
-		}
-	default:
-		var rows []db.ListSandboxesByTeamPagedRow
-		rows, err = h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
-			TeamID:     teamID,
-			Metadata:   metadataJSON,
-			Status:     statusFilter,
-			NameSearch: nameSearch,
-			SortBy:     pg.SortBy,
-			SortDir:    pg.SortDir,
-			RowOffset:  pg.Offset,
-			RowLimit:   pg.Limit,
-		})
-		sandboxes = make([]listRow, len(rows))
-		for i, r := range rows {
-			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+	} else {
+		switch {
+		case pg.SortBy == "created_at" && pg.SortDir == "asc":
+			var rows []db.ListSandboxesByTeamCreatedAscRow
+			rows, err = h.DB.ListSandboxesByTeamCreatedAsc(ctx, db.ListSandboxesByTeamCreatedAscParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Status:     statusFilter,
+				NameSearch: nameSearch,
+				RowOffset:  pg.Offset,
+				RowLimit:   pg.Limit,
+			})
+			sandboxes = make([]listRow, len(rows))
+			for i, r := range rows {
+				sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+			}
+		case pg.SortBy == "created_at":
+			var rows []db.ListSandboxesByTeamCreatedDescRow
+			rows, err = h.DB.ListSandboxesByTeamCreatedDesc(ctx, db.ListSandboxesByTeamCreatedDescParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Status:     statusFilter,
+				NameSearch: nameSearch,
+				RowOffset:  pg.Offset,
+				RowLimit:   pg.Limit,
+			})
+			sandboxes = make([]listRow, len(rows))
+			for i, r := range rows {
+				sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+			}
+		default:
+			var rows []db.ListSandboxesByTeamPagedRow
+			rows, err = h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Status:     statusFilter,
+				NameSearch: nameSearch,
+				SortBy:     pg.SortBy,
+				SortDir:    pg.SortDir,
+				RowOffset:  pg.Offset,
+				RowLimit:   pg.Limit,
+			})
+			sandboxes = make([]listRow, len(rows))
+			for i, r := range rows {
+				sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+			}
 		}
 	}
 	if err != nil {
@@ -2495,35 +2539,12 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	if caller, machine := machineCallerFromContext(c); machine {
-		owners, ownerErr := h.DB.ListMachineSandboxOwners(ctx, caller.PrincipalID, teamID)
-		if ownerErr != nil {
-			// Missing or unavailable ownership is fail-closed for machine list;
-			// it must never fall back to the team-wide human query.
-			log.Error().Err(ownerErr).Msg("machine sandbox ownership lookup failed")
-			respondError(c, ErrForbidden)
-			return
-		}
-		owned := make(map[uuid.UUID]struct{}, len(owners))
-		for _, owner := range owners {
-			if owner.OwnerPrincipalID == caller.PrincipalID && owner.TeamID == teamID {
-				owned[owner.SandboxID] = struct{}{}
-			}
-		}
-		filtered := sandboxes[:0]
-		for _, row := range sandboxes {
-			if _, ok := owned[row.sandbox.ID]; ok {
-				filtered = append(filtered, row)
-			}
-		}
-		sandboxes = filtered
-	}
-
 	var total int64
-	if _, machine := machineCallerFromContext(c); machine {
-		// The filtered in-memory page is intentionally not followed by a
-		// team-wide COUNT, which would disclose unrelated resource volume.
-		total = int64(len(sandboxes))
+	if machine {
+		total, err = h.DB.CountSandboxesByMachineOwner(ctx, db.CountSandboxesByMachineOwnerParams{
+			TeamID: teamID, OwnerPrincipalID: caller.PrincipalID, Metadata: metadataJSON,
+			Status: statusFilter, NameSearch: nameSearch,
+		})
 	} else {
 		total, err = resolveTotal(pg, len(sandboxes), func() (int64, error) {
 			return h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
@@ -2614,16 +2635,21 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 
 	resp := h.sandboxToResponse(sandbox)
 	resp.PreviewAccess = row.Access
-	canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
-	if permErr != nil {
-		log.Error().
-			Err(permErr).
-			Str("team_id", teamID.String()).
-			Str("sandbox_id", sandboxID.String()).
-			Msg("RBAC sandbox token permission check failed")
-	} else if canWrite {
-		resp = h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
+	if _, machine := machineCallerFromContext(c); machine {
+		resp = h.sandboxResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
 		resp.PreviewAccess = row.Access
+	} else {
+		canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
+		if permErr != nil {
+			log.Error().
+				Err(permErr).
+				Str("team_id", teamID.String()).
+				Str("sandbox_id", sandboxID.String()).
+				Msg("RBAC sandbox token permission check failed")
+		} else if canWrite {
+			resp = h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
+			resp.PreviewAccess = row.Access
+		}
 	}
 	if !isConsoleImpersonation(c) {
 		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
@@ -2820,6 +2846,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		sourceSnapshotID = id
 	}
 	if caller, machine := machineCallerFromContext(c); machine {
+		// The control plane owns the resolved QM template.  Omitting
+		// from_template means "use that approved template", never the public
+		// default/alias path; an explicit value must be its stable UUID.
+		if req.FromTemplate == nil && caller.ApprovedTemplateID != nil {
+			approved := caller.ApprovedTemplateID.String()
+			req.FromTemplate = &approved
+		}
 		var templateID *uuid.UUID
 		if req.FromTemplate != nil {
 			id, parseErr := uuid.Parse(*req.FromTemplate)
@@ -2907,7 +2940,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	if _, machine := machineCallerFromContext(c); machine && h.Pool == nil {
+	machineCaller, machineRequest := machineCallerFromContext(c)
+	if machineRequest && h.Pool == nil {
 		// Ownership must be committed with the machine sandbox row; a handler
 		// without a transaction-capable pool cannot safely create one.
 		respondErrorMsg(c, "service_unavailable", "machine sandbox creation is not available", http.StatusServiceUnavailable)
@@ -3277,7 +3311,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// Quota is enforced by the sandbox_quota_on_insert trigger.
 		q := h.DB
 		var tx pgx.Tx
-		if _, machine := machineCallerFromContext(c); machine && h.Pool != nil {
+		if machineRequest && h.Pool != nil {
 			var beginErr error
 			tx, beginErr = h.Pool.Begin(insertCtx)
 			if beginErr != nil {
@@ -3290,8 +3324,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		sb, err := insertWithBindings(q)
 		if err == nil {
-			if caller, machine := machineCallerFromContext(c); machine {
-				err = q.CreateMachineSandboxOwner(insertCtx, sb.ID, caller.PrincipalID, teamID)
+			if machineRequest {
+				err = q.CreateMachineSandboxOwner(insertCtx, sb.ID, machineCaller.PrincipalID, teamID)
 			}
 		}
 		if err == nil && tx != nil {
@@ -3781,7 +3815,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	sandbox.Status = db.SandboxStatusActive
 	c.Set("routing_observed_at", routingObservedAt)
-	resp := h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
+	resp := h.sandboxResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
 	resp.PreviewAccess = previewAccess
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		// Echo the normalized rules, not the raw request, so the create

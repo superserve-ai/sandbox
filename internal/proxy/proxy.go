@@ -82,6 +82,11 @@ type Handler struct {
 	// Machine capabilities fail closed when a proxy has not been configured
 	// with it; legacy tokens remain available only to ordinary sandboxes.
 	machineAuthority auth.RevocationAuthority
+	// sessions is the bounded active-stream registry. It is deliberately
+	// local to a serving instance; durable authority refresh/invalidation
+	// calls RevokeCredential/RevokePrincipal and the registered cancel funcs
+	// terminate transports without per-frame durable I/O.
+	sessions *auth.SessionRegistry
 
 	// terminal holds the dependencies specific to the /terminal WebSocket
 	// bridge (allowed browser origins for the Origin check). Nil means
@@ -156,6 +161,7 @@ func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handle
 		sandboxConns:       newConnLimiter(maxConnsPerSandbox),
 		ipConns:            newConnLimiter(maxConnsPerIP),
 		authenticatedConns: newConnLimiter(1024),
+		sessions:           auth.NewSessionRegistry(1024),
 		log:                log,
 	}
 	return h

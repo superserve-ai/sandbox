@@ -132,6 +132,63 @@ func TestSessionRegistryRevokesCredentialAndPrincipal(t *testing.T) {
 	}
 }
 
+func TestSessionRegistryRevocationCancelsActiveStream(t *testing.T) {
+	principal, credential := uuid.New(), uuid.New()
+	registry := NewSessionRegistry(2)
+	cancelled := make(chan struct{})
+	if err := registry.RegisterWithCancel("stream", RevocationState{
+		PrincipalID: principal, CredentialID: credential, RevocationGeneration: 3,
+		ExpiresAt: time.Now().Add(time.Minute),
+	}, func() { close(cancelled) }); err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.RevokeCredential(credential, 3); got != 1 {
+		t.Fatalf("removed sessions = %d, want 1", got)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("revocation did not cancel the active stream")
+	}
+}
+
+func TestSessionRegistryExpireOnlyClosesOneStream(t *testing.T) {
+	principal, credential, lineage := uuid.New(), uuid.New(), uuid.New()
+	registry := NewSessionRegistry(2)
+	first, second := make(chan struct{}), make(chan struct{})
+	state := RevocationState{PrincipalID: principal, CredentialID: credential, LineageID: lineage, RevocationGeneration: 1, ExpiresAt: time.Now().Add(time.Minute)}
+	if err := registry.RegisterWithCancel("first", state, func() { close(first) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.RegisterWithCancel("second", state, func() { close(second) }); err != nil {
+		t.Fatal(err)
+	}
+	registry.Expire("first")
+	select {
+	case <-first:
+	case <-time.After(time.Second):
+		t.Fatal("expired stream was not cancelled")
+	}
+	capability := MachineCapability{PrincipalID: principal, CredentialID: credential, LineageID: lineage, RevocationGeneration: 1, ExpiresAt: time.Now().Add(time.Minute)}
+	if !registry.Allows("second", capability, time.Now()) {
+		t.Fatal("expiring one child capability revoked its sibling")
+	}
+	select {
+	case <-second:
+		t.Fatal("sibling stream was cancelled")
+	default:
+	}
+}
+
+func TestMachineCredentialRejectsStalePrincipalGeneration(t *testing.T) {
+	now := time.Unix(100, 0)
+	principal := MachinePrincipal{PrincipalID: uuid.New(), TeamID: uuid.New(), HostedTenantID: uuid.New(), Status: PrincipalActive, Generation: 2}
+	credential := MachineCredential{CredentialID: uuid.New(), PrincipalID: principal.PrincipalID, LineageID: uuid.New(), State: CredentialActive, ExpiresAt: now.Add(time.Minute), RevocationGeneration: 1}
+	if err := credential.ValidateAt(now, principal); err == nil {
+		t.Fatal("stale credential generation must be rejected")
+	}
+}
+
 func TestOperationForHTTPDefaultsToDeny(t *testing.T) {
 	if op, ok := OperationForHTTP("GET", "/sandboxes"); !ok || op != MachineOperationList {
 		t.Fatalf("list operation = %q, %v", op, ok)

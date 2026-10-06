@@ -144,6 +144,9 @@ func (c MachineCredential) ValidateAt(now time.Time, principal MachinePrincipal)
 	if c.CredentialID == uuid.Nil || c.PrincipalID != principal.PrincipalID || c.LineageID == uuid.Nil || c.RevocationGeneration == 0 {
 		return fmt.Errorf("%w: credential lineage is incomplete", ErrInvalidMachineIdentity)
 	}
+	if c.RevocationGeneration != principal.Generation {
+		return fmt.Errorf("%w: credential generation is stale", ErrInvalidMachineIdentity)
+	}
 	if c.State != CredentialActive || principal.Status != PrincipalActive {
 		return fmt.Errorf("%w: credential or principal is not active", ErrInvalidMachineIdentity)
 	}
@@ -260,15 +263,20 @@ func VerifyMachineCapabilityWithAuthority(ctx context.Context, token string, sig
 // instance refreshes it at most once per freshness window; request and frame
 // checks are local and therefore do not add per-frame I/O.
 type RevocationState struct {
-	PrincipalID          uuid.UUID
-	CredentialID         uuid.UUID
+	PrincipalID  uuid.UUID
+	CredentialID uuid.UUID
+	// LineageID is optional for compatibility with older in-process callers;
+	// serving registrations populate it and then require an exact match.
+	LineageID            uuid.UUID
 	RevocationGeneration uint64
 	ExpiresAt            time.Time
 }
 
 func (s RevocationState) Allows(capability MachineCapability, now time.Time) bool {
+	lineageMatches := s.LineageID == uuid.Nil || capability.LineageID == s.LineageID
 	return capability.PrincipalID == s.PrincipalID && capability.CredentialID == s.CredentialID &&
-		capability.RevocationGeneration == s.RevocationGeneration && now.Before(s.ExpiresAt)
+		lineageMatches && capability.RevocationGeneration == s.RevocationGeneration &&
+		now.Before(s.ExpiresAt) && now.Before(capability.ExpiresAt)
 }
 
 // SessionRegistry bounds active stream registrations and makes revocation
@@ -277,7 +285,12 @@ func (s RevocationState) Allows(capability MachineCapability, now time.Time) boo
 type SessionRegistry struct {
 	mu       sync.Mutex
 	max      int
-	sessions map[string]RevocationState
+	sessions map[string]sessionEntry
+}
+
+type sessionEntry struct {
+	state  RevocationState
+	cancel context.CancelFunc
 }
 
 var ErrSessionLimit = errors.New("auth: machine session limit reached")
@@ -286,10 +299,22 @@ func NewSessionRegistry(max int) *SessionRegistry {
 	if max < 1 {
 		max = 1
 	}
-	return &SessionRegistry{max: max, sessions: make(map[string]RevocationState)}
+	return &SessionRegistry{max: max, sessions: make(map[string]sessionEntry)}
 }
 
 func (r *SessionRegistry) Register(id string, state RevocationState) error {
+	return r.register(id, state, nil)
+}
+
+// RegisterWithCancel associates a stream cancellation callback with the
+// bounded registration. Revocation removes the registration and invokes the
+// callback outside the registry lock so active transports can terminate
+// without blocking other registrations.
+func (r *SessionRegistry) RegisterWithCancel(id string, state RevocationState, cancel context.CancelFunc) error {
+	return r.register(id, state, cancel)
+}
+
+func (r *SessionRegistry) register(id string, state RevocationState, cancel context.CancelFunc) error {
 	if r == nil || id == "" || state.PrincipalID == uuid.Nil || state.CredentialID == uuid.Nil {
 		return ErrMachineCapabilityDenied
 	}
@@ -298,7 +323,7 @@ func (r *SessionRegistry) Register(id string, state RevocationState) error {
 	if _, exists := r.sessions[id]; !exists && len(r.sessions) >= r.max {
 		return ErrSessionLimit
 	}
-	r.sessions[id] = state
+	r.sessions[id] = sessionEntry{state: state, cancel: cancel}
 	return nil
 }
 
@@ -311,14 +336,32 @@ func (r *SessionRegistry) Unregister(id string) {
 	r.mu.Unlock()
 }
 
+// Expire removes one capability session and cancels only that stream.  A
+// child capability's expiry must not revoke sibling sessions issued from the
+// same credential.
+func (r *SessionRegistry) Expire(id string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	entry, ok := r.sessions[id]
+	if ok {
+		delete(r.sessions, id)
+	}
+	r.mu.Unlock()
+	if ok && entry.cancel != nil {
+		entry.cancel()
+	}
+}
+
 func (r *SessionRegistry) Allows(id string, capability MachineCapability, now time.Time) bool {
 	if r == nil {
 		return false
 	}
 	r.mu.Lock()
-	state, ok := r.sessions[id]
+	entry, ok := r.sessions[id]
 	r.mu.Unlock()
-	return ok && state.Allows(capability, now)
+	return ok && entry.state.Allows(capability, now)
 }
 
 func (r *SessionRegistry) RevokeCredential(credentialID uuid.UUID, generation uint64) int {
@@ -326,13 +369,20 @@ func (r *SessionRegistry) RevokeCredential(credentialID uuid.UUID, generation ui
 		return 0
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	removed := 0
-	for id, state := range r.sessions {
-		if state.CredentialID == credentialID && state.RevocationGeneration <= generation {
+	var cancels []context.CancelFunc
+	for id, entry := range r.sessions {
+		if entry.state.CredentialID == credentialID && entry.state.RevocationGeneration <= generation {
 			delete(r.sessions, id)
+			if entry.cancel != nil {
+				cancels = append(cancels, entry.cancel)
+			}
 			removed++
 		}
+	}
+	r.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
 	}
 	return removed
 }
@@ -342,13 +392,20 @@ func (r *SessionRegistry) RevokePrincipal(principalID uuid.UUID, generation uint
 		return 0
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	removed := 0
-	for id, state := range r.sessions {
-		if state.PrincipalID == principalID && state.RevocationGeneration <= generation {
+	var cancels []context.CancelFunc
+	for id, entry := range r.sessions {
+		if entry.state.PrincipalID == principalID && entry.state.RevocationGeneration <= generation {
 			delete(r.sessions, id)
+			if entry.cancel != nil {
+				cancels = append(cancels, entry.cancel)
+			}
 			removed++
 		}
+	}
+	r.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
 	}
 	return removed
 }
@@ -436,6 +493,10 @@ func OperationForHTTP(method, path string) (MachineOperation, bool) {
 		case "preview-ports":
 			return MachineOperationMetadata, true
 		}
+	case method == "POST" && len(parts) >= 5 && parts[2] == "preview-ports" && parts[len(parts)-1] == "token":
+		return MachineOperationToken, true
+	case method == "POST" && len(parts) >= 6 && parts[2] == "preview-ports" && parts[len(parts)-1] == "rotate":
+		return MachineOperationToken, true
 	case len(parts) == 3 && method == "GET" && parts[2] == "files":
 		return MachineOperationFileList, true
 	}

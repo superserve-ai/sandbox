@@ -79,6 +79,8 @@ CREATE TABLE sandbox_machine_owner (
     created_at         timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (owner_principal_id, team_id)
         REFERENCES machine_principal(id, team_id),
+    FOREIGN KEY (sandbox_id, team_id)
+        REFERENCES sandbox(id, team_id),
     UNIQUE (sandbox_id, team_id)
 );
 
@@ -158,6 +160,22 @@ $$;
 REVOKE ALL ON machine_principal, machine_credential, sandbox_machine_owner FROM PUBLIC;
 REVOKE ALL ON FUNCTION ensure_machine_principal(uuid, uuid, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION disable_machine_principal(uuid), restore_machine_principal(uuid) FROM PUBLIC;
+DO $$
+DECLARE r text;
+BEGIN
+    FOREACH r IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+            EXECUTE format('REVOKE ALL ON machine_principal, machine_credential, sandbox_machine_owner FROM %I', r);
+            EXECUTE format('REVOKE ALL ON FUNCTION ensure_machine_principal(uuid, uuid, uuid) FROM %I', r);
+            EXECUTE format('REVOKE ALL ON FUNCTION disable_machine_principal(uuid) FROM %I', r);
+            EXECUTE format('REVOKE ALL ON FUNCTION restore_machine_principal(uuid) FROM %I', r);
+        END IF;
+    END LOOP;
+END;
+$$;
+ALTER TABLE machine_principal ENABLE ROW LEVEL SECURITY;
+ALTER TABLE machine_credential ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sandbox_machine_owner ENABLE ROW LEVEL SECURITY;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN

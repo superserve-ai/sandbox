@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
@@ -33,7 +34,15 @@ type InstanceInfo struct {
 	OwnerID   string // creating user, for usage attribution; empty when unknown
 	// MachineOwned is set by a resolver that has loaded the durable owner
 	// record. Legacy sandbox-only tokens are rejected for such instances.
-	MachineOwned             bool
+	MachineOwned bool
+	// MachineOwnerPrincipalID is the durable owner attestation returned by
+	// the control plane/VMD for machine-owned sandboxes. It is required for
+	// machine capability authorization; an absent value fails closed.
+	MachineOwnerPrincipalID string
+	// MachineCaller carries the capability verifier's canonical identity to
+	// downstream attribution/transport code. It is absent for human/legacy
+	// requests and is never populated from headers or resource ownership.
+	MachineCaller            *auth.CallerContext
 	PreviewAccess            string
 	PreviewPorts             map[int]struct{}
 	PreviewPortAccess        map[int]string
@@ -193,11 +202,15 @@ func (r *VMDResolver) Invalidate(instanceID string) {
 
 // vmdResponse matches the JSON returned by VMD's local HTTP server.
 type vmdResponse struct {
-	VMIP                     string            `json:"vm_ip"`
-	Status                   string            `json:"status"`
-	StartedAt                int64             `json:"started_at"`
-	TeamID                   string            `json:"team_id"`
-	OwnerID                  string            `json:"owner_id"`
+	VMIP      string `json:"vm_ip"`
+	Status    string `json:"status"`
+	StartedAt int64  `json:"started_at"`
+	TeamID    string `json:"team_id"`
+	OwnerID   string `json:"owner_id"`
+	// MachineOwned is an explicit control-plane/VMD attestation. The proxy
+	// never infers machine ownership from OwnerID or caller-provided metadata.
+	MachineOwned             bool              `json:"machine_owned"`
+	MachineOwnerPrincipalID  string            `json:"machine_owner_principal_id"`
 	PreviewAccess            string            `json:"preview_access"`
 	PreviewPorts             map[string]bool   `json:"preview_ports"`
 	PreviewPortAccess        map[string]string `json:"preview_port_access"`
@@ -244,7 +257,8 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 
 	info := InstanceInfo{
 		VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt,
-		TeamID: raw.TeamID, OwnerID: raw.OwnerID,
+		TeamID: raw.TeamID, OwnerID: raw.OwnerID, MachineOwned: raw.MachineOwned,
+		MachineOwnerPrincipalID:  raw.MachineOwnerPrincipalID,
 		PreviewAccess:            raw.PreviewAccess,
 		PreviewPorts:             decodePreviewPorts(raw.PreviewPorts),
 		PreviewPortAccess:        decodePreviewPortAccess(raw.PreviewPorts, raw.PreviewPortAccess),
