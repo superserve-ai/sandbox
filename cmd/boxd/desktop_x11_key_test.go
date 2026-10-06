@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jezek/xgb/xproto"
 
@@ -230,6 +231,42 @@ func TestPlanKey_Chords(t *testing.T) {
 			}
 			eventsEqual(t, segs[0].events, tc.want)
 		})
+	}
+}
+
+// With one usable spare, alternating unmapped characters rebind it every
+// stroke; past the segment cap the request is declined with nothing bound.
+func TestPlanKey_TooManySegmentsDeclines(t *testing.T) {
+	km := testKeymap(1)
+	alternating := func(n int) string { return strings.Repeat("éà", n/2) }
+	if _, err := planKey(km, xkbState{}, textEvent(alternating(maxKeySegments))); err != nil {
+		t.Fatalf("%d segments should still plan: %v", maxKeySegments, err)
+	}
+	km = testKeymap(1)
+	_, err := planKey(km, xkbState{}, textEvent(alternating(maxKeySegments+2)))
+	if !errors.Is(err, errBackendKept) {
+		t.Fatalf("err = %v, want errBackendKept", err)
+	}
+	if len(km.bound) != 0 {
+		t.Errorf("a declined plan bound %v", km.bound)
+	}
+}
+
+// Changing DISPLAY while no backend is attached must still forget the old
+// server's scratch bindings.
+func TestX11Holder_DisplayChangeForgetsBindingsWithoutABackend(t *testing.T) {
+	s := newDesktopService(&sandboxContext{})
+	b := withFakeBackend(s)
+	b.keys = testKeymap(1)
+	s.x11.drop(b)
+	if s.x11.keys == nil {
+		t.Fatal("drop did not keep the keymap")
+	}
+	s.x11.disabled = false
+	s.x11.lastProbe = time.Now() // no dial: the cooldown returns nil
+	s.x11.get(context.Background(), ":99")
+	if s.x11.keys != nil {
+		t.Error("bindings from the old display survived a DISPLAY change")
 	}
 }
 

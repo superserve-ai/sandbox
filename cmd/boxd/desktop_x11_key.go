@@ -116,6 +116,8 @@ type keyEvent struct {
 	press bool
 }
 
+const maxKeySegments = 32
+
 type keyBind struct {
 	code   xproto.Keycode
 	keysym uint32
@@ -124,6 +126,9 @@ type keyBind struct {
 // keySegment is a run of strokes whose scratch bindings are all applied
 // before the first press. A new segment starts only when the spare pool is
 // exhausted and a keycode already typed in this request must be rebound.
+// Each costs two round trips, so a request that would need more than
+// maxKeySegments is declined before anything is bound: that only happens
+// with a tiny spare pool and text full of unmapped characters.
 type keySegment struct {
 	binds  []keyBind
 	events []keyEvent
@@ -449,6 +454,9 @@ func planKey(km *x11Keymap, state xkbState, ev *pb.KeyEvent) ([]keySegment, erro
 	}
 	if err != nil {
 		return nil, err
+	}
+	if len(p.segments)+1 > maxKeySegments {
+		return nil, fmt.Errorf("%d scratch rebinds needed, max %d: %w", len(p.segments)+1, maxKeySegments, errBackendKept)
 	}
 	km.spare, km.bound = p.spare, p.bound
 	return append(p.segments, p.cur), nil

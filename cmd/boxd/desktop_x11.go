@@ -435,9 +435,11 @@ func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 		h.mu.Unlock()
 		return nil
 	}
-	if h.backend != nil && h.display != display {
-		h.backend.Close()
-		h.backend = nil
+	if h.display != display {
+		if h.backend != nil {
+			h.backend.Close()
+			h.backend = nil
+		}
 		h.keys = nil // a different server, different bindings
 	}
 	if h.backend != nil {
