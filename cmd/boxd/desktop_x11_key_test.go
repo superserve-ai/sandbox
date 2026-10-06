@@ -16,17 +16,42 @@ import (
 
 // testKeymap is a two-column US-like layout starting at keycode 8:
 // 8 a/A, 9 u/U, 10 1/!, 11 space, 12 Return, 13 Shift_L, 14 Control_L,
-// 15 KP_End/KP_1, 16 Pause/Break, then `spares` empty keycodes.
+// 15 KP_End/KP_1, 16 Pause/Break, then `spares` usable empty keycodes
+// (plus the one the keymap reserves for xdotool).
 func testKeymap(spares int) *x11Keymap {
 	rows := [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}}
 	var syms []xproto.Keysym
 	for _, r := range rows {
 		syms = append(syms, r[0], r[1])
 	}
-	for i := 0; i < spares; i++ {
+	for i := 0; i < spares+1; i++ {
 		syms = append(syms, 0, 0)
 	}
 	return buildKeymap(8, 2, syms, nil)
+}
+
+func TestBuildKeymap_ReservesOneKeycodeForTheFallback(t *testing.T) {
+	km := testKeymap(1)
+	reserved := xproto.Keycode(int(kcSpare0) + 1)
+	if len(km.spare) != 1 || km.spare[0] != kcSpare0 {
+		t.Fatalf("spare = %v, want just %d with %d held back", km.spare, kcSpare0, reserved)
+	}
+	// Two unmapped characters still fit, by rebinding the one pool keycode
+	// across segments; the reserved one is never touched.
+	segs, err := planKey(km, xkbState{}, textEvent("éà"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("segments = %d, want 2", len(segs))
+	}
+	for _, seg := range segs {
+		for _, bind := range seg.binds {
+			if bind.code != kcSpare0 {
+				t.Errorf("bound keycode %d, want only %d (keycode %d is reserved)", bind.code, kcSpare0, reserved)
+			}
+		}
+	}
 }
 
 const (
@@ -242,7 +267,7 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	// A reload after an external MappingNotify sees our scratch keycode with
 	// a keysym now; it must stay scratch, not become a layout key for é.
 	syms := make([]xproto.Keysym, 0, 11*2)
-	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0xe9, 0}, {0, 0}} {
+	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0xe9, 0}, {0, 0}, {0, 0}} {
 		syms = append(syms, r[0], r[1])
 	}
 	reloaded := buildKeymap(8, 2, syms, km.bound)
@@ -255,11 +280,11 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 
 	// A reload that no longer types é on that keycode drops the binding:
 	// cleared, it is spare again; rewritten, it is a layout key.
-	cleared := append(append([]xproto.Keysym{}, syms[:18]...), 0, 0, 0, 0)
+	cleared := append(append([]xproto.Keysym{}, syms[:18]...), 0, 0, 0, 0, 0, 0)
 	if r := buildKeymap(8, 2, cleared, km.bound); len(r.bound) != 0 || len(r.spare) != 2 {
 		t.Errorf("cleared row: bound = %v, spare = %v; want no binding and two spares", r.bound, r.spare)
 	}
-	rewritten := append(append([]xproto.Keysym{}, syms[:18]...), 'z', 'Z', 0, 0)
+	rewritten := append(append([]xproto.Keysym{}, syms[:18]...), 'z', 'Z', 0, 0, 0, 0)
 	r := buildKeymap(8, 2, rewritten, km.bound)
 	if len(r.bound) != 0 || r.direct['z'].code != kcSpare0 || len(r.spare) != 1 {
 		t.Errorf("rewritten row: bound = %v, direct[z] = %v, spare = %v; want z on %d and one spare", r.bound, r.direct['z'], r.spare, kcSpare0)
@@ -267,11 +292,11 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 
 	// The server exports a bound cased letter as its lower/upper pair:
 	// still ours. Any other symbol on the row means another client owns it.
-	paired := append(append([]xproto.Keysym{}, syms[:18]...), 0xe9, 0xc9, 0, 0)
+	paired := append(append([]xproto.Keysym{}, syms[:18]...), 0xe9, 0xc9, 0, 0, 0, 0)
 	if r := buildKeymap(8, 2, paired, km.bound); r.bound[kcSpare0] != 0xe9 {
 		t.Errorf("paired row: bound = %v, want é kept on %d", r.bound, kcSpare0)
 	}
-	foreign := append(append([]xproto.Keysym{}, syms[:18]...), 0xe9, 'x', 0, 0)
+	foreign := append(append([]xproto.Keysym{}, syms[:18]...), 0xe9, 'x', 0, 0, 0, 0)
 	if r := buildKeymap(8, 2, foreign, km.bound); len(r.bound) != 0 || r.direct['x'].code != kcSpare0 {
 		t.Errorf("foreign row: bound = %v, direct[x] = %v; want the binding dropped and x on %d", r.bound, r.direct['x'], kcSpare0)
 	}

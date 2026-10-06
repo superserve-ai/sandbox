@@ -98,7 +98,9 @@ type x11Keymap struct {
 	// spare are keycodes with no keysyms of their own, least recently bound
 	// first. A bound one stays bound until the pool wraps around, so a
 	// repeated character never rebinds and applications are never asked to
-	// re-read the map between a key press and its release.
+	// re-read the map between a key press and its release. One empty
+	// keycode is left out of the pool for xdotool, whose fallback path
+	// binds an unused keycode of its own.
 	spare []xproto.Keycode
 	// bound is the keysym each scratch keycode currently types.
 	bound map[xproto.Keycode]uint32
@@ -166,6 +168,9 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound ma
 				}
 			}
 		}
+	}
+	if len(km.spare) > 0 {
+		km.spare = km.spare[:len(km.spare)-1] // reserved for xdotool
 	}
 	// Previously bound scratch keycodes rejoin the pool as most recently used.
 	for code := range km.bound {
