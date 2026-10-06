@@ -292,6 +292,21 @@ func TestBackupReporterDefersAnInFlightFinalize(t *testing.T) {
 	}
 }
 
+// A lost lock race is the same shape of deferral: this report redelivers
+// while the rest of the outbox drains.
+func TestBackupReporterDefersALostLockRace(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"code":"lock_contention","message":"backup report lost a lock race; retry"}}`))
+	}))
+	defer srv.Close()
+	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "b", Log: zerolog.Nop()}
+	err := r.Deliver(backup.Task{SandboxID: "sb", Generation: "g"})
+	if !errors.Is(err, backup.ErrNotificationDeferred) {
+		t.Fatalf("Deliver = %v, want the deferral sentinel", err)
+	}
+}
+
 // A control plane that predates saved-snapshot backups rejects the owner
 // field; the report is kept for a later delivery, not dropped with its
 // coverage row. Any other rejection of a snapshot report still drops.
