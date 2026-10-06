@@ -1,0 +1,108 @@
+name: Apply deployment migrations
+
+on:
+  workflow_call:
+    inputs:
+      revision:
+        required: true
+        type: string
+      production:
+        required: true
+        type: boolean
+      allow_branch_staging:
+        default: false
+        type: boolean
+      resume_run_id:
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+# Callers keep their deployment locks; only this callee takes the database lock.
+concurrency:
+  group: database-migrations
+  queue: max
+  cancel-in-progress: false
+
+env:
+  DEPLOYMENT_REVISION: ${{ inputs.revision }}
+  DEPLOYMENT_PRODUCTION: ${{ inputs.production && 'true' || 'false' }}
+  ALLOW_BRANCH_STAGING: ${{ inputs.allow_branch_staging && 'true' || 'false' }}
+  RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+
+jobs:
+  gate:
+    outputs:
+      migration_revision: ${{ steps.revision.outputs.migration_revision }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify exact deployment revision and push CI
+        id: revision
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  staging:
+    needs: [gate]
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      MIGRATION_REVISION: ${{ needs.gate.outputs.migration_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.migration_revision }}
+          path: migration-source
+      - uses: supabase/setup-cli@v1
+        with:
+          version: '2.119.0'
+      - run: python3 -m pip install -r migration-source/scripts/migration-requirements.txt
+      - name: Apply all staging migrations for the deployment
+        run: |
+          python3 .github/workflows/scripts/deployment_migration_gate.py --verify-revision
+          python3 migration-source/scripts/migrate_database.py staging push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+
+  production:
+    if: inputs.production
+    needs: [gate, staging]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      MIGRATION_REVISION: ${{ needs.gate.outputs.migration_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.migration_revision }}
+          path: migration-source
+      - uses: supabase/setup-cli@v1
+        with:
+          version: '2.119.0'
+      - run: python3 -m pip install -r migration-source/scripts/migration-requirements.txt
+      - name: Apply all primary production migrations for the deployment
+        run: |
+          python3 .github/workflows/scripts/deployment_migration_gate.py --verify-revision
+          python3 migration-source/scripts/migrate_database.py use4 push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+      - name: Apply all west production migrations for the deployment
+        run: |
+          python3 .github/workflows/scripts/deployment_migration_gate.py --verify-revision
+          python3 migration-source/scripts/migrate_database.py usw2 push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}

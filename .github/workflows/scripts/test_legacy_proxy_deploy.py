@@ -96,7 +96,7 @@ class LegacyProxyTests(unittest.TestCase):
     def test_legacy_mode_bypasses_only_generation_promotion(self):
         workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
         step = workflow.split('      - name: Require host identity readiness for automatic rollout\n')[1].split('      - name:', 1)[0]
-        script = step.split('        run: |\n')[1]
+        script = step.split('        run: |\n')[1].split('\n  migrations:', 1)[0]
         for ready in ('', 'true'):
             env = dict(os.environ, PROXY_DEPLOYMENT_MODE='legacy', DEPLOY_EVENT='push', ROLLOUT_READY=ready)
             result = subprocess.run(['bash', '-eu', '-c', script], env=env, capture_output=True, text=True)
