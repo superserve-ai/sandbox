@@ -351,6 +351,13 @@ func TestPlanKey_DeclinesForKeyboardStateItCannotHonor(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventsEqual(t, segs[0].events, tapEvents(kc1))
+	// A held modifier declines literal text only; a chord keeps it.
+	if _, err := planKey(testKeymap(1), xkbState{held: true}, textEvent("1")); !errors.Is(err, errBackendKept) {
+		t.Errorf("held modifier, text: err = %v, want errBackendKept", err)
+	}
+	if _, err := planKey(testKeymap(1), xkbState{held: true}, chordEvent("1")); err != nil {
+		t.Errorf("held modifier, chord: %v", err)
+	}
 }
 
 func TestPlanKey_DeclinesBeforeTouchingTheServer(t *testing.T) {
@@ -551,10 +558,15 @@ func TestPlanKey_NonPrintableLevelTwoUsesScratch(t *testing.T) {
 func TestXkbStateFromReply(t *testing.T) {
 	reply := make([]byte, 32)
 	reply[0], reply[1] = 1, 3 // reply, deviceID
+	reply[8] = xproto.ModMaskLock | xproto.ModMaskShift | xproto.ModMaskControl
 	reply[11] = xproto.ModMaskLock | xproto.ModMaskShift
 	reply[12] = 1
-	if got := xkbStateFromReply(reply); got != (xkbState{group: 1, capsLock: true, shiftLock: true}) {
-		t.Errorf("state = %+v, want group 1 with Caps Lock and Shift Lock", got)
+	if got := xkbStateFromReply(reply); got != (xkbState{group: 1, capsLock: true, shiftLock: true, held: true}) {
+		t.Errorf("state = %+v, want group 1, both locks and a held Control", got)
+	}
+	reply[8] = xproto.ModMaskLock | xproto.ModMaskShift // only the locks are in effect
+	if got := xkbStateFromReply(reply); got.held {
+		t.Errorf("state = %+v, want nothing held when only locks are in effect", got)
 	}
 	if got := xkbStateFromReply(reply[:8]); got != (xkbState{}) {
 		t.Errorf("short reply = %+v, want zero state", got)

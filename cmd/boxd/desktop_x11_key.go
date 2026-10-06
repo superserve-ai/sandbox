@@ -30,12 +30,14 @@ const (
 	xkbAbsent
 )
 
-// xkbState is what the core keyboard map cannot show: the active group and
-// the locked modifiers (Caps Lock, Shift Lock).
+// xkbState is what the core keyboard map cannot show: the active group,
+// the locked modifiers (Caps Lock, Shift Lock), and whether any other
+// modifier is in effect, held down or latched.
 type xkbState struct {
 	group     int
 	capsLock  bool
 	shiftLock bool
+	held      bool
 }
 
 // xkbGetState asks the server for the keyboard state. Without the
@@ -106,11 +108,12 @@ func xkbStateFromReply(reply []byte) xkbState {
 	if len(reply) < 13 {
 		return xkbState{}
 	}
-	locked := reply[11]
+	effective, locked := reply[8], reply[11]
 	return xkbState{
 		group:     int(reply[12]),
 		capsLock:  locked&xproto.ModMaskLock != 0,
 		shiftLock: locked&xproto.ModMaskShift != 0,
+		held:      effective&^locked != 0,
 	}
 }
 
@@ -506,12 +509,17 @@ func (p *keyPlanner) chord(modifiers []string, key string) error {
 // planKey lowers a validated KeyEvent for the given keyboard state. On
 // success the keymap's scratch state is updated to what the plan will bind.
 //
-// Another active group is declined outright: the core map describes the
-// first group only, so a layout keycode would type that group's symbol.
-// xdotool locks groups per keysym, so it keeps that case.
+// Two states are declined outright. Another active group: the core map
+// describes the first group only, so a layout keycode would type that
+// group's symbol (xdotool locks groups per keysym). A modifier held down or
+// latched while literal text is requested: a key someone is holding cannot
+// be released from here, and xdotool's --clearmodifiers owns that case.
 func planKey(km *x11Keymap, state xkbState, ev *pb.KeyEvent) ([]keySegment, error) {
 	if state.group != 0 {
 		return nil, fmt.Errorf("keyboard group %d is active: %w", state.group+1, errBackendKept)
+	}
+	if _, literal := ev.GetInput().(*pb.KeyEvent_Text); literal && state.held {
+		return nil, fmt.Errorf("a modifier is held: %w", errBackendKept)
 	}
 	p := newKeyPlanner(km)
 	var err error
