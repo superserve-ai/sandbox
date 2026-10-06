@@ -63,7 +63,17 @@ func TestMain(m *testing.M) {
 	defer cancel()
 
 	var err error
-	testPool, err = pgxpool.New(ctx, dbURL)
+	poolConfig, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse test database config: %v\n", err)
+		os.Exit(1)
+	}
+	poolConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		db.RegisterEnumArrays(conn.TypeMap())
+		return nil
+	}
+	testPool, err = pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect to test database: %v\n", err)
 		os.Exit(1)
