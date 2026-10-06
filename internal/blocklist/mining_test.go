@@ -12,7 +12,7 @@ import (
 func TestMiningMatchKeepsClassificationAndRevisionIndependent(t *testing.T) {
 	dir := t.TempDir()
 	ordinary := New(&Config{CustomDomains: []string{"ordinary.example"}, StatePath: filepath.Join(dir, "generic")}, zerolog.Nop())
-	mining := New(&Config{CustomDomains: []string{"mining.example"}, CustomCIDRs: []string{"203.0.113.0/24"}, StatePath: filepath.Join(dir, "private")}, zerolog.Nop())
+	mining := New(&Config{mining: true, CustomDomains: []string{"mining.example"}, CustomCIDRs: []string{"203.0.113.0/24"}, StatePath: filepath.Join(dir, "private")}, zerolog.Nop())
 	if ok, _ := ordinary.Blocked("ordinary.example", nil); !ok {
 		t.Fatal("generic block missing")
 	}
@@ -26,6 +26,19 @@ func TestMiningMatchKeepsClassificationAndRevisionIndependent(t *testing.T) {
 	ip, ok := mining.MiningMatch("", net.ParseIP("203.0.113.9"))
 	if !ok || ip.Kind != "ip" || ip.PolicyRevision != domain.PolicyRevision || len(ip.PolicyRevision) != 64 {
 		t.Fatal("CIDR evidence/revision missing")
+	}
+	if ordinary.cur.Load().revision != "" {
+		t.Fatal("ordinary startup computed an unused mining revision")
+	}
+	ordinary.Refresh(context.Background())
+	if ordinary.cur.Load().revision != "" {
+		t.Fatal("ordinary refresh computed an unused mining revision")
+	}
+	mining.cfg.CustomDomains = append(mining.cfg.CustomDomains, "added.example")
+	mining.Refresh(context.Background())
+	updated, ok := mining.MiningMatch("added.example", nil)
+	if !ok || len(updated.PolicyRevision) != 64 || updated.PolicyRevision == domain.PolicyRevision {
+		t.Fatal("mining refresh did not publish updated evidence revision")
 	}
 }
 

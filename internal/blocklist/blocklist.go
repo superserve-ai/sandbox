@@ -191,7 +191,7 @@ func New(cfg *Config, log zerolog.Logger) *Blocklist {
 		}
 		b.log.Info().Int("entries", n).Str("path", cfg.StatePath).Msg("seeded blocklist from persisted state")
 	}
-	b.cur.Store(seed.snapshot())
+	b.publishSnapshot(seed.snapshot())
 	return b
 }
 
@@ -374,7 +374,7 @@ func (b *Blocklist) refresh(ctx context.Context) {
 	}
 
 	snap := builder.snapshot()
-	b.cur.Store(snap)
+	b.publishSnapshot(snap)
 	b.log.Info().
 		Int("domains", len(snap.domains)).
 		Int("cidrs", len(snap.nets)).
@@ -531,9 +531,16 @@ func (sb *snapshotBuilder) snapshot() *blocklistSnapshot {
 	for p := range sb.nets {
 		nets = append(nets, p)
 	}
-	s := &blocklistSnapshot{domains: sb.domains, nets: nets}
-	s.revision = snapshotRevision(s)
-	return s
+	return &blocklistSnapshot{domains: sb.domains, nets: nets}
+}
+
+func (b *Blocklist) publishSnapshot(s *blocklistSnapshot) {
+	// Only published mining policies need evidence revisions. Ordinary startup
+	// and intermediate feed snapshots must not sort and hash the full corpus.
+	if b.cfg.mining {
+		s.revision = snapshotRevision(s)
+	}
+	b.cur.Store(s)
 }
 
 // normalizeDomain lowercases and validates a domain-ish entry. Returns ""
