@@ -144,6 +144,16 @@ func (b *x11Backend) sync() error {
 	if _, err := xproto.GetInputFocus(b.conn).Reply(); err != nil {
 		return err
 	}
+	return b.drainEvents()
+}
+
+// drainEvents consumes everything the server has already sent, without a
+// round trip: errors for unchecked requests, and keyboard mapping changes
+// made by other clients (our own remaps are expected and counted down).
+func (b *x11Backend) drainEvents() error {
+	if b.conn == nil {
+		return nil
+	}
 	for {
 		ev, xerr := b.conn.PollForEvent()
 		if xerr != nil {

@@ -243,6 +243,18 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	if reloaded.bound[kcSpare0] != 0xe9 || len(reloaded.spare) != 2 {
 		t.Errorf("bound = %v, spare = %v; want é kept on %d and both keycodes in the pool", reloaded.bound, reloaded.spare, kcSpare0)
 	}
+
+	// A reload that no longer types é on that keycode drops the binding:
+	// cleared, it is spare again; rewritten, it is a layout key.
+	cleared := append(append([]xproto.Keysym{}, syms[:14]...), 0, 0, 0, 0)
+	if r := buildKeymap(8, 2, cleared, km.bound); len(r.bound) != 0 || len(r.spare) != 2 {
+		t.Errorf("cleared row: bound = %v, spare = %v; want no binding and two spares", r.bound, r.spare)
+	}
+	rewritten := append(append([]xproto.Keysym{}, syms[:14]...), 'z', 'Z', 0, 0)
+	r := buildKeymap(8, 2, rewritten, km.bound)
+	if len(r.bound) != 0 || r.direct['z'].code != kcSpare0 || len(r.spare) != 1 {
+		t.Errorf("rewritten row: bound = %v, direct[z] = %v, spare = %v; want z on %d and one spare", r.bound, r.direct['z'], r.spare, kcSpare0)
+	}
 }
 
 // A declined plan must fall back to xdotool and keep the connection: the

@@ -227,6 +227,31 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	if s.x11.backend == nil {
 		t.Fatal("keys did not go through the X11 backend")
 	}
+
+	// Another client changes the layout between requests: the cached map
+	// must be refreshed from the queued MappingNotify, not reused. With
+	// `a` gone from the layout it has to be typed through a scratch keycode.
+	remap := exec.Command("xmodmap", "-e", "keysym a = z")
+	remap.Env = append(os.Environ(), "DISPLAY="+display)
+	if out, err := remap.CombinedOutput(); err != nil {
+		t.Fatalf("xmodmap: %v: %s", err, out)
+	}
+	time.Sleep(200 * time.Millisecond)
+	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "banana\n"}})
+	want += "banana\n"
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if out, err := os.ReadFile(typed); err == nil {
+			got = string(out)
+			if got == want {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got != want {
+		t.Fatalf("after an external remap the terminal received %q, want %q", got, want)
+	}
 }
 
 // A reachable display with a screen it does not have must be an init error

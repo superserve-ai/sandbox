@@ -57,7 +57,8 @@ type keySegment struct {
 }
 
 // buildKeymap lowers a core keyboard mapping to lookup tables. Keycodes in
-// bound are scratch keycodes from an earlier map and stay scratch.
+// bound are scratch keycodes from an earlier map; one stays bound only if
+// the fetched row still types its keysym, otherwise the row decides.
 func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound map[xproto.Keycode]uint32) *x11Keymap {
 	km := &x11Keymap{perCode: perCode, direct: map[uint32]keystroke{}, bound: map[xproto.Keycode]uint32{}}
 	if perCode < 1 {
@@ -65,11 +66,11 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound ma
 	}
 	for i := 0; (i+1)*perCode <= len(syms); i++ {
 		code := xproto.Keycode(int(min) + i)
-		if ks, ours := bound[code]; ours {
+		row := syms[i*perCode : (i+1)*perCode]
+		if ks, ours := bound[code]; ours && uint32(row[0]) == ks {
 			km.bound[code] = ks
 			continue
 		}
-		row := syms[i*perCode : (i+1)*perCode]
 		empty := true
 		for _, ks := range row {
 			if ks != 0 {
@@ -102,8 +103,13 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound ma
 }
 
 // keymap returns the current mapping, fetching it on first use and after a
-// MappingNotify this backend did not cause.
+// MappingNotify this backend did not cause. Queued events are drained first,
+// since a change made between two requests is only known once its
+// notification is read.
 func (b *x11Backend) keymap() (*x11Keymap, error) {
+	if err := b.drainEvents(); err != nil {
+		return nil, err
+	}
 	if b.keys != nil && !b.keysDirty {
 		return b.keys, nil
 	}
