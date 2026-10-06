@@ -571,7 +571,7 @@ func DeriveCapability(caller CallerContext, ownership SandboxOwnership, sandboxI
 	}
 	return MachineCapability{
 		PrincipalID: caller.PrincipalID, CredentialID: caller.CredentialID, LineageID: caller.LineageID,
-		TeamID: caller.TeamID, SandboxID: sandboxID, Operations: slices.Clone(operations), Audience: caller.Audience,
+		TeamID: caller.TeamID, SandboxID: sandboxID, Operations: slices.Clone(operations), Audience: audience,
 		ExpiresAt: expiresAt, RevocationGeneration: caller.RevocationGeneration,
 	}, nil
 }

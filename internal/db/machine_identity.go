@@ -1,9 +1,11 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -74,6 +76,19 @@ type LifecycleOptions struct {
 	ReplacementCredentialID *uuid.UUID
 }
 
+type lifecycleBeginner interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+func (q *Queries) beginLifecycle(ctx context.Context) (pgx.Tx, bool, error) {
+	b, ok := q.db.(lifecycleBeginner)
+	if !ok {
+		return nil, false, nil
+	}
+	tx, err := b.Begin(ctx)
+	return tx, true, err
+}
+
 func requireLifecycleFence(options []LifecycleOptions) (LifecycleOptions, error) {
 	if len(options) != 1 || options[0].ExpectedGeneration == nil || *options[0].ExpectedGeneration <= 0 || options[0].OperationID == uuid.Nil {
 		return LifecycleOptions{}, fmt.Errorf("machine lifecycle requires expected generation and operation id")
@@ -140,7 +155,55 @@ func (q *Queries) IssueMachineCredentialFenced(ctx context.Context, principalID,
 		return MachineCredentialRow{}, fmt.Errorf("machine credential issuance requires lifecycle fence")
 	}
 	digest := lifecycleInputDigest("issue", principalID, lineageID, secretHash, expiresAt, permissions, audience, *options.ExpectedGeneration, uuid.Nil)
+	if tx, ok, err := q.beginLifecycle(ctx); ok {
+		if err != nil {
+			return MachineCredentialRow{}, err
+		}
+		row, runErr := q.WithTx(tx).issueMachineCredentialTx(ctx, principalID, lineageID, secretHash, expiresAt, permissions, audience, options, digest)
+		if runErr != nil {
+			_ = tx.Rollback(ctx)
+			return MachineCredentialRow{}, runErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return MachineCredentialRow{}, err
+		}
+		return row, nil
+	}
 	return scanMachineCredentialRow(q.db.QueryRow(ctx, `WITH existing AS (SELECT result_credential_id,input_digest FROM machine_lifecycle_operation WHERE principal_id=$1 AND operation_id=$3), principal AS (SELECT id,generation FROM machine_principal WHERE id=$1 AND status='active' AND generation=$2 FOR UPDATE), op AS (INSERT INTO machine_lifecycle_operation(principal_id,operation_id,operation_kind,expected_generation,input_digest,lineage_id,credential_digest,expires_at,permissions,audience) SELECT id,$3,'issue',$2,$5,$4,$6,$7,$8,$9 FROM principal WHERE NOT EXISTS (SELECT 1 FROM existing) ON CONFLICT (principal_id,operation_id) DO NOTHING RETURNING principal_id), issued AS (INSERT INTO machine_credential(principal_id,lineage_id,secret_hash,expires_at,revocation_generation,permissions,audience) SELECT id,$4,$6,$7,generation,$8,$9 FROM principal WHERE EXISTS (SELECT 1 FROM op) RETURNING id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash), linked AS (UPDATE machine_lifecycle_operation o SET result_credential_id=(SELECT id FROM issued) WHERE o.principal_id=$1 AND o.operation_id=$3 AND o.result_credential_id IS NULL AND EXISTS (SELECT 1 FROM issued) RETURNING result_credential_id), chosen AS (SELECT c.id,c.principal_id,c.lineage_id,c.state,c.expires_at,c.revocation_generation,c.permissions,c.audience,c.issued_at,c.revoked_at,c.secret_hash FROM machine_credential c JOIN machine_lifecycle_operation o ON o.result_credential_id=c.id WHERE o.principal_id=$1 AND o.operation_id=$3 AND o.input_digest=$5 UNION ALL SELECT id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash FROM issued) SELECT * FROM chosen LIMIT 1`, principalID, *options.ExpectedGeneration, options.OperationID, lineageID, digest, secretHash, expiresAt, permissions, audience))
+}
+
+func (q *Queries) issueMachineCredentialTx(ctx context.Context, principalID, lineageID uuid.UUID, secretHash []byte, expiresAt time.Time, permissions []string, audience string, options LifecycleOptions, digest []byte) (MachineCredentialRow, error) {
+	var existingID pgtype.UUID
+	var existingDigest []byte
+	err := q.db.QueryRow(ctx, `SELECT result_credential_id,input_digest FROM machine_lifecycle_operation WHERE principal_id=$1 AND operation_id=$2`, principalID, options.OperationID).Scan(&existingID, &existingDigest)
+	if err == nil {
+		if !bytes.Equal(existingDigest, digest) || !existingID.Valid {
+			return MachineCredentialRow{}, fmt.Errorf("machine lifecycle operation conflict")
+		}
+		return q.machineCredentialByID(ctx, uuid.UUID(existingID.Bytes))
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return MachineCredentialRow{}, err
+	}
+	var generation int64
+	if err := q.db.QueryRow(ctx, `SELECT generation FROM machine_principal WHERE id=$1 AND status='active' AND generation=$2 FOR UPDATE`, principalID, *options.ExpectedGeneration).Scan(&generation); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	if _, err := q.db.Exec(ctx, `INSERT INTO machine_lifecycle_operation(principal_id,operation_id,operation_kind,expected_generation,input_digest,lineage_id,credential_digest,expires_at,permissions,audience) VALUES($1,$2,'issue',$3,$4,$5,$6,$7,$8,$9)`, principalID, options.OperationID, *options.ExpectedGeneration, digest, lineageID, secretHash, expiresAt, permissions, audience); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	row, err := scanMachineCredentialRow(q.db.QueryRow(ctx, `INSERT INTO machine_credential(principal_id,lineage_id,secret_hash,expires_at,revocation_generation,permissions,audience) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash`, principalID, lineageID, secretHash, expiresAt, generation, permissions, audience))
+	if err != nil {
+		return MachineCredentialRow{}, err
+	}
+	if _, err := q.db.Exec(ctx, `UPDATE machine_lifecycle_operation SET result_credential_id=$1 WHERE principal_id=$2 AND operation_id=$3`, row.ID, principalID, options.OperationID); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	return row, nil
+}
+
+func (q *Queries) machineCredentialByID(ctx context.Context, id uuid.UUID) (MachineCredentialRow, error) {
+	return scanMachineCredentialRow(q.db.QueryRow(ctx, `SELECT id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash FROM machine_credential WHERE id=$1`, id))
 }
 
 // RotateMachineCredential fences replacement and issuance in one statement;
@@ -157,7 +220,58 @@ func (q *Queries) RotateMachineCredentialTargeted(ctx context.Context, principal
 		return row, fmt.Errorf("machine credential rotation requires replacement credential and lifecycle fence")
 	}
 	digest := lifecycleInputDigest("rotate", principalID, lineageID, secretHash, expiresAt, permissions, audience, *options.ExpectedGeneration, replacementID)
+	if tx, ok, err := q.beginLifecycle(ctx); ok {
+		if err != nil {
+			return MachineCredentialRow{}, err
+		}
+		row, runErr := q.WithTx(tx).rotateMachineCredentialTx(ctx, principalID, replacementID, lineageID, secretHash, expiresAt, permissions, audience, options, digest)
+		if runErr != nil {
+			_ = tx.Rollback(ctx)
+			return MachineCredentialRow{}, runErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return MachineCredentialRow{}, err
+		}
+		return row, nil
+	}
 	return scanMachineCredentialRow(q.db.QueryRow(ctx, `WITH existing AS (SELECT result_credential_id,input_digest FROM machine_lifecycle_operation WHERE principal_id=$1 AND operation_id=$3), principal AS (SELECT id,generation FROM machine_principal WHERE id=$1 AND status='active' AND generation=$2 FOR UPDATE), replacement AS (SELECT c.id FROM machine_credential c JOIN principal p ON p.id=c.principal_id AND c.revocation_generation=p.generation WHERE c.id=$4 AND c.state='active' FOR UPDATE), op AS (INSERT INTO machine_lifecycle_operation(principal_id,operation_id,operation_kind,expected_generation,input_digest,lineage_id,credential_digest,replacement_credential_id,expires_at,permissions,audience) SELECT id,$3,'rotate',$2,$5,$6,$7,$4,$8,$9,$10 FROM principal WHERE EXISTS (SELECT 1 FROM replacement) AND NOT EXISTS (SELECT 1 FROM existing) ON CONFLICT (principal_id,operation_id) DO NOTHING RETURNING principal_id), revoked AS (UPDATE machine_credential SET state='revoked',revoked_at=COALESCE(revoked_at,now()) WHERE id=$4 AND principal_id=$1 AND state='active' AND EXISTS (SELECT 1 FROM op) RETURNING id), issued AS (INSERT INTO machine_credential(principal_id,lineage_id,secret_hash,expires_at,revocation_generation,permissions,audience) SELECT id,$6,$7,$8,generation,$9,$10 FROM principal WHERE EXISTS (SELECT 1 FROM revoked) RETURNING id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash), linked AS (UPDATE machine_lifecycle_operation o SET result_credential_id=(SELECT id FROM issued) WHERE o.principal_id=$1 AND o.operation_id=$3 AND o.result_credential_id IS NULL AND EXISTS (SELECT 1 FROM issued) RETURNING result_credential_id), chosen AS (SELECT c.id,c.principal_id,c.lineage_id,c.state,c.expires_at,c.revocation_generation,c.permissions,c.audience,c.issued_at,c.revoked_at,c.secret_hash FROM machine_credential c JOIN machine_lifecycle_operation o ON o.result_credential_id=c.id WHERE o.principal_id=$1 AND o.operation_id=$3 AND o.input_digest=$5 UNION ALL SELECT id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash FROM issued) SELECT * FROM chosen LIMIT 1`, principalID, *options.ExpectedGeneration, options.OperationID, replacementID, digest, lineageID, secretHash, expiresAt, permissions, audience))
+}
+
+func (q *Queries) rotateMachineCredentialTx(ctx context.Context, principalID, replacementID, lineageID uuid.UUID, secretHash []byte, expiresAt time.Time, permissions []string, audience string, options LifecycleOptions, digest []byte) (MachineCredentialRow, error) {
+	var existingID pgtype.UUID
+	var existingDigest []byte
+	err := q.db.QueryRow(ctx, `SELECT result_credential_id,input_digest FROM machine_lifecycle_operation WHERE principal_id=$1 AND operation_id=$2`, principalID, options.OperationID).Scan(&existingID, &existingDigest)
+	if err == nil {
+		if !bytes.Equal(existingDigest, digest) || !existingID.Valid {
+			return MachineCredentialRow{}, fmt.Errorf("machine lifecycle operation conflict")
+		}
+		return q.machineCredentialByID(ctx, uuid.UUID(existingID.Bytes))
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return MachineCredentialRow{}, err
+	}
+	var generation int64
+	if err := q.db.QueryRow(ctx, `SELECT generation FROM machine_principal WHERE id=$1 AND status='active' AND generation=$2 FOR UPDATE`, principalID, *options.ExpectedGeneration).Scan(&generation); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	var replacementGeneration int64
+	if err := q.db.QueryRow(ctx, `SELECT revocation_generation FROM machine_credential WHERE id=$1 AND principal_id=$2 AND state='active' AND revocation_generation=$3 FOR UPDATE`, replacementID, principalID, generation).Scan(&replacementGeneration); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	if _, err := q.db.Exec(ctx, `INSERT INTO machine_lifecycle_operation(principal_id,operation_id,operation_kind,expected_generation,input_digest,lineage_id,credential_digest,replacement_credential_id,expires_at,permissions,audience) VALUES($1,$2,'rotate',$3,$4,$5,$6,$7,$8,$9,$10)`, principalID, options.OperationID, *options.ExpectedGeneration, digest, lineageID, secretHash, replacementID, expiresAt, permissions, audience); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	if _, err := q.db.Exec(ctx, `UPDATE machine_credential SET state='revoked',revoked_at=COALESCE(revoked_at,now()) WHERE id=$1 AND state='active'`, replacementID); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	row, err := scanMachineCredentialRow(q.db.QueryRow(ctx, `INSERT INTO machine_credential(principal_id,lineage_id,secret_hash,expires_at,revocation_generation,permissions,audience) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash`, principalID, lineageID, secretHash, expiresAt, replacementGeneration, permissions, audience))
+	if err != nil {
+		return MachineCredentialRow{}, err
+	}
+	if _, err := q.db.Exec(ctx, `UPDATE machine_lifecycle_operation SET result_credential_id=$1 WHERE principal_id=$2 AND operation_id=$3`, row.ID, principalID, options.OperationID); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	return row, nil
 }
 
 func (q *Queries) RevokeMachineCredential(ctx context.Context, id uuid.UUID) error {
@@ -189,7 +303,55 @@ func (q *Queries) RestoreMachineCredentialFenced(ctx context.Context, principalI
 		return MachineCredentialRow{}, err
 	}
 	digest := lifecycleInputDigest("restore", principalID, lineageID, secretHash, expiresAt, permissions, audience, *fence.ExpectedGeneration, uuid.Nil)
+	if tx, ok, err := q.beginLifecycle(ctx); ok {
+		if err != nil {
+			return MachineCredentialRow{}, err
+		}
+		row, runErr := q.WithTx(tx).restoreMachineCredentialTx(ctx, principalID, lineageID, secretHash, expiresAt, permissions, audience, fence, digest)
+		if runErr != nil {
+			_ = tx.Rollback(ctx)
+			return MachineCredentialRow{}, runErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return MachineCredentialRow{}, err
+		}
+		return row, nil
+	}
 	return scanMachineCredentialRow(q.db.QueryRow(ctx, `WITH existing AS (SELECT result_credential_id,input_digest FROM machine_lifecycle_operation WHERE principal_id=$1 AND operation_id=$3), op AS (INSERT INTO machine_lifecycle_operation(principal_id,operation_id,operation_kind,expected_generation,input_digest,lineage_id,credential_digest,expires_at,permissions,audience) VALUES($1,$3,'restore',$2,$5,$4,$6,$7,$8,$9) ON CONFLICT (principal_id,operation_id) DO NOTHING RETURNING principal_id), restored AS (UPDATE machine_principal SET status='active',generation=generation+1,restore_until=NULL,updated_at=now() WHERE id=$1 AND status='disabled' AND generation=$2 AND restore_until IS NOT NULL AND restore_until > now() AND EXISTS (SELECT 1 FROM op) RETURNING id,generation), issued AS (INSERT INTO machine_credential(principal_id,lineage_id,secret_hash,expires_at,revocation_generation,permissions,audience) SELECT id,$4,$6,$7,generation,$8,$9 FROM restored RETURNING id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash), linked AS (UPDATE machine_lifecycle_operation o SET result_credential_id=(SELECT id FROM issued) WHERE o.principal_id=$1 AND o.operation_id=$3 AND o.result_credential_id IS NULL AND EXISTS (SELECT 1 FROM issued) RETURNING result_credential_id), chosen AS (SELECT c.id,c.principal_id,c.lineage_id,c.state,c.expires_at,c.revocation_generation,c.permissions,c.audience,c.issued_at,c.revoked_at,c.secret_hash FROM machine_credential c JOIN machine_lifecycle_operation o ON o.result_credential_id=c.id WHERE o.principal_id=$1 AND o.operation_id=$3 AND o.input_digest=$5 UNION ALL SELECT id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash FROM issued) SELECT * FROM chosen LIMIT 1`, principalID, *fence.ExpectedGeneration, fence.OperationID, lineageID, digest, secretHash, expiresAt, permissions, audience))
+}
+
+func (q *Queries) restoreMachineCredentialTx(ctx context.Context, principalID, lineageID uuid.UUID, secretHash []byte, expiresAt time.Time, permissions []string, audience string, fence LifecycleOptions, digest []byte) (MachineCredentialRow, error) {
+	var existingID pgtype.UUID
+	var existingDigest []byte
+	err := q.db.QueryRow(ctx, `SELECT result_credential_id,input_digest FROM machine_lifecycle_operation WHERE principal_id=$1 AND operation_id=$2`, principalID, fence.OperationID).Scan(&existingID, &existingDigest)
+	if err == nil {
+		if !bytes.Equal(existingDigest, digest) || !existingID.Valid {
+			return MachineCredentialRow{}, fmt.Errorf("machine lifecycle operation conflict")
+		}
+		return q.machineCredentialByID(ctx, uuid.UUID(existingID.Bytes))
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return MachineCredentialRow{}, err
+	}
+	var generation int64
+	if err := q.db.QueryRow(ctx, `SELECT generation FROM machine_principal WHERE id=$1 AND status='disabled' AND generation=$2 AND restore_until IS NOT NULL AND restore_until > now() FOR UPDATE`, principalID, *fence.ExpectedGeneration).Scan(&generation); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	if _, err := q.db.Exec(ctx, `INSERT INTO machine_lifecycle_operation(principal_id,operation_id,operation_kind,expected_generation,input_digest,lineage_id,credential_digest,expires_at,permissions,audience) VALUES($1,$2,'restore',$3,$4,$5,$6,$7,$8,$9)`, principalID, fence.OperationID, *fence.ExpectedGeneration, digest, lineageID, secretHash, expiresAt, permissions, audience); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	var nextGeneration int64
+	if err := q.db.QueryRow(ctx, `UPDATE machine_principal SET status='active',generation=generation+1,restore_until=NULL,updated_at=now() WHERE id=$1 AND status='disabled' AND generation=$2 RETURNING generation`, principalID, generation).Scan(&nextGeneration); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	row, err := scanMachineCredentialRow(q.db.QueryRow(ctx, `INSERT INTO machine_credential(principal_id,lineage_id,secret_hash,expires_at,revocation_generation,permissions,audience) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash`, principalID, lineageID, secretHash, expiresAt, nextGeneration, permissions, audience))
+	if err != nil {
+		return MachineCredentialRow{}, err
+	}
+	if _, err := q.db.Exec(ctx, `UPDATE machine_lifecycle_operation SET result_credential_id=$1 WHERE principal_id=$2 AND operation_id=$3`, row.ID, principalID, fence.OperationID); err != nil {
+		return MachineCredentialRow{}, err
+	}
+	return row, nil
 }
 
 type MachineCredentialLookupRow struct {

@@ -43,16 +43,17 @@ type DBMachineAuthority struct {
 // AuthorityEligibility is the explicit, fail-closed activation input. Schema
 // presence alone never enables authority-producing writes.
 type AuthorityEligibility struct {
-	ContractRevision string
-	Environment      string
-	SchemaReady      bool
-	OwnershipReady   bool
-	VerifierReady    bool
-	OperatorReady    bool
+	ContractRevision      string
+	Environment           string
+	ConfiguredEnvironment string
+	SchemaReady           bool
+	OwnershipReady        bool
+	VerifierReady         bool
+	OperatorReady         bool
 }
 
 func (e AuthorityEligibility) Valid() bool {
-	return e.ContractRevision != "" && e.Environment != "" && e.SchemaReady && e.OwnershipReady && e.VerifierReady && e.OperatorReady
+	return e.ContractRevision == "machine-identity-v1" && e.Environment != "" && e.ConfiguredEnvironment != "" && e.Environment == e.ConfiguredEnvironment && e.SchemaReady && e.OwnershipReady && e.VerifierReady && e.OperatorReady
 }
 
 var ErrMachineAuthorityUnavailable = errors.New("machine authority unavailable")
@@ -210,7 +211,11 @@ func (a *DBMachineAuthority) IssueCredentialFenced(ctx context.Context, principa
 		return auth.MachineCredential{}, err
 	}
 	digest := sha256.Sum256([]byte(rawSecret))
-	row, err := a.Queries.IssueMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(time.Now()), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	now := time.Now()
+	if a.Now != nil {
+		now = a.Now()
+	}
+	row, err := a.Queries.IssueMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}
@@ -229,7 +234,11 @@ func (a *DBMachineAuthority) RotateCredentialFenced(ctx context.Context, princip
 		return auth.MachineCredential{}, err
 	}
 	digest := sha256.Sum256([]byte(rawSecret))
-	row, err := a.Queries.RotateMachineCredentialTargeted(ctx, principalID, replacementID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(time.Now()), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	now := time.Now()
+	if a.Now != nil {
+		now = a.Now()
+	}
+	row, err := a.Queries.RotateMachineCredentialTargeted(ctx, principalID, replacementID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}
@@ -262,7 +271,11 @@ func (a *DBMachineAuthority) RestorePrincipalFenced(ctx context.Context, princip
 		return auth.MachineCredential{}, err
 	}
 	digest := sha256.Sum256([]byte(rawSecret))
-	row, err := a.Queries.RestoreMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(time.Now()), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	now := time.Now()
+	if a.Now != nil {
+		now = a.Now()
+	}
+	row, err := a.Queries.RestoreMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}

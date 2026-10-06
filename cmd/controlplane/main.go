@@ -211,12 +211,13 @@ func run() error {
 		// explicit compatibility/readiness predicates. Table existence alone is
 		// not an activation signal.
 		machineAuthority.SetEligibility(api.AuthorityEligibility{
-			ContractRevision: os.Getenv("QM_MACHINE_AUTH_CONTRACT_REVISION"),
-			Environment:      os.Getenv("QM_MACHINE_AUTH_ENVIRONMENT"),
-			SchemaReady:      true,
-			OwnershipReady:   os.Getenv("QM_MACHINE_AUTH_OWNERSHIP_READY") == "true",
-			VerifierReady:    os.Getenv("QM_MACHINE_AUTH_VERIFIER_READY") == "true",
-			OperatorReady:    os.Getenv("QM_MACHINE_AUTH_OPERATOR_READY") == "true",
+			ContractRevision:      os.Getenv("QM_MACHINE_AUTH_CONTRACT_REVISION"),
+			Environment:           os.Getenv("QM_MACHINE_AUTH_ENVIRONMENT"),
+			ConfiguredEnvironment: os.Getenv("QM_MACHINE_AUTH_CONFIGURED_ENVIRONMENT"),
+			SchemaReady:           true,
+			OwnershipReady:        os.Getenv("QM_MACHINE_AUTH_OWNERSHIP_READY") == "true",
+			VerifierReady:         os.Getenv("QM_MACHINE_AUTH_VERIFIER_READY") == "true",
+			OperatorReady:         os.Getenv("QM_MACHINE_AUTH_OPERATOR_READY") == "true",
 		})
 		machineAuthority.Enable()
 	}

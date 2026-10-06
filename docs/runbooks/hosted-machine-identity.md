@@ -105,6 +105,10 @@ and route gate, the `mcap.v1` verifier, and the proxy session registry must be
 deployed as one compatible set. A serving instance is **ready** only when its
 health/readiness check reports all four surfaces present, the authority lookup
 is available, and the proxy is configured with the machine revocation resolver.
+The deployment must also provide `QM_MACHINE_AUTH_CONFIGURED_ENVIRONMENT`; the
+activation record's `environment` must exactly match that independently supplied
+value. Unsupported revisions or arbitrary non-empty environment values remain
+ineligible.
 Issuance additionally requires an explicit activation record containing the
 contract revision, environment, schema readiness, ownership-producer
 readiness, verifier readiness, and operator/staging eligibility. Missing or

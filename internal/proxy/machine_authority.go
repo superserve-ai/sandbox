@@ -50,15 +50,25 @@ func (a *CachedMachineAuthority) Lookup(ctx context.Context, principalID, creden
 // slow query happened to complete. In-flight fills are coalesced and an
 // invalidation epoch prevents late results from re-entering the cache.
 func (a *CachedMachineAuthority) LookupSnapshot(ctx context.Context, principalID, credentialID uuid.UUID) (uint64, time.Time, error) {
+	return a.lookupSnapshot(ctx, principalID, credentialID, false)
+}
+
+func (a *CachedMachineAuthority) RefreshSnapshot(ctx context.Context, principalID, credentialID uuid.UUID) (uint64, time.Time, error) {
+	return a.lookupSnapshot(ctx, principalID, credentialID, true)
+}
+
+func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID, credentialID uuid.UUID, force bool) (uint64, time.Time, error) {
 	if a == nil || a.pool == nil || principalID == uuid.Nil || credentialID == uuid.Nil {
 		return 0, time.Time{}, errors.New("machine authority unavailable")
 	}
 	now := time.Now()
 	key := machineAuthorityKey{principal: principalID, credential: credentialID}
 	a.mu.Lock()
-	if entry, ok := a.items[key]; ok && now.Before(entry.expiresAt) {
-		a.mu.Unlock()
-		return entry.generation, entry.expiresAt, nil
+	if !force {
+		if entry, ok := a.items[key]; ok && now.Before(entry.expiresAt) {
+			a.mu.Unlock()
+			return entry.generation, entry.expiresAt, nil
+		}
 	}
 	epoch := a.epoch
 	a.mu.Unlock()

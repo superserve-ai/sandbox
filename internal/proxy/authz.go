@@ -19,6 +19,7 @@ type authzFailure struct {
 	Status  int
 	Message string
 	Code    string
+	Caller  *auth.CallerContext
 }
 
 type machineCapabilityContextKey struct{}
@@ -27,10 +28,30 @@ func (f *authzFailure) write(w http.ResponseWriter) {
 	if f.Code != "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(f.Status)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": f.Code, "message": f.Message}})
+		errBody := map[string]any{"code": f.Code, "message": f.Message}
+		if f.Caller != nil {
+			errBody["caller"] = safeCallerReferences(*f.Caller)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": errBody})
 		return
 	}
 	http.Error(w, f.Message, f.Status)
+}
+
+func safeCallerReferences(caller auth.CallerContext) map[string]string {
+	refs := map[string]string{
+		"principal_id":  caller.PrincipalID.String(),
+		"credential_id": caller.CredentialID.String(),
+		"lineage_id":    caller.LineageID.String(),
+		"team_id":       caller.TeamID.String(),
+	}
+	if caller.CallerKind != "" {
+		refs["caller_kind"] = caller.CallerKind
+	}
+	if caller.ActorID != uuid.Nil {
+		refs["actor_id"] = caller.ActorID.String()
+	}
+	return refs
 }
 
 // authorizeSandboxRequest verifies the per-sandbox HMAC access token
@@ -47,9 +68,6 @@ func (h *Handler) authorizeSandboxRequest(
 
 	var verifiedCapability *auth.MachineCapability
 	if strings.HasPrefix(token, "mcap.") {
-		if h.machineAuthority == nil {
-			return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}
-		}
 		capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
 		if err == nil && capability.CallerKind != "human" {
 			if h.machineAuthority == nil {
@@ -105,10 +123,10 @@ func (h *Handler) authorizeSandboxRequest(
 		capabilityTeam := verifiedCapability.TeamID.String()
 		if verifiedCapability.CallerKind == "human" {
 			if info.TeamID == "" || capabilityTeam != info.TeamID || ownershipState == auth.OwnershipUnknown {
-				return InstanceInfo{}, &authzFailure{Status: http.StatusForbidden, Message: "sandbox ownership could not be verified"}
+				return InstanceInfo{}, &authzFailure{Status: http.StatusForbidden, Message: "sandbox ownership could not be verified", Code: "sandbox_ownership_denied", Caller: callerContextFromCapability(*verifiedCapability)}
 			}
 		} else if ownershipState != auth.OwnershipMachine || info.TeamID == "" || capabilityTeam != info.TeamID || info.MachineOwnerPrincipalID == "" || info.MachineOwnerPrincipalID != verifiedCapability.PrincipalID.String() {
-			return InstanceInfo{}, &authzFailure{Status: http.StatusForbidden, Message: "machine sandbox ownership could not be verified"}
+			return InstanceInfo{}, &authzFailure{Status: http.StatusForbidden, Message: "machine sandbox ownership could not be verified", Code: "sandbox_ownership_denied", Caller: callerContextFromCapability(*verifiedCapability)}
 		}
 		credentialID := verifiedCapability.CredentialID
 		if verifiedCapability.CallerKind == "human" {
@@ -132,6 +150,21 @@ func (h *Handler) authorizeSandboxRequest(
 	}
 
 	return info, nil
+}
+
+func callerContextFromCapability(capability auth.MachineCapability) *auth.CallerContext {
+	credentialID := capability.CredentialID
+	if capability.CallerKind == "human" {
+		credentialID = capability.ParentCredentialID
+	}
+	return &auth.CallerContext{
+		PrincipalID: capability.PrincipalID, CredentialID: credentialID,
+		LineageID: capability.LineageID, TeamID: capability.TeamID,
+		Permissions: append([]auth.MachineOperation(nil), capability.Operations...),
+		Policy:      auth.NewMachinePolicy(capability.Operations...), Audience: capability.Audience,
+		ExpiresAt: capability.ExpiresAt, RevocationGeneration: capability.RevocationGeneration,
+		CallerKind: capability.CallerKind, ActorID: capability.ActorID,
+	}
 }
 
 // VerifyMachineOperation is shared by command/file/terminal entry points
@@ -188,9 +221,10 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 		return parent, func() {}, false
 	}
 	if capability.CallerKind == "human" {
-		// Human child claims are bounded by their verified parent session and
+		// Human child claims are bounded by their typed capability expiry and
 		// carry no machine credential lineage to register in the machine fence.
-		return parent, func() {}, true
+		ctx, cancel := context.WithDeadline(parent, capability.ExpiresAt)
+		return ctx, cancel, true
 	}
 	if h.machineAuthority == nil || h.sessions == nil {
 		return parent, func() {}, false
@@ -249,7 +283,7 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 				resultCh := make(chan refreshResult, 1)
 				refreshCtx, refreshCancel := context.WithTimeout(context.Background(), time.Second)
 				go func() {
-					generation, nextUntil, refreshErr := h.lookupMachineAuthority(refreshCtx, capability)
+					generation, nextUntil, refreshErr := h.refreshMachineAuthority(refreshCtx, capability)
 					resultCh <- refreshResult{generation: generation, until: nextUntil, err: refreshErr}
 				}()
 				hardDeadline := time.NewTimer(time.Until(deadline))
@@ -296,6 +330,17 @@ func (h *Handler) lookupMachineAuthority(ctx context.Context, capability auth.Ma
 	}
 	generation, err := h.machineAuthority(ctx, capability.PrincipalID, capability.CredentialID)
 	return generation, time.Now().Add(5 * time.Second), err
+}
+
+type proactiveAuthoritySnapshotter interface {
+	RefreshSnapshot(context.Context, uuid.UUID, uuid.UUID) (uint64, time.Time, error)
+}
+
+func (h *Handler) refreshMachineAuthority(ctx context.Context, capability auth.MachineCapability) (uint64, time.Time, error) {
+	if refresher, ok := h.machineAuthoritySnapshotter.(proactiveAuthoritySnapshotter); ok {
+		return refresher.RefreshSnapshot(ctx, capability.PrincipalID, capability.CredentialID)
+	}
+	return h.lookupMachineAuthority(ctx, capability)
 }
 
 func (h *Handler) bindMachineRequest(r *http.Request, token string) (*http.Request, func(), bool) {

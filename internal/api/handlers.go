@@ -1504,6 +1504,9 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 
 // ownerIDFromContext returns the actor's UUID as a string, or "" when unknown.
 func ownerIDFromContext(c *gin.Context) string {
+	if owner := c.GetString("restore_owner_id"); owner != "" {
+		return owner
+	}
 	if caller, machine := machineCallerFromContext(c); machine {
 		return "machine:" + caller.PrincipalID.String()
 	}
@@ -1669,6 +1672,14 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		}
 		tLookupDone = time.Now()
 		return true
+	}
+	// Stateless restore must preserve immutable durable ownership even when a
+	// human/admin initiates the resume. Resolve it before any VMD side effect.
+	if owner, ownerErr := h.DB.GetMachineSandboxOwner(c.Request.Context(), sandboxID, teamID); ownerErr == nil {
+		c.Set("restore_owner_id", "machine:"+owner.OwnerPrincipalID.String())
+	} else if !errors.Is(ownerErr, pgx.ErrNoRows) {
+		respondError(c, ErrInternal)
+		return
 	}
 	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID, settled); !ok {
 		return
@@ -2370,9 +2381,9 @@ func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox, observedAt time.Time
 // machine-owned request.  Those tokens have no principal, lineage, scope, or
 // revocation generation and therefore cannot cross the machine boundary.
 func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, observedAt time.Time) sandboxResponse {
+	resp := h.sandboxToResponse(s)
 	if caller, machine := machineCallerFromContext(c); machine {
-		resp := h.sandboxToResponse(s)
-		if h.Config == nil || h.Config.SandboxAccessTokenSeed == nil || caller.Audience != "sandbox-proxy" {
+		if h.Config == nil || h.Config.SandboxAccessTokenSeed == nil {
 			return resp
 		}
 		if h.DB == nil {
@@ -2397,6 +2408,32 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 		resp.AccessToken = token
 		resp.RoutingHint = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, s.ID.String(), s.HostID, h.Config.EdgeProxyDomain, observedAt, s.RoutingVersion)
 		return resp
+	}
+	// Human/admin callers receive a typed child capability when the immutable
+	// owner relation proves this is a machine sandbox. A lookup error or
+	// unknown ownership never falls back to a legacy token.
+	if h.DB != nil && h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		if owner, err := h.DB.GetMachineSandboxOwner(c.Request.Context(), s.ID, s.TeamID); err == nil {
+			if actor := actorIDFromContext(c); actor != nil && owner.TeamID == s.TeamID {
+				now := timeNow(h)
+				parentID, _ := uuid.Parse(c.GetString("api_key_id"))
+				capability, capErr := auth.DeriveHumanCapabilityWithParent(*actor, parentID, s.TeamID, s.ID, "sandbox-proxy", []auth.MachineOperation{
+					auth.MachineOperationRead, auth.MachineOperationReconnect,
+					auth.MachineOperationCommandRun, auth.MachineOperationCommandRead, auth.MachineOperationCommandWrite, auth.MachineOperationCommandSignal,
+					auth.MachineOperationFileRead, auth.MachineOperationFileWrite,
+				}, now.Add(15*time.Minute), now)
+				if capErr == nil {
+					if token, signErr := auth.SignMachineCapability(capability, h.Config.SandboxAccessTokenSeed, now); signErr == nil {
+						resp.AccessToken = token
+						resp.RoutingHint = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, s.ID.String(), s.HostID, h.Config.EdgeProxyDomain, observedAt, s.RoutingVersion)
+						return resp
+					}
+				}
+			}
+			return resp
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return resp
+		}
 	}
 	return h.sandboxToResponseWithToken(s, observedAt)
 }
@@ -2510,6 +2547,10 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 
 	ctx := c.Request.Context()
 	caller, machine := machineCallerFromContext(c)
+	if machine && pg.Limit == nil {
+		limit := int64(maxPageSize)
+		pg.Limit = &limit
+	}
 	// The default created_at sort is the hot path (and the only sort
 	// unpaginated SDK callers use), so it goes through the static-ORDER BY
 	// queries the planner can serve from idx_sandbox_team_created_active
