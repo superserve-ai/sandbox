@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,17 +22,26 @@ import (
 
 func startMiningProtection(ctx context.Context, ready <-chan struct{}, cfg Config, pool *pgxpool.Pool, proxy *network.EgressProxy, lc *lifecycle, log zerolog.Logger, recorder telemetry.Recorder, manager *vm.Manager) func() {
 	path := os.Getenv("VMD_MINING_POLICY_CONFIG")
-	if path == "" {
+	var initialize func(context.Context, <-chan struct{}) error
+	if path != "" {
+		initialize = func(ctx context.Context, reloads <-chan struct{}) error {
+			if pool == nil {
+				log.Warn().Msg("mining policy requires a database; escalation disabled")
+				return nil
+			}
+			return runMiningProtection(ctx, reloads, path, cfg, pool, proxy, log, recorder, manager)
+		}
+	}
+	reload := startBackgroundMiningProtection(ctx, ready, lc, network.RemoveMiningGate, initialize)
+	if initialize == nil {
 		return nil
 	}
-	return startBackgroundMiningProtection(ctx, ready, lc, func(ctx context.Context, reloads <-chan struct{}) error {
-		return runMiningProtection(ctx, reloads, path, cfg, pool, proxy, log, recorder, manager)
-	})
+	return reload
 }
 
 // Register cleanup before starting initialization: lifecycle shutdown snapshots
 // closers, so a background initializer must never register a late closer.
-func startBackgroundMiningProtection(ctx context.Context, ready <-chan struct{}, lc *lifecycle, run func(context.Context, <-chan struct{}) error) func() {
+func startBackgroundMiningProtection(ctx context.Context, ready <-chan struct{}, lc *lifecycle, cleanup func() error, run func(context.Context, <-chan struct{}) error) func() {
 	miningCtx, cancel := context.WithCancel(ctx)
 	reloads := make(chan struct{}, 1)
 	done := make(chan struct{})
@@ -55,7 +66,16 @@ func startBackgroundMiningProtection(ctx context.Context, ready <-chan struct{},
 		if miningCtx.Err() != nil {
 			return nil
 		}
-		cleanupErr = run(miningCtx, reloads)
+		if cleanup != nil {
+			if err := cleanup(); err != nil {
+				lc.log.Warn().Err(err).Msg("stale mining gate cleanup failed; escalation disabled")
+				<-miningCtx.Done()
+				return nil
+			}
+		}
+		if miningCtx.Err() == nil && run != nil {
+			cleanupErr = run(miningCtx, reloads)
+		}
 		// Disabled/failed optional initialization must not stop the daemon. The
 		// registered closer still owns cancellation and any cleanup failure.
 		<-miningCtx.Done()
@@ -92,7 +112,7 @@ func runMiningProtection(ctx context.Context, reloads <-chan struct{}, path stri
 	if ctx.Err() != nil {
 		return nil
 	}
-	gate, err := network.NewMiningPacketGate(log)
+	gate, err := newSeededMiningGate(ctx, policy, func() (miningPacketGate, error) { return network.NewMiningPacketGate(log) })
 	if err != nil {
 		log.Error().Err(err).Msg("mining packet gate unavailable; escalation disabled")
 		return nil
@@ -201,4 +221,31 @@ func runMiningProtection(ctx context.Context, reloads <-chan struct{}, path stri
 			policy.Reload(path)
 		}
 	}
+}
+
+// The caller may publish enforcement only after local CIDRs have reached the
+// kernel. Remote feed refresh is deliberately outside this bootstrap boundary.
+type miningPacketGate interface {
+	network.MiningGate
+	UpdateCIDRs([]string) error
+	SyncAssignments(*network.HostMiningSource) error
+	Run(context.Context, *blocklist.Blocklist, *network.MiningContainment) error
+	Close() error
+}
+
+func newSeededMiningGate(ctx context.Context, policy *blocklist.Blocklist, open func() (miningPacketGate, error)) (miningPacketGate, error) {
+	gate, err := open()
+	if err != nil {
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		return nil, errors.Join(ctx.Err(), gate.Close())
+	}
+	if err := gate.UpdateCIDRs(policy.CIDRs()); err != nil {
+		return nil, errors.Join(fmt.Errorf("seed mining destinations: %w", err), gate.Close())
+	}
+	if ctx.Err() != nil {
+		return nil, errors.Join(ctx.Err(), gate.Close())
+	}
+	return gate, nil
 }

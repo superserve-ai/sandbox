@@ -730,9 +730,6 @@ func main() {
 	signal.Notify(hupCh, syscall.SIGHUP)
 
 	lc := newLifecycle(log)
-	if err := network.RemoveMiningGate(); err != nil {
-		log.Warn().Err(err).Msg("stale mining gate cleanup failed; queue bypass remains fail open")
-	}
 
 	// ---- Egress blocklist (optional) ----
 	// VMD_EGRESS_BLOCKLIST_CONFIG points at the operator-supplied config
@@ -1905,6 +1902,7 @@ func main() {
 	} else {
 		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
 		st.mark("db_connect", false, -1)
+		reloadMiningPolicy = startMiningProtection(ctx, postReady, cfg, nil, egressProxy, lc, log, recorder, mgr)
 	}
 
 	// ---- Continuous reconciler ----

@@ -2,12 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/superserve-ai/sandbox/internal/blocklist"
 )
 
 func TestMiningInitializationWaitsForReadinessAndQueuesReload(t *testing.T) {
@@ -19,7 +28,7 @@ func TestMiningInitializationWaitsForReadinessAndQueuesReload(t *testing.T) {
 		finishInit := make(chan struct{})
 		reloaded := make(chan struct{})
 		lc := newLifecycle(zerolog.Nop())
-		reload := startBackgroundMiningProtection(ctx, ready, lc, func(ctx context.Context, reloads <-chan struct{}) error {
+		reload := startBackgroundMiningProtection(ctx, ready, lc, nil, func(ctx context.Context, reloads <-chan struct{}) error {
 			close(entered)
 			<-finishInit
 			select {
@@ -70,7 +79,7 @@ func TestMiningShutdownWaitsForInitializationBeforeDependencies(t *testing.T) {
 		lc := newLifecycle(zerolog.Nop())
 		var dependencyClosed atomic.Bool
 		lc.addCloser("database", func(context.Context) error { dependencyClosed.Store(true); return nil })
-		startBackgroundMiningProtection(context.Background(), ready, lc, func(ctx context.Context, _ <-chan struct{}) error {
+		startBackgroundMiningProtection(context.Background(), ready, lc, nil, func(ctx context.Context, _ <-chan struct{}) error {
 			close(entered)
 			<-ctx.Done()
 			close(cancelled)
@@ -100,7 +109,7 @@ func TestMiningDisabledInitializationDoesNotStopDaemon(t *testing.T) {
 		close(ready)
 		returned := make(chan struct{})
 		lc := newLifecycle(zerolog.Nop())
-		startBackgroundMiningProtection(context.Background(), ready, lc, func(context.Context, <-chan struct{}) error { close(returned); return nil })
+		startBackgroundMiningProtection(context.Background(), ready, lc, nil, func(context.Context, <-chan struct{}) error { close(returned); return nil })
 		<-returned
 		synctest.Wait()
 		select {
@@ -119,7 +128,7 @@ func TestMiningShutdownBeforeReadySkipsInitialization(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		lc := newLifecycle(zerolog.Nop())
 		var called atomic.Bool
-		startBackgroundMiningProtection(context.Background(), make(chan struct{}), lc, func(context.Context, <-chan struct{}) error { called.Store(true); return nil })
+		startBackgroundMiningProtection(context.Background(), make(chan struct{}), lc, nil, func(context.Context, <-chan struct{}) error { called.Store(true); return nil })
 		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		lc.shutdown(closeCtx)
@@ -138,7 +147,7 @@ func TestMiningShutdownDeadlinePreservesLiveInitializerDependencies(t *testing.T
 		lc := newLifecycle(zerolog.Nop())
 		var dependencyClosed atomic.Bool
 		lc.addCloser("database", func(context.Context) error { dependencyClosed.Store(true); return nil })
-		startBackgroundMiningProtection(context.Background(), ready, lc, func(context.Context, <-chan struct{}) error {
+		startBackgroundMiningProtection(context.Background(), ready, lc, nil, func(context.Context, <-chan struct{}) error {
 			close(entered)
 			<-finishInit
 			return nil
@@ -153,4 +162,155 @@ func TestMiningShutdownDeadlinePreservesLiveInitializerDependencies(t *testing.T
 		close(finishInit)
 		<-lc.done
 	})
+}
+
+func TestMiningStaleCleanupWaitsForReadyAndPrecedesInitialization(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ready := make(chan struct{})
+				cleanupEntered := make(chan struct{})
+				finishCleanup := make(chan struct{})
+				initialized := make(chan struct{})
+				lc := newLifecycle(zerolog.Nop())
+				var initialize func(context.Context, <-chan struct{}) error
+				if enabled {
+					initialize = func(context.Context, <-chan struct{}) error { close(initialized); return nil }
+				}
+				startBackgroundMiningProtection(context.Background(), ready, lc, func() error { close(cleanupEntered); <-finishCleanup; return nil }, initialize)
+				synctest.Wait()
+				select {
+				case <-cleanupEntered:
+					t.Fatal("kernel cleanup ran before readiness")
+				default:
+				}
+				close(ready)
+				<-cleanupEntered
+				synctest.Wait()
+				select {
+				case <-initialized:
+					t.Fatal("new mining gate raced stale cleanup")
+				default:
+				}
+				close(finishCleanup)
+				if enabled {
+					<-initialized
+				}
+				lc.shutdown(context.Background())
+				if lc.closerErr != nil {
+					t.Fatal(lc.closerErr)
+				}
+			})
+		})
+	}
+}
+
+func TestMiningStaleCleanupFailureKeepsEnforcementDisabled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ready := make(chan struct{})
+		close(ready)
+		cleaned := make(chan struct{})
+		var initialized atomic.Bool
+		lc := newLifecycle(zerolog.Nop())
+		startBackgroundMiningProtection(context.Background(), ready, lc, func() error { close(cleaned); return errors.New("kernel unavailable") }, func(context.Context, <-chan struct{}) error { initialized.Store(true); return nil })
+		<-cleaned
+		synctest.Wait()
+		if initialized.Load() {
+			t.Fatal("initialized despite stale kernel cleanup failure")
+		}
+		select {
+		case <-lc.done:
+			t.Fatal("optional cleanup failure stopped daemon")
+		default:
+		}
+		lc.shutdown(context.Background())
+	})
+}
+
+type startupTestMiningGate struct {
+	miningPacketGate
+	mu      sync.Mutex
+	cidrs   []string
+	updates int
+	closed  bool
+	seedErr error
+}
+
+func (g *startupTestMiningGate) UpdateCIDRs(cidrs []string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.updates++
+	g.cidrs = slices.Clone(cidrs)
+	return g.seedErr
+}
+func (g *startupTestMiningGate) Close() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.closed = true
+	return nil
+}
+
+func TestMiningGateSeedsPinnedAndPersistedCIDRsBeforeSlowFeed(t *testing.T) {
+	dir := t.TempDir()
+	feed := filepath.Join(dir, "feed.txt")
+	configPath := filepath.Join(dir, "mining.yaml")
+	state := filepath.Join(dir, "mining.state")
+	if err := os.WriteFile(feed, []byte("203.0.113.0/24\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf("domain_feeds: [%q]\ncustom_cidrs: [192.0.2.0/24]\nstate_path: %q\n", feed, state)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := blocklist.LoadMiningConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write persisted state through the actual private-policy writer.
+	blocklist.New(cfg, zerolog.Nop()).Refresh(context.Background())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		fmt.Fprint(w, "198.51.100.0/24\n")
+	}))
+	defer server.Close()
+	defer close(release)
+	cfg.DomainFeeds = []string{server.URL}
+	policy := blocklist.New(cfg, zerolog.Nop())
+	gate := &startupTestMiningGate{}
+	readyGate, err := newSeededMiningGate(context.Background(), policy, func() (miningPacketGate, error) { return gate, nil })
+	if err != nil || readyGate == nil {
+		t.Fatalf("local bootstrap failed: %v", err)
+	}
+	policy.SetCIDRSink(func(cidrs []string) { _ = gate.UpdateCIDRs(cidrs) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _ = policy.Start(ctx) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("feed refresh did not start")
+	}
+	gate.mu.Lock()
+	seeded := gate.updates == 1 && slices.Contains(gate.cidrs, "192.0.2.0/24") && slices.Contains(gate.cidrs, "203.0.113.0/24")
+	gate.mu.Unlock()
+	if !seeded {
+		t.Fatal("known direct destinations were unavailable while remote feed blocked")
+	}
+	cancel()
+	<-done
+}
+
+func TestMiningGateSeedFailureClosesBeforePublication(t *testing.T) {
+	policy := blocklist.New(&blocklist.Config{CustomCIDRs: []string{"192.0.2.0/24"}, StatePath: filepath.Join(t.TempDir(), "state")}, zerolog.Nop())
+	gate := &startupTestMiningGate{seedErr: errors.New("kernel update failed")}
+	readyGate, err := newSeededMiningGate(context.Background(), policy, func() (miningPacketGate, error) { return gate, nil })
+	if readyGate != nil || err == nil || !gate.closed {
+		t.Fatalf("failed seed could be published or leaked gate: gate=%v err=%v closed=%v", readyGate, err, gate.closed)
+	}
 }

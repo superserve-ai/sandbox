@@ -138,8 +138,10 @@ Existing global destination blocks and customer egress rules do not create
 mining incidents. Private mining destinations are still denied in off/observe
 mode and for trusted teams; those modes and exemptions prevent escalation.
 Only a current attributed, untrusted sandbox in enforce mode can escalate.
-Kernel setup and spool recovery start in the background after host readiness;
-escalation remains disabled until initialization and attribution complete.
+Kernel cleanup, setup, and spool recovery run in the background after host
+readiness. Known local CIDRs reach the gate before protection is published;
+remote feeds refresh afterward. Escalation remains disabled until initialization
+and attribution complete.
 Assignments refresh every two seconds in the background. A newly registered
 sandbox can attempt a blocked destination before attribution is published;
 escalation then fails open, so a mirror may succeed in that initial window.
