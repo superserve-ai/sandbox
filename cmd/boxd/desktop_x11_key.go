@@ -103,11 +103,12 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, bound ma
 }
 
 // keymap returns the current mapping, fetching it on first use and after a
-// MappingNotify this backend did not cause. Queued events are drained first,
-// since a change made between two requests is only known once its
-// notification is read.
+// MappingNotify this backend did not cause. A round trip comes first: the
+// server sends that notification before it answers any later request, so
+// a change another client made before this call is in the queue by the
+// time the cache is consulted.
 func (b *x11Backend) keymap() (*x11Keymap, error) {
-	if err := b.drainEvents(); err != nil {
+	if err := b.sync(); err != nil {
 		return nil, err
 	}
 	if b.keys != nil && !b.keysDirty {

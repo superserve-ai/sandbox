@@ -141,6 +141,10 @@ func (b *x11Backend) Close() {
 // them. Events are sent unchecked, so one round trip covers a whole action
 // instead of one per event.
 func (b *x11Backend) sync() error {
+	// A backend without a connection (tests) has nothing to sync.
+	if b.conn == nil {
+		return nil
+	}
 	if _, err := xproto.GetInputFocus(b.conn).Reply(); err != nil {
 		return err
 	}
@@ -151,9 +155,6 @@ func (b *x11Backend) sync() error {
 // round trip: errors for unchecked requests, and keyboard mapping changes
 // made by other clients (our own remaps are expected and counted down).
 func (b *x11Backend) drainEvents() error {
-	if b.conn == nil {
-		return nil
-	}
 	for {
 		ev, xerr := b.conn.PollForEvent()
 		if xerr != nil {

@@ -236,7 +236,8 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	if out, err := remap.CombinedOutput(); err != nil {
 		t.Fatalf("xmodmap: %v: %s", err, out)
 	}
-	time.Sleep(200 * time.Millisecond)
+	// No settle on purpose: the server already processed the remap when
+	// xmodmap exited, and the next request must see it without help.
 	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "banana\n"}})
 	want += "banana\n"
 	deadline = time.Now().Add(10 * time.Second)
