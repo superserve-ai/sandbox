@@ -212,12 +212,13 @@ func TestRevertPause_UnansweredDatabaseHoldsForOneTimeout(t *testing.T) {
 	}
 	h := &Handlers{DB: db.New(mock)}
 
+	const testRevertTimeout = 50 * time.Millisecond
 	started := time.Now()
-	if h.revertPause(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop()) {
+	if h.revertPauseWithTimeout(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop(), testRevertTimeout) {
 		t.Fatal("revert reported as landed with a database that never answered")
 	}
-	if held := time.Since(started); held > asyncTimeout+time.Second {
-		t.Fatalf("revert held the caller for %v; want about one timeout of %v", held, asyncTimeout)
+	if held := time.Since(started); held > testRevertTimeout+time.Second {
+		t.Fatalf("revert held the caller for %v; want about one timeout of %v", held, testRevertTimeout)
 	}
 }
 

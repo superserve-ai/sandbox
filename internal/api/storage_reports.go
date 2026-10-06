@@ -315,14 +315,26 @@ func (h *Handlers) fenceStorageReportIncarnation(c *gin.Context, tx pgx.Tx, host
 }
 
 // StartStorageReportWorker applies reports in short, independently retryable
-// transactions. A five-second poll and exponential retry capped at one minute
-// bound normal telemetry lag without adding work to sandbox activation paths.
+// transactions using the production poll interval. A five-second poll and
+// exponential retry capped at one minute bound normal telemetry lag without
+// adding work to sandbox activation paths.
 func StartStorageReportWorker(ctx context.Context, pool *pgxpool.Pool) {
+	startStorageReportWorker(ctx, pool, storageReportPoll)
+}
+
+// StartStorageReportWorkerWithInterval is the explicitly configured entry
+// point for workers whose cadence is owned by a test. Each invocation owns its
+// ticker; the interval is not process-global state.
+func StartStorageReportWorkerWithInterval(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) {
+	startStorageReportWorker(ctx, pool, interval)
+}
+
+func startStorageReportWorker(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) {
 	if pool == nil {
 		return
 	}
 	go func() {
-		ticker := time.NewTicker(storageReportPoll)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {

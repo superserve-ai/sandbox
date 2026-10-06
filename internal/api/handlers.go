@@ -398,7 +398,11 @@ func (h *Handlers) claimedPause(ctx context.Context, id, teamID, op uuid.UUID) (
 // synchronous path this runs inside the request, so retries must not stack
 // their timeouts.
 func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) bool {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	return h.revertPauseWithTimeout(reqCtx, sandboxID, teamID, lease, actorID, l, asyncTimeout)
+}
+
+func (h *Handlers) revertPauseWithTimeout(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), timeout)
 	defer cancel()
 	backoff := 200 * time.Millisecond
 	for attempt := 1; ; attempt++ {
