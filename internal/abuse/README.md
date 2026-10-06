@@ -135,6 +135,9 @@ Do not include port-only indicators. Mining state defaults to
 share the generic blocklist state file. State-path changes require a restart for
 both policy types; a reload with a different path retains the previous config
 and snapshot. Generic blocklists reject mining-marked persisted state.
+When both policies are configured, startup resolves state-directory aliases
+after readiness. Final-file symlinks, parent traversal, or unverifiable targets
+disable mining escalation.
 Keep production indicators, feed locations,
 state files, and incident spools outside source control and tenant mounts.
 Existing global destination blocks and customer egress rules do not create

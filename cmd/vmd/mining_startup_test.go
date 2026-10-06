@@ -314,3 +314,80 @@ func TestMiningGateSeedFailureClosesBeforePublication(t *testing.T) {
 		t.Fatalf("failed seed could be published or leaked gate: gate=%v err=%v closed=%v", readyGate, err, gate.closed)
 	}
 }
+
+func TestMiningStateTargetDirectoryAliases(t *testing.T) {
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	linkDir := filepath.Join(dir, "link")
+	if err := os.Mkdir(realDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"state", "missing/nested/state"} {
+		t.Run(suffix, func(t *testing.T) {
+			realTarget, err := miningStateTarget(filepath.Join(realDir, suffix))
+			if err != nil {
+				t.Fatal(err)
+			}
+			linkTarget, err := miningStateTarget(filepath.Join(linkDir, suffix))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if realTarget != linkTarget {
+				t.Fatalf("directory aliases escaped collision detection: %q != %q", realTarget, linkTarget)
+			}
+			otherTarget, err := miningStateTarget(filepath.Join(linkDir, suffix+"-other"))
+			if err != nil || otherTarget == realTarget {
+				t.Fatalf("distinct file rejected: %q, %v", otherTarget, err)
+			}
+		})
+	}
+	// Existing regular files have the same identity as absent destinations.
+	path := filepath.Join(realDir, "state")
+	before, err := miningStateTarget(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("synthetic state"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	after, err := miningStateTarget(filepath.Join(linkDir, "state"))
+	if err != nil || after != before {
+		t.Fatalf("regular file identity changed: %q != %q, %v", after, before, err)
+	}
+}
+
+func TestMiningStateTargetRejectsUnverifiablePaths(t *testing.T) {
+	dir := t.TempDir()
+	loop := filepath.Join(dir, "loop")
+	dangling := filepath.Join(dir, "dangling")
+	finalLink := filepath.Join(dir, "state-link")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "absent"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(dir, "state")
+	if err := os.WriteFile(state, []byte("synthetic state"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(state, finalLink); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"directory symlink loop":     filepath.Join(loop, "state"),
+		"dangling directory symlink": filepath.Join(dangling, "nested", "state"),
+		"final file symlink":         finalLink,
+		"regular parent file":        filepath.Join(state, "nested"),
+		"parent traversal":           dir + "/loop/../state",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if target, err := miningStateTarget(path); err == nil || target != "" {
+				t.Fatalf("unverifiable target accepted: %q, %v", target, err)
+			}
+		})
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -101,8 +102,16 @@ func runMiningProtection(ctx context.Context, reloads <-chan struct{}, path stri
 			log.Error().Err(err).Msg("cannot verify mining state separation; escalation disabled")
 			return nil
 		}
-		miningState, _ := filepath.Abs(policyConfig.StatePath)
-		genericState, _ := filepath.Abs(generic.StatePath)
+		miningState, err := miningStateTarget(policyConfig.StatePath)
+		if err != nil {
+			log.Error().Err(err).Msg("cannot verify mining state target; escalation disabled")
+			return nil
+		}
+		genericState, err := miningStateTarget(generic.StatePath)
+		if err != nil {
+			log.Error().Err(err).Msg("cannot verify generic state target; escalation disabled")
+			return nil
+		}
 		if miningState == genericState {
 			log.Error().Msg("mining and generic policy must use separate state files; escalation disabled")
 			return nil
@@ -220,6 +229,62 @@ func runMiningProtection(ctx context.Context, reloads <-chan struct{}, path stri
 		case <-reloads:
 			policy.Reload(path)
 		}
+	}
+}
+
+// Persistence atomically renames into the parent directory, so directory
+// symlinks must be resolved even when the state file or its parents do not yet
+// exist. Reject final-file symlinks: writes replace them, but startup reads
+// follow them and could seed one policy from the other's state.
+func miningStateTarget(path string) (string, error) {
+	// Cleaning symlink/../ before resolution can name a different target
+	// than the original path passed to Rename. Require an unambiguous path.
+	for _, part := range strings.Split(path, string(filepath.Separator)) {
+		if part == ".." {
+			return "", fmt.Errorf("state path must not contain parent traversal: %s", path)
+		}
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if info, err := os.Lstat(abs); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("state file must not be a symlink: %s", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	parent := filepath.Dir(abs)
+	suffix := filepath.Base(abs)
+	for {
+		resolved, err := filepath.EvalSymlinks(parent)
+		if err == nil {
+			info, err := os.Stat(resolved)
+			if err != nil {
+				return "", err
+			}
+			if !info.IsDir() {
+				return "", fmt.Errorf("state parent is not a directory: %s", parent)
+			}
+			return filepath.Join(resolved, suffix), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		// Only missing directories can be deferred. An existing dangling
+		// symlink has no verifiable target and must not be treated as absent.
+		if _, statErr := os.Lstat(parent); statErr == nil {
+			return "", err
+		} else if !os.IsNotExist(statErr) {
+			return "", statErr
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return "", err
+		}
+		suffix = filepath.Join(filepath.Base(parent), suffix)
+		parent = next
 	}
 }
 
