@@ -26,11 +26,14 @@ var ErrVMDPreviewProtocolUnsupported = errors.New("proxy: vmd does not attest pr
 
 // InstanceInfo holds the routing information for a sandbox instance.
 type InstanceInfo struct {
-	VMIP                     string
-	Status                   string
-	StartedAt                int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
-	TeamID                   string // owning team, for usage attribution
-	OwnerID                  string // creating user, for usage attribution; empty when unknown
+	VMIP      string
+	Status    string
+	StartedAt int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
+	TeamID    string // owning team, for usage attribution
+	OwnerID   string // creating user, for usage attribution; empty when unknown
+	// MachineOwned is set by a resolver that has loaded the durable owner
+	// record. Legacy sandbox-only tokens are rejected for such instances.
+	MachineOwned             bool
 	PreviewAccess            string
 	PreviewPorts             map[int]struct{}
 	PreviewPortAccess        map[int]string

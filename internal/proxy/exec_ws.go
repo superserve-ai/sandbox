@@ -185,6 +185,10 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 		fail.write(w)
 		return
 	}
+	if !verifyMachineProxyOperation(token, h.seedKey, instanceID, r.Method, execConnectPath) {
+		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted"}).write(w)
+		return
+	}
 	h.captureUsage(instanceID, "command_run", info)
 
 	acceptOpts := &websocket.AcceptOptions{

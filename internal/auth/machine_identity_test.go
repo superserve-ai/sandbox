@@ -1,6 +1,11 @@
 package auth
 
 import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,3 +88,88 @@ func TestMachineCapabilityRejectsUnknownOperation(t *testing.T) {
 		t.Fatal("expected unknown capability operation to be rejected")
 	}
 }
+
+func TestMachineCapabilityRoundTripAndTamperRejection(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	capability := MachineCapability{PrincipalID: uuid.New(), CredentialID: uuid.New(), LineageID: uuid.New(), TeamID: uuid.New(), SandboxID: uuid.New(), Operations: []MachineOperation{MachineOperationRead}, Audience: "sandbox-proxy", ExpiresAt: now.Add(time.Minute), RevocationGeneration: 3}
+	token, err := SignMachineCapability(capability, []byte("test-signing-key"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := VerifyMachineCapability(token, []byte("test-signing-key"), now)
+	if err != nil || !reflect.DeepEqual(got, capability) {
+		t.Fatalf("round trip mismatch: %#v, %v", got, err)
+	}
+	parts := strings.Split(token, ".")
+	signature, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature[0] ^= 1
+	parts[3] = base64.RawURLEncoding.EncodeToString(signature)
+	if _, err := VerifyMachineCapability(strings.Join(parts, "."), []byte("test-signing-key"), now); err == nil {
+		t.Fatal("expected a tampered signature to be rejected")
+	}
+}
+
+func TestSessionRegistryRevokesCredentialAndPrincipal(t *testing.T) {
+	now := time.Unix(100, 0)
+	principal, credential := uuid.New(), uuid.New()
+	r := NewSessionRegistry(1)
+	state := RevocationState{PrincipalID: principal, CredentialID: credential, RevocationGeneration: 2, ExpiresAt: now.Add(time.Minute)}
+	if err := r.Register("stream-1", state); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register("stream-2", state); err != ErrSessionLimit {
+		t.Fatalf("expected bounded registry, got %v", err)
+	}
+	capability := MachineCapability{PrincipalID: principal, CredentialID: credential, RevocationGeneration: 2, ExpiresAt: now.Add(time.Minute)}
+	if !r.Allows("stream-1", capability, now) {
+		t.Fatal("active session should be allowed")
+	}
+	if removed := r.RevokeCredential(credential, 2); removed != 1 || r.Allows("stream-1", capability, now) {
+		t.Fatal("credential revocation did not close the session")
+	}
+}
+
+func TestOperationForHTTPDefaultsToDeny(t *testing.T) {
+	if op, ok := OperationForHTTP("GET", "/sandboxes"); !ok || op != MachineOperationList {
+		t.Fatalf("list operation = %q, %v", op, ok)
+	}
+	if op, ok := OperationForHTTP("POST", "/teams/anything/members"); ok || op != "" {
+		t.Fatalf("management route must not be machine-authorized: %q, %v", op, ok)
+	}
+}
+
+func TestValidateMachineCreateRejectsIndirectSources(t *testing.T) {
+	now := time.Now().Add(time.Minute)
+	templateID := uuid.New()
+	caller := CallerContext{PrincipalID: uuid.New(), CredentialID: uuid.New(), LineageID: uuid.New(), TeamID: uuid.New(), HostedTenantID: uuid.New(), Permissions: []MachineOperation{MachineOperationCreate}, Policy: NewMachinePolicy(MachineOperationCreate), Audience: "api", ExpiresAt: now, RevocationGeneration: 1, ApprovedTemplateID: &templateID}
+	if err := ValidateMachineCreate(caller, &templateID, nil, 0); err != nil {
+		t.Fatalf("approved machine create rejected: %v", err)
+	}
+	if err := ValidateMachineCreate(caller, &templateID, uuidPtr(uuid.New()), 0); err == nil {
+		t.Fatal("snapshot source must be rejected")
+	}
+}
+
+func TestMachineCapabilityAuthorityFailureFailsClosed(t *testing.T) {
+	now := time.Unix(100, 0)
+	capability := MachineCapability{PrincipalID: uuid.New(), CredentialID: uuid.New(), LineageID: uuid.New(), TeamID: uuid.New(), SandboxID: uuid.New(), Operations: []MachineOperation{MachineOperationRead}, Audience: "sandbox-proxy", ExpiresAt: now.Add(time.Minute), RevocationGeneration: 4}
+	token, err := SignMachineCapability(capability, []byte("authority-key"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyMachineCapabilityWithAuthority(t.Context(), token, []byte("authority-key"), now, func(context.Context, uuid.UUID, uuid.UUID) (uint64, error) {
+		return 0, errors.New("authority unavailable")
+	}); err == nil {
+		t.Fatal("authority failure must deny capability")
+	}
+	if _, err := VerifyMachineCapabilityWithAuthority(t.Context(), token, []byte("authority-key"), now, func(context.Context, uuid.UUID, uuid.UUID) (uint64, error) {
+		return 4, nil
+	}); err != nil {
+		t.Fatalf("current authority rejected capability: %v", err)
+	}
+}
+
+func uuidPtr(id uuid.UUID) *uuid.UUID { return &id }

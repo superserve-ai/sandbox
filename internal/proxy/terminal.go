@@ -40,6 +40,14 @@ func (h *Handler) WithAuth(seedKey []byte) *Handler {
 	return h
 }
 
+// WithMachineAuthority installs the durable revocation resolver used for
+// lineage-bound machine capabilities. Omitting it keeps ordinary sandbox
+// tokens working but makes every machine capability fail closed.
+func (h *Handler) WithMachineAuthority(authority auth.RevocationAuthority) *Handler {
+	h.machineAuthority = authority
+	return h
+}
+
 // WithTerminal enables the /terminal WebSocket bridge. Requires
 // WithAuth to have been called first.
 func (h *Handler) WithTerminal(allowedOrigins []string) *Handler {
@@ -193,6 +201,10 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 	if fail != nil {
 		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("terminal: auth failed")
 		fail.write(w)
+		return
+	}
+	if !verifyMachineProxyOperation(token, h.seedKey, instanceID, r.Method, terminalPath) {
+		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted"}).write(w)
 		return
 	}
 	h.captureUsage(instanceID, "terminal_opened", info)

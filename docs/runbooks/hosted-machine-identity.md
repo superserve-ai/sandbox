@@ -20,6 +20,13 @@ must keep the parent principal, team, credential lineage, audience, and
 revocation generation, use a subset of the parent operations, and expire no
 later than the parent. Legacy sandbox-only tokens are not a machine fallback.
 
+The sandbox-side wire form is `mcap.v1.<base64url-payload>.<base64url-HMAC>`.
+The payload contains principal, credential and lineage references, team,
+sandbox, explicit operations, audience, expiry, and revocation generation.
+Verifiers reject unknown versions/fields, invalid signatures, expired values,
+and generations that are no longer current. Peer forwarding carries this
+verified capability, never an actor or team header.
+
 ## Durable lifecycle handoff
 
 The authorized control-plane/provisioning actor owns these fenced operations:
@@ -31,12 +38,20 @@ The authorized control-plane/provisioning actor owns these fenced operations:
 | Rotate | Preserve principal and sandbox ownership; revoke the replaced credential according to the bounded rotation policy. |
 | Revoke | Invalidate one credential, its descendants, and associated sessions. |
 | Disable | Invalidate every credential and block new issuance. |
-| Restore | Reuse the same principal after authorized same-tenant recovery and issue fresh credentials; old generations remain invalid. |
+| Restore | Reuse the same principal during the authorized same-tenant seven-day recovery window and issue fresh credentials; old generations remain invalid. |
 
 Runtime machine credentials cannot invoke these operations or change tenant,
 team, owner, scope, or template associations. Secret payloads and credential
 material remain in the owning delivery workflow; logs contain only safe IDs and
 denial context.
+
+Serving instances keep bounded in-memory session registrations. A stream
+registers once at handshake and unregisters on every exit path; each request
+or continuation checks the local generation/expiry snapshot without a
+per-frame database call. Durable revoke/disable invalidation closes matching
+registrations immediately, while bounded freshness refresh fails closed when
+the authority store is unavailable. Deployment must measure the multi-instance
+result against the 30-second maximum.
 
 ## Ownership and rollout seam
 

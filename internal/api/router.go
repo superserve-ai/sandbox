@@ -31,6 +31,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// customer gets a dedicated bucket regardless of source IP. Behind a
 	// load balancer the per-IP limit collapses tenants onto one bucket
 	// and becomes meaningless for fairness.
+	if h != nil && h.MachineCredentials != nil {
+		// Machine auth runs before human API-key auth. APIKeyAuth observes the
+		// verified machine context and does not require a creator-derived key.
+		api.Use(MachineCredentialAuth(h.MachineCredentials))
+	}
 	api.Use(APIKeyAuth(pool), TeamRateLimit(ctx, DefaultTeamRateLimitConfig()), SandboxLifecycleTelemetry())
 	{
 		// Sandbox lifecycle.

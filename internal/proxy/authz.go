@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
 )
@@ -39,7 +41,15 @@ func (h *Handler) authorizeSandboxRequest(
 		panic("proxy: authorizeSandboxRequest called without WithAuth")
 	}
 
-	if !auth.VerifyAccessToken(h.seedKey, requestSandboxID, token) {
+	if strings.HasPrefix(token, "mcap.") {
+		if h.machineAuthority == nil {
+			return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}
+		}
+		capability, err := auth.VerifyMachineCapabilityWithAuthority(ctx, token, h.seedKey, time.Now(), h.machineAuthority)
+		if err != nil || capability.SandboxID.String() != requestSandboxID || capability.Audience != "sandbox-proxy" {
+			return InstanceInfo{}, &authzFailure{Status: http.StatusUnauthorized, Message: "invalid machine capability"}
+		}
+	} else if !auth.VerifyAccessToken(h.seedKey, requestSandboxID, token) {
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusUnauthorized,
 			Message: "invalid access token",
@@ -61,6 +71,9 @@ func (h *Handler) authorizeSandboxRequest(
 			Code:    "sandbox_unavailable",
 		}
 	}
+	if info.MachineOwned && !strings.HasPrefix(token, "mcap.") {
+		return InstanceInfo{}, &authzFailure{Status: http.StatusUnauthorized, Message: "machine sandbox requires a machine capability"}
+	}
 	if info.Status != "running" {
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusServiceUnavailable,
@@ -70,6 +83,44 @@ func (h *Handler) authorizeSandboxRequest(
 	}
 
 	return info, nil
+}
+
+// VerifyMachineOperation is shared by command/file/terminal entry points
+// after token authentication. Legacy sandbox tokens intentionally return
+// false because they carry no operation scope or lineage.
+func VerifyMachineOperation(token string, signingKey []byte, sandboxID string, operation auth.MachineOperation, now time.Time) bool {
+	if !strings.HasPrefix(token, "mcap.") {
+		return false
+	}
+	capability, err := auth.VerifyMachineCapability(token, signingKey, now)
+	return err == nil && capability.Audience == "sandbox-proxy" && capability.SandboxID.String() == sandboxID && capability.Allows(operation)
+}
+
+func machineOperationForProxyPath(method, path string) (auth.MachineOperation, bool) {
+	switch {
+	case path == "/terminal":
+		return auth.MachineOperationCommandRun, true
+	case path == "/exec" && method == http.MethodPost:
+		return auth.MachineOperationCommandRun, true
+	case path == "/exec/stream":
+		return auth.MachineOperationCommandRead, true
+	case path == "/exec/connect":
+		return auth.MachineOperationCommandWrite, true
+	case path == "/files" && method == http.MethodGet:
+		return auth.MachineOperationFileRead, true
+	case path == "/files" && (method == http.MethodPost || method == http.MethodPut):
+		return auth.MachineOperationFileWrite, true
+	default:
+		return "", false
+	}
+}
+
+func verifyMachineProxyOperation(token string, signingKey []byte, sandboxID, method, path string) bool {
+	if !strings.HasPrefix(token, "mcap.") {
+		return true
+	}
+	operation, ok := machineOperationForProxyPath(method, path)
+	return ok && VerifyMachineOperation(token, signingKey, sandboxID, operation, time.Now())
 }
 
 // Routing must authenticate before consulting shared ownership. Keep token
@@ -111,5 +162,12 @@ func (h *Handler) canRouteBoxdRequest(r *http.Request, sandboxID string) bool {
 	default:
 		return false
 	}
-	return h.seedKey != nil && auth.VerifyAccessToken(h.seedKey, sandboxID, token)
+	if h.seedKey == nil {
+		return false
+	}
+	if strings.HasPrefix(token, "mcap.") {
+		capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
+		return err == nil && capability.SandboxID.String() == sandboxID && capability.Audience == "sandbox-proxy"
+	}
+	return auth.VerifyAccessToken(h.seedKey, sandboxID, token)
 }

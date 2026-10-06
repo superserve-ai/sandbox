@@ -151,6 +151,10 @@ type HostRegistry interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
+	// MachineCredentials is optional until the compatible machine-identity
+	// rollout is deployed. When set, hosted QM credentials use the separate
+	// machine middleware and never become human actor IDs.
+	MachineCredentials    MachineCredentialResolver
 	ComputeRestrictions   *abuse.ComputeEvaluator
 	SignupRestrictions    *abuse.SignupEvaluator
 	VMD                   VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
@@ -2491,15 +2495,45 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		owners, ownerErr := h.DB.ListMachineSandboxOwners(ctx, caller.PrincipalID, teamID)
+		if ownerErr != nil {
+			// Missing or unavailable ownership is fail-closed for machine list;
+			// it must never fall back to the team-wide human query.
+			log.Error().Err(ownerErr).Msg("machine sandbox ownership lookup failed")
+			respondError(c, ErrForbidden)
+			return
+		}
+		owned := make(map[uuid.UUID]struct{}, len(owners))
+		for _, owner := range owners {
+			if owner.OwnerPrincipalID == caller.PrincipalID && owner.TeamID == teamID {
+				owned[owner.SandboxID] = struct{}{}
+			}
+		}
+		filtered := sandboxes[:0]
+		for _, row := range sandboxes {
+			if _, ok := owned[row.sandbox.ID]; ok {
+				filtered = append(filtered, row)
+			}
+		}
+		sandboxes = filtered
+	}
 
-	total, err := resolveTotal(pg, len(sandboxes), func() (int64, error) {
-		return h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
-			TeamID:     teamID,
-			Metadata:   metadataJSON,
-			Status:     statusFilter,
-			NameSearch: nameSearch,
+	var total int64
+	if _, machine := machineCallerFromContext(c); machine {
+		// The filtered in-memory page is intentionally not followed by a
+		// team-wide COUNT, which would disclose unrelated resource volume.
+		total = int64(len(sandboxes))
+	} else {
+		total, err = resolveTotal(pg, len(sandboxes), func() (int64, error) {
+			return h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Status:     statusFilter,
+				NameSearch: nameSearch,
+			})
 		})
-	})
+	}
 	if err != nil {
 		log.Error().Err(err).Msg("DB CountSandboxesByTeamPaged failed")
 		respondError(c, ErrInternal)
@@ -2772,6 +2806,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "from_template and from_snapshot are mutually exclusive", http.StatusBadRequest)
 		return
 	}
+	if _, machine := machineCallerFromContext(c); machine && !machineCreateHeaders(c) {
+		return
+	}
 	// Nil is no snapshot's id, and below it means no snapshot was named.
 	var sourceSnapshotID uuid.UUID
 	if req.FromSnapshot != nil {
@@ -2781,6 +2818,26 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			return
 		}
 		sourceSnapshotID = id
+	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		var templateID *uuid.UUID
+		if req.FromTemplate != nil {
+			id, parseErr := uuid.Parse(*req.FromTemplate)
+			if parseErr != nil {
+				respondErrorMsg(c, "forbidden", "machine template must be the approved resolved template", http.StatusForbidden)
+				return
+			}
+			templateID = &id
+		}
+		if err := auth.ValidateMachineCreate(caller, templateID, func() *uuid.UUID {
+			if sourceSnapshotID == uuid.Nil {
+				return nil
+			}
+			return &sourceSnapshotID
+		}(), len(req.Secrets)); err != nil {
+			respondErrorMsg(c, "forbidden", "machine sandbox creation is restricted to the approved template", http.StatusForbidden)
+			return
+		}
 	}
 
 	if err := validateTimeoutSeconds(req.TimeoutSeconds); err != nil {
@@ -2848,6 +2905,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	if _, machine := machineCallerFromContext(c); machine && h.Pool == nil {
+		// Ownership must be committed with the machine sandbox row; a handler
+		// without a transaction-capable pool cannot safely create one.
+		respondErrorMsg(c, "service_unavailable", "machine sandbox creation is not available", http.StatusServiceUnavailable)
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
@@ -3130,9 +3193,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// any secret bindings in one statement. That keeps the legacy-public
 	// fallback unobservable for new sandboxes and leaves the quota admission's
 	// uncommitted window statement-sized (see the query comments).
-	insertWithBindings := func() (db.Sandbox, error) {
+	insertWithBindings := func(q *db.Queries) (db.Sandbox, error) {
 		if len(secretBindings) == 0 && sourceSnapshotID == uuid.Nil {
-			return runInsert(h.DB)
+			return runInsert(q)
 		}
 		secretIDs := make([]uuid.UUID, len(secretBindings))
 		envKeys := make([]string, len(secretBindings))
@@ -3144,7 +3207,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			proxyTokens[i] = secretMeta[i].ProxyToken
 		}
 		if sourceSnapshotID != uuid.Nil {
-			row, err := h.DB.CreateSandboxFromSnapshot(insertCtx, db.CreateSandboxFromSnapshotParams{
+			row, err := q.CreateSandboxFromSnapshot(insertCtx, db.CreateSandboxFromSnapshotParams{
 				SnapshotID:        sourceSnapshotID,
 				TeamID:            teamID,
 				ID:                sandboxID,
@@ -3163,7 +3226,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			return db.RoutingSandbox(row).Sandbox(), err
 		}
 		if templateID.Valid {
-			row, err := h.DB.CreateSandboxFromTemplateWithSecrets(insertCtx, db.CreateSandboxFromTemplateWithSecretsParams{
+			row, err := q.CreateSandboxFromTemplateWithSecrets(insertCtx, db.CreateSandboxFromTemplateWithSecretsParams{
 				TemplateID:        uuid.UUID(templateID.Bytes),
 				TeamID:            teamID,
 				SystemTeamID:      h.systemTeamID(),
@@ -3188,7 +3251,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			routingObservedAt = row.RoutingObservedAt
 			return db.RoutingSandbox(row).Sandbox(), err
 		}
-		row, err := h.DB.CreateSandboxWithSecrets(insertCtx, db.CreateSandboxWithSecretsParams{
+		row, err := q.CreateSandboxWithSecrets(insertCtx, db.CreateSandboxWithSecretsParams{
 			ID:                sandboxID,
 			TeamID:            teamID,
 			Name:              req.Name,
@@ -3212,7 +3275,28 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	go func() {
 		tInsertStart = time.Now()
 		// Quota is enforced by the sandbox_quota_on_insert trigger.
-		sb, err := insertWithBindings()
+		q := h.DB
+		var tx pgx.Tx
+		if _, machine := machineCallerFromContext(c); machine && h.Pool != nil {
+			var beginErr error
+			tx, beginErr = h.Pool.Begin(insertCtx)
+			if beginErr != nil {
+				insertCh <- insertResult{err: beginErr}
+				tInsertEnd = time.Now()
+				return
+			}
+			defer tx.Rollback(insertCtx)
+			q = h.DB.WithTx(tx)
+		}
+		sb, err := insertWithBindings(q)
+		if err == nil {
+			if caller, machine := machineCallerFromContext(c); machine {
+				err = q.CreateMachineSandboxOwner(insertCtx, sb.ID, caller.PrincipalID, teamID)
+			}
+		}
+		if err == nil && tx != nil {
+			err = tx.Commit(insertCtx)
+		}
 		tInsertEnd = time.Now()
 		insertCh <- insertResult{sandbox: sb, err: err}
 	}()

@@ -730,6 +730,31 @@ type LegacyHostStorageReport struct {
 	LastError              *string     `json:"last_error"`
 }
 
+type MachineCredential struct {
+	ID                   uuid.UUID          `json:"id"`
+	PrincipalID          uuid.UUID          `json:"principal_id"`
+	LineageID            uuid.UUID          `json:"lineage_id"`
+	State                string             `json:"state"`
+	ExpiresAt            time.Time          `json:"expires_at"`
+	RevocationGeneration int64              `json:"revocation_generation"`
+	Permissions          []string           `json:"permissions"`
+	Audience             string             `json:"audience"`
+	IssuedAt             time.Time          `json:"issued_at"`
+	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type MachinePrincipal struct {
+	ID                 uuid.UUID          `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	HostedTenantID     uuid.UUID          `json:"hosted_tenant_id"`
+	Status             string             `json:"status"`
+	Generation         int64              `json:"generation"`
+	ApprovedTemplateID pgtype.UUID        `json:"approved_template_id"`
+	RestoreUntil       pgtype.Timestamptz `json:"restore_until"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+}
+
 type NetFlow struct {
 	ID         int64      `json:"id"`
 	Ts         time.Time  `json:"ts"`
@@ -1033,6 +1058,13 @@ type SandboxComputeBillingInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+}
+
+type SandboxMachineOwner struct {
+	SandboxID        uuid.UUID `json:"sandbox_id"`
+	OwnerPrincipalID uuid.UUID `json:"owner_principal_id"`
+	TeamID           uuid.UUID `json:"team_id"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // Preview routing policy. default_access is the API default for new ports; access is a restrictive Phase 1-compatible wire fallback.

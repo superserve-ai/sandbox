@@ -78,6 +78,10 @@ type Handler struct {
 	// sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
 	// Set via WithAuth; nil means data-plane endpoints are disabled.
 	seedKey []byte
+	// machineAuthority is the bounded-freshness durable revocation resolver.
+	// Machine capabilities fail closed when a proxy has not been configured
+	// with it; legacy tokens remain available only to ordinary sandboxes.
+	machineAuthority auth.RevocationAuthority
 
 	// terminal holds the dependencies specific to the /terminal WebSocket
 	// bridge (allowed browser origins for the Origin check). Nil means

@@ -32,6 +32,11 @@ func (h *Handler) authorizeBoxdRequest(w http.ResponseWriter, r *http.Request, i
 		fail.write(w)
 		return InstanceInfo{}, false
 	}
+	if !verifyMachineProxyOperation(token, h.seedKey, instanceID, r.Method, r.URL.Path) {
+		h.log.Warn().Str("sandbox_id", instanceID).Msg(logPrefix + ": machine operation denied")
+		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted"}).write(w)
+		return InstanceInfo{}, false
+	}
 	return info, true
 }
 

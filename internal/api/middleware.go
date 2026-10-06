@@ -65,6 +65,14 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		// latency includes a slow auth cache miss (auth must never exceed
 		// its own request's total).
 		c.Set("auth_start", authStart)
+		// A verified hosted machine credential is a separate authority. Do not
+		// force it through human API-key/creator lookup or synthesize actor_id.
+		if _, machine := machineCallerFromContext(c); machine {
+			c.Set("auth_ms", time.Since(authStart).Milliseconds())
+			c.Set("auth_duration", time.Since(authStart))
+			c.Next()
+			return
+		}
 		// A request aborted before its handler (auth failure, or a
 		// downstream middleware like the team rate limit) never runs the
 		// handler defer that emits the op's phase series, so those slow
