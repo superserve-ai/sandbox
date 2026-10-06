@@ -25,9 +25,9 @@ const (
 type Request struct {
 	UserID, TeamID uuid.UUID
 	IP, Domain     string
-	// AuthProvider identifies the provider for the corporate identity represented
-	// by Domain. A matching active association grants the same trust precedence
-	// as an explicitly verified team.
+	// AuthProvider is legacy signup identity context supplied by a trusted
+	// server caller. Compute resolution ignores these claims and resolves
+	// confirmed accounts and target-team ownership from authoritative state.
 	AuthProvider  string
 	Action        Action
 	GlobalEnabled bool
@@ -91,6 +91,30 @@ func Resolve(ctx context.Context, q db.DBTX, req Request) (Decision, error) {
 	}
 	if !req.GlobalEnabled {
 		return Decision{Allowed: true, Reason: "global_off"}, nil
+	}
+	if req.Action == ActionCreate || req.Action == ActionResume {
+		if req.TeamID == uuid.Nil {
+			return Decision{}, fmt.Errorf("compute resolution requires a target team")
+		}
+		policy, err := ResolveTeamPolicy(ctx, q, req.TeamID)
+		if err != nil {
+			return Decision{}, err
+		}
+		result := Decision{Allowed: true, Generation: policy.Generation, Reason: "no_restriction"}
+		switch {
+		case !policy.Known:
+			result.Reason = "policy_unavailable"
+		case policy.Mode == ModeOff:
+			result.Reason = "global_off"
+		case policy.Trusted:
+			result.Reason = "trusted_team"
+		case policy.Restricted && policy.Mode == ModeEnforce:
+			result.Allowed = false
+			result.Reason = "active_restriction"
+		case policy.Restricted && policy.Mode == ModeObserve:
+			result.Reason = "would_deny"
+		}
+		return result, nil
 	}
 	// Capture the invalidation token before reading trust state. If a trust or
 	// identity mutation races this evaluation, the decision retains the older

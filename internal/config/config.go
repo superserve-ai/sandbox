@@ -19,14 +19,15 @@ import (
 
 // Config holds all configuration for the Superserve Sandbox control plane.
 type Config struct {
-	TemplateBuildRegion     string                       // TEMPLATE_BUILD_REGION matches the host registry region exactly
-	TemplateBackupBucket    string                       // BACKUP_BUCKET, cell-local durable template storage
-	ComputeRestrictionsFile string                       // COMPUTE_RESTRICTIONS_FILE; empty disables config loading
-	Port                    string                       // API_PORT, default "8080"
-	VMDAddress              string                       // VMD_GRPC_ADDRESS, default "localhost:50051"
-	DatabaseURL             string                       // DATABASE_URL, required
-	TeamCreationRegion      string                       // TEAM_CREATION_REGION; receiving cell identifier
-	TeamCreationKeys        map[string]ed25519.PublicKey // TEAM_CREATION_PUBLIC_KEYS; kid to base64 public key
+	TemplateBuildRegion       string                       // TEMPLATE_BUILD_REGION matches the host registry region exactly
+	TemplateBackupBucket      string                       // BACKUP_BUCKET, cell-local durable template storage
+	ComputeRestrictionsFile   string                       // COMPUTE_RESTRICTIONS_FILE; empty disables config loading
+	ComputeRestrictionsSource string                       // COMPUTE_RESTRICTIONS_SOURCE; file (default) or database
+	Port                      string                       // API_PORT, default "8080"
+	VMDAddress                string                       // VMD_GRPC_ADDRESS, default "localhost:50051"
+	DatabaseURL               string                       // DATABASE_URL, required
+	TeamCreationRegion        string                       // TEAM_CREATION_REGION; receiving cell identifier
+	TeamCreationKeys          map[string]ed25519.PublicKey // TEAM_CREATION_PUBLIC_KEYS; kid to base64 public key
 
 	StripeSecretKey               string   // STRIPE_SECRET_KEY
 	StripeWebhookSecret           string   // STRIPE_WEBHOOK_SECRET (snapshot lifecycle destination)
@@ -133,6 +134,7 @@ func Load() (*Config, error) {
 		TeamCreationRegion:            os.Getenv("TEAM_CREATION_REGION"),
 		TeamCreationKeys:              teamCreationKeys(os.Getenv("TEAM_CREATION_PUBLIC_KEYS")),
 		ComputeRestrictionsFile:       os.Getenv("COMPUTE_RESTRICTIONS_FILE"),
+		ComputeRestrictionsSource:     envOrDefault("COMPUTE_RESTRICTIONS_SOURCE", "file"),
 		Port:                          envOrDefault("API_PORT", "8080"),
 		VMDAddress:                    envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
 		DatabaseURL:                   dbURL,
@@ -163,6 +165,9 @@ func Load() (*Config, error) {
 		OTelInsecure:                  boolEnv("OTEL_EXPORTER_OTLP_INSECURE", false),
 		OTelExportInterval:            exportInterval,
 		BackupGCServiceAccount:        strings.TrimSpace(os.Getenv("BACKUP_GC_SERVICE_ACCOUNT")),
+	}
+	if cfg.ComputeRestrictionsSource != "file" && cfg.ComputeRestrictionsSource != "database" {
+		return nil, fmt.Errorf("COMPUTE_RESTRICTIONS_SOURCE must be file or database")
 	}
 	return cfg, nil
 }
