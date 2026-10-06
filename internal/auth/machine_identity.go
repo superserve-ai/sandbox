@@ -83,6 +83,7 @@ type CallerContext struct {
 	TeamID               uuid.UUID
 	HostedTenantID       uuid.UUID
 	Permissions          []MachineOperation
+	Policy               MachinePolicy
 	Audience             string
 	ExpiresAt            time.Time
 	RevocationGeneration uint64
@@ -148,6 +149,11 @@ func (c CallerContext) ValidateAt(now time.Time) error {
 	if len(c.Permissions) == 0 {
 		return ErrInvalidMachineIdentity
 	}
+	for _, operation := range c.Permissions {
+		if !c.Policy.Allows(operation) {
+			return ErrInvalidMachineIdentity
+		}
+	}
 	return nil
 }
 
@@ -163,7 +169,7 @@ func (c MachineCapability) ValidateAt(now time.Time) error {
 		return ErrMachineCapabilityDenied
 	}
 	for _, operation := range c.Operations {
-		if operation == "" {
+		if !isKnownMachineOperation(operation) {
 			return ErrMachineCapabilityDenied
 		}
 	}
@@ -181,20 +187,20 @@ func DeriveCapability(caller CallerContext, ownership SandboxOwnership, sandboxI
 	if err := caller.ValidateAt(now); err != nil {
 		return MachineCapability{}, err
 	}
-	if err := ownership.Validate(); err != nil || ownership.SandboxID != sandboxID || ownership.OwnerPrincipalID != caller.PrincipalID || ownership.TeamID != caller.TeamID || audience == "" || len(operations) == 0 || sandboxID == uuid.Nil {
+	if err := ownership.Validate(); err != nil || ownership.SandboxID != sandboxID || ownership.OwnerPrincipalID != caller.PrincipalID || ownership.TeamID != caller.TeamID || audience == "" || audience != caller.Audience || len(operations) == 0 || sandboxID == uuid.Nil {
 		return MachineCapability{}, ErrMachineCapabilityDenied
 	}
 	if expiresAt.IsZero() || expiresAt.After(caller.ExpiresAt) || !now.Before(expiresAt) {
 		return MachineCapability{}, ErrMachineCapabilityDenied
 	}
 	for _, operation := range operations {
-		if operation == "" || !slices.Contains(caller.Permissions, operation) {
+		if operation == "" || !caller.Policy.Allows(operation) || !slices.Contains(caller.Permissions, operation) {
 			return MachineCapability{}, ErrMachineCapabilityDenied
 		}
 	}
 	return MachineCapability{
 		PrincipalID: caller.PrincipalID, CredentialID: caller.CredentialID, LineageID: caller.LineageID,
-		TeamID: caller.TeamID, SandboxID: sandboxID, Operations: slices.Clone(operations), Audience: audience,
+		TeamID: caller.TeamID, SandboxID: sandboxID, Operations: slices.Clone(operations), Audience: caller.Audience,
 		ExpiresAt: expiresAt, RevocationGeneration: caller.RevocationGeneration,
 	}, nil
 }
@@ -206,7 +212,7 @@ type MachinePolicy struct{ allowed map[MachineOperation]struct{} }
 func NewMachinePolicy(operations ...MachineOperation) MachinePolicy {
 	allowed := make(map[MachineOperation]struct{}, len(operations))
 	for _, operation := range operations {
-		if operation != "" {
+		if isKnownMachineOperation(operation) {
 			allowed[operation] = struct{}{}
 		}
 	}
@@ -215,7 +221,22 @@ func NewMachinePolicy(operations ...MachineOperation) MachinePolicy {
 
 func (p MachinePolicy) Allows(operation MachineOperation) bool {
 	_, ok := p.allowed[operation]
-	return operation != "" && ok
+	return isKnownMachineOperation(operation) && ok
+}
+
+func isKnownMachineOperation(operation MachineOperation) bool {
+	switch operation {
+	case MachineOperationCreate, MachineOperationList, MachineOperationRead,
+		MachineOperationMetadata, MachineOperationPause, MachineOperationResume,
+		MachineOperationActivate, MachineOperationDelete, MachineOperationPatch,
+		MachineOperationToken, MachineOperationReconnect, MachineOperationCommandRun,
+		MachineOperationCommandSpawn, MachineOperationCommandRead, MachineOperationCommandWrite,
+		MachineOperationCommandSignal, MachineOperationFileRead, MachineOperationFileWrite,
+		MachineOperationFileList, MachineOperationFileImport, MachineOperationFileExport:
+		return true
+	default:
+		return false
+	}
 }
 
 // PrincipalLifecycle is the sandbox-side handoff to the authorized control
