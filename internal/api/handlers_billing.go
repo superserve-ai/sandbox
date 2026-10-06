@@ -96,16 +96,16 @@ type billingSummaryPermissions struct {
 }
 
 type billingSummaryResource struct {
-	ResourceKey string  `json:"resource_key"`
-	Resource    string  `json:"resource"`
-	DisplayName string  `json:"display_name"`
-	SortOrder   int     `json:"sort_order"`
-	Unit        string  `json:"unit"`
-	DisplayUnit string  `json:"display_unit"`
-	Usage       float64 `json:"usage"`
-	Tracked     bool    `json:"tracked"`
-	Billable    bool    `json:"billable"`
-	ChargeUSD   float64 `json:"charge_usd"`
+	ResourceKey string   `json:"resource_key"`
+	Resource    string   `json:"resource"`
+	DisplayName string   `json:"display_name"`
+	SortOrder   int      `json:"sort_order"`
+	Unit        string   `json:"unit"`
+	DisplayUnit string   `json:"display_unit"`
+	Usage       *float64 `json:"usage"`
+	Tracked     bool     `json:"tracked"`
+	Billable    bool     `json:"billable"`
+	ChargeUSD   float64  `json:"charge_usd"`
 }
 
 type billingUsageResource struct {
@@ -266,7 +266,9 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	if !usage.StorageGibSeconds.Valid || !usage.BillableStorageGibSeconds.Valid {
+	// Missing pre-activation storage measurements cannot change payable totals.
+	// Keep tracked usage unknown while still requiring complete billable usage.
+	if !usage.BillableStorageGibSeconds.Valid {
 		respondErrorMsg(c, "storage_unavailable", "Storage usage is temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -331,7 +333,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	storageGibSeconds, err := numericFloat64(usage.StorageGibSeconds)
+	storageGibSeconds, err := nullableNumericFloat64(usage.StorageGibSeconds)
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert storage usage failed")
 		respondError(c, ErrInternal)
@@ -514,10 +516,10 @@ func billingAccountHasStripeCreditState(account db.GetTeamBillingAccountRow) boo
 }
 
 type billingUsageSeriesResource struct {
-	Usage    float64 `json:"usage"`
-	CostUSD  float64 `json:"cost_usd"`
-	Tracked  bool    `json:"tracked"`
-	Billable bool    `json:"billable"`
+	Usage    *float64 `json:"usage"`
+	CostUSD  float64  `json:"cost_usd"`
+	Tracked  bool     `json:"tracked"`
+	Billable bool     `json:"billable"`
 }
 type billingUsageSeriesBucket struct {
 	Start          time.Time                  `json:"start"`
@@ -603,7 +605,7 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 		u := usageRows[i]
 		cpu, cpuErr := numericFloat64(u.VcpuSeconds)
 		mem, memErr := numericFloat64(u.MemoryGibSeconds)
-		storage, storageErr := numericFloat64(u.StorageGibSeconds)
+		storage, storageErr := nullableNumericFloat64(u.StorageGibSeconds)
 		payableStorage, payableStorageErr := numericFloat64(u.BillableStorageGibSeconds)
 		if cpuErr != nil || memErr != nil {
 			respondError(c, ErrInternal)
@@ -633,7 +635,7 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 		if storageState.Billable {
 			billedTotal += sc
 		}
-		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{cpu, cc, cpuState.Tracked, cpuState.Billable}, Memory: billingUsageSeriesResource{mem, mc, memoryState.Tracked, memoryState.Billable}, Storage: billingUsageSeriesResource{storage, sc, storageState.Tracked, storageState.Billable}, BilledTotalUSD: billedTotal})
+		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{&cpu, cc, cpuState.Tracked, cpuState.Billable}, Memory: billingUsageSeriesResource{&mem, mc, memoryState.Tracked, memoryState.Billable}, Storage: billingUsageSeriesResource{storage, sc, storageState.Tracked, storageState.Billable}, BilledTotalUSD: billedTotal})
 	}
 	setPrivateBillingCacheHeaders(c)
 	c.JSON(http.StatusOK, gin.H{"start": start, "end": end, "granularity": c.Query("granularity"), "timezone": c.Query("timezone"), "buckets": result})
@@ -798,16 +800,17 @@ func billingCheckoutPriceIDs(resources []billingResourceState) ([]string, error)
 	return ids, nil
 }
 
-func billingSummaryResourcesFromState(resources []billingResourceState, vcpuSeconds, memoryGibSeconds, storageGibSeconds float64, charges billing.SummaryCharges) []billingSummaryResource {
+func billingSummaryResourcesFromState(resources []billingResourceState, vcpuSeconds, memoryGibSeconds float64, storageGibSeconds *float64, charges billing.SummaryCharges) []billingSummaryResource {
 	out := make([]billingSummaryResource, 0, len(resources))
 	for _, resource := range resources {
-		var usage, charge float64
+		var usage *float64
+		var charge float64
 		switch resource.ResourceKey {
 		case "vcpu":
-			usage = vcpuSeconds
+			usage = &vcpuSeconds
 			charge = charges.Breakdown.ComputeUSD
 		case "memory_gib":
-			usage = memoryGibSeconds
+			usage = &memoryGibSeconds
 			charge = charges.Breakdown.MemoryUSD
 		case "storage_gib":
 			usage = storageGibSeconds
@@ -1069,6 +1072,17 @@ func numericFloat64(n pgtype.Numeric) (float64, error) {
 		return 0, fmt.Errorf("numeric value is null")
 	}
 	return v.Float64, nil
+}
+
+func nullableNumericFloat64(n pgtype.Numeric) (*float64, error) {
+	if !n.Valid {
+		return nil, nil
+	}
+	v, err := numericFloat64(n)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
 }
 
 // The timestamp describes the advisory observation, not this API response.
