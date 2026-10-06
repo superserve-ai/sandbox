@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,10 +128,60 @@ func TestMiningSameSandboxReRegistrationInvalidatesPublishedAssignment(t *testin
 	if _, known := source.MiningPolicy(id, ip); !known {
 		t.Fatal("idempotent registration invalidated assignment")
 	}
+	var updates sync.WaitGroup
+	updates.Add(1)
+	go func() {
+		defer updates.Done()
+		for n := 0; n < 1000; n++ {
+			proxy.SetRules(ip, &EgressRules{SandboxID: id.String(), DeniedCIDRs: []string{"192.0.2.0/24"}})
+		}
+	}()
+	for n := 0; n < 1000; n++ {
+		if _, known := source.MiningPolicy(id, ip); !known {
+			t.Error("policy edit opened an attribution gap")
+		}
+		_ = proxy.getRules(ip)
+	}
+	updates.Wait()
+	if _, known := source.MiningPolicy(id, ip); !known {
+		t.Fatal("policy edit invalidated published assignment")
+	}
+	if rules := proxy.getRules(ip); len(rules.DeniedCIDRs) != 1 || rules.DeniedCIDRs[0] != "192.0.2.0/24" {
+		t.Fatal("policy edit was not applied")
+	}
 	proxy.RemoveRules(ip)
 	proxy.RegisterSandbox(ip, id.String())
 	if _, known := source.MiningPolicy(id, ip); known {
 		t.Fatal("same sandbox/IP replacement inherited retired assignment before refresh")
+	}
+}
+
+func TestMiningRegistrationReplacementCannotReviveOldAssignment(t *testing.T) {
+	for _, reset := range []string{"register-owner", "rules-owner", "clear-rules"} {
+		t.Run(reset, func(t *testing.T) {
+			proxy := NewEgressProxy(0, 0, 0, 10, zerolog.Nop())
+			team, id, other := uuid.New(), uuid.New(), uuid.New()
+			ip := "10.11.0.2"
+			proxy.RegisterSandbox(ip, id.String())
+			_, original := proxy.miningRegistration(ip)
+			source := NewHostMiningSource(nil, &kernelTestTeams{id: team}, proxy, "host-test", "boot-test")
+			policy := abuse.SandboxPolicy{TeamPolicy: abuse.TeamPolicy{TeamID: team}, SandboxID: id, HostIP: ip, HostID: "host-test", Assignment: "persisted-instance-time"}
+			source.ready.Store(&miningReady{policies: miningAssignments{id: policy}, bindings: map[uuid.UUID]*EgressRules{id: original}})
+			switch reset {
+			case "register-owner":
+				proxy.RegisterSandbox(ip, other.String())
+				proxy.RegisterSandbox(ip, id.String())
+			case "rules-owner":
+				proxy.SetRules(ip, &EgressRules{SandboxID: other.String()})
+				proxy.SetRules(ip, &EgressRules{SandboxID: id.String()})
+			case "clear-rules":
+				proxy.SetRules(ip, nil)
+				proxy.SetRules(ip, &EgressRules{SandboxID: id.String()})
+			}
+			if _, known := source.MiningPolicy(id, ip); known {
+				t.Fatal("replacement revived old assignment before refresh")
+			}
+		})
 	}
 }
 
@@ -148,6 +199,7 @@ func TestMiningClosesPrePolicyStreamsWithoutClosingReusedRegistration(t *testing
 	source := NewHostMiningSource(nil, &kernelTestTeams{id: team}, proxy, "host-test", "boot-test")
 	policy := abuse.SandboxPolicy{TeamPolicy: abuse.TeamPolicy{TeamID: team}, SandboxID: id, HostIP: ip, HostID: "host-test", Assignment: "persisted-instance-time"}
 	source.ready.Store(&miningReady{policies: miningAssignments{id: policy}, bindings: map[uuid.UUID]*EgressRules{id: registration}})
+	proxy.SetRules(ip, &EgressRules{SandboxID: id.String(), AllowedDomains: []string{"example.com"}})
 	controller := NewMiningContainment(source, &miningTestGate{on: make(map[string]bool)}, &miningTestSubmit{}, zerolog.Nop())
 	if !controller.Observe(id, ip, abuse.MiningEvidence{}) {
 		t.Fatal("mining hit not contained")

@@ -118,7 +118,11 @@ func (p *EgressProxy) RegisterSandbox(hostIP, sandboxID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if r, ok := p.rules[hostIP]; ok {
-		r.SandboxID = sandboxID
+		if r.SandboxID != sandboxID {
+			copy := *r
+			copy.SandboxID = sandboxID
+			p.rules[hostIP] = &copy
+		}
 	} else {
 		p.rules[hostIP] = &EgressRules{SandboxID: sandboxID}
 	}
@@ -136,8 +140,13 @@ func (p *EgressProxy) SetRules(hostIP string, rules *EgressRules) {
 	defer p.mu.Unlock()
 	if rules == nil {
 		delete(p.rules, hostIP)
+	} else if current := p.rules[hostIP]; current != nil && current.SandboxID != "" && current.SandboxID == rules.SandboxID {
+		// Policy edits retain the registration identity used by mining attribution.
+		// Readers snapshot rules under this same lock.
+		*current = *rules
 	} else {
-		p.rules[hostIP] = rules
+		copy := *rules
+		p.rules[hostIP] = &copy
 	}
 }
 

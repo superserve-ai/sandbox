@@ -183,6 +183,8 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string, slot int)
 	if err := gate.SyncAssignments(source); err != nil {
 		t.Fatal(err)
 	}
+	// A policy update must not open a raw-packet attribution gap before refresh.
+	p.SetRules(sourceIP, &EgressRules{SandboxID: sandbox.String(), AllowedDomains: []string{"example.com"}})
 	if err := gate.UpdateCIDRs([]string{"203.0.113.9/32"}); err != nil {
 		t.Fatal(err)
 	}
@@ -337,6 +339,13 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string, slot int)
 		t.Fatalf("IP reuse falsely blocked new occupant: %v", err)
 	}
 	p.RegisterSandbox(sourceIP, sandbox.String())
+	if controller.Blocked(sandbox, sourceIP) {
+		t.Fatal("re-registration revived stale containment before refresh")
+	}
+	_, source.curBindings[sandbox] = p.miningRegistration(sourceIP)
+	if err := gate.SyncAssignments(source); err != nil {
+		t.Fatal(err)
+	}
 	if !controller.Blocked(sandbox, sourceIP) {
 		t.Fatal("containment missing before observer shutdown test")
 	}
