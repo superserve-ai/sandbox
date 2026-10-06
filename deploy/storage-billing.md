@@ -159,15 +159,28 @@ Shared paths retain their existing union semantics, split at new measurement
 eligibility boundaries. No endpoint averaging or historical catch-up is added.
 
 Legacy references are captured without rewriting the sandbox fleet. A template
-rebuild preserves its prior fallback for uncaptured old owners. New sandbox
-fallback capture requires matching pinned snapshot and memory paths. Template,
+rebuild preserves its prior fallback and original snapshot/memory pins for
+uncaptured old owners. A fallback is known only when those original pins match;
+a template rebuilt before capture cannot identify an older sandbox. A pause
+freezes the old reference decision before changing its runnable image paths.
+New sandbox fallback capture requires matching pinned snapshot and memory paths. Template,
 base, and delta pins cannot change after sandbox creation. Team migration
 materializes source references in both copy and checksum paths; retries retain
 the same authority. Reconstructing an unidentified path later cannot change a
-previously excluded interval.
+previously excluded interval. A retry refuses a preexisting destination close
+while the source close is mutable, or when its storage quantity or classification conflicts with a frozen
+source close, before copying period state. Quiesce billing writers and reconcile
+that destination operationally before retrying. Destination billing writers
+must remain stopped throughout copy and validation; the migration holds hourly
+rollups, but that hold alone does not stop manual closes or export workers.
+Initial imports and identical frozen retries are supported. Mutable or
+conflicting repeat imports require operational reconciliation and are refused
+before any destination writes.
 
 Hourly rollups persist the known subtotal separately from nullable full usage.
 Consumed export measurements and period close record nullable completeness;
-aggregates prioritize partial, then unclassified, then complete. Authoritative closed quantities and completeness remain unchanged, including
-imported historical rows. Observation caches still track legitimate corrections
-without changing settled quantities or exported events. This migration does not activate storage billing.
+aggregates prioritize partial, then unclassified, then complete. Authoritative
+closed quantities and completeness remain unchanged, including imported historical
+rows. Observation caches still track legitimate corrections without changing
+settled quantities or exported events. This migration does not activate storage
+billing.

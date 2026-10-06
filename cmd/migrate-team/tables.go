@@ -184,9 +184,9 @@ func tableByName(name string) (tableSpec, bool) {
 func sourceRowExpression(table string) string {
 	switch table {
 	case "template":
-		return `to_jsonb(t)||jsonb_build_object('legacy_storage_rootfs_ref',COALESCE(t.legacy_storage_rootfs_ref,jsonb_build_object('path',t.rootfs_path)))`
+		return `to_jsonb(t)||jsonb_build_object('legacy_storage_rootfs_ref',COALESCE(t.legacy_storage_rootfs_ref,jsonb_build_object('path',t.rootfs_path,'snapshot',t.snapshot_path,'mem',t.mem_path)))`
 	case "sandbox":
-		return `to_jsonb(t)||jsonb_build_object('legacy_storage_refs',legacy_storage_reference(t.template_id,t.base_path,t.delta_path,t.legacy_storage_refs))`
+		return `to_jsonb(t)||jsonb_build_object('legacy_storage_refs',legacy_storage_reference(t.template_id,t.base_path,t.delta_path,t.legacy_storage_refs,t.snapshot_path,t.mem_path))`
 	default:
 		return "to_jsonb(t)"
 	}

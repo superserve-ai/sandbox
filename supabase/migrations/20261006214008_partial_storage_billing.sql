@@ -2,25 +2,28 @@
 ALTER TABLE template ADD COLUMN legacy_storage_rootfs_ref jsonb;
 ALTER TABLE sandbox ADD COLUMN legacy_storage_refs jsonb;
 
-CREATE FUNCTION legacy_storage_reference(p_template uuid,p_base text,p_delta text,p_capture jsonb)
+CREATE FUNCTION legacy_storage_reference(p_template uuid,p_base text,p_delta text,p_capture jsonb,p_snapshot text DEFAULT NULL,p_mem text DEFAULT NULL)
 RETURNS jsonb LANGUAGE sql STABLE AS $$
  SELECT COALESCE(p_capture,jsonb_build_object('base',p_base,'delta',p_delta,
    'rootfs_fallback',CASE WHEN p_base IS NULL AND p_delta IS NULL THEN
-     (SELECT COALESCE(t.legacy_storage_rootfs_ref,jsonb_build_object('path',t.rootfs_path))->>'path'
-      FROM template t WHERE t.id=p_template) END))
+     (SELECT ref->>'path' FROM template t
+      CROSS JOIN LATERAL (SELECT COALESCE(t.legacy_storage_rootfs_ref,
+        jsonb_build_object('path',t.rootfs_path,'snapshot',t.snapshot_path,'mem',t.mem_path)) ref) capture
+      WHERE t.id=p_template AND NULLIF(p_snapshot,'') IS NOT NULL AND NULLIF(p_mem,'') IS NOT NULL
+        AND ref->>'snapshot'=p_snapshot AND ref->>'mem'=p_mem) END))
 $$;
 
 CREATE FUNCTION capture_legacy_template_reference() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF OLD.legacy_storage_rootfs_ref IS NOT NULL THEN
    NEW.legacy_storage_rootfs_ref:=OLD.legacy_storage_rootfs_ref;
- ELSIF NEW.legacy_storage_rootfs_ref IS NULL AND NEW.rootfs_path IS DISTINCT FROM OLD.rootfs_path THEN
-   NEW.legacy_storage_rootfs_ref:=jsonb_build_object('path',OLD.rootfs_path);
+ ELSIF NEW.legacy_storage_rootfs_ref IS NULL AND ROW(NEW.rootfs_path,NEW.snapshot_path,NEW.mem_path) IS DISTINCT FROM ROW(OLD.rootfs_path,OLD.snapshot_path,OLD.mem_path) THEN
+   NEW.legacy_storage_rootfs_ref:=jsonb_build_object('path',OLD.rootfs_path,'snapshot',OLD.snapshot_path,'mem',OLD.mem_path);
  END IF;
  RETURN NEW;
 END;
 $$;
-CREATE TRIGGER capture_legacy_template_reference BEFORE UPDATE OF rootfs_path,legacy_storage_rootfs_ref
+CREATE TRIGGER capture_legacy_template_reference BEFORE UPDATE OF rootfs_path,snapshot_path,mem_path,legacy_storage_rootfs_ref
 ON template FOR EACH ROW EXECUTE FUNCTION capture_legacy_template_reference();
 
 CREATE FUNCTION capture_legacy_sandbox_reference() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -38,11 +41,14 @@ BEGIN
    END IF;
  ELSIF OLD.legacy_storage_refs IS NOT NULL THEN
    NEW.legacy_storage_refs:=OLD.legacy_storage_refs;
+ ELSIF ROW(NEW.snapshot_path,NEW.mem_path) IS DISTINCT FROM ROW(OLD.snapshot_path,OLD.mem_path) THEN
+   NEW.legacy_storage_refs:=legacy_storage_reference(OLD.template_id,OLD.base_path,OLD.delta_path,
+     NULL,OLD.snapshot_path,OLD.mem_path);
  END IF;
  RETURN NEW;
 END;
 $$;
-CREATE TRIGGER capture_legacy_sandbox_reference BEFORE INSERT OR UPDATE OF template_id,base_path,delta_path,legacy_storage_refs
+CREATE TRIGGER capture_legacy_sandbox_reference BEFORE INSERT OR UPDATE OF template_id,base_path,delta_path,snapshot_path,mem_path,legacy_storage_refs
 ON sandbox FOR EACH ROW EXECUTE FUNCTION capture_legacy_sandbox_reference();
 
 ALTER TABLE team_billing_usage_hourly
@@ -61,7 +67,7 @@ RETURNS TABLE(known_mib_seconds numeric,complete boolean,blocked boolean) LANGUA
 WITH sandbox_refs AS MATERIALIZED (
  SELECT s.id,s.team_id,s.template_id,s.snapshot_id,s.destroyed_at,
   refs->>'base' base_path,refs->>'delta' delta_path,refs->>'rootfs_fallback' rootfs_ref
- FROM sandbox s CROSS JOIN LATERAL (SELECT legacy_storage_reference(s.template_id,s.base_path,s.delta_path,s.legacy_storage_refs) refs) capture
+ FROM sandbox s CROSS JOIN LATERAL (SELECT legacy_storage_reference(s.template_id,s.base_path,s.delta_path,s.legacy_storage_refs,s.snapshot_path,s.mem_path) refs) capture
  WHERE s.team_id=p_team
 ), bounds AS MATERIALIZED (
  SELECT LEAST(p_end,billing_request_now()) period_end,billing_request_now() request_now

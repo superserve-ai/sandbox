@@ -216,7 +216,7 @@ func TestIntegration_LegacyStorageReferenceAuthority(t *testing.T) {
 	stale := create("/older/snapshot", "/older/memory")
 	read := func(id uuid.UUID) *string {
 		var path *string
-		if err := testPool.QueryRow(t.Context(), `SELECT legacy_storage_reference(template_id,base_path,delta_path,legacy_storage_refs)->>'rootfs_fallback' FROM sandbox WHERE id=$1`, id).Scan(&path); err != nil {
+		if err := testPool.QueryRow(t.Context(), `SELECT legacy_storage_reference(template_id,base_path,delta_path,legacy_storage_refs,snapshot_path,mem_path)->>'rootfs_fallback' FROM sandbox WHERE id=$1`, id).Scan(&path); err != nil {
 			t.Fatal(err)
 		}
 		return path
@@ -238,6 +238,9 @@ func TestIntegration_LegacyStorageReferenceAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err = tx.Exec(t.Context(), `UPDATE sandbox SET legacy_storage_refs=NULL WHERE id=$1`, matched); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(t.Context(), `UPDATE template SET legacy_storage_rootfs_ref=NULL WHERE id=$1`, tpl); err != nil {
 		t.Fatal(err)
 	}
 	if err = tx.Commit(t.Context()); err != nil {
@@ -311,5 +314,66 @@ func TestIntegration_TemplateCreationCapturesStorageReferences(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestIntegration_UncapturedLegacyReferenceRequiresOriginalBuild(t *testing.T) {
+	for _, match := range []bool{false, true} {
+		t.Run(map[bool]string{false: "rebuilt-before-upgrade", true: "matching-before-upgrade"}[match], func(t *testing.T) {
+			team, _ := seedTeamAndKey(t)
+			start := time.Now().UTC().Add(-2 * time.Hour)
+			end := start.Add(time.Hour)
+			path := "/templates/" + team.String() + "/current.ext4"
+			snap, mem := path+".snap", path+".mem"
+			tpl := partialTemplate(t, team, &path)
+			storageExec(t, `UPDATE template SET snapshot_path=$2,mem_path=$3 WHERE id=$1`, tpl, snap, mem)
+			storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256) VALUES($1,'base.ext4',$2,1048576,1048576,repeat('0',64))`, tpl, path)
+			seedHistoricalTemplateEvidence(t, tpl, path, start)
+			owner := partialOwner(t, team, tpl, nil, 0, start, end)
+			if !match {
+				snap, mem = "/previous/vm.snap", "/previous/memory.snap"
+			}
+			// These are pre-upgrade rows: the template's current image may already
+			// differ from the image pinned by the old full-copy sandbox.
+			tx, err := testPool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(t.Context())
+			if _, err = tx.Exec(t.Context(), `SET LOCAL session_replication_role=replica`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(t.Context(), `UPDATE template SET legacy_storage_rootfs_ref=NULL WHERE id=$1`, tpl); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(t.Context(), `UPDATE sandbox SET legacy_storage_refs=NULL,snapshot_path=$2,mem_path=$3 WHERE id=$1`, owner, snap, mem); err != nil {
+				t.Fatal(err)
+			}
+			if err = tx.Commit(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			assertUsage := func() {
+				t.Helper()
+				var known pgtype.Numeric
+				var complete, blocked bool
+				if err := testPool.QueryRow(t.Context(), `SELECT * FROM storage_usage_detail($1,$2,$3,false)`, team, start, end).Scan(&known, &complete, &blocked); err != nil {
+					t.Fatal(err)
+				}
+				want := 0.0
+				if match {
+					want = 3600
+				}
+				if numericFloat64(t, known) != want || complete != match || blocked {
+					t.Fatalf("reference changed authority: known=%v complete=%v blocked=%v", known, complete, blocked)
+				}
+			}
+			assertUsage()
+			storageExec(t, `UPDATE template SET rootfs_path=$2,snapshot_path=$3,mem_path=$4 WHERE id=$1`, tpl, path+".next", path+".next.snap", path+".next.mem")
+			assertUsage()
+			// A pause replaces the runnable snapshot paths. It must preserve the old
+			// reference decision, even if the new paths happen to match the template.
+			storageExec(t, `UPDATE sandbox SET snapshot_path=$2,mem_path=$3 WHERE id=$1`, owner, path+".next.snap", path+".next.mem")
+			assertUsage()
+		})
 	}
 }

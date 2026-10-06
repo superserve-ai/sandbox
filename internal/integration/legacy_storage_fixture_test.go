@@ -45,7 +45,7 @@ func seedLegacyStoragePins(t *testing.T, ctx context.Context, query string, args
 		return pgconn.CommandTag{}, err
 	}
 	tag := rows.CommandTag()
-	if _, err = tx.Exec(ctx, `UPDATE sandbox SET legacy_storage_refs=legacy_storage_reference(template_id,base_path,delta_path,NULL) WHERE id=ANY($1::uuid[])`, ids); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE sandbox SET legacy_storage_refs=legacy_storage_reference(template_id,base_path,delta_path,NULL,snapshot_path,mem_path) WHERE id=ANY($1::uuid[])`, ids); err != nil {
 		return tag, err
 	}
 	return tag, tx.Commit(ctx)

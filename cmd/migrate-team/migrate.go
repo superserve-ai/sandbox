@@ -514,6 +514,61 @@ func checkTemplateAllocationCopySupported(ctx context.Context, src querier, team
 // into the dest.
 type rowTransform func(row map[string]any) error
 
+// A mutable source close can freeze after this read-committed check. Refuse
+// every overlap until the source is frozen and matches the destination; never
+// bypass normal close immutability to make a stale copy converge.
+func checkFrozenStorageUsageCopySupported(ctx context.Context, src, dst querier, teamID uuid.UUID) error {
+	rows, err := src.Query(ctx, `SELECT to_jsonb(u)||jsonb_build_object('source_frozen',
+ COALESCE(u.exported_at IS NOT NULL OR u.finalized_at IS NOT NULL
+ OR p.exported_at IS NOT NULL OR p.finalized_at IS NOT NULL OR p.status IN ('exporting','exported','finalized'),false))
+ FROM team_billing_usage u LEFT JOIN team_billing_period p USING(team_id,period_start,period_end)
+ WHERE u.team_id=$1`, teamID)
+	if err != nil {
+		return fmt.Errorf("check frozen storage copy: %w", err)
+	}
+	defer rows.Close()
+	batch := make([]json.RawMessage, 0, copyBatchSize)
+	check := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		payload, err := json.Marshal(batch)
+		if err != nil {
+			return err
+		}
+		var period string
+		err = dst.QueryRow(ctx, `SELECT d.period_start::text FROM team_billing_usage d
+ JOIN jsonb_to_recordset($1::jsonb) s(team_id uuid,period_start timestamptz,period_end timestamptz,
+ storage_mib_seconds numeric,storage_complete boolean,source_frozen boolean) USING(team_id,period_start,period_end)
+ WHERE NOT s.source_frozen OR ROW(d.storage_mib_seconds,d.storage_complete) IS DISTINCT FROM ROW(s.storage_mib_seconds,s.storage_complete)
+ LIMIT 1`, payload).Scan(&period)
+		if errors.Is(err, pgx.ErrNoRows) {
+			batch = batch[:0]
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("check destination frozen storage copy: %w", err)
+		}
+		return fmt.Errorf("refusing team migration: destination storage close for period %s cannot safely be recopied from a mutable or conflicting source close; quiesce billing writers and reconcile the destination through the approved operational process before retrying", period)
+	}
+	for rows.Next() {
+		var raw json.RawMessage
+		if err := rows.Scan(&raw); err != nil {
+			return err
+		}
+		batch = append(batch, raw)
+		if len(batch) == copyBatchSize {
+			if err := check(); err != nil {
+				return err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return check()
+}
+
 func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	// The window requires everything paused or destroyed. Hard-stop otherwise.
 	blockers, err := activeSandboxes(ctx, src, cfg.teamID)
@@ -552,6 +607,9 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	if err := checkTemplateAllocationCopySupported(ctx, src, cfg.teamID); err != nil {
 		return err
 	}
+	if err := checkFrozenStorageUsageCopySupported(ctx, src, dst, cfg.teamID); err != nil {
+		return err
+	}
 	// The dest host must exist and live in the dest region before any
 	// sandbox row points at it.
 	var hostRegion string
@@ -585,6 +643,9 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 		return err
 	}
 	if err := checkTemplateAllocationCopySupported(ctx, sourceTx, cfg.teamID); err != nil {
+		return err
+	}
+	if err := checkFrozenStorageUsageCopySupported(ctx, sourceTx, dst, cfg.teamID); err != nil {
 		return err
 	}
 	transforms, err := buildTransforms(ctx, sourceTx, dst, cfg)
@@ -1136,9 +1197,9 @@ func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (strin
 // so schema drift in either cell surfaces as a loud error instead of silent
 // truncation. Inserts upsert on the table's primary key (DO UPDATE with
 // every non-key column from EXCLUDED): re-runs CONVERGE the dest onto the
-// source's current content instead of skipping rows that already landed —
-// a retry after a partial copy must never preserve a stale dest row while
-// the source moved on (background writers keep running through the freeze).
+// source's current content instead of skipping rows that already landed.
+// Close snapshots are the exception: the preflight refuses mutable or
+// conflicting overlaps before destination writes, preserving billing guards.
 // Tables without a primary key fall back to DO NOTHING with a warning;
 // validate's per-row checksums remain the backstop either way.
 func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
