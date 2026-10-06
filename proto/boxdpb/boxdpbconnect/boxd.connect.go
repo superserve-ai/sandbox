@@ -67,6 +67,8 @@ const (
 	// DesktopServiceSendActionsProcedure is the fully-qualified name of the DesktopService's
 	// SendActions RPC.
 	DesktopServiceSendActionsProcedure = "/superserve.boxd.v1.DesktopService/SendActions"
+	// DesktopServiceStepProcedure is the fully-qualified name of the DesktopService's Step RPC.
+	DesktopServiceStepProcedure = "/superserve.boxd.v1.DesktopService/Step"
 	// DesktopServiceSendPointerProcedure is the fully-qualified name of the DesktopService's
 	// SendPointer RPC.
 	DesktopServiceSendPointerProcedure = "/superserve.boxd.v1.DesktopService/SendPointer"
@@ -440,6 +442,12 @@ type DesktopServiceClient interface {
 	// so no other input can interleave mid-batch. Execution stops at the first
 	// failing action; the error names its index, and later actions never run.
 	SendActions(context.Context, *connect.Request[boxdpb.ActionBatch]) (*connect.Response[boxdpb.ActionBatchResponse], error)
+	// Step executes an ordered action batch exactly as SendActions does, then
+	// captures the frame before releasing the input lock, so an agent turn is
+	// one round trip and the frame reflects exactly this batch. The frame is
+	// captured even when the batch stops at a failing action, so the caller
+	// can see the state its input left behind.
+	Step(context.Context, *connect.Request[boxdpb.StepRequest]) (*connect.Response[boxdpb.StepResponse], error)
 	// SendPointer moves the pointer and/or presses/releases/clicks a button.
 	SendPointer(context.Context, *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error)
 	// SendKey presses a key (optionally with modifiers) or types literal text.
@@ -481,6 +489,12 @@ func NewDesktopServiceClient(httpClient connect.HTTPClient, baseURL string, opts
 			connect.WithSchema(desktopServiceMethods.ByName("SendActions")),
 			connect.WithClientOptions(opts...),
 		),
+		step: connect.NewClient[boxdpb.StepRequest, boxdpb.StepResponse](
+			httpClient,
+			baseURL+DesktopServiceStepProcedure,
+			connect.WithSchema(desktopServiceMethods.ByName("Step")),
+			connect.WithClientOptions(opts...),
+		),
 		sendPointer: connect.NewClient[boxdpb.PointerEvent, boxdpb.PointerResponse](
 			httpClient,
 			baseURL+DesktopServiceSendPointerProcedure,
@@ -513,6 +527,7 @@ type desktopServiceClient struct {
 	screenshot  *connect.Client[boxdpb.ScreenshotRequest, boxdpb.ScreenshotResponse]
 	stream      *connect.Client[boxdpb.FrameConfig, boxdpb.Frame]
 	sendActions *connect.Client[boxdpb.ActionBatch, boxdpb.ActionBatchResponse]
+	step        *connect.Client[boxdpb.StepRequest, boxdpb.StepResponse]
 	sendPointer *connect.Client[boxdpb.PointerEvent, boxdpb.PointerResponse]
 	sendKey     *connect.Client[boxdpb.KeyEvent, boxdpb.KeyResponse]
 	scroll      *connect.Client[boxdpb.ScrollEvent, boxdpb.ScrollResponse]
@@ -532,6 +547,11 @@ func (c *desktopServiceClient) Stream(ctx context.Context, req *connect.Request[
 // SendActions calls superserve.boxd.v1.DesktopService.SendActions.
 func (c *desktopServiceClient) SendActions(ctx context.Context, req *connect.Request[boxdpb.ActionBatch]) (*connect.Response[boxdpb.ActionBatchResponse], error) {
 	return c.sendActions.CallUnary(ctx, req)
+}
+
+// Step calls superserve.boxd.v1.DesktopService.Step.
+func (c *desktopServiceClient) Step(ctx context.Context, req *connect.Request[boxdpb.StepRequest]) (*connect.Response[boxdpb.StepResponse], error) {
+	return c.step.CallUnary(ctx, req)
 }
 
 // SendPointer calls superserve.boxd.v1.DesktopService.SendPointer.
@@ -573,6 +593,12 @@ type DesktopServiceHandler interface {
 	// so no other input can interleave mid-batch. Execution stops at the first
 	// failing action; the error names its index, and later actions never run.
 	SendActions(context.Context, *connect.Request[boxdpb.ActionBatch]) (*connect.Response[boxdpb.ActionBatchResponse], error)
+	// Step executes an ordered action batch exactly as SendActions does, then
+	// captures the frame before releasing the input lock, so an agent turn is
+	// one round trip and the frame reflects exactly this batch. The frame is
+	// captured even when the batch stops at a failing action, so the caller
+	// can see the state its input left behind.
+	Step(context.Context, *connect.Request[boxdpb.StepRequest]) (*connect.Response[boxdpb.StepResponse], error)
 	// SendPointer moves the pointer and/or presses/releases/clicks a button.
 	SendPointer(context.Context, *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error)
 	// SendKey presses a key (optionally with modifiers) or types literal text.
@@ -610,6 +636,12 @@ func NewDesktopServiceHandler(svc DesktopServiceHandler, opts ...connect.Handler
 		connect.WithSchema(desktopServiceMethods.ByName("SendActions")),
 		connect.WithHandlerOptions(opts...),
 	)
+	desktopServiceStepHandler := connect.NewUnaryHandler(
+		DesktopServiceStepProcedure,
+		svc.Step,
+		connect.WithSchema(desktopServiceMethods.ByName("Step")),
+		connect.WithHandlerOptions(opts...),
+	)
 	desktopServiceSendPointerHandler := connect.NewUnaryHandler(
 		DesktopServiceSendPointerProcedure,
 		svc.SendPointer,
@@ -642,6 +674,8 @@ func NewDesktopServiceHandler(svc DesktopServiceHandler, opts ...connect.Handler
 			desktopServiceStreamHandler.ServeHTTP(w, r)
 		case DesktopServiceSendActionsProcedure:
 			desktopServiceSendActionsHandler.ServeHTTP(w, r)
+		case DesktopServiceStepProcedure:
+			desktopServiceStepHandler.ServeHTTP(w, r)
 		case DesktopServiceSendPointerProcedure:
 			desktopServiceSendPointerHandler.ServeHTTP(w, r)
 		case DesktopServiceSendKeyProcedure:
@@ -669,6 +703,10 @@ func (UnimplementedDesktopServiceHandler) Stream(context.Context, *connect.Reque
 
 func (UnimplementedDesktopServiceHandler) SendActions(context.Context, *connect.Request[boxdpb.ActionBatch]) (*connect.Response[boxdpb.ActionBatchResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("superserve.boxd.v1.DesktopService.SendActions is not implemented"))
+}
+
+func (UnimplementedDesktopServiceHandler) Step(context.Context, *connect.Request[boxdpb.StepRequest]) (*connect.Response[boxdpb.StepResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("superserve.boxd.v1.DesktopService.Step is not implemented"))
 }
 
 func (UnimplementedDesktopServiceHandler) SendPointer(context.Context, *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error) {
