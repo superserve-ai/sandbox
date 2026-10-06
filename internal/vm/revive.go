@@ -469,7 +469,7 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, 
 		inst.BackupGeneration = backupGeneration
 		seedRevivedRetainedDependencies(inst, prevRec)
 		inst.TeamID = prevRec.TeamID
-		inst.OwnerID = prevRec.OwnerID
+		restoreOwnershipFromRecord(inst, prevRec)
 		inst.PreviewAccess = prevRec.PreviewAccess
 		inst.PreviewPorts = previewPortsFromRecord(prevRec.PreviewPorts, prevRec.PreviewPortAccess, prevRec.PreviewPortTokenVersions)
 		inst.PreviewPolicyRevision = prevRec.PreviewPolicyRevision

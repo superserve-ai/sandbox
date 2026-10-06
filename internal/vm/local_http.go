@@ -115,8 +115,14 @@ type instanceResponse struct {
 }
 
 func ownershipState(machineOwned bool, principalID, ownerID string) string {
-	if machineOwned && principalID != "" {
-		return "machine"
+	if machineOwned {
+		// A machine attestation without its principal is not ordinary
+		// ownership. Treat malformed or incomplete attestation as unknown so
+		// the proxy fails closed instead of falling back to a creator owner.
+		if principalID != "" {
+			return "machine"
+		}
+		return "unknown"
 	}
 	if ownerID != "" {
 		return "ordinary"

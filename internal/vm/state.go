@@ -1109,6 +1109,22 @@ func toRecord(inst *VMInstance) VMRecord {
 	return toRecordLocked(inst)
 }
 
+// restoreOwnershipFromRecord carries the server-attested owner through a
+// human-triggered revive. Machine ownership is never converted into creator
+// ownership; an incomplete machine attestation remains fail-closed.
+func restoreOwnershipFromRecord(inst *VMInstance, rec *VMRecord) {
+	if inst == nil || rec == nil {
+		return
+	}
+	inst.MachineOwned = rec.MachineOwned
+	inst.MachineOwnerPrincipalID = rec.MachineOwnerPrincipalID
+	if rec.MachineOwned {
+		inst.OwnerID = ""
+		return
+	}
+	inst.OwnerID = rec.OwnerID
+}
+
 // toRecordLocked snapshots an instance while its caller holds inst.mu. It is
 // used when a state write must be serialized with the in-memory mutation.
 func toRecordLocked(inst *VMInstance) VMRecord {
