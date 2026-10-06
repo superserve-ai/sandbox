@@ -327,7 +327,12 @@ func loadDurableBuild(snapshotRoot, buildVMID string) (BuildStatusSnapshot, bool
 	if err != nil || !buildArtifactsPresent(res) {
 		return BuildStatusSnapshot{}, false
 	}
-	populateBuildAllocations(res)
+	if !res.AllocationsVerified {
+		// Legacy metadata has no persisted allocation fields. Preserve its
+		// numeric recovery behavior without upgrading it to verified evidence.
+		populateBuildAllocations(res)
+		res.AllocationsVerified = false
+	}
 	return BuildStatusSnapshot{
 		BuildVMID:  buildVMID,
 		TemplateID: filepath.Base(filepath.Dir(dir)),
@@ -358,9 +363,11 @@ func populateBuildAllocations(result *BuildTemplateResult) {
 	if result == nil {
 		return
 	}
-	result.RootfsAllocatedBytes = physicalAllocatedBytes(result.RootfsPath)
-	result.BaseAllocatedBytes = physicalAllocatedBytes(result.BasePath)
-	result.DeltaAllocatedBytes = physicalAllocatedBytes(result.DeltaPath)
+	var rootfsOK, baseOK, deltaOK bool
+	result.RootfsAllocatedBytes, rootfsOK = physicalAllocatedBytes(result.RootfsPath)
+	result.BaseAllocatedBytes, baseOK = physicalAllocatedBytes(result.BasePath)
+	result.DeltaAllocatedBytes, deltaOK = physicalAllocatedBytes(result.DeltaPath)
+	result.AllocationsVerified = result.RootfsPath != "" && rootfsOK && baseOK && deltaOK
 }
 
 // CancelBuild marks a build cancelled and signals its template-builder

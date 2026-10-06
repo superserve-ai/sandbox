@@ -211,7 +211,7 @@ func (s *BuildSupervisor) finalizeExecution(ctx context.Context, id uuid.UUID, a
 		return err
 	}
 	finalized, err := s.q.FinalizeTemplateBuild(ctx, id, a.ID, runtime,
-		result.RootfsAllocatedBytes, result.BaseAllocatedBytes, result.DeltaAllocatedBytes)
+		result.RootfsAllocatedBytes, result.BaseAllocatedBytes, result.DeltaAllocatedBytes, result.AllocationsVerified)
 	if err != nil || !finalized {
 		return err
 	}

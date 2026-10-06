@@ -110,3 +110,28 @@ Merging this implementation does not establish production readiness.
 
 Provider request contracts: [subscription item creation](https://docs.stripe.com/api/subscription_items/create)
 and [billing credit grants](https://docs.stripe.com/api/billing/credit-grant/object).
+
+### Template allocation evidence
+
+Apply the allocation-provenance migration before deploying the API or VMD
+binaries that send `allocations_verified`. The new API accepts old VMD build
+reports: a positive allocation remains usable, but a zero without the new
+capability remains unknown. Old API finalizers keep working against the new
+schema and cannot assert a measured zero. New VMD results persist the capability
+only after every declared allocation path was successfully measured; older
+persisted build results default to unverified. This does not change build
+readiness or the separate publication obligation.
+
+Template manifests record the asserting build/attempt and a database-owned
+eligibility time. Existing positive allocations retain their historical
+eligibility. Historical zero-valued manifests are unknown regardless of hash.
+New evidence, including a changed quantity on the same path, is eligible only
+prospectively. A publication with zero or unavailable allocation can preserve
+an existing measurement only for its exact build, attempt, and artifact path;
+it cannot certify zero on its own. Frozen usage and exported events are not
+rewritten, and this migration does not activate storage charging.
+
+Raw storage remains unknown when a relevant template allocation is unknown.
+Before activation, billing continues to show compute usage and charges with
+storage usage unavailable. After activation, the existing fail-closed storage
+billing behavior remains in place; partial billing is a separate change.

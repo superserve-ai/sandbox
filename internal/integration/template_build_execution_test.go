@@ -112,7 +112,7 @@ func finalizeExecution(t *testing.T, build uuid.UUID, a db.BuildAttempt) bool {
 	runtime := backup.TemplateRuntime{RootfsPath: root + "base.ext4", BasePath: root + "base.ext4",
 		SnapshotPath: root + "vmstate.snap", MemPath: root + "mem.snap", DeltaPath: root + "rootfs.delta", SizeBytes: 1024}
 	r, _ := json.Marshal(runtime)
-	ok, err := testQueries.FinalizeTemplateBuild(context.Background(), build, a.ID, r, 512, 256, 128)
+	ok, err := testQueries.FinalizeTemplateBuild(context.Background(), build, a.ID, r, 512, 256, 128, true)
 	if err != nil {
 		t.Fatal(err)
 	}

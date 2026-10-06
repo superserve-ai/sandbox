@@ -57,6 +57,7 @@ type BuildTemplateResult struct {
 	RootfsAllocatedBytes int64
 	BaseAllocatedBytes   int64
 	DeltaAllocatedBytes  int64
+	AllocationsVerified  bool
 }
 
 // BuildTemplate starts a template build asynchronously and returns the
@@ -321,6 +322,10 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 		return nil, fmt.Errorf("read build meta: %w", err)
 	}
 	populateBuildAllocations(result)
+	if err := writeBuildAllocations(snapshotDir, result); err != nil {
+		result.AllocationsVerified = false
+		log.Warn().Err(err).Msg("could not persist build allocation evidence")
+	}
 
 	// Best-effort: a missing access.log just means sandboxes restore
 	// without prefetch. The "build-" prefix must remain so isBuildVM
@@ -358,19 +363,19 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	return result, nil
 }
 
-func physicalAllocatedBytes(path string) int64 {
+func physicalAllocatedBytes(path string) (int64, bool) {
 	if path == "" {
-		return 0
+		return 0, true
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return 0
+		return 0, false
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0
+	if !ok || stat.Blocks < 0 {
+		return 0, false
 	}
-	return stat.Blocks * 512
+	return stat.Blocks * 512, true
 }
 
 // backupBuildArtifacts makes a finished build's artifact set durable: hash
@@ -824,25 +829,33 @@ func readBuildMetaJSON(snapshotDir string) (*BuildTemplateResult, error) {
 		return nil, err
 	}
 	var meta struct {
-		SnapshotPath   string `json:"snapshot_path"`
-		MemPath        string `json:"mem_path"`
-		RootfsPath     string `json:"rootfs_path"`
-		BasePath       string `json:"base_path"`
-		DeltaPath      string `json:"delta_path"`
-		ResolvedDigest string `json:"resolved_digest"`
-		SizeBytes      int64  `json:"size_bytes"`
+		SnapshotPath         string `json:"snapshot_path"`
+		MemPath              string `json:"mem_path"`
+		RootfsPath           string `json:"rootfs_path"`
+		BasePath             string `json:"base_path"`
+		DeltaPath            string `json:"delta_path"`
+		ResolvedDigest       string `json:"resolved_digest"`
+		SizeBytes            int64  `json:"size_bytes"`
+		RootfsAllocatedBytes int64  `json:"rootfs_allocated_bytes"`
+		BaseAllocatedBytes   int64  `json:"base_allocated_bytes"`
+		DeltaAllocatedBytes  int64  `json:"delta_allocated_bytes"`
+		AllocationsVerified  bool   `json:"allocations_verified"`
 	}
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, err
 	}
 	return &BuildTemplateResult{
-		SnapshotPath:   meta.SnapshotPath,
-		MemFilePath:    meta.MemPath,
-		RootfsPath:     meta.RootfsPath,
-		BasePath:       meta.BasePath,
-		DeltaPath:      meta.DeltaPath,
-		ResolvedDigest: meta.ResolvedDigest,
-		SizeBytes:      meta.SizeBytes,
+		SnapshotPath:         meta.SnapshotPath,
+		MemFilePath:          meta.MemPath,
+		RootfsPath:           meta.RootfsPath,
+		BasePath:             meta.BasePath,
+		DeltaPath:            meta.DeltaPath,
+		ResolvedDigest:       meta.ResolvedDigest,
+		SizeBytes:            meta.SizeBytes,
+		RootfsAllocatedBytes: meta.RootfsAllocatedBytes,
+		BaseAllocatedBytes:   meta.BaseAllocatedBytes,
+		DeltaAllocatedBytes:  meta.DeltaAllocatedBytes,
+		AllocationsVerified:  meta.AllocationsVerified,
 	}, nil
 }
 
@@ -863,12 +876,45 @@ type buildArtifactDigest struct {
 	SizeBytes int64  `json:"size_bytes"`
 }
 
+func writeBuildAllocations(snapshotDir string, result *BuildTemplateResult) error {
+	return updateBuildMeta(snapshotDir, func(meta map[string]json.RawMessage) error {
+		for key, value := range map[string]any{
+			"rootfs_allocated_bytes": result.RootfsAllocatedBytes,
+			"base_allocated_bytes":   result.BaseAllocatedBytes,
+			"delta_allocated_bytes":  result.DeltaAllocatedBytes,
+			"allocations_verified":   result.AllocationsVerified,
+		} {
+			raw, err := json.Marshal(value)
+			if err != nil {
+				return err
+			}
+			meta[key] = raw
+		}
+		return nil
+	})
+}
+
 // writeBuildDigests rewrites build.meta.json with an "artifacts" field
 // carrying the hashed artifact set. The document is edited as raw JSON so
 // every field template-builder wrote (including ones vmd does not model)
 // survives the round trip, and the replace is atomic so readers
 // (loadDurableBuild, the backup drain) never observe a torn file.
 func writeBuildDigests(snapshotDir string, entries []ManifestEntry) error {
+	return updateBuildMeta(snapshotDir, func(meta map[string]json.RawMessage) error {
+		digests := make([]buildArtifactDigest, 0, len(entries))
+		for _, e := range entries {
+			digests = append(digests, buildArtifactDigest{Name: e.FileName, SHA256: e.SHA256, SizeBytes: e.SizeBytes})
+		}
+		raw, err := json.Marshal(digests)
+		if err != nil {
+			return err
+		}
+		meta["artifacts"] = raw
+		return nil
+	})
+}
+
+func updateBuildMeta(snapshotDir string, update func(map[string]json.RawMessage) error) error {
 	path := filepath.Join(snapshotDir, buildMetaFilename)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -878,19 +924,9 @@ func writeBuildDigests(snapshotDir string, entries []ManifestEntry) error {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return fmt.Errorf("parse %s: %w", buildMetaFilename, err)
 	}
-	digests := make([]buildArtifactDigest, 0, len(entries))
-	for _, e := range entries {
-		digests = append(digests, buildArtifactDigest{
-			Name:      e.FileName,
-			SHA256:    e.SHA256,
-			SizeBytes: e.SizeBytes,
-		})
-	}
-	raw, err := json.Marshal(digests)
-	if err != nil {
+	if err := update(meta); err != nil {
 		return err
 	}
-	meta["artifacts"] = raw
 	out, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err

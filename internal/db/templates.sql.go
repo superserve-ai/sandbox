@@ -408,23 +408,28 @@ WHERE template.id = build_done.template_id
 RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at, template.base_path, template.delta_path
 ), artifacts AS (
 INSERT INTO artifact_manifest (
-    template_id, file_name, path, size_bytes, allocated_bytes, sha256
+    template_id, file_name, path, size_bytes, allocated_bytes, sha256,
+    allocation_measured_at, allocation_build_id
 )
 SELECT DISTINCT ON (a.path) updated.id, a.file_name, a.path, a.size_bytes, a.allocated_bytes,
-       repeat('0', 64)
+       repeat('0', 64),
+       CASE WHEN $8::boolean AND a.allocated_bytes>=0 THEN clock_timestamp() END,$1
 FROM updated
 CROSS JOIN LATERAL (
     VALUES
-        ('rootfs.ext4', updated.rootfs_path, COALESCE(updated.size_bytes, 0), $8::bigint),
-        ('base.ext4', updated.base_path, 0::bigint, $9::bigint),
-        ('delta.ext4', updated.delta_path, 0::bigint, $10::bigint)
+        ('rootfs.ext4', updated.rootfs_path, COALESCE(updated.size_bytes, 0), $9::bigint),
+        ('base.ext4', updated.base_path, 0::bigint, $10::bigint),
+        ('delta.ext4', updated.delta_path, 0::bigint, $11::bigint)
 ) AS a(file_name, path, size_bytes, allocated_bytes)
 WHERE a.path IS NOT NULL
 ORDER BY a.path, (a.file_name = 'rootfs.ext4') DESC
 ON CONFLICT (template_id, path) WHERE template_id IS NOT NULL DO UPDATE
 SET path = EXCLUDED.path,
     size_bytes = EXCLUDED.size_bytes,
-    allocated_bytes = EXCLUDED.allocated_bytes
+    allocated_bytes = EXCLUDED.allocated_bytes,
+    allocation_measured_at = EXCLUDED.allocation_measured_at,
+    allocation_build_id = EXCLUDED.allocation_build_id,
+    allocation_attempt_id = NULL
 RETURNING 1
 )
 SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM updated
@@ -438,6 +443,7 @@ type FinalizeBuildParams struct {
 	SizeBytes            *int64    `json:"size_bytes"`
 	BasePath             *string   `json:"base_path"`
 	DeltaPath            *string   `json:"delta_path"`
+	AllocationsVerified  bool      `json:"allocations_verified"`
 	RootfsAllocatedBytes int64     `json:"rootfs_allocated_bytes"`
 	BaseAllocatedBytes   int64     `json:"base_allocated_bytes"`
 	DeltaAllocatedBytes  int64     `json:"delta_allocated_bytes"`
@@ -481,6 +487,7 @@ func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (F
 		arg.SizeBytes,
 		arg.BasePath,
 		arg.DeltaPath,
+		arg.AllocationsVerified,
 		arg.RootfsAllocatedBytes,
 		arg.BaseAllocatedBytes,
 		arg.DeltaAllocatedBytes,
