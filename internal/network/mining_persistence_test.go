@@ -164,6 +164,68 @@ func TestMiningReceiptOrReconcileWinsOverLatePersistence(t *testing.T) {
 	}
 }
 
+func TestMiningDifferentAppliedReceiptWinsOverPendingObservation(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "submit-success", true: "submit-failure"}[fail], func(t *testing.T) {
+			c, s, g, _ := miningFixture()
+			p := s.p
+			entered := make(chan abuse.MiningIncident, 1)
+			release := make(chan struct{})
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			c.submit = miningSubmitFunc(func(i abuse.MiningIncident) error {
+				entered <- i
+				<-release
+				if fail {
+					return errors.New("storage unavailable")
+				}
+				return nil
+			})
+			conn, peer := net.Pipe()
+			defer conn.Close()
+			defer peer.Close()
+			done, allowed := c.Track(p.SandboxID, p.HostIP, conn)
+			defer done()
+			if !allowed {
+				t.Fatal("initial stream rejected")
+			}
+			result := make(chan bool, 1)
+			go func() { result <- c.Observe(p.SandboxID, p.HostIP, abuse.MiningEvidence{}) }()
+			pending := <-entered
+			applied := pending
+			applied.ID = uuid.New()
+			if err := c.Receipt(context.Background(), applied, abuse.IncidentReceipt{Disposition: abuse.IncidentApplied}); err != nil {
+				t.Fatal(err)
+			}
+			peer.SetReadDeadline(time.Now().Add(time.Second))
+			if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+				t.Fatalf("applied receipt did not close stream before Submit finished: %v", err)
+			}
+			close(release)
+			if !<-result || !c.Blocked(p.SandboxID, p.HostIP) || !g.on[p.HostIP] {
+				t.Fatal("late submission result lost authoritative containment")
+			}
+			if err := c.Receipt(context.Background(), pending, abuse.IncidentReceipt{Disposition: abuse.IncidentReleased}); err != nil {
+				t.Fatal(err)
+			}
+			if !c.Blocked(p.SandboxID, p.HostIP) {
+				t.Fatal("different incident release cleared applied containment")
+			}
+			if err := c.Receipt(context.Background(), applied, abuse.IncidentReceipt{Disposition: abuse.IncidentReleased}); err != nil {
+				t.Fatal(err)
+			}
+			if c.Blocked(p.SandboxID, p.HostIP) || g.on[p.HostIP] {
+				t.Fatal("owning receipt could not release containment")
+			}
+		})
+	}
+}
+
 func TestMiningPacketPersistenceQueueIsBoundedAndDoesNotWaitForStorage(t *testing.T) {
 	c, s, _, _ := miningFixture()
 	p := s.p

@@ -171,9 +171,14 @@ func (c *MiningContainment) completeObservation(i abuse.MiningIncident, err erro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	current, exists := c.incidents[ip]
-	if !exists || current.incident.ID != i.ID {
-		// A release, reconciliation, or replacement owns the current state now.
+	if !exists {
 		return false
+	}
+	if current.incident.ID != i.ID {
+		// Another durable receipt may now own the same assignment. The late
+		// local result cannot remove it or change a replacement assignment.
+		p, ok = c.source.MiningPolicy(id, ip)
+		return !current.pending && enforceMining(p, ok) && sameMiningAssignment(p, incidentPolicy(i)) && sameMiningAssignment(p, incidentPolicy(current.incident))
 	}
 	if !current.pending {
 		// An authoritative receipt may arrive before Submit returns. It already
@@ -257,13 +262,13 @@ func (c *MiningContainment) Receipt(_ context.Context, i abuse.MiningIncident, r
 	defer c.mu.Unlock()
 	p, ok := c.source.MiningPolicy(i.SandboxID, i.HostIP)
 	current, exists := c.incidents[i.HostIP]
-	if exists && current.incident.ID != i.ID {
+	keep := (r.Disposition == abuse.IncidentApplied || ((r.Disposition == abuse.IncidentReleased || r.Disposition == abuse.IncidentIgnored) && p.Restricted)) && enforceMining(p, ok) && sameMiningAssignment(p, incidentPolicy(i))
+	if exists && current.incident.ID != i.ID && !(r.Disposition == abuse.IncidentApplied && keep && sameMiningAssignment(p, incidentPolicy(current.incident))) {
 		if c.assignmentRetired(i) {
 			return abuse.ErrMiningLocalCleanupComplete
 		}
 		return nil
 	}
-	keep := (r.Disposition == abuse.IncidentApplied || ((r.Disposition == abuse.IncidentReleased || r.Disposition == abuse.IncidentIgnored) && p.Restricted)) && enforceMining(p, ok) && sameMiningAssignment(p, incidentPolicy(i))
 	if keep {
 		if err := c.gate.SetContained(i.HostIP, true); err != nil {
 			return err
