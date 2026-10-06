@@ -326,6 +326,22 @@ func TestIntegration_BillingStorageDoesNotCorrectPreActivationFrozenUsage(t *tes
 	for _, status := range []string{"exported", "finalized"} {
 		t.Run(status, func(t *testing.T) {
 			store, period := seedIncrementalPeriod(t)
+			// This settled quantity predates activation enforcement and must remain
+			// intact; ordinary new close writers correctly clip it to zero.
+			tx, err := testPool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(t.Context())
+			if _, err = tx.Exec(t.Context(), `SET LOCAL session_replication_role=replica`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(t.Context(), `UPDATE team_billing_usage SET storage_mib_seconds=3686400,storage_complete=NULL WHERE team_id=$1`, period.TeamID); err != nil {
+				t.Fatal(err)
+			}
+			if err = tx.Commit(t.Context()); err != nil {
+				t.Fatal(err)
+			}
 			storageExec(t, `UPDATE team_billing_account SET commercial_billing_anchor=$2 WHERE team_id=$1`, period.TeamID, period.Start)
 			storageExec(t, `INSERT INTO billing_export_observation(team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,counted_quantity,query_start,query_end) VALUES($1,$2,$3,'cpu',0,0,0,0,$2,$3)`, period.TeamID, period.Start, period.End)
 			storageExec(t, `UPDATE team_billing_usage SET exported_at=now(),finalized_at=CASE WHEN $2='finalized' THEN now() ELSE NULL END WHERE team_id=$1`, period.TeamID, status)
@@ -729,7 +745,7 @@ func TestIntegration_BillingStorageFractionalArtifactSettlement(t *testing.T) {
 			storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
                 SELECT id,'base.ext4',rootfs_path,1073745920,1073745920,repeat('0',64) FROM template WHERE team_id=$1`, p.TeamID)
 			seedHistoricalPositiveTeamAllocations(t, p.TeamID, p.Start)
-			storageExec(t, `UPDATE sandbox SET template_id=(SELECT id FROM template WHERE team_id=$1),base_path=(SELECT rootfs_path FROM template WHERE team_id=$1),created_at=$2,destroyed_at=NULL WHERE team_id=$1`, p.TeamID, p.Start)
+			seedLegacyStoragePinsExec(t, `UPDATE sandbox SET template_id=(SELECT id FROM template WHERE team_id=$1),base_path=(SELECT rootfs_path FROM template WHERE team_id=$1),created_at=$2,destroyed_at=NULL WHERE team_id=$1`, p.TeamID, p.Start)
 			storageExec(t, `UPDATE sandbox_storage_interval SET ended_at=NULL,end_reason=NULL WHERE team_id=$1`, p.TeamID)
 			payload := billing.ExportPayload{EventName: "storage_gib_hours", CustomerID: "cus_" + p.TeamID.String()}
 			accepted := new(big.Rat)
@@ -1031,7 +1047,7 @@ func TestIntegration_BillingStorageProviderRecovery(t *testing.T) {
 func seedMeasuredZeroLegacyBaseline(t *testing.T, sandboxID uuid.UUID) {
 	t.Helper()
 	path := "/example/empty-baseline/" + sandboxID.String() + "/rootfs.ext4"
-	storageExec(t, `UPDATE sandbox SET base_path=$2,delta_path=NULL WHERE id=$1`, sandboxID, path)
+	seedLegacyStoragePinsExec(t, `UPDATE sandbox SET base_path=$2,delta_path=NULL WHERE id=$1`, sandboxID, path)
 	storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
 		SELECT template_id,$2,$2,0,0,repeat('0',64) FROM sandbox WHERE id=$1`, sandboxID, path)
 	var template uuid.UUID

@@ -281,7 +281,7 @@ func TestPlatformBillingDeduplicatesSharedArtifactStorage(t *testing.T) {
 		if i == 2 {
 			deltaPathForSandbox = deltaPath
 		}
-		if _, err := testPool.Exec(ctx, `
+		if _, err := seedLegacyStoragePins(t, ctx, `
 			UPDATE sandbox
 			SET created_at = $2, base_path = $4, delta_path = NULLIF($5,'')
 			WHERE id = $1 AND team_id = $3

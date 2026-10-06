@@ -143,7 +143,7 @@ func (q *Queries) CountTemplatesForTeamPaged(ctx context.Context, arg CountTempl
 const createTemplate = `-- name: CreateTemplate :one
 INSERT INTO template (team_id, name, build_spec, vcpu, memory_mib, disk_mib)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path
+RETURNING id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, legacy_storage_rootfs_ref
 `
 
 type CreateTemplateParams struct {
@@ -189,6 +189,7 @@ func (q *Queries) CreateTemplate(ctx context.Context, arg CreateTemplateParams) 
 		&i.DeletedAt,
 		&i.BasePath,
 		&i.DeltaPath,
+		&i.LegacyStorageRootfsRef,
 	)
 	return i, err
 }
@@ -343,7 +344,7 @@ tpl_update AS (
     AND template.status IN ('pending', 'building')
   RETURNING template.id
 )
-SELECT t.id, t.team_id, t.name, t.status, t.build_spec, t.vcpu, t.memory_mib, t.disk_mib, t.rootfs_path, t.snapshot_path, t.mem_path, t.size_bytes, t.error_message, t.created_at, t.updated_at, t.built_at, t.deleted_at, t.base_path, t.delta_path
+SELECT t.id, t.team_id, t.name, t.status, t.build_spec, t.vcpu, t.memory_mib, t.disk_mib, t.rootfs_path, t.snapshot_path, t.mem_path, t.size_bytes, t.error_message, t.created_at, t.updated_at, t.built_at, t.deleted_at, t.base_path, t.delta_path, t.legacy_storage_rootfs_ref
 FROM target_build tb
 JOIN template t ON t.id = tb.template_id
 `
@@ -379,6 +380,7 @@ func (q *Queries) FailBuild(ctx context.Context, arg FailBuildParams) (Template,
 		&i.DeletedAt,
 		&i.BasePath,
 		&i.DeltaPath,
+		&i.LegacyStorageRootfsRef,
 	)
 	return i, err
 }
@@ -405,7 +407,7 @@ SET status = 'ready',
     error_message = NULL
 FROM build_done
 WHERE template.id = build_done.template_id
-RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at, template.base_path, template.delta_path
+RETURNING template.id, template.team_id, template.name, template.status, template.build_spec, template.vcpu, template.memory_mib, template.disk_mib, template.rootfs_path, template.snapshot_path, template.mem_path, template.size_bytes, template.error_message, template.created_at, template.updated_at, template.built_at, template.deleted_at, template.base_path, template.delta_path, template.legacy_storage_rootfs_ref
 ), artifacts AS (
 INSERT INTO artifact_manifest (
     template_id, file_name, path, size_bytes, allocated_bytes, sha256,
@@ -432,7 +434,7 @@ SET path = EXCLUDED.path,
     allocation_attempt_id = NULL
 RETURNING 1
 )
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM updated
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, legacy_storage_rootfs_ref FROM updated
 `
 
 type FinalizeBuildParams struct {
@@ -450,25 +452,26 @@ type FinalizeBuildParams struct {
 }
 
 type FinalizeBuildRow struct {
-	ID           uuid.UUID          `json:"id"`
-	TeamID       uuid.UUID          `json:"team_id"`
-	Name         string             `json:"name"`
-	Status       TemplateStatus     `json:"status"`
-	BuildSpec    []byte             `json:"build_spec"`
-	Vcpu         int32              `json:"vcpu"`
-	MemoryMib    int32              `json:"memory_mib"`
-	DiskMib      int32              `json:"disk_mib"`
-	RootfsPath   *string            `json:"rootfs_path"`
-	SnapshotPath *string            `json:"snapshot_path"`
-	MemPath      *string            `json:"mem_path"`
-	SizeBytes    *int64             `json:"size_bytes"`
-	ErrorMessage *string            `json:"error_message"`
-	CreatedAt    time.Time          `json:"created_at"`
-	UpdatedAt    time.Time          `json:"updated_at"`
-	BuiltAt      pgtype.Timestamptz `json:"built_at"`
-	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
-	BasePath     *string            `json:"base_path"`
-	DeltaPath    *string            `json:"delta_path"`
+	ID                     uuid.UUID          `json:"id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	Name                   string             `json:"name"`
+	Status                 TemplateStatus     `json:"status"`
+	BuildSpec              []byte             `json:"build_spec"`
+	Vcpu                   int32              `json:"vcpu"`
+	MemoryMib              int32              `json:"memory_mib"`
+	DiskMib                int32              `json:"disk_mib"`
+	RootfsPath             *string            `json:"rootfs_path"`
+	SnapshotPath           *string            `json:"snapshot_path"`
+	MemPath                *string            `json:"mem_path"`
+	SizeBytes              *int64             `json:"size_bytes"`
+	ErrorMessage           *string            `json:"error_message"`
+	CreatedAt              time.Time          `json:"created_at"`
+	UpdatedAt              time.Time          `json:"updated_at"`
+	BuiltAt                pgtype.Timestamptz `json:"built_at"`
+	DeletedAt              pgtype.Timestamptz `json:"deleted_at"`
+	BasePath               *string            `json:"base_path"`
+	DeltaPath              *string            `json:"delta_path"`
+	LegacyStorageRootfsRef []byte             `json:"legacy_storage_rootfs_ref"`
 }
 
 // Atomically transition template_build → ready and template → ready with
@@ -513,6 +516,7 @@ func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (F
 		&i.DeletedAt,
 		&i.BasePath,
 		&i.DeltaPath,
+		&i.LegacyStorageRootfsRef,
 	)
 	return i, err
 }
@@ -559,7 +563,7 @@ func (q *Queries) GetExistingInflightBuild(ctx context.Context, arg GetExistingI
 }
 
 const getTemplate = `-- name: GetTemplate :one
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, legacy_storage_rootfs_ref FROM template
 WHERE id = $1
   AND deleted_at IS NULL
   AND (team_id = $2 OR team_id = $3)
@@ -597,6 +601,7 @@ func (q *Queries) GetTemplate(ctx context.Context, arg GetTemplateParams) (Templ
 		&i.DeletedAt,
 		&i.BasePath,
 		&i.DeltaPath,
+		&i.LegacyStorageRootfsRef,
 	)
 	return i, err
 }
@@ -649,7 +654,7 @@ func (q *Queries) GetTemplateBuild(ctx context.Context, arg GetTemplateBuildPara
 }
 
 const getTemplateByName = `-- name: GetTemplateByName :one
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, legacy_storage_rootfs_ref FROM template
 WHERE name = $1
   AND deleted_at IS NULL
   AND (team_id = $2 OR team_id = $3)
@@ -689,12 +694,13 @@ func (q *Queries) GetTemplateByName(ctx context.Context, arg GetTemplateByNamePa
 		&i.DeletedAt,
 		&i.BasePath,
 		&i.DeltaPath,
+		&i.LegacyStorageRootfsRef,
 	)
 	return i, err
 }
 
 const getTemplateForOwner = `-- name: GetTemplateForOwner :one
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, legacy_storage_rootfs_ref FROM template
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
 `
 
@@ -728,6 +734,7 @@ func (q *Queries) GetTemplateForOwner(ctx context.Context, arg GetTemplateForOwn
 		&i.DeletedAt,
 		&i.BasePath,
 		&i.DeltaPath,
+		&i.LegacyStorageRootfsRef,
 	)
 	return i, err
 }
@@ -934,7 +941,7 @@ func (q *Queries) ListPendingBuildsOrdered(ctx context.Context, limit int32) ([]
 }
 
 const listTemplatesForTeamPaged = `-- name: ListTemplatesForTeamPaged :many
-SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path FROM template
+SELECT id, team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path, snapshot_path, mem_path, size_bytes, error_message, created_at, updated_at, built_at, deleted_at, base_path, delta_path, legacy_storage_rootfs_ref FROM template
 WHERE deleted_at IS NULL
   AND (
     ($1::text = 'all'    AND (team_id = $2 OR team_id = $3))
@@ -1021,6 +1028,7 @@ func (q *Queries) ListTemplatesForTeamPaged(ctx context.Context, arg ListTemplat
 			&i.DeletedAt,
 			&i.BasePath,
 			&i.DeltaPath,
+			&i.LegacyStorageRootfsRef,
 		); err != nil {
 			return nil, err
 		}

@@ -285,9 +285,11 @@ compute_usage AS (
 ),
 storage_usage AS (
  SELECT sp.team_id,
-        storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds,
+        CASE WHEN d.complete AND NOT d.blocked THEN d.known_mib_seconds END AS storage_mib_seconds,
+        CASE WHEN NOT d.blocked THEN d.known_mib_seconds END AS known_storage_mib_seconds,
+        CASE WHEN d.blocked THEN 'blocked' WHEN d.complete THEN 'complete' ELSE 'partial' END AS storage_measurement_status,
         billable_storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS billable_storage_mib_seconds
- FROM selected_plans sp
+ FROM selected_plans sp CROSS JOIN LATERAL storage_usage_detail(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) d
 ),
 credits AS (
 	SELECT
@@ -324,7 +326,7 @@ costed AS (
 		sp.*,
 		r.plan_name,
 		r.currency,
-		su.storage_mib_seconds,
+		su.storage_mib_seconds,su.known_storage_mib_seconds,su.storage_measurement_status,
 		su.billable_storage_mib_seconds,
 		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
@@ -341,7 +343,7 @@ costed AS (
 			  OR (storage_billing_activated(sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
 			  OR (storage_billing_activated(sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
-			WHEN su.storage_mib_seconds IS NULL
+			WHEN su.storage_measurement_status='blocked'
 			  OR (storage_billing_activated(sp.team_id) AND su.billable_storage_mib_seconds IS NULL)
 			THEN 'storage_unavailable'
 		END AS error_code
@@ -398,6 +400,8 @@ response_rows AS (
 				'credits_remaining_usd', credits_remaining_usd,
 				'expected_invoice_amount_usd', expected_invoice_amount_usd,
 				'storage_mib_seconds', storage_mib_seconds,
+				'known_storage_mib_seconds',known_storage_mib_seconds,
+				'storage_measurement_status',storage_measurement_status,
 				'cost_breakdown_usd', jsonb_build_object(
 					'compute', compute_usd,
 					'memory', memory_usd,
@@ -552,9 +556,11 @@ compute_usage AS (
 ),
 storage_usage AS (
  SELECT sp.team_id,
-        storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds,
+        CASE WHEN d.complete AND NOT d.blocked THEN d.known_mib_seconds END AS storage_mib_seconds,
+        CASE WHEN NOT d.blocked THEN d.known_mib_seconds END AS known_storage_mib_seconds,
+        CASE WHEN d.blocked THEN 'blocked' WHEN d.complete THEN 'complete' ELSE 'partial' END AS storage_measurement_status,
         billable_storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS billable_storage_mib_seconds
- FROM selected_plans sp
+ FROM selected_plans sp CROSS JOIN LATERAL storage_usage_detail(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) d
 ),
 credits AS (
 	SELECT
@@ -591,7 +597,7 @@ costed AS (
 		sp.*,
 		r.plan_name,
 		r.currency,
-		su.storage_mib_seconds,
+		su.storage_mib_seconds,su.known_storage_mib_seconds,su.storage_measurement_status,
 		su.billable_storage_mib_seconds,
 		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
@@ -608,7 +614,7 @@ costed AS (
 			  OR (storage_billing_activated(sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
 			  OR (storage_billing_activated(sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
-			WHEN su.storage_mib_seconds IS NULL
+			WHEN su.storage_measurement_status='blocked'
 			  OR (storage_billing_activated(sp.team_id) AND su.billable_storage_mib_seconds IS NULL)
 			THEN 'storage_unavailable'
 		END AS error_code
@@ -658,6 +664,8 @@ response_rows AS (
 				'credits_remaining_usd', credits_remaining_usd,
 				'expected_invoice_amount_usd', expected_invoice_amount_usd,
 				'storage_mib_seconds', storage_mib_seconds,
+				'known_storage_mib_seconds',known_storage_mib_seconds,
+				'storage_measurement_status',storage_measurement_status,
 				'cost_breakdown_usd', jsonb_build_object(
 					'compute', compute_usd,
 					'memory', memory_usd,

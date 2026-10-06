@@ -3937,6 +3937,7 @@ func billingTeamUsageFromUpsertRow(usage db.UpsertTeamBillingUsageRow) db.TeamBi
 		VcpuSeconds:       usage.VcpuSeconds,
 		MemoryMibSeconds:  usage.MemoryMibSeconds,
 		StorageMibSeconds: usage.StorageMibSeconds,
+		StorageComplete:   usage.StorageComplete,
 		FinalizedAt:       usage.FinalizedAt,
 		ExportedAt:        usage.ExportedAt,
 		UpdatedAt:         usage.UpdatedAt,
@@ -3944,7 +3945,7 @@ func billingTeamUsageFromUpsertRow(usage db.UpsertTeamBillingUsageRow) db.TeamBi
 }
 
 func billingTeamUsageFromReadRow(usage db.GetTeamBillingUsageRow) (db.TeamBillingUsage, error) {
-	if !usage.StorageGibSeconds.Valid || !usage.BillableStorageGibSeconds.Valid {
+	if !usage.BillableStorageGibSeconds.Valid {
 		return db.TeamBillingUsage{}, billing.ErrStorageUsageUnavailable
 	}
 	memoryGibSeconds, err := numericFloat64(usage.MemoryGibSeconds)
@@ -3962,6 +3963,7 @@ func billingTeamUsageFromReadRow(usage db.GetTeamBillingUsageRow) (db.TeamBillin
 		VcpuSeconds:       usage.VcpuSeconds,
 		MemoryMibSeconds:  numericFromFloat(memoryGibSeconds * 1024.0),
 		StorageMibSeconds: numericFromFloat(storageGibSeconds * 1024.0),
+		StorageComplete:   &usage.StorageComplete,
 	}, nil
 }
 

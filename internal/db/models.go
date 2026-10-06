@@ -414,16 +414,19 @@ type BillingExportMeasurement struct {
 	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
 	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
 	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
+	StorageComplete   *bool          `json:"storage_complete"`
 }
 
 type BillingExportMeasurementQueue struct {
-	TeamID            uuid.UUID          `json:"team_id"`
-	HourStart         time.Time          `json:"hour_start"`
-	Pending           bool               `json:"pending"`
-	HourEnd           pgtype.Timestamptz `json:"hour_end"`
-	VcpuSeconds       pgtype.Numeric     `json:"vcpu_seconds"`
-	MemoryMibSeconds  pgtype.Numeric     `json:"memory_mib_seconds"`
-	StorageMibSeconds pgtype.Numeric     `json:"storage_mib_seconds"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	HourStart              time.Time          `json:"hour_start"`
+	Pending                bool               `json:"pending"`
+	HourEnd                pgtype.Timestamptz `json:"hour_end"`
+	VcpuSeconds            pgtype.Numeric     `json:"vcpu_seconds"`
+	MemoryMibSeconds       pgtype.Numeric     `json:"memory_mib_seconds"`
+	StorageMibSeconds      pgtype.Numeric     `json:"storage_mib_seconds"`
+	KnownStorageMibSeconds pgtype.Numeric     `json:"known_storage_mib_seconds"`
+	StorageComplete        *bool              `json:"storage_complete"`
 }
 
 type BillingExportObservation struct {
@@ -451,6 +454,7 @@ type BillingExportUsage struct {
 	StorageMibSeconds   pgtype.Numeric     `json:"storage_mib_seconds"`
 	UpdatedAt           time.Time          `json:"updated_at"`
 	LastExportAttemptAt pgtype.Timestamptz `json:"last_export_attempt_at"`
+	StorageComplete     *bool              `json:"storage_complete"`
 }
 
 type BillingExportWork struct {
@@ -1012,8 +1016,9 @@ type Sandbox struct {
 	// Why the pause in flight was started (pause, timeout, billing_ineligible); kept so a reconciled pause records its original cause.
 	PauseOpTrigger *string `json:"pause_op_trigger"`
 	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
-	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
-	RoutingVersion int64       `json:"routing_version"`
+	PauseOpActorID    pgtype.UUID `json:"pause_op_actor_id"`
+	RoutingVersion    int64       `json:"routing_version"`
+	LegacyStorageRefs []byte      `json:"legacy_storage_refs"`
 	// Snapshot this sandbox was created from; NULL when created from a template.
 	SourceSnapshotID pgtype.UUID `json:"source_snapshot_id"`
 }
@@ -1386,16 +1391,19 @@ type TeamBillingUsage struct {
 	FinalizedAt       pgtype.Timestamptz `json:"finalized_at"`
 	ExportedAt        pgtype.Timestamptz `json:"exported_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+	StorageComplete   *bool              `json:"storage_complete"`
 }
 
 type TeamBillingUsageHourly struct {
-	TeamID            uuid.UUID      `json:"team_id"`
-	HourStart         time.Time      `json:"hour_start"`
-	HourEnd           time.Time      `json:"hour_end"`
-	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
-	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
-	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
-	UpdatedAt         time.Time      `json:"updated_at"`
+	TeamID                 uuid.UUID      `json:"team_id"`
+	HourStart              time.Time      `json:"hour_start"`
+	HourEnd                time.Time      `json:"hour_end"`
+	VcpuSeconds            pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryMibSeconds       pgtype.Numeric `json:"memory_mib_seconds"`
+	StorageMibSeconds      pgtype.Numeric `json:"storage_mib_seconds"`
+	UpdatedAt              time.Time      `json:"updated_at"`
+	KnownStorageMibSeconds pgtype.Numeric `json:"known_storage_mib_seconds"`
+	StorageComplete        *bool          `json:"storage_complete"`
 }
 
 type TeamCreationRequest struct {
@@ -1539,25 +1547,26 @@ type TelemetrySamplerLease struct {
 }
 
 type Template struct {
-	ID           uuid.UUID          `json:"id"`
-	TeamID       uuid.UUID          `json:"team_id"`
-	Name         string             `json:"name"`
-	Status       TemplateStatus     `json:"status"`
-	BuildSpec    []byte             `json:"build_spec"`
-	Vcpu         int32              `json:"vcpu"`
-	MemoryMib    int32              `json:"memory_mib"`
-	DiskMib      int32              `json:"disk_mib"`
-	RootfsPath   *string            `json:"rootfs_path"`
-	SnapshotPath *string            `json:"snapshot_path"`
-	MemPath      *string            `json:"mem_path"`
-	SizeBytes    *int64             `json:"size_bytes"`
-	ErrorMessage *string            `json:"error_message"`
-	CreatedAt    time.Time          `json:"created_at"`
-	UpdatedAt    time.Time          `json:"updated_at"`
-	BuiltAt      pgtype.Timestamptz `json:"built_at"`
-	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
-	BasePath     *string            `json:"base_path"`
-	DeltaPath    *string            `json:"delta_path"`
+	ID                     uuid.UUID          `json:"id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	Name                   string             `json:"name"`
+	Status                 TemplateStatus     `json:"status"`
+	BuildSpec              []byte             `json:"build_spec"`
+	Vcpu                   int32              `json:"vcpu"`
+	MemoryMib              int32              `json:"memory_mib"`
+	DiskMib                int32              `json:"disk_mib"`
+	RootfsPath             *string            `json:"rootfs_path"`
+	SnapshotPath           *string            `json:"snapshot_path"`
+	MemPath                *string            `json:"mem_path"`
+	SizeBytes              *int64             `json:"size_bytes"`
+	ErrorMessage           *string            `json:"error_message"`
+	CreatedAt              time.Time          `json:"created_at"`
+	UpdatedAt              time.Time          `json:"updated_at"`
+	BuiltAt                pgtype.Timestamptz `json:"built_at"`
+	DeletedAt              pgtype.Timestamptz `json:"deleted_at"`
+	BasePath               *string            `json:"base_path"`
+	DeltaPath              *string            `json:"delta_path"`
+	LegacyStorageRootfsRef []byte             `json:"legacy_storage_rootfs_ref"`
 }
 
 type TemplateBuild struct {

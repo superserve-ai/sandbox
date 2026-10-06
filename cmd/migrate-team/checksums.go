@@ -49,7 +49,7 @@ func rowChecksums(
 	transform rowTransform,
 ) (map[string]int, error) {
 	rows, err := pool.Query(ctx,
-		fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.effectiveCopyScope()), teamID)
+		fmt.Sprintf(`SELECT %s FROM %s t WHERE %s`, sourceRowExpression(t.name), t.name, t.effectiveCopyScope()), teamID)
 	if err != nil {
 		return nil, fmt.Errorf("checksum select %s: %w", t.name, err)
 	}
@@ -240,7 +240,7 @@ func contentDriftUnderLock(ctx context.Context, tx pgx.Tx, dst *pgxpool.Pool, cf
 	for _, chk := range checks {
 		srcSums := map[string]int{}
 		rows, err := tx.Query(ctx,
-			fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, chk.spec.name, chk.spec.effectiveCopyScope()), cfg.teamID)
+			fmt.Sprintf(`SELECT %s FROM %s t WHERE %s`, sourceRowExpression(chk.spec.name), chk.spec.name, chk.spec.effectiveCopyScope()), cfg.teamID)
 		if err != nil {
 			return "", fmt.Errorf("locked %s read: %w", chk.spec.name, err)
 		}

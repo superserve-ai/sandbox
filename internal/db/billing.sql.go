@@ -1054,7 +1054,7 @@ FROM recent_compute b
  UNION ALL SELECT started_at,COALESCE(ended_at,now()) FROM recent_retained WHERE started_at<now()
   ) intervals
 )
-SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 OR (SELECT count(*) FROM recent_retained)>1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated($1) THEN storage_mib_seconds($1::uuid,GREATEST((SELECT started_at FROM sample_window),(SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)),now())/1024.0*rates.storage ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
+SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 OR (SELECT count(*) FROM recent_retained)>1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated($1) THEN billable_storage_mib_seconds($1::uuid,GREATEST((SELECT started_at FROM sample_window),(SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)),now())/1024.0*rates.storage ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
        sample_bounds.started_at, sample_bounds.ended_at,
        EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
 FROM compute, rates, sample_bounds
@@ -1445,7 +1445,10 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(now(), $3)) > $2
 ),
 storage AS (
- SELECT storage_mib_seconds($1::uuid,$2::timestamptz,$3::timestamptz)::numeric AS storage_mib_seconds
+ SELECT CASE WHEN d.complete AND NOT d.blocked THEN d.known_mib_seconds END::numeric AS storage_mib_seconds,
+ CASE WHEN NOT d.blocked THEN d.known_mib_seconds END::numeric AS known_storage_mib_seconds,
+ d.complete::boolean AS storage_complete,d.blocked::boolean AS storage_blocked
+ FROM storage_usage_detail($1::uuid,$2::timestamptz,$3::timestamptz) d
 )
 SELECT
     $1::uuid AS team_id,
@@ -1454,6 +1457,8 @@ SELECT
     compute.vcpu_seconds,
     (compute.memory_mib_seconds / 1024.0)::numeric AS memory_gib_seconds,
     (storage.storage_mib_seconds / 1024.0)::numeric AS storage_gib_seconds,
+    (storage.known_storage_mib_seconds / 1024.0)::numeric AS known_storage_gib_seconds,
+    storage.storage_complete,storage.storage_blocked,
     (billable_storage_mib_seconds($1,$2,$3)/1024.0)::numeric AS billable_storage_gib_seconds
 FROM compute, storage
 `
@@ -1471,6 +1476,9 @@ type GetTeamBillingUsageRow struct {
 	VcpuSeconds               pgtype.Numeric `json:"vcpu_seconds"`
 	MemoryGibSeconds          pgtype.Numeric `json:"memory_gib_seconds"`
 	StorageGibSeconds         pgtype.Numeric `json:"storage_gib_seconds"`
+	KnownStorageGibSeconds    pgtype.Numeric `json:"known_storage_gib_seconds"`
+	StorageComplete           bool           `json:"storage_complete"`
+	StorageBlocked            bool           `json:"storage_blocked"`
 	BillableStorageGibSeconds pgtype.Numeric `json:"billable_storage_gib_seconds"`
 }
 
@@ -1485,13 +1493,16 @@ func (q *Queries) GetTeamBillingUsage(ctx context.Context, arg GetTeamBillingUsa
 		&i.VcpuSeconds,
 		&i.MemoryGibSeconds,
 		&i.StorageGibSeconds,
+		&i.KnownStorageGibSeconds,
+		&i.StorageComplete,
+		&i.StorageBlocked,
 		&i.BillableStorageGibSeconds,
 	)
 	return i, err
 }
 
 const getTeamBillingUsageRollup = `-- name: GetTeamBillingUsageRollup :one
-SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at
+SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at, storage_complete
 FROM team_billing_usage
 WHERE team_id = $1
   AND period_start = $2
@@ -1517,6 +1528,7 @@ func (q *Queries) GetTeamBillingUsageRollup(ctx context.Context, arg GetTeamBill
 		&i.FinalizedAt,
 		&i.ExportedAt,
 		&i.UpdatedAt,
+		&i.StorageComplete,
 	)
 	return i, err
 }
@@ -1541,10 +1553,12 @@ JOIN unnest($3::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
  GROUP BY b.bucket_start,b.bucket_end
 ), storage AS (
  SELECT b.bucket_start,b.bucket_end,
- storage_mib_seconds($1::uuid,b.bucket_start,b.bucket_end,false)::numeric AS storage_mib_seconds
- FROM buckets b
+ CASE WHEN d.complete AND NOT d.blocked THEN d.known_mib_seconds END::numeric AS storage_mib_seconds,
+ CASE WHEN NOT d.blocked THEN d.known_mib_seconds END::numeric AS known_storage_mib_seconds,
+ d.complete::boolean AS storage_complete,d.blocked::boolean AS storage_blocked
+ FROM buckets b CROSS JOIN LATERAL storage_usage_detail($1::uuid,b.bucket_start,b.bucket_end,false) d
 )
-SELECT $1::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(billable_storage_mib_seconds($1,c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
+SELECT $1::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(s.known_storage_mib_seconds/1024.0)::numeric known_storage_gib_seconds,s.storage_complete,s.storage_blocked,(billable_storage_mib_seconds($1,c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start
 `
 
@@ -1561,6 +1575,9 @@ type GetTeamBillingUsageSeriesRow struct {
 	VcpuSeconds               pgtype.Numeric `json:"vcpu_seconds"`
 	MemoryGibSeconds          pgtype.Numeric `json:"memory_gib_seconds"`
 	StorageGibSeconds         pgtype.Numeric `json:"storage_gib_seconds"`
+	KnownStorageGibSeconds    pgtype.Numeric `json:"known_storage_gib_seconds"`
+	StorageComplete           bool           `json:"storage_complete"`
+	StorageBlocked            bool           `json:"storage_blocked"`
 	BillableStorageGibSeconds pgtype.Numeric `json:"billable_storage_gib_seconds"`
 }
 
@@ -1581,6 +1598,9 @@ func (q *Queries) GetTeamBillingUsageSeries(ctx context.Context, arg GetTeamBill
 			&i.VcpuSeconds,
 			&i.MemoryGibSeconds,
 			&i.StorageGibSeconds,
+			&i.KnownStorageGibSeconds,
+			&i.StorageComplete,
+			&i.StorageBlocked,
 			&i.BillableStorageGibSeconds,
 		); err != nil {
 			return nil, err
@@ -2215,7 +2235,7 @@ func (q *Queries) ListTeamBillingPeriods(ctx context.Context, arg ListTeamBillin
 }
 
 const listTeamBillingUsageHourly = `-- name: ListTeamBillingUsageHourly :many
-SELECT team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, updated_at
+SELECT team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, updated_at, known_storage_mib_seconds, storage_complete
 FROM team_billing_usage_hourly
 WHERE team_id = $1
   AND feature_enabled('tenant_usage_dashboard', team_id)
@@ -2247,6 +2267,8 @@ func (q *Queries) ListTeamBillingUsageHourly(ctx context.Context, arg ListTeamBi
 			&i.MemoryMibSeconds,
 			&i.StorageMibSeconds,
 			&i.UpdatedAt,
+			&i.KnownStorageMibSeconds,
+			&i.StorageComplete,
 		); err != nil {
 			return nil, err
 		}
@@ -3919,7 +3941,8 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(now(), $1)) > $2
 ),
 storage AS (
- SELECT billable_storage_mib_seconds($3::uuid,$2::timestamptz,$1::timestamptz)::numeric AS storage_mib_seconds
+ SELECT CASE WHEN NOT d.blocked THEN d.known_mib_seconds END::numeric AS storage_mib_seconds,
+ d.complete::boolean AS storage_complete FROM billable_storage_usage_detail($3::uuid,$2::timestamptz,$1::timestamptz) d
 ),
 usage AS (
     SELECT
@@ -3928,13 +3951,13 @@ usage AS (
         $1::timestamptz AS period_end,
         compute.vcpu_seconds,
         compute.memory_mib_seconds,
-        storage.storage_mib_seconds
+        storage.storage_mib_seconds,storage.storage_complete
     FROM compute, storage
 ),
 upserted AS (
     INSERT INTO team_billing_usage (
         team_id, period_start, period_end,
-        vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+        vcpu_seconds, memory_mib_seconds, storage_mib_seconds, storage_complete
     )
     SELECT
         usage.team_id,
@@ -3942,7 +3965,7 @@ upserted AS (
         usage.period_end,
         usage.vcpu_seconds,
         usage.memory_mib_seconds,
-        usage.storage_mib_seconds
+        usage.storage_mib_seconds,usage.storage_complete
     FROM usage
     WHERE NOT EXISTS (
         SELECT 1
@@ -3962,12 +3985,13 @@ upserted AS (
     SET vcpu_seconds = EXCLUDED.vcpu_seconds,
         memory_mib_seconds = EXCLUDED.memory_mib_seconds,
         storage_mib_seconds = EXCLUDED.storage_mib_seconds,
+        storage_complete = EXCLUDED.storage_complete,
         updated_at = now()
     WHERE team_billing_usage.finalized_at IS NULL
       AND team_billing_usage.exported_at IS NULL
     RETURNING
         team_id, period_start, period_end,
-        vcpu_seconds, memory_mib_seconds, storage_mib_seconds,
+        vcpu_seconds, memory_mib_seconds, storage_mib_seconds, storage_complete,
         finalized_at, exported_at, updated_at
 ),
 immutable_existing AS (
@@ -3977,7 +4001,7 @@ immutable_existing AS (
         existing.period_end,
         existing.vcpu_seconds,
         existing.memory_mib_seconds,
-        existing.storage_mib_seconds,
+        existing.storage_mib_seconds,existing.storage_complete,
         existing.finalized_at,
         existing.exported_at,
         existing.updated_at
@@ -3993,9 +4017,9 @@ immutable_existing AS (
       )
       AND storage_reports_complete_through(existing.team_id, existing.period_end)
 )
-SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at FROM upserted
+SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, storage_complete, finalized_at, exported_at, updated_at FROM upserted
 UNION ALL
-SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at FROM immutable_existing
+SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, storage_complete, finalized_at, exported_at, updated_at FROM immutable_existing
 LIMIT 1
 `
 
@@ -4012,6 +4036,7 @@ type UpsertTeamBillingUsageRow struct {
 	VcpuSeconds       pgtype.Numeric     `json:"vcpu_seconds"`
 	MemoryMibSeconds  pgtype.Numeric     `json:"memory_mib_seconds"`
 	StorageMibSeconds pgtype.Numeric     `json:"storage_mib_seconds"`
+	StorageComplete   *bool              `json:"storage_complete"`
 	FinalizedAt       pgtype.Timestamptz `json:"finalized_at"`
 	ExportedAt        pgtype.Timestamptz `json:"exported_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
@@ -4029,6 +4054,7 @@ func (q *Queries) UpsertTeamBillingUsage(ctx context.Context, arg UpsertTeamBill
 		&i.VcpuSeconds,
 		&i.MemoryMibSeconds,
 		&i.StorageMibSeconds,
+		&i.StorageComplete,
 		&i.FinalizedAt,
 		&i.ExportedAt,
 		&i.UpdatedAt,
@@ -4058,7 +4084,9 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(billing_request_now(), $1)) > $2
 ),
 storage AS (
- SELECT storage_mib_seconds($3::uuid,$2::timestamptz,$1::timestamptz)::numeric AS storage_mib_seconds
+ SELECT CASE WHEN d.complete AND NOT d.blocked THEN d.known_mib_seconds END::numeric AS storage_mib_seconds,
+ d.known_mib_seconds::numeric AS known_storage_mib_seconds,d.complete::boolean AS storage_complete,d.blocked::boolean AS storage_blocked
+ FROM storage_usage_detail($3::uuid,$2::timestamptz,$1::timestamptz) d
 ),
 usage AS (
     SELECT
@@ -4067,15 +4095,15 @@ usage AS (
         $1::timestamptz AS hour_end,
         compute.vcpu_seconds,
         compute.memory_mib_seconds,
-        storage.storage_mib_seconds
+        storage.storage_mib_seconds,storage.known_storage_mib_seconds,storage.storage_complete
     FROM compute, storage
     WHERE feature_enabled('billing_hourly_rollups', $3::uuid)
       AND storage_reports_complete_through($3::uuid, $1::timestamptz)
-      AND storage.storage_mib_seconds IS NOT NULL
+      AND NOT storage.storage_blocked
 )
 INSERT INTO team_billing_usage_hourly (
     team_id, hour_start, hour_end,
-    vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+    vcpu_seconds, memory_mib_seconds, storage_mib_seconds,known_storage_mib_seconds,storage_complete
 )
 SELECT
     usage.team_id,
@@ -4083,15 +4111,16 @@ SELECT
     usage.hour_end,
     usage.vcpu_seconds,
     usage.memory_mib_seconds,
-    usage.storage_mib_seconds
+    usage.storage_mib_seconds,usage.known_storage_mib_seconds,usage.storage_complete
 FROM usage
 ON CONFLICT (team_id, hour_start) DO UPDATE
 SET hour_end = EXCLUDED.hour_end,
     vcpu_seconds = EXCLUDED.vcpu_seconds,
     memory_mib_seconds = EXCLUDED.memory_mib_seconds,
     storage_mib_seconds = EXCLUDED.storage_mib_seconds,
+    known_storage_mib_seconds=EXCLUDED.known_storage_mib_seconds,storage_complete=EXCLUDED.storage_complete,
     updated_at = now()
-RETURNING team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, updated_at
+RETURNING team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, updated_at, known_storage_mib_seconds, storage_complete
 `
 
 type UpsertTeamBillingUsageHourParams struct {
@@ -4111,6 +4140,8 @@ func (q *Queries) UpsertTeamBillingUsageHour(ctx context.Context, arg UpsertTeam
 		&i.MemoryMibSeconds,
 		&i.StorageMibSeconds,
 		&i.UpdatedAt,
+		&i.KnownStorageMibSeconds,
+		&i.StorageComplete,
 	)
 	return i, err
 }

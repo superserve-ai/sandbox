@@ -36,7 +36,7 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	if _, err := q.CreateSandboxSnapshot(ctx, params("mem+fs", nil)); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("snapshot of a starting sandbox: want no rows, got %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', base_path = '/base.ext4', disk_mib = 4096 WHERE id = $1`, sandboxID); err != nil {
+	if _, err := seedLegacyStoragePins(t, ctx, `UPDATE sandbox SET status = 'active', base_path = '/base.ext4', disk_mib = 4096 WHERE id = $1`, sandboxID); err != nil {
 		t.Fatal(err)
 	}
 	key := "deploy-1"

@@ -1491,8 +1491,8 @@ func testFrozenFractionalStorageReplay(t *testing.T, pool *pgxpool.Pool) {
 			exec(`INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) VALUES($1,$2,$2)`, team.ID, start)
 			exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'approved')`, team.ID, start, end)
 			exec(`INSERT INTO billing_incremental_period(team_id,period_start,period_end) VALUES($1,$2,$3)`, team.ID, start, end)
-			exec(`INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id,base_path,created_at,destroyed_at) VALUES($1,$2,'example-fractional','deleted',1,1024,'default',$3,$4,$5)`, sandbox, team.ID, path, start, start.Add(time.Hour))
 			exec(`INSERT INTO template(team_id,name,status,build_spec,vcpu,memory_mib,disk_mib,rootfs_path) VALUES($1,'example-fractional','ready','{}',1,1024,1024,$2)`, team.ID, path)
+			exec(`INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id,template_id,base_path,created_at,destroyed_at) VALUES($1,$2,'example-fractional','deleted',1,1024,'default',(SELECT id FROM template WHERE team_id=$2),$3,$4,$5)`, sandbox, team.ID, path, start, start.Add(time.Hour))
 			exec(`INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256) SELECT id,'base.ext4',rootfs_path,1073745920,1073745920,repeat('0',64) FROM template WHERE team_id=$1`, team.ID)
 			// This fixture represents a measurement already known in January.
 			// Ordinary runtime writes cannot backdate template eligibility.
@@ -1510,7 +1510,6 @@ func testFrozenFractionalStorageReplay(t *testing.T, pool *pgxpool.Pool) {
 			if err = tx.Commit(ctx); err != nil {
 				t.Fatal(err)
 			}
-			exec(`UPDATE sandbox SET template_id=(SELECT id FROM template WHERE team_id=$1) WHERE id=$2`, team.ID, sandbox)
 			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason) VALUES($1,$2,1024,$3,$4,'deleted')`, sandbox, team.ID, start, start.Add(time.Hour))
 			rollup := func() {
 				t.Helper()

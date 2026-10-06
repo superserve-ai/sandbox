@@ -1142,7 +1142,7 @@ func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (strin
 // Tables without a primary key fall back to DO NOTHING with a warning;
 // validate's per-row checksums remain the backstop either way.
 func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
-	selectQ := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.effectiveCopyScope())
+	selectQ := fmt.Sprintf(`SELECT %s FROM %s t WHERE %s`, sourceRowExpression(t.name), t.name, t.effectiveCopyScope())
 	conflict, err := conflictClause(ctx, dst, t.name)
 	if err != nil {
 		return 0, 0, err
