@@ -110,9 +110,9 @@ func NewMiningPacketGate(log zerolog.Logger) (*MiningPacketGate, error) {
 	if err = n.Flush(); err != nil {
 		return fail(err)
 	}
-	for start := 0; start < MaxSlots; start += 512 {
+	for start := 1; start <= MaxSlots; start += 512 {
 		elements := make([]nftables.SetElement, 0, 512)
-		for index := start; index < min(start+512, MaxSlots); index++ {
+		for index := start; index < min(start+512, MaxSlots+1); index++ {
 			key := make([]byte, 20)
 			copy(key, vethNameForSlot(index))
 			ip := netip.MustParseAddr(hostIPForSlot(index)).As4()
@@ -253,6 +253,20 @@ func (g *MiningPacketGate) SyncAssignments(source *HostMiningSource) error {
 	return nil
 }
 func (g *MiningPacketGate) Run(ctx context.Context, policy *blocklist.Blocklist, c *MiningContainment) error {
+	workerCtx, cancel := context.WithCancel(ctx)
+	pending := make(chan abuse.MiningIncident, 64)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		c.runPersistence(workerCtx, pending)
+	}()
+	defer func() {
+		// Unregister first so queue-bypass takes effect even if an in-flight
+		// spool write delays worker shutdown. Close still removes nft rules.
+		_ = g.queue.Close()
+		cancel()
+		<-workerDone
+	}()
 	var lastOverflow time.Time
 	for ctx.Err() == nil {
 		_ = g.queue.SetReadDeadline(time.Now().Add(time.Second))
@@ -287,7 +301,7 @@ func (g *MiningPacketGate) Run(ctx context.Context, policy *blocklist.Blocklist,
 						if c.Blocked(p.SandboxID, p.HostIP) {
 							verdict = 0
 						} else if evidence, hit := policy.MiningMatch("", dst); hit {
-							c.observeAssignment(p.SandboxID, p.HostIP, evidence, assignment.Assignment)
+							c.observeQueued(p.SandboxID, p.HostIP, evidence, assignment.Assignment, pending)
 							verdict = 0
 						}
 					}

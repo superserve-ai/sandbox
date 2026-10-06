@@ -23,7 +23,10 @@ type MiningGate interface {
 	SetContained(hostIP string, contained bool) error
 }
 
-type localMiningIncident struct{ incident abuse.MiningIncident }
+type localMiningIncident struct {
+	incident abuse.MiningIncident
+	pending  bool
+}
 type miningStream struct {
 	policy abuse.SandboxPolicy
 	conn   net.Conn
@@ -58,17 +61,74 @@ func incidentPolicy(i abuse.MiningIncident) abuse.SandboxPolicy {
 }
 
 // Observe runs after a private mining match, before the offending connection
-// can continue. A failed durable write rolls back tentative isolation.
+// can continue. Persistence runs outside the shared traffic lock. A failed
+// durable write rolls back its tentative gate without closing existing streams.
 func (c *MiningContainment) Observe(id uuid.UUID, ip string, evidence abuse.MiningEvidence) bool {
 	return c.observeAssignment(id, ip, evidence, "")
 }
 func (c *MiningContainment) observeAssignment(id uuid.UUID, ip string, evidence abuse.MiningEvidence, assignment string) bool {
+	i, reserved, blocked := c.reserveObservation(id, ip, evidence, assignment)
+	if !reserved {
+		return blocked
+	}
+	return c.persistObservation(i)
+}
+func (c *MiningContainment) persistObservation(i abuse.MiningIncident) bool {
+	return c.completeObservation(i, c.submit.Submit(i))
+}
+
+// Raw packet decisions cannot wait for spool I/O. One bounded worker drains
+// reservations; saturation rolls back only the new tentative reservation.
+func (c *MiningContainment) observeQueued(id uuid.UUID, ip string, evidence abuse.MiningEvidence, assignment string, queue chan<- abuse.MiningIncident) bool {
+	i, reserved, blocked := c.reserveObservation(id, ip, evidence, assignment)
+	if !reserved {
+		return blocked
+	}
+	select {
+	case queue <- i:
+		return true
+	default:
+		return c.completeObservation(i, fmt.Errorf("mining persistence queue full"))
+	}
+}
+func (c *MiningContainment) runPersistence(ctx context.Context, queue <-chan abuse.MiningIncident) {
+	// Run owns the producer and joins this worker before closing the gate.
+	// On shutdown queued reservations have never been persisted and must be
+	// rolled back; an in-flight durable write may finish but cannot close streams.
+	defer func() {
+		for {
+			select {
+			case i := <-queue:
+				c.completeObservation(i, context.Canceled)
+			default:
+				return
+			}
+		}
+	}()
+	for ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+			return
+		case i := <-queue:
+			if ctx.Err() != nil {
+				c.completeObservation(i, ctx.Err())
+				return
+			}
+			err := c.submit.Submit(i)
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			}
+			c.completeObservation(i, err)
+		}
+	}
+}
+func (c *MiningContainment) reserveObservation(id uuid.UUID, ip string, evidence abuse.MiningEvidence, assignment string) (abuse.MiningIncident, bool, bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	p, ok := c.source.MiningPolicy(id, ip)
 	if assignment != "" && p.Assignment != assignment {
 		c.observations.Unknown++
-		return false
+		c.mu.Unlock()
+		return abuse.MiningIncident{}, false, false
 	}
 	if !enforceMining(p, ok) {
 		switch {
@@ -81,28 +141,59 @@ func (c *MiningContainment) observeAssignment(id uuid.UUID, ip string, evidence 
 		default:
 			c.observations.Disabled++
 		}
-		return false
+		c.mu.Unlock()
+		return abuse.MiningIncident{}, false, false
 	}
-	if existing, ok := c.incidents[ip]; ok && sameMiningAssignment(p, incidentPolicy(existing.incident)) {
-		return true
+	if existing, exists := c.incidents[ip]; exists && sameMiningAssignment(p, incidentPolicy(existing.incident)) {
+		c.mu.Unlock()
+		return abuse.MiningIncident{}, false, true
 	}
 	if c.submit == nil || c.gate == nil {
-		return false
+		c.mu.Unlock()
+		return abuse.MiningIncident{}, false, false
 	}
 	if err := c.gate.SetContained(ip, true); err != nil {
 		c.observations.Failed++
-		return false
+		c.mu.Unlock()
+		return abuse.MiningIncident{}, false, false
 	}
 	i := abuse.MiningIncident{ID: uuid.New(), SandboxID: id, TeamID: p.TeamID, HostID: p.HostID, HostIP: ip, Assignment: p.Assignment, Generation: p.Generation, ObservedAt: time.Now().UTC(), Evidence: evidence}
-	c.incidents[ip] = localMiningIncident{incident: i}
-	c.observations.Contained++
-	c.closeStreamsLocked(p)
-	if err := c.submit.Submit(i); err != nil {
-		delete(c.incidents, ip)
-		_ = c.gate.SetContained(ip, false)
-		c.observations.Failed++
+	c.incidents[ip] = localMiningIncident{incident: i, pending: true}
+	c.mu.Unlock()
+
+	return i, true, true
+}
+func (c *MiningContainment) completeObservation(i abuse.MiningIncident, err error) bool {
+	id, ip := i.SandboxID, i.HostIP
+	var p abuse.SandboxPolicy
+	var ok bool
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	current, exists := c.incidents[ip]
+	if !exists || current.incident.ID != i.ID {
+		// A release, reconciliation, or replacement owns the current state now.
 		return false
 	}
+	if !current.pending {
+		// An authoritative receipt may arrive before Submit returns. It already
+		// made the current-state decision; a late local result must not undo it.
+		p, ok = c.source.MiningPolicy(id, ip)
+		return enforceMining(p, ok) && sameMiningAssignment(p, incidentPolicy(i))
+	}
+	p, ok = c.source.MiningPolicy(id, ip)
+	if err != nil || !enforceMining(p, ok) || !sameMiningAssignment(p, incidentPolicy(i)) {
+		delete(c.incidents, ip)
+		_ = c.gate.SetContained(ip, false)
+		if err != nil {
+			c.observations.Failed++
+		}
+		return false
+	}
+	current.pending = false
+	c.incidents[ip] = current
+	c.observations.Contained++
+	c.closeStreamsLocked(p)
 	return true
 }
 
@@ -129,7 +220,7 @@ func (c *MiningContainment) Track(id uuid.UUID, ip string, conn net.Conn) (func(
 		p.SandboxID = id
 		p.HostIP = ip
 	}
-	if i, exists := c.incidents[ip]; exists && enforceMining(p, ok) && sameMiningAssignment(p, incidentPolicy(i.incident)) {
+	if i, exists := c.incidents[ip]; exists && !i.pending && enforceMining(p, ok) && sameMiningAssignment(p, incidentPolicy(i.incident)) {
 		_ = conn.Close()
 		return func() {}, false
 	}

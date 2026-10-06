@@ -2,9 +2,11 @@ package network
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,10 +41,18 @@ func (s *kernelTestTeams) TeamPolicy(id uuid.UUID) abuse.TeamPolicy {
 // including the raw/forward paths missed by the web proxy.
 func TestMiningKernelContainmentTCPUDP(t *testing.T) {
 	for _, protocol := range []string{"udp", "tcp"} {
-		t.Run(protocol, func(t *testing.T) { testMiningKernelContainment(t, protocol) })
+		t.Run(protocol, func(t *testing.T) { testMiningKernelContainment(t, protocol, 2) })
 	}
 }
-func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
+func TestMiningKernelAllocatorBounds(t *testing.T) {
+	for _, slot := range []int{1, MaxSlots} {
+		t.Run(fmt.Sprintf("slot-%d", slot), func(t *testing.T) { testMiningKernelContainment(t, "udp", slot) })
+	}
+}
+func testMiningKernelContainment(t *testing.T, triggerProtocol string, slot int) {
+	sourceIP, forgedIP := hostIPForSlot(slot), hostIPForSlot(slot+1)
+	gateway := net.ParseIP(sourceIP).To4()
+	gateway[3] = 254
 	if os.Getenv("RUN_MINING_NETNS_TESTS") != "1" {
 		t.Skip("requires disposable Linux namespace with CAP_NET_ADMIN and CAP_SYS_ADMIN")
 	}
@@ -61,12 +71,12 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 		t.Fatal(err)
 	}
 	defer guest.Close()
-	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "veth-2"}, PeerName: "mining-peer"}
+	veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: vethNameForSlot(slot)}, PeerName: "mining-peer"}
 	if err := netlink.LinkAdd(veth); err != nil {
 		t.Fatal(err)
 	}
 	defer netlink.LinkDel(veth)
-	host, err := netlink.LinkByName("veth-2")
+	host, err := netlink.LinkByName(vethNameForSlot(slot))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +97,7 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 		}
 		t.Cleanup(func() { _ = netlink.AddrDel(link, a) })
 	}
-	addAddr(host, "10.11.0.1/24")
+	addAddr(host, gateway.String()+"/24")
 	if err := netlink.LinkSetUp(host); err != nil {
 		t.Fatal(err)
 	}
@@ -108,10 +118,10 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 		defer netns.Set(root)
 		link, err := netlink.LinkByName("mining-peer")
 		if err == nil {
-			addr, _ := netlink.ParseAddr("10.11.0.2/24")
+			addr, _ := netlink.ParseAddr(sourceIP + "/24")
 			err = netlink.AddrAdd(link, addr)
 			if err == nil {
-				forged, _ := netlink.ParseAddr("10.11.0.3/32")
+				forged, _ := netlink.ParseAddr(forgedIP + "/32")
 				err = netlink.AddrAdd(link, forged)
 			}
 		}
@@ -119,7 +129,7 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 			err = netlink.LinkSetUp(link)
 		}
 		if err == nil {
-			err = netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: net.ParseIP("10.11.0.1")})
+			err = netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: net.ParseIP(gateway.String())})
 		}
 		configure <- err
 	}()
@@ -159,12 +169,12 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 	p := NewEgressProxy(0, 0, 0, 10, zerolog.Nop())
 	sandbox, team := uuid.New(), uuid.New()
 	victim := uuid.New()
-	p.RegisterSandbox("10.11.0.3", victim.String())
-	p.RegisterSandbox("10.11.0.2", sandbox.String())
+	p.RegisterSandbox(forgedIP, victim.String())
+	p.RegisterSandbox(sourceIP, sandbox.String())
 	teams := &kernelTestTeams{id: team}
 	source := NewHostMiningSource(nil, teams, p, "host-test", "boot-test")
-	assignments := miningAssignments{sandbox: {TeamPolicy: abuse.TeamPolicy{TeamID: team}, SandboxID: sandbox, HostID: "host-test", HostIP: "10.11.0.2", Assignment: "assignment-one"}}
-	assignments[victim] = abuse.SandboxPolicy{TeamPolicy: abuse.TeamPolicy{TeamID: team}, SandboxID: victim, HostID: "host-test", HostIP: "10.11.0.3", Assignment: "assignment-victim"}
+	assignments := miningAssignments{sandbox: {TeamPolicy: abuse.TeamPolicy{TeamID: team}, SandboxID: sandbox, HostID: "host-test", HostIP: sourceIP, Assignment: "assignment-one"}}
+	assignments[victim] = abuse.SandboxPolicy{TeamPolicy: abuse.TeamPolicy{TeamID: team}, SandboxID: victim, HostID: "host-test", HostIP: forgedIP, Assignment: "assignment-victim"}
 	source.cur.Store(&assignments)
 	source.curBindings = make(map[uuid.UUID]*EgressRules)
 	for id, assignment := range assignments {
@@ -177,7 +187,12 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 		t.Fatal(err)
 	}
 	policy := blocklist.New(&blocklist.Config{CustomCIDRs: []string{"203.0.113.9/32"}}, zerolog.Nop())
-	submit := &miningTestSubmit{}
+	storageBlocked := make(chan struct{})
+	storageEntered := make(chan struct{}, 1)
+	var releaseStorage sync.Once
+	unblockStorage := func() { releaseStorage.Do(func() { close(storageBlocked) }) }
+	defer unblockStorage()
+	submit := miningSubmitFunc(func(abuse.MiningIncident) error { storageEntered <- struct{}{}; <-storageBlocked; return nil })
 	controller := NewMiningContainment(source, gate, submit, zerolog.Nop())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -242,13 +257,13 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 		if _, _, err := blockedDestination.ReadFrom(make([]byte, 20)); err == nil {
 			t.Fatal("independent mining destination deny bypassed")
 		}
-		if controller.Blocked(sandbox, "10.11.0.2") {
+		if controller.Blocked(sandbox, sourceIP) {
 			t.Fatal("trusted/off/observe traffic triggered containment")
 		}
 	}
 	teams.trusted.Store(false)
 	teams.mode.Store(0)
-	spoof, err := dialFrom("udp", "203.0.113.9:45454", "10.11.0.3")
+	spoof, err := dialFrom("udp", "203.0.113.9:45454", forgedIP)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +272,7 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 	}
 	spoof.Close()
 	time.Sleep(100 * time.Millisecond)
-	if controller.Blocked(victim, "10.11.0.3") || controller.Blocked(sandbox, "10.11.0.2") {
+	if controller.Blocked(victim, forgedIP) || controller.Blocked(sandbox, sourceIP) {
 		t.Fatal("spoofed source triggered quarantine")
 	}
 	mining, err := dial(triggerProtocol, "203.0.113.9:45454")
@@ -275,16 +290,21 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
-	for !controller.Blocked(sandbox, "10.11.0.2") && time.Now().Before(deadline) {
+	for !controller.Blocked(sandbox, sourceIP) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if !controller.Blocked(sandbox, "10.11.0.2") {
+	if !controller.Blocked(sandbox, sourceIP) {
 		select {
 		case err := <-done:
 			t.Fatalf("observer stopped: %v", err)
 		default:
 			t.Fatal("direct mining hit did not contain")
 		}
+	}
+	select {
+	case <-storageEntered:
+	case <-time.After(time.Second):
+		t.Fatal("incident worker did not start")
 	}
 	if _, err := mirror.Write([]byte("b")); err != nil {
 		t.Fatal(err)
@@ -305,9 +325,10 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 		t.Fatal("new TCP mirror bypassed containment")
 	}
 	// The set is intentionally still present. A replacement occupant must pass
-	// even before background cleanup, proving stale-IP safety in the kernel.
+	// even before background cleanup and while Submit remains blocked. This
+	// proves that slow storage does not stall unrelated queued packet verdicts.
 	replacement := uuid.New()
-	p.RegisterSandbox("10.11.0.2", replacement.String())
+	p.RegisterSandbox(sourceIP, replacement.String())
 	if _, err := mirror.Write([]byte("c")); err != nil {
 		t.Fatal(err)
 	}
@@ -315,22 +336,42 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string) {
 	if _, _, err := udp.ReadFrom(make([]byte, 1)); err != nil {
 		t.Fatalf("IP reuse falsely blocked new occupant: %v", err)
 	}
-	p.RegisterSandbox("10.11.0.2", sandbox.String())
-	if !controller.Blocked(sandbox, "10.11.0.2") {
-		t.Fatal("containment missing before queue failure test")
+	p.RegisterSandbox(sourceIP, sandbox.String())
+	if !controller.Blocked(sandbox, sourceIP) {
+		t.Fatal("containment missing before observer shutdown test")
 	}
-	_ = gate.queue.Close()
+	// Cancellation stops packet decisions, but Run must remain joined to its
+	// blocked persistence worker. Its queue must already be unregistered so
+	// bypass works before either the write or Run can finish.
+	cancel()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if _, err := mirror.Write([]byte("d")); err != nil {
+			t.Fatal(err)
+		}
+		udp.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if _, _, err := udp.ReadFrom(make([]byte, 1)); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("observer shutdown waited for storage before enabling queue bypass")
+		}
+	}
 	select {
 	case <-done:
+		t.Fatal("observer abandoned its blocked persistence worker")
+	default:
+	}
+	unblockStorage()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("observer cancellation: %v", err)
+		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("observer did not exit")
+		t.Fatal("observer did not exit after storage completed")
 	}
-	if _, err := mirror.Write([]byte("d")); err != nil {
-		t.Fatal(err)
+	if controller.Blocked(sandbox, sourceIP) {
+		t.Fatal("late storage completion restored cancelled containment")
 	}
-	udp.SetReadDeadline(time.Now().Add(time.Second))
-	if _, _, err := udp.ReadFrom(make([]byte, 1)); err != nil {
-		t.Fatalf("dead queue listener did not fail open: %v", err)
-	}
-	cancel()
 }
