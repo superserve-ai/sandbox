@@ -135,3 +135,9 @@ Raw storage remains unknown when a relevant template allocation is unknown.
 Before activation, billing continues to show compute usage and charges with
 storage usage unavailable. After activation, the existing fail-closed storage
 billing behavior remains in place; partial billing is a separate change.
+
+The team migration tool refuses to copy team-owned template manifests with
+known allocations or measurement evidence. Its generic insert path cannot
+preserve their original eligibility timestamps. The refusal occurs before
+source fencing or destination copying; keep the evidence intact. Faithful
+transfer requires separate migration support.
