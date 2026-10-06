@@ -106,6 +106,90 @@ func recordExecution(t *testing.T, a db.BuildAttempt) bool {
 	return ok
 }
 
+func finalizeExecution(t *testing.T, build uuid.UUID, a db.BuildAttempt) bool {
+	t.Helper()
+	root := "/artifacts/" + a.TemplateID.String() + "/" + a.VMID + "/"
+	runtime := backup.TemplateRuntime{RootfsPath: root + "base.ext4", BasePath: root + "base.ext4",
+		SnapshotPath: root + "vmstate.snap", MemPath: root + "mem.snap", DeltaPath: root + "rootfs.delta", SizeBytes: 1024}
+	r, _ := json.Marshal(runtime)
+	ok, err := testQueries.FinalizeTemplateBuild(context.Background(), build, a.ID, r, 512, 256, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
+func TestIntegration_TemplateIsServableBeforeItsUpload(t *testing.T) {
+	ctx := context.Background()
+	b, cell := executionFixture(t)
+	executionHost(t, cell, "active")
+	a := claimExecution(t, b, cell)
+	admitExecution(t, a)
+	if !finalizeExecution(t, b.ID, a) {
+		t.Fatal("finalize rejected a reported build")
+	}
+	var status, rootfs string
+	if err := testPool.QueryRow(ctx, `SELECT t.status,COALESCE(t.rootfs_path,'') FROM template t
+ JOIN template_build b ON b.template_id=t.id WHERE b.id=$1`, b.ID).Scan(&status, &rootfs); err != nil {
+		t.Fatal(err)
+	}
+	if status != "ready" || rootfs == "" {
+		t.Fatalf("template not servable before its upload: %s %q", status, rootfs)
+	}
+	// The upload lands afterwards and banks durability on its own report.
+	if !recordExecution(t, a) {
+		t.Fatal("publication rejected after readiness")
+	}
+	var accepted bool
+	var sha string
+	if err := testPool.QueryRow(ctx, `SELECT p.accepted_at IS NOT NULL,
+ (SELECT am.sha256 FROM artifact_manifest am WHERE am.template_id=p.template_id AND am.path=$2)
+ FROM template_build_publication p WHERE p.build_id=$1`, b.ID,
+		"/artifacts/"+a.TemplateID.String()+"/"+a.VMID+"/base.ext4").Scan(&accepted, &sha); err != nil {
+		t.Fatal(err)
+	}
+	if !accepted || sha != "1111111111111111111111111111111111111111111111111111111111111111" {
+		t.Fatalf("late report did not bank durability: accepted=%v sha=%s", accepted, sha)
+	}
+}
+
+func TestIntegration_AnOlderReportCannotDisplaceANewerTemplate(t *testing.T) {
+	ctx := context.Background()
+	older, cell := executionFixture(t)
+	executionHost(t, cell, "active")
+	// Resources are edited while the first build runs, so the second carries a
+	// distinct canonical input and a higher revision.
+	if _, err := testPool.Exec(ctx, `UPDATE template SET vcpu=vcpu+1 WHERE id=$1`, older.TemplateID); err != nil {
+		t.Fatal(err)
+	}
+	newer, err := testQueries.CreateTemplateBuild(ctx, db.CreateTemplateBuildParams{
+		TemplateID: older.TemplateID, TeamID: older.TeamID, BuildSpecHash: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newerAttempt := claimExecution(t, newer, cell)
+	admitExecution(t, newerAttempt)
+	olderAttempt := claimExecution(t, older, cell)
+	admitExecution(t, olderAttempt)
+
+	if !finalizeExecution(t, newer.ID, newerAttempt) {
+		t.Fatal("newer build was refused")
+	}
+	wanted := "/artifacts/" + newerAttempt.TemplateID.String() + "/" + newerAttempt.VMID + "/base.ext4"
+	// Neither upload has been accepted yet, so the older report must still lose.
+	if finalizeExecution(t, older.ID, olderAttempt) {
+		t.Fatal("older build displaced a newer promoted template")
+	}
+	var rootfs string
+	if err := testPool.QueryRow(ctx, `SELECT COALESCE(rootfs_path,'') FROM template WHERE id=$1`,
+		older.TemplateID).Scan(&rootfs); err != nil {
+		t.Fatal(err)
+	}
+	if rootfs != wanted {
+		t.Fatalf("template points at the superseded build: got %q want %q", rootfs, wanted)
+	}
+}
+
 func TestIntegration_BuildStatusExposesExecutionMetadata(t *testing.T) {
 	ctx := context.Background()
 	b, cell := executionFixture(t)
@@ -671,7 +755,7 @@ func TestIntegration_BuildThreeAttemptsAndImmutableInputIdentity(t *testing.T) {
 		t.Fatal("mixed hash formats duplicated logical build")
 	}
 }
-func TestIntegration_BuildReadyRequiresPublication(t *testing.T) {
+func TestIntegration_BuildReadyRequiresFinalizedAttempt(t *testing.T) {
 	b, cell := executionFixture(t)
 	executionHost(t, cell, "active")
 	a := claimExecution(t, b, cell)
@@ -680,7 +764,7 @@ func TestIntegration_BuildReadyRequiresPublication(t *testing.T) {
 		t.Fatal("accepted local-only build")
 	}
 	if _, err := testPool.Exec(context.Background(), `UPDATE template_build SET status='ready' WHERE id=$1`, b.ID); err == nil {
-		t.Fatal("old finalizer bypassed durable gate")
+		t.Fatal("old finalizer bypassed the promotion gate")
 	}
 	if _, err := testQueries.TransitionBuildAttempt(context.Background(), b.ID, &a.ID, "uploading", ""); err != nil {
 		t.Fatal(err)

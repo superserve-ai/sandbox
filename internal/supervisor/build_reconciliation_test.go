@@ -29,6 +29,10 @@ type reconciliationDB struct {
 	now                         time.Time
 	hostLost                    bool
 	publication                 bool
+	finalized                   bool
+	finalizeCalls               int
+	acceptCalls                 int
+	firstStarted                *time.Time
 	transitions                 []string
 	recorded                    bool
 	claimAvailable              bool
@@ -49,7 +53,11 @@ func (m *reconciliationDB) Query(context.Context, string, ...interface{}) (pgx.R
 func (m *reconciliationDB) QueryRow(_ context.Context, sql string, args ...interface{}) pgx.Row {
 	switch {
 	case strings.Contains(sql, "FROM template_build_execution e"):
-		return reconciliationRow{values: []any{m.buildID, m.current, (*string)(nil), &m.now, "", len(m.attempts), m.publication, ""}}
+		first := m.firstStarted
+		if first == nil {
+			first = &m.now
+		}
+		return reconciliationRow{values: []any{m.buildID, m.current, (*string)(nil), first, "", len(m.attempts), m.publication, "", m.finalized}}
 	case strings.Contains(sql, "SELECT template_id,created_at,now()"):
 		return reconciliationRow{values: []any{m.templateID, m.now.Add(-time.Minute), m.now}}
 	case strings.Contains(sql, "SELECT claim_template_build"):
@@ -86,6 +94,11 @@ func (m *reconciliationDB) QueryRow(_ context.Context, sql string, args ...inter
 		m.publication = true
 		return reconciliationRow{values: []any{true}}
 	case strings.Contains(sql, "SELECT accept_template_publication"):
+		m.acceptCalls++
+		return reconciliationRow{values: []any{true}}
+	case strings.Contains(sql, "SELECT finalize_template_build"):
+		m.finalizeCalls++
+		m.finalized = true
 		return reconciliationRow{values: []any{true}}
 	case strings.Contains(sql, "SELECT template_id,team_id FROM template_build"):
 		return reconciliationRow{values: []any{m.templateID, m.teamID}}
@@ -333,5 +346,235 @@ func TestReconcileExecutionRecordsDurableManifestBeforeHostRetry(t *testing.T) {
 	}
 	if !m.recorded || len(m.transitions) != 0 || m.current == nil {
 		t.Fatalf("recorded=%v transitions=%v current=%v", m.recorded, m.transitions, m.current)
+	}
+}
+
+func readyBuildStatus() vmdclient.BuildStatusResult {
+	return vmdclient.BuildStatusResult{Status: "ready", AllocatedBytesSupported: true,
+		RootfsPath: "/snapshots/example/rootfs.ext4", SnapshotPath: "/snapshots/example/snapshot",
+		MemFilePath: "/snapshots/example/mem", SizeBytes: 4096, RootfsAllocatedBytes: 2048,
+		ResolvedDigest: "sha256:example"}
+}
+
+func TestReportedArtifactsMakeTheTemplateReadyWithoutAnUpload(t *testing.T) {
+	s, m, v := newReconciliationFixture()
+	v.result = readyBuildStatus()
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	if m.finalizeCalls != 1 || m.publication {
+		t.Fatalf("finalizeCalls=%d publication=%v", m.finalizeCalls, m.publication)
+	}
+	for _, action := range m.transitions {
+		if action == "uploading" {
+			t.Fatalf("readiness still parked the attempt on the upload: %v", m.transitions)
+		}
+	}
+}
+
+func TestAnOutstandingUploadDoesNotExpireAReadyBuild(t *testing.T) {
+	s, m, v := newReconciliationFixture()
+	v.result = readyBuildStatus()
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	// The upload is still queued when the old combined budget would have lapsed.
+	lapsed := m.now.Add(-31 * time.Minute)
+	m.firstStarted = &lapsed
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range m.transitions {
+		if action == "fail" {
+			t.Fatalf("ready build failed for an outstanding upload: %v", m.transitions)
+		}
+	}
+}
+
+func TestUnmeasuredAllocationDefersFinalizing(t *testing.T) {
+	s, m, v := newReconciliationFixture()
+	v.result = readyBuildStatus()
+	v.result.AllocatedBytesSupported = false
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	if m.finalizeCalls != 0 {
+		t.Fatalf("finalized without measured allocation: %d", m.finalizeCalls)
+	}
+}
+
+func lapsedBudget(m *reconciliationDB) {
+	lapsed := m.now.Add(-31 * time.Minute)
+	m.firstStarted = &lapsed
+}
+
+func TestAProducerThatFinishedIsFinalizedNotExpired(t *testing.T) {
+	s, m, v := newReconciliationFixture()
+	lapsedBudget(m)
+	v.result = readyBuildStatus()
+	// Completed ten minutes in; this pass is simply the first to see it.
+	v.result.EndedAtUnix = m.firstStarted.Add(10 * time.Minute).Unix()
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	if m.finalizeCalls != 1 {
+		t.Fatalf("completed build was not finalized: %d", m.finalizeCalls)
+	}
+	for _, action := range m.transitions {
+		if action == "fail" {
+			t.Fatalf("completed build expired on observer timing: %v", m.transitions)
+		}
+	}
+}
+
+func TestARecordedPublicationIsNotExpired(t *testing.T) {
+	s, m, _ := newReconciliationFixture()
+	m.publication = true
+	lapsedBudget(m)
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range m.transitions {
+		if action == "fail" {
+			t.Fatalf("durable publication discarded by the deadline: %v", m.transitions)
+		}
+	}
+}
+
+func TestAnUnfinishedBuildStillExpires(t *testing.T) {
+	s, m, v := newReconciliationFixture()
+	v.result = vmdclient.BuildStatusResult{Status: "running"}
+	lapsedBudget(m)
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	failed := false
+	for _, action := range m.transitions {
+		if action == "fail" {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatalf("execution deadline no longer bounds a running build: %v", m.transitions)
+	}
+}
+
+func TestAProducerThatFinishedOutsideTheBudgetIsRefused(t *testing.T) {
+	s, m, v := newReconciliationFixture()
+	lapsedBudget(m)
+	v.result = readyBuildStatus()
+	v.result.EndedAtUnix = m.firstStarted.Add(55 * time.Minute).Unix()
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	if m.finalizeCalls != 0 {
+		t.Fatalf("late completion was promoted: %d", m.finalizeCalls)
+	}
+	failed := false
+	for _, action := range m.transitions {
+		if action == "fail" {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatalf("late completion was not refused: %v", m.transitions)
+	}
+}
+
+func TestAnUnreportedCompletionTimeDoesNotCondemnTheBuild(t *testing.T) {
+	s, m, v := newReconciliationFixture()
+	lapsedBudget(m)
+	v.result = readyBuildStatus()
+	v.result.EndedAtUnix = 0
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	if m.finalizeCalls != 1 {
+		t.Fatalf("a build without a completion stamp was refused: %d", m.finalizeCalls)
+	}
+}
+
+func TestAFinalizedBuildChasesItsManifestWhenTheOwnerIsLost(t *testing.T) {
+	s, m, v := newReconciliationFixture()
+	v.result = readyBuildStatus()
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	if !m.finalized {
+		t.Fatal("fixture did not finalize")
+	}
+	s.publicationStore = stockedPublication(t, m.attempts[0])
+	// The owner dies before its upload reports; the bucket is the last resort.
+	m.hostLost = true
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	if !m.recorded {
+		t.Fatal("a stranded finalized build never looked for its manifest")
+	}
+}
+
+func stockedPublication(t *testing.T, a db.BuildAttempt) reconciliationStore {
+	t.Helper()
+	paths := []string{"/runtime/rootfs.ext4", "/runtime/vmstate.snap", "/runtime/mem.bin", "/runtime/build.meta.json"}
+	names := []string{"rootfs.ext4", "vmstate.snap", "mem.bin", "build.meta.json"}
+	var files []backup.ManifestFile
+	var keyFiles []backup.TaskFile
+	for i, name := range names {
+		hash := strings.Repeat(string(rune('a'+i)), 64)
+		files = append(files, backup.ManifestFile{Name: name, RuntimePath: paths[i], Object: name + ".pabc", SHA256: hash, Size: 10})
+		keyFiles = append(keyFiles, backup.TaskFile{Name: name, SHA256: hash, Size: 10})
+	}
+	generation := backup.GenerationKey(keyFiles)
+	manifest := backup.GenerationManifest{TemplateID: a.TemplateID.String(), BuildID: a.VMID, Generation: generation,
+		Files: files, TemplateRuntime: &backup.TemplateRuntime{RootfsPath: paths[0], SnapshotPath: paths[1], MemPath: paths[2]}}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := backup.TemplateObject(a.TemplateID.String(), a.VMID, generation, backup.ManifestObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reconciliationStore{object: object, data: data}
+}
+
+// A publication is judged on when the producer finished, never on when its
+// upload happened to arrive.
+func TestPublicationFirstPromotionHonoursTheProducerBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		finished time.Duration
+		accepted bool
+	}{
+		{"on time, upload arrived late", 10 * time.Minute, true},
+		{"completed outside the budget", 31 * time.Minute, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, m, v := newReconciliationFixture()
+			lapsedBudget(m)
+			m.publication = true
+			v.result = readyBuildStatus()
+			v.result.EndedAtUnix = m.firstStarted.Add(tc.finished).Unix()
+			if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+				t.Fatal(err)
+			}
+			if accepted := m.acceptCalls > 0; accepted != tc.accepted {
+				t.Fatalf("accepted=%v want %v (transitions=%v)", accepted, tc.accepted, m.transitions)
+			}
+		})
+	}
+}
+
+func TestAPublicationSurvivesAnUnreachableProducer(t *testing.T) {
+	s, m, _ := newReconciliationFixture()
+	lapsedBudget(m)
+	m.publication = true
+	s.resolve = func(context.Context, string) (vmdclient.Client, error) { return nil, ErrBuildHostGone }
+	if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+		t.Fatal(err)
+	}
+	if m.acceptCalls != 1 {
+		t.Fatalf("acceptance required a live producer: acceptCalls=%d", m.acceptCalls)
 	}
 }

@@ -52,11 +52,18 @@ func (s *BuildSupervisor) reconcileExecution(ctx context.Context, id uuid.UUID) 
 	if err != nil {
 		return err
 	}
-	reason := executionExpired(e, created, now)
-	if reason != "" {
-		return s.failExecution(ctx, id, e.CurrentAttempt, reason)
+	// A ready template owes only its upload, which drains on its own schedule.
+	// The producer may also have finished inside the budget without having been
+	// observed yet, so the deadline is applied only where this pass found no
+	// completion evidence, never on the strength of our own polling cadence.
+	expired := ""
+	if !e.Finalized && !e.Publication {
+		expired = executionExpired(e, created, now)
 	}
 	if e.CurrentAttempt == nil {
+		if expired != "" {
+			return s.failExecution(ctx, id, nil, expired)
+		}
 		if e.Attempts >= 3 {
 			return s.failExecution(ctx, id, nil, "infrastructure retries exhausted (three total attempts)")
 		}
@@ -103,6 +110,9 @@ func (s *BuildSupervisor) reconcileExecution(ctx context.Context, id uuid.UUID) 
 	}
 	// Publication is independent of a producer's continued availability.
 	if e.Publication {
+		if s.publishedLate(ctx, e, a) {
+			return s.failExecution(ctx, id, &a.ID, "build execution deadline exceeded; producer completed outside the budget")
+		}
 		accepted, err := s.q.AcceptBuildPublication(ctx, id, a.ID)
 		if accepted {
 			if s.onFinalize != nil {
@@ -112,6 +122,16 @@ func (s *BuildSupervisor) reconcileExecution(ctx context.Context, id uuid.UUID) 
 				Str("publication_state", "accepted").Msg("build durably ready")
 			s.logExecutionCompleted(ctx, id, "success", "", "")
 		}
+		return err
+	}
+	// Only the upload is outstanding. A lost owner is the one thing that can
+	// strand it, so look for a manifest the producer may already have written.
+	if e.Finalized {
+		lost, err := s.q.BuildAttemptHostLost(ctx, a)
+		if err != nil || !lost {
+			return err
+		}
+		_, err = s.reconcileDurablePublication(ctx, a)
 		return err
 	}
 	lost, err := s.q.BuildAttemptHostLost(ctx, a)
@@ -134,10 +154,16 @@ func (s *BuildSupervisor) reconcileExecution(ctx context.Context, id uuid.UUID) 
 			}
 			return s.retryExecution(ctx, e, a, "host registration missing")
 		}
+		if expired != "" {
+			return s.failExecution(ctx, id, &a.ID, expired)
+		}
 		return err
 	}
 	result, err := client.GetBuildStatus(metadata.AppendToOutgoingContext(ctx, "template-build-incarnation", a.IncarnationID.String()), a.VMID)
 	if err != nil {
+		if expired != "" {
+			return s.failExecution(ctx, id, &a.ID, expired)
+		}
 		return err
 	}
 	if result.NotFound {
@@ -148,16 +174,71 @@ func (s *BuildSupervisor) reconcileExecution(ctx context.Context, id uuid.UUID) 
 			}
 			return s.retryExecution(ctx, e, a, "execution missing after registration grace")
 		}
+		if expired != "" {
+			return s.failExecution(ctx, id, &a.ID, expired)
+		}
 		return nil
 	}
 	switch result.Status {
 	case "ready":
-		_, err = s.q.TransitionBuildAttempt(ctx, id, &a.ID, "uploading", "")
+		if completedLate(e, result) {
+			err = s.failExecution(ctx, id, &a.ID, "build execution deadline exceeded; producer completed outside the budget")
+			break
+		}
+		err = s.finalizeExecution(ctx, id, a, result)
 	case "failed", "cancelled":
 		// No transport heuristic turns user-step or unclassified failures into retries.
 		err = s.failExecution(ctx, id, &a.ID, result.ErrorMessage)
+	default:
+		if expired != "" {
+			return s.failExecution(ctx, id, &a.ID, expired)
+		}
 	}
 	return err
+}
+
+// finalizeExecution promotes the producer's reported artifacts. The upload is
+// recorded separately, so a loaded uploader delays the backup, not the build.
+func (s *BuildSupervisor) finalizeExecution(ctx context.Context, id uuid.UUID, a db.BuildAttempt, result vmdclient.BuildStatusResult) error {
+	if !result.AllocatedBytesSupported {
+		s.log.Info().Str("build_id", id.String()).Str("host_id", a.HostID).
+			Msg("build status lacks allocation-field support; waiting for an upgraded host before finalizing")
+		return nil
+	}
+	runtime, err := json.Marshal(backup.TemplateRuntime{RootfsPath: result.RootfsPath, SnapshotPath: result.SnapshotPath,
+		MemPath: result.MemFilePath, BasePath: result.BasePath, DeltaPath: result.DeltaPath, SizeBytes: result.SizeBytes})
+	if err != nil {
+		return err
+	}
+	finalized, err := s.q.FinalizeTemplateBuild(ctx, id, a.ID, runtime,
+		result.RootfsAllocatedBytes, result.BaseAllocatedBytes, result.DeltaAllocatedBytes)
+	if err != nil || !finalized {
+		return err
+	}
+	if s.onFinalize != nil {
+		s.onFinalize(a.TemplateID)
+	}
+	s.log.Info().Str("build_id", id.String()).Str("attempt_id", a.ID.String()).Str("host_id", a.HostID).
+		Str("digest", result.ResolvedDigest).Int64("size", result.SizeBytes).Msg("build ready")
+	s.logExecutionCompleted(ctx, id, "success", "", result.ResolvedDigest)
+	return nil
+}
+
+// publishedLate judges a publication on the same producer budget as a status
+// report, so promotion does not depend on which path observes a build first.
+// An unreachable owner yields no evidence, and evidence is what condemns a
+// build: acceptance must never require the producer to still be alive.
+func (s *BuildSupervisor) publishedLate(ctx context.Context, e db.BuildExecution, a db.BuildAttempt) bool {
+	client, err := s.resolve(ctx, a.HostID)
+	if err != nil {
+		return false
+	}
+	result, err := client.GetBuildStatus(
+		metadata.AppendToOutgoingContext(ctx, "template-build-incarnation", a.IncarnationID.String()), a.VMID)
+	if err != nil || result.NotFound {
+		return false
+	}
+	return completedLate(e, result)
 }
 
 func (s *BuildSupervisor) failExecution(ctx context.Context, id uuid.UUID, attempt *uuid.UUID, reason string) error {
@@ -203,13 +284,26 @@ func (s *BuildSupervisor) reconcileDurablePublication(ctx context.Context, a db.
 	return true, nil
 }
 
+// executionBudget bounds the producer, measured from its first dispatch.
+const executionBudget = 30 * time.Minute
+
+// completedLate reports a completion the producer itself timestamps outside the
+// budget, which is late however early or late we observe it. An unreported
+// timestamp carries no evidence either way, so it does not condemn the build.
+func completedLate(e db.BuildExecution, result vmdclient.BuildStatusResult) bool {
+	if e.FirstStartedAt == nil || result.EndedAtUnix <= 0 {
+		return false
+	}
+	return !time.Unix(result.EndedAtUnix, 0).Before(e.FirstStartedAt.Add(executionBudget))
+}
+
 func executionExpired(e db.BuildExecution, created, now time.Time) string {
 	if e.FirstStartedAt == nil {
 		if !now.Before(created.Add(2 * time.Minute)) {
 			return "no eligible host/capacity before initial queue deadline"
 		}
-	} else if !now.Before(e.FirstStartedAt.Add(30 * time.Minute)) {
-		return "build execution/publication deadline exceeded; no eligible replacement or durable publication within budget"
+	} else if !now.Before(e.FirstStartedAt.Add(executionBudget)) {
+		return "build execution deadline exceeded; no eligible replacement within budget"
 	}
 	return ""
 }
