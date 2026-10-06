@@ -554,8 +554,10 @@ func keyArgs(msg *pb.KeyEvent) ([]string, error) {
 		}
 		// Modifiers don't apply to literal text entry. --delay 0 drops
 		// xdotool's default 12ms/char pacing, which is for human visibility;
-		// at that rate a long paste takes seconds.
-		return []string{"type", "--delay", "0", "--", text}, nil
+		// at that rate a long paste takes seconds. --clearmodifiers lifts an
+		// active Caps or Shift Lock for the duration, so the text comes out
+		// as written (the X11 path does the same itself).
+		return []string{"type", "--delay", "0", "--clearmodifiers", "--", text}, nil
 	default:
 		return nil, errors.New("one of key or text is required")
 	}
