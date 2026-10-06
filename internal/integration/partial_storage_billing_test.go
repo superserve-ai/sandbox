@@ -257,3 +257,59 @@ func TestIntegration_LegacyStorageReferenceAuthority(t *testing.T) {
 	}
 	storageExec(t, `UPDATE sandbox SET template_id=template_id,base_path=base_path,delta_path=delta_path,status='paused' WHERE id=$1`, matched)
 }
+
+func TestIntegration_TemplateCreationCapturesStorageReferences(t *testing.T) {
+	for _, withSecrets := range []bool{false, true} {
+		for _, kind := range []string{"matching", "rebuilt", "pinned-base"} {
+			t.Run(map[bool]string{false: "without-secrets", true: "with-secrets"}[withSecrets]+"/"+kind, func(t *testing.T) {
+				team, _ := seedTeamAndKey(t)
+				path := "/templates/" + team.String() + "/rootfs.ext4"
+				snapshot, mem := path+".snap", path+".mem"
+				tpl := partialTemplate(t, team, &path)
+				storageExec(t, `UPDATE template SET snapshot_path=$2,mem_path=$3 WHERE id=$1`, tpl, snapshot, mem)
+				var base *string
+				if kind == "pinned-base" {
+					base = &path
+				}
+				if kind == "rebuilt" {
+					// The API selected these pins before a rebuild; the insert must not
+					// associate the new rootfs with the older image it is about to boot.
+					storageExec(t, `UPDATE template SET rootfs_path=$2,snapshot_path=$3,mem_path=$4 WHERE id=$1`, tpl, path+".new", snapshot+".new", mem+".new")
+				}
+				var capture []byte
+				var err error
+				if withSecrets {
+					row, e := testQueries.CreateSandboxFromTemplateWithSecrets(t.Context(), db.CreateSandboxFromTemplateWithSecretsParams{
+						ID: uuid.New(), TeamID: team, TemplateID: tpl, Name: "capture-example", Status: db.SandboxStatusPaused, VcpuCount: 1, MemoryMib: 1024, HostID: "default", SnapshotPath: &snapshot, MemPath: &mem, BasePath: base, PreviewAccess: "public",
+					})
+					capture, err = row.LegacyStorageRefs, e
+				} else {
+					row, e := testQueries.CreateSandboxFromTemplate(t.Context(), db.CreateSandboxFromTemplateParams{
+						ID: uuid.New(), TeamID: team, ID_2: tpl, TeamID_2: team, Name: "capture-example", Status: db.SandboxStatusPaused, VcpuCount: 1, MemoryMib: 1024, HostID: "default", SnapshotPath: &snapshot, MemPath: &mem, BasePath: base, PreviewAccess: "public",
+					})
+					capture, err = row.LegacyStorageRefs, e
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				var refs map[string]*string
+				if err = json.Unmarshal(capture, &refs); err != nil {
+					t.Fatal(err)
+				}
+				if len(refs) != 3 {
+					t.Fatalf("missing explicit capture: %s", capture)
+				}
+				if kind == "matching" {
+					if refs["rootfs_fallback"] == nil || *refs["rootfs_fallback"] != path {
+						t.Fatalf("matching full-copy reference lost: %s", capture)
+					}
+				} else if refs["rootfs_fallback"] != nil {
+					t.Fatalf("unexpected fallback: %s", capture)
+				}
+				if kind == "pinned-base" && (refs["base"] == nil || *refs["base"] != path) {
+					t.Fatalf("pinned base lost: %s", capture)
+				}
+			})
+		}
+	}
+}

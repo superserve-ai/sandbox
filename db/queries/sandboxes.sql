@@ -26,15 +26,23 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- during the INSERT, serializing with SoftDeleteTemplateIfUnused's FOR
 -- UPDATE. Returns 0 rows if the template is missing, deleted, or not
 -- visible to the caller.
+-- Carry the capture from this existing read so the insert trigger needs no
+-- second template lookup; mismatched build pins remain explicitly unknown.
 WITH tpl AS (
-  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+  SELECT t.id AS tpl_id, t.disk_mib, t.rootfs_path AS tpl_rootfs_path,
+         t.snapshot_path AS tpl_snapshot_path, t.mem_path AS tpl_mem_path FROM template t
   WHERE t.id = $13
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings, legacy_storage_refs)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false,
+         jsonb_build_object('base',$18::text,'delta',$19::text,
+           'rootfs_fallback',CASE WHEN $18::text IS NULL AND $19::text IS NULL
+             AND NULLIF($16::text,'') IS NOT NULL AND NULLIF($17::text,'') IS NOT NULL
+             AND tpl_snapshot_path=$16 AND tpl_mem_path=$17 THEN tpl_rootfs_path END)
+  FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -71,15 +79,23 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- CreateSandboxWithSecrets for why the single statement matters). Returns
 -- 0 rows if the template is missing, deleted, or not visible — then no
 -- bindings are written either.
+-- Carry the capture from this existing read so the insert trigger needs no
+-- second template lookup; mismatched build pins remain explicitly unknown.
 WITH tpl AS (
-  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+  SELECT t.id AS tpl_id, t.disk_mib, t.rootfs_path AS tpl_rootfs_path,
+         t.snapshot_path AS tpl_snapshot_path, t.mem_path AS tpl_mem_path FROM template t
   WHERE t.id = @template_id
     AND t.deleted_at IS NULL
     AND (t.team_id = @team_id OR t.team_id = @system_team_id)
   FOR KEY SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
-  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds, true FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings, legacy_storage_refs)
+  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds, true,
+         jsonb_build_object('base',@base_path::text,'delta',@delta_path::text,
+           'rootfs_fallback',CASE WHEN @base_path::text IS NULL AND @delta_path::text IS NULL
+             AND NULLIF(@snapshot_path::text,'') IS NOT NULL AND NULLIF(@mem_path::text,'') IS NOT NULL
+             AND tpl_snapshot_path = @snapshot_path AND tpl_mem_path = @mem_path THEN tpl_rootfs_path END)
+  FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
