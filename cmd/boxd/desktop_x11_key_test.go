@@ -372,6 +372,26 @@ func TestPlanKey_UppercaseScratchLettersAreShifted(t *testing.T) {
 	eventsEqual(t, segs[0].events, shiftedTap(kcSpare0))
 }
 
+// İ lowercases to i, which uppercases to I: no shared slot, the keysym
+// itself is bound and still typed with Shift. The server reports such a
+// key as [i, İ], which must still count as ours.
+func TestPlanKey_UppercaseWithoutRoundTripKeepsItsKeysym(t *testing.T) {
+	km := testKeymap(2)
+	const dotI = 0x01000000 | 0x130
+	segs, err := planKey(km, xkbState{}, textEvent("İ"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindsEqual(t, segs[0].binds, []keyBind{{kcSpare0, dotI}})
+	eventsEqual(t, segs[0].events, shiftedTap(kcSpare0))
+	if !scratchRowIntact([]xproto.Keysym{'i', dotI}, dotI) {
+		t.Error("the server's [i, İ] pairing was not recognized as the bound key")
+	}
+	if scratchRowIntact([]xproto.Keysym{'i', 'I'}, dotI) {
+		t.Error("[i, I] is a different key and must not count as İ")
+	}
+}
+
 func TestPlanKey_CapsLockLeavesSymbolicKeysAlone(t *testing.T) {
 	km := testKeymap(1)
 	segs, err := planKey(km, xkbState{capsLock: true}, chordEvent("a", "ctrl"))

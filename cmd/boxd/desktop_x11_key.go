@@ -191,21 +191,19 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, prev *x1
 
 // scratchRowIntact reports whether a fetched row is still the single-keysym
 // key bound to ks: the server exports a cased letter back as its
-// lower/upper pair, so those are the only symbols allowed besides NoSymbol.
+// lower/upper pair (with the lowercase form first), so those are the only
+// symbols allowed besides NoSymbol.
 func scratchRowIntact(row []xproto.Keysym, ks uint32) bool {
-	if len(row) == 0 || uint32(row[0]) != ks {
+	lower, upper := ks, ks
+	if casedLetter(ks) {
+		r := keysymRune(ks)
+		lower, upper = keysymFromRune(unicode.ToLower(r)), keysymFromRune(unicode.ToUpper(r))
+	}
+	if len(row) == 0 || (uint32(row[0]) != ks && uint32(row[0]) != lower) {
 		return false
 	}
-	upper := ks
-	if casedLetter(ks) {
-		r := rune(ks)
-		if ks >= 0x01000000 {
-			r = rune(ks & 0x00ffffff)
-		}
-		upper = keysymFromRune(unicode.ToUpper(r))
-	}
 	for _, sym := range row[1:] {
-		if s := uint32(sym); s != 0 && s != ks && s != upper {
+		if s := uint32(sym); s != 0 && s != ks && s != lower && s != upper {
 			return false
 		}
 	}
@@ -315,17 +313,28 @@ func (p *keyPlanner) stroke(ks uint32, literal bool) (keystroke, error) {
 	return keystroke{code: code, shift: shift != invert}, nil
 }
 
-// lowerKeysym returns the lowercase form of a cased letter keysym and
-// whether ks was uppercase; other keysyms come back unchanged.
+// lowerKeysym reports whether ks is an uppercase letter and, when its
+// lowercase form uppercases back to it, that form: the two can then share
+// a scratch keycode. A letter without that round trip (İ, K, ẞ) keeps its
+// own keysym; the server still pairs it as [lower, ks], and Shift selects
+// it.
 func lowerKeysym(ks uint32) (lower uint32, upper bool) {
-	if !casedLetter(ks) {
+	r := keysymRune(ks)
+	if !casedLetter(ks) || !unicode.IsUpper(r) {
 		return ks, false
 	}
-	r := rune(ks)
-	if ks >= 0x01000000 {
-		r = rune(ks & 0x00ffffff)
+	if l := unicode.ToLower(r); unicode.ToUpper(l) == r {
+		return keysymFromRune(l), true
 	}
-	return keysymFromRune(unicode.ToLower(r)), unicode.IsUpper(r)
+	return ks, true
+}
+
+// keysymRune is the code point of a Latin-1 or Unicode keysym.
+func keysymRune(ks uint32) rune {
+	if ks >= 0x01000000 {
+		return rune(ks & 0x00ffffff)
+	}
+	return rune(ks)
 }
 
 // printable reports whether ks is a character rather than a function,
@@ -342,12 +351,10 @@ func keypad(ks uint32) bool {
 // casedLetter reports whether ks is a letter with distinct cases, for the
 // Latin-1 and Unicode keysym ranges.
 func casedLetter(ks uint32) bool {
-	r := rune(ks)
-	if ks >= 0x01000000 {
-		r = rune(ks & 0x00ffffff)
-	} else if ks > 0xff {
+	if ks > 0xff && ks < 0x01000000 {
 		return false
 	}
+	r := keysymRune(ks)
 	return unicode.IsLetter(r) && unicode.ToUpper(r) != unicode.ToLower(r)
 }
 
