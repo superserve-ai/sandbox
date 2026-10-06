@@ -108,12 +108,16 @@ func xkbStateFromReply(reply []byte) xkbState {
 	if len(reply) < 13 {
 		return xkbState{}
 	}
-	effective, locked := reply[8], reply[11]
+	effective, base, latched, locked := reply[8], reply[9], reply[10], reply[11]
+	// Key clears a locked Shift or Lock itself; any other modifier in effect
+	// (held, latched, or locked by a sticky-keys client), or Shift and Lock
+	// when depressed rather than locked, counts as held.
+	const clearable = xproto.ModMaskShift | xproto.ModMaskLock
 	return xkbState{
 		group:     int(reply[12]),
 		capsLock:  locked&xproto.ModMaskLock != 0,
 		shiftLock: locked&xproto.ModMaskShift != 0,
-		held:      effective&^locked != 0,
+		held:      effective&^clearable != 0 || (base|latched)&clearable != 0,
 	}
 }
 

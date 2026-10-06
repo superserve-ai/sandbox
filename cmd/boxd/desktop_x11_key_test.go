@@ -568,6 +568,16 @@ func TestXkbStateFromReply(t *testing.T) {
 	if got := xkbStateFromReply(reply); got.held {
 		t.Errorf("state = %+v, want nothing held when only locks are in effect", got)
 	}
+	// A locked Control (sticky keys) is not something Key clears: held.
+	reply[8], reply[11] = xproto.ModMaskControl, xproto.ModMaskControl
+	if got := xkbStateFromReply(reply); !got.held {
+		t.Errorf("state = %+v, want held for a locked Control", got)
+	}
+	// Shift depressed (base) while also locked: still held.
+	reply[8], reply[9], reply[11] = xproto.ModMaskShift, xproto.ModMaskShift, xproto.ModMaskShift
+	if got := xkbStateFromReply(reply); !got.held {
+		t.Errorf("state = %+v, want held for a depressed Shift", got)
+	}
 	if got := xkbStateFromReply(reply[:8]); got != (xkbState{}) {
 		t.Errorf("short reply = %+v, want zero state", got)
 	}
