@@ -31,10 +31,11 @@ const (
 )
 
 // xkbState is what the core keyboard map cannot show: the active group and
-// the locked modifiers (Caps Lock).
+// the locked modifiers (Caps Lock, Shift Lock).
 type xkbState struct {
-	group    int
-	capsLock bool
+	group     int
+	capsLock  bool
+	shiftLock bool
 }
 
 // xkbGetState asks the server for the keyboard state; a server without the
@@ -88,7 +89,12 @@ func xkbStateFromReply(reply []byte) xkbState {
 	if len(reply) < 13 {
 		return xkbState{}
 	}
-	return xkbState{group: int(reply[12]), capsLock: reply[11]&xproto.ModMaskLock != 0}
+	locked := reply[11]
+	return xkbState{
+		group:     int(reply[12]),
+		capsLock:  locked&xproto.ModMaskLock != 0,
+		shiftLock: locked&xproto.ModMaskShift != 0,
+	}
 }
 
 // x11Keymap is the server's core keyboard mapping plus the scratch keycodes
@@ -471,7 +477,18 @@ func (p *keyPlanner) chord(modifiers []string, key string) error {
 
 // planKey lowers a validated KeyEvent for the given keyboard state. On
 // success the keymap's scratch state is updated to what the plan will bind.
+//
+// Two states are declined outright: the core map describes the first group
+// only, so under another group a layout keycode types that group's symbol;
+// and a locked Shift would shift every keycode sent. xdotool handles both
+// (it locks groups per keysym), so it keeps those cases.
 func planKey(km *x11Keymap, state xkbState, ev *pb.KeyEvent) ([]keySegment, error) {
+	if state.group != 0 {
+		return nil, fmt.Errorf("keyboard group %d is active: %w", state.group+1, errBackendKept)
+	}
+	if state.shiftLock {
+		return nil, fmt.Errorf("shift lock is active: %w", errBackendKept)
+	}
 	p := newKeyPlanner(km, state)
 	var err error
 	switch in := ev.GetInput().(type) {
@@ -511,12 +528,6 @@ func (b *x11Backend) Key(ev *pb.KeyEvent) error {
 	state, err := b.xkbGetState()
 	if err != nil {
 		return err
-	}
-	// The core map describes the first group only; under another group a
-	// layout keycode types that group's symbol. xdotool locks groups per
-	// keysym, so it keeps that case.
-	if state.group != 0 {
-		return fmt.Errorf("keyboard group %d is active: %w", state.group+1, errBackendKept)
 	}
 	segments, err := planKey(km, state, ev)
 	if err != nil {

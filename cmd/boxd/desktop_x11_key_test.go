@@ -297,6 +297,15 @@ func TestPlanKey_UsesShiftRWhenShiftLIsAbsent(t *testing.T) {
 	eventsEqual(t, segs[0].events, want)
 }
 
+func TestPlanKey_DeclinesForKeyboardStateItCannotHonor(t *testing.T) {
+	for name, state := range map[string]xkbState{"second group": {group: 1}, "shift lock": {shiftLock: true}} {
+		km := testKeymap(1)
+		if _, err := planKey(km, state, textEvent("1")); !errors.Is(err, errBackendKept) {
+			t.Errorf("%s: err = %v, want errBackendKept", name, err)
+		}
+	}
+}
+
 func TestPlanKey_DeclinesBeforeTouchingTheServer(t *testing.T) {
 	cases := map[string]struct {
 		spares int
@@ -497,10 +506,10 @@ func TestPlanKey_NonPrintableLevelTwoUsesScratch(t *testing.T) {
 func TestXkbStateFromReply(t *testing.T) {
 	reply := make([]byte, 32)
 	reply[0], reply[1] = 1, 3 // reply, deviceID
-	reply[11] = xproto.ModMaskLock
+	reply[11] = xproto.ModMaskLock | xproto.ModMaskShift
 	reply[12] = 1
-	if got := xkbStateFromReply(reply); got != (xkbState{group: 1, capsLock: true}) {
-		t.Errorf("state = %+v, want group 1 with Caps Lock", got)
+	if got := xkbStateFromReply(reply); got != (xkbState{group: 1, capsLock: true, shiftLock: true}) {
+		t.Errorf("state = %+v, want group 1 with Caps Lock and Shift Lock", got)
 	}
 	if got := xkbStateFromReply(reply[:8]); got != (xkbState{}) {
 		t.Errorf("short reply = %+v, want zero state", got)
