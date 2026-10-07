@@ -4,8 +4,8 @@ run "base_url_is_the_only_required_input" {
     runbook_base_url = "https://example.com/runbooks/"
   }
   assert {
-    condition     = length(output.urls) == 9 && length(toset(values(output.urls))) == 9
-    error_message = "All nine procedures must have distinct default page destinations."
+    condition     = length(output.urls) == 12 && length(toset(values(output.urls))) == 12
+    error_message = "All reviewed procedures must have distinct default page destinations."
   }
   assert {
     condition = alltrue([
