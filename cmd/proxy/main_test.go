@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -328,17 +329,41 @@ func TestRoutingBootstrapGate(t *testing.T) {
 }
 
 func TestRoutingBootstrapGatesDataPlane(t *testing.T) {
-	ready, dispatched := false, false
-	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched = true }), func() bool { return ready })
+	ready := false
+	var logs bytes.Buffer
+	handler := proxy.NewHandler([]string{"sandbox.test"}, nil, zerolog.New(&logs))
+	gate := withRoutingBootstrap(handler, func() bool { return ready })
+	mux := newProxyMuxWithReadiness(handler, gate, nil)
+	request := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/exec?private=SYNTHETIC_SECRET", nil)
+		r.Host = "boxd-12345678-1234-1234-1234-123456789abc.sandbox.test"
+		return r
+	}
 	w := httptest.NewRecorder()
-	gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
-	if dispatched || w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"sandbox_unavailable"`) {
-		t.Fatalf("cold request dispatched=%v status=%d body=%s", dispatched, w.Code, w.Body)
+	mux.ServeHTTP(w, request())
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"sandbox_unavailable"`) {
+		t.Fatalf("cold request status=%d body=%s", w.Code, w.Body)
+	}
+	var event map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &event); err != nil {
+		t.Fatal(err, logs.String())
+	}
+	for field, want := range map[string]any{"event_type": "request", "route": "/exec", "status": float64(503), "auth_outcome": "not_evaluated"} {
+		if event[field] != want {
+			t.Errorf("%s = %v, want %v", field, event[field], want)
+		}
+	}
+	if strings.Contains(logs.String(), "SYNTHETIC_SECRET") {
+		t.Fatal("query leaked")
 	}
 	ready = true
-	gate.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/exec", nil))
-	if !dispatched {
-		t.Fatal("warm request was not dispatched")
+	logs.Reset()
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, request())
+	// The disabled exec handler rejects after warmup; its nested logger must not
+	// duplicate the record established outside the gate.
+	if w.Code == http.StatusServiceUnavailable || bytes.Count(logs.Bytes(), []byte(`"event_type":"request"`)) != 1 {
+		t.Fatalf("warm request status=%d logs=%s", w.Code, logs.String())
 	}
 }
 

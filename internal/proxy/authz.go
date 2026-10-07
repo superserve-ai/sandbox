@@ -92,6 +92,7 @@ func (h *Handler) authorizeSandboxRequest(
 		}
 		verifiedCapability = &capability
 	} else if !auth.VerifyAccessToken(h.seedKey, requestSandboxID, token) {
+		logSandboxAuth(ctx, "invalid", "")
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusUnauthorized,
 			Message: "invalid access token",
@@ -101,6 +102,9 @@ func (h *Handler) authorizeSandboxRequest(
 	var verifiedCaller *auth.CallerContext
 	if verifiedCapability != nil {
 		verifiedCaller = callerContextFromCapability(*verifiedCapability)
+	}
+	if verifiedCapability == nil {
+		logSandboxAuth(ctx, "authenticated", "")
 	}
 	info, err := h.resolver.Lookup(ctx, requestSandboxID)
 	if err != nil {
@@ -118,6 +122,9 @@ func (h *Handler) authorizeSandboxRequest(
 			Code:    "sandbox_unavailable",
 			Caller:  verifiedCaller,
 		}
+	}
+	if verifiedCapability == nil {
+		logSandboxAuth(ctx, "authenticated", info.TeamID)
 	}
 	ownershipState := info.OwnershipState
 	if ownershipState == "" {
@@ -159,6 +166,7 @@ func (h *Handler) authorizeSandboxRequest(
 			CallerKind: verifiedCapability.CallerKind, ActorID: verifiedCapability.ActorID,
 		}
 	}
+	logSandboxAuth(ctx, "authenticated", info.TeamID)
 	if info.Status != "running" {
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusServiceUnavailable,
@@ -498,5 +506,9 @@ func (h *Handler) canRouteBoxdRequest(r *http.Request, sandboxID string) bool {
 		capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
 		return err == nil && capability.SandboxID.String() == sandboxID && capability.Audience == "sandbox-proxy"
 	}
-	return auth.VerifyAccessToken(h.seedKey, sandboxID, token)
+	valid := auth.VerifyAccessToken(h.seedKey, sandboxID, token)
+	if valid {
+		logSandboxAuth(r.Context(), "authenticated", "")
+	}
+	return valid
 }

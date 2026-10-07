@@ -30,6 +30,7 @@ func OperatorAuth() gin.HandlerFunc {
 	token := os.Getenv("OPERATOR_API_TOKEN")
 
 	return func(c *gin.Context) {
+		logSharedAuthAttempt(c, token != "")
 		if token == "" {
 			respondErrorMsg(c, "unauthorized", "operator API not configured", http.StatusUnauthorized)
 			c.Abort()
@@ -50,6 +51,7 @@ func OperatorAuth() gin.HandlerFunc {
 			return
 		}
 
+		logServiceIdentity(c, "operator")
 		c.Next()
 	}
 }
