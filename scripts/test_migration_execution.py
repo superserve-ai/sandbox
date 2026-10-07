@@ -103,6 +103,29 @@ ANALYZE sandbox;
         self.assertEqual(self.sql("SELECT count(*) FROM supabase_migrations.schema_migrations"), "1")
         self.sql("UPDATE sandbox SET destroyed_at=now() WHERE id=43")
 
+    def test_concurrent_snapshot_index_has_a_separate_bounded_budget(self):
+        self.seed_snapshot_references()
+        # Delay the actual CREATE INDEX statement rather than depending on
+        # machine speed or a large fixture to exceed the old 1.9s budget.
+        self.sql("""
+CREATE FUNCTION delay_index_build() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_query() LIKE 'CREATE INDEX CONCURRENTLY idx_sandbox_snapshot_id %' THEN
+    PERFORM pg_sleep(2.2);
+  END IF;
+END $$;
+CREATE EVENT TRIGGER delay_index_build ON ddl_command_start
+  WHEN TAG IN ('CREATE INDEX') EXECUTE FUNCTION delay_index_build();
+""")
+        with patch.object(snapshot_index, "BUILD_TIMEOUT", 2):
+            with self.assertRaisesRegex(migration.MigrationError, "preparation failed.*57014"):
+                self.invoke()
+        self.assertEqual(self.sql("SELECT count(*) FROM supabase_migrations.schema_migrations"), "1")
+        self.assertEqual(self.sql("SELECT to_regclass('idx_sandbox_snapshot_id') IS NULL"), "t")
+        self.invoke()
+        self.assertEqual(self.sql("SELECT indisvalid FROM pg_index "
+                                  "WHERE indexrelid='idx_sandbox_snapshot_id'::regclass"), "t")
+
     def test_read_only_preflight_and_guard_rejection(self):
         self.invoke("preflight")
         self.assertEqual(self.sql("SELECT to_regclass('supabase_migrations.schema_migrations') IS NULL"), "t")

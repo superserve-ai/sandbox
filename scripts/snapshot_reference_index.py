@@ -10,6 +10,7 @@ from retained_storage_recovery import MUTEX
 
 FILE = "20261007201056_sandbox_snapshot_reference_index.sql"
 NAME = "idx_sandbox_snapshot_id"
+BUILD_TIMEOUT = 30
 DEFINITION = ("CREATE INDEX idx_sandbox_snapshot_id ON public.sandbox USING btree (snapshot_id) "
               "WHERE (snapshot_id IS NOT NULL)")
 
@@ -39,12 +40,18 @@ def prepare(database_url, root, deadline):
                 return
             if check(conn):
                 return
-            if time.monotonic() + 6 >= deadline:
+            budget_ms = int(min(BUILD_TIMEOUT, deadline - time.monotonic() - 6) * 1000)
+            if budget_ms < 2000:
                 raise migration.MigrationError("Migration deadline exceeded before snapshot index preparation")
-            # Keep deployment's 2s transaction and 250ms lock budgets. A failed
-            # concurrent build leaves no successful migration history entry.
+            # Concurrent builds do not block ordinary writes. Give only this
+            # statement a longer budget, still bounded by the command deadline;
+            # a 2s transaction timer would cancel its individual build phases.
+            conn.execute("SET transaction_timeout=0")
+            conn.execute("SELECT set_config('statement_timeout',%s,false)", (f"{budget_ms}ms",))
             conn.execute("CREATE INDEX CONCURRENTLY idx_sandbox_snapshot_id "
                          "ON public.sandbox(snapshot_id) WHERE snapshot_id IS NOT NULL")
+            conn.execute("SET statement_timeout='1900ms'")
+            conn.execute("RESET transaction_timeout")
             if not check(conn):
                 raise migration.MigrationError("Snapshot reference index preparation did not complete")
     except psycopg.Error as error:

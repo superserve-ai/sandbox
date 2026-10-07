@@ -58,9 +58,13 @@ substitute for the gates.
 ## Snapshot reference index
 
 The ordinary `push` action prebuilds `idx_sandbox_snapshot_id` concurrently
-before the CLI applies its migration. It uses the migration mutex and existing
-250ms lock, 2s transaction, and 60s command budgets, with a 1.9s statement timeout
-covering the concurrent build's internal transactions. Preflight, list, and
+before the CLI applies its migration. It uses the migration mutex, the existing
+250ms lock timeout, and the 60s command deadline. Only the concurrent build may
+run for up to 30s, shortened when necessary to leave 6s in the command budget.
+That statement temporarily disables its session's 2s transaction timer so it
+can span multiple build phases; the statement timeout bounds the whole build.
+The session restores the short timers afterward and closes on any failure.
+Ordinary migration transactions retain their 2s limit. Preflight, list, and
 dry-run remain read-only. A fresh database builds the index in its normal SQL
 migration. The index includes soft-deleted sandboxes because snapshot deletion
 must clear their foreign-key references too.
