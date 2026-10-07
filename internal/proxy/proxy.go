@@ -82,6 +82,7 @@ type Handler struct {
 	// machineAuthority is the bounded-freshness durable revocation resolver.
 	// Machine capabilities fail closed when a proxy has not been configured
 	// with it; legacy tokens remain available only to ordinary sandboxes.
+	sandboxOwnership            *CachedSandboxOwnership
 	machineAuthority            auth.RevocationAuthority
 	machineAuthoritySnapshotter interface {
 		LookupSnapshot(context.Context, uuid.UUID, uuid.UUID) (uint64, time.Time, error)

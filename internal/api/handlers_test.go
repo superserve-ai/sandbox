@@ -1268,6 +1268,9 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 		*dest[47].(*[]int64) = versions
 		*dest[48].(**string) = nil
 		*dest[49].(*time.Time) = time.Now()
+		*dest[50].(*bool) = false
+		*dest[51].(*pgtype.UUID) = pgtype.UUID{}
+		*dest[52].(*pgtype.UUID) = pgtype.UUID{}
 		return nil
 	}}
 }

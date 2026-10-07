@@ -31,8 +31,15 @@ The proxy resolver/VMD attestation for a machine-owned sandbox must include
 `machine_owned`, the durable `machine_owner_principal_id`, and `team_id`.
 Machine capabilities are rejected when any binding is absent or mismatched;
 the proxy never infers ownership from a human `owner_id`. A VMD response also
-attests `ownership_state` as `machine`, `ordinary`, or `unknown`; unknown is a
-denial state. Authorized team API keys receive a typed `mcap.v1` child with
+attests `ownership_state` as `machine`, `ordinary`, or `unknown`. For an existing
+ownerless record with no machine attestation, the proxy verifies its live team
+and owner association through the restricted database role after verifying the
+request token. Only confirmed absence establishes ordinary ownership. These
+reads have a 500ms deadline, share a bounded five-second cache, and never run
+per frame or during VM startup. Missing configuration or lookup failure denies
+access; explicit or contradictory machine attestations cannot be downgraded.
+Configure `PROXY_DATABASE_URL` on serving proxies before rollout, including
+proxies with peer routing disabled. Authorized team API keys receive a typed `mcap.v1` child with
 `caller_kind=api_key`, the verified `parent_credential_id`, team, operation
 subset, and `sandbox-proxy` audience. Expiry is capped at the earlier of fifteen
 minutes and the parent key expiry. An API key creator is not a verified human
@@ -49,10 +56,9 @@ identity through resource and operation denials; failed authentication has no
 verified caller. API-key claims identify their parent key, never its creator as
 the current user. Peer destinations independently verify the capability.
 
-Resume performs one bounded indexed ownership lookup before claiming or
-publishing a replacement VM. The result is reused within the request for token
-production. It must be synchronous because publishing a replacement with a
-human owner would remove the machine access boundary.
+Resume returns the immutable ownership association in the existing claim
+statement and reuses that result for VM publication and token production.
+Ownership verification adds no separate round trip to the resume path.
 
 ## Durable lifecycle handoff
 
@@ -152,7 +158,13 @@ production issuance, rollout, or completion, record staging evidence for:
 - operator invocation, response-loss retries, rotation, creator offboarding,
   disablement and same-tenant restore with fresh credentials;
 - recreated sandbox ownership, legacy/downgrade refusal, approved-template
-  enforcement, compatible clients, and safe attribution on both API and proxy.
+  enforcement, compatible clients, and safe attribution on both API and proxy;
+- production revocation monitoring: the sandbox lifecycle owner must provide
+  a durable post-commit revocation signal; the attribution/collector owner must
+  preserve safe credential references and correlate existing session start and
+  completion events. Validate loss/restart behavior and the 30-second alert in
+  staging before issuance. Request logs alone are not a durable audit ledger,
+  and this PR does not claim the monitor is deployed.
 
 ## Ownership and rollout seam
 

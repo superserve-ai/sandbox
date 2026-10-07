@@ -95,9 +95,8 @@ func (h *Handler) authorizeSandboxRequest(
 		}
 		if err != nil || capability.Audience != "sandbox-proxy" {
 			outcome := "invalid"
-			if authorityErr != nil {
-				// The authority currently has no typed denial/error distinction.
-				// Do not infer invalid credentials from a failed authority lookup.
+			if authorityErr != nil && !errors.Is(authorityErr, auth.ErrMachineCapabilityDenied) {
+				// A store outage is distinct from an explicit authority denial.
 				outcome = "error"
 			}
 			logSandboxAuth(ctx, outcome, "")
@@ -139,6 +138,11 @@ func (h *Handler) authorizeSandboxRequest(
 			Code:    "sandbox_unavailable",
 			Caller:  verifiedCaller,
 		}
+	}
+	info, err = h.attestUnclassifiedSandbox(ctx, requestSandboxID, info)
+	if err != nil {
+		return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable,
+			Message: "sandbox ownership unavailable", Code: "sandbox_ownership_unavailable", Caller: verifiedCaller}
 	}
 	logResourceTeam(ctx, info.TeamID)
 	ownershipState := info.OwnershipState

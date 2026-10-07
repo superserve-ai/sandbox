@@ -660,7 +660,8 @@ RETURNING *;
 
 -- name: ClaimResume :one
 -- The paused→resuming claim plus the boot inputs in one round trip:
--- snapshot paths, preview policy with published ports, template base path.
+-- snapshot paths, preview policy with published ports, template base path,
+-- and immutable machine ownership.
 -- The advisory lock is the one attach/detach take before re-reading
 -- status; held to statement end, so the returned row already reflects a
 -- binding mutation that beat the claim. It rides a FROM item joined on
@@ -687,11 +688,15 @@ FROM (
          COALESCE(pp.ports, '{}')::int[] AS port_numbers,
          COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
          COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
-         t.base_path AS template_base_path
+         t.base_path AS template_base_path,
+         (mo.sandbox_id IS NOT NULL)::boolean AS machine_ownership_present,
+         mo.owner_principal_id AS machine_owner_principal_id,
+         mo.team_id AS machine_owner_team_id
   FROM sandbox sb
   LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
   LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
   LEFT JOIN template t ON t.id = sb.template_id
+  LEFT JOIN sandbox_machine_owner mo ON mo.sandbox_id = sb.id
   LEFT JOIN LATERAL (
     SELECT array_agg(pp.port ORDER BY pp.port) AS ports,
            array_agg(pp.access ORDER BY pp.port) AS accesses,
@@ -709,7 +714,8 @@ RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path, statement_timestamp()::timestamptz AS routing_observed_at;
+          x.template_base_path, statement_timestamp()::timestamptz AS routing_observed_at,
+          x.machine_ownership_present, x.machine_owner_principal_id, x.machine_owner_team_id;
 
 -- name: ResumePostBootCheck :one
 -- The two reads a resume makes after the boot, in one statement: the

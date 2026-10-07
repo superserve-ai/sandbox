@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -52,7 +53,7 @@ func assertMachineLog(t *testing.T, event map[string]any, c auth.MachineCapabili
 
 func TestMachineRequestLoggingRotationAndDenials(t *testing.T) {
 	base := loggingMachineCapability()
-	for _, name := range []string{"success", "rotation", "owner denial", "team denial", "scope denial", "target denial", "bad signature", "revoked", "authority failure", "api key", "verified human", "verified human without parent"} {
+	for _, name := range []string{"success", "rotation", "owner denial", "team denial", "scope denial", "target denial", "bad signature", "revoked", "authority denial", "authority failure", "api key", "verified human", "verified human without parent"} {
 		t.Run(name, func(t *testing.T) {
 			capability := base
 			if name == "rotation" {
@@ -96,6 +97,11 @@ func TestMachineRequestLoggingRotationAndDenials(t *testing.T) {
 				status, outcome = 401, "invalid"
 			case "revoked":
 				h.machineAuthority = func(context.Context, uuid.UUID, uuid.UUID) (uint64, error) { return 2, nil }
+				status, outcome = 401, "invalid"
+			case "authority denial":
+				h.machineAuthority = func(context.Context, uuid.UUID, uuid.UUID) (uint64, error) {
+					return 0, fmt.Errorf("denied: %w", auth.ErrMachineCapabilityDenied)
+				}
 				status, outcome = 401, "invalid"
 			case "authority failure":
 				h.machineAuthority = func(context.Context, uuid.UUID, uuid.UUID) (uint64, error) {

@@ -93,7 +93,7 @@ func run() error {
 	if routingEnabled != "" && routingEnabled != "0" && routingEnabled != "1" {
 		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")
 	}
-	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1", os.Getenv("PROXY_DATABASE_URL"))
+	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1" || os.Getenv("PROXY_DATABASE_URL") != "", os.Getenv("PROXY_DATABASE_URL"))
 	if err != nil {
 		log.Fatal().Err(err).Msg("init ownership database")
 	}
@@ -106,6 +106,7 @@ func run() error {
 		// requests and stream registration; durable revocation notifications
 		// invalidate this snapshot through the handler hook.
 		proxyHandler.WithMachineAuthority(proxy.NewCachedMachineAuthority(dbPool, 5*time.Second))
+		proxyHandler.WithSandboxOwnership(proxy.NewCachedSandboxOwnership(dbPool))
 	}
 	var routingRecorder telemetry.RoutingOutcomeRecorder
 	var peerTelemetry proxy.RecorderPeerTelemetry

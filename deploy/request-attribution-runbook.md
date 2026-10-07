@@ -227,12 +227,12 @@ not create a console session-proof producer or establish live acceptance.
 | Peer edge enforces continuing stream authority | Forwarding records do not supply the owner-verified caller; the owner verifies authority and resource ownership and emits the primary record |
 | Peer edge rejects its authority/session gate | Primary rejection is `error` without claimed IDs; the gate exposes no typed denial/error distinction |
 
-The current proxy authority interface returns untyped errors for both some
-revocation denials and infrastructure failures. These failed lookups are
-conservatively logged as `error`; the logger does not inspect error strings
-or invent a distinction. A returned generation mismatch is `invalid`.
-The final authority handoff must resolve this distinction before final
-acceptance. A valid, current capability used for another sandbox retains its
+An explicit `ErrMachineCapabilityDenied` from the proxy authority (including
+wrapped errors for missing, revoked or expired authority) and a returned
+generation mismatch are logged as `invalid`. Other lookup errors are `error`;
+the logger never inspects error text. The peer-edge session gate exposes only
+a success boolean, so its fail-closed rejection remains conservatively `error`.
+A valid, current capability used for another sandbox retains its
 verified caller in the rejection record; its requested sandbox is still only
 the attempted target. HTTP rejection codes remain owned by authentication.
 
