@@ -117,24 +117,54 @@ class ProjectTests(unittest.TestCase):
 
 
 class ViewTests(unittest.TestCase):
-    def test_partial_permissions_wait_for_full_grant_on_real_view(self):
-        view = 'projects/example-project/locations/global/buckets/_Default/views/example-heartbeats'
-        permissions = ['logging.views.getIamPolicy', 'logging.views.setIamPolicy']
-        with patch.object(prerequisites, 'request', side_effect=[
-                {'permissions': permissions[:1]}, prerequisites.ApiError(403),
-                {'permissions': permissions}]) as request, \
-                patch.object(prerequisites, 'pause') as pause:
-            prerequisites.view_permissions(view, 100)
-        self.assertEqual(pause.call_count, 2)
-        self.assertTrue(all(call.args == ('POST', 'https://logging.googleapis.com/v2/' +
-                                        view + ':testIamPermissions', {'permissions': permissions})
-                            for call in request.call_args_list))
+    view = 'projects/example-project/locations/global/buckets/_Default/views/example-heartbeats'
+    policy = {'version': 3, 'etag': 'original', 'bindings': [{
+        'role': 'roles/logging.viewAccessor', 'members': ['user:reader@example.test'],
+        'condition': {'title': 'example', 'expression': 'true'}}]}
 
-    def test_missing_grant_times_out(self):
-        with patch.object(prerequisites, 'request', return_value={}), \
+    def test_get_allowed_set_denied_waits_then_roundtrips_policy_unchanged(self):
+        with patch.object(prerequisites, 'request', side_effect=[
+                self.policy, prerequisites.ApiError(403), self.policy, self.policy]) as request, \
+                patch.object(prerequisites, 'pause') as pause:
+            prerequisites.view_permissions(self.view, 100)
+        self.assertEqual(pause.call_count, 1)
+        url = 'https://logging.googleapis.com/v2/' + self.view
+        self.assertEqual([call.args for call in request.call_args_list], [
+            ('POST', url + ':getIamPolicy', {'options': {'requestedPolicyVersion': 3}}),
+            ('POST', url + ':setIamPolicy', {'policy': self.policy})] * 2)
+
+    def test_conflict_rereads_and_keeps_concurrent_binding(self):
+        for code in (409, 412):
+            with self.subTest(code=code):
+                fresh = {'version': 3, 'etag': 'fresh', 'bindings': self.policy['bindings'] + [{
+                    'role': 'roles/logging.viewAccessor', 'members': ['user:second@example.test']}]}
+                with patch.object(prerequisites, 'request', side_effect=[
+                        self.policy, prerequisites.ApiError(code), fresh, fresh]) as request, \
+                        patch.object(prerequisites, 'pause'):
+                    prerequisites.view_permissions(self.view, 100)
+                self.assertEqual(request.call_args_list[3].args[2], {'policy': fresh})
+
+    def test_empty_policy_is_safe_but_missing_etag_never_writes(self):
+        with patch.object(prerequisites, 'request', return_value={'etag': 'empty'}) as request:
+            prerequisites.view_permissions(self.view, 100)
+        self.assertEqual(request.call_args_list[1].args[2], {'policy': {'etag': 'empty'}})
+        with patch.object(prerequisites, 'request', return_value={}) as request:
+            with self.assertRaises(RuntimeError):
+                prerequisites.view_permissions(self.view, 100)
+        self.assertEqual(request.call_count, 1)
+
+    def test_denied_set_times_out(self):
+        with patch.object(prerequisites, 'request', side_effect=[self.policy, prerequisites.ApiError(403)]), \
                 patch.object(prerequisites.time, 'monotonic', return_value=101):
             with self.assertRaises(TimeoutError):
-                prerequisites.view_permissions('example-view', 100)
+                prerequisites.view_permissions(self.view, 100)
+
+    def test_permanent_failure_is_not_retried(self):
+        with patch.object(prerequisites, 'request', side_effect=[
+                self.policy, prerequisites.ApiError(400)]) as request:
+            with self.assertRaises(prerequisites.ApiError):
+                prerequisites.view_permissions(self.view, 100)
+        self.assertEqual(request.call_count, 2)
 
 
 if __name__ == '__main__':

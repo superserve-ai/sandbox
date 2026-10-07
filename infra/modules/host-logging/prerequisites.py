@@ -92,16 +92,22 @@ def instance_metadata(config, deadline):
 
 
 def view_permissions(view, deadline):
-    url = f'https://logging.googleapis.com/v2/{view}:testIamPermissions'
-    expected = {'logging.views.getIamPolicy', 'logging.views.setIamPolicy'}
+    url = f'https://logging.googleapis.com/v2/{view}'
     while True:
         try:
-            result = request('POST', url, {'permissions': sorted(expected)})
-            if expected.issubset(result.get('permissions', [])):
-                return
+            # testIamPermissions may fail open. Exercise the real read/write
+            # permissions without changing any binding, condition, or version.
+            policy = request('POST', url + ':getIamPolicy',
+                             {'options': {'requestedPolicyVersion': 3}})
+            if not policy.get('etag'):
+                raise RuntimeError('Heartbeat view policy has no concurrency token')
+            request('POST', url + ':setIamPolicy', {'policy': policy})
+            return
         except ApiError as error:
-            if error.code not in (403, 429, 500, 502, 503, 504):
+            if error.code not in (403, 409, 412, 429, 500, 502, 503, 504):
                 raise
+        # Always fetch a new policy after a denial or conflict; never replay a
+        # stale snapshot over a concurrently added reader or condition.
         pause(deadline, 'Heartbeat log-view IAM permission did not propagate')
 
 
