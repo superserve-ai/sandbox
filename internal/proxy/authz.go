@@ -119,6 +119,11 @@ func (h *Handler) authorizeSandboxRequest(
 			Caller:  verifiedCaller,
 		}
 	}
+	info, err = h.attestUnclassifiedSandbox(ctx, requestSandboxID, info)
+	if err != nil {
+		return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable,
+			Message: "sandbox ownership unavailable", Code: "sandbox_ownership_unavailable", Caller: verifiedCaller}
+	}
 	ownershipState := info.OwnershipState
 	if ownershipState == "" {
 		if info.MachineOwned && info.MachineOwnerPrincipalID != "" {

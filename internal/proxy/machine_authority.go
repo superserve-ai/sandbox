@@ -10,6 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
 // CachedMachineAuthority provides the bounded local freshness boundary used by
@@ -100,7 +102,7 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 			}
 			a.mu.Unlock()
 			if errors.Is(err, pgx.ErrNoRows) {
-				return authoritySnapshot{}, errors.New("machine authority denied")
+				return authoritySnapshot{}, auth.ErrMachineCapabilityDenied
 			}
 			return authoritySnapshot{}, err
 		}

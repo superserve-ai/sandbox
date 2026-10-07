@@ -907,17 +907,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 
-	// Every recovery caller uses durable resource ownership, including automatic
-	// resume by a team API key. This bounded read must precede VM publication.
-	owner, ownerErr := h.requestSandboxOwner(c, sandboxID, teamID)
-	if ownerErr != nil && !errors.Is(ownerErr, pgx.ErrNoRows) {
-		respondError(c, ErrInternal)
-		return "", false
-	}
-	if ownerErr == nil {
-		c.Set("restore_owner_id", "machine:"+owner.OwnerPrincipalID.String())
-	}
-
 	// One statement for the claim and the boot inputs; see ClaimResume.
 	claimParams := db.ClaimResumeParams{
 		ID:      sandboxID,
@@ -966,6 +955,21 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}); err != nil {
 			l.Error().Err(err).Msg("RevertResumeToPaused failed — sandbox may be stuck in 'resuming'")
 		}
+	}
+
+	// The claim returns immutable ownership with the other boot inputs, so
+	// ordinary and machine restores do not pay for a separate authority read.
+	owner, ownerErr := cacheClaimedSandboxOwner(c, sandboxID, teamID, claimed)
+	if ownerErr != nil && !errors.Is(ownerErr, pgx.ErrNoRows) {
+		markRevert()
+		revertToPaused()
+		respondError(c, ErrInternal)
+		return "", false
+	}
+	if ownerErr == nil {
+		c.Set("restore_owner_id", "machine:"+owner.OwnerPrincipalID.String())
+	} else if actorIDFromContext(c) == nil {
+		c.Set("restore_owner_id", "ordinary:attested")
 	}
 
 	if !sandbox.SnapshotID.Valid {
@@ -2415,9 +2419,8 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 	// unknown ownership never falls back to a legacy token.
 	if h.DB != nil && h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
 		if owner, err := h.requestSandboxOwner(c, s.ID, s.TeamID); err == nil {
-			if actor := actorIDFromContext(c); actor != nil && owner.TeamID == s.TeamID {
+			if parentID, parseErr := uuid.Parse(c.GetString("api_key_id")); parseErr == nil && parentID != uuid.Nil && owner.TeamID == s.TeamID {
 				now := timeNow(h)
-				parentID, _ := uuid.Parse(c.GetString("api_key_id"))
 				capability, capErr := auth.DeriveAPIKeyCapability(parentID, s.TeamID, s.ID, "sandbox-proxy", []auth.MachineOperation{
 					auth.MachineOperationRead, auth.MachineOperationReconnect,
 					auth.MachineOperationCommandRun, auth.MachineOperationCommandRead, auth.MachineOperationCommandWrite, auth.MachineOperationCommandSignal,
@@ -3503,12 +3506,18 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		vmdErr                   error
 	)
 	if booted {
+		// This newly allocated ID is ordinary unless the authenticated create
+		// caller supplied machine authority. No creator identity is required.
+		createOwnerID := ownerIDFromContext(c)
+		if createOwnerID == "" {
+			createOwnerID = "ordinary:attested"
+		}
 		// Same shape the sandbox row is being inserted with (the image's, or
 		// the defaults) — declared so the daemon never has to ask Firecracker
 		// for it afterwards.
 		limits := vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID, Egress: restoreEgress}
 		ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr = retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
-			ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars, limits)
+			ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), createOwnerID, previewAccess, nil, 0, req.EnvVars, limits)
 			// A host that lost the snapshot's files boots its backup instead;
 			// the generation is kept so a retry adopts that boot.
 			if vmdclient.IsSavedSnapshotMissing(err) && limits.BackupGeneration == "" {
@@ -3520,7 +3529,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 					return ip, vcpu, memMiB, err
 				}
 				limits.BackupGeneration = gen
-				ip, vcpu, memMiB, protocol, applied, err = vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars, limits)
+				ip, vcpu, memMiB, protocol, applied, err = vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), createOwnerID, previewAccess, nil, 0, req.EnvVars, limits)
 			}
 			previewProtocol, rulesApplied = protocol, applied
 			return ip, vcpu, memMiB, err

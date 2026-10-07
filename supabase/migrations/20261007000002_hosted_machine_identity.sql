@@ -191,3 +191,11 @@ CREATE POLICY proxy_machine_authority_read ON machine_principal FOR SELECT
     TO sandbox_proxy_router USING (true);
 CREATE POLICY proxy_machine_authority_read ON machine_credential FOR SELECT
     TO sandbox_proxy_router USING (true);
+
+-- Classify legacy VMD records without guessing from an absent creator. The
+-- proxy may read ownership identifiers, never credentials or mutate owners.
+GRANT SELECT (team_id) ON sandbox TO sandbox_proxy_router;
+GRANT SELECT (sandbox_id, owner_principal_id, team_id)
+    ON sandbox_machine_owner TO sandbox_proxy_router;
+CREATE POLICY proxy_machine_owner_read ON sandbox_machine_owner FOR SELECT
+    TO sandbox_proxy_router USING (true);

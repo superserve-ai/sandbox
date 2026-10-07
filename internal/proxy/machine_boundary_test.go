@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -228,5 +229,21 @@ func TestTeamDesktopCapabilityAdmission(t *testing.T) {
 	}
 	if auth.NewTrustedIssuancePolicy([]auth.MachineOperation{auth.TeamOperationDesktopRead}, "sandbox-proxy").Allows(auth.TeamOperationDesktopRead) {
 		t.Fatal("machine policy allowed desktop")
+	}
+}
+
+type failedAuthorityDB struct{ err error }
+
+func (d failedAuthorityDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	return authorityTestRow{scan: func(...any) error { return d.err }}
+}
+func TestMachineAuthorityDenialIsDistinctFromOutage(t *testing.T) {
+	for _, err := range []error{pgx.ErrNoRows, context.DeadlineExceeded} {
+		cache := NewCachedMachineAuthority(nil, time.Second)
+		cache.pool = failedAuthorityDB{err: err}
+		_, _, got := cache.LookupSnapshot(context.Background(), uuid.New(), uuid.New())
+		if errors.Is(got, auth.ErrMachineCapabilityDenied) != errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("classification for %v: %v", err, got)
+		}
 	}
 }
