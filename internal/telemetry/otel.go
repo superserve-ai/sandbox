@@ -102,6 +102,8 @@ type OTelRecorder struct {
 	hostConntrackBuckets     metric.Int64Gauge
 	hostConntrackSynTimeout  metric.Int64Gauge
 	hostConntrackUDPTimeout  metric.Int64Gauge
+	hostConntrackDrops       metric.Int64Gauge
+	hostConntrackEarlyDrops  metric.Int64Gauge
 	// Observable, uniquely in this file: coverage is published by one
 	// lease-elected replica per cell, and a synchronous gauge retains
 	// its last value per process, so a replica that lost leadership
@@ -269,6 +271,12 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.hostConntrackUDPTimeout, err = meter.Int64Gauge("host_conntrack_udp_timeout_seconds"); err != nil {
+		return nil, err
+	}
+	if r.hostConntrackDrops, err = meter.Int64Gauge("host_conntrack_drops"); err != nil {
+		return nil, err
+	}
+	if r.hostConntrackEarlyDrops, err = meter.Int64Gauge("host_conntrack_early_drops"); err != nil {
 		return nil, err
 	}
 	if r.backupUncoveredPaused, err = meter.Int64ObservableGauge("backup_uncovered_paused_sandboxes"); err != nil {
@@ -571,6 +579,8 @@ func (r *OTelRecorder) RecordHostConntrack(ctx context.Context, c HostConntrack)
 	r.hostConntrackBuckets.Record(ctx, c.Buckets, opt)
 	r.hostConntrackSynTimeout.Record(ctx, c.TCPSynSentTimeoutSecs, opt)
 	r.hostConntrackUDPTimeout.Record(ctx, c.UDPTimeoutSecs, opt)
+	r.hostConntrackDrops.Record(ctx, c.Drops, opt)
+	r.hostConntrackEarlyDrops.Record(ctx, c.EarlyDrops, opt)
 }
 
 func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {
