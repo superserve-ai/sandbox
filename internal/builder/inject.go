@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/rs/zerolog"
 )
@@ -53,7 +54,7 @@ var seedentropyBinary []byte
 //	/sbin/init                 (0755)  — shell wrapper that execs tini
 //
 // Returns the byte count of the boxd binary copied, for observability.
-func injectGuestAgent(rootfsDir, boxdBinaryPath string, freezeWorkload bool, logger *zerolog.Logger) (int64, error) {
+func injectGuestAgent(ctx context.Context, rootfsDir, boxdBinaryPath string, freezeWorkload bool, logger *zerolog.Logger) (int64, error) {
 	if boxdBinaryPath == "" {
 		return 0, fmt.Errorf("boxd binary path is empty")
 	}
@@ -125,8 +126,10 @@ func injectGuestAgent(rootfsDir, boxdBinaryPath string, freezeWorkload bool, log
 	// Canonical's public apt mirrors are intermittently throttled or
 	// unreachable, which surfaces inside build VMs as hung fetches, partial
 	// .deb downloads and steps running past their deadline. Point the image
-	// at a mirror the builder has just verified instead (aptmirror.go).
-	mirror := selectAptMirror(context.Background(), os.Getenv(aptMirrorEnv), logger)
+	// at a mirror the builder has just verified instead (aptmirror.go). The
+	// probe is deferred until a source actually needs rewriting so images
+	// without Canonical sources never pay for it.
+	mirror := sync.OnceValue(func() string { return selectAptMirror(ctx, os.Getenv(aptMirrorEnv), logger) })
 	if err := rewriteAptSources(rootfsDir, mirror, logger); err != nil {
 		return 0, fmt.Errorf("rewrite apt sources: %w", err)
 	}
@@ -209,10 +212,11 @@ func injectProxyCA(rootfsDir, caCertPath string, logger *zerolog.Logger) error {
 
 // rewriteAptSources rewrites http:// and https:// references to
 // canonicalUbuntuMirrors in /etc/apt/sources.list and
-// /etc/apt/sources.list.d/{*.list,*.sources} to point at mirror, and bounds
+// /etc/apt/sources.list.d/{*.list,*.sources} to point at mirror(), and bounds
 // apt's per-request wait (aptAcquireConf). No-op when /etc/apt is absent;
-// files that reference no canonical hostname are left alone.
-func rewriteAptSources(rootfsDir, mirror string, logger *zerolog.Logger) error {
+// files that reference no canonical hostname are left alone and mirror() is
+// never called.
+func rewriteAptSources(rootfsDir string, mirror func() string, logger *zerolog.Logger) error {
 	aptDir := filepath.Join(rootfsDir, "etc/apt")
 	if _, err := os.Stat(aptDir); err != nil {
 		if os.IsNotExist(err) {
@@ -249,7 +253,7 @@ func rewriteAptSources(rootfsDir, mirror string, logger *zerolog.Logger) error {
 	}
 	if len(rewritten) > 0 && logger != nil {
 		logger.Info().
-			Str("mirror", mirror).
+			Str("mirror", mirror()).
 			Strs("files", rewritten).
 			Msg("rewrote apt sources to alternate Ubuntu mirror")
 	}
@@ -289,7 +293,7 @@ func findAptSourceFiles(aptDir string) ([]string, error) {
 // rewriteAptFile rewrites one apt sources file in place. Returns changed=true
 // only when the file matched a canonical hostname and was overwritten.
 // Idempotent: re-running on an already-rewritten file is a no-op.
-func rewriteAptFile(path, mirror string) (bool, error) {
+func rewriteAptFile(path string, mirror func() string) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false, err
@@ -319,9 +323,10 @@ func rewriteAptFile(path, mirror string) (bool, error) {
 	}
 
 	rewritten := contents
-	for _, host := range canonicalUbuntuMirrors {
+	host := mirror()
+	for _, canonical := range canonicalUbuntuMirrors {
 		for _, scheme := range schemes {
-			rewritten = strings.ReplaceAll(rewritten, scheme+host, "http://"+mirror)
+			rewritten = strings.ReplaceAll(rewritten, scheme+canonical, "http://"+host)
 		}
 	}
 

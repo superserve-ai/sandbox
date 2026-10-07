@@ -100,7 +100,7 @@ func TestRewriteAptSources(t *testing.T) {
 			"deb http://archive.ubuntu.com/ubuntu noble main\n"+
 			"deb http://security.ubuntu.com/ubuntu noble-security main\n")
 
-		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
+		if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -131,7 +131,7 @@ func TestRewriteAptSources(t *testing.T) {
 			"Suites: noble noble-updates\n"+
 			"Components: main universe\n")
 
-		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
+		if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -149,7 +149,7 @@ func TestRewriteAptSources(t *testing.T) {
 			"deb https://my.private.mirror/ubuntu noble main\n"
 		writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"), original)
 
-		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
+		if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -165,7 +165,7 @@ func TestRewriteAptSources(t *testing.T) {
 			"deb https://archive.ubuntu.com/ubuntu noble main\n"+
 				"deb https://security.ubuntu.com/ubuntu noble-security main\n")
 
-		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
+		if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -193,7 +193,7 @@ func TestRewriteAptSources(t *testing.T) {
 				"deb http://security.ubuntu.com/ubuntu noble-security main\n"+
 				"deb http://my.private.mirror/ubuntu noble main\n")
 
-		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
+		if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -216,12 +216,12 @@ func TestRewriteAptSources(t *testing.T) {
 		writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"),
 			"deb http://archive.ubuntu.com/ubuntu noble main\n")
 
-		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
+		if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
 			t.Fatalf("first rewrite: %v", err)
 		}
 		first := readTestFile(t, filepath.Join(root, "etc/apt/sources.list"))
 
-		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
+		if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
 			t.Fatalf("second rewrite: %v", err)
 		}
 		second := readTestFile(t, filepath.Join(root, "etc/apt/sources.list"))
@@ -233,7 +233,7 @@ func TestRewriteAptSources(t *testing.T) {
 
 	t.Run("no-op when /etc/apt is absent", func(t *testing.T) {
 		root := t.TempDir() // empty
-		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
+		if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
 			t.Errorf("expected nil error for missing /etc/apt, got: %v", err)
 		}
 	})
@@ -262,10 +262,25 @@ func readTestFile(t *testing.T, path string) string {
 	return string(b)
 }
 
+func fixedMirror(host string) func() string { return func() string { return host } }
+
+func TestRewriteAptSources_SkipsMirrorSelectionWithoutCanonicalSources(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"), "deb http://deb.debian.org/debian bookworm main\n")
+	selected := false
+	err := rewriteAptSources(root, func() string { selected = true; return fallbackAptMirror }, nil)
+	if err != nil {
+		t.Fatalf("rewriteAptSources: %v", err)
+	}
+	if selected {
+		t.Error("mirror selected although no source needed rewriting")
+	}
+}
+
 func TestRewriteAptSources_BoundsAptRequests(t *testing.T) {
 	root := t.TempDir()
 	writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"), "deb http://archive.ubuntu.com/ubuntu noble main\n")
-	if err := rewriteAptSources(root, "europe-west1.gce.archive.ubuntu.com", nil); err != nil {
+	if err := rewriteAptSources(root, fixedMirror("europe-west1.gce.archive.ubuntu.com"), nil); err != nil {
 		t.Fatalf("rewriteAptSources: %v", err)
 	}
 	if got := readTestFile(t, filepath.Join(root, "etc/apt/sources.list")); !strings.Contains(got, "deb http://europe-west1.gce.archive.ubuntu.com/ubuntu noble main") {
