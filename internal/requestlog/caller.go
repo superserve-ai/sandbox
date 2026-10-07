@@ -9,22 +9,28 @@ import (
 // It does not validate authority or recheck expiry at session completion.
 func VerifiedCaller(c auth.CallerContext) Identity {
 	i := Identity{AuthOutcome: "authenticated", AttributionStatus: "identified"}
-	if c.TeamID == uuid.Nil || c.CredentialID == uuid.Nil {
+	if c.TeamID == uuid.Nil {
 		return Identity{ActorType: "unknown", AuthOutcome: "authenticated", AttributionStatus: "error"}
 	}
-	i.TeamID, i.CredentialID = c.TeamID.String(), c.CredentialID.String()
+	i.TeamID = c.TeamID.String()
+	if c.CredentialID != uuid.Nil {
+		i.CredentialID = c.CredentialID.String()
+	}
 	switch c.CallerKind {
 	case "", "machine":
-		if c.PrincipalID == uuid.Nil {
-			i.ActorType, i.AttributionStatus = "unknown", "error"
-			return i
+		if c.PrincipalID != uuid.Nil && c.CredentialID != uuid.Nil {
+			i.ActorType, i.ActorID = "machine", c.PrincipalID.String()
 		}
-		i.ActorType, i.ActorID = "machine", c.PrincipalID.String()
+	case "api_key":
+		if c.CredentialID != uuid.Nil {
+			i.ActorType, i.ActorID = "api_key", c.CredentialID.String()
+		}
 	case "human":
-		// This capability producer currently derives ActorID from the key
-		// owner. Its parent credential is proven; a human session is not.
-		i.ActorType, i.ActorID = "api_key", c.CredentialID.String()
-	default:
+		if c.ActorID != uuid.Nil {
+			i.ActorType, i.ActorID, i.UserID = "human", c.ActorID.String(), c.ActorID.String()
+		}
+	}
+	if i.ActorID == "" {
 		i.ActorType, i.AttributionStatus = "unknown", "error"
 	}
 	return i

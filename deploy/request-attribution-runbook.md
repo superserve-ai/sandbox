@@ -207,14 +207,14 @@ following credential/capability verification. See the
 issuance, expiry, revocation and authorization. Logging does not add an
 authority lookup or change permission checks, HTTP responses or stream limits.
 
-The integration is preparatory until that authority's consumer contract and
-rollout are accepted. In particular, the current capability kind `human` does
-not establish session provenance: its producer can use an API key's creator.
-For those capabilities, logs use the verified parent credential as an
-`api_key` actor, omit `user_id`, and never substitute the target machine owner.
-Missing required identity references produce `attribution_status=error`.
-A separately verified human discriminator must come from the identity owner
-before these data-plane records may claim human attribution.
+The adapter distinguishes the authority's explicit `machine`, `api_key` and
+`human` caller kinds. API-key children use the verified parent credential as
+their actor and credential ID and omit `user_id`; a key creator is never a
+human-session claim. Signed human capabilities use the separately verified
+actor as `actor_id` and `user_id`, retaining a parent credential only when
+provided. Missing required identity references produce
+`attribution_status=error`. These logs consume existing verification and do
+not create a console session-proof producer or establish live acceptance.
 
 | Observation | Log interpretation |
 | --- | --- |
@@ -224,7 +224,8 @@ before these data-plane records may claim human attribution.
 | Signature, expiry, audience or current generation fails verification | Do not copy claimed principal/credential/team into logs |
 | Authority lookup fails | `actor_type=unknown`, `auth_outcome=error`, `attribution_status=error`; no claimed caller IDs |
 | Stream ends after credential expiry/revocation | Completion retains the identity verified at establishment; it does not assert that the credential remains valid |
-| Peer edge checks only a capability signature to route it | Forwarding event has no verified machine caller; the owner verifies current authority and emits the primary record |
+| Peer edge enforces continuing stream authority | Forwarding records do not supply the owner-verified caller; the owner verifies authority and resource ownership and emits the primary record |
+| Peer edge rejects its authority/session gate | Primary rejection is `error` without claimed IDs; the gate exposes no typed denial/error distinction |
 
 The current proxy authority interface returns untyped errors for both some
 revocation denials and infrastructure failures. These failed lookups are

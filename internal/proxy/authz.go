@@ -181,7 +181,6 @@ func (h *Handler) authorizeSandboxRequest(
 			CallerKind: verifiedCapability.CallerKind, ActorID: verifiedCapability.ActorID,
 		}
 	}
-	logSandboxAuth(ctx, "authenticated", info.TeamID)
 	if info.Status != "running" {
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusServiceUnavailable,

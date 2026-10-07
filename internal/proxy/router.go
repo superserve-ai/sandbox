@@ -144,6 +144,7 @@ func (h *RoutingHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		// hijacked client and peer transports when this context is canceled.
 		ctx, cleanup, ok := local.machineSessionContext(r.Context(), token)
 		if !ok {
+			logSandboxAuth(r.Context(), "error", "")
 			(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
 			return
 		}

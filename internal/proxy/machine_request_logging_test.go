@@ -52,7 +52,7 @@ func assertMachineLog(t *testing.T, event map[string]any, c auth.MachineCapabili
 
 func TestMachineRequestLoggingRotationAndDenials(t *testing.T) {
 	base := loggingMachineCapability()
-	for _, name := range []string{"success", "rotation", "owner denial", "team denial", "scope denial", "target denial", "bad signature", "revoked", "authority failure", "human key owner"} {
+	for _, name := range []string{"success", "rotation", "owner denial", "team denial", "scope denial", "target denial", "bad signature", "revoked", "authority failure", "api key", "verified human", "verified human without parent"} {
 		t.Run(name, func(t *testing.T) {
 			capability := base
 			if name == "rotation" {
@@ -64,9 +64,16 @@ func TestMachineRequestLoggingRotationAndDenials(t *testing.T) {
 			if name == "target denial" {
 				capability.SandboxID = uuid.New()
 			}
-			if name == "human key owner" {
-				capability.CallerKind, capability.ActorID = "human", uuid.New()
-				capability.ParentCredentialID = uuid.New()
+			if name == "api key" || strings.HasPrefix(name, "verified human") {
+				capability.PrincipalID, capability.CredentialID, capability.LineageID = uuid.Nil, uuid.Nil, uuid.Nil
+				capability.RevocationGeneration = 0
+				capability.CallerKind, capability.ParentCredentialID = "api_key", uuid.New()
+				if strings.HasPrefix(name, "verified human") {
+					capability.CallerKind, capability.ActorID = "human", uuid.New()
+				}
+				if name == "verified human without parent" {
+					capability.ParentCredentialID = uuid.Nil
+				}
 			}
 			var served atomic.Int32
 			h, buf, token := machineLoggingProxy(t, capability, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,9 +117,20 @@ func TestMachineRequestLoggingRotationAndDenials(t *testing.T) {
 				t.Fatal(e)
 			}
 			if outcome == "authenticated" {
-				if name == "human key owner" {
+				if name == "api key" {
 					if e["actor_type"] != "api_key" || e["actor_id"] != capability.ParentCredentialID.String() || e["credential_id"] != capability.ParentCredentialID.String() || e["user_id"] != nil {
 						t.Fatalf("key creator became human: %v", e)
+					}
+				} else if strings.HasPrefix(name, "verified human") {
+					if e["actor_type"] != "human" || e["actor_id"] != capability.ActorID.String() || e["user_id"] != capability.ActorID.String() {
+						t.Fatal(e)
+					}
+					if capability.ParentCredentialID == uuid.Nil {
+						if e["credential_id"] != nil {
+							t.Fatal("fabricated credential", e)
+						}
+					} else if e["credential_id"] != capability.ParentCredentialID.String() {
+						t.Fatal(e)
 					}
 				} else {
 					assertMachineLog(t, e, capability)
@@ -163,7 +181,7 @@ func TestMachineRequestLoggingPeerPreservesOwnerIdentity(t *testing.T) {
 		if e["event_type"] == "request" {
 			assertMachineLog(t, e, capability)
 		} else if e["actor_id"] != nil || e["auth_outcome"] != "not_evaluated" {
-			t.Fatal("routing-only signature check asserted current authority")
+			t.Fatal("forwarding edge asserted owner-verified caller identity")
 		}
 	}
 	if counts["request"] != 1 || counts["proxy_forward"] != 1 {
@@ -204,5 +222,32 @@ func TestMachineRequestLoggingSessionRetainsHandshakeIdentity(t *testing.T) {
 	assertMachineLog(t, events[1], capability)
 	if strings.Contains(buf.text(), "SYNTHETIC_CONTENT") || strings.Contains(buf.text(), token) {
 		t.Fatal("session content/credential leaked")
+	}
+}
+
+func TestMachineRequestLoggingPeerAuthorityFailure(t *testing.T) {
+	capability := loggingMachineCapability()
+	h, buf, token := machineLoggingProxy(t, capability, nil)
+	var lookups atomic.Int32
+	h.machineAuthority = func(context.Context, uuid.UUID, uuid.UUID) (uint64, error) {
+		lookups.Add(1)
+		return 0, errors.New("SYNTHETIC_AUTHORITY_SECRET")
+	}
+	ownerCalls := atomic.Int32{}
+	owner := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ownerCalls.Add(1) }))
+	defer owner.Close()
+	peers, addr := startRoutingTestPeer(t, owner.Listener.Addr().String())
+	router := NewRoutingHandler(h.domains, "edge", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+		return SandboxRoute{HostID: "owner", ProxyAddr: addr, Generation: 1}, nil
+	}), peers, h, h.log)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, loggingRequest("GET", "/files?path=/data", token))
+	events := buf.events(t)
+	if w.Code != http.StatusServiceUnavailable || lookups.Load() != 1 || ownerCalls.Load() != 0 || len(events) != 1 {
+		t.Fatalf("status=%d lookups=%d owner=%d events=%v", w.Code, lookups.Load(), ownerCalls.Load(), events)
+	}
+	e := events[0]
+	if e["event_type"] != "request" || e["auth_outcome"] != "error" || e["actor_type"] != "unknown" || e["actor_id"] != nil || e["credential_id"] != nil || e["team_id"] != nil || strings.Contains(buf.text(), "SYNTHETIC") {
+		t.Fatal(e)
 	}
 }

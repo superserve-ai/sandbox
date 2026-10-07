@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
@@ -22,7 +24,8 @@ func (f loggingMachineResolver) ResolveMachineCredential(ctx context.Context, ra
 }
 
 func TestMachineRequestAttributionRotationAndDenials(t *testing.T) {
-	buf := captureRequestLogs(t)
+	buf := new(bytes.Buffer)
+	logger := zerolog.New(buf)
 	caller := auth.CallerContext{
 		PrincipalID: uuid.New(), CredentialID: uuid.New(), LineageID: uuid.New(), TeamID: uuid.New(), HostedTenantID: uuid.New(),
 		Permissions: []auth.MachineOperation{auth.MachineOperationRead}, Policy: auth.NewMachinePolicy(auth.MachineOperationRead),
@@ -49,7 +52,7 @@ func TestMachineRequestAttributionRotationAndDenials(t *testing.T) {
 			}
 			calls, handled := 0, false
 			r := gin.New()
-			r.Use(RequestLogger(), MachineCredentialAuth(loggingMachineResolver(func(context.Context, string) (auth.CallerContext, error) {
+			r.Use(requestLogger(&logger), MachineCredentialAuth(loggingMachineResolver(func(context.Context, string) (auth.CallerContext, error) {
 				calls++
 				return caller, tc.err
 			})), APIKeyAuth(nil))

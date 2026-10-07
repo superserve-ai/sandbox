@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -250,6 +249,10 @@ func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
 // RequestLogger returns a Gin middleware that logs each request using zerolog,
 // including method, path, status code, and latency.
 func RequestLogger() gin.HandlerFunc {
+	return requestLogger(&log.Logger)
+}
+
+func requestLogger(logger *zerolog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 
@@ -261,11 +264,11 @@ func RequestLogger() gin.HandlerFunc {
 		method := requestlog.Method(c.Request.Method)
 		route, path := requestLogPath(c)
 
-		evt := log.Info()
+		evt := logger.Info()
 		if status >= 500 && !c.GetBool(stripeCheckoutAssociationPendingRequestKey) {
-			evt = log.Error()
+			evt = logger.Error()
 		} else if status >= 400 {
-			evt = log.Warn()
+			evt = logger.Warn()
 		}
 
 		switch outcome := c.GetString(logAuthorizationOutcomeKey); outcome {
