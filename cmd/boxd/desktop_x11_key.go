@@ -284,7 +284,7 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifier
 // modifierKeysym reports whether ks is a modifier key (Shift, Control,
 // Alt, Super, Hyper, Meta, the locks, Mode_switch, ISO_Level3_Shift).
 func modifierKeysym(ks uint32) bool {
-	return (ks >= 0xffe1 && ks <= 0xffee) || ks == 0xff7e || ks == 0xff7f || ks == 0xfe03
+	return (ks >= 0xffe1 && ks <= 0xffee) || ks == 0xff7e || ks == 0xff7f || ks == 0xff14 || ks == 0xfe03
 }
 
 // scratchRowIntact reports whether a fetched row is still the single-keysym
@@ -585,8 +585,10 @@ func planKey(km *x11Keymap, state xkbState, ev *pb.KeyEvent) ([]keySegment, erro
 // Key delivers one KeyEvent through XTest: scratch bindings, a sync so the
 // server has applied them (and told every client) before the presses, then
 // the strokes and one sync per segment. A plan failure happens before any
-// request is sent; after that, errors are returned without replay.
-func (b *x11Backend) Key(ev *pb.KeyEvent) error {
+// request is sent; after that, errors are returned without replay. A lock
+// that could not be put back is an error too, so the backend is dropped
+// rather than a cleared lock left behind unnoticed.
+func (b *x11Backend) Key(ev *pb.KeyEvent) (err error) {
 	// A backend without a connection (tests) cannot type.
 	if b.conn == nil {
 		return fmt.Errorf("no X11 connection: %w", errBackendKept)
@@ -618,7 +620,11 @@ func (b *x11Backend) Key(ev *pb.KeyEvent) error {
 			if err := b.xkbSetLocks(locks, 0); err != nil {
 				return err
 			}
-			defer func() { _ = b.xkbSetLocks(locks, locks) }()
+			defer func() {
+				if restoreErr := b.xkbSetLocks(locks, locks); restoreErr != nil && err == nil {
+					err = restoreErr
+				}
+			}()
 		}
 	}
 	for _, seg := range segments {

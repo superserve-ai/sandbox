@@ -528,6 +528,11 @@ func TestBuildKeymap_ModifierKeycodesOfferOnlyModifierKeysyms(t *testing.T) {
 	if _, ok := km.direct[keysymShiftL]; !ok {
 		t.Error("Shift_L on a modifier keycode must stay usable")
 	}
+	for _, ks := range []uint32{0xff14, 0xff7f, 0xffe5} { // Scroll_Lock, Num_Lock, Caps_Lock
+		if !modifierKeysym(ks) {
+			t.Errorf("keysym %#x is a lock key and must count as a modifier", ks)
+		}
+	}
 	if st, ok := km.direct[0xe9]; ok {
 		t.Errorf("é on modifier keycode %d was offered as a layout key", st.code)
 	}
