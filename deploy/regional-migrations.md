@@ -55,6 +55,23 @@ retain the operator's responsibility for migration prerequisites. Route held
 infrastructure work to its owner. Do not cancel an in-flight deployment as a
 substitute for the gates.
 
+## Snapshot reference index
+
+The ordinary `push` action prebuilds `idx_sandbox_snapshot_id` concurrently
+before the CLI applies its migration. It uses the migration mutex and existing
+250ms lock, 2s transaction, and 60s command budgets, with a 1.9s statement timeout
+covering the concurrent build's internal transactions. Preflight, list, and
+dry-run remain read-only. A fresh database builds the index in its normal SQL
+migration. The index includes soft-deleted sandboxes because snapshot deletion
+must clear their foreign-key references too.
+
+Both preparation and migration verify the exact index definition and validity.
+An interrupted build can leave an invalid index; stop and review that index's
+recovery before retrying. The runner does not drop it, increase timeouts, or mark
+the migration applied. If preparation succeeds but the subsequent CLI run fails,
+the next approved run reuses the valid index and records the normal migration.
+Release this through the same revision, preflight, and environment gates above.
+
 ## Retained-storage recovery
 
 The fixed `retained-storage-v1` plan handles West before retained migration 01
