@@ -70,7 +70,10 @@ An interrupted build can leave an invalid index; stop and review that index's
 recovery before retrying. The runner does not drop it, increase timeouts, or mark
 the migration applied. If preparation succeeds but the subsequent CLI run fails,
 the next approved run reuses the valid index and records the normal migration.
-Release this through the same revision, preflight, and environment gates above.
+Merging a migration-only change triggers the API deployment's migration
+prerequisite: successful push CI at the exact revision, then staging, East, and
+West through their environment gates. The standalone CD Migrate workflow also
+supports the explicit preflight/release procedure above.
 
 ## Retained-storage recovery
 
