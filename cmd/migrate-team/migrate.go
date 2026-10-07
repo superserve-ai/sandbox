@@ -143,6 +143,9 @@ func run(ctx context.Context, cfg config) error {
 // the source's actual flag state — its value when a row exists there,
 // absence when none does.
 func runReleaseRollups(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
+	if err := checkRetainedAccountingReady(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 	var srcEnabled *bool
 	if err := src.QueryRow(ctx, `
 		SELECT enabled FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`,
@@ -425,6 +428,65 @@ func reportArtifactDirs(ctx context.Context, src *pgxpool.Pool, cfg config) erro
 	return nil
 }
 
+// checkRetainedAccountingReady is a fail-closed migration fence for the
+// canonical retained-storage state.  Migration may carry ended history, but
+// it must never move a team while an active first-measurement obligation,
+// incomplete report, or NULL canonical quantity would be hidden by the
+// destination's fresh settlement horizon.
+func checkRetainedAccountingReady(ctx context.Context, src querier, teamID uuid.UUID) error {
+	var unresolved int64
+	if err := src.QueryRow(ctx, `
+		SELECT count(*)
+		FROM retained_storage_measurement_obligation
+		WHERE team_id = $1 AND resolved_at IS NULL AND ended_at IS NULL`, teamID).Scan(&unresolved); err != nil {
+		return fmt.Errorf("check retained measurement obligations: %w", err)
+	}
+	if unresolved > 0 {
+		return fmt.Errorf("refusing team migration: %d retained measurement obligation(s) remain unresolved; obtain an authoritative measurement or cleanup and rerun", unresolved)
+	}
+
+	historyStart, historyEnd, err := retainedAccountingWindow(ctx, src, teamID)
+	if err != nil {
+		return err
+	}
+
+	var complete bool
+	if err := src.QueryRow(ctx, `SELECT storage_reports_complete_through($1, $2)`, teamID, historyEnd).Scan(&complete); err != nil {
+		return fmt.Errorf("check storage report completeness: %w", err)
+	}
+	if !complete {
+		return fmt.Errorf("refusing team migration: storage reports are pending or incomplete in the retained accounting history; repair and rerun")
+	}
+
+	var known bool
+	if err := src.QueryRow(ctx, `SELECT storage_mib_seconds($1, $2, $3, false) IS NOT NULL`, teamID, historyStart, historyEnd).Scan(&known); err != nil {
+		return fmt.Errorf("check canonical retained storage quantity: %w", err)
+	}
+	if !known {
+		return fmt.Errorf("refusing team migration: canonical retained storage quantity is unknown (missing baseline provenance or unsupported measurement); repair and rerun")
+	}
+	return nil
+}
+
+func retainedAccountingWindow(ctx context.Context, src querier, teamID uuid.UUID) (time.Time, time.Time, error) {
+	var historyStart, historyEnd time.Time
+	if err := src.QueryRow(ctx, `
+		WITH points(at) AS (
+			SELECT started_at FROM sandbox_storage_interval WHERE team_id = $1
+			UNION ALL SELECT ended_at FROM sandbox_storage_interval WHERE team_id = $1 AND ended_at IS NOT NULL
+			UNION ALL SELECT started_at FROM retained_storage_interval WHERE team_id = $1
+			UNION ALL SELECT ended_at FROM retained_storage_interval WHERE team_id = $1 AND ended_at IS NOT NULL
+			UNION ALL SELECT effective_at FROM sandbox_storage_baseline WHERE team_id = $1
+			UNION ALL SELECT ended_at FROM sandbox_storage_baseline WHERE team_id = $1 AND ended_at IS NOT NULL
+			UNION ALL SELECT effective_at FROM retained_storage_measurement_obligation WHERE team_id = $1
+			UNION ALL SELECT ended_at FROM retained_storage_measurement_obligation WHERE team_id = $1 AND ended_at IS NOT NULL
+		)
+		SELECT COALESCE(MIN(at), now()), GREATEST(COALESCE(MAX(at), now()), now()) FROM points`, teamID).Scan(&historyStart, &historyEnd); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("find retained accounting history window: %w", err)
+	}
+	return historyStart, historyEnd, nil
+}
+
 // ---------------------------------------------------------------------------
 // copy
 
@@ -479,6 +541,9 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	if hostRegion != cfg.destRegion {
 		return fmt.Errorf("dest host %q is in region %q, not --dest-region %q", cfg.destHostID, hostRegion, cfg.destRegion)
 	}
+	if err := checkRetainedAccountingReady(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 
 	// Commit the source-only fence first so a failed or interrupted copy cannot
 	// reopen source admission after destination ownership has become reachable.
@@ -491,6 +556,9 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	}
 	defer sourceTx.Rollback(ctx)
 	if err := lockSourcePromotionMigration(ctx, sourceTx, cfg.teamID); err != nil {
+		return err
+	}
+	if err := checkRetainedAccountingReady(ctx, sourceTx, cfg.teamID); err != nil {
 		return err
 	}
 	transforms, err := buildTransforms(ctx, sourceTx, dst, cfg)
@@ -921,6 +989,20 @@ var insertOnlyTables = map[string]bool{
 	// Activation rows are immutable; retries must preserve the original
 	// timestamp and validation must detect any destination divergence.
 	"team_storage_billing_activation": true,
+	// Checkout publication authority is append-only and protected by an
+	// immutability trigger. A retry must leave the destination fact untouched.
+	"stripe_checkout_generation_authority":     true,
+	"stripe_checkout_publication_decision":     true,
+	"stripe_checkout_publication_subscription": true,
+}
+
+// These records deliberately outlive source-team purge. They are immutable
+// generation authority and may still be needed to explain or reject a late
+// Stripe callback after the team's ownership rows have been retired.
+var retainedAfterPurgeTables = map[string]bool{
+	"stripe_checkout_generation_authority":     true,
+	"stripe_checkout_publication_decision":     true,
+	"stripe_checkout_publication_subscription": true,
 }
 
 // allColumns lists a table's column names in attnum order.
@@ -952,7 +1034,10 @@ func allColumns(ctx context.Context, dst *pgxpool.Pool, table string) ([]string,
 // converge. Conflicting on the natural key instead lets the copy overwrite
 // scheduler-created rows (id included) and re-runs stay idempotent.
 var conflictTargets = map[string]string{
-	"billing_rollup_job": "(team_id, hour_start)",
+	"billing_rollup_job":                      "(team_id, hour_start)",
+	"retained_storage_interval":               "(host_id, owner_kind, owner_id, started_at)",
+	"sandbox_storage_baseline":                "(sandbox_id, host_id, effective_at, receipt_id)",
+	"retained_storage_measurement_obligation": "(migration_identity)",
 }
 
 func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (string, error) {
@@ -970,7 +1055,7 @@ func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (strin
 		}
 		var updates []string
 		for _, col := range cols {
-			if targetCols[col] {
+			if targetCols[col] || (col == "id" && (table == "retained_storage_interval" || table == "sandbox_storage_baseline" || table == "retained_storage_measurement_obligation")) {
 				continue
 			}
 			q := pgx.Identifier{col}.Sanitize()
@@ -1040,6 +1125,33 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 		`INSERT INTO %s SELECT * FROM jsonb_populate_recordset(NULL::%s, $1::jsonb) %s`,
 		t.name, t.name, conflict)
 
+	// Generated accounting IDs are cell-local identities.  Omit them from
+	// inserts so retries preserve the destination's local key.  Intervals
+	// converge on the owner boundary; baselines use their receipt boundary and
+	// obligations use the additive UUID migration identity.
+	if t.name == "retained_storage_interval" || t.name == "sandbox_storage_baseline" || t.name == "retained_storage_measurement_obligation" {
+		// Close previously copied intervals before inserting their replacements,
+		// both across batches and within each destination INSERT.
+		orderClause := ""
+		if t.name == "retained_storage_interval" {
+			const intervalOrder = " ORDER BY (ended_at IS NULL), started_at, host_id, owner_kind, owner_id"
+			selectQ += intervalOrder
+			orderClause = intervalOrder
+		}
+		cols, err := allColumns(ctx, dst, t.name)
+		if err != nil {
+			return 0, 0, err
+		}
+		var projected []string
+		for _, col := range cols {
+			if col != "id" {
+				projected = append(projected, pgx.Identifier{col}.Sanitize())
+			}
+		}
+		names := strings.Join(projected, ", ")
+		insertQ = fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM jsonb_populate_recordset(NULL::%s, $1::jsonb)%s %s`, t.name, names, names, t.name, orderClause, conflict)
+	}
+
 	rows, err := src.Query(ctx, selectQ, teamID)
 	if err != nil {
 		return 0, 0, err
@@ -1054,6 +1166,12 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 		}
 		payload, err := json.Marshal(batch)
 		if err != nil {
+			return err
+		}
+		if err := verifyRetainedBatch(ctx, dst, t.name, batch); err != nil {
+			return err
+		}
+		if err := assertAccountingIdentityOwnership(ctx, dst, t.name, payload); err != nil {
 			return err
 		}
 		tag, err := dst.Exec(ctx, insertQ, payload)
@@ -1090,7 +1208,63 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 	if err := flush(); err != nil {
 		return copied, 0, err
 	}
+	if retainedAfterPurgeTables[t.name] {
+		// The source row count is already known from the streaming copy. A
+		// single destination count catches destination-only retained rows
+		// without another historical JSON checksum pass; differing rows with
+		// matching keys were checked by verifyRetainedBatch above.
+		var destinationRows int64
+		if err := dst.QueryRow(ctx,
+			fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.effectiveCopyScope()), teamID).
+			Scan(&destinationRows); err != nil {
+			return copied, 0, fmt.Errorf("count retained %s rows: %w", t.name, err)
+		}
+		if destinationRows != total {
+			return copied, 0, fmt.Errorf("%s: content drift before billing account publication", t.name)
+		}
+	}
 	return copied, total - copied, nil
+}
+
+// assertAccountingIdentityOwnership prevents a migration identity or natural
+// baseline key belonging to another team from being treated as an idempotent
+// retry.  A local generated-id collision is harmless because the insert omits
+// that id; a durable identity collision across teams is a hard refusal.
+func assertAccountingIdentityOwnership(ctx context.Context, dst *pgxpool.Pool, table string, payload []byte) error {
+	var collision bool
+	switch table {
+	case "retained_storage_measurement_obligation":
+		err := dst.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM retained_storage_measurement_obligation d
+				JOIN jsonb_populate_recordset(NULL::retained_storage_measurement_obligation, $1::jsonb) i
+				  ON d.migration_identity = i.migration_identity
+				WHERE d.team_id <> i.team_id
+			)`, payload).Scan(&collision)
+		if err != nil {
+			return fmt.Errorf("check retained obligation migration identity ownership: %w", err)
+		}
+	case "sandbox_storage_baseline":
+		err := dst.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM sandbox_storage_baseline d
+				JOIN jsonb_populate_recordset(NULL::sandbox_storage_baseline, $1::jsonb) i
+				  ON d.sandbox_id = i.sandbox_id
+				 AND d.host_id = i.host_id
+				 AND d.effective_at = i.effective_at
+				 AND d.receipt_id = i.receipt_id
+				WHERE d.team_id <> i.team_id
+			)`, payload).Scan(&collision)
+		if err != nil {
+			return fmt.Errorf("check retained baseline identity ownership: %w", err)
+		}
+	}
+	if collision {
+		return fmt.Errorf("refusing accounting copy: %s identity belongs to another team", table)
+	}
+	return nil
 }
 
 // transformRow decodes a row's jsonb, applies the transform, and re-encodes.
@@ -1282,6 +1456,37 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 		if srcV != dstV {
 			mismatches = append(mismatches, fmt.Sprintf("%s: source=%s dest=%s", bs.name, srcV, dstV))
 		}
+	}
+
+	// Compare the canonical retained quantity and settlement fence at one
+	// source-defined boundary.  This catches a copied history set that has
+	// equal row counts but a missing provenance segment or completeness state.
+	historyStart, historyEnd, err := retainedAccountingWindow(ctx, src, teamID)
+	if err != nil {
+		return nil, err
+	}
+	var srcUnknown, dstUnknown bool
+	var srcQuantity, dstQuantity *string
+	var srcComplete, dstComplete bool
+	if err := src.QueryRow(ctx, `
+		SELECT storage_mib_seconds($1, $2, $3, false) IS NULL,
+		       storage_mib_seconds($1, $2, $3, false)::text,
+		       storage_reports_complete_through($1, $3)`, teamID, historyStart, historyEnd).
+		Scan(&srcUnknown, &srcQuantity, &srcComplete); err != nil {
+		return nil, fmt.Errorf("source canonical retained accounting: %w", err)
+	}
+	if err := dst.QueryRow(ctx, `
+		SELECT storage_mib_seconds($1, $2, $3, false) IS NULL,
+		       storage_mib_seconds($1, $2, $3, false)::text,
+		       storage_reports_complete_through($1, $3)`, teamID, historyStart, historyEnd).
+		Scan(&dstUnknown, &dstQuantity, &dstComplete); err != nil {
+		return nil, fmt.Errorf("dest canonical retained accounting: %w", err)
+	}
+	if srcUnknown != dstUnknown || srcQuantity == nil || dstQuantity == nil || (srcQuantity != nil && dstQuantity != nil && *srcQuantity != *dstQuantity) {
+		mismatches = append(mismatches, fmt.Sprintf("canonical retained storage quantity differs (source=%v dest=%v)", srcQuantity, dstQuantity))
+	}
+	if srcComplete != dstComplete {
+		mismatches = append(mismatches, fmt.Sprintf("canonical storage completeness differs (source=%t dest=%t)", srcComplete, dstComplete))
 	}
 
 	// 3. Every live paused sandbox in the dest must carry its artifact paths;
@@ -1477,6 +1682,9 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	if cfg.confirmTeamName != teamName {
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
 	}
+	if err := checkRetainedAccountingReady(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 
 	// A re-run during the soak must be a pure no-op, not a replay: the
 	// sweep and the rollup release below write to the dest, which has been
@@ -1556,6 +1764,9 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	}
 	defer tx.Rollback(ctx)
 	if err := lockSourcePromotionMigration(ctx, tx, cfg.teamID); err != nil {
+		return err
+	}
+	if err := checkRetainedAccountingReady(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
 
@@ -1651,6 +1862,9 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	if cfg.confirmTeamName != teamName {
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
 	}
+	if err := checkRetainedAccountingReady(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 
 	// A detached source flips purge's relationship to the dest: the dest
 	// has been the live home since detach, so source↔dest comparisons and
@@ -1728,6 +1942,9 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	if err := lockSourcePromotionMigration(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
+	if err := checkRetainedAccountingReady(ctx, tx, cfg.teamID); err != nil {
+		return err
+	}
 
 	// Lock the team's rows first: the auto-delete worker claims paused
 	// sandboxes past their deadline with an UPDATE, which now blocks behind
@@ -1767,6 +1984,9 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		return err
 	} else if len(blockers) > 0 {
 		return fmt.Errorf("aborting purge: sandbox changed before the locks:\n  %s", strings.Join(blockers, "\n  "))
+	}
+	if err := checkRetainedAccountingReady(ctx, tx, cfg.teamID); err != nil {
+		return err
 	}
 	// The source rows die below, so capture the rollup-flag state now and
 	// restore it into the dest after the deletes commit — purged
@@ -1864,6 +2084,9 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		if t.name == "team_storage_billing_activation" {
 			continue
 		}
+		if retainedAfterPurgeTables[t.name] {
+			continue
+		}
 		tag, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, t.name, t.scope), cfg.teamID)
 		if err != nil {
 			return fmt.Errorf("delete from %s: %w", t.name, err)
@@ -1884,6 +2107,6 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		log.Info().Msg("purge: dest rollup hold released to the source's pre-delete state")
 	}
 
-	log.Info().Int64("deleted", total).Msg("purge: source rows removed (profiles and append-only audit tables retained)")
+	log.Info().Int64("deleted", total).Msg("purge: source rows removed (profiles, immutable publication authority, and append-only audit tables retained)")
 	return nil
 }

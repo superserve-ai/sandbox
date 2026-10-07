@@ -88,10 +88,20 @@ func (h *Handlers) RecoverStripeCheckoutSession(c *gin.Context) {
 		respondCheckoutRecoveryUnavailable(c)
 		return
 	}
+	noCredit, err := h.DB.StripeCheckoutPublicationFailed(ctx, db.StripeCheckoutPublicationFailedParams{
+		TeamID: teamID, Generation: account.CheckoutInitializingAt.Time, UserID: actorID,
+	})
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
 	evidence := db.StripeCheckoutRecoveryEvidenceAvailableParams{
 		ActorID: actorID, EvidenceVersion: account.StripeCheckoutIdentityEvidenceVersion,
 	}
-	available, err := h.DB.StripeCheckoutRecoveryEvidenceAvailable(ctx, evidence)
+	available := noCredit
+	if !noCredit {
+		available, err = h.DB.StripeCheckoutRecoveryEvidenceAvailable(ctx, evidence)
+	}
 	if err != nil || !available {
 		log.Warn().Err(err).Str("team_id", teamID.String()).Msg("captured checkout recovery evidence unavailable")
 		respondErrorMsg(c, "service_unavailable", "captured checkout identity evidence is unavailable", http.StatusServiceUnavailable)
@@ -120,7 +130,12 @@ func (h *Handlers) RecoverStripeCheckoutSession(c *gin.Context) {
 	}
 	defer tx.Rollback(ctx)
 	queries := h.DB.WithTx(tx)
-	if err := queries.LockStripeCheckoutRecoveryIdentity(ctx, actorID); err != nil {
+	if noCredit {
+		_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, actorID.String())
+	} else {
+		err = queries.LockStripeCheckoutRecoveryIdentity(ctx, actorID)
+	}
+	if err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
@@ -144,7 +159,9 @@ func (h *Handlers) RecoverStripeCheckoutSession(c *gin.Context) {
 		respondCheckoutRecoveryUnavailable(c)
 		return
 	}
-	available, err = queries.StripeCheckoutRecoveryEvidenceAvailable(ctx, evidence)
+	if !noCredit {
+		available, err = queries.StripeCheckoutRecoveryEvidenceAvailable(ctx, evidence)
+	}
 	if err != nil || !available {
 		respondErrorMsg(c, "service_unavailable", "captured checkout identity evidence is unavailable", http.StatusServiceUnavailable)
 		return

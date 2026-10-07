@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
 
@@ -53,7 +54,9 @@ type EgressProxy struct {
 	// blocklist is the global egress denylist (nil = disabled). Checked
 	// before per-sandbox rules; a blocklist hit cannot be overridden by a
 	// sandbox's own allow rules.
-	blocklist *blocklist.Blocklist
+	blocklist     *blocklist.Blocklist
+	mining        atomic.Pointer[MiningProxyPolicy]
+	miningStreams *miningProxyStreams
 
 	// sandboxRules maps sandbox host IPs to their egress config.
 	mu    sync.RWMutex
@@ -115,7 +118,11 @@ func (p *EgressProxy) RegisterSandbox(hostIP, sandboxID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if r, ok := p.rules[hostIP]; ok {
-		r.SandboxID = sandboxID
+		if r.SandboxID != sandboxID {
+			copy := *r
+			copy.SandboxID = sandboxID
+			p.rules[hostIP] = &copy
+		}
 	} else {
 		p.rules[hostIP] = &EgressRules{SandboxID: sandboxID}
 	}
@@ -133,8 +140,13 @@ func (p *EgressProxy) SetRules(hostIP string, rules *EgressRules) {
 	defer p.mu.Unlock()
 	if rules == nil {
 		delete(p.rules, hostIP)
+	} else if current := p.rules[hostIP]; current != nil && current.SandboxID != "" && current.SandboxID == rules.SandboxID {
+		// Policy edits retain the registration identity used by mining attribution.
+		// Readers snapshot rules under this same lock.
+		*current = *rules
 	} else {
-		p.rules[hostIP] = rules
+		copy := *rules
+		p.rules[hostIP] = &copy
 	}
 }
 
@@ -149,7 +161,12 @@ func (p *EgressProxy) RemoveRules(hostIP string) {
 func (p *EgressProxy) getRules(hostIP string) *EgressRules {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.rules[hostIP]
+	r := p.rules[hostIP]
+	if r == nil {
+		return nil
+	}
+	copy := *r
+	return &copy
 }
 
 // Start begins listening on the three proxy ports. Blocks until ctx is cancelled.
@@ -242,7 +259,28 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 	if rules != nil {
 		sandboxID = rules.SandboxID
 	}
+	var miningRegistration *EgressRules
+	if p.miningStreams != nil {
+		_, miningRegistration = p.miningRegistration(srcHost)
+		earlyDone := p.trackEarlyMining(srcHost, sandboxID, miningRegistration, conn)
+		defer earlyDone()
+	}
 	sandboxLog := p.sandboxLogger(sandboxID)
+	mining := p.mining.Load()
+	miningID, _ := uuid.Parse(sandboxID)
+	var miningAssignment string
+	if mining != nil {
+		if policy, known := mining.Containment.source.MiningPolicy(miningID, srcHost); known {
+			miningAssignment = policy.Assignment
+		}
+	}
+	if mining != nil {
+		done, allowed := mining.Containment.Track(miningID, srcHost, conn)
+		if !allowed {
+			return
+		}
+		defer done()
+	}
 
 	// Connection limit check.
 	_, acquired := p.limiter.TryAcquire(srcHost, p.maxConnsPerSandbox)
@@ -295,6 +333,16 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		Host:      hostname,
 		DstIP:     dstIP.String(),
 		DstPort:   int32(dstPort),
+	}
+
+	if mining != nil {
+		if evidence, match := mining.Policy.MiningMatch(hostname, dstIP); match {
+			mining.Containment.ObserveForAssignment(miningID, srcHost, evidence, miningAssignment)
+			return
+		}
+		if mining.Containment.Blocked(miningID, srcHost) {
+			return
+		}
 	}
 
 	// Global blocklist first — a hit here cannot be overridden by the
@@ -360,6 +408,13 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 				ipDenied.Store(true)
 				return fmt.Errorf("blocked: hostname resolved to internal IP %s", resolved)
 			}
+			if resolved != nil && mining != nil {
+				if evidence, match := mining.Policy.MiningMatch("", resolved); match {
+					mining.Containment.ObserveForAssignment(miningID, srcHost, evidence, miningAssignment)
+					dialBlocklisted.Store(true)
+					return fmt.Errorf("egress denied")
+				}
+			}
 			if resolved != nil && p.blocklist != nil {
 				if blocked, _ := p.blocklist.Blocked("", resolved); blocked {
 					dialBlocklisted.Store(true)
@@ -391,6 +446,15 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		return
 	}
 	defer upstream.Close()
+	upstreamDone := p.trackEarlyMining(srcHost, sandboxID, miningRegistration, upstream)
+	defer upstreamDone()
+	if activeMining := p.mining.Load(); activeMining != nil {
+		done, allowed := activeMining.Containment.Track(miningID, srcHost, upstream)
+		if !allowed {
+			return
+		}
+		defer done()
+	}
 
 	// If we peeked data, write it to upstream first.
 	sent := int64(len(peekedData))
@@ -594,4 +658,18 @@ func getOriginalDst(conn net.Conn) (net.IP, int, error) {
 	}
 
 	return ip, port, sockErr
+}
+
+// MiningProxyPolicy is installed atomically after background services are ready.
+type MiningProxyPolicy struct {
+	Policy      *blocklist.Blocklist
+	Containment *MiningContainment
+}
+
+func (p *EgressProxy) SetMiningPolicy(policy *blocklist.Blocklist, c *MiningContainment) {
+	if policy == nil || c == nil {
+		p.mining.Store(nil)
+		return
+	}
+	p.mining.Store(&MiningProxyPolicy{Policy: policy, Containment: c})
 }

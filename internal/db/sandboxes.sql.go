@@ -25,7 +25,12 @@ WITH activated AS (
       ip_address = $4,
       updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
-  RETURNING id, team_id, vcpu_count, memory_mib, disk_mib
+  RETURNING id, team_id, host_id, vcpu_count, memory_mib, disk_mib
+),
+retained_fence AS (
+  SELECT pg_try_advisory_xact_lock_shared(hashtextextended(a.host_id, 0)) AS host_lock,
+         pg_try_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || a.host_id, 0)) AS pending_lock
+  FROM activated a
 ),
 opened_compute AS (
   INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
@@ -43,12 +48,44 @@ opened_billing_compute AS (
   WHERE feature_enabled('billing_metrics_write', a.team_id)
   ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
   RETURNING sandbox_id
-)
+),
+opened_measurement_obligation AS (
+  INSERT INTO retained_storage_measurement_obligation (
+    team_id, owner_kind, owner_id, host_id, effective_at
+  )
+  SELECT a.team_id, 'sandbox', a.id, a.host_id, clock_timestamp()
+  FROM activated a
+  WHERE feature_enabled('billing_metrics_write', a.team_id)
+    AND EXISTS (
+      SELECT 1 FROM retained_storage_cutover c
+      WHERE c.team_id=a.team_id AND c.host_id=a.host_id AND c.started_at <= clock_timestamp()
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM retained_storage_interval i
+      WHERE i.team_id=a.team_id AND i.host_id=a.host_id
+        AND i.owner_kind='sandbox' AND i.owner_id=a.id
+        AND i.started_at <= clock_timestamp()
+        AND (i.ended_at IS NULL OR i.ended_at > clock_timestamp())
+    )
+  ON CONFLICT (owner_kind, owner_id) WHERE resolved_at IS NULL AND ended_at IS NULL DO NOTHING
+  RETURNING owner_id
+),
+opened_storage AS (
 INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
+CROSS JOIN (SELECT count(*) FROM retained_fence) retained_fence_guard
 WHERE feature_enabled('billing_metrics_write', a.team_id)
+  -- After retained physical reporting has cut over, activation.disk_mib is
+  -- provisioned capacity rather than a trusted measurement. The next durable
+  -- host report owns the quantity; do not charge the template baseline here.
+  AND NOT EXISTS (
+    SELECT 1 FROM retained_storage_cutover c
+    WHERE c.team_id = a.team_id AND c.host_id = a.host_id AND c.started_at <= now()
+  )
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
+)
+SELECT COALESCE(bool_and(host_lock AND pending_lock), true) FROM retained_fence
 `
 
 type ActivateSandboxParams struct {
@@ -69,6 +106,7 @@ type ActivateSandboxParams struct {
 // A leftover open interval must not fail the activation, so ON CONFLICT keeps
 // the existing open row — an orphaned interval can never block a resumed VM.
 // (Creation has no prior interval; this reuse only ever applies on resume.)
+// Evaluate the fence even when cutover suppresses the legacy interval insert.
 func (q *Queries) ActivateSandbox(ctx context.Context, arg ActivateSandboxParams) error {
 	_, err := q.db.Exec(ctx, activateSandbox,
 		arg.ID,
@@ -921,16 +959,16 @@ SELECT COUNT(*) FROM sandbox
 WHERE team_id = $1
   AND destroyed_at IS NULL
   AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR name ILIKE '%' || $4::text || '%')
 `
 
 type CountSandboxesByTeamPagedParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
 }
 
 // Total rows matching the same filters as ListSandboxesByTeamPaged (ignoring
@@ -939,7 +977,7 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 	row := q.db.QueryRow(ctx, countSandboxesByTeamPaged,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 	)
 	var count int64
@@ -2845,7 +2883,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY s.created_at ASC
@@ -2854,12 +2892,12 @@ OFFSET COALESCE($5::bigint, 0)
 `
 
 type ListSandboxesByTeamCreatedAscParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamCreatedAscRow struct {
@@ -2871,7 +2909,7 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedAsc,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.RowOffset,
 		arg.RowLimit,
@@ -2944,7 +2982,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY s.created_at DESC
@@ -2953,12 +2991,12 @@ OFFSET COALESCE($5::bigint, 0)
 `
 
 type ListSandboxesByTeamCreatedDescParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamCreatedDescRow struct {
@@ -2983,7 +3021,7 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedDesc,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.RowOffset,
 		arg.RowLimit,
@@ -3055,7 +3093,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY
@@ -3070,14 +3108,14 @@ OFFSET COALESCE($7::bigint, 0)
 `
 
 type ListSandboxesByTeamPagedParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	SortBy     string    `json:"sort_by"`
-	SortDir    string    `json:"sort_dir"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	SortBy     string          `json:"sort_by"`
+	SortDir    string          `json:"sort_dir"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamPagedRow struct {
@@ -3091,7 +3129,7 @@ type ListSandboxesByTeamPagedRow struct {
 // which the planner can satisfy from an index.
 //
 // Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
-// to match everything), status equality, and a case-insensitive name
+// to match everything), status membership, and a case-insensitive name
 // substring. Sort column/direction come from @sort_by + @sort_dir: exactly one
 // guarded CASE term is active per query (the sort params are constant across
 // rows, so every other term evaluates to NULL for all rows and acts as a
@@ -3102,7 +3140,7 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 	rows, err := q.db.Query(ctx, listSandboxesByTeamPaged,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.SortBy,
 		arg.SortDir,

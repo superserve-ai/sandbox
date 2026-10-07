@@ -14,7 +14,10 @@ The shared Auth PostgreSQL project owns `signup_device_attempt` and
 `supabase/shared-auth-migrations/` in timestamp order **once to that project**,
 separately from each regional migration chain. The immutability script revokes
 Supabase's direct application-role table grants and guards accepted facts.
-This store is server only, independent of East or West promotion databases.
+This store is server only and has separate authority from regional promotion
+state, even when it shares East's PostgreSQL project. Subsequent regional
+migrations must use the [database-specific migration inputs](regional-migrations.md)
+so that this completed Auth setup is recognized without replaying it.
 Verified attempts and account bindings are retained indefinitely, including after
 account deletion;
 unverified attempts may be purged only after their verification window closes.
@@ -127,6 +130,38 @@ mutated creation attempt, team, region, and decision fields. The fixture contain
 public key and assertions, never a private key or real account evidence. This
 test skips without the fixture; an ordinary backend suite pass is not evidence
 that the cross-runtime check ran. Record both producer and verifier execution.
+
+The fixture JSON has `public_key` (base64 Ed25519 public key) and `requests`
+(exactly one entry per operation). Each entry has `operation`, `assertion`
+(fresh EdDSA JWT), `actor` (the verified user UUID), and `body` (the exact JSON
+request). The create-team entry uses this shape with generated test UUIDs:
+
+```json
+{
+  "operation": "create-team",
+  "assertion": "<fresh signed JWT>",
+  "actor": "6a70c7ad-9304-4517-a125-9b633502df08",
+  "body": {
+    "user_id": "6a70c7ad-9304-4517-a125-9b633502df08",
+    "attempt_id": "f9ff68c6-43cc-4fab-97fb-c23481ec3058",
+    "team_id": "958253b4-558f-4ce4-89b7-c752ff4fb748",
+    "name": "example-team",
+    "home_region": "use",
+    "authority_unavailable": true
+  }
+}
+```
+
+Sign `sub=actor`, `operation=create-team`, `attempt_id`, `team_id`,
+`home_region`, and `authority_unavailable`, with the issuer/audience above,
+current `iat`, and `exp` no more than 300 seconds later. The legacy create-team
+operation does not sign `name`; durable prepare/complete operations bind it as
+documented below. The verifier selects the creation fixture's `use` or `usw`
+region and corresponding existing account test bearer. All four assertions must
+use the same generated test key. Generate assertions with the real Console
+signer immediately before verification; stored assertions are not reusable
+validation evidence. The valid request reaches the unavailable database (503);
+each signed-field mutation must fail authentication or provenance checks (403).
 
 The staging, production East, and production West Terraform roots each create
 four cell-specific Secret Manager secrets. `promotion_evidence_enabled` defaults
@@ -639,3 +674,189 @@ exact published backend revision must be recorded at release handoff before
 consumer adoption; this contract does not claim those tests ran or certify
 consumer readiness. Enforcement remains off. Checkout publication-failure
 fencing is a separate contract and is not supplied by these routes.
+
+## Checkout publication decisions
+
+`POST /stripe/checkout-session/publication-decision` creates or retries a Checkout
+with a trusted publication decision. It requires the existing customer
+credential in `X-API-Key`, its authenticated actor, and `billing:write` permission on the
+credential's team. It also requires `X-Promotion-Account-Assertion`, signed by
+the server-only account adapter using the existing Ed25519 key whose public
+half is configured as `PROMOTION_ACCOUNT_PUBLIC_KEY`. The customer credential
+does not authorize choosing a credit decision. `X-Actor-User-Id` cannot override
+its actor. No new shared secret or direct private-table access is needed.
+
+The trusted adapter determines publication success or failure from its own
+backend publication result, never a browser eligibility flag. Choose
+`publication_failed` when publication failed or its authority is unavailable.
+Choose `standard` to retain the ordinary backend eligibility checks; this value
+is not a credit grant or an eligibility assertion. Neither choice requires a
+new Fingerprint capture.
+
+Generate a random UUID `operation_id` before sending the first request, and
+retain that locator in the initiating flow so retries after a lost response can
+reuse it. It is not a credential. Do not generate a replacement locator merely
+because a request timed out. A renewed assertion must carry the same intent,
+actor, team, region, decision, and request parameters.
+
+Example request body (maximum 4096 bytes; unknown fields are rejected):
+
+```json
+{
+  "operation_id": "a85c8c2c-4d61-4b41-9fb8-e83c66b0df3c",
+  "home_region": "use",
+  "decision": "publication_failed",
+  "success_url": "https://example.com/billing/success",
+  "cancel_url": "https://example.com/billing/cancel"
+}
+```
+
+The redirects must be allowed by the regional API's existing billing redirect
+configuration. The signed JWT has algorithm `EdDSA` and these claims:
+
+```json
+{
+  "iss": "promotion-auth-adapter",
+  "aud": "promotion-account",
+  "sub": "48c66f8c-824e-4cfb-9f61-0ca3b2790631",
+  "iat": 1790769600,
+  "exp": 1790769900,
+  "operation": "checkout",
+  "team_id": "8107b213-41c3-4779-8e8f-701ecb0e57f9",
+  "operation_id": "a85c8c2c-4d61-4b41-9fb8-e83c66b0df3c",
+  "home_region": "use",
+  "decision": "publication_failed",
+  "success_url": "https://example.com/billing/success",
+  "cancel_url": "https://example.com/billing/cancel"
+}
+```
+
+Use current `iat` and `exp` values, with a positive lifetime no longer than five
+minutes. `sub` and `team_id` must exactly match the customer credential's actor
+and team. All five body fields must match the signed claims. `home_region` must
+match the receiving cell (`use` or `usw`; untagged East uses `use`). Do not include
+team-creation `attempt_id` or `authority_unavailable` claims.
+
+HTTP 200 returns the existing Checkout response shape:
+
+```json
+{"id":"cs_example","url":"https://checkout.stripe.com/example"}
+```
+
+The database commits the original payer, operation ID, local region, normalized
+request key, generation timestamp, and decision atomically before session
+creation. The request key includes the operation ID and the existing customer,
+redirect, and price inputs. Concurrent identical retries use one generation and
+one Stripe idempotency key. Different intents cannot replace an open generation,
+including when Stripe created a session but the response was lost. A request
+cannot retrofit a decision onto a legacy generation or change an existing
+trusted generation's decision. No-credit generations do not require a captured
+promotion identity pin, even if previous valid evidence remains stored.
+
+Retries after a lost Stripe response or failed local session write use this same
+route, body, credential, and a renewed assertion. They retain the original
+expiration and financial decision. The existing
+`POST /stripe/checkout-session/recover` accepts `{}` or the original
+`checkout_generation` timestamp with the customer credential. It retrieves an
+already-recorded session without creating one, and can recover a no-credit
+session with no evidence pin. If no session was recorded, repeat the original
+signed creation request. Recovery does not choose or change a decision.
+
+The existing 23-hour create-retry window, session expiration, pending attempts,
+ambiguous outcomes, and confirmed-expiration cleanup rules still apply. Once a
+generation is retired (including a definitive create failure), its operation ID
+is permanently closed and cannot allocate another session. An explicitly new
+operation may proceed only when the existing subscription and reservation fences
+permit it. The record is retained after lease cleanup and team deletion.
+
+Errors use the existing JSON error envelope:
+
+| HTTP | Code | Meaning / next action |
+| --- | --- | --- |
+| 400 | `invalid_request` | Malformed, oversized, or unknown-field body; correct the input. |
+| 400 | `bad_request` | Missing/invalid redirect; use an allowed redirect. |
+| 401 | existing customer-auth error | Renew the customer credential. |
+| 403 | `forbidden` | Invalid/expired assertion, mismatched signed binding, missing billing permission, or shadow billing; do not dispatch through a legacy route. |
+| 409 | `conflict` | Different/closed intent, changed decision/parameters/payer, existing generation, reservation, or established subscription; recover the original operation. |
+| 500 | `internal_error` | Database/persistence failure; retry the identical operation, since commit or Stripe creation may already have succeeded. |
+| 502 | `bad_gateway` | Stripe create failed; retain the original intent and uncertainty fence. |
+| 503 | `service_unavailable` | Required billing configuration unavailable. |
+
+An unavailable route on an old API is not permission to fall back to legacy
+creation. The legacy route rejects these decision fields on upgraded servers;
+its ordinary existing requests remain compatible.
+
+### Reservation, callbacks, and rollout
+
+The regional `stripe_checkout_publication_decision` table is immutable, keyed by
+team/generation with a unique operation locator. A separate append-only
+`stripe_checkout_publication_subscription` association survives lease cleanup.
+Reservation checks consult these records under the existing user reservation
+lock, before identity/device lookup. A `publication_failed` decision returns the
+existing `authority_unavailable` reservation denial and records that reason in
+`stripe_promotion_outcome`. Paid activation proceeds without a credit reservation
+or Stripe grant. Restored evidence, duplicate/out-of-order webhooks, callbacks
+without repeated generation metadata, and old event-only reservation calls
+cannot upgrade that generation. The retained decision table distinguishes
+publication failure from other authority failures for trusted database operators.
+Existing matching reservations replay before the new denial check; other pending
+financial obligations remain retryable and are never released by this decision.
+An invoice or subscription-ID projection does not establish generation ownership.
+Only verified Checkout association writes populate the retained subscription
+table. For teams with publication decisions, subscription callbacks without
+generation metadata or a retained association defer credit with
+`authority_unavailable` while preserving paid activation and existing obligations.
+Server-created generations retain their actor and captured identity evidence in
+`stripe_checkout_generation_authority`, including generations created by older
+API writers. Legacy callbacks remain eligible through this retained generation
+and verified subscription association; mutable invoice projections cannot prove
+ownership. Existing generation facts are preserved at migration time without
+reconstructing promotion decisions. Unmatched callbacks remain fenced. Migration
+copies and verifies all three immutable tables before exposing the billing account's customer routing,
+including during interrupted copies and retries, and rejects an unresolved
+Checkout lease before committing the source migration fence. Checkout
+admission and retry also check that fence after acquiring the billing-account lock,
+including writes from older API instances.
+
+Retry bookkeeping holds at most 32 attempt IDs. Compaction permanently records
+that an older request may have reached Stripe; a later definitive failure cannot
+release that uncertainty. Replays retain the original generation, actor, decision,
+and Stripe idempotency key within the existing 23-hour replay deadline.
+
+Trusted service-role RPCs are:
+
+```text
+begin_stripe_checkout_with_publication_decision(uuid, uuid, uuid, text, text, text, uuid) RETURNS void
+-- team_id, user_id, operation_id, home_region, backend request_key, decision, attempt_id
+stripe_checkout_publication_failed(uuid, timestamptz, uuid) RETURNS boolean
+-- team_id, generation, original user_id
+```
+
+The API calls the begin RPC and reads the account in one transaction, committing
+before Stripe session creation. The RPC reports binding/closed-generation
+conflicts as SQLSTATE `23505`, invalid inputs as `22023`, and retries a live exact
+intent without recapturing evidence. Direct table privileges are revoked for
+`anon`, `authenticated`, and `service_role`; no browser RPC access is granted.
+
+Apply `20261002000132_checkout_publication_decision.sql` and then
+`20261002000201_checkout_publication_reservation_fence.sql` in both regional
+schemas before deploying the API; only then adopt the signed consumer route. The
+first migration stores the immutable generation decision and subscription
+association, while the second installs the locked reservation recheck that
+enforces those records for webhook and recovery paths. Together they add no
+historical decisions and change no balances, evidence, ownership, consumption,
+existing reservations, policy switches, or old RPC signatures. Legacy generations
+have no decision row and retain their behavior when their server-side account
+association proves the callback. Database reservation enforcement
+and subscription retention also protect new generations processed by old webhook
+readers, using their existing denial vocabulary. Old API recovery may reject a
+no-credit generation's missing evidence pin; route those recoveries to an upgraded
+API. Keep enforcement OFF; no deployment or activation is part of this change.
+
+Coverage is authored in `TestPromotionCheckoutAssertion` and
+`TestIntegration_BillingCheckoutPublication*`, alongside the existing Checkout
+retry/recovery, activation, revocation, and promotion reservation suites. These
+are test targets, not execution claims. The release handoff must include the
+exact published backend revision and canonical validation evidence before this
+consumer dependency is declared ready. Backend readiness does not certify the
+consumer integration.

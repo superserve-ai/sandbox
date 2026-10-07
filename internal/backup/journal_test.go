@@ -397,7 +397,7 @@ func TestPromotionWhileTaskInFlight(t *testing.T) {
 		if got.Priority != PriorityPause {
 			t.Fatalf("row priority = %d, want the promotion kept", got.Priority)
 		}
-		if verified, err := j.WasVerified("obj-1", reclaimAt); err != nil || !verified {
+		if verified, err := j.WasVerified("obj-1"); err != nil || !verified {
 			t.Fatalf("WasVerified = %v (err %v), want the history recorded", verified, err)
 		}
 	})
@@ -756,7 +756,7 @@ func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
 	if err := j.RecordVerification(stale, "bucket\x00obj", now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
 		t.Fatalf("stale RecordVerification = %v, want errClaimStolen", err)
 	}
-	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL)); err != nil || !verified {
+	if verified, err := j.WasVerified("bucket\x00obj"); err != nil || !verified {
 		t.Fatalf("WasVerified after refused stale record = %v/%v, want history preserved", verified, err)
 	}
 	// The full attack chain stays closed: the follow-up stale Ack is
@@ -775,7 +775,7 @@ func TestStaleRecordVerificationCannotResurrectRow(t *testing.T) {
 	if err := j.RecordVerification(redo, "bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if verified, err := j.WasVerified("bucket\x00obj", now.Add(claimTTL+time.Hour)); err != nil || !verified {
+	if verified, err := j.WasVerified("bucket\x00obj"); err != nil || !verified {
 		t.Fatalf("WasVerified = %v/%v after live-claim record", verified, err)
 	}
 }
@@ -887,5 +887,387 @@ func TestStagingRootsRecordIsIdempotentAndRemoveDrops(t *testing.T) {
 	}
 	if len(roots) != 1 || roots[0] != "/mnt/backup-data-2/backup-staging" {
 		t.Fatalf("StagingRoots after removing one = %v, want only the other", roots)
+	}
+}
+
+// An upload slower than the lease must keep its task, or a sibling worker
+// steals it and the transfer starts again from zero, forever.
+func TestRenewClaimKeepsAStreamingTaskClaimed(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(1000, 0)
+	task := Task{SandboxID: "sb-slow", Generation: "gen", EnqueuedAt: now,
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 1}}}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+
+	// Still streaming at half the lease, so the lease moves with it.
+	if !j.RenewClaim(claimed, now.Add(claimTTL/2)) {
+		t.Fatal("the owner could not renew its own lease")
+	}
+	if _, ok, err := j.Next(now.Add(claimTTL + time.Minute)); err != nil || ok {
+		t.Fatal("the task was handed to another worker while its upload was still running")
+	}
+
+	// Past the renewed lease it is claimable again: a wedged worker must
+	// still be recoverable.
+	stolen, ok, err := j.Next(now.Add(claimTTL/2 + claimTTL + time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("after the renewed lease expired: %v (%v)", ok, err)
+	}
+	// And the superseded attempt can no longer renew or resolve.
+	if j.RenewClaim(claimed, now.Add(claimTTL)) {
+		t.Fatal("a superseded attempt renewed a lease it no longer holds")
+	}
+	if err := j.Nack(claimed, now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("superseded Nack = %v, want the steal reported", err)
+	}
+	if err := j.Nack(stolen, now.Add(claimTTL)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// soleClaimUntil reads the lease of the single claimed task, so a test
+// can watch a renewal move it.
+func soleClaimUntil(t *testing.T, j *Journal) time.Time {
+	t.Helper()
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.claims) != 1 {
+		t.Fatalf("claims = %d, want exactly one", len(j.claims))
+	}
+	for _, c := range j.claims {
+		return c.until
+	}
+	return time.Time{}
+}
+
+// A generation already queued keeps its paths on a re-enqueue, but not
+// its blanks: a row written before allocation sizes were carried would
+// otherwise report a generation of unknown size for as long as it waits.
+func TestEnqueueAdoptsAllocationsOnDedupe(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(100, 0)
+	queued := func(alloc int64) Task {
+		return Task{
+			SandboxID: "sb-a", Generation: "gen", EnqueuedAt: now,
+			Files: []TaskFile{{
+				Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
+				AllocatedBytes: alloc,
+			}},
+		}
+	}
+	if err := j.Enqueue(queued(-1)); err != nil {
+		t.Fatal(err)
+	}
+	// An unchanged re-pause of the same generation, same staging state,
+	// this time measuring what the artifact occupies.
+	if err := j.Enqueue(queued(4096)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	if got.Files[0].AllocatedBytes != 4096 {
+		t.Fatalf("allocated = %d, want the measurement the re-enqueue carried", got.Files[0].AllocatedBytes)
+	}
+}
+
+// The ack is the last durable moment: it deletes the row and writes the
+// completion record that stops any later sweep from correcting the
+// number. A re-enqueue that measured sizes after the final artifact
+// verified must still reach the notification, and must not cost the
+// finalized object paths the upload actually wrote.
+func TestAckAdoptsAllocationsMeasuredDuringTheUpload(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(500, 0)
+	queued := func(alloc int64) Task {
+		return Task{
+			SandboxID: "sb-late", Generation: "gen", EnqueuedAt: now,
+			Files: []TaskFile{{
+				Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
+				AllocatedBytes: alloc,
+			}},
+		}
+	}
+	if err := j.Enqueue(queued(-1)); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	if err := j.RecordVerification(claimed, "k\x00sandboxes/sb-late/gen/rootfs", now); err != nil {
+		t.Fatal(err)
+	}
+	// An unchanged re-pause lands after the last artifact verified, while
+	// the manifest is being published.
+	if err := j.Enqueue(queued(4096)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The upload acks with what IT finalized: the objects it wrote, and
+	// the sizes it was handed at claim time.
+	finalized := claimed
+	finalized.Files = []TaskFile{{
+		Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
+		AllocatedBytes: -1,
+		Object:         "sandboxes/sb-late/gen/rootfs.p0000",
+	}}
+	if _, err := j.Ack(finalized, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || len(pending[0].Files) != 1 {
+		t.Fatalf("notifications = %+v", pending)
+	}
+	if got := pending[0].Files[0].AllocatedBytes; got != 4096 {
+		t.Fatalf("notified allocated = %d, want the size measured during the upload", got)
+	}
+	if got := pending[0].Files[0].Object; got != "sandboxes/sb-late/gen/rootfs.p0000" {
+		t.Fatalf("notified object = %q, want the object the upload wrote", got)
+	}
+}
+
+// A pathless re-completion keeps the richer manifest already waiting in
+// the outbox, but a size that only the later pass measured belongs on it:
+// the paths and the measurement come from different passes.
+func TestPreservedOutboxManifestAdoptsNewerAllocations(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(900, 0)
+	queued := func(alloc int64) Task {
+		return Task{
+			SandboxID: "sb-keep", Generation: "gen", EnqueuedAt: now,
+			Files: []TaskFile{{
+				Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10,
+				AllocatedBytes: alloc,
+			}},
+		}
+	}
+	const object = "sandboxes/sb-keep/gen/rootfs.p0000"
+
+	// A first completion banks the objects, with nothing measured.
+	if err := j.Enqueue(queued(-1)); err != nil {
+		t.Fatal(err)
+	}
+	first, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	first.Files = []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 10, AllocatedBytes: -1, Object: object}}
+	if _, err := j.Ack(first, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// An unchanged re-pause measures the artifact, and its manifest create
+	// dedupes, so its own completion carries no paths.
+	if err := j.Enqueue(queued(4096)); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := j.Next(now.Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("second claim = %v (%v)", ok, err)
+	}
+	if _, err := j.Ack(second, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := j.PendingNotifications(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || len(pending[0].Files) != 1 {
+		t.Fatalf("notifications = %+v", pending)
+	}
+	if got := pending[0].Files[0].Object; got != object {
+		t.Fatalf("object = %q, want the path the first completion banked", got)
+	}
+	if got := pending[0].Files[0].AllocatedBytes; got != 4096 {
+		t.Fatalf("allocated = %d, want the size the later pass measured", got)
+	}
+}
+
+// Once a lease has run out the task belongs to whoever claims it next,
+// even if nobody has yet and the old worker still holds the token:
+// reviving it would postpone by another full lease the recovery that the
+// expiry exists to allow.
+func TestRenewClaimRefusesAnExpiredLease(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(2000, 0)
+	task := Task{SandboxID: "sb-wedged", Generation: "gen", EnqueuedAt: now,
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 1}}}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+
+	// The worker wakes past its lease, before any other drain worker has
+	// looked: the token still matches, and that is not enough.
+	if j.RenewClaim(claimed, now.Add(claimTTL+time.Minute)) {
+		t.Fatal("an expired lease was revived by the worker still holding its token")
+	}
+	if _, ok, err := j.Next(now.Add(claimTTL + 2*time.Minute)); err != nil || !ok {
+		t.Fatalf("the task was not claimable after its lease expired: %v (%v)", ok, err)
+	}
+}
+
+// A fully sparse artifact measures zero legitimately. Since a
+// generation's identity covers apparent content and not physical layout,
+// the same generation can be re-enqueued from a file laid out with
+// allocated zero-filled extents — and that footprint belongs to the other
+// layout, not to the paths this row keeps.
+func TestMergeAllocationsKeepsARealZero(t *testing.T) {
+	queued := []TaskFile{
+		{Name: "sparse.ext4", AllocatedBytes: 0},
+		{Name: "unmeasured.ext4", AllocatedBytes: -1},
+	}
+	incoming := []TaskFile{
+		{Name: "sparse.ext4", AllocatedBytes: 4 << 20},
+		{Name: "unmeasured.ext4", AllocatedBytes: 8192},
+	}
+	if !mergeAllocations(queued, incoming) {
+		t.Fatal("the missing measurement was not adopted")
+	}
+	if queued[0].AllocatedBytes != 0 {
+		t.Fatalf("a measured zero became %d, taking another layout's footprint", queued[0].AllocatedBytes)
+	}
+	if queued[1].AllocatedBytes != 8192 {
+		t.Fatalf("the missing measurement = %d, want the incoming one", queued[1].AllocatedBytes)
+	}
+}
+
+// A verification record is the only proof a write-only host has that an
+// object already in the bucket holds the bytes a manifest claims. Expire
+// one whose generation is still queued and that generation can never be
+// completed: every retry meets its own objects as a dedupe nothing can
+// vouch for, and abandons.
+func TestPruneKeepsProofWhileItsGenerationIsQueued(t *testing.T) {
+	j, _ := testJournal(t)
+	stale := time.Now().Add(-15 * 24 * time.Hour)
+
+	// Still queued, and deliberately less urgent so the ack below does not
+	// claim it out of the queue.
+	waiting := Task{
+		SandboxID: "sb-waiting", Generation: "gen-waiting", EnqueuedAt: stale,
+		Priority: PriorityCheckpoint,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 1}},
+	}
+	if err := j.Enqueue(waiting); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		queuedProof  = "test-bucket\x00sandboxes/sb-waiting/gen-waiting/rootfs.ext4.p0000"
+		settledProof = "test-bucket\x00sandboxes/sb-settled/gen-settled/rootfs.ext4.p0000"
+		sharedProof  = "test-bucket\x00bases/" + "0000000000000000000000000000000000000000000000000000000000000000" + ".p0000"
+	)
+	for _, object := range []string{queuedProof, settledProof, sharedProof} {
+		if err := j.RecordVerification(waiting, object, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Any ack runs the bounded prune; this one is more urgent, so Next
+	// takes it rather than the record under test.
+	driver := Task{
+		SandboxID: "sb-driver", Generation: "gen-driver", EnqueuedAt: time.Now(),
+		Priority: PriorityPause,
+		Files:    []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d2", Size: 1}},
+	}
+	if err := j.Enqueue(driver); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(time.Now())
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	if claimed.SandboxID != driver.SandboxID {
+		t.Fatalf("claimed %s, want the driver so the queued record stays queued", claimed.SandboxID)
+	}
+	if _, err := j.Ack(claimed, "test-bucket", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Asked as of the moment it was recorded, so the answer is presence
+	// rather than freshness.
+	for _, tc := range []struct {
+		name   string
+		object string
+		want   bool
+	}{
+		{"a queued generation keeps its proof", queuedProof, true},
+		{"a settled generation's proof expires", settledProof, false},
+		{"a shared base's history is only a shortcut", sharedProof, false},
+	} {
+		got, err := j.WasVerified(tc.object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s: present = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A generation whose objects nothing here can vouch for is recorded so
+// its re-offerer can stop handing out work that always abandons. Paced
+// rather than foreclosed: the object name carries a packing fingerprint
+// the generation key does not, so a relaid artifact may upload cleanly
+// under a name that does not exist yet.
+func TestUnvouchableMarkIsPacedAndScoped(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Now()
+	stuck := Task{
+		TemplateID: "tpl-a", BuildID: "build-a", Generation: "gen-stuck", EnqueuedAt: now,
+		Priority: PriorityCheckpoint,
+		Files:    []TaskFile{{Name: "mem.snap", Path: "/mem", SHA256: "m", Size: 1}},
+	}
+
+	if marked, err := j.Unvouchable("test-bucket", stuck, now); err != nil || marked {
+		t.Fatalf("unmarked generation = %v (%v)", marked, err)
+	}
+	if err := j.MarkUnvouchable("test-bucket", stuck, now); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		scope string
+		at    time.Time
+		want  bool
+	}{
+		{"within the cooldown", "test-bucket", now.Add(time.Hour), true},
+		{"past the cooldown", "test-bucket", now.Add(unvouchableCooldown + time.Minute), false},
+		{"another bucket has met nothing", "other-bucket", now.Add(time.Hour), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marked, err := j.Unvouchable(tc.scope, stuck, tc.at)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if marked != tc.want {
+				t.Fatalf("marked = %v, want %v", marked, tc.want)
+			}
+		})
+	}
+
+	// A rebuild keys differently and is never held.
+	rebuilt := stuck
+	rebuilt.Generation = "gen-rebuilt"
+	if marked, err := j.Unvouchable("test-bucket", rebuilt, now.Add(time.Hour)); err != nil || marked {
+		t.Fatalf("rebuilt generation = %v (%v)", marked, err)
 	}
 }

@@ -467,6 +467,7 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, 
 		inst.RevivalPending = true
 		inst.RevivedDisk = diskPath
 		inst.BackupGeneration = backupGeneration
+		seedRevivedRetainedDependencies(inst, prevRec)
 		inst.TeamID = prevRec.TeamID
 		inst.OwnerID = prevRec.OwnerID
 		inst.PreviewAccess = prevRec.PreviewAccess
@@ -600,3 +601,22 @@ const reviveBoxdReadyBudget = 90 * time.Second
 // directory, so it gets more room than a bare unit stop, but never an
 // unbounded hold on the RPC and lifecycle lock.
 const reviveTeardownBudget = 60 * time.Second
+
+// seedRevivedRetainedDependencies preserves known generation anchors while
+// keeping temporary revival inputs out of the retained dependency set.
+func seedRevivedRetainedDependencies(inst *VMInstance, previous *VMRecord) {
+	if previous == nil {
+		return
+	}
+	inst.SourceSnapshotID = previous.SourceSnapshotID
+	// Cold boot does not use the previous memory image, even if its path
+	// remains recorded. Its base is not a dependency of the new generation.
+	inst.BaseMemPath = ""
+	inst.StrandedOverlays = append([]string(nil), previous.StrandedOverlays...)
+	// coldBootFromRootfs receives the temporary restore input separately. Do
+	// not persist that input as a retained dependency when the old record had
+	// no pinned template rootfs; backup resume removes the staging directory
+	// after the durable VM copy is complete.
+	inst.Config.RootfsPath = previous.RootfsPath
+	inst.Config.DeltaDir = previous.DeltaDir
+}

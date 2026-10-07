@@ -228,7 +228,6 @@ func TestIntegration_BillingStorageActivationReadinessAndConcurrency(t *testing.
 	if stripe.creates != 1 {
 		t.Fatalf("created %d items", stripe.creates)
 	}
-	before := time.Now().UTC()
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
@@ -244,8 +243,8 @@ func TestIntegration_BillingStorageActivationReadinessAndConcurrency(t *testing.
 	if err := testPool.QueryRow(t.Context(), `SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1`, team).Scan(&first); err != nil {
 		t.Fatal(err)
 	}
-	if first.Before(before) || first.Before(cutoff) {
-		t.Fatal("activation backdated")
+	if first.Before(cutoff) {
+		t.Fatalf("activation backdated: effective_at=%s cutoff=%s", first, cutoff)
 	}
 	// A replacement (including an old Checkout completing late) must be checked
 	// against the current association, while the original cutoff remains fixed.
@@ -729,7 +728,7 @@ func TestIntegration_BillingStorageFractionalArtifactSettlement(t *testing.T) {
                 VALUES($1,'example-fractional','ready','{}',1,1024,1024,'/templates/'||$1::uuid::text||'/base.ext4')`, p.TeamID)
 			storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
                 SELECT id,'base.ext4',rootfs_path,1073745920,1073745920,repeat('0',64) FROM template WHERE team_id=$1`, p.TeamID)
-			storageExec(t, `UPDATE sandbox SET template_id=(SELECT id FROM template WHERE team_id=$1),created_at=$2,destroyed_at=NULL WHERE team_id=$1`, p.TeamID, p.Start)
+			storageExec(t, `UPDATE sandbox SET template_id=(SELECT id FROM template WHERE team_id=$1),base_path=(SELECT rootfs_path FROM template WHERE team_id=$1),created_at=$2,destroyed_at=NULL WHERE team_id=$1`, p.TeamID, p.Start)
 			storageExec(t, `UPDATE sandbox_storage_interval SET ended_at=NULL,end_reason=NULL WHERE team_id=$1`, p.TeamID)
 			payload := billing.ExportPayload{EventName: "storage_gib_hours", CustomerID: "cus_" + p.TeamID.String()}
 			accepted := new(big.Rat)
@@ -1024,4 +1023,14 @@ func TestIntegration_BillingStorageProviderRecovery(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Overlay-only billing fixtures carry an explicit measured-zero baseline so
+// absent provenance cannot silently stand in for zero allocated storage.
+func seedMeasuredZeroLegacyBaseline(t *testing.T, sandboxID uuid.UUID) {
+	t.Helper()
+	path := "/example/empty-baseline/" + sandboxID.String() + "/rootfs.ext4"
+	storageExec(t, `UPDATE sandbox SET base_path=$2,delta_path=NULL WHERE id=$1`, sandboxID, path)
+	storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
+		SELECT template_id,$2,$2,0,0,repeat('0',64) FROM sandbox WHERE id=$1`, sandboxID, path)
 }

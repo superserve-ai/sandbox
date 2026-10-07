@@ -919,11 +919,44 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 			}
 		}
 		bc.user = name
+		// Later steps and start_cmd run as this user; without this they would
+		// inherit root's HOME and write their config into /root.
+		passwd, err := runShellCapture(ctx, vmIP, "getent passwd "+shellquote.Single(name), root)
+		if err != nil {
+			return bc, fmt.Errorf("resolve home for %s: %w", name, err)
+		}
+		bc.env["HOME"] = homeFromPasswd(passwd, name)
+		bc.env["USER"] = name
 		emitUser("system", "User: %s", name)
 		return bc, nil
 	default:
 		return bc, fmt.Errorf("step has no op set")
 	}
+}
+
+// homeFromPasswd reads the home field of a `getent passwd` line, falling
+// back to adduser's default when the entry is unreadable.
+func homeFromPasswd(passwd, name string) string {
+	fields := strings.Split(strings.TrimSpace(passwd), ":")
+	if len(fields) >= 6 && fields[5] != "" {
+		return fields[5]
+	}
+	return "/home/" + name
+}
+
+// runShellCapture runs an internal command as a build step and returns its
+// stdout; stderr and the command echo go to operator logs.
+func runShellCapture(ctx context.Context, vmIP, cmd string, bc buildCtx) (string, error) {
+	var out strings.Builder
+	err := runShellCmdEmit(ctx, vmIP, cmd, bc, func(stream, format string, args ...any) {
+		if stream == "stdout" {
+			fmt.Fprintf(&out, format, args...)
+			out.WriteByte('\n')
+			return
+		}
+		emitInternal(stream, format, args...)
+	})
+	return out.String(), err
 }
 
 // runShellCmd runs a user build step: the command and its output stream to the

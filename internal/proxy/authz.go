@@ -98,6 +98,17 @@ func (h *Handler) canRouteBoxdRequest(r *http.Request, sandboxID string) bool {
 			return false
 		}
 		token = extractTerminalToken(r)
+	case desktopScreenshotPath,
+		desktopStreamPath,
+		desktopSendPointerPath,
+		desktopSendKeyPath,
+		desktopScrollPath,
+		desktopResizePath,
+		desktopSendActionsPath,
+		desktopStepPath:
+		if !h.desktopEnabled {
+			return false
+		}
 	default:
 		return false
 	}

@@ -219,8 +219,37 @@ module "api" {
     VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host_b.internal_ip)
     STRIPE_API_BASE_URL         = "https://api.stripe.com"
     STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
-    STRIPE_API_VERSION          = "2026-05-27.dahlia"
-    APP_ALLOWED_ORIGINS         = "https://console-staging.superserve.ai"
+    BILLING_RESOURCE_CONFIG = jsonencode([
+      {
+        resource_key         = "vcpu"
+        usage_unit           = "second"
+        stripe_event_name    = "cpu_vcpu_hours"
+        stripe_price_id      = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz"
+        tracked              = true
+        billable             = true
+        subscription_enabled = true
+      },
+      {
+        resource_key         = "memory_gib"
+        usage_unit           = "second"
+        stripe_event_name    = "memory_gib_hours"
+        stripe_price_id      = "price_1U1UqtQ9Sm5V6nX8E1or6k4w"
+        tracked              = true
+        billable             = true
+        subscription_enabled = true
+      },
+      {
+        resource_key         = "storage_gib"
+        usage_unit           = "second"
+        stripe_event_name    = "storage_gib_hours"
+        stripe_price_id      = "price_1UL73aQ9Sm5V6nX8wpUHIbmU"
+        tracked              = true
+        billable             = false
+        subscription_enabled = true
+      },
+    ])
+    STRIPE_API_VERSION  = "2026-05-27.dahlia"
+    APP_ALLOWED_ORIGINS = "https://console-staging.superserve.ai"
 
     # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
 
@@ -229,6 +258,9 @@ module "api" {
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
   }
   secrets = merge(local.promotion_evidence_secrets, {
+    OPERATOR_API_TOKEN = {
+      secret = google_secret_manager_secret.operator_api_token.secret_id
+    }
     SANDBOX_ACCESS_TOKEN_SEED = {
       secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
     }

@@ -36,14 +36,14 @@ import (
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/integrationdb"
 	"github.com/superserve-ai/sandbox/internal/preview"
-	"github.com/superserve-ai/sandbox/internal/promotiontest"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-const testDefaultHostID = "default"
+const testDefaultHostID = integrationdb.DefaultHostID
 
-const integrationSchemaLockKey int64 = 0x5355504552534552
+const integrationSchemaLockKey = integrationdb.SchemaLockKey
 
 var (
 	testPool         *pgxpool.Pool
@@ -63,7 +63,17 @@ func TestMain(m *testing.M) {
 	defer cancel()
 
 	var err error
-	testPool, err = pgxpool.New(ctx, dbURL)
+	poolConfig, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse test database config: %v\n", err)
+		os.Exit(1)
+	}
+	poolConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		db.RegisterEnumArrays(conn.TypeMap())
+		return nil
+	}
+	testPool, err = pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect to test database: %v\n", err)
 		os.Exit(1)
@@ -86,34 +96,16 @@ func TestMain(m *testing.M) {
 	}
 	setupCtx, stopSetup := context.WithTimeout(context.Background(), 30*time.Second)
 
-	if err := resetTestSchema(setupCtx, testPool); err != nil {
-		fmt.Fprintf(os.Stderr, "reset test schema: %v\n", err)
+	testSystemTeamID, err = integrationdb.Reset(setupCtx, testPool)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "initialize integration database: %v\n", err)
 		os.Exit(1)
 	}
-
-	if err := applyMigrations(setupCtx, testPool); err != nil {
-		fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
-		os.Exit(1)
-	}
-	if err := promotiontest.Install(setupCtx, testPool); err != nil {
-		fmt.Fprintf(os.Stderr, "install trusted identity fixture: %v\n", err)
-		os.Exit(1)
-	}
-
 	testQueries = db.New(testPool)
-
-	if err := seedSystemTemplate(setupCtx, testQueries); err != nil {
-		fmt.Fprintf(os.Stderr, "seed system template: %v\n", err)
-		os.Exit(1)
-	}
-	if err := seedPreviewCapableHost(setupCtx, testQueries); err != nil {
-		fmt.Fprintf(os.Stderr, "seed preview-capable host: %v\n", err)
-		os.Exit(1)
-	}
 	stopSetup()
 
 	workerCtx, stopStorageWorker := context.WithCancel(context.Background())
-	api.StartStorageReportWorker(workerCtx, testPool)
+	api.StartStorageReportWorkerWithInterval(workerCtx, testPool, 25*time.Millisecond)
 	code := m.Run()
 	stopStorageWorker()
 	if _, err := lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, integrationSchemaLockKey); err != nil {
@@ -125,92 +117,6 @@ func TestMain(m *testing.M) {
 		code = 1
 	}
 	os.Exit(code)
-}
-
-func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS promotion_auth CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
-	return err
-}
-
-// seedSystemTemplate creates the system team + a ready `superserve/base`
-// template so CreateSandbox's default from_template lookup resolves. Every
-// integration test that POSTs /sandboxes without an explicit from_template
-// relies on this.
-func seedSystemTemplate(ctx context.Context, q *db.Queries) error {
-	team, err := q.CreateTeam(ctx, "superserve-system")
-	if err != nil {
-		return fmt.Errorf("create system team: %w", err)
-	}
-	testSystemTeamID = team.ID
-
-	tpl, err := q.CreateTemplate(ctx, db.CreateTemplateParams{
-		TeamID:    team.ID,
-		Name:      "superserve/base",
-		BuildSpec: []byte(`{"from":"test","steps":[]}`),
-		Vcpu:      1,
-		MemoryMib: 1024,
-		DiskMib:   4096,
-	})
-	if err != nil {
-		return fmt.Errorf("create superserve/base: %w", err)
-	}
-
-	// Flip to 'ready' with plausible paths so handlers.go's ready-check
-	// passes. The stubVMD ignores these values.
-	_, err = testPool.Exec(ctx,
-		`UPDATE template SET status = 'ready',
-		   rootfs_path = '/tmp/test/rootfs.ext4',
-		   snapshot_path = '/tmp/test/vmstate.snap',
-		   mem_path = '/tmp/test/mem.snap',
-		   size_bytes = 0,
-		   built_at = now()
-		 WHERE id = $1`, tpl.ID)
-	if err != nil {
-		return fmt.Errorf("mark superserve/base ready: %w", err)
-	}
-	return nil
-}
-
-// seedPreviewCapableHost creates the fallback host selected by integration
-// routers and binds its preview capability to the current heartbeat. Strict
-// sandbox creation intentionally rejects hosts without this live attestation.
-func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
-	if _, err := q.CreateHost(ctx, db.CreateHostParams{
-		ID:                testDefaultHostID,
-		VmdAddr:           "localhost:0",
-		ProxyAddr:         "localhost:0",
-		Region:            "test",
-		CapacityMemoryMib: 1024,
-		CapacityVcpus:     1,
-	}); err != nil {
-		return fmt.Errorf("create default host: %w", err)
-	}
-	if _, err := q.UpdateHostHeartbeat(ctx, testDefaultHostID); err != nil {
-		return fmt.Errorf("heartbeat default host: %w", err)
-	}
-	capabilities := []string{
-		preview.HostCapabilityPorts,
-		preview.HostCapabilityPortAccess,
-		preview.HostCapabilityPortTokens,
-		preview.HostCapabilityPortBrowserAuth,
-	}
-	if err := q.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
-		HostID: testDefaultHostID, Capabilities: capabilities,
-	}); err != nil {
-		return fmt.Errorf("advertise capabilities: %w", err)
-	}
-
-	capable, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		AllowedStatuses: []string{"active"},
-		HostID:          testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
-	})
-	if err != nil {
-		return fmt.Errorf("verify preview capability: %w", err)
-	}
-	if !capable {
-		return fmt.Errorf("preview capability is not bound to the current heartbeat")
-	}
-	return nil
 }
 
 func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
@@ -289,50 +195,11 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 }
 
 func findMigrationsDir() (string, error) {
-	// Walk up from the test file to the repo root (contains supabase/).
-	dir, _ := os.Getwd()
-	for {
-		migrationsDir := filepath.Join(dir, "supabase", "migrations")
-		if _, err := os.Stat(migrationsDir); err == nil {
-			return migrationsDir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("could not find supabase/migrations from %s", dir)
-		}
-		dir = parent
-	}
+	return integrationdb.FindMigrationsDir()
 }
 
-// applyMigrations reads SQL files from supabase/migrations/ and executes them
-// in order against the test database. Uses IF NOT EXISTS / OR REPLACE so it is
-// safe to run repeatedly against the same database.
 func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	migrationsDir, err := findMigrationsDir()
-	if err != nil {
-		return err
-	}
-
-	entries, err := os.ReadDir(migrationsDir)
-	if err != nil {
-		return fmt.Errorf("read migrations dir: %w", err)
-	}
-
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".sql") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(migrationsDir, e.Name()))
-		if err != nil {
-			return fmt.Errorf("read %s: %w", e.Name(), err)
-		}
-		if _, err := pool.Exec(ctx, string(data)); err != nil {
-			return fmt.Errorf("exec %s: %w", e.Name(), err)
-		}
-	}
-	return nil
+	return integrationdb.ApplyMigrations(ctx, pool)
 }
 
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible
@@ -1560,6 +1427,7 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse sandbox id: %v", err)
 	}
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
@@ -2197,6 +2065,7 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse sandbox id: %v", err)
 	}
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
@@ -3745,6 +3614,7 @@ func TestIntegration_HourlyRollupBoundsOpenIntervalsAtNow(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	hourStart := fixedNow.Truncate(time.Hour)
 	hourEnd := hourStart.Add(time.Hour)
@@ -3869,6 +3739,7 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 
 	periodStart := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 	periodEnd := periodStart.Add(100 * time.Second)
@@ -3947,9 +3818,9 @@ func TestIntegration_GetTeamBillingUsageDeduplicatesSharedArtifact(t *testing.T)
 	for i, sandboxID := range sandboxIDs {
 		if _, err := testPool.Exec(ctx, `
 			UPDATE sandbox
-			SET created_at = $2, base_path = NULL, delta_path = NULL
+			SET created_at = $2, base_path = $4, delta_path = NULL
 			WHERE id = $1 AND team_id = $3
-		`, sandboxID, periodStart, teamID); err != nil {
+		`, sandboxID, periodStart, teamID, artifactPath); err != nil {
 			t.Fatalf("prepare sandbox %d: %v", i, err)
 		}
 		var snapshotID uuid.UUID
@@ -4018,9 +3889,9 @@ func TestIntegration_GetTeamBillingUsageStartsArtifactRetentionAtStorageBoundary
 	const artifactBytes = int64(8 * 1024 * 1024)
 	if _, err := testPool.Exec(ctx, `
 		UPDATE sandbox
-		SET created_at = $2, base_path = NULL, delta_path = NULL
+		SET created_at = $2, base_path = $4, delta_path = NULL
 		WHERE id = $1 AND team_id = $3
-	`, sandboxID, periodStart, teamID); err != nil {
+	`, sandboxID, periodStart, teamID, artifactPath); err != nil {
 		t.Fatalf("prepare sandbox: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `
@@ -4069,7 +3940,7 @@ func TestIntegration_GetTeamBillingUsageStartsArtifactRetentionAtStorageBoundary
 	}
 }
 
-func TestIntegration_GetTeamBillingUsageExcludesUnmeasuredArtifact(t *testing.T) {
+func TestIntegration_GetTeamBillingUsagePreservesUnmeasuredArtifact(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
 	r := newRouter(t)
@@ -4086,9 +3957,9 @@ func TestIntegration_GetTeamBillingUsageExcludesUnmeasuredArtifact(t *testing.T)
 	const logicalArtifactBytes = int64(64 * 1024 * 1024)
 	if _, err := testPool.Exec(ctx, `
 		UPDATE sandbox
-		SET created_at = $2, base_path = NULL, delta_path = NULL
+		SET created_at = $2, base_path = $4, delta_path = NULL
 		WHERE id = $1 AND team_id = $3
-	`, sandboxID, periodStart, teamID); err != nil {
+	`, sandboxID, periodStart, teamID, artifactPath); err != nil {
 		t.Fatalf("prepare sandbox: %v", err)
 	}
 	var snapshotID uuid.UUID
@@ -4102,12 +3973,9 @@ func TestIntegration_GetTeamBillingUsageExcludesUnmeasuredArtifact(t *testing.T)
 	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET snapshot_id = $2 WHERE id = $1`, sandboxID, snapshotID); err != nil {
 		t.Fatalf("link snapshot: %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, sha256)
-		VALUES ($1, 'unmeasured-rootfs.ext4', $2, $3, $4)
-	`, snapshotID, artifactPath, logicalArtifactBytes, strings.Repeat("0", 64)); err != nil {
-		t.Fatalf("seed unmeasured artifact: %v", err)
-	}
+	// Without a measured manifest, the template's logical size is not a
+	// physical allocation. Omitting allocated_bytes on an inserted manifest
+	// would instead use the schema's explicit-zero default.
 	if _, err := testPool.Exec(ctx, `UPDATE template SET rootfs_path = $1, size_bytes = $2 WHERE name = 'superserve/base'`, artifactPath, logicalArtifactBytes); err != nil {
 		t.Fatalf("set template artifact: %v", err)
 	}
@@ -4124,6 +3992,22 @@ func TestIntegration_GetTeamBillingUsageExcludesUnmeasuredArtifact(t *testing.T)
 	})
 	if err != nil {
 		t.Fatalf("get team billing usage: %v", err)
+	}
+	if usage.StorageGibSeconds.Valid {
+		t.Fatalf("unmeasured artifact returned numeric storage: %v", usage.StorageGibSeconds)
+	}
+	// A measured zero permits overlay billing; a missing allocation does not.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256)
+		VALUES ($1, 'unmeasured-rootfs.ext4', $2, $3, 0, $4)
+	`, snapshotID, artifactPath, logicalArtifactBytes, strings.Repeat("0", 64)); err != nil {
+		t.Fatalf("record explicit zero artifact allocation: %v", err)
+	}
+	usage, err = testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+		TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd,
+	})
+	if err != nil {
+		t.Fatalf("get measured-zero billing usage: %v", err)
 	}
 	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(2*10)/1024; got != want {
 		t.Fatalf("storage GiB seconds = %v, want %v; logical artifact size must not be used", got, want)

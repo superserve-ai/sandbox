@@ -23,6 +23,8 @@ const profileScope = `id IN (
 	UNION SELECT assigned_by FROM team_pricing_plan WHERE team_id = $1 AND assigned_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_grant WHERE team_id = $1 AND created_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_ledger WHERE team_id = $1 AND created_by IS NOT NULL
+	UNION SELECT user_id FROM stripe_checkout_publication_decision WHERE team_id = $1
+	UNION SELECT user_id FROM stripe_checkout_generation_authority WHERE team_id = $1
 )`
 
 // sandboxScope covers tables keyed by sandbox_id without a team_id column.
@@ -74,6 +76,12 @@ var migratedTables = []tableSpec{
 	{"profile", profileScope},
 	{"team", "id = $1"},
 	{"team_feature_flag", "team_id = $1"},
+	// Checkout publication decisions and subscription associations are
+	// immutable financial authority. Copy and verify them before the account
+	// exposes customer routing to destination webhooks.
+	{"stripe_checkout_generation_authority", "team_id = $1"},
+	{"stripe_checkout_publication_decision", "team_id = $1"},
+	{"stripe_checkout_publication_subscription", "team_id = $1"},
 	{"team_billing_account", "team_id = $1"},
 	// The cutoff is the authoritative, immutable activation boundary. It must
 	// move with the team so a cell migration cannot silently re-enable storage
@@ -115,6 +123,10 @@ var migratedTables = []tableSpec{
 	{"sandbox_active_interval", "team_id = $1"},
 	{"sandbox_compute_billing_interval", "team_id = $1"},
 	{"sandbox_storage_interval", "team_id = $1"},
+	{"sandbox_storage_baseline", "team_id = $1"},
+	{"retained_storage_cutover", "team_id = $1"},
+	{"retained_storage_interval", "team_id = $1"},
+	{"retained_storage_measurement_obligation", "team_id = $1"},
 	{"team_billing_usage", "team_id = $1"},
 	{"team_billing_usage_hourly", "team_id = $1"},
 	{"team_billing_period", "team_id = $1"},

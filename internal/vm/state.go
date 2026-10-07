@@ -1,15 +1,20 @@
 package vm
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	bolt "go.etcd.io/bbolt"
 )
+
+var errRetainedArchiveChanged = errors.New("retained archive changed before retirement")
 
 // State provides durable local persistence for VM instance metadata.
 // It is a cache — systemd is the ground truth for liveness, the control
@@ -18,8 +23,11 @@ import (
 // control plane.
 
 var (
-	bucketName              = []byte("vms")
-	previewPolicyBucketName = []byte("vm_preview_policies")
+	bucketName = []byte("vms")
+	// Artifact references for failed owners outlive the live VM record until
+	// the control-plane sandbox is explicitly destroyed.
+	retainedRecordBucketName = []byte("retained_storage_records")
+	previewPolicyBucketName  = []byte("vm_preview_policies")
 	// Derived, safety-critical startup indexes: sparse projections of the
 	// records bucket (cgroup-supervised membership; vmID→namespace for records
 	// holding a network slot), maintained inside the same transaction as every
@@ -171,7 +179,9 @@ type VMRecord struct {
 	// RevivedDisk records the resolved salvage path a completed revival
 	// booted from: the idempotency witness that lets a retry of the same
 	// request (a lost RPC response, a failed post-commit injection)
-	// recognize the live VM as its own completed work.
+	// recognize the live VM as its own completed work. Retained inventory also
+	// uses its presence as revival provenance when legacy template anchors are
+	// unavailable.
 	RevivedDisk string `json:"revived_disk,omitempty"`
 	// BackupGeneration names the backup a backup-backed resume booted from,
 	// so a retry of that resume recognizes the live VM as its own.
@@ -259,10 +269,16 @@ type VMRecord struct {
 	MemoryMiB  uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
-	// dual-symlink mount namespace). DeltaDir is intentionally NOT
-	// persisted — it's only relevant at create-from-template; a resumed
-	// sandbox reuses its existing overlay file in place.
+	// dual-symlink mount namespace).
 	BasePath string `json:"base_path,omitempty"`
+	// RootfsPath retains the immutable template rootfs for full-copy sandboxes.
+	// It is metadata for storage inventory; lifecycle restore continues to use
+	// DiskPath as the VM's writable rootfs.
+	RootfsPath string `json:"rootfs_path,omitempty"`
+	// DeltaDir identifies the pinned template overlay retained by this VM.
+	// It is persisted for asynchronous physical-storage inventory; resume does
+	// not use it to mutate the VM's existing overlay.
+	DeltaDir string `json:"delta_dir,omitempty"`
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
@@ -453,6 +469,9 @@ func OpenStateStore(path string) (*StateStore, error) {
 		if _, err := tx.CreateBucketIfNotExists(backfillMarkBucketName); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists(retainedRecordBucketName); err != nil {
+			return err
+		}
 		policies, err := tx.CreateBucketIfNotExists(previewPolicyBucketName)
 		if err != nil {
 			return err
@@ -619,8 +638,177 @@ func (s *StateStore) Delete(vmID string) error {
 		if err := dropIndexEntries(tx, key); err != nil {
 			return err
 		}
+		if err := tx.Bucket(previewPolicyBucketName).Delete(key); err != nil {
+			return err
+		}
+		// Live and archived metadata are one deletion unit. A failure or crash
+		// cannot expose an obsolete archive after the live record is removed.
+		if archive := tx.Bucket(retainedRecordBucketName); archive != nil {
+			if err := archive.Delete(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// ReleaseRetainingStorage atomically moves the durable record out of lifecycle
+// discovery while preserving its artifact references for storage accounting.
+func (s *StateStore) ReleaseRetainingStorage(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		key := []byte(vmID)
+		live := tx.Bucket(bucketName)
+		if data := live.Get(key); data != nil {
+			archive, err := tx.CreateBucketIfNotExists(retainedRecordBucketName)
+			if err != nil {
+				return err
+			}
+			var rec VMRecord
+			if err := json.Unmarshal(data, &rec); err != nil {
+				return err
+			}
+			// Process cleanup has been confirmed. Keep artifact paths, but do not
+			// leave a lifecycle marker that only live reconciliation can resolve.
+			rec.Unverified = false
+			rec.RevivalPending = false
+			rec.TeardownPending = ""
+			rec.WakePending = false
+			rec.WakeToken = ""
+			rec.WakeSnapshotPath = ""
+			rec.WakeMemPath = ""
+			rec.WakeOwedFromPaused = false
+			settled, err := json.Marshal(rec)
+			if err != nil {
+				return err
+			}
+			if err := archive.Put(key, settled); err != nil {
+				return err
+			}
+		}
+		if err := live.Delete(key); err != nil {
+			return err
+		}
+		if err := dropIndexEntries(tx, key); err != nil {
+			return err
+		}
 		return tx.Bucket(previewPolicyBucketName).Delete(key)
 	})
+}
+
+// RetireRetainingStorage removes a confirmed orphan without preserving an
+// inventory dependency whose owner no longer exists in the control plane.
+func (s *StateStore) RetireRetainingStorage(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		key := []byte(vmID)
+		if err := tx.Bucket(bucketName).Delete(key); err != nil {
+			return err
+		}
+		if archive := tx.Bucket(retainedRecordBucketName); archive != nil {
+			if err := archive.Delete(key); err != nil {
+				return err
+			}
+		}
+		if err := dropIndexEntries(tx, key); err != nil {
+			return err
+		}
+		return tx.Bucket(previewPolicyBucketName).Delete(key)
+	})
+}
+
+// DeleteRetainedRecord removes archived metadata after an explicit destroy.
+func (s *StateStore) DeleteRetainedRecord(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(retainedRecordBucketName)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.Delete([]byte(vmID))
+	})
+}
+
+// RetireArchivedRecordIfUnchanged removes only an archived dependency after
+// the caller has confirmed authoritative owner termination. The archive is
+// compared inside the same Bolt transaction that checks for a live record, so
+// a replacement generation cannot be removed by a stale reconciliation pass.
+// Live indexes and preview policy are deliberately untouched: a live record
+// wins discovery and owns those projections.
+func (s *StateStore) RetireArchivedRecordIfUnchanged(expected VMRecord) (bool, error) {
+	retired := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		key := []byte(expected.ID)
+		if live := tx.Bucket(bucketName); live != nil && live.Get(key) != nil {
+			return errRetainedArchiveChanged
+		}
+		archive := tx.Bucket(retainedRecordBucketName)
+		if archive == nil {
+			return nil
+		}
+		data := archive.Get(key)
+		if data == nil {
+			return nil
+		}
+		var current VMRecord
+		if err := json.Unmarshal(data, &current); err != nil {
+			return err
+		}
+		if !sameRetainedGeneration(expected, current) {
+			return errRetainedArchiveChanged
+		}
+		if err := archive.Delete(key); err != nil {
+			return err
+		}
+		retired = true
+		return nil
+	})
+	if errors.Is(err, errRetainedArchiveChanged) {
+		return false, nil
+	}
+	return retired, err
+}
+
+func (s *StateStore) retainedArchivedRecords() ([]VMRecord, error) {
+	return s.retainedArchivedRecordsContext(context.Background())
+}
+
+func (s *StateStore) retainedArchivedRecordsContext(ctx context.Context) ([]VMRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	budget := retainedScanBudget{}
+	return s.retainedArchivedRecordsWithBudget(ctx, &budget)
+}
+
+func (s *StateStore) retainedArchivedRecordsWithBudget(ctx context.Context, budget *retainedScanBudget) ([]VMRecord, error) {
+	var records []VMRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(retainedRecordBucketName)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(key, value []byte) error {
+			if err := budget.accountEntry(ctx, key, value); err != nil {
+				return err
+			}
+			if _, err := uuid.Parse(string(key)); err != nil {
+				return nil
+			}
+			if err := budget.reserveOwner(); err != nil {
+				return err
+			}
+			var rec VMRecord
+			if err := json.Unmarshal(value, &rec); err != nil {
+				return err
+			}
+			if rec.ID != "" {
+				records = append(records, rec)
+			}
+			return nil
+		})
+	})
+	if err == nil {
+		err = ctx.Err()
+	}
+	return records, err
 }
 
 // maintainIndexes keeps the sparse startup indexes in sync with a record
@@ -961,6 +1149,8 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		VCPU:                       inst.Config.VCPU,
 		MemoryMiB:                  inst.Config.MemoryMiB,
 		BasePath:                   inst.Config.BasePath,
+		RootfsPath:                 inst.Config.RootfsPath,
+		DeltaDir:                   inst.Config.DeltaDir,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
 		PausedAt:                   inst.PausedAt,
@@ -1080,9 +1270,11 @@ func toInstance(rec VMRecord) *VMInstance {
 		PreviewPolicyRevision:      rec.PreviewPolicyRevision,
 		PreviewTokenPolicyRevision: tokenPolicyRevision,
 		Config: VMConfig{
-			VCPU:      rec.VCPU,
-			MemoryMiB: rec.MemoryMiB,
-			BasePath:  rec.BasePath,
+			VCPU:       rec.VCPU,
+			MemoryMiB:  rec.MemoryMiB,
+			BasePath:   rec.BasePath,
+			RootfsPath: rec.RootfsPath,
+			DeltaDir:   rec.DeltaDir,
 		},
 	}
 }

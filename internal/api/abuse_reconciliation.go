@@ -25,15 +25,20 @@ const (
 	computePauseWorkers  = 4
 )
 
-// RunComputeReconciliation is the sole periodic refresh owner. Refresh keeps
-// its cadence even when a large sweep outlives one tick; sweeps never overlap.
-func (h *Handlers) RunComputeReconciliation(ctx context.Context, source *abuse.ConfigComputeSource) {
+// RunComputeReconciliation refreshes legacy file sources on the sweep cadence.
+// Sources exposing Changes own their background refresh; notifications only
+// wake this coalesced scheduler. Sweeps never overlap.
+func (h *Handlers) RunComputeReconciliation(ctx context.Context, source abuse.RefreshingComputeSource) {
 	ticker := time.NewTicker(computeSweepInterval)
 	defer ticker.Stop()
 	h.runComputeReconciliation(ctx, source, ticker.C, h.reconcileComputeOnce)
 }
 
-func (h *Handlers) runComputeReconciliation(ctx context.Context, source *abuse.ConfigComputeSource, ticks <-chan time.Time, sweep func(context.Context, <-chan *abuse.ComputeSnapshot)) {
+func (h *Handlers) runComputeReconciliation(ctx context.Context, source abuse.RefreshingComputeSource, ticks <-chan time.Time, sweep func(context.Context, <-chan *abuse.ComputeSnapshot)) {
+	var changes <-chan struct{}
+	if notifier, ok := source.(interface{ Changes() <-chan struct{} }); ok {
+		changes = notifier.Changes()
+	}
 	done := make(chan struct{}, 1)
 	running := false
 	var updates chan *abuse.ComputeSnapshot
@@ -44,7 +49,7 @@ func (h *Handlers) runComputeReconciliation(ctx context.Context, source *abuse.C
 		}
 		if initial {
 			initial = false
-		} else {
+		} else if changes == nil {
 			source.Refresh(ctx)
 		}
 		if running {
@@ -82,6 +87,7 @@ func (h *Handlers) runComputeReconciliation(ctx context.Context, source *abuse.C
 		case <-ctx.Done():
 			return
 		case <-ticks:
+		case <-changes:
 		}
 	}
 }
@@ -316,6 +322,23 @@ func (h *Handlers) reconcileComputeCandidate(ctx context.Context, candidate db.L
 		recordComputeReconciliation(ctx, "would_pause")
 		l.Info().Str("outcome", "would_pause").Msg("compute reconciliation candidate")
 		return
+	}
+	// Only the authoritative backend performs this background-only check.
+	// A failed lookup allows workloads to continue; it never claims a pause from
+	// stale trust. This check begins the pause attempt; concurrent edits after
+	// it may race with the normal claim, and that attempt may finish normally.
+	if current, ok := h.ComputeRestrictions.Source.(interface {
+		CurrentTeamPolicy(context.Context, uuid.UUID) (abuse.TeamPolicy, error)
+	}); ok {
+		policy, err := current.CurrentTeamPolicy(ctx, candidate.TeamID)
+		if err != nil {
+			recordComputeReconciliation(ctx, "policy_unavailable")
+			return
+		}
+		if !policy.Known || policy.Trusted || !policy.Restricted || policy.Mode != abuse.ModeEnforce {
+			recordComputeReconciliation(ctx, "no_op_current_policy")
+			return
+		}
 	}
 	claimedAt := time.Now()
 	op := uuid.New()

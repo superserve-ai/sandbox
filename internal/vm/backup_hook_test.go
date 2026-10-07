@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2042,5 +2043,166 @@ func TestMarkerReuseRotatesOwnershipWithPauseToken(t *testing.T) {
 	}
 	if _, ok, _ := m.state.GetPendingBackup("vm-1"); !ok {
 		t.Fatal("refreshed marker deleted by the old ownership token")
+	}
+}
+
+// The manifest measures what each artifact really occupies, and the row
+// the control plane stores comes from the enqueued task: dropped there,
+// every sandbox generation records zero and nothing can size a backup.
+func TestEnqueueCarriesAllocatedBytes(t *testing.T) {
+	var got backup.Task
+	m := &Manager{log: zerolog.Nop()}
+	m.SetBackupEnqueue(func(task backup.Task) error {
+		got = task
+		return nil
+	})
+
+	manifest := []ManifestEntry{
+		{FileName: "rootfs.ext4", Path: "/disk", SizeBytes: 1 << 30, AllocatedBytes: 4 << 20, SHA256: "d"},
+		// The manifest's sentinel for an allocation it could not measure.
+		{FileName: "vmstate.snap", Path: "/snap", SizeBytes: 4096, AllocatedBytes: -1, SHA256: "s"},
+	}
+	// Carried as measured, sentinel included: only the sentinel can tell
+	// an allocation that is missing from one that is genuinely zero, and
+	// a dedupe downstream has to make exactly that distinction. The
+	// rendering for readers outside the host is where it becomes zero.
+	want := []int64{4 << 20, -1}
+	if ok, _, _ := m.enqueueBackup("vm-1", manifest, backup.PriorityPause, ""); !ok {
+		t.Fatal("enqueue refused a complete manifest")
+	}
+
+	if len(got.Files) != len(manifest) {
+		t.Fatalf("files = %d, want %d", len(got.Files), len(manifest))
+	}
+	for i, f := range got.Files {
+		if f.AllocatedBytes != want[i] {
+			t.Fatalf("%s allocated = %d, want %d", f.Name, f.AllocatedBytes, want[i])
+		}
+	}
+}
+
+// One pass must work through the backlog, not dispatch a single record
+// and sleep until the next tick: with two slots and a five-minute cadence
+// that paced a backlog of thousands at about eight an hour, so it never
+// cleared.
+func TestPendingSweepDispatchesTheWholeBacklogInOnePass(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	const records = 25
+	for i := 0; i < records; i++ {
+		if err := st.PutPendingBackup(newPendingBackup(fmt.Sprintf("vm-%02d", i), "/snap", "/disk", "", "")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// No instance and a dead unit: every record resolves immediately as
+	// superseded, so the pass is measured on dispatch rather than on how
+	// long a rehash takes.
+	var mu sync.Mutex
+	done := 0
+	m := &Manager{
+		state:    st,
+		log:      zerolog.Nop(),
+		vms:      map[string]*VMInstance{},
+		unitDead: func(context.Context, string) bool { return true },
+	}
+	m.rehashDone = func() {
+		mu.Lock()
+		done++
+		mu.Unlock()
+	}
+
+	m.ensureRehashSlots()
+	m.runPendingBackups(context.Background(), zerolog.Nop())
+	// Taking every slot waits for the dispatched workers: each releases
+	// its slot only after its rehash returns.
+	for i := 0; i < cap(m.rehashSlots); i++ {
+		m.rehashSlots <- struct{}{}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if done != records {
+		t.Fatalf("one pass dispatched %d of %d retained records", done, records)
+	}
+}
+
+// A pass that runs out of budget while every slot is held must return,
+// not block the sweep goroutine behind a long rehash.
+func TestPendingSweepReturnsWhenItsBudgetIsSpent(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for i := 0; i < 10; i++ {
+		if err := st.PutPendingBackup(newPendingBackup(fmt.Sprintf("vm-%02d", i), "/snap", "/disk", "", "")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := &Manager{state: st, log: zerolog.Nop(), pendingSweepBudget: 20 * time.Millisecond}
+	m.ensureRehashSlots()
+	// Every slot held by work this pass cannot influence.
+	for i := 0; i < cap(m.rehashSlots); i++ {
+		m.rehashSlots <- struct{}{}
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		m.runPendingBackups(context.Background(), zerolog.Nop())
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pass never returned with its budget spent and every slot held")
+	}
+}
+
+// Records that keep their markers would otherwise be re-offered at the
+// head of every key-ordered pass, and the tail of a long backlog would
+// never get a turn. The rotation is what prevents that, so it is asserted
+// directly rather than through a pass whose reach depends on timing.
+func TestPendingSweepOrderResumesAfterTheCursor(t *testing.T) {
+	pending := make([]PendingBackup, 0, 6)
+	for i := 0; i < 6; i++ {
+		pending = append(pending, PendingBackup{VMID: fmt.Sprintf("vm-%02d", i)})
+	}
+	names := func(got []PendingBackup) []string {
+		out := make([]string, 0, len(got))
+		for _, pb := range got {
+			out = append(out, pb.VMID)
+		}
+		return out
+	}
+
+	for _, tc := range []struct {
+		name   string
+		cursor string
+		want   []string
+	}{
+		{"no cursor starts at the head", "", []string{"vm-00", "vm-01", "vm-02", "vm-03", "vm-04", "vm-05"}},
+		{"resumes after the cursor and wraps", "vm-02", []string{"vm-03", "vm-04", "vm-05", "vm-00", "vm-01", "vm-02"}},
+		{"a cursor past the tail starts at the head", "vm-05", []string{"vm-00", "vm-01", "vm-02", "vm-03", "vm-04", "vm-05"}},
+		{"a cursor whose record is gone resumes after it", "vm-02x", []string{"vm-03", "vm-04", "vm-05", "vm-00", "vm-01", "vm-02"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Manager{pendingSweepCursor: tc.cursor}
+			got := names(m.pendingSweepOrder(pending))
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("order = %v, want %v", got, tc.want)
+			}
+			// The listing the caller handed in is never reordered.
+			if first := pending[0].VMID; first != "vm-00" {
+				t.Fatalf("the caller's listing was rotated in place: starts at %s", first)
+			}
+		})
 	}
 }

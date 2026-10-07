@@ -1,72 +1,151 @@
-# CD — Migrate — Supabase schema migrations.
-#
-# Triggers:
-#   - push to main on supabase/migrations/**: runs staging, then production
-#   - workflow_dispatch with environment=staging: staging only
-#   - workflow_dispatch with environment=production: staging FIRST, then production
-#
-# Production NEVER migrates without staging first. Running prod migrations
-# while staging is behind is a recipe for schema drift and rollback pain.
-
 name: CD — Migrate
 
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: 'Read-only connection preflight, or separately approved migrations'
+        required: true
+        type: choice
+        default: preflight
+        options: [preflight, migrate, recovery-preflight, recover]
+      approved_revision:
+        description: 'Exact approved main commit SHA'
+        required: true
+        type: string
       environment:
         description: 'Target environment (staging always runs first)'
-        required: false
+        required: true
         type: choice
-        options:
-          - staging
-          - production
-  push:
-    branches: [main]
-    paths:
-      - 'supabase/migrations/**'
+        default: staging
+        options: [staging, production]
+      preflight_run_id:
+        description: 'Migrate only: successful same-revision preflight covering every target'
+        required: false
+        type: string
+      recovery_evidence_run_id:
+        description: 'Production recovery: fresh authenticated read-only collector run'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: database-migrations
+  queue: max
+  cancel-in-progress: false
 
 jobs:
+  gate:
+    name: Verify migration release
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.gate.outputs.action }}
+      production: ${{ steps.gate.outputs.production }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gate
+        run: python3 .github/workflows/scripts/migration_gate.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPROVED_REVISION: ${{ inputs.approved_revision }}
+          MIGRATION_ACTION: ${{ inputs.action }}
+          MIGRATION_ENVIRONMENT: ${{ inputs.environment }}
+          PREFLIGHT_RUN_ID: ${{ inputs.preflight_run_id }}
+          RECOVERY_EVIDENCE_RUN_ID: ${{ inputs.recovery_evidence_run_id }}
+
   migrate-staging:
-    name: Migrate Staging
+    name: ${{ needs.gate.outputs.action == 'recovery-preflight' && 'Recovery Preflight Staging' || needs.gate.outputs.action == 'recover' && 'Recover Staging' || needs.gate.outputs.action == 'preflight' && 'Preflight Staging' || 'Migrate Staging' }}
+    needs: [gate]
     runs-on: ubuntu-latest
     environment: staging
+    env:
+      RECOVERY_RECEIPT_DIR: ${{ github.workspace }}/recovery-receipts
+      RECOVERY_EVIDENCE_RUN_ID: ${{ inputs.recovery_evidence_run_id }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
-
-      - name: Push migrations to staging
-        run: supabase db push --db-url "$DATABASE_URL"
+          version: '2.119.0'
+      - run: python3 -m pip install -r scripts/migration-requirements.txt
+      - uses: actions/download-artifact@v4
+        if: needs.gate.outputs.action == 'recover'
+        with:
+          name: recovery-preflight-staging
+          path: ${{ env.RECOVERY_RECEIPT_DIR }}
+          run-id: ${{ inputs.preflight_run_id }}
+          github-token: ${{ github.token }}
+      - name: Run approved staging action
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py staging "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
+          MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+      - uses: actions/upload-artifact@v4
+        if: needs.gate.outputs.action == 'recovery-preflight'
+        with:
+          name: recovery-preflight-staging
+          path: ${{ env.RECOVERY_RECEIPT_DIR }}/*.json
+          if-no-files-found: error
+          retention-days: 1
 
   migrate-prod:
-    name: Migrate Production
-    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
+    name: ${{ needs.gate.outputs.action == 'recovery-preflight' && 'Recovery Preflight Production' || needs.gate.outputs.action == 'recover' && 'Recover Production' || needs.gate.outputs.action == 'preflight' && 'Preflight Production' || 'Migrate Production' }}
+    if: needs.gate.outputs.production == 'true'
+    needs: [gate, migrate-staging]
     runs-on: ubuntu-latest
     environment: production
-    needs: [migrate-staging]
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      RECOVERY_RECEIPT_DIR: ${{ github.workspace }}/recovery-receipts
+      RECOVERY_EVIDENCE_RUN_ID: ${{ inputs.recovery_evidence_run_id }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
-
-      - name: Push migrations to production
-        run: supabase db push --db-url "$DATABASE_URL"
+          version: '2.119.0'
+      - run: python3 -m pip install -r scripts/migration-requirements.txt
+      - uses: actions/download-artifact@v4
+        if: needs.gate.outputs.action == 'recover'
+        with:
+          name: recovery-preflight-production
+          path: ${{ env.RECOVERY_RECEIPT_DIR }}
+          run-id: ${{ inputs.preflight_run_id }}
+          github-token: ${{ github.token }}
+      - uses: google-github-actions/auth@v2
+        if: needs.gate.outputs.action == 'recovery-preflight' || needs.gate.outputs.action == 'recover'
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+        if: needs.gate.outputs.action == 'recovery-preflight' || needs.gate.outputs.action == 'recover'
+      - name: Run approved primary production action
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py use4 "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
+          MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
-
-      # Every cell DB runs the identical migration set; a cell that misses a
-      # migration silently drifts until a deploy 500s against it. A step in
-      # this job — not a separate job — so a protected production environment
-      # gates ONE approval (a second env-referencing job would double-gate
-      # Deploy API, which waits on this whole workflow). Step order still
-      # stops a bad migration at the primary before it spreads.
-      - name: Push migrations to usw cell
-        run: supabase db push --db-url "$DATABASE_URL"
+      - name: Run approved west production action
+        run: |
+          python3 .github/workflows/scripts/migration_gate.py --verify-revision
+          python3 scripts/migrate_database.py usw2 "$MIGRATION_ACTION"
         env:
+          GH_TOKEN: ${{ github.token }}
+          MIGRATION_ACTION: ${{ needs.gate.outputs.action }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
+      - uses: actions/upload-artifact@v4
+        if: needs.gate.outputs.action == 'recovery-preflight'
+        with:
+          name: recovery-preflight-production
+          path: ${{ env.RECOVERY_RECEIPT_DIR }}/*.json
+          if-no-files-found: error
+          retention-days: 1

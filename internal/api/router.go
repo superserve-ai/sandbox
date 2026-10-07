@@ -99,6 +99,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
 		api.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetTeamBillingExportPreview)
 		api.POST("/stripe/checkout-session", h.CreateStripeCheckoutSession)
+		api.POST("/stripe/checkout-session/publication-decision", PromotionAccountAuth(), h.CreateStripeCheckoutSession)
 		api.POST("/stripe/checkout-session/recover", h.RecoverStripeCheckoutSession)
 		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
 
@@ -158,6 +159,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.GET("/abuse/teams/:team_id/trust", h.GetPlatformAbuseTeamTrust)
 		operator.PUT("/abuse/teams/:team_id/trust", h.SetPlatformAbuseTeamTrust)
 		operator.GET("/abuse/restrictions", h.ListPlatformAbuseRestrictions)
+		operator.GET("/abuse/mode", h.GetPlatformAbuseMode)
+		operator.PUT("/abuse/mode", h.SetPlatformAbuseMode)
 		operator.POST("/abuse/restrictions", h.CreatePlatformAbuseRestriction)
 		operator.POST("/abuse/restrictions/:restriction_id/release", h.ReleasePlatformAbuseRestriction)
 		operator.POST("/abuse/refresh", h.RecordPlatformAbuseRefresh)

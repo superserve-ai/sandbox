@@ -31,6 +31,12 @@ func (h *Handlers) streamAttemptLogs(c *gin.Context, initial db.TemplateBuild) {
 		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
 		flusher.Flush()
 	}
+	// A comment holds the connection open through a quiet build without
+	// reaching a consumer: every SSE parser drops a line that is not a field.
+	keepalive := func() {
+		fmt.Fprint(c.Writer, ":\n\n")
+		flusher.Flush()
+	}
 	type event struct {
 		attempt uuid.UUID
 		log     vmdclient.BuildLogEvent
@@ -88,7 +94,10 @@ func (h *Handlers) streamAttemptLogs(c *gin.Context, initial db.TemplateBuild) {
 		if err != nil {
 			return true
 		}
-		write(gin.H{"stream": "system", "text": e.Reason, "status": string(b.Status), "finished": false, "execution": e})
+		// Scheduling state is the build status endpoint's to report. Emitting it
+		// here put host, attempt and publication vocabulary in the log body the
+		// user reads as their own build output.
+		keepalive()
 		next := uuid.Nil
 		if e.CurrentAttempt != nil {
 			next = *e.CurrentAttempt

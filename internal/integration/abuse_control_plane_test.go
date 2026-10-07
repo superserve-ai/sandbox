@@ -49,7 +49,13 @@ func TestPlatformAbuseControlPlaneRoutes(t *testing.T) {
 		t.Fatal("expected team trust audit row")
 	}
 
-	create := doInternal(r, http.MethodPost, "/internal/abuse/restrictions", adminID.String(), `{"subject_type":"ip","subject_value":"192.0.2.10","action":"create","reason":"test restriction","evidence":{"case":"integration"}}`)
+	for _, action := range []string{"create", "resume"} {
+		rejected := doInternal(r, http.MethodPost, "/internal/abuse/restrictions", adminID.String(), fmt.Sprintf(`{"subject_type":"ip","subject_value":"192.0.2.10","action":%q,"reason":"unsupported compute attribution"}`, action))
+		if rejected.Code != http.StatusBadRequest {
+			t.Fatalf("compute IP action %s accepted: %d %s", action, rejected.Code, rejected.Body.String())
+		}
+	}
+	create := doInternal(r, http.MethodPost, "/internal/abuse/restrictions", adminID.String(), `{"subject_type":"ip","subject_value":"192.0.2.10","action":"signup","reason":"test restriction","evidence":{"case":"integration"}}`)
 	if create.Code != http.StatusCreated {
 		t.Fatalf("create restriction status = %d, want 201: %s", create.Code, create.Body.String())
 	}

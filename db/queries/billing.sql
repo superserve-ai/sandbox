@@ -96,69 +96,8 @@ WITH compute AS (
       AND i.started_at < LEAST(now(), sqlc.arg(period_end))
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
-artifact_bounds AS (
-    SELECT
-        s.id,
-        s.team_id,
-        s.snapshot_id,
-        s.template_id,
-        s.base_path,
-        s.delta_path,
-        s.destroyed_at,
-        first_interval.started_at AS billing_started_at
-    FROM sandbox s
-    LEFT JOIN LATERAL (
-        SELECT MIN(i.started_at) AS started_at
-        FROM sandbox_storage_interval i
-        WHERE i.sandbox_id = s.id
-          AND i.team_id = s.team_id
-    ) first_interval ON true
-    WHERE s.team_id = sqlc.arg(team_id)
-      AND first_interval.started_at IS NOT NULL
-      AND first_interval.started_at < LEAST(now(), sqlc.arg(period_end))
-      AND s.created_at < LEAST(now(), sqlc.arg(period_end))
-      AND COALESCE(s.destroyed_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
-),
-artifact_ranges AS (
-    SELECT p.path,
-           MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-           range_agg(tstzrange(
-               GREATEST(s.billing_started_at, sqlc.arg(period_start)),
-               LEAST(COALESCE(s.destroyed_at, now()), sqlc.arg(period_end)), '[)'
-           )) AS retained_ranges
-    FROM artifact_bounds s
-    LEFT JOIN template t ON t.id = s.template_id
-    CROSS JOIN LATERAL unnest(ARRAY[
-        s.base_path,
-        s.delta_path,
-        CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END
-    ]) AS p(path)
-    LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-      AND am.path = p.path
-    WHERE p.path IS NOT NULL
-    GROUP BY p.path
-),
-artifact_storage AS (
-    SELECT FLOOR(COALESCE(SUM(artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
-    FROM artifact_ranges ar
-    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
-),
 storage AS (
-    -- Overlay intervals are per sandbox; template artifacts are a separate
-    -- distinct-path set so shared bases and deltas are never multiplied by
-    -- the number of sandboxes that pin them.
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
-            - GREATEST(i.started_at, sqlc.arg(period_start))
-        )) * i.disk_mib
-    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
-    FROM artifact_storage
-    LEFT JOIN sandbox_storage_interval i ON
-      i.team_id = sqlc.arg(team_id)
-      AND sqlc.arg(period_start) < LEAST(now(), sqlc.arg(period_end))
-      AND i.started_at < LEAST(now(), sqlc.arg(period_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
+ SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)::numeric AS storage_mib_seconds
 )
 SELECT
     sqlc.arg(team_id)::uuid AS team_id,
@@ -202,7 +141,7 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
 storage AS (
-    SELECT billable_storage_mib_seconds(sqlc.arg(team_id), sqlc.arg(period_start), sqlc.arg(period_end))::numeric AS storage_mib_seconds
+ SELECT billable_storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)::numeric AS storage_mib_seconds
 ),
 usage AS (
     SELECT
@@ -240,6 +179,7 @@ upserted AS (
           )
     )
       AND storage_reports_complete_through(usage.team_id, usage.period_end)
+      AND usage.storage_mib_seconds IS NOT NULL
     ON CONFLICT (team_id, period_start, period_end) DO UPDATE
     SET vcpu_seconds = EXCLUDED.vcpu_seconds,
         memory_mib_seconds = EXCLUDED.memory_mib_seconds,
@@ -301,58 +241,8 @@ WITH compute AS (
       AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
       AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
 ),
-artifact_bounds AS (
-    SELECT
-        s.id,
-        s.team_id,
-        s.snapshot_id,
-        s.template_id,
-        s.base_path,
-        s.delta_path,
-        s.destroyed_at,
-        first_interval.started_at AS billing_started_at
-    FROM sandbox s
-    LEFT JOIN LATERAL (
-        SELECT MIN(i.started_at) AS started_at
-        FROM sandbox_storage_interval i
-        WHERE i.sandbox_id = s.id
-          AND i.team_id = s.team_id
-    ) first_interval ON true
-    WHERE s.team_id = sqlc.arg(team_id)
-      AND first_interval.started_at IS NOT NULL
-      AND first_interval.started_at < LEAST(billing_request_now(), sqlc.arg(hour_end))
-      AND s.created_at < LEAST(billing_request_now(), sqlc.arg(hour_end))
-      AND COALESCE(s.destroyed_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
-),
-artifact_storage AS (
-    SELECT FLOOR(COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
-    FROM (
-        SELECT p.path,
-               MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-               range_agg(tstzrange(GREATEST(s.billing_started_at, sqlc.arg(hour_start)), LEAST(COALESCE(s.destroyed_at, billing_request_now()), sqlc.arg(hour_end)), '[)')) AS retained_ranges
-        FROM artifact_bounds s
-        LEFT JOIN template t ON t.id = s.template_id
-        CROSS JOIN LATERAL unnest(ARRAY[s.base_path, s.delta_path, CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
-        LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-          AND am.path = p.path
-        WHERE p.path IS NOT NULL
-        GROUP BY p.path
-    ) ar
-    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
-),
 storage AS (
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
-            - GREATEST(i.started_at, sqlc.arg(hour_start))
-        )) * i.disk_mib
-    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
-    FROM artifact_storage
-    LEFT JOIN sandbox_storage_interval i ON
-      i.team_id = sqlc.arg(team_id)
-      AND i.started_at < sqlc.arg(hour_end)
-      AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
-      AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
+ SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(hour_start)::timestamptz,sqlc.arg(hour_end)::timestamptz)::numeric AS storage_mib_seconds
 ),
 usage AS (
     SELECT
@@ -365,6 +255,7 @@ usage AS (
     FROM compute, storage
     WHERE feature_enabled('billing_hourly_rollups', sqlc.arg(team_id)::uuid)
       AND storage_reports_complete_through(sqlc.arg(team_id)::uuid, sqlc.arg(hour_end)::timestamptz)
+      AND storage.storage_mib_seconds IS NOT NULL
 )
 INSERT INTO team_billing_usage_hourly (
     team_id, hour_start, hour_end,
@@ -664,15 +555,28 @@ SET checkout_initializing_at = now(),
     checkout_anchor_snapshot = COALESCE(checkout_anchor_snapshot, commercial_billing_anchor),
     updated_at = now()
 FROM locks
-WHERE team_id = sqlc.arg(team_id)
+WHERE team_billing_account.team_id = sqlc.arg(team_id)
   AND checkout_completed_at IS NULL
   AND checkout_initializing_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM stripe_promotion_migration_fence f
+      WHERE f.team_id = sqlc.arg(team_id)
+  )
 RETURNING team_billing_account.*;
 
 -- name: ResumeTeamBillingCheckout :one
 UPDATE team_billing_account
-SET checkout_pending_attempt_ids = array_append(checkout_pending_attempt_ids, sqlc.arg(attempt_id)::uuid), updated_at = now()
-WHERE team_id = sqlc.arg(team_id)
+SET checkout_pending_attempt_ids = CASE
+        -- Discarded attempts may still be in flight. Preserve that uncertainty
+        -- while replaying the same generation and Stripe idempotency key.
+        WHEN cardinality(checkout_pending_attempt_ids) >= 32
+          THEN ARRAY[sqlc.arg(attempt_id)::uuid]
+        ELSE array_append(checkout_pending_attempt_ids, sqlc.arg(attempt_id)::uuid)
+    END,
+    checkout_may_exist = checkout_may_exist OR cardinality(checkout_pending_attempt_ids) >= 32,
+    updated_at = now()
+WHERE team_billing_account.team_id = sqlc.arg(team_id)
+  AND NOT EXISTS (SELECT 1 FROM stripe_promotion_migration_fence f WHERE f.team_id=sqlc.arg(team_id))
   AND stripe_checkout_actor_id = sqlc.arg(actor_id)
   AND checkout_request_key = sqlc.arg(request_key)
   AND NOT (sqlc.arg(attempt_id)::uuid = ANY(checkout_pending_attempt_ids))
@@ -1226,30 +1130,21 @@ FROM recent_compute b
      WHERE team_id = sqlc.arg(team_id) AND ended_at > (SELECT started_at FROM sample_window) AND storage_billing_activated(sqlc.arg(team_id))
      LIMIT 1025)
   ) i
-), recent_artifact_ranges AS MATERIALIZED (
-  SELECT p.path,
-         MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-         range_agg(tstzrange(
-           GREATEST(rs.started_at, (SELECT started_at FROM sample_window)),
-           LEAST(COALESCE(rs.ended_at, now()), COALESCE(s.destroyed_at, now()), now()), '[)'
-         )) AS retained_ranges
-  FROM recent_storage rs
-  JOIN sandbox s ON s.id = rs.sandbox_id AND s.team_id = sqlc.arg(team_id)
-  LEFT JOIN template t ON t.id = s.template_id
-  CROSS JOIN LATERAL unnest(ARRAY[
-    s.base_path,
-    s.delta_path,
-    CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END
-  ]) AS p(path)
-  LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-    AND am.path = p.path
-  WHERE p.path IS NOT NULL
-    AND rs.started_at < LEAST(COALESCE(rs.ended_at, now()), COALESCE(s.destroyed_at, now()), now())
-  GROUP BY p.path
-), artifact_storage AS MATERIALIZED (
-  SELECT COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0)::numeric AS mib_seconds
-  FROM recent_artifact_ranges ar
-  CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
+), recent_retained AS MATERIALIZED (
+ -- Retained spend is clipped at storage activation as well as the trial
+ -- sample window; otherwise storage-only trials get a pre-activation
+ -- denominator with no corresponding spend.
+ SELECT GREATEST(
+          started_at,
+          (SELECT started_at FROM sample_window),
+          COALESCE((SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id)), started_at)
+        ) started_at,ended_at
+ FROM retained_storage_interval WHERE team_id=sqlc.arg(team_id)
+ AND COALESCE(ended_at,now())>GREATEST(
+       (SELECT started_at FROM sample_window),
+       COALESCE((SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id)), (SELECT started_at FROM sample_window))
+     )
+ AND storage_billing_activated(sqlc.arg(team_id)) LIMIT 1025
 ), sample_bounds AS (
   SELECT MIN(started_at) AS started_at,
          MAX(LEAST(ended_at, now())) AS ended_at
@@ -1257,14 +1152,10 @@ FROM recent_compute b
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute WHERE started_at < now()
     UNION ALL
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage WHERE started_at < now()
-    UNION ALL
-    SELECT lower(r), upper(r)
-    FROM recent_artifact_ranges ar
-    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
-    WHERE ar.artifact_mib > 0 AND lower(r) < upper(r)
+ UNION ALL SELECT started_at,COALESCE(ended_at,now()) FROM recent_retained WHERE started_at<now()
   ) intervals
 )
-SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated(sqlc.arg(team_id)) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates WHERE s.started_at < LEAST(COALESCE(s.ended_at, now()), now())), 0) + COALESCE((SELECT mib_seconds / 1024.0 * rates.storage FROM artifact_storage), 0) ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
+SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 OR (SELECT count(*) FROM recent_retained)>1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated(sqlc.arg(team_id)) THEN storage_mib_seconds(sqlc.arg(team_id)::uuid,GREATEST((SELECT started_at FROM sample_window),(SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id))),now())/1024.0*rates.storage ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
        sample_bounds.started_at, sample_bounds.ended_at,
        EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
 FROM compute, rates, sample_bounds;
@@ -1363,24 +1254,34 @@ ORDER BY g.team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ListTrialCreditWarningTeams :many
-WITH consuming_teams AS (
-    SELECT s.team_id
-    FROM sandbox s
-    WHERE s.destroyed_at IS NULL AND s.status = 'active'
-      AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-    UNION
-    SELECT i.team_id
-    FROM sandbox_storage_interval i
-    -- A zero-sized overlay can still retain billable shared artifacts.
-    WHERE i.ended_at IS NULL AND i.started_at < now()
-      AND i.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-      AND storage_billing_activated(i.team_id)
+-- Fence the trial team set before evaluating activation or probing consumption;
+-- interval counts must not multiply per-team billing eligibility reads.
+WITH trial_teams AS MATERIALIZED (
+    SELECT DISTINCT g.team_id
+    FROM team_credit_grant g
+    LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+    WHERE a.trial_ended_at IS NULL
+      AND g.reason = 'signup trial credit'
+      AND g.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+), candidates AS MATERIALIZED (
+    SELECT team_id, storage_billing_activated(team_id) AS storage_active
+    FROM trial_teams
 )
 SELECT c.team_id
-FROM consuming_teams c
-LEFT JOIN team_billing_account a ON a.team_id = c.team_id
-WHERE a.trial_ended_at IS NULL
-  AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = c.team_id AND g.reason = 'signup trial credit')
+FROM candidates c
+WHERE EXISTS (
+    SELECT 1 FROM sandbox s
+    WHERE s.team_id = c.team_id AND s.destroyed_at IS NULL AND s.status = 'active'
+) OR (c.storage_active AND (
+    -- A zero-sized overlay can still retain billable shared artifacts.
+    -- Ordered probes keep negative lookups on team indexes under fleet skew.
+    (SELECT i.sandbox_id FROM sandbox_storage_interval i
+     WHERE i.team_id = c.team_id AND i.ended_at IS NULL AND i.started_at < now()
+     ORDER BY i.sandbox_id LIMIT 1) IS NOT NULL
+    OR (SELECT i.started_at FROM retained_storage_interval i
+        WHERE i.team_id = c.team_id AND i.ended_at IS NULL AND i.started_at < now()
+        ORDER BY i.started_at LIMIT 1) IS NOT NULL
+))
 ORDER BY c.team_id
 LIMIT sqlc.arg(batch_limit);
 
@@ -1537,31 +1438,10 @@ JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_en
  FROM buckets b LEFT JOIN compute_intervals i ON
   i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
  GROUP BY b.bucket_start,b.bucket_end
-), storage_intervals AS (
- SELECT i.* FROM sandbox_storage_interval i CROSS JOIN bounds r
- WHERE i.team_id=sqlc.arg(team_id) AND i.started_at < LEAST(now(),r.range_end)
-   AND COALESCE(i.ended_at,now()) > r.range_start
-), artifact_ranges AS (
- SELECT b.bucket_start,b.bucket_end,p.path,
-   MAX(COALESCE(NULLIF(am.allocated_bytes,0),0))::numeric/1048576.0 AS artifact_mib,
-   range_agg(tstzrange(GREATEST(s.started_at,b.bucket_start),LEAST(COALESCE(sb.destroyed_at,now()),b.bucket_end),'[)')) AS retained_ranges
- FROM buckets b
- JOIN storage_intervals s ON TRUE
- JOIN sandbox sb ON sb.id=s.sandbox_id
- LEFT JOIN template t ON t.id=sb.template_id
- CROSS JOIN LATERAL unnest(ARRAY[sb.base_path,sb.delta_path,CASE WHEN sb.base_path IS NULL AND sb.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
- LEFT JOIN artifact_manifest am ON (am.snapshot_id=sb.snapshot_id OR am.template_id=t.id) AND am.path=p.path
- WHERE p.path IS NOT NULL AND s.started_at < LEAST(now(),b.bucket_end) AND COALESCE(sb.destroyed_at,LEAST(now(),b.bucket_end)) > b.bucket_start
- GROUP BY b.bucket_start,b.bucket_end,p.path
-), artifact_storage AS (
- SELECT bucket_start,bucket_end,COALESCE(SUM(artifact_mib*EXTRACT(EPOCH FROM (upper(r)-lower(r)))),0)::numeric AS mib_seconds
- FROM artifact_ranges CROSS JOIN LATERAL unnest(retained_ranges) AS ranges(r) GROUP BY bucket_start,bucket_end
 ), storage AS (
  SELECT b.bucket_start,b.bucket_end,
-   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.disk_mib),0)::numeric + COALESCE(MAX(a.mib_seconds),0) AS storage_mib_seconds
- FROM buckets b LEFT JOIN storage_intervals i ON
-  i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
- LEFT JOIN artifact_storage a ON a.bucket_start=b.bucket_start AND a.bucket_end=b.bucket_end GROUP BY b.bucket_start,b.bucket_end
+ storage_mib_seconds(sqlc.arg(team_id)::uuid,b.bucket_start,b.bucket_end,false)::numeric AS storage_mib_seconds
+ FROM buckets b
 )
 SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(billable_storage_mib_seconds(sqlc.arg(team_id),c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
@@ -1617,3 +1497,12 @@ SELECT storage_billing_activated(sqlc.arg(team_id)::uuid)::boolean;
 
 -- name: IsStorageBillingActivatedForWindow :one
 SELECT storage_billing_activated(sqlc.arg(team_id)::uuid, sqlc.arg(period_end)::timestamptz)::boolean;
+
+-- name: BeginStripeCheckoutWithPublicationDecision :exec
+SELECT begin_stripe_checkout_with_publication_decision(
+    sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(operation_id)::uuid,
+    sqlc.arg(home_region)::text, sqlc.arg(request_key)::text, sqlc.arg(decision)::text, sqlc.arg(attempt_id)::uuid);
+
+-- name: StripeCheckoutPublicationFailed :one
+SELECT stripe_checkout_publication_failed(sqlc.arg(team_id)::uuid,
+    sqlc.arg(generation)::timestamptz, sqlc.arg(user_id)::uuid)::boolean AS publication_failed;

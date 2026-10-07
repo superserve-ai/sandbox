@@ -35,6 +35,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/hostidentity"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/proxy"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vm"
@@ -1044,6 +1045,9 @@ func main() {
 		log,
 	)
 	egressProxy.SetHostID(cfg.HostID)
+	if os.Getenv("VMD_MINING_POLICY_CONFIG") != "" {
+		egressProxy.EnableMiningStreamTracking()
+	}
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
 	st.mark("vm_manager_init", true, -1)
@@ -1201,9 +1205,10 @@ func main() {
 		if workers < 1 {
 			workers = 1
 		}
+		store := backup.NewGCSStore(gcsClient, bucket)
 		uploader := &backup.Uploader{
 			Journal:     journal,
-			Store:       backup.NewGCSStore(gcsClient, bucket),
+			Store:       store,
 			Limiter:     rate.NewLimiter(bytesPerSec, 32<<20),
 			Concurrency: workers,
 			Log:         log.With().Str("component", "backup").Logger(),
@@ -1381,6 +1386,13 @@ func main() {
 			// Coverage is per bucket: a completed generation elsewhere
 			// must not suppress uploading into this one.
 			return journal.Covered(bucket, t)
+		})
+		// A generation whose objects nothing here can vouch for completes
+		// for nobody. The template sweep uses this to stop re-offering one
+		// rather than abandoning an upload on every pass; scoped per
+		// bucket for the same reason coverage is.
+		mgr.SetBackupUnvouchable(func(t backup.Task) (bool, error) {
+			return journal.Unvouchable(store.Identity(), t, time.Now())
 		})
 		// Verified generations report back to the control plane so backup
 		// coverage is a DB query. Rides the uploader's durable outbox:
@@ -1833,6 +1845,7 @@ func main() {
 	// logging. If DATABASE_URL is unset, the reconciler falls back to a
 	// BoltDB ↔ systemd comparison only.
 	var reconcilerDB *dbq.Queries
+	var reloadMiningPolicy func()
 	if cfg.DatabaseURL != "" {
 		dbCfg, dbErr := pgxpool.ParseConfig(cfg.DatabaseURL)
 		if dbErr != nil {
@@ -1876,6 +1889,7 @@ func main() {
 			return nil
 		})
 		log.Info().Msg("reconciler DB connection ready")
+		reloadMiningPolicy = startMiningProtection(ctx, postReady, cfg, dbPool, egressProxy, lc, log, recorder, mgr)
 
 		// Per-connection egress logging. Drops on a full buffer rather than
 		// back-pressuring the proxy's data path.
@@ -1888,6 +1902,7 @@ func main() {
 	} else {
 		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
 		st.mark("db_connect", false, -1)
+		reloadMiningPolicy = startMiningProtection(ctx, postReady, cfg, nil, egressProxy, lc, log, recorder, mgr)
 	}
 
 	// ---- Continuous reconciler ----
@@ -1968,7 +1983,12 @@ func main() {
 					log.Warn().Err(err).Msg("unable to resolve heartbeat addresses; heartbeat will omit host self-description")
 				}
 			}
+			var retainedStorage func(context.Context) (*retainedstorage.Inventory, error)
+			if os.Getenv("VMD_RETAINED_STORAGE_REPORTS") == "true" {
+				retainedStorage = mgr.RetainedStorageInventory
+			}
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
+				RetainedStorage: retainedStorage,
 				TemplateBuildReady: func() bool {
 					return startupReady.Load() && backupBucket != "" && buildRuntimeInstalled && cfg.IncarnationID != "" && publishesPressure
 				},
@@ -1978,6 +1998,7 @@ func main() {
 				Token:             os.Getenv("INTERNAL_API_TOKEN"),
 				ProxyHealthURL:    proxyHealthURL,
 				RunDir:            cfg.RunDir,
+				SnapshotDir:       cfg.SnapshotDir,
 				VMDAddr:           vmdAddr,
 				ProxyAddr:         proxyAddr,
 				Region:            cfg.HostRegion,
@@ -2110,6 +2131,9 @@ func main() {
 		for {
 			select {
 			case <-hupCh:
+				if reloadMiningPolicy != nil {
+					reloadMiningPolicy()
+				}
 				if blockList != nil && blocklistPath != "" {
 					log.Info().Msg("SIGHUP: reloading egress blocklist config")
 					blockList.Reload(blocklistPath)

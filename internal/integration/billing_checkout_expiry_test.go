@@ -143,6 +143,9 @@ func TestIntegration_CheckoutExpirationPreservesCompletedCheckout(t *testing.T) 
 				t.Fatalf("checkout: %d %s", w.Code, w.Body.String())
 			}
 			now := time.Now().UTC().Truncate(time.Second)
+			if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET checkout_initializing_at=now()-interval '2 days' WHERE team_id=$1`, teamID); err != nil {
+				t.Fatal(err)
+			}
 			for _, eventType := range []string{"checkout.session.completed", "checkout.session.expired"} {
 				payload := checkoutExpiryWebhookPayload(t, "evt_"+eventType+teamID.String(), eventType, "cs_expiry_1", teamID.String(), stripe.nextCustomerID, subscriptionID, now)
 				req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
@@ -153,7 +156,7 @@ func TestIntegration_CheckoutExpirationPreservesCompletedCheckout(t *testing.T) 
 				}
 				if eventType == "checkout.session.completed" {
 					if _, err := testPool.Exec(ctx, `UPDATE team_billing_account
-						SET checkout_initializing_at=now()-interval '2 days', checkout_completed_at=checkout_completed_at-interval '2 days'
+						SET checkout_completed_at=checkout_completed_at-interval '2 days'
 						WHERE team_id=$1`, teamID); err != nil {
 						t.Fatal(err)
 					}

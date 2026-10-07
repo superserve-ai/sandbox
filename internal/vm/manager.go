@@ -452,6 +452,8 @@ type ManagerConfig struct {
 
 // Manager orchestrates the lifecycle of Firecracker microVMs.
 type Manager struct {
+	storageEpoch     atomic.Uint64
+	storageMutations atomic.Int64
 	buildIncarnation string // immutable daemon identity for durable build reports
 
 	cfg         ManagerConfig
@@ -506,6 +508,17 @@ type Manager struct {
 	// pendingInFlight guards one pending-backup worker per VM across the
 	// startup recovery and the periodic sweep.
 	pendingInFlight sync.Map
+	// backupUnvouchable probes whether a generation's objects are in the
+	// bucket with nothing here able to vouch for them.
+	backupUnvouchable func(backup.Task) (bool, error)
+	// pendingSweepCursor is the last record a sweep pass offered a turn,
+	// so the next pass resumes after it instead of re-offering the head
+	// of a key-ordered listing. Sweep-goroutine only, and deliberately
+	// not persisted: a restart may re-offer the head once.
+	pendingSweepCursor string
+	// pendingSweepBudget overrides how long one pending-backup sweep pass
+	// keeps dispatching in tests; zero means pendingSweepPassBudget.
+	pendingSweepBudget time.Duration
 	// pendingSweepInterval overrides the pending-backup sweep pace in
 	// tests; 0 means pendingBackupSweepInterval.
 	pendingSweepInterval time.Duration
@@ -538,6 +551,11 @@ type Manager struct {
 	restoreForResumeHook func(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, trackingSessionID string, err error)
 	// restoreSnapshotHook is the restore path's.
 	restoreSnapshotHook func(socketPath, snapshotPath, memPath string, clockRealtime *bool) error
+	// These hooks are test seams for the retained-dependency lock-order
+	// regression; nil in production.
+	retainedDependencyLockHook      func(string)
+	handleVMErrorPreManagerLockHook func(string)
+	handleVMErrorManagerLockHook    func(string)
 	// pausedNetworkControllerState bounds pause-network reclamation cadence.
 	pausedNetworkControllerMu      sync.Mutex
 	pausedNetworkControllerLastRun time.Time
@@ -886,7 +904,8 @@ func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
 			<-ch
 			return nil, err
 		}
-		return func() { <-ch }, nil
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-ch }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -898,7 +917,8 @@ func (m *Manager) tryLockVMOp(vmID string) (unlock func(), ok bool) {
 	ch := m.vmOpCh(vmID)
 	select {
 	case ch <- struct{}{}:
-		return func() { <-ch }, true
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-ch }, true
 	default:
 		return nil, false
 	}
@@ -1105,38 +1125,40 @@ func planRestore(basePath, deltaDir string, fork, reuse bool) restorePlan {
 //
 // Anything else is an error: silently falling back to BaseRootfsPath would
 // put the wrong disk under the snapshot's memory view.
-func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (string, error) {
+func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (diskPath, rootfsPath string, err error) {
 	if src, srcErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath); srcErr == nil {
 		dst, err := m.copyRootfs(ctx, vmID, src)
 		if err != nil {
-			return "", fmt.Errorf("copy rootfs for restore: %w", err)
+			return "", "", fmt.Errorf("copy rootfs for restore: %w", err)
 		}
-		return dst, nil
+		return dst, src, nil
 	} else {
 		existing := filepath.Join(m.cfg.RunDir, vmID, "rootfs.ext4")
 		if _, statErr := os.Stat(existing); statErr != nil {
-			return "", fmt.Errorf(
+			return "", "", fmt.Errorf(
 				"resolve rootfs for vm %s: snapshot %q is not a template snapshot (%v) and per-VM rootfs %q is missing (%v)",
 				vmID, snapshotPath, srcErr, existing, statErr,
 			)
 		}
-		return existing, nil
+		return existing, "", nil
 	}
 }
 
-// templateRootfsForSnapshot maps .../templates/<id>/<file>.snap →
-// <runDir>/templates/<id>/rootfs.ext4. Lets vmd find the template's rootfs
-// without needing controlplane to pass it.
+// templateRootfsForSnapshot preserves the template/build path beneath templates
+// when mapping a snapshot to its rootfs in runDir. Flat legacy templates omit
+// the build directory.
 func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
-	parent := filepath.Dir(snapshotPath) // .../templates/<templateID>
-	templateID := filepath.Base(parent)  // <templateID>
-	if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
-		return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
+	parent := filepath.Dir(snapshotPath)
+	relative := filepath.Base(parent)
+	templatesDir := filepath.Dir(parent)
+	if filepath.Base(templatesDir) != TemplatesDirName {
+		relative = filepath.Join(filepath.Base(templatesDir), relative)
+		templatesDir = filepath.Dir(templatesDir)
 	}
-	if templateID == "" || templateID == "." || templateID == string(filepath.Separator) {
-		return "", fmt.Errorf("snapshot path %q has an empty template id segment", snapshotPath)
+	if filepath.Base(templatesDir) != TemplatesDirName {
+		return "", fmt.Errorf("snapshot path %q is not a template or build snapshot", snapshotPath)
 	}
-	return filepath.Join(runDir, TemplatesDirName, templateID, "rootfs.ext4"), nil
+	return filepath.Join(runDir, TemplatesDirName, relative, "rootfs.ext4"), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -3560,6 +3582,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		metaSnapshot, metaMem = fork.SnapshotPath, fork.MemPath
 	}
+	// Do not infer a template rootfs on the restore path. Overlay/build
+	// snapshots do not create the legacy path, and a synchronous filesystem
+	// probe here would both invent a dependency and add latency to resume.
+	// Reconciliation resolves legacy full-copy dependencies from build metadata
+	// before retained accounting accepts the generation.
 	// Failed restores return before the first-attempt success block below
 	// records the setup phases; emit whichever stages completed (elapsed for
 	// the in-flight one) so failed attempts — which can consume most of the
@@ -3805,7 +3832,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.cleanupRunDir(vmID)
 		}
 	}
-	var diskPath string
+	var diskPath, templateRootfs string
 	var diskErr error
 	diskUntouched := false
 	switch plan.action {
@@ -3819,7 +3846,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			diskPath = existing
 		}
 	case restoreLegacyResolve:
-		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+		diskPath, templateRootfs, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
 	case restoreMaterializeFork:
 		if (inPlace || priorRunDir) && stopErr != nil {
 			// A stop that did not confirm may leave a Firecracker that still
@@ -3933,6 +3960,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// so the in-memory view is consistent for concurrent readers.
 		inst.mu.Lock()
 		inst.DiskPath = diskPath
+		if templateRootfs != "" {
+			// A full pause replaces the memory anchors before inventory may run.
+			inst.Config.RootfsPath = templateRootfs
+		}
 		inst.IP = hostIP
 		inst.TAPDevice = tapDevice
 		inst.MACAddress = macAddr
@@ -5602,7 +5633,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				sigkillPID(rec.PID, 500*time.Millisecond)
 				log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
 			}
-			m.state.Delete(rec.ID)
+			if err := m.state.ReleaseRetainingStorage(rec.ID); err != nil {
+				log.Error().Err(err).Msg("failed to preserve stale storage metadata")
+				return nil, false
+			}
 			// Free this record's namespace/slot directly instead of a broad
 			// re-sweep (which would also delete the warm pool's netns).
 			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
@@ -5670,7 +5704,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					return m.returnInterruptedResumeToPaused(ctx, rec, cleanupStale, log)
 				}
 				if confirmed {
-					if derr := m.state.Delete(rec.ID); derr == nil {
+					if derr := m.state.ReleaseRetainingStorage(rec.ID); derr == nil {
 						m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 						return nil, false
 					} else {
@@ -6174,8 +6208,8 @@ func (m *Manager) getRunningVMIP(vmID string) (string, error) {
 }
 
 // handleVMError checks whether a connection error to a VM means the VM is
-// dead. If the systemd unit is no longer active, it marks the VM as failed
-// in BoltDB, removes it from the in-memory map, and returns NotFound so
+// dead. If the process is definitively dead, it archives the durable record,
+// removes it from the in-memory map, and returns NotFound so
 // the control plane returns 410 Gone. If the unit is still active (transient
 // error), it returns the original error unchanged.
 func (m *Manager) handleVMError(vmID string, origErr error) error {
@@ -6191,9 +6225,16 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 	if !m.vmDefinitelyDead(checkCtx, vmID, m.supervisionForVM(vmID)) {
 		return origErr
 	}
+	// Test-only coordination point after the definitive-death preflight. The
+	// hook is nil in production and deliberately runs before m.mu is acquired,
+	// so lock-order tests can schedule cleanup without holding either manager or
+	// instance mutex.
+	if hook := m.handleVMErrorPreManagerLockHook; hook != nil {
+		hook(vmID)
+	}
 
-	// Single lock acquisition for both status update and removal so
-	// concurrent callers can't race on the same VM.
+	// Keep a stopped instance tracked until archival succeeds so a lazy lookup
+	// cannot adopt the durable record's stale running status after a write failure.
 	m.mu.Lock()
 	inst, ok := m.vms[vmID]
 	if !ok {
@@ -6201,17 +6242,28 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 		// Already cleaned up by another goroutine.
 		return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 	}
+	if hook := m.handleVMErrorManagerLockHook; hook != nil {
+		hook(vmID)
+	}
 	inst.mu.Lock()
 	inst.Status = StatusStopped
 	inst.mu.Unlock()
-	delete(m.vms, vmID)
-	m.unindexVM(vmID)
 	m.mu.Unlock()
 
 	m.log.Warn().Str("vm_id", vmID).Err(origErr).
 		Msg("VM process is dead — cleaning up and returning NotFound")
-	m.persistState(inst)
-	m.deleteState(vmID)
+	if m.state != nil && !isBuildVM(vmID) {
+		if err := m.state.ReleaseRetainingStorage(vmID); err != nil {
+			m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to preserve dead VM storage metadata")
+			return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
+		}
+	}
+	m.mu.Lock()
+	if m.vms[vmID] == inst {
+		delete(m.vms, vmID)
+		m.unindexVM(vmID)
+	}
+	m.mu.Unlock()
 	return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 }
 
@@ -7520,6 +7572,7 @@ func (m *Manager) deleteState(vmID string) {
 	}
 	if err := m.state.Delete(vmID); err != nil {
 		m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to delete VM state from BoltDB")
+		return
 	}
 }
 

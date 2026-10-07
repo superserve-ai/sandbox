@@ -152,6 +152,20 @@ func (ns NullTemplateStatus) Value() (driver.Value, error) {
 	return string(ns.TemplateStatus), nil
 }
 
+type AbuseMiningIncident struct {
+	ID            uuid.UUID   `json:"id"`
+	HostID        string      `json:"host_id"`
+	SandboxID     uuid.UUID   `json:"sandbox_id"`
+	TeamID        uuid.UUID   `json:"team_id"`
+	Assignment    string      `json:"assignment"`
+	BodyDigest    string      `json:"body_digest"`
+	Disposition   string      `json:"disposition"`
+	RestrictionID pgtype.UUID `json:"restriction_id"`
+	Evidence      []byte      `json:"evidence"`
+	ObservedAt    time.Time   `json:"observed_at"`
+	CreatedAt     time.Time   `json:"created_at"`
+}
+
 type AbuseRestriction struct {
 	ID            uuid.UUID          `json:"id"`
 	SubjectType   string             `json:"subject_type"`
@@ -168,6 +182,12 @@ type AbuseRestriction struct {
 	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
 	ReleasedAt    pgtype.Timestamptz `json:"released_at"`
 	ReleasedBy    pgtype.UUID        `json:"released_by"`
+}
+
+type AbuseRuntimeSetting struct {
+	Singleton bool      `json:"singleton"`
+	Mode      string    `json:"mode"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type AbuseStateChange struct {
@@ -478,6 +498,18 @@ type BillingInvoiceAccount struct {
 	EnrolledAt          time.Time          `json:"enrolled_at"`
 	LastAttemptAt       pgtype.Timestamptz `json:"last_attempt_at"`
 	LastError           *string            `json:"last_error"`
+}
+
+type BillingInvoiceCalendar struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	PeriodStart        time.Time `json:"period_start"`
+	PeriodEnd          time.Time `json:"period_end"`
+	CustomerID         string    `json:"customer_id"`
+	SubscriptionID     string    `json:"subscription_id"`
+	InvoiceStart       time.Time `json:"invoice_start"`
+	InvoiceEnd         time.Time `json:"invoice_end"`
+	BillingCycleAnchor int64     `json:"billing_cycle_anchor"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 type BillingInvoiceClose struct {
@@ -885,6 +917,40 @@ type ReconcilerLog struct {
 	CreatedAt time.Time   `json:"created_at"`
 }
 
+type RetainedStorageCutover struct {
+	HostID    string    `json:"host_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+type RetainedStorageInterval struct {
+	ID                     int64              `json:"id"`
+	HostID                 string             `json:"host_id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	OwnerKind              string             `json:"owner_kind"`
+	OwnerID                uuid.UUID          `json:"owner_id"`
+	Generation             string             `json:"generation"`
+	Extents                []byte             `json:"extents"`
+	StartedAt              time.Time          `json:"started_at"`
+	EndedAt                pgtype.Timestamptz `json:"ended_at"`
+	BaselinePath           *string            `json:"baseline_path"`
+	BaselineGeneration     *string            `json:"baseline_generation"`
+	BaselineAllocatedBytes *int64             `json:"baseline_allocated_bytes"`
+}
+
+type RetainedStorageMeasurementObligation struct {
+	ID                 int64              `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	OwnerKind          string             `json:"owner_kind"`
+	OwnerID            uuid.UUID          `json:"owner_id"`
+	HostID             string             `json:"host_id"`
+	EffectiveAt        time.Time          `json:"effective_at"`
+	EndedAt            pgtype.Timestamptz `json:"ended_at"`
+	ResolvedAt         pgtype.Timestamptz `json:"resolved_at"`
+	ResolutionReportID pgtype.UUID        `json:"resolution_report_id"`
+	MigrationIdentity  uuid.UUID          `json:"migration_identity"`
+}
+
 type RevokedProxyToken struct {
 	SandboxID  uuid.UUID `json:"sandbox_id"`
 	ProxyToken string    `json:"proxy_token"`
@@ -1079,7 +1145,23 @@ type SandboxSnapshot struct {
 	ReadyAt        pgtype.Timestamptz `json:"ready_at"`
 	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
 	// When the sweep next asks the host about a row creating or deleting; pushed out on every attempt, NULL once the host has confirmed.
-	SweepAfter pgtype.Timestamptz `json:"sweep_after"`
+	SweepAfter       pgtype.Timestamptz `json:"sweep_after"`
+	RetentionEndedAt pgtype.Timestamptz `json:"retention_ended_at"`
+}
+
+type SandboxStorageBaseline struct {
+	ID             int64              `json:"id"`
+	SandboxID      uuid.UUID          `json:"sandbox_id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	HostID         string             `json:"host_id"`
+	Path           string             `json:"path"`
+	Generation     string             `json:"generation"`
+	AllocatedBytes int64              `json:"allocated_bytes"`
+	ObservedAt     time.Time          `json:"observed_at"`
+	StartedAt      time.Time          `json:"started_at"`
+	EndedAt        pgtype.Timestamptz `json:"ended_at"`
+	EffectiveAt    time.Time          `json:"effective_at"`
+	ReceiptID      uuid.UUID          `json:"receipt_id"`
 }
 
 type SandboxStorageInterval struct {
@@ -1090,6 +1172,7 @@ type SandboxStorageInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+	HostID    *string            `json:"host_id"`
 }
 
 // Host-side reclaim still owed for a deleted sandbox; removed when the VM and its artifacts are gone.
@@ -1168,6 +1251,29 @@ type StripeCheckoutExpirationEvidence struct {
 	CheckoutGeneration time.Time `json:"checkout_generation"`
 	CheckoutSessionID  string    `json:"checkout_session_id"`
 	ExpiredAt          time.Time `json:"expired_at"`
+}
+
+type StripeCheckoutGenerationAuthority struct {
+	TeamID                  uuid.UUID   `json:"team_id"`
+	CheckoutGeneration      time.Time   `json:"checkout_generation"`
+	UserID                  uuid.UUID   `json:"user_id"`
+	IdentityEvidenceVersion pgtype.UUID `json:"identity_evidence_version"`
+}
+
+type StripeCheckoutPublicationDecision struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
+	UserID             uuid.UUID `json:"user_id"`
+	OperationID        uuid.UUID `json:"operation_id"`
+	HomeRegion         string    `json:"home_region"`
+	RequestKey         string    `json:"request_key"`
+	Decision           string    `json:"decision"`
+}
+
+type StripeCheckoutPublicationSubscription struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	SubscriptionID     string    `json:"subscription_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
 }
 
 type StripePromotionMigrationFence struct {

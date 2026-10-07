@@ -778,7 +778,7 @@ func TestUploaderRefreshesVerificationOnRepeatedDedupe(t *testing.T) {
 	}
 	overlayObj := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4")
 	key := store.Identity() + "\x00" + overlayObj
-	if ok, err := j.WasVerified(key, fake); err != nil || !ok {
+	if ok, err := j.WasVerified(key); err != nil || !ok {
 		t.Fatalf("WasVerified immediately after first upload = %v (err %v), want valid", ok, err)
 	}
 
@@ -826,7 +826,7 @@ func TestUploaderRefreshesVerificationOnRepeatedDedupe(t *testing.T) {
 
 	// Direct check: the record reads valid at a time that is only within
 	// retention when measured from the refresh, not the original write.
-	if ok, err := j.WasVerified(key, fake); err != nil || !ok {
+	if ok, err := j.WasVerified(key); err != nil || !ok {
 		t.Fatalf("WasVerified after refresh = %v (err %v), want valid", ok, err)
 	}
 }
@@ -1079,7 +1079,7 @@ func TestFailedVerificationWriteNotCarriedIntoTask(t *testing.T) {
 	db.Close()
 
 	u := &Uploader{Journal: j, Store: newMemStore()}
-	_, _, _, err = u.uploadFile(context.Background(), &task, task.Files[0])
+	_, _, _, err = u.uploadFile(context.Background(), &task, task.Files[0], func() {})
 	if err == nil {
 		t.Fatal("uploadFile succeeded despite a failed verification write")
 	}
@@ -1789,12 +1789,12 @@ func TestSharedDedupeRecordsHistoryForFutureSkips(t *testing.T) {
 	if store.creates[baseObject] != 1 {
 		t.Fatalf("base Create calls = %d, want exactly the deduped attempt", store.creates[baseObject])
 	}
-	ok, err := j.WasVerified("test-bucket\x00"+baseObject, time.Now())
+	ok, err := j.WasVerified("test-bucket\x00" + baseObject)
 	if err != nil || !ok {
 		t.Fatalf("dedupe not recorded in verification history: ok=%v err=%v", ok, err)
 	}
 	// A different bucket's identity must not see this history.
-	other, err := j.WasVerified("other-bucket\x00"+baseObject, time.Now())
+	other, err := j.WasVerified("other-bucket\x00" + baseObject)
 	if err != nil || other {
 		t.Fatalf("verification history leaked across buckets: ok=%v err=%v", other, err)
 	}
@@ -1916,10 +1916,10 @@ func TestLegacyUnscopedVerificationRecordsStillTrusted(t *testing.T) {
 	if err := j.MigrateVerificationScope("other-bucket"); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := j.WasVerified("other-bucket\x00"+object, time.Now()); err != nil || ok {
+	if ok, err := j.WasVerified("other-bucket\x00" + object); err != nil || ok {
 		t.Fatalf("bucket change saw migrated history: ok=%v err=%v", ok, err)
 	}
-	if ok, err := j.WasVerified(store.Identity()+"\x00"+object, time.Now()); err != nil || !ok {
+	if ok, err := j.WasVerified(store.Identity() + "\x00" + object); err != nil || !ok {
 		t.Fatalf("migrated record lost: ok=%v err=%v", ok, err)
 	}
 }
@@ -2530,7 +2530,7 @@ func TestUploadRetriesExhaustedAbandons(t *testing.T) {
 	if _, err := os.Stat(staged); !os.IsNotExist(err) {
 		t.Fatalf("staged dir still present (err %v), want removed on exhaustion", err)
 	}
-	if verified, err := j.WasVerified("gen-stuck", time.Unix(10, 0)); err != nil || verified {
+	if verified, err := j.WasVerified("gen-stuck"); err != nil || verified {
 		t.Fatalf("WasVerified = %v (err %v), want no completion recorded", verified, err)
 	}
 }
@@ -3418,5 +3418,340 @@ func TestDeferredPageDoesNotHideLaterNotifications(t *testing.T) {
 	pending, err := j.PendingNotifications(0)
 	if err != nil || len(pending) != notifyFlushBatch {
 		t.Fatalf("outbox = %d entries (err %v), want the %d deferred ones retained", len(pending), err, notifyFlushBatch)
+	}
+}
+
+// Hashing before the stream exists to abort early on a source a resume
+// mutated. Nothing can mutate a copy the uploader owns, nor an artifact
+// written once at capture — except a shared base entry, which still names
+// the host's live template.
+func TestImmutableSourceSkipsThePreStreamHashOnlyWhenNothingCanWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		task Task
+		file TaskFile
+		want bool
+	}{
+		{"staged copies", Task{Staged: true}, TaskFile{}, true},
+		{"staged base copy", Task{Staged: true}, TaskFile{Shared: true}, true},
+		{"captured snapshot", Task{Immutable: true}, TaskFile{}, true},
+		{"captured snapshot's live template", Task{Immutable: true}, TaskFile{Shared: true}, false},
+		{"live pause paths", Task{}, TaskFile{}, false},
+		{"live pause base", Task{}, TaskFile{Shared: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := immutableSource(&tc.task, tc.file); got != tc.want {
+				t.Fatalf("immutableSource = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Skipping the pre-stream hash must not weaken what it guarded: the
+// stream hasher digests what actually ships, so a source mutated mid
+// upload is still abandoned without a manifest.
+func TestImmutableSourceStillAbandonsAMutatedStream(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	// Staged, so the pre-stream hash is skipped for every file in it.
+	task.Staged = true
+	store := &midStreamMutator{
+		memStore: newMemStore(),
+		target:   "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4"),
+		hook: func() {
+			if err := os.WriteFile(task.Files[0].Path, []byte("diskMUTA"), 0o644); err != nil {
+				t.Error(err)
+			}
+		},
+	}
+	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop()}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.objects["sandboxes/sb-1/gen-abc/manifest.json"]; ok {
+		t.Fatal("a generation was completed over bytes that changed mid-stream")
+	}
+}
+
+// Good bytes thrown away must page. A dedupe against an object this host
+// cannot vouch for abandons a staged generation whose artifacts existed,
+// which is the one abandonment that means real loss — and it used to log
+// at warn, below the level alerting forwards.
+func TestUnverifiableDedupeOfAStagedGenerationLogsAsLoss(t *testing.T) {
+	store := newMemStore()
+	dir := t.TempDir()
+
+	// One host uploads the generation, so the objects exist.
+	first := writeTask(t, dir)
+	first.Staged = true
+	j1, _ := testJournal(t)
+	if err := j1.Enqueue(first); err != nil {
+		t.Fatal(err)
+	}
+	u1 := &Uploader{Journal: j1, Store: store, Log: zerolog.Nop()}
+	if completed, _, _, err := u1.uploadTask(context.Background(), &first); err != nil || !completed {
+		t.Fatalf("seed upload: completed=%v err=%v", completed, err)
+	}
+
+	// A host with no history of those objects meets them as a dedupe.
+	var logged bytes.Buffer
+	second := writeTask(t, dir)
+	second.Staged = true
+	j2, _ := testJournal(t)
+	if err := j2.Enqueue(second); err != nil {
+		t.Fatal(err)
+	}
+	u2 := &Uploader{Journal: j2, Store: store, Log: zerolog.New(&logged)}
+	if completed, _, _, err := u2.uploadTask(context.Background(), &second); completed {
+		t.Fatalf("completed over objects nothing can vouch for (err %v)", err)
+	}
+
+	level, found := logLevelOf(t, logged.String(), "no verification history")
+	if !found {
+		t.Fatalf("the abandonment was not reported: %s", logged.String())
+	}
+	if level != "error" {
+		t.Fatalf("reported at %q, below the level alerting forwards", level)
+	}
+}
+
+// logLevelOf returns the level of the one logged record whose message
+// contains want. Asserting on the whole buffer would be satisfied by any
+// other record that happens to carry the level being looked for.
+func logLevelOf(t *testing.T, out, want string) (string, bool) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		var rec struct {
+			Level   string `json:"level"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if strings.Contains(rec.Message, want) {
+			return rec.Level, true
+		}
+	}
+	return "", false
+}
+
+// The skip has to be wired, not merely decided: with the pre-stream hash
+// in place a source already mutated before the upload aborts before any
+// bytes ship, so an immutable task reaching the stream's own verdict
+// instead is what proves the second read is gone.
+func TestImmutableSourceSkipsThePreStreamHashInUploadFile(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	task.Staged = true
+	// Mutated before the upload begins: the pre-stream hash, if it ran,
+	// would catch this and abandon without shipping anything.
+	if err := os.WriteFile(task.Files[0].Path, []byte("diskMUTA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logged bytes.Buffer
+	u := &Uploader{Journal: j, Store: newMemStore(), Log: zerolog.New(&logged)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	out := logged.String()
+	if _, found := logLevelOf(t, out, "changed since pause"); found {
+		t.Fatalf("the pre-stream hash still read an immutable source: %s", out)
+	}
+	if _, found := logLevelOf(t, out, "changed during upload"); !found {
+		t.Fatalf("the stream's own verdict did not abandon the generation: %s", out)
+	}
+}
+
+// slowStore consumes a stream in pieces, letting the clock run between
+// them as a bandwidth-capped transfer does.
+type slowStore struct {
+	*memStore
+	advance func()
+}
+
+func (s *slowStore) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
+	var buf bytes.Buffer
+	for {
+		s.advance()
+		n, err := io.CopyN(&buf, r, 8)
+		if err != nil {
+			if n == 0 && errors.Is(err, io.EOF) {
+				break
+			}
+			if !errors.Is(err, io.EOF) {
+				return false, err
+			}
+			break
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[object] = buf.Bytes()
+	return true, nil
+}
+
+// Renewal has to come from the stream itself. Calling RenewClaim directly
+// proves the journal's half; this proves the half that matters in
+// production, where a slow upload keeps its task only because the reader
+// calls through on the same clock the lease is stamped from.
+func TestStreamingUploadRenewsItsClaim(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	// Ahead of the wall clock: a renewal that compared wall time against
+	// a lease stamped from this clock would see a negative interval and
+	// never fire, losing the task the upload is still streaming.
+	start := time.Now().Add(100 * time.Hour)
+	claimed, ok, err := j.Next(start)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	before := soleClaimUntil(t, j)
+
+	now := start
+	store := &slowStore{memStore: newMemStore(), advance: func() { now = now.Add(claimRenewEvery) }}
+	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop(), Now: func() time.Time { return now }}
+	// The task's own gate, so the renewal path is the production one.
+	if _, _, _, err := u.uploadFile(context.Background(), &claimed, claimed.Files[0], u.claimRenewer(&claimed)); err != nil {
+		t.Fatal(err)
+	}
+
+	after := soleClaimUntil(t, j)
+	if !after.After(before) {
+		t.Fatalf("the lease did not move while the upload streamed: %v then %v", before, after)
+	}
+}
+
+// The lease covers a task, not an object. Two artifacts that each take
+// most of the interval but not all of it still add up past it, so a gate
+// created per object would renew nothing while the lease ran out.
+func TestClaimRenewalSpansTheWholeTask(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	task.Files[0].BasePath = ""
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().Add(100 * time.Hour)
+	claimed, ok, err := j.Next(start)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	before := soleClaimUntil(t, j)
+
+	now := start
+	// Each object spends most of the interval, none spends all of it.
+	perObject := claimRenewEvery - claimRenewEvery/5
+	objects := 0
+	store := &perObjectClock{memStore: newMemStore(), tick: func() {
+		objects++
+		now = now.Add(perObject)
+	}}
+	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop(), Now: func() time.Time { return now }}
+	if _, _, _, err := u.uploadTask(context.Background(), &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if objects < 2 {
+		t.Fatalf("objects streamed = %d, want the task's artifacts", objects)
+	}
+	if after := soleClaimUntil(t, j); !after.After(before) {
+		t.Fatalf("the lease never moved across %d objects spending %v each", objects, perObject)
+	}
+}
+
+// perObjectClock lets the clock run once per object, as a transfer that
+// takes real time for each artifact does.
+type perObjectClock struct {
+	*memStore
+	tick func()
+}
+
+func (p *perObjectClock) Create(ctx context.Context, object string, r io.Reader) (bool, error) {
+	p.tick()
+	return p.memStore.Create(ctx, object, r)
+}
+
+// The pre-stream hash is a full read of the artifact, and on contended
+// storage it can outlast the lease on its own. Renewing only after it
+// returns is too late: a thief would already hold the task.
+func TestPreStreamHashRenewsWhileItReads(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().Add(100 * time.Hour)
+	claimed, ok, err := j.Next(start)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+	before := soleClaimUntil(t, j)
+
+	now := start
+	u := &Uploader{Journal: j, Log: zerolog.Nop(), Now: func() time.Time { return now }}
+	renew := u.claimRenewer(&claimed)
+	// Time passes as the read does, which is the whole point: the lease
+	// has to move before the hash returns.
+	progress := func() {
+		now = now.Add(claimRenewEvery)
+		renew()
+	}
+
+	f, err := os.Open(claimed.Files[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	extents, apparent, err := Extents(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hashApparentProgress(context.Background(), f, extents, apparent, progress); err != nil {
+		t.Fatal(err)
+	}
+
+	if after := soleClaimUntil(t, j); !after.After(before) {
+		t.Fatal("the lease never moved while the hash read the artifact")
+	}
+}
+
+// The sentinel lives inside the pipeline only. A reader outside the host
+// sums these numbers, so an unmeasured allocation has to arrive as
+// unknown rather than as a negative that shrinks the totals.
+func TestPublishedManifestRendersAnUnmeasuredAllocationAsZero(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	task.Files[0].BasePath = ""
+	task.Files[0].AllocatedBytes = -1
+	task.Files[1].AllocatedBytes = 0
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop()}
+	if completed, _, _, err := u.uploadTask(context.Background(), &task); err != nil || !completed {
+		t.Fatalf("upload: completed=%v err=%v", completed, err)
+	}
+
+	raw, ok := store.objects["sandboxes/sb-1/gen-abc/"+ManifestObject]
+	if !ok {
+		t.Fatal("no manifest published")
+	}
+	var published GenerationManifest
+	if err := json.Unmarshal(raw, &published); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range published.Files {
+		if f.AllocatedBytes < 0 {
+			t.Fatalf("%s published allocated = %d, want it rendered as unknown", f.Name, f.AllocatedBytes)
+		}
 	}
 }

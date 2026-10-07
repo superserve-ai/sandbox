@@ -31,12 +31,13 @@ var latencyBuckets = []float64{
 
 // OTelConfig contains the app-level metrics settings needed by the recorder.
 type OTelConfig struct {
-	ServiceName    string
-	ServiceVersion string
-	Environment    string
-	Endpoint       string
-	Insecure       bool
-	ExportInterval time.Duration
+	ComputeRestrictionsSource string
+	ServiceName               string
+	ServiceVersion            string
+	Environment               string
+	Endpoint                  string
+	Insecure                  bool
+	ExportInterval            time.Duration
 	// HostID scopes per-host series to the host that produced them. The
 	// collector stamps host_id only onto its own hostmetrics pipeline,
 	// assuming OTLP senders label their own series — so without this, a
@@ -66,6 +67,9 @@ type OTelConfig struct {
 // OTelRecorder emits the sandbox control plane's bounded operational metrics
 // through OTLP. It intentionally exposes only a small label vocabulary.
 type OTelRecorder struct {
+	computeSource     string
+	abusePolicyEvents metric.Int64Counter
+	abusePolicyState  metric.Int64Gauge
 	billing           *billingMetrics
 	computeDecisions  metric.Int64Counter
 	computeRefreshes  metric.Int64Counter
@@ -155,13 +159,24 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	meter := provider.Meter(instrumentationName)
+	computeSource := "config"
+	if cfg.ComputeRestrictionsSource == "database" {
+		computeSource = "database"
+	}
 
 	r := &OTelRecorder{
-		provider:    provider,
-		serviceName: cfg.ServiceName,
-		environment: cfg.Environment,
-		hostID:      safeHostID(cfg.HostID),
-		instanceID:  cfg.InstanceID,
+		computeSource: computeSource,
+		provider:      provider,
+		serviceName:   cfg.ServiceName,
+		environment:   cfg.Environment,
+		hostID:        safeHostID(cfg.HostID),
+		instanceID:    cfg.InstanceID,
+	}
+	if r.abusePolicyEvents, err = meter.Int64Counter("abuse_policy_sync_total"); err != nil {
+		return nil, err
+	}
+	if r.abusePolicyState, err = meter.Int64Gauge("abuse_policy_cache"); err != nil {
+		return nil, err
 	}
 	if r.computeDecisions, err = meter.Int64Counter("compute_restriction_decision_total"); err != nil {
 		return nil, err

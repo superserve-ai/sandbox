@@ -25,7 +25,7 @@ func TestComputeDecisionAndRefreshMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &OTelRecorder{computeDecisions: decisions, computeRefreshes: refreshes, signupDecisions: signup}
+	r := &OTelRecorder{computeSource: "config", computeDecisions: decisions, computeRefreshes: refreshes, signupDecisions: signup}
 	r.RecordComputeDecision(ctx, "create", "observe", "would_deny", "user")
 	r.RecordComputeDecision(ctx, "resume", "enforce", "blocked", "team")
 	r.RecordComputeDecision(ctx, "create", "off", "allowed", "none")

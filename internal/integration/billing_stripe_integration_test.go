@@ -2159,6 +2159,7 @@ func TestIntegration_TeamBillingUsageReportsGiBBasedResources(t *testing.T) {
 		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
 	}
 	sandboxID := uuid.MustParse(mustJSON(t, cw)["id"].(string))
+	seedMeasuredZeroLegacyBaseline(t, sandboxID)
 	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
 		t.Fatalf("clear seeded compute billing interval: %v", err)
 	}
