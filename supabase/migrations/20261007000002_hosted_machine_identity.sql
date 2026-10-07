@@ -180,3 +180,14 @@ BEGIN
     END IF;
 END;
 $$;
+
+-- Proxy admission needs only revocation state. Credential material, policy,
+-- tenant metadata and lifecycle mutation remain outside the routing role.
+REVOKE ALL ON machine_principal, machine_credential, sandbox_machine_owner, machine_lifecycle_operation FROM sandbox_proxy_router;
+GRANT SELECT (id, status, generation) ON machine_principal TO sandbox_proxy_router;
+GRANT SELECT (id, principal_id, state, expires_at, revocation_generation)
+    ON machine_credential TO sandbox_proxy_router;
+CREATE POLICY proxy_machine_authority_read ON machine_principal FOR SELECT
+    TO sandbox_proxy_router USING (true);
+CREATE POLICY proxy_machine_authority_read ON machine_credential FOR SELECT
+    TO sandbox_proxy_router USING (true);

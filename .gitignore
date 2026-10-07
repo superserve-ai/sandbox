@@ -53,9 +53,6 @@ migrate
 
 # Docs
 docs/
-!docs/
-!docs/runbooks/
-!docs/runbooks/hosted-machine-identity.md
 
 # Local build outputs (binaries in repo root)
 /boxd
