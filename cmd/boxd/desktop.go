@@ -270,29 +270,44 @@ func encodeFramePNG(frame *image.RGBA) ([]byte, error) {
 // working while a viewer holds a long-lived Stream open. Dimensions come from
 // the PNG header rather than a second xdotool round trip.
 func (s *desktopService) Screenshot(ctx context.Context, req *connect.Request[pb.ScreenshotRequest]) (*connect.Response[pb.ScreenshotResponse], error) {
-	format := req.Msg.GetFormat()
-	if format == pb.FrameFormat_FRAME_FORMAT_UNSPECIFIED {
-		format = pb.FrameFormat_FRAME_FORMAT_PNG
+	format, err := screenshotFormat(req.Msg.GetFormat())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	if format != pb.FrameFormat_FRAME_FORMAT_PNG {
-		return nil, connect.NewError(connect.CodeInvalidArgument,
-			fmt.Errorf("unsupported frame format %v: only PNG is supported", format))
-	}
-
-	img, err := s.captureScreenshot(ctx)
+	resp, err := s.screenshotResponse(ctx, format)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
+	return connect.NewResponse(resp), nil
+}
+
+// screenshotFormat resolves a requested frame format; only PNG exists today.
+func screenshotFormat(format pb.FrameFormat) (pb.FrameFormat, error) {
+	switch format {
+	case pb.FrameFormat_FRAME_FORMAT_UNSPECIFIED, pb.FrameFormat_FRAME_FORMAT_PNG:
+		return pb.FrameFormat_FRAME_FORMAT_PNG, nil
+	default:
+		return 0, fmt.Errorf("unsupported frame format %v: only PNG is supported", format)
+	}
+}
+
+// screenshotResponse captures one frame and reads its dimensions from the
+// PNG header. Shared by Screenshot and Step.
+func (s *desktopService) screenshotResponse(ctx context.Context, format pb.FrameFormat) (*pb.ScreenshotResponse, error) {
+	img, err := s.captureScreenshot(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := png.DecodeConfig(bytes.NewReader(img))
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("decode screenshot header: %w", err))
+		return nil, fmt.Errorf("decode screenshot header: %w", err)
 	}
-	return connect.NewResponse(&pb.ScreenshotResponse{
+	return &pb.ScreenshotResponse{
 		Image:  img,
 		Width:  uint32(cfg.Width),
 		Height: uint32(cfg.Height),
 		Format: format,
-	}), nil
+	}, nil
 }
 
 // captureScreenshot returns the current frame as PNG bytes: the persistent
@@ -673,6 +688,58 @@ func (s *desktopService) SendActions(ctx context.Context, req *connect.Request[p
 		}
 	}
 	return connect.NewResponse(&pb.ActionBatchResponse{Executed: uint32(len(lowered))}), nil
+}
+
+// ---------------------------------------------------------------------------
+// Step — action batch plus frame in one request
+// ---------------------------------------------------------------------------
+
+// maxStepSettle caps the pause between a batch and its capture. The input
+// lock is held across it, so a long settle would stall every other input.
+const maxStepSettle = 2 * time.Second
+
+func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepRequest]) (*connect.Response[pb.StepResponse], error) {
+	format, err := screenshotFormat(req.Msg.GetFormat())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	settle := time.Duration(req.Msg.GetSettleMs()) * time.Millisecond
+	if settle > maxStepSettle {
+		return nil, connect.NewError(connect.CodeInvalidArgument,
+			fmt.Errorf("settle_ms %d exceeds max %d", req.Msg.GetSettleMs(), maxStepSettle/time.Millisecond))
+	}
+	lowered, err := s.lowerActions(req.Msg.GetActions())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+
+	// The lock also covers the settle and the capture, so the frame shows
+	// the state this batch produced and nothing that arrived after it.
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	resp := &pb.StepResponse{Executed: uint32(len(lowered))}
+	for i, run := range lowered {
+		if err := run(ctx); err != nil {
+			resp.Executed = uint32(i)
+			resp.ActionError = fmt.Sprintf("action %d failed after %d executed: %v", i, i, err)
+			break
+		}
+	}
+	if settle > 0 {
+		select {
+		case <-time.After(settle):
+		case <-ctx.Done():
+		}
+	}
+	// Input already landed by now, so a capture failure is reported in the
+	// response rather than as an RPC error the caller might retry.
+	shot, err := s.screenshotResponse(ctx, format)
+	if err != nil {
+		resp.CaptureError = err.Error()
+	} else {
+		resp.Screenshot = shot
+	}
+	return connect.NewResponse(resp), nil
 }
 
 func abs32(v int32) int64 {

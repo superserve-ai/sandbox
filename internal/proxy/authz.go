@@ -104,7 +104,8 @@ func (h *Handler) canRouteBoxdRequest(r *http.Request, sandboxID string) bool {
 		desktopSendKeyPath,
 		desktopScrollPath,
 		desktopResizePath,
-		desktopSendActionsPath:
+		desktopSendActionsPath,
+		desktopStepPath:
 		if !h.desktopEnabled {
 			return false
 		}

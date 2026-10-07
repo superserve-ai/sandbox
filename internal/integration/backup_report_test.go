@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -482,5 +483,96 @@ func TestIntegration_BackupReport_DefersDuringTransitionalStatus(t *testing.T) {
 		if code := deliver(); code != http.StatusOK {
 			t.Fatalf("report after the operation resolved on a stale %q = %d, want 200", status, code)
 		}
+	}
+}
+
+// Snapshot deletion holds the snapshot row and then updates the sandbox row
+// and the coverage referencing it. A report that still reached for the
+// snapshot while holding the sandbox row closed that cycle, so a report for a
+// torn-down sandbox must settle without touching the snapshot at all.
+func TestIntegration_BackupReportForDestroyedSandboxNeverTouchesTheSnapshot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	teamID, apiKey := seedTeamAndKey(t)
+	t.Setenv("INTERNAL_API_TOKEN", "itok-destroyed")
+	r := newRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"report-after-teardown"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	sid := mustJSON(t, cw)["id"].(string)
+	sandboxID, _ := uuid.Parse(sid)
+	if pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	// The pause-time manifest the report matches against, so this report is
+	// one that would otherwise reach the coverage write.
+	if _, err := testQueries.FinalizePause(ctx, db.FinalizePauseParams{
+		ID: sandboxID, TeamID: teamID,
+		Path:              "/snapshots/" + sid + "/vmstate.snap",
+		Trigger:           "manual",
+		ManifestFileNames: []string{"vmstate.snap"},
+		ManifestPaths:     []string{"/snapshots/" + sid + "/vmstate.snap"},
+		ManifestSizes:     []int64{128},
+		ManifestDigests:   []string{vmstateSHA},
+		ManifestBasePaths: []string{""},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var snapshotID uuid.UUID
+	if err := testPool.QueryRow(ctx, `SELECT snapshot_id FROM sandbox WHERE id = $1`, sandboxID).Scan(&snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	// Teardown has begun; its snapshot delete is what the report must not meet.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET destroyed_at = now() WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stand in for the deletion's hold on the snapshot row, without its
+	// foreign-key fanout, so only a report that wants the snapshot blocks.
+	holdTx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holdTx.Rollback(ctx)
+	if _, err := holdTx.Exec(ctx, `SELECT id FROM snapshot WHERE id = $1 FOR UPDATE`, snapshotID); err != nil {
+		t.Fatal(err)
+	}
+
+	report := `{"sandbox_id":"` + sid + `","generation":"` + genKey + `",` +
+		`"bucket":"cell-bucket","completed_at":"2026-10-06T10:00:00Z","files":[` +
+		`{"name":"rootfs.ext4","size_bytes":4096,"sha256":"` + diskSHA + `"},` +
+		`{"name":"vmstate.snap","size_bytes":128,"sha256":"` + vmstateSHA + `"}]}`
+	done := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest("POST", "/internal/hosts/host-1/backups", strings.NewReader(report))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer itok-destroyed")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		done <- w.Code
+	}()
+
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("report after teardown = %d, want 200", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("report blocked on the snapshot row a deletion would hold")
+	}
+
+	var covered *uuid.UUID
+	if err := testPool.QueryRow(ctx,
+		`SELECT covered_snapshot_id FROM backup_generation WHERE sandbox_id = $1 AND generation = $2`,
+		sandboxID, genKey).Scan(&covered); err != nil {
+		t.Fatal(err)
+	}
+	if covered != nil {
+		t.Fatalf("report linked coverage for a torn-down sandbox: %s", covered)
 	}
 }

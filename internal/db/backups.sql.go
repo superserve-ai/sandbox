@@ -293,15 +293,16 @@ func (q *Queries) LatestSnapshotManifest(ctx context.Context, sandboxID uuid.UUI
 }
 
 const lockSandboxRow = `-- name: LockSandboxRow :one
-SELECT id, status, updated_at, pause_op_id
+SELECT id, status, updated_at, pause_op_id, destroyed_at
 FROM sandbox WHERE id = $1 FOR UPDATE
 `
 
 type LockSandboxRowRow struct {
-	ID        uuid.UUID     `json:"id"`
-	Status    SandboxStatus `json:"status"`
-	UpdatedAt time.Time     `json:"updated_at"`
-	PauseOpID pgtype.UUID   `json:"pause_op_id"`
+	ID          uuid.UUID          `json:"id"`
+	Status      SandboxStatus      `json:"status"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+	PauseOpID   pgtype.UUID        `json:"pause_op_id"`
+	DestroyedAt pgtype.Timestamptz `json:"destroyed_at"`
 }
 
 // Serializes the backup report's snapshot-size sync against FinalizePause,
@@ -319,6 +320,7 @@ func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (LockSandbox
 		&i.Status,
 		&i.UpdatedAt,
 		&i.PauseOpID,
+		&i.DestroyedAt,
 	)
 	return i, err
 }

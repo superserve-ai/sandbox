@@ -1252,3 +1252,114 @@ func TestDesktopHandler_RejectsOversizedMessage(t *testing.T) {
 		t.Fatalf("SendKey with %d-byte text: code %v (%v), want resource_exhausted", len(huge), connect.CodeOf(err), err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Step
+// ---------------------------------------------------------------------------
+
+// stepFakeBins installs a logging xdotool (failing on the given verb, if any)
+// and an import that returns a tiny PNG, and returns the log path.
+func stepFakeBins(t *testing.T, failVerb string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 5, 3))); err != nil {
+		t.Fatalf("encode test png: %v", err)
+	}
+	pngFile := filepath.Join(t.TempDir(), "frame.png")
+	if err := os.WriteFile(pngFile, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write test png: %v", err)
+	}
+	logFile := filepath.Join(t.TempDir(), "args.log")
+	xdotool := fmt.Sprintf("echo \"$@\" >> %q\n", logFile)
+	if failVerb != "" {
+		xdotool += fmt.Sprintf("if [ \"$1\" = %q ]; then echo boom >&2; exit 1; fi\n", failVerb)
+	}
+	withFakeBin(t, map[string]string{
+		"xdotool": xdotool + "exit 0\n",
+		"import":  fmt.Sprintf("cat %q\n", pngFile),
+	})
+	return logFile
+}
+
+func stepBatch() []*pb.Action {
+	return []*pb.Action{
+		{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 10, Y: 20, Action: pb.PointerAction_POINTER_ACTION_CLICK}}},
+		{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Key{Key: "Return"}}}},
+		{Action: &pb.Action_Scroll{Scroll: &pb.ScrollEvent{Dy: 3}}},
+	}
+}
+
+func TestStep_EndToEnd_ActionsThenFrame(t *testing.T) {
+	logFile := stepFakeBins(t, "")
+	client := newDesktopTestServer(t)
+	resp, err := client.Step(context.Background(), connect.NewRequest(&pb.StepRequest{
+		Actions: stepBatch(), SettleMs: 10,
+	}))
+	if err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	if resp.Msg.GetExecuted() != 3 || resp.Msg.GetActionError() != "" || resp.Msg.GetCaptureError() != "" {
+		t.Fatalf("executed=%d action_error=%q capture_error=%q, want 3 and no errors",
+			resp.Msg.GetExecuted(), resp.Msg.GetActionError(), resp.Msg.GetCaptureError())
+	}
+	shot := resp.Msg.GetScreenshot()
+	if shot.GetWidth() != 5 || shot.GetHeight() != 3 || len(shot.GetImage()) == 0 {
+		t.Errorf("screenshot = %dx%d, %d bytes; want 5x3 with data", shot.GetWidth(), shot.GetHeight(), len(shot.GetImage()))
+	}
+	got, _ := os.ReadFile(logFile)
+	want := "mousemove 10 20 click 1\nkey -- Return\nclick --repeat 3 --delay 0 5\n"
+	if string(got) != want {
+		t.Errorf("xdotool invocations:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestStep_FailedActionStillReturnsTheFrame(t *testing.T) {
+	logFile := stepFakeBins(t, "key")
+	client := newDesktopTestServer(t)
+	resp, err := client.Step(context.Background(), connect.NewRequest(&pb.StepRequest{Actions: stepBatch()}))
+	if err != nil {
+		t.Fatalf("Step: %v, want a response carrying the action error", err)
+	}
+	if resp.Msg.GetExecuted() != 1 || !strings.Contains(resp.Msg.GetActionError(), "action 1") {
+		t.Errorf("executed=%d action_error=%q, want 1 and the failing index", resp.Msg.GetExecuted(), resp.Msg.GetActionError())
+	}
+	if resp.Msg.GetScreenshot().GetWidth() != 5 || resp.Msg.GetCaptureError() != "" {
+		t.Errorf("no frame after a failed action: screenshot=%v capture_error=%q", resp.Msg.GetScreenshot(), resp.Msg.GetCaptureError())
+	}
+	if got, _ := os.ReadFile(logFile); strings.Contains(string(got), "click --repeat") {
+		t.Errorf("scroll ran after a failed action:\n%s", got)
+	}
+}
+
+func TestStep_CaptureFailureIsReportedNotRaised(t *testing.T) {
+	stepFakeBins(t, "")
+	withFakeBin(t, map[string]string{"import": "echo nope >&2\nexit 1\n"})
+	client := newDesktopTestServer(t)
+	resp, err := client.Step(context.Background(), connect.NewRequest(&pb.StepRequest{Actions: stepBatch()}))
+	if err != nil {
+		t.Fatalf("Step: %v, want a response: the input already landed", err)
+	}
+	if resp.Msg.GetExecuted() != 3 || resp.Msg.GetActionError() != "" {
+		t.Errorf("executed=%d action_error=%q, want the full batch", resp.Msg.GetExecuted(), resp.Msg.GetActionError())
+	}
+	if resp.Msg.GetScreenshot() != nil || resp.Msg.GetCaptureError() == "" {
+		t.Errorf("screenshot=%v capture_error=%q, want no frame and a capture error", resp.Msg.GetScreenshot(), resp.Msg.GetCaptureError())
+	}
+}
+
+func TestStep_ValidationErrorNeverShellsOut(t *testing.T) {
+	// No fake tools on PATH: rejected requests must fail before any action.
+	client := newDesktopTestServer(t)
+	for name, req := range map[string]*pb.StepRequest{
+		"bad action":   {Actions: []*pb.Action{{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: -5, Y: 1}}}}},
+		"empty batch":  {},
+		"settle limit": {Actions: stepBatch(), SettleMs: uint32(maxStepSettle/time.Millisecond) + 1},
+		"bad format":   {Actions: stepBatch(), Format: pb.FrameFormat(99)},
+	} {
+		_, err := client.Step(context.Background(), connect.NewRequest(req))
+		var ce *connect.Error
+		if !errors.As(err, &ce) || ce.Code() != connect.CodeInvalidArgument {
+			t.Errorf("%s: error = %v, want CodeInvalidArgument", name, err)
+		}
+	}
+}
