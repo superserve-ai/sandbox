@@ -29,7 +29,8 @@ that already passed authentication. `not_evaluated` includes public routes and
 requests rejected before authentication; it does not mean invalid credentials.
 The QM authorization route retains its existing HTTP 200 response for policy
 denials; use `authorization_outcome` to distinguish those from an allowed
-decision. A rejected human proof does not establish a caller identity.
+decision. A rejected human proof retains the verified API-key identity without
+asserting a human; authorization remains `not_evaluated`.
 
 Legacy sandbox access tokens prove sandbox access only. They emit
 `actor_type=sandbox_capability`, `auth_outcome=authenticated`, and

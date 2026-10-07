@@ -187,7 +187,7 @@ func TestQMRequestLoggingRejectsUnverifiedClaimsAndRetainsVerifiedFailures(t *te
 		status                                 int
 		fail, panicAuthz                       bool
 	}{
-		{name: "invalid proof", proof: "SYNTHETIC_PROOF_SECRET", authOutcome: "invalid", authzOutcome: "not_evaluated", status: 401},
+		{name: "invalid proof", proof: "SYNTHETIC_PROOF_SECRET", authOutcome: "authenticated", authzOutcome: "not_evaluated", status: 401},
 		{name: "authorization unavailable", authOutcome: "authenticated", authzOutcome: "error", status: 503, fail: true},
 		{name: "authorization panic", authOutcome: "authenticated", authzOutcome: "error", status: 500, panicAuthz: true},
 	} {
@@ -214,8 +214,9 @@ func TestQMRequestLoggingRejectsUnverifiedClaimsAndRetainsVerifiedFailures(t *te
 				if entry["actor_id"] != identity.KeyID.String() || entry["credential_id"] != identity.KeyID.String() || entry["team_id"] != identity.TeamID.String() {
 					t.Fatal(entry)
 				}
-			} else if entry["actor_id"] != nil || entry["credential_id"] != nil || entry["team_id"] != nil || f.calls != 0 {
-				t.Fatal(entry)
+			}
+			if tc.proof != "" && f.calls != 0 {
+				t.Fatal("invalid proof reached authorization")
 			}
 			if entry["user_id"] != nil || strings.Contains(logs.String(), "SYNTHETIC") {
 				t.Fatal("unverified identity or secret logged", entry)

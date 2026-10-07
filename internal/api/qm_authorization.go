@@ -179,7 +179,7 @@ func qmAuthorizationHandler(authority qmIdentityAuthority, serviceToken string, 
 		if assertion != "" {
 			human, e := qmHuman(assertion, humanKey, identity, input.Action)
 			if e != nil {
-				logAuthOutcome(c, "invalid")
+				// A rejected optional proof cannot erase the already verified key.
 				c.AbortWithStatusJSON(401, gin.H{"error": "invalid_human_assertion"})
 				return
 			}
