@@ -1045,6 +1045,33 @@ func main() {
 		maxConnsPerSandbox,
 		log,
 	)
+	egressCapacity, err := egressCapacityConfig(os.Getenv)
+	if err != nil {
+		log.Fatal().Err(err).Msg("invalid egress capacity configuration")
+	}
+	if egressCapacity.Enforce {
+		var limits syscall.Rlimit
+		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limits); err != nil {
+			log.Fatal().Err(err).Msg("read egress FD headroom")
+		}
+		if err := validateEgressFDHeadroom(egressCapacity, limits.Cur); err != nil {
+			log.Fatal().Err(err).Msg("invalid egress FD headroom")
+		}
+	}
+	egressMetrics, err := telemetry.NewEgressRecorder(recorder)
+	if err != nil {
+		log.Warn().Err(err).Msg("egress metrics unavailable")
+	}
+	if err := egressProxy.ConfigureCapacity(egressCapacity, egressMetrics); err != nil {
+		log.Fatal().Err(err).Msg("invalid egress capacity")
+	}
+	if egressMetrics != nil {
+		lc.start("egress capacity metrics", func() error {
+			egressMetrics.Sample(ctx, egressCapacity.MaxConnections, egressCapacity.Enforce)
+			return nil
+		})
+	}
+	log.Info().Int("max_connections", egressCapacity.MaxConnections).Bool("enforce", egressCapacity.Enforce).Msg("egress capacity configured")
 	egressProxy.SetHostID(cfg.HostID)
 	if os.Getenv("VMD_MINING_POLICY_CONFIG") != "" {
 		egressProxy.EnableMiningStreamTracking()
