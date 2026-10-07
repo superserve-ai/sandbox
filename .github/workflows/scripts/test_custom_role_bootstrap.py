@@ -51,6 +51,10 @@ class CustomRoleBootstrapTests(unittest.TestCase):
         self.assertLess(bootstrap.index('apply -input=false -auto-approve host-logging-iam.tfplan'), bootstrap.index('wait_host_logging_iam.py'))
         logging = (WORKFLOW.parents[2] / 'infra/envs/staging/us-central1/main.tf').read_text().split('module "host_logging" {', 1)[1].split('\n}', 1)[0]
         self.assertIn('google_project_iam_member.cd_host_logging', logging)
+        manual = WORKFLOW.with_name('terraform-rollout-staging.yml').read_text().split('  staging:', 1)[1]
+        manual_bootstrap = manual.split('      - name: Bootstrap staging host logging permissions', 1)[1].split('      - name: Terraform apply staging/us-central1', 1)[0]
+        self.assertEqual(manual_bootstrap, bootstrap)
+
 
     def test_effective_permissions_gate_regional_applies(self):
         text = WORKFLOW.read_text()
