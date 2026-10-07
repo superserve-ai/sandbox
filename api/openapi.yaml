@@ -876,7 +876,7 @@ paths:
         `X-Total-Count` response header reports the total across all pages.
         Omitting `limit` returns the full list, so existing unpaginated
         callers are unaffected. Sort with `sort` + `order`, filter by exact
-        `status`, and search names with `q` (case-insensitive substring).
+        `status` (one value or comma-separated values), and search names with `q` (case-insensitive substring).
 
         ## Filtering by metadata
 
@@ -901,11 +901,20 @@ paths:
         - name: status
           in: query
           required: false
-          description: Filter by exact sandbox status. Unknown values are a `400`.
+          description: |
+            Match any selected status, for example `status=active,starting,resuming`.
+            A single status and repeated `status` parameters are also accepted.
+            Omit or pass a single empty value for no filter. Unknown values or
+            empty entries in a multiple-status filter are a `400`.
+          style: form
+          explode: false
           schema:
-            type: string
-            enum:
-              [starting, active, pausing, paused, resuming, migrating, failed, deleted]
+            type: array
+            minItems: 1
+            items:
+              type: string
+              enum:
+                [starting, active, pausing, paused, resuming, migrating, failed, deleted]
         - name: sort
           in: query
           required: false

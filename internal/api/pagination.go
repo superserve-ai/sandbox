@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/superserve-ai/sandbox/internal/db"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -104,4 +106,24 @@ func resolveTotal(pg pageParams, pageLen int, count func() (int64, error)) (int6
 		return offset + int64(pageLen), nil
 	}
 	return count()
+}
+
+// parseSandboxStatusFilter accepts a single status, comma-separated statuses,
+// or repeated status parameters. An omitted or single empty value is unfiltered.
+func parseSandboxStatusFilter(values []string) ([]db.SandboxStatus, error) {
+	if len(values) == 0 || (len(values) == 1 && values[0] == "") {
+		return nil, nil
+	}
+	var statuses []db.SandboxStatus
+	for _, value := range values {
+		for _, status := range strings.Split(value, ",") {
+			if !slices.Contains(sandboxStatusFilterValues, status) {
+				return nil, fmt.Errorf("status must be one or more of: %s", strings.Join(sandboxStatusFilterValues, ", "))
+			}
+			if !slices.Contains(statuses, db.SandboxStatus(status)) {
+				statuses = append(statuses, db.SandboxStatus(status))
+			}
+		}
+	}
+	return statuses, nil
 }
