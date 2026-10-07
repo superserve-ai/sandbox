@@ -35,6 +35,7 @@ class CustomRoleBootstrapTests(unittest.TestCase):
         west = WORKFLOW.with_name('terraform-rollout-production.yml').read_text().split('  central1:', 1)[0]
         bootstrap = west.split('      - name: Bootstrap credentials key IAM and host logging API\n')[1].split('      - name: Terraform apply production/us-west2')[0]
         self.assertIn('-target=google_project_service.host_log_os_config', bootstrap)
+        self.assertIn('-target=\'module.iam.google_project_iam_member.project_bindings["cd_osconfig_admin"]\'', bootstrap)
         self.assertIn('-chdir=infra/envs/production/us-central1 plan', bootstrap)
         self.assertIn('apply -input=false -auto-approve cd-key.tfplan', bootstrap)
         self.assertLess(west.index('apply -input=false -auto-approve cd-key.tfplan'), west.index('cd infra/envs/production/us-west2'))
@@ -43,6 +44,7 @@ class CustomRoleBootstrapTests(unittest.TestCase):
         text = WORKFLOW.read_text()
         job = text.split('  production-us-central1-bootstrap:\n')[1].split('\n  production-us-west2-infra:')[0]
         self.assertIn('-target=\'module.iam.google_project_iam_member.project_bindings["cd_role_admin"]\'', job)
+        self.assertIn('-target=\'module.iam.google_project_iam_member.project_bindings["cd_osconfig_admin"]\'', job)
         script = job.split('      - name: Wait for custom role management permissions\n')[1].split('        run: |\n')[1]
         for cell in ('us-east4', 'us-west2'):
             region = text.split('  production-' + cell + '-infra:\n')[1].split('    steps:')[0]
@@ -73,11 +75,28 @@ esac
                 counter.unlink(missing_ok=True)
                 env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
                            GCP_PROJECT='example-project', ROLE_TEST_MODE=mode, ROLE_TEST_COUNT=str(counter),
-                           ROLE_TEST_PERMISSIONS='{"permissions":["iam.roles.create","iam.roles.get","iam.roles.update","iam.roles.delete"]}')
+                           ROLE_TEST_PERMISSIONS='{"permissions":["iam.roles.create","iam.roles.get","iam.roles.update","iam.roles.delete","osconfig.osPolicyAssignments.create","osconfig.osPolicyAssignments.update"]}')
                 result = subprocess.run(['bash', '-eu', '-c', script], env=env, capture_output=True, text=True)
                 with self.subTest(mode=mode):
                     self.assertEqual(result.returncode, expected, result.stderr)
                     self.assertEqual(int(counter.read_text()), calls)
+
+
+    def test_staging_bootstraps_osconfig_grant_before_its_full_apply(self):
+        text = WORKFLOW.read_text()
+        job = text.split('  staging-us-central1-infra:\n')[1].split('\n  staging-us-central1-api:')[0]
+        self.assertIn('-target=\'module.iam.google_project_iam_member.project_bindings["cd_osconfig_admin"]\'', job)
+        self.assertLess(job.index('cd-osconfig.tfplan'), job.index('Terraform apply staging/us-central1'))
+        self.assertLess(job.index('Wait for OS Config policy permissions'),
+                        job.index('Terraform apply staging/us-central1'))
+        root = WORKFLOW.parents[2] / 'infra/envs'
+        for cell in ('staging/us-central1', 'production/us-central1'):
+            config = (root / cell / 'main.tf').read_text()
+            self.assertIn('cd_osconfig_admin = {', config, cell)
+            self.assertIn('roles/osconfig.osPolicyAssignmentAdmin', config, cell)
+        staging = (root / 'staging/us-central1/main.tf').read_text()
+        logging = staging.split('module "host_logging" {')[1].split('\n}')[0]
+        self.assertIn('module.iam', logging)
 
 
 if __name__ == '__main__':

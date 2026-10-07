@@ -77,7 +77,9 @@ jobs:
           terraform -chdir=infra/envs/production/us-central1 init -input=false
           terraform -chdir=infra/envs/production/us-central1 plan -input=false \
             -target=google_project_iam_member.cd_credentials_key_iam \
-            -target=google_project_service.host_log_os_config -out=cd-key.tfplan
+            -target=google_project_service.host_log_os_config \
+            -target='module.iam.google_project_iam_member.project_bindings["cd_osconfig_admin"]' \
+            -out=cd-key.tfplan
           terraform -chdir=infra/envs/production/us-central1 apply -input=false -auto-approve cd-key.tfplan
           python3 .github/workflows/scripts/wait_credentials_key_iam.py --project "${{ vars.GCP_PROJECT }}"
 

@@ -160,6 +160,13 @@ module "iam" {
       role    = "roles/iam.roleAdmin"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
     }
+    # #604's host-logging module creates an OS Config policy assignment, which
+    # the CD service account cannot create under roleAdmin alone. Grant it here
+    # so the apply that introduces the assignment also carries the permission.
+    cd_osconfig_admin = {
+      role    = "roles/osconfig.osPolicyAssignmentAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
     grafana_monitoring_viewer = {
       role = "roles/monitoring.viewer"
       members = [
@@ -772,7 +779,7 @@ module "host_logging" {
       service_account_email = google_service_account.vmd_runtime.email
     }
   }
-  depends_on = [module.sandbox_host, module.sandbox_host_b, google_project_service.host_log_os_config, google_project_service.host_log_telemetry]
+  depends_on = [module.iam, module.sandbox_host, module.sandbox_host_b, google_project_service.host_log_os_config, google_project_service.host_log_telemetry]
 }
 
 # Durability tier for the host's local artifacts (sandbox snapshots, template

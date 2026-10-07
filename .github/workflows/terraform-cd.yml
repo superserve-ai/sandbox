@@ -83,11 +83,46 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
+      - uses: google-github-actions/setup-gcloud@v2
+
       - name: Verify validation dependencies
         run: |
           set -euo pipefail
           command -v jq
           command -v curl
+
+      - name: Bootstrap staging/us-central1 CD permissions
+        run: |
+          set -euo pipefail
+          cd infra/envs/staging/us-central1
+          terraform init -input=false
+          terraform plan -input=false \
+            -target=google_project_service.host_log_os_config \
+            -target='module.iam.google_project_iam_member.project_bindings["cd_osconfig_admin"]' \
+            -out=cd-osconfig.tfplan
+          terraform apply -input=false -auto-approve cd-osconfig.tfplan
+
+      - name: Wait for OS Config policy permissions
+        run: |
+          set -euo pipefail
+          # Read the project from the root's own tfvars rather than a repo
+          # variable, so this gate can never test the wrong project.
+          GCP_PROJECT="$(sed -n 's/^project_id *= *"\(.*\)"$/\1/p' infra/envs/staging/us-central1/terraform.tfvars)"
+          test -n "$GCP_PROJECT"
+          permissions='["osconfig.osPolicyAssignments.create","osconfig.osPolicyAssignments.get","osconfig.osPolicyAssignments.update"]'
+          for attempt in $(seq 1 30); do
+            token="$(gcloud auth print-access-token)"
+            if curl --fail --silent --show-error --max-time 15 \
+              -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+              --data "{\"permissions\":$permissions}" \
+              "https://cloudresourcemanager.googleapis.com/v1/projects/$GCP_PROJECT:testIamPermissions" |
+              jq -e --argjson expected "$permissions" '($expected - (.permissions // [])) | length == 0'; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'CI OS Config policy permissions did not become available.' >&2
+          exit 1
 
       - name: Terraform apply staging/us-central1
         env:
@@ -234,6 +269,7 @@ jobs:
             -target=google_project_service.host_log_os_config \
             -target='module.iam.google_project_iam_member.project_bindings["cd_privateca_auditor"]' \
             -target='module.iam.google_project_iam_member.project_bindings["cd_role_admin"]' \
+            -target='module.iam.google_project_iam_member.project_bindings["cd_osconfig_admin"]' \
             -out=tfplan
           terraform apply -input=false -auto-approve tfplan
 
@@ -245,7 +281,7 @@ jobs:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
           set -euo pipefail
-          permissions='["iam.roles.create","iam.roles.get","iam.roles.update","iam.roles.delete"]'
+          permissions='["iam.roles.create","iam.roles.get","iam.roles.update","iam.roles.delete","osconfig.osPolicyAssignments.create","osconfig.osPolicyAssignments.update"]'
           for attempt in $(seq 1 30); do
             token="$(gcloud auth print-access-token)"
             if curl --fail --silent --show-error --max-time 15 \
