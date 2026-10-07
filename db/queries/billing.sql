@@ -1015,22 +1015,34 @@ VALUES (
 RETURNING *;
 
 -- name: ListExportedTeamBillingPeriods :many
-WITH ranked AS (
+WITH exported_teams AS (
+    SELECT team_id, max(period_end) AS latest_exported_end
+    FROM team_billing_period
+    WHERE finalized_at IS NULL AND status = 'exported'
+    GROUP BY team_id
+), candidates AS MATERIALIZED (
+    -- Fence the expensive completeness check behind exported-team discovery.
+    -- Earlier unfinalized periods must still participate in team ordering.
+    SELECT p.*
+    FROM team_billing_period p
+    JOIN exported_teams e ON e.team_id = p.team_id
+    WHERE p.finalized_at IS NULL AND p.period_end <= e.latest_exported_end
+), ranked AS (
     SELECT
-        team_billing_period.*,
+        candidates.*,
         ROW_NUMBER() OVER (
             PARTITION BY team_id
             ORDER BY period_end ASC, period_start ASC
         ) AS team_rank
-    FROM team_billing_period
-    WHERE finalized_at IS NULL
-      AND storage_reports_complete_through(team_id, period_end)
+    FROM candidates
+    WHERE storage_reports_complete_through(team_id, period_end)
 )
-SELECT *
+SELECT ranked.*
 FROM ranked
+LEFT JOIN billing_finalization_attempt attempt ON attempt.team_id = ranked.team_id
 WHERE team_rank = 1
   AND status = 'exported'
-ORDER BY period_end ASC, period_start ASC, team_id ASC
+ORDER BY attempt.last_attempt_at ASC NULLS FIRST, period_end ASC, period_start ASC, ranked.team_id ASC
 LIMIT sqlc.arg(batch_size);
 
 -- name: GrantTeamCredit :one
