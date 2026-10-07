@@ -178,19 +178,15 @@ type keyEvent struct {
 	press bool
 }
 
-const maxKeySegments = 32
-
 type keyBind struct {
 	code   xproto.Keycode
 	keysym uint32
 }
 
-// keySegment is a run of strokes whose scratch bindings are all applied
-// before the first press. A new segment starts only when the spare pool is
-// exhausted and a keycode already typed in this request must be rebound.
-// Each costs two round trips, so a request that would need more than
-// maxKeySegments is declined before anything is bound: that only happens
-// with a tiny spare pool and text full of unmapped characters.
+// keySegment is one request's strokes with the scratch bindings they need,
+// all applied before the first press. A keycode is never rebound within a
+// request: applications read the keyboard map lazily, so a rebind could
+// change what an earlier stroke of the same request means to them.
 type keySegment struct {
 	binds  []keyBind
 	events []keyEvent
@@ -269,6 +265,21 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifier
 	if len(km.spare) > 0 {
 		km.spare = km.spare[:len(km.spare)-1] // reserved for xdotool
 	}
+	// A layout's own keys carry legacy keysyms (Greek_alpha, Cyrillic_a);
+	// text is resolved by code point, so each gets its Unicode alias.
+	aliases := map[uint32]keystroke{}
+	for ks, st := range km.direct {
+		if r, ok := legacyKeysymToRune[ks]; ok {
+			if alias := keysymFromRune(r); alias != ks {
+				aliases[alias] = st
+			}
+		}
+	}
+	for alias, st := range aliases {
+		if _, dup := km.direct[alias]; !dup {
+			km.direct[alias] = st
+		}
+	}
 	// Bound scratch keycodes rejoin the pool after the empty ones, in the
 	// order they were last used.
 	if prev != nil {
@@ -338,12 +349,11 @@ func (b *x11Backend) keymap() (*x11Keymap, error) {
 // keyPlanner lowers one key request to keycodes against a copy of the
 // scratch state, so a declined request leaves the keymap untouched.
 type keyPlanner struct {
-	km       *x11Keymap
-	spare    []xproto.Keycode
-	bound    map[xproto.Keycode]uint32
-	used     map[xproto.Keycode]bool
-	segments []keySegment
-	cur      keySegment
+	km    *x11Keymap
+	spare []xproto.Keycode
+	bound map[xproto.Keycode]uint32
+	used  map[xproto.Keycode]bool
+	cur   keySegment
 }
 
 func newKeyPlanner(km *x11Keymap) *keyPlanner {
@@ -366,28 +376,24 @@ func (p *keyPlanner) touch(code xproto.Keycode) {
 }
 
 // scratch returns a keycode bound to ks, binding the least recently used
-// spare when none is. Rebinding a keycode this request already typed with
-// closes the segment, so the rebind is applied only after those strokes.
-func (p *keyPlanner) scratch(ks uint32) (xproto.Keycode, bool) {
+// spare when none is. When that spare was already typed with in this
+// request the pool is exhausted: the request declines rather than rebind
+// a keycode an application may not have consumed yet.
+func (p *keyPlanner) scratch(ks uint32) (xproto.Keycode, error) {
 	for code, bks := range p.bound {
 		if bks == ks {
 			p.touch(code)
-			return code, true
+			return code, nil
 		}
 	}
-	if len(p.spare) == 0 {
-		return 0, false
+	if len(p.spare) == 0 || p.used[p.spare[0]] {
+		return 0, fmt.Errorf("no spare keycode for keysym 0x%x: %w", ks, errBackendKept)
 	}
 	code := p.spare[0]
-	if p.used[code] {
-		p.segments = append(p.segments, p.cur)
-		p.cur = keySegment{}
-		p.used = map[xproto.Keycode]bool{}
-	}
 	p.bound[code] = ks
 	p.touch(code)
 	p.cur.binds = append(p.cur.binds, keyBind{code: code, keysym: ks})
-	return code, true
+	return code, nil
 }
 
 // stroke resolves ks to a keystroke: natively when the layout has it (with
@@ -418,9 +424,9 @@ func (p *keyPlanner) stroke(ks uint32) (keystroke, error) {
 		}
 		ks, shift = lower, true
 	}
-	code, ok := p.scratch(ks)
-	if !ok {
-		return keystroke{}, fmt.Errorf("no spare keycode for keysym 0x%x: %w", ks, errBackendKept)
+	code, err := p.scratch(ks)
+	if err != nil {
+		return keystroke{}, err
 	}
 	return keystroke{code: code, shift: shift}, nil
 }
@@ -575,16 +581,13 @@ func planKey(km *x11Keymap, state xkbState, ev *pb.KeyEvent) ([]keySegment, erro
 	if err != nil {
 		return nil, err
 	}
-	if len(p.segments)+1 > maxKeySegments {
-		return nil, fmt.Errorf("%d scratch rebinds needed, max %d: %w", len(p.segments)+1, maxKeySegments, errBackendKept)
-	}
 	km.spare, km.bound = p.spare, p.bound
-	return append(p.segments, p.cur), nil
+	return []keySegment{p.cur}, nil
 }
 
 // Key delivers one KeyEvent through XTest: scratch bindings, a sync so the
 // server has applied them (and told every client) before the presses, then
-// the strokes and one sync per segment. A plan failure happens before any
+// the strokes and a final sync. A plan failure happens before any
 // request is sent; after that, errors are returned without replay. A lock
 // that could not be put back is an error too, so the backend is dropped
 // rather than a cleared lock left behind unnoticed.

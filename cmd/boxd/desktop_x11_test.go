@@ -274,6 +274,37 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 		t.Fatalf("%s: terminal received %q, want %q", label, got, want)
 	}
 
+	// A native non-Latin layout: its keys carry legacy keysyms, which the
+	// X11 path must find by code point rather than bind scratch keycodes
+	// for (there are not enough of those for an alphabet).
+	setLayout := func(layout string) {
+		t.Helper()
+		cmd := exec.Command("setxkbmap", "-layout", layout)
+		cmd.Env = append(os.Environ(), "DISPLAY="+display)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("setxkbmap %s: %v: %s", layout, err, out)
+		}
+	}
+	if _, err := exec.LookPath("setxkbmap"); err != nil {
+		t.Skip("setxkbmap not installed; layout checks skipped")
+	}
+	setLayout("gr")
+	expect("Greek layout literal input", "αβγδεζηθικλμνξοπρστυφχψω\n")
+	// More distinct unmapped characters than spare keycodes: the X11 path
+	// declines rather than recycle keycodes mid-request. With no helper on
+	// PATH the decline surfaces as an error, and nothing was typed.
+	if _, err := s.SendKey(ctx, connect.NewRequest(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "абвгдежзийклмнопрсту\n"}})); err == nil {
+		t.Fatal("20 unmapped characters on an 18-keycode pool should have declined")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if out, _ := os.ReadFile(typed); string(out) != want {
+		t.Fatalf("a declined request still typed: %q", out)
+	}
+	if s.x11.backend == nil {
+		t.Fatal("the decline dropped the backend")
+	}
+	setLayout("us")
+
 	// Caps Lock on: literal text is typed with the lock cleared and the lock
 	// is back afterwards.
 	toggleCaps := func() {
@@ -336,14 +367,7 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	// A second group made active: the X11 path declines (its keycodes
 	// would type the other group's symbols) and xdotool, which locks the
 	// group per keysym, types the text.
-	if _, err := exec.LookPath("setxkbmap"); err != nil {
-		t.Skip("setxkbmap not installed; group check skipped")
-	}
-	layout := exec.Command("setxkbmap", "-layout", "us,ru")
-	layout.Env = append(os.Environ(), "DISPLAY="+display)
-	if out, err := layout.CombinedOutput(); err != nil {
-		t.Fatalf("setxkbmap: %v: %s", err, out)
-	}
+	setLayout("us,ru")
 	xkbLatchLockState(t, display, 0, 0, true, 1)
 	if state, err := s.x11.backend.xkbGetState(0); err != nil || state.group != 1 {
 		t.Fatalf("state after lock = %+v, %v; want group 1", state, err)

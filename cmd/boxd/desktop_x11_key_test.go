@@ -37,21 +37,10 @@ func TestBuildKeymap_ReservesOneKeycodeForTheFallback(t *testing.T) {
 	if len(km.spare) != 1 || km.spare[0] != kcSpare0 {
 		t.Fatalf("spare = %v, want just %d with %d held back", km.spare, kcSpare0, reserved)
 	}
-	// Two unmapped characters still fit, by rebinding the one pool keycode
-	// across segments; the reserved one is never touched.
-	segs, err := planKey(km, xkbState{}, textEvent("éà"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(segs) != 2 {
-		t.Fatalf("segments = %d, want 2", len(segs))
-	}
-	for _, seg := range segs {
-		for _, bind := range seg.binds {
-			if bind.code != kcSpare0 {
-				t.Errorf("bound keycode %d, want only %d (keycode %d is reserved)", bind.code, kcSpare0, reserved)
-			}
-		}
+	// Two unmapped characters do not fit in a one-keycode pool; the
+	// reserved keycode is never used to make them fit.
+	if _, err := planKey(km, xkbState{}, textEvent("éà")); !errors.Is(err, errBackendKept) {
+		t.Fatalf("err = %v, want errBackendKept (keycode %d is reserved)", err, reserved)
 	}
 }
 
@@ -185,21 +174,50 @@ func TestPlanKey_UnmappedCharactersBindScratchKeycodesOnce(t *testing.T) {
 	eventsEqual(t, segs[0].events, tapEvents(kcSpare0))
 }
 
-func TestPlanKey_ExhaustedPoolRebindsInANewSegment(t *testing.T) {
+// A keycode is never rebound within one request: when the pool runs out
+// the request declines, with nothing bound.
+func TestPlanKey_ExhaustedPoolDeclines(t *testing.T) {
 	km := testKeymap(1)
-	segs, err := planKey(km, xkbState{}, textEvent("éàé"))
+	_, err := planKey(km, xkbState{}, textEvent("éà"))
+	if !errors.Is(err, errBackendKept) {
+		t.Fatalf("err = %v, want errBackendKept", err)
+	}
+	if len(km.bound) != 0 {
+		t.Errorf("a declined plan bound %v", km.bound)
+	}
+	// The same characters fit across two requests: the first binds é, the
+	// second evicts it for à.
+	if _, err := planKey(km, xkbState{}, textEvent("é")); err != nil {
+		t.Fatal(err)
+	}
+	segs, err := planKey(km, xkbState{}, textEvent("à"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(segs) != 3 {
-		t.Fatalf("segments = %d, want 3: every rebind of the one spare after use starts a segment", len(segs))
+	bindsEqual(t, segs[0].binds, []keyBind{{kcSpare0, 0xe0}})
+}
+
+// A native layout key carries a legacy keysym; text written by code point
+// must still find it rather than bind a scratch keycode.
+func TestBuildKeymap_AliasesLegacyKeysymsByCodePoint(t *testing.T) {
+	var syms []xproto.Keysym
+	for _, r := range [][2]xproto.Keysym{{0x7e1, 0x7c1}, {0x6c1, 0x6e1}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0, 0}, {0, 0}} {
+		syms = append(syms, r[0], r[1]) // Greek_alpha/ALPHA, Cyrillic_a/A
 	}
-	for i, ks := range []uint32{0xe9, 0xe0, 0xe9} {
-		if fmt.Sprint(segs[i].binds) != fmt.Sprint([]keyBind{{kcSpare0, ks}}) {
-			t.Errorf("segment %d binds = %v, want %#x on the spare", i, segs[i].binds, ks)
-		}
-		eventsEqual(t, segs[i].events, tapEvents(kcSpare0))
+	km := buildKeymap(8, 2, syms, nil, nil)
+	segs, err := planKey(km, xkbState{}, textEvent("αΑа"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(segs[0].binds) != 0 {
+		t.Errorf("binds = %v, want none: the layout has these letters", segs[0].binds)
+	}
+	alpha, cyrA, shift := xproto.Keycode(8), xproto.Keycode(9), xproto.Keycode(12)
+	var want []keyEvent
+	want = append(want, tapEvents(alpha)...)
+	want = append(want, events(shift, true, alpha, true, alpha, false, shift, false)...)
+	want = append(want, tapEvents(cyrA)...)
+	eventsEqual(t, segs[0].events, want)
 }
 
 func TestPlanKey_Chords(t *testing.T) {
@@ -231,24 +249,6 @@ func TestPlanKey_Chords(t *testing.T) {
 			}
 			eventsEqual(t, segs[0].events, tc.want)
 		})
-	}
-}
-
-// With one usable spare, alternating unmapped characters rebind it every
-// stroke; past the segment cap the request is declined with nothing bound.
-func TestPlanKey_TooManySegmentsDeclines(t *testing.T) {
-	km := testKeymap(1)
-	alternating := func(n int) string { return strings.Repeat("éà", n/2) }
-	if _, err := planKey(km, xkbState{}, textEvent(alternating(maxKeySegments))); err != nil {
-		t.Fatalf("%d segments should still plan: %v", maxKeySegments, err)
-	}
-	km = testKeymap(1)
-	_, err := planKey(km, xkbState{}, textEvent(alternating(maxKeySegments+2)))
-	if !errors.Is(err, errBackendKept) {
-		t.Fatalf("err = %v, want errBackendKept", err)
-	}
-	if len(km.bound) != 0 {
-		t.Errorf("a declined plan bound %v", km.bound)
 	}
 }
 
