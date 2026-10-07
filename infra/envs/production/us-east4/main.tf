@@ -521,7 +521,51 @@ module "observability" {
       instance_id   = module.sandbox_host_c.instance_id
     }
   }
+  host_logging_alerts = {
+    display_prefix = "Host logging / ${local.active_host_name}"
+    expected_hosts = {
+      sandbox_host_c = {
+        active            = !contains(["preserve", "rollback"], var.host_logging_legacy_transition)
+        instance_name     = module.sandbox_host_c.instance_name
+        instance_id       = module.sandbox_host_c.instance_id
+        collector_host_id = module.sandbox_host_c.instance_name
+      }
+    }
+  }
   labels = local.common_labels
+}
+
+# One dedicated zonal assignment owns OTel logs for the serving host and its
+# replacements. East's existing legacy delivery remains independent until the
+# staged OTel cutover is evidenced.
+module "host_logging" {
+  source = "../../../modules/host-logging"
+
+  project_id      = local.project_id
+  zone            = local.zone
+  environment     = local.environment
+  region          = local.region
+  assignment_name = "superserve-otel-host-logging-us-east4-a"
+  # Keep the existing zonal Ops Agent policy as an explicit legacy writer
+  # until staged OTel receipt, drain, and rollback evidence authorizes retire.
+  legacy_policy_name = "goog-ops-agent-v2-template-1-7-0-us-east4-c"
+  legacy_transition  = var.host_logging_legacy_transition
+  legacy_migration   = var.host_logging_legacy_migration
+  selector_labels = {
+    application = "sandbox-host"
+    environment = local.environment
+    region      = local.region
+  }
+  enrolled_hosts = {
+    sandbox_host_c = {
+      instance_name         = module.sandbox_host_c.instance_name
+      instance_id           = module.sandbox_host_c.instance_id
+      host_id               = var.host_c_host_id
+      incarnation           = "installed-host-identity"
+      service_account_email = google_service_account.vmd_runtime.email
+    }
+  }
+  depends_on = [module.sandbox_host_c]
 }
 
 # Durability tier for the host's local-SSD artifacts (sandbox snapshots,

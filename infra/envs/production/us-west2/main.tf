@@ -434,7 +434,45 @@ module "observability" {
     host_id        = local.active_host_name
     display_prefix = "Infrastructure / ${local.active_host_name}"
   }
+  host_logging_alerts = {
+    display_prefix = "Host logging / ${local.active_host_name}"
+    expected_hosts = {
+      sandbox_host_b = {
+        instance_name     = module.sandbox_host_b.instance_name
+        instance_id       = module.sandbox_host_b.instance_id
+        collector_host_id = module.sandbox_host_b.instance_name
+      }
+    }
+  }
   labels = local.common_labels
+}
+
+# One dedicated zonal assignment owns OTel log convergence for the serving host
+# and replacement host selected by the same Terraform labels.
+module "host_logging" {
+  source = "../../../modules/host-logging"
+
+  project_id        = local.project_id
+  zone              = local.zone
+  environment       = local.environment
+  region            = local.region
+  assignment_name   = "superserve-otel-host-logging-us-west2-a"
+  legacy_transition = "preserve"
+  selector_labels = {
+    application = "sandbox-host"
+    environment = local.environment
+    region      = local.region
+  }
+  enrolled_hosts = {
+    sandbox_host_b = {
+      instance_name         = module.sandbox_host_b.instance_name
+      instance_id           = module.sandbox_host_b.instance_id
+      host_id               = var.standby_host_id
+      incarnation           = "installed-host-identity"
+      service_account_email = google_service_account.vmd_runtime.email
+    }
+  }
+  depends_on = [module.sandbox_host_b, google_project_service.host_log_telemetry]
 }
 
 # Durability tier for the host's local-SSD artifacts (sandbox snapshots,
@@ -490,4 +528,10 @@ module "cloud_ids" {
   notification_channel_ids   = var.notification_channel_ids
   runbook_base_url           = var.cloud_ids_runbook_base_url
   labels                     = local.common_labels
+}
+
+resource "google_project_service" "host_log_telemetry" {
+  project            = local.project_id
+  service            = "telemetry.googleapis.com"
+  disable_on_destroy = false
 }

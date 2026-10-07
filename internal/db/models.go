@@ -152,6 +152,20 @@ func (ns NullTemplateStatus) Value() (driver.Value, error) {
 	return string(ns.TemplateStatus), nil
 }
 
+type AbuseMiningIncident struct {
+	ID            uuid.UUID   `json:"id"`
+	HostID        string      `json:"host_id"`
+	SandboxID     uuid.UUID   `json:"sandbox_id"`
+	TeamID        uuid.UUID   `json:"team_id"`
+	Assignment    string      `json:"assignment"`
+	BodyDigest    string      `json:"body_digest"`
+	Disposition   string      `json:"disposition"`
+	RestrictionID pgtype.UUID `json:"restriction_id"`
+	Evidence      []byte      `json:"evidence"`
+	ObservedAt    time.Time   `json:"observed_at"`
+	CreatedAt     time.Time   `json:"created_at"`
+}
+
 type AbuseRestriction struct {
 	ID            uuid.UUID          `json:"id"`
 	SubjectType   string             `json:"subject_type"`

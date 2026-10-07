@@ -443,7 +443,7 @@ func (q warningDispatchScope) Query(ctx context.Context, sql string, args ...any
 		sql = strings.ReplaceAll(sql, "WHERE s.destroyed_at IS NULL", "WHERE s.team_id = '"+q.team.String()+"'::uuid AND s.destroyed_at IS NULL")
 	}
 	if strings.Contains(sql, "-- name: ListTrialCreditWarningTeams") {
-		sql = strings.ReplaceAll(sql, "WHERE a.trial_ended_at IS NULL", "WHERE c.team_id = '"+q.team.String()+"'::uuid AND a.trial_ended_at IS NULL")
+		sql = strings.ReplaceAll(sql, "WHERE a.trial_ended_at IS NULL", "WHERE g.team_id = '"+q.team.String()+"'::uuid AND a.trial_ended_at IS NULL")
 	}
 	return q.Pool.Query(ctx, sql, args...)
 }

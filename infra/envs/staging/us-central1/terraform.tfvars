@@ -13,6 +13,7 @@ sandbox_access_token_seed_secret_name = "sandbox-access-token-seed-staging"
 secrets_signing_key_secret_name       = "secretsproxy-signing-key-staging"
 peer_ca_operator_members              = ["user:alejandro@superserve.ai"]
 build_host_id                         = "staging-usc1-2-5751551b1d454aaa9445ea891fe3625d"
+notification_channel_ids              = ["projects/rayai-dev/notificationChannels/11010951251479934548"]
 
 proxy_generation_cells = {
   staging = {

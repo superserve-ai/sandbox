@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -269,6 +270,71 @@ func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context, logger zerolog
 	}
 }
 
+// fenceOrder lists the distinct hosts a batch will fence, in the order every
+// caller must take them. Sorted here rather than in SQL: statement order is
+// the only ordering a plan cannot rearrange.
+func fenceOrder(rows []db.LockAutoDeleteDueRow) []string {
+	seen := make(map[string]struct{}, len(rows))
+	hosts := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.HostID == "" {
+			continue
+		}
+		if _, dup := seen[r.HostID]; dup {
+			continue
+		}
+		seen[r.HostID] = struct{}{}
+		hosts = append(hosts, r.HostID)
+	}
+	sort.Strings(hosts)
+	return hosts
+}
+
+// claimAutoDeleteBatch claims a batch under its lifetime fences, taken in
+// host order. Updating a sandbox takes that fence once per row, so a batch
+// spanning hosts would otherwise acquire several of them in row order and two
+// replicas, holding disjoint rows but overlapping hosts, could each hold the
+// other's next one. A fixed order cannot form that cycle. The fences stay
+// row-level by design: the shared probes that read them never wait, so taking
+// them off the write would change what they observe.
+func (h *Handlers) claimAutoDeleteBatch(ctx context.Context, batchSize int32) ([]db.ClaimAutoDeleteSandboxesRow, error) {
+	begin := h.beginReaperTx
+	if begin == nil {
+		if h.Pool == nil {
+			return nil, errors.New("auto-delete claim needs a connection pool for its fences")
+		}
+		begin = h.Pool.Begin
+	}
+	tx, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	q := h.DB.WithTx(tx)
+	rows, err := q.LockAutoDeleteDue(ctx, batchSize)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	ids := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID)
+	}
+	for _, host := range fenceOrder(rows) {
+		if err := q.FenceRetainedStorageHost(ctx, host); err != nil {
+			return nil, err
+		}
+	}
+	claimed, err := q.ClaimAutoDeleteSandboxes(ctx, db.ClaimAutoDeleteSandboxesParams{
+		SandboxIds:          ids,
+		RevocationExpiresAt: time.Now().Add(SecretsJWTLifetime),
+		LeaseSeconds:        0,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claimed, tx.Commit(ctx)
+}
+
 // reapAutoDeleteOnce deletes paused sandboxes whose auto-delete deadline has
 // passed. ClaimAutoDeleteSandboxes soft-deletes the rows (revocation written,
 // intervals closed, reclaim recorded) in one guarded statement. The reclaim
@@ -277,11 +343,7 @@ func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context, logger zerolog
 // batch this size could not promise.
 func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, logger zerolog.Logger) {
 	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
-	due, err := h.DB.ClaimAutoDeleteSandboxes(queryCtx, db.ClaimAutoDeleteSandboxesParams{
-		BatchSize:           batchSize,
-		RevocationExpiresAt: time.Now().Add(SecretsJWTLifetime),
-		LeaseSeconds:        0,
-	})
+	due, err := h.claimAutoDeleteBatch(queryCtx, batchSize)
 	queryCancel()
 	if err != nil {
 		logger.Error().Err(err).Msg("reaper: ClaimAutoDeleteSandboxes failed")

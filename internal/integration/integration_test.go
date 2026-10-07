@@ -63,7 +63,17 @@ func TestMain(m *testing.M) {
 	defer cancel()
 
 	var err error
-	testPool, err = pgxpool.New(ctx, dbURL)
+	poolConfig, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "parse test database config: %v\n", err)
+		os.Exit(1)
+	}
+	poolConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		db.RegisterEnumArrays(conn.TypeMap())
+		return nil
+	}
+	testPool, err = pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect to test database: %v\n", err)
 		os.Exit(1)
@@ -7159,8 +7169,16 @@ func TestIntegration_AutoDeleteTeardownStartsAtAttemptZero(t *testing.T) {
 	); err != nil {
 		t.Fatalf("insert sandbox: %v", err)
 	}
+	dueRows, err := testQueries.LockAutoDeleteDue(ctx, 100)
+	if err != nil {
+		t.Fatalf("lock auto-delete due: %v", err)
+	}
+	dueIDs := make([]uuid.UUID, 0, len(dueRows))
+	for _, r := range dueRows {
+		dueIDs = append(dueIDs, r.ID)
+	}
 	if _, err := testQueries.ClaimAutoDeleteSandboxes(ctx, db.ClaimAutoDeleteSandboxesParams{
-		BatchSize: 100, RevocationExpiresAt: time.Now().Add(time.Hour), LeaseSeconds: 0,
+		SandboxIds: dueIDs, RevocationExpiresAt: time.Now().Add(time.Hour), LeaseSeconds: 0,
 	}); err != nil {
 		t.Fatalf("claim auto-delete: %v", err)
 	}
@@ -7248,5 +7266,111 @@ func TestIntegration_TeardownClaimsSpreadAcrossHostsWhileOneIsInFlight(t *testin
 	}
 	if rec.SandboxID != b1 || rec.HostID != hostB {
 		t.Fatalf("claim while host A's is in flight = %+v, want %s on %s", rec, b1, hostB)
+	}
+}
+
+// Concurrent claims hold disjoint rows but overlapping hosts. Taking the
+// lifetime fences in host order before the claim keeps them from each holding
+// the other's next one; the batch itself still spans hosts, which is what the
+// deadline ordering is for.
+func TestIntegration_ConcurrentAutoDeleteClaimsShareHostsWithoutDeadlock(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hosts := []string{"auto-del-x-" + uuid.NewString(), "auto-del-y-" + uuid.NewString()}
+	for _, h := range hosts {
+		if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+			ID: h, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+			CapacityMemoryMib: 1024, CapacityVcpus: 1,
+		}); err != nil {
+			t.Fatalf("create host: %v", err)
+		}
+	}
+	mine := map[uuid.UUID]string{}
+	for i := range 8 {
+		id, host := uuid.New(), hosts[i%2]
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id, auto_delete_at)
+			 VALUES ($1,$2,$3,'paused',$4, now() - make_interval(mins => $5))`,
+			id, teamID, fmt.Sprintf("auto-del-conc-%d", i), host, 40-i); err != nil {
+			t.Fatalf("insert sandbox: %v", err)
+		}
+		mine[id] = host
+	}
+
+	// Mirrors the reaper: take the rows, fence their hosts in order, claim.
+	claim := func() ([]uuid.UUID, error) {
+		tx, err := testPool.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback(ctx)
+		q := testQueries.WithTx(tx)
+		rows, err := q.LockAutoDeleteDue(ctx, 4)
+		if err != nil || len(rows) == 0 {
+			return nil, err
+		}
+		ids := make([]uuid.UUID, 0, len(rows))
+		seen := map[string]bool{}
+		fences := []string{}
+		for _, r := range rows {
+			ids = append(ids, r.ID)
+			if r.HostID != "" && !seen[r.HostID] {
+				seen[r.HostID] = true
+				fences = append(fences, r.HostID)
+			}
+		}
+		sort.Strings(fences)
+		for _, h := range fences {
+			if err := q.FenceRetainedStorageHost(ctx, h); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := q.ClaimAutoDeleteSandboxes(ctx, db.ClaimAutoDeleteSandboxesParams{
+			SandboxIds: ids, RevocationExpiresAt: time.Now().Add(time.Hour), LeaseSeconds: 0,
+		}); err != nil {
+			return nil, err
+		}
+		return ids, tx.Commit(ctx)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	results := make(chan []uuid.UUID, 2)
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ids, err := claim()
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- ids
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(results)
+	for err := range errs {
+		t.Fatalf("concurrent auto-delete claim failed: %v", err)
+	}
+
+	spanned := false
+	for ids := range results {
+		seen := map[string]bool{}
+		for _, id := range ids {
+			if host, ours := mine[id]; ours {
+				seen[host] = true
+			}
+		}
+		if len(seen) > 1 {
+			spanned = true
+		}
+	}
+	if !spanned {
+		t.Fatal("no claim spanned hosts; the deadline ordering no longer batches across them")
 	}
 }

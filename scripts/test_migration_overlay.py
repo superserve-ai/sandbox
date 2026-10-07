@@ -179,6 +179,15 @@ class MigrationOverlayTest(cli_test.MigrationCLITest):
                     self.assertEqual(self.sql("SELECT to_regclass('signup_device_attempt') IS NULL"), "t")
                 self.assertEqual(self.sql("SELECT count(*) FROM pg_roles WHERE rolname='promotion_evidence_proxy'"), roles)
 
+    def test_older_bundle_refuses_newer_remote_history_without_repair(self):
+        self.invoke("staging")
+        self.sql("INSERT INTO supabase_migrations.schema_migrations(version,name,statements) "
+                 "VALUES ('20990101000000','later_release',ARRAY['SELECT 1;']);")
+        history = self.history()
+        with self.assertRaisesRegex(migration.MigrationError, "stage=migration_preview category=cli_exit"):
+            self.invoke("staging")
+        self.assertEqual(self.history(), history)
+
     def test_east_existing_history_and_guards(self):
         self.copy_migrations("20261002155219")
         self.push()

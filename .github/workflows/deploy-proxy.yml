@@ -195,71 +195,21 @@ jobs:
             exit 1
           fi
 
-      # Manual dispatch requires the operator to apply migrations first.
-      - name: Check same-SHA push CI and migration baseline
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git checkout "$GITHUB_SHA" -- .github/workflows/scripts/wait-for-push-ci.py
-          python3 .github/workflows/scripts/wait-for-push-ci.py
-
-      - name: Wait for same-SHA CD Migrate to succeed
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" != "push" ]; then
-            echo "Manual dispatch — operator owns migration ordering; skipping gate."
-            exit 0
-          fi
-
-          git checkout --detach "${{ steps.revision.outputs.revision }}"
-
-          # Diff the WHOLE pushed range, not just the tip commit — a
-          # multi-commit push can carry migrations in an earlier commit.
-          # An endpoint diff (before vs sha) is exactly "what changed on
-          # main since the last deployed tip", and works even for a force
-          # push where `before` is no longer an ancestor.
-          BEFORE="${{ github.event.before }}"
-          MIGRATIONS_CHANGED=unknown
-          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] &&
-             git fetch --quiet --depth=1 origin "$BEFORE" 2>/dev/null; then
-            if git diff --name-only "$BEFORE" HEAD | grep -Eq '^(supabase/(migrations|shared-auth-history)/|scripts/migrate_database[.]py$|[.]github/workflows/cd[.]yml$)'; then
-              MIGRATIONS_CHANGED=yes
-            else
-              MIGRATIONS_CHANGED=no
-            fi
-          fi
-
-          if [ "$MIGRATIONS_CHANGED" = "no" ]; then
-            echo "No migration changes in ${BEFORE}..${{ github.sha }}; skipping gate."
-            exit 0
-          fi
-
-          # An unknown range must still observe a successful migration run.
-          echo "migrations_changed=$MIGRATIONS_CHANGED — checking CD Migrate for ${{ github.sha }}"
-          # ~20 min budget (60 × 20s), then fail closed: a deploy against a
-          # missing column is worse than a late deploy.
-          for i in $(seq 1 60); do
-            run=$(gh api "repos/${{ github.repository }}/actions/workflows/cd.yml/runs?head_sha=${{ github.sha }}&event=push" \
-              --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
-            status=${run% *}; conclusion=${run#* }
-            echo "attempt $i: status=$status conclusion=$conclusion"
-            if [ "$status" = "completed" ]; then
-              if [ "$conclusion" = "success" ]; then
-                echo "CD Migrate succeeded; proceeding."
-                exit 0
-              fi
-              echo "CD Migrate concluded '$conclusion' — refusing to deploy against an unmigrated schema."
-              exit 1
-            fi
-            sleep 20
-          done
-          echo "Timed out waiting for CD Migrate; refusing to deploy."
-          exit 1
+  migrations:
+    needs: [migration-gate]
+    uses: ./.github/workflows/deployment-migrations.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      revision: ${{ needs.migration-gate.outputs.revision }}
+      production: ${{ github.event_name == 'push' || inputs.environment == 'production' }}
+      resume_run_id: ${{ inputs.rollout_id || '' }}
+      allow_branch_staging: ${{ github.event_name == 'workflow_dispatch' && inputs.environment == 'staging' && needs.migration-gate.outputs.mode == 'legacy' && !inputs.rollout_id && !inputs.revision }}
+    secrets: inherit
 
   deploy-staging:
-    needs: [migration-gate]
+    needs: [migration-gate, migrations]
     runs-on: ubuntu-latest
     environment: staging
     permissions:
