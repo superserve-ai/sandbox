@@ -68,6 +68,14 @@ func boxdLogRoute(path string) string {
 	}
 }
 
+// RequestLogging includes admission wrappers outside the routing handler. Nested
+// handlers reuse the request record so each attempt still has one primary event.
+func (h *Handler) RequestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logBoxdRequest(h.log, h.domains, w, r, next.ServeHTTP)
+	})
+}
+
 func logBoxdRequest(log zerolog.Logger, domains []string, w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 	if requestRecordFrom(r.Context()) != nil {
 		next(w, r)
@@ -234,7 +242,11 @@ func logSessionStart(ctx context.Context, status int) {
 func logRequestOutcome(ctx context.Context, outcome string) {
 	if s := requestRecordFrom(ctx); s != nil {
 		s.mu.Lock()
-		s.outcome = outcome
+		// An observed process exit remains authoritative if bridge teardown races
+		// with an input or output failure.
+		if s.outcome != "process_exited" {
+			s.outcome = outcome
+		}
 		s.mu.Unlock()
 	}
 }

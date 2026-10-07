@@ -414,6 +414,9 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 					Data: data,
 				}))
 				if err != nil {
+					if !errors.Is(err, context.Canceled) && connect.CodeOf(err) != connect.CodeCanceled {
+						logRequestOutcome(ctx, "upstream_error")
+					}
 					l.Warn().Msg("terminal: boxd SendInput failed")
 					return
 				}

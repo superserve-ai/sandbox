@@ -14,10 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
 )
 
 type requestLogBuffer struct {
@@ -339,5 +341,51 @@ func TestRequestLoggingPeerHasOnePrimaryEvent(t *testing.T) {
 	}
 	if counts["request"] != 1 || counts["proxy_forward"] != 1 {
 		t.Fatal(events)
+	}
+}
+
+func TestRequestLoggingTerminalInputFailure(t *testing.T) {
+	fake := newFakeProcessService()
+	fake.sendInputErr = connect.NewError(connect.CodeUnavailable, errors.New("SYNTHETIC_RPC_SECRET"))
+	fake.pushStart(42)
+	_, upstream := boxdpbconnect.NewProcessServiceHandler(fake)
+	h, buf := loggingProxy(t, upstream)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Host = "boxd-" + logTestSandbox + ".sandbox.test"
+		h.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+terminalPath, &websocket.DialOptions{
+		Subprotocols: []string{terminalProtocol, "token." + auth.ComputeAccessToken(logTestSeed, logTestSandbox)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.CloseNow()
+	if err := ws.Write(ctx, websocket.MessageBinary, []byte("SYNTHETIC_INPUT_SECRET")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _ = ws.Read(ctx)
+	events := awaitRequestEvents(t, buf, 2)
+	if len(events) != 2 || events[1]["event_type"] != "session_complete" || events[1]["outcome"] != "upstream_error" || events[0]["request_id"] != events[1]["request_id"] {
+		t.Fatal(events)
+	}
+	if strings.Contains(buf.text(), "SYNTHETIC") {
+		t.Fatal("terminal content leaked")
+	}
+}
+
+func TestRequestLoggingProcessExitSurvivesBridgeFailure(t *testing.T) {
+	for _, outcomes := range [][]string{{"process_exited", "upstream_error"}, {"upstream_error", "process_exited"}} {
+		record := &requestRecord{}
+		ctx := context.WithValue(context.Background(), requestLogKey{}, record)
+		for _, outcome := range outcomes {
+			logRequestOutcome(ctx, outcome)
+		}
+		if record.outcome != "process_exited" {
+			t.Fatalf("exit lost for ordering %v", outcomes)
+		}
 	}
 }

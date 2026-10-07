@@ -531,6 +531,7 @@ func withRoutingBootstrap(next http.Handler, ready func() bool) http.Handler {
 }
 
 func newProxyMuxWithReadiness(proxyHandler *proxy.Handler, dataPlane http.Handler, dependencies func(context.Context) bool) *http.ServeMux {
+	dataPlane = proxyHandler.RequestLogging(dataPlane)
 	generation := os.Getenv("PROXY_GENERATION")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
