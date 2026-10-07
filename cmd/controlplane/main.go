@@ -137,6 +137,10 @@ func run() error {
 	// uses unnamed prepared statements (which don't persist) while still using
 	// the extended protocol for typed/binary parameter encoding.
 	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		dbq.RegisterEnumArrays(conn.TypeMap())
+		return nil
+	}
 	if v := os.Getenv("DB_MAX_CONNS"); v != "" {
 		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
 			poolCfg.MaxConns = int32(n)
