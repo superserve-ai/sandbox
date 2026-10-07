@@ -28,6 +28,7 @@ on:
       - 'infra/**'
       - '.github/workflows/terraform-cd.yml'
       - '.github/workflows/scripts/wait_credentials_key_iam.py'
+      - '.github/workflows/scripts/wait_host_logging_iam.py'
       - 'deploy/otel/**'
       - 'deploy/superserve-otel-collector.service'
       - '.github/workflows/deploy-otel-collector.yml'

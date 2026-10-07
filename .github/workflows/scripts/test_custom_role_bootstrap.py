@@ -15,6 +15,8 @@ class CustomRoleBootstrapTests(unittest.TestCase):
         text = WORKFLOW.read_text()
         bootstrap = text.split('  production-us-central1-bootstrap:\n')[1].split('\n  production-us-west2-infra:')[0]
         self.assertIn('-target=google_project_service.host_log_os_config', bootstrap)
+        self.assertIn('-target=google_project_iam_member.cd_host_logging', bootstrap)
+        self.assertLess(bootstrap.index('terraform apply'), bootstrap.index('wait_host_logging_iam.py'))
         self.assertIn('terraform apply -input=false -auto-approve tfplan', bootstrap)
         root = WORKFLOW.parents[2] / 'infra/envs'
         owners = []
@@ -37,7 +39,18 @@ class CustomRoleBootstrapTests(unittest.TestCase):
         self.assertIn('-target=google_project_service.host_log_os_config', bootstrap)
         self.assertIn('-chdir=infra/envs/production/us-central1 plan', bootstrap)
         self.assertIn('apply -input=false -auto-approve cd-key.tfplan', bootstrap)
+        self.assertIn('-target=google_project_iam_member.cd_host_logging', bootstrap)
+        self.assertLess(bootstrap.index('apply -input=false -auto-approve cd-key.tfplan'), bootstrap.index('wait_host_logging_iam.py'))
         self.assertLess(west.index('apply -input=false -auto-approve cd-key.tfplan'), west.index('cd infra/envs/production/us-west2'))
+
+    def test_staging_bootstrap_precedes_refresh_of_partially_applied_resources(self):
+        staging = WORKFLOW.read_text().split('  staging-us-central1-infra:', 1)[1].split('  staging-us-central1-api:', 1)[0]
+        bootstrap = staging.split('      - name: Bootstrap staging host logging permissions', 1)[1].split('      - name: Terraform apply staging/us-central1', 1)[0]
+        self.assertIn('-target=google_project_iam_member.cd_host_logging', bootstrap)
+        self.assertIn('-target=google_project_service.host_log_os_config', bootstrap)
+        self.assertLess(bootstrap.index('apply -input=false -auto-approve host-logging-iam.tfplan'), bootstrap.index('wait_host_logging_iam.py'))
+        logging = (WORKFLOW.parents[2] / 'infra/envs/staging/us-central1/main.tf').read_text().split('module "host_logging" {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('google_project_iam_member.cd_host_logging', logging)
 
     def test_effective_permissions_gate_regional_applies(self):
         text = WORKFLOW.read_text()
