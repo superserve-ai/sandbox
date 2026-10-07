@@ -486,6 +486,83 @@ RUN apt-get update \\
     def test_reconcile_converges_and_is_idempotent(self):
         self._exercise_reconciliation(False)
 
+    def test_policy_stages_files_on_a_fresh_host(self):
+        # Exercise the actual ordered policy, including inline exec scripts.
+        # Reconciliation fixtures alone pre-create this directory and cannot
+        # detect file resources failing before reconciliation is reached.
+        with tempfile.TemporaryDirectory(prefix="host-logging-policy-") as directory:
+            fixture = Path(directory)
+            module = fixture / "infra/modules/host-logging"
+            shutil.copytree(MODULE, module, ignore=shutil.ignore_patterns(".terraform", ".terraform.lock.hcl"))
+            (fixture / "scripts").mkdir()
+            shutil.copy(ROOT / "scripts/host_logging_legacy_migration.py", fixture / "scripts")
+            for args in (
+                ["init", "-backend=false", "-input=false"],
+                ["test", "-filter=tests/policy.tftest.hcl", "-json", "-verbose"],
+            ):
+                result = subprocess.run(
+                    ["terraform", f"-chdir={module}", *args],
+                    text=True, capture_output=True, timeout=180,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            events = [json.loads(line) for line in result.stdout.splitlines()]
+            state = next(event["test_state"] for event in events if event["type"] == "test_state")
+            resources = state["root_module"]["resources"]
+            assignment = next(resource["values"] for resource in resources
+                              if resource["type"] == "google_os_config_os_policy_assignment")
+            policy = assignment["os_policies"][0]["resource_groups"][0]["resources"]
+            objects = {resource["values"]["name"]: resource["values"]["content"]
+                       for resource in resources if resource["type"] == "google_storage_bucket_object"}
+            (fixture / "policy.json").write_text(json.dumps({"resources": policy, "objects": objects}))
+            script = textwrap.dedent(r"""
+                python3 - <<'PY'
+                import json, pathlib, subprocess
+                policy = json.loads(pathlib.Path('/fixture/policy.json').read_text())
+                state = pathlib.Path('/var/lib/superserve/host-logging')
+                assert not state.exists()
+                staged = []
+                preparation = None
+                for resource in policy['resources']:
+                    if resource['id'] == 'reconcile-and-validate':
+                        break
+                    if resource['exec']:
+                        preparation = resource['exec'][0]
+                        assert subprocess.run(['/bin/sh', '-c', preparation['validate'][0]['script']]).returncode == 101
+                        assert subprocess.run(['/bin/sh', '-c', preparation['enforce'][0]['script']]).returncode == 100
+                        assert subprocess.run(['/bin/sh', '-c', preparation['validate'][0]['script']]).returncode == 100
+                    else:
+                        spec = resource['file'][0]
+                        content = spec['content']
+                        if spec['file']:
+                            content = policy['objects'][spec['file'][0]['gcs'][0]['object']]
+                        # Like OS Config's file resource, writing does not
+                        # create missing parents. The previous policy fails here.
+                        destination = pathlib.Path(spec['path'])
+                        destination.write_text(content)
+                        staged.append(destination)
+                assert preparation is not None
+                assert (state / 'validate.sh') in staged and (state / 'reconcile.sh') in staged
+                assert len(staged) == 5
+                before = {path: path.read_bytes() for path in staged}
+                marker = state / 'cursor' / 'existing-cursor'
+                marker.parent.mkdir()
+                marker.write_bytes(b'persisted delivery state')
+                state.chmod(0o755)
+                assert subprocess.run(['/bin/sh', '-c', preparation['validate'][0]['script']]).returncode == 101
+                assert subprocess.run(['/bin/sh', '-c', preparation['enforce'][0]['script']]).returncode == 100
+                assert subprocess.run(['/bin/sh', '-c', preparation['validate'][0]['script']]).returncode == 100
+                assert marker.read_bytes() == b'persisted delivery state'
+                assert before == {path: path.read_bytes() for path in staged}
+                # A non-directory must fail enforcement, never report success.
+                import shutil
+                shutil.rmtree(state)
+                state.write_text('obstruction')
+                assert subprocess.run(['/bin/sh', '-c', preparation['validate'][0]['script']]).returncode == 101
+                assert subprocess.run(['/bin/sh', '-c', preparation['enforce'][0]['script']]).returncode not in (0, 100)
+                PY
+            """)
+            self._docker("host-logging-fresh-policy", fixture, script)
+
     def test_post_activation_failure_restores_active_state(self):
         self._exercise_reconciliation(True)
 
