@@ -203,6 +203,7 @@ module "api" {
   service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
+    COMPUTE_RESTRICTIONS_SOURCE = "database"
     API_PORT                    = "8080"
     TEAM_CREATION_REGION        = "use"
     TEAM_CREATION_PUBLIC_KEYS   = var.team_creation_public_keys
