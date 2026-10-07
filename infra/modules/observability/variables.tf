@@ -44,6 +44,38 @@ variable "host_maintenance_event_alerts" {
   default = {}
 }
 
+variable "host_logging_alerts" {
+  description = "OTel logs failure/lag alerts plus independent expected-host freshness signals for every active serving host."
+  type = object({
+    display_prefix        = string
+    lag_threshold_seconds = optional(number, 300)
+    heartbeat_duration    = optional(string, "600s")
+    # The standalone collector scrapes its Prometheus endpoint and exports
+    # the native self metric through the GMP exporter. PromQL therefore uses
+    # the native series name, not the Cloud Monitoring workload namespace.
+    heartbeat_metric_type = optional(string, "otelcol_process_uptime")
+    expected_hosts = map(object({
+      instance_name = string
+      instance_id   = string
+      # The stable numeric VM identity is explicit so replacements cannot
+      # inherit a predecessor's heartbeat series. The OTel log heartbeat
+      # matches resource.labels.instance_id; runtime host_id, VM name, and
+      # incarnation stay separate.
+      # Retired hosts remain in inventory with active=false until their alert
+      # state is closed.
+      collector_host_id = optional(string)
+      incarnation       = optional(string)
+      active            = optional(bool, true)
+    }))
+  })
+  default = null
+
+  validation {
+    condition     = var.host_logging_alerts == null ? true : var.host_logging_alerts.lag_threshold_seconds > 0
+    error_message = "host_logging_alerts.lag_threshold_seconds must be positive."
+  }
+}
+
 variable "log_buckets" {
   description = "Logging bucket definitions keyed by logical name."
   type = map(object({

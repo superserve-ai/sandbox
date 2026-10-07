@@ -14,6 +14,9 @@ POLICIES = {
     "launch_path": ("vmd_launch|vmd_network", "vmd", "vmd", "variant", ["launcher_not_ready", "netns_accumulation", "netns_runaway"]),
     "ids_triage": ("investigation", "cloud_ids", "vmd", "security_finding", ["triage"]),
     "ids_medium": ("investigation", "cloud_ids", "vmd", "security_finding", ["retired"]),
+    "host_logging_export_failures": ("host_logging_export", "host_logging", "host", "export_failure", ["each"]),
+    "host_logging_lag": ("host_logging_lag", "host_logging", "host", "delivery_lag", ["each"]),
+    "host_logging_heartbeat": ("host_logging_heartbeat", "host_logging", "host", "missing_telemetry", ["each"]),
 }
 
 
