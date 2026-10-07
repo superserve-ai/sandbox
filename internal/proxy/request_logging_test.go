@@ -112,6 +112,29 @@ func TestRequestLoggingFilesRedactionAndResponse(t *testing.T) {
 	}
 }
 
+func TestRequestLoggingDesktopStep(t *testing.T) {
+	h, buf := loggingProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != desktopStepPath {
+			t.Errorf("upstream path = %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "SYNTHETIC_SCREENSHOT_SECRET")
+	}))
+	h.WithDesktop()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, loggingRequest("POST", desktopStepPath, auth.ComputeAccessToken(logTestSeed, logTestSandbox)))
+	events := buf.events(t)
+	if w.Code != http.StatusOK || w.Body.String() != "SYNTHETIC_SCREENSHOT_SECRET" || len(events) != 1 {
+		t.Fatalf("step changed: status=%d events=%v", w.Code, events)
+	}
+	if events[0]["route"] != desktopStepPath || events[0]["path"] != desktopStepPath || events[0]["auth_outcome"] != "authenticated" {
+		t.Fatal(events)
+	}
+	if strings.Contains(buf.text(), "SYNTHETIC_SCREENSHOT_SECRET") {
+		t.Fatal("screenshot content leaked")
+	}
+}
+
 func TestRequestLoggingEarlyFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name, path, token, outcome string

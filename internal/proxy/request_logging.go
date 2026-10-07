@@ -61,7 +61,7 @@ func boxdLogRoute(path string) string {
 	switch path {
 	case filesPath, execPath, execStreamPath, execConnectPath, terminalPath,
 		desktopScreenshotPath, desktopStreamPath, desktopSendPointerPath,
-		desktopSendKeyPath, desktopScrollPath, desktopResizePath, desktopSendActionsPath:
+		desktopSendKeyPath, desktopScrollPath, desktopResizePath, desktopSendActionsPath, desktopStepPath:
 		return path
 	default:
 		return "__unmatched__"

@@ -15,6 +15,7 @@ client retries are separate attempts. They are not historical audit records.
 | `team_id` | Authenticated caller's team, when known |
 | `resource_team_id`, `sandbox_id` | Resolved target team and requested sandbox ID; neither proves caller identity |
 | `auth_outcome` | `authenticated`, `missing`, `invalid`, `error`, `not_evaluated` |
+| `authorization_outcome` | QM authorization decision: `allowed`, `denied`, `error`, `not_evaluated`; absent on other routes |
 | `attribution_status` | `identified`, `sandbox_only`, `unavailable`, `error` |
 | `delegated_by` | Authenticated actor kind that supplied a verified human assertion |
 | `route`, `method` | Matched route template and HTTP method; unknown targets are `__unmatched__` |
@@ -26,6 +27,9 @@ human assertion is accepted only behind its existing authenticated internal
 boundary or signed assertion verifier. Authorization denials retain identities
 that already passed authentication. `not_evaluated` includes public routes and
 requests rejected before authentication; it does not mean invalid credentials.
+The QM authorization route retains its existing HTTP 200 response for policy
+denials; use `authorization_outcome` to distinguish those from an allowed
+decision. A rejected human proof does not establish a caller identity.
 
 Legacy sandbox access tokens prove sandbox access only. They emit
 `actor_type=sandbox_capability`, `auth_outcome=authenticated`, and
@@ -79,7 +83,12 @@ and parse that JSON. Confirm one known request from **each** plane reaches the
 selected sink before interpreting an empty query as absence of traffic. Check
 every serving revision/host; a mixed rollout gives an incomplete inventory.
 
-If proxy collection is not deployed, export on each serving host for the same
+The current host collector allowlist does not yet preserve the attribution
+fields or numeric status/latency. Central inventory requires a collector
+contract update; the source logging deployment can proceed independently.
+Until field preservation is verified, use the journal export below.
+
+If proxy collection is unavailable or drops required fields, export on each serving host for the same
 UTC interval and retain host/generation alongside the export:
 
 ```sh
@@ -89,7 +98,7 @@ journalctl -u proxy.service -u 'proxy-*.service' \
   jq -Rc 'fromjson? | select(.plane == "data" and .event_type != null)' > proxy-events.jsonl
 ```
 
-Missing central collection is an explicit rollout prerequisite, not proof that
+Field-preserving central collection is a prerequisite for central queries, not proof that
 the workload used no data-plane endpoints. The separately deployed QM management
 service must document its own actual sink and verified human attribution; do
 not assume an AWS service is collected into Cloud Logging.
@@ -149,11 +158,12 @@ jq -s '
   (reduce $primary[] as $e ({}; if $e.request_id then .[$e.request_id] = true else . end)) as $seen |
   ($primary + [.[] | select(.event_type == "proxy_forward" and ($seen[.request_id] != true))]) |
   group_by([.service, .plane, .method, .route, .actor_type, .actor_id,
-            .credential_id, .team_id, .resource_team_id, .status, .outcome, .event_type]) |
+            .credential_id, .team_id, .resource_team_id, .status, .authorization_outcome, .outcome, .event_type]) |
   map({service: .[0].service, plane: .[0].plane, method: .[0].method,
        route: .[0].route, actor_type: .[0].actor_type, actor_id: .[0].actor_id,
        credential_id: .[0].credential_id, team_id: .[0].team_id,
        resource_team_id: .[0].resource_team_id, status: .[0].status,
+       authorization_outcome: .[0].authorization_outcome,
        outcome: .[0].outcome, event_type: .[0].event_type, attempts: length})
 ' events.jsonl > endpoint-inventory.json
 ```

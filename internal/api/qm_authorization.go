@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/superserve-ai/sandbox/internal/requestlog"
 )
 
 type qmKeyIdentity struct {
@@ -93,8 +94,14 @@ func qmHuman(raw string, key ed25519.PublicKey, identity qmKeyIdentity, action s
 func qmAuthorizationHandler(authority qmIdentityAuthority, serviceToken string, humanKey ed25519.PublicKey) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
+		c.Set(logAuthorizationOutcomeKey, "not_evaluated")
 		defer func() {
 			if recover() != nil {
+				if logIdentity(c).AuthOutcome != "authenticated" {
+					logAuthOutcome(c, "error")
+				} else {
+					c.Set(logAuthorizationOutcomeKey, "error")
+				}
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "authorization_unavailable"})
 			}
 		}()
@@ -107,10 +114,22 @@ func qmAuthorizationHandler(authority qmIdentityAuthority, serviceToken string, 
 		// A service credential is distinct from any user's key and is never treated
 		// as authorization to a team. Missing service configuration fails closed.
 		if len(serviceToken) < 32 || len(token) > 4096 || subtle.ConstantTimeCompare([]byte(token), []byte(serviceToken)) != 1 {
+			outcome := "invalid"
+			if len(serviceToken) < 32 {
+				outcome = "error"
+			} else if token == "" {
+				outcome = "missing"
+			}
+			logAuthOutcome(c, outcome)
 			c.AbortWithStatusJSON(503, gin.H{"error": "service_authentication_failed"})
 			return
 		}
 		if key == "" || len(key) > 4096 {
+			outcome := "invalid"
+			if key == "" {
+				outcome = "missing"
+			}
+			logAuthOutcome(c, outcome)
 			c.AbortWithStatusJSON(401, gin.H{"error": "invalid_credentials"})
 			return
 		}
@@ -135,8 +154,10 @@ func qmAuthorizationHandler(authority qmIdentityAuthority, serviceToken string, 
 		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 4*time.Second)
 		defer cancel()
+		logAuthOutcome(c, "error")
 		identity, err := authority.Resolve(ctx, key)
 		if errors.Is(err, pgx.ErrNoRows) {
+			logAuthOutcome(c, "invalid")
 			c.AbortWithStatusJSON(401, gin.H{"error": "invalid_credentials"})
 			return
 		}
@@ -149,10 +170,16 @@ func qmAuthorizationHandler(authority qmIdentityAuthority, serviceToken string, 
 			return
 		}
 		decision := qmAuthorization{ActorType: "api_key", ActorID: identity.KeyID.String(), CredentialID: identity.KeyID.String(), TeamID: identity.TeamID.String(), OwnerID: identity.OwnerID.String(), AuthOutcome: "authenticated", AttributionStatus: "identified"}
+		c.Set(logIdentityKey, requestlog.Identity{
+			ActorType: decision.ActorType, ActorID: decision.ActorID,
+			CredentialID: decision.CredentialID, TeamID: decision.TeamID,
+			AuthOutcome: decision.AuthOutcome, AttributionStatus: decision.AttributionStatus,
+		})
 		actor := identity.OwnerID
 		if assertion != "" {
 			human, e := qmHuman(assertion, humanKey, identity, input.Action)
 			if e != nil {
+				logAuthOutcome(c, "invalid")
 				c.AbortWithStatusJSON(401, gin.H{"error": "invalid_human_assertion"})
 				return
 			}
@@ -160,6 +187,7 @@ func qmAuthorizationHandler(authority qmIdentityAuthority, serviceToken string, 
 			decision.ActorID = human.String()
 			decision.UserID = human.String()
 			actor = human
+			logHumanIdentity(c, human.String())
 		}
 		// Preserve the existing prohibition on ordinary RBAC use of impersonation keys.
 		if identity.Name != consoleImpersonationKeyName {
@@ -169,9 +197,15 @@ func qmAuthorizationHandler(authority qmIdentityAuthority, serviceToken string, 
 			}
 		}
 		if err != nil {
+			c.Set(logAuthorizationOutcomeKey, "error")
 			c.AbortWithStatusJSON(503, gin.H{"error": "authorization_unavailable"})
 			return
 		}
+		outcome := "denied"
+		if decision.Allowed {
+			outcome = "allowed"
+		}
+		c.Set(logAuthorizationOutcomeKey, outcome)
 		// Denials return the same verified identity; Allowed is the authorization result.
 		c.JSON(http.StatusOK, decision)
 	}

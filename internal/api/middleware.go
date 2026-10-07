@@ -238,6 +238,10 @@ func RequestLogger() gin.HandlerFunc {
 			evt = log.Warn()
 		}
 
+		switch outcome := c.GetString(logAuthorizationOutcomeKey); outcome {
+		case "allowed", "denied", "error", "not_evaluated":
+			evt.Str("authorization_outcome", outcome)
+		}
 		identity := logIdentity(c)
 		if identity.CredentialID != "" && c.GetString("api_key_id") == identity.CredentialID {
 			evt.Str("api_key_id", identity.CredentialID)

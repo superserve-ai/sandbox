@@ -9,6 +9,7 @@ import (
 )
 
 const logIdentityKey = "request_log_identity"
+const logAuthorizationOutcomeKey = "request_log_authorization_outcome"
 
 func logIdentity(c *gin.Context) requestlog.Identity {
 	i, _ := c.Get(logIdentityKey)
