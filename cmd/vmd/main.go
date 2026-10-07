@@ -27,6 +27,7 @@ import (
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
@@ -1577,6 +1578,10 @@ func main() {
 	maxStreams, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_STREAMS", "2000"))
 	grpcServer := grpc.NewServer(
 		grpc.MaxConcurrentStreams(uint32(maxStreams)),
+		// Clients ping idle connections every 30s; accept that and ping back so
+		// a dead connection is dropped on both ends.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 20 * time.Second, PermitWithoutStream: true}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 60 * time.Second, Timeout: 20 * time.Second}),
 		grpc.MaxRecvMsgSize(64<<20), // 64 MiB
 		grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			if !startupReady.Load() {
