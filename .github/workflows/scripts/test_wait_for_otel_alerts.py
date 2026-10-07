@@ -72,6 +72,24 @@ class AlertRolloutGateTests(unittest.TestCase):
         ]), self.assertRaisesRegex(RuntimeError, 'changed during'):
             MODULE.alert_applies_ready('example/repository', 'current', self.required)
 
+    def test_a_lagging_latest_read_is_not_a_supersede(self):
+        run = {'id': 37646813452, 'head_sha': 'current', 'head_branch': 'main', 'status': 'in_progress'}
+        for latest in (None, {'id': 37646813451, 'head_sha': 'older'}, {'id': 1, 'head_sha': 'current'}):
+            with self.subTest(latest=latest):
+                self.assertFalse(MODULE.superseded(latest, run, 'current'))
+        for latest in ({'id': 37646813453, 'head_sha': 'newer'},
+                       {'id': 37646813452, 'head_sha': 'different'}):
+            with self.subTest(latest=latest):
+                self.assertTrue(MODULE.superseded(latest, run, 'current'))
+
+    def test_an_empty_latest_page_does_not_refuse_a_live_rollout(self):
+        run = {'id': 123, 'head_sha': 'current', 'head_branch': 'main', 'status': 'in_progress'}
+        with patch.object(MODULE, 'api', side_effect=[
+            [{'workflow_runs': [run]}], [{'workflow_runs': []}], [{'jobs': self.jobs('success')}],
+            [{'workflow_runs': [run]}],
+        ]):
+            self.assertTrue(MODULE.alert_applies_ready('example/repository', 'current', self.required))
+
     def test_latest_lookup_does_not_scan_history_or_filter_by_sha(self):
         with patch.object(MODULE, 'api', return_value=[{'workflow_runs': []}]) as api:
             self.assertIsNone(MODULE.latest_alert_run('example/repository'))
