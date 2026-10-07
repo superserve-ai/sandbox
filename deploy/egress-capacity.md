@@ -52,7 +52,11 @@ workflow enforcement variable explicitly writes `false`; an omitted maximum
 preserves the host setting (or the binary default on a fresh host). When invoking
 the deployment script directly, omitted maximum/enforcement settings preserve
 existing host values. Preflight examines those effective values without sourcing
-the host environment file. Inherited scalar settings may have surrounding
+the host environment file. The workflow supplies the actual `DEPLOY_CELL` for
+each step. Direct staging invocations must set `DEPLOY_CELL=staging` to use the
+staging activation exemption; any other or omitted cell requires release/limit
+approval when enabling enforcement. Telemetry metadata does not select this gate.
+Inherited scalar settings may have surrounding
 whitespace or simple quotes. Invalid inherited scalar values require explicit
 deployment settings. Multiline/escaped host environment syntax must be normalized
 before deployment, even with explicit overrides: physical-line updates could

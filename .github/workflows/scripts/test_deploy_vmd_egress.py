@@ -15,7 +15,7 @@ spec.loader.exec_module(deploy)
 
 class EgressCapacityDeploymentTest(unittest.TestCase):
     def exercise(self, existing='', **overrides):
-        env = {'SHA': 'a' * 40, 'OTEL_ENVIRONMENT': 'production'}
+        env = {'SHA': 'a' * 40, 'DEPLOY_CELL': 'use4'}
         env.update(overrides)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'vmd.env'
@@ -39,11 +39,24 @@ class EgressCapacityDeploymentTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_staging_can_enable_and_reruns_preserve_optional_settings(self):
-        result, contents = self.exercise(OTEL_ENVIRONMENT='staging', VMD_EGRESS_ENFORCE='true', VMD_EGRESS_MAX_CONNECTIONS='8')
+        result, contents = self.exercise(DEPLOY_CELL='staging', VMD_EGRESS_ENFORCE='true', VMD_EGRESS_MAX_CONNECTIONS='8')
         self.assertEqual(result.returncode, 0, result.stderr)
-        result, again = self.exercise(contents.removeprefix('UNRELATED=preserve\n'), OTEL_ENVIRONMENT='staging')
+        result, again = self.exercise(contents.removeprefix('UNRELATED=preserve\n'), DEPLOY_CELL='staging')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(contents, again)
+
+    def test_telemetry_metadata_cannot_select_staging_exemption(self):
+        for cell in ('use4', 'usw2', '', 'unknown'):
+            with self.subTest(cell=cell):
+                result, contents = self.exercise(DEPLOY_CELL=cell, OTEL_ENVIRONMENT='staging',
+                                                VMD_EGRESS_ENFORCE='true')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('VMD_EGRESS_ENFORCE=', contents)
+        # The actual staging cell is exempt even with missing/conflicting telemetry.
+        for telemetry in ('', 'production'):
+            result, _ = self.exercise(DEPLOY_CELL='staging', OTEL_ENVIRONMENT=telemetry,
+                                      VMD_EGRESS_ENFORCE='true')
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_explicit_disable_is_safe_without_approval(self):
         result, contents = self.exercise('VMD_EGRESS_ENFORCE=true\nVMD_EGRESS_MAX_CONNECTIONS=8\n', VMD_EGRESS_ENFORCE='false')

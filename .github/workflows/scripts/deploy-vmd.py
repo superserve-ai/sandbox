@@ -16,7 +16,9 @@ Env vars:
                        GCP_REGION before deploying to a standby
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
-  SHA                  required — commit SHA (only first 8 chars used)
+  SHA                  required — commit SHA (full SHA binds egress rollout approval)
+  DEPLOY_CELL          optional — actual target cell; only staging exempts
+                       egress enforcement from release/limit rollout approval
   SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
   BACKUP_BUCKET        optional — the cell's artifact backup bucket. Upserted
                        into vmd.env when set; empty = skip, leaving the
@@ -390,7 +392,7 @@ def egress_capacity_settings(env):
 def egress_capacity_preflight(env):
     maximum, enforce = egress_capacity_settings(env)
     args = " ".join(shlex.quote(v) for v in (
-        maximum, enforce, env.get("OTEL_ENVIRONMENT", ""),
+        maximum, enforce, env.get("DEPLOY_CELL", ""),
         env.get("SHA", ""), env.get("VMD_EGRESS_ROLLOUT_APPROVAL", ""),
     ))
     # Interpret only simple scalar assignments; never source host environment
@@ -400,7 +402,7 @@ def egress_capacity_preflight(env):
         import re
         import sys
 
-        maximum, enforce, environment, sha, approval = sys.argv[1:]
+        maximum, enforce, cell, sha, approval = sys.argv[1:]
         wanted = set()
         if not maximum:
             wanted.add("VMD_EGRESS_MAX_CONNECTIONS")
@@ -437,7 +439,7 @@ def egress_capacity_preflight(env):
             sys.exit("Invalid effective egress capacity")
         if enforce not in ("true", "false"):
             sys.exit("Invalid effective egress enforcement")
-        if enforce == "true" and environment != "staging":
+        if enforce == "true" and cell != "staging":
             if not re.fullmatch(r"[0-9a-f]{40}", sha) or approval != sha + ":" + maximum:
                 sys.exit("Egress enforcement requires reviewed staging evidence and release:limit rollout approval")
     """)
