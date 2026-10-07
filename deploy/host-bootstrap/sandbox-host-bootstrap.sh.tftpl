@@ -1,3 +1,22 @@
+
+# Every connection a guest opens is a conntrack entry, and a guest can mint
+# entries far faster than they expire; at the kernel default of 262144 the
+# table fills and the host drops packets for every sandbox and for its own
+# control traffic. Sized for the fleet's memory, with unanswered SYN and UDP
+# entries expiring early so a spray drains itself. The module must be loaded
+# for the keys to exist, here and at boot before sysctl.d is applied.
+printf 'nf_conntrack\n' > /etc/modules-load.d/sandbox-conntrack.conf
+modprobe nf_conntrack
+if [ ! -f /etc/sysctl.d/90-sandbox-conntrack.conf ]; then
+  printf '%s\n' \
+    'net.netfilter.nf_conntrack_max = 4194304' \
+    'net.netfilter.nf_conntrack_buckets = 1048576' \
+    'net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 30' \
+    'net.netfilter.nf_conntrack_udp_timeout = 15' > /etc/sysctl.d/.90-sandbox-conntrack.conf.tmp
+  sysctl -q -p /etc/sysctl.d/.90-sandbox-conntrack.conf.tmp
+  mv /etc/sysctl.d/.90-sandbox-conntrack.conf.tmp /etc/sysctl.d/90-sandbox-conntrack.conf
+  sysctl -q --system || true
+fi
 #!/bin/bash
 # Host startup step: prepare a fresh sandbox host for its first vmd deploy.
 #
