@@ -63,12 +63,29 @@ resource "google_logging_log_view" "heartbeat_receipts" {
   filter      = "log_id(\"superserve_host_logs\") AND resource.type=\"gce_instance\" AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.environment=${jsonencode(var.environment)} AND labels.region=${jsonencode(var.region)}"
 }
 
+# Test the conditional grant on the real view after creation, so fresh projects
+# and partial applies both wait for IAM propagation before setting its policy.
+resource "terraform_data" "heartbeat_view_iam_ready" {
+  count            = var.legacy_policy_name == null ? 0 : 1
+  triggers_replace = [google_logging_log_view.heartbeat_receipts[0].id, filesha256("${path.module}/prerequisites.py")]
+  provisioner "local-exec" {
+    command = "python3 \"${path.module}/prerequisites.py\""
+    environment = {
+      HOST_LOGGING_PREREQUISITE = jsonencode({
+        phase = "view-iam"
+        view  = google_logging_log_view.heartbeat_receipts[0].id
+      })
+    }
+  }
+}
+
 resource "google_logging_log_view_iam_member" "heartbeat_reader" {
-  for_each = var.legacy_policy_name == null ? toset([]) : toset([for host in values(var.enrolled_hosts) : host.service_account_email])
-  parent   = google_logging_log_view.heartbeat_receipts[0].parent
-  location = google_logging_log_view.heartbeat_receipts[0].location
-  bucket   = google_logging_log_view.heartbeat_receipts[0].bucket
-  name     = google_logging_log_view.heartbeat_receipts[0].name
-  role     = "roles/logging.viewAccessor"
-  member   = "serviceAccount:${each.value}"
+  for_each   = var.legacy_policy_name == null ? toset([]) : toset([for host in values(var.enrolled_hosts) : host.service_account_email])
+  parent     = google_logging_log_view.heartbeat_receipts[0].parent
+  location   = google_logging_log_view.heartbeat_receipts[0].location
+  bucket     = google_logging_log_view.heartbeat_receipts[0].bucket
+  name       = google_logging_log_view.heartbeat_receipts[0].name
+  depends_on = [terraform_data.heartbeat_view_iam_ready]
+  role       = "roles/logging.viewAccessor"
+  member     = "serviceAccount:${each.value}"
 }

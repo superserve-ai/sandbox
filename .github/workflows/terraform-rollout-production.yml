@@ -77,6 +77,8 @@ jobs:
           terraform -chdir=infra/envs/production/us-central1 init -input=false
           terraform -chdir=infra/envs/production/us-central1 plan -input=false \
             -target=google_project_iam_member.cd_credentials_key_iam \
+            -target=terraform_data.host_logging_project_features \
+            -target=google_project_iam_member.cd_heartbeat_view_iam \
             -target=google_project_iam_member.cd_host_logging \
             -target=google_project_service.host_log_os_config -out=cd-key.tfplan
           terraform -chdir=infra/envs/production/us-central1 apply -input=false -auto-approve cd-key.tfplan
