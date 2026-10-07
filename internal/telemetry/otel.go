@@ -579,8 +579,10 @@ func (r *OTelRecorder) RecordHostConntrack(ctx context.Context, c HostConntrack)
 	r.hostConntrackBuckets.Record(ctx, c.Buckets, opt)
 	r.hostConntrackSynTimeout.Record(ctx, c.TCPSynSentTimeoutSecs, opt)
 	r.hostConntrackUDPTimeout.Record(ctx, c.UDPTimeoutSecs, opt)
-	r.hostConntrackDrops.Record(ctx, c.Drops, opt)
-	r.hostConntrackEarlyDrops.Record(ctx, c.EarlyDrops, opt)
+	if c.DropsKnown {
+		r.hostConntrackDrops.Record(ctx, c.Drops, opt)
+		r.hostConntrackEarlyDrops.Record(ctx, c.EarlyDrops, opt)
+	}
 }
 
 func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {

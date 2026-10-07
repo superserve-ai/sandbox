@@ -28,9 +28,11 @@ type HostConntrack struct {
 	UDPTimeoutSecs        int64
 	// Drops and EarlyDrops are the kernel's cumulative counts of packets
 	// refused and entries evicted because the table was full: a burst that
-	// fills and drains between two samples still moves them.
+	// fills and drains between two samples still moves them. Exported only
+	// when DropsKnown: kernels without conntrack procfs stats have no source.
 	Drops      int64
 	EarlyDrops int64
+	DropsKnown bool
 }
 
 // StartHostConntrackSampler exports the conntrack table's fill and settings
@@ -45,15 +47,19 @@ func StartHostConntrackSampler(ctx context.Context, recorder Recorder, hostID st
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		warnedDrops := false
 		for {
 			c, err := readHostConntrack(conntrackSysctlDir)
-			if err == nil {
-				c.Drops, c.EarlyDrops, err = readConntrackDrops(conntrackStatPath)
-			}
 			if err != nil {
 				log.Warn().Err(err).Msg("conntrack sample skipped")
 			} else {
 				c.HostID = hostID
+				c.Drops, c.EarlyDrops, err = readConntrackDrops(conntrackStatPath)
+				c.DropsKnown = err == nil
+				if err != nil && !warnedDrops {
+					warnedDrops = true
+					log.Warn().Err(err).Msg("conntrack drop counters unavailable; exporting fill and settings only")
+				}
 				recorder.RecordHostConntrack(ctx, c)
 			}
 			select {
