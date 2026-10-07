@@ -212,11 +212,13 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
 	if fail != nil {
 		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("terminal: auth failed")
+		retainVerifiedCaller(r, fail.Caller)
 		fail.write(w)
 		return
 	}
+	retainVerifiedCaller(r, info.MachineCaller)
 	if !verifyMachineProxyOperation(token, h.seedKey, instanceID, r.Method, terminalPath) {
-		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted"}).write(w)
+		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted", Code: "operation_denied", Caller: info.MachineCaller}).write(w)
 		return
 	}
 	bridgeCtx, cleanup, ok := h.machineSessionContext(r.Context(), token)

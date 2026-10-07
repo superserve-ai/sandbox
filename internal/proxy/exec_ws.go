@@ -183,11 +183,13 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	tAuthDone = time.Now()
 	if fail != nil {
 		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("exec/ws: auth failed")
+		retainVerifiedCaller(r, fail.Caller)
 		fail.write(w)
 		return
 	}
+	retainVerifiedCaller(r, info.MachineCaller)
 	if !verifyMachineProxyOperation(token, h.seedKey, instanceID, r.Method, execConnectPath) {
-		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted"}).write(w)
+		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted", Code: "operation_denied", Caller: info.MachineCaller}).write(w)
 		return
 	}
 	bridgeCtx, cleanup, ok := h.machineSessionContext(r.Context(), token)

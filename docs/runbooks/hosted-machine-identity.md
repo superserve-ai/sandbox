@@ -32,10 +32,27 @@ The proxy resolver/VMD attestation for a machine-owned sandbox must include
 Machine capabilities are rejected when any binding is absent or mismatched;
 the proxy never infers ownership from a human `owner_id`. A VMD response also
 attests `ownership_state` as `machine`, `ordinary`, or `unknown`; unknown is a
-denial state. Authorized humans receive a typed `mcap.v1` child with
-`caller_kind=human` and an explicit actor ID, team, operation subset,
-`sandbox-proxy` audience, and bounded expiry. It never carries machine-owner
-lineage or falls back to a legacy token for a machine-owned row.
+denial state. Authorized team API keys receive a typed `mcap.v1` child with
+`caller_kind=api_key`, the verified `parent_credential_id`, team, operation
+subset, and `sandbox-proxy` audience. Expiry is capped at the earlier of fifteen
+minutes and the parent key expiry. An API key creator is not a verified human
+session: these claims omit actor identity and machine-owner lineage. The
+`human` kind is reserved for independently verified human sessions; the API-key
+producer does not issue it. Ownership lookup failures never produce legacy
+capabilities. Ordinary sandboxes retain legacy compatibility after confirmed
+absence of a machine-owner association.
+
+Attribution consumers can read `VerifiedMachineCallerFromContext` after API
+credential verification, including route denials, without treating it as an
+authorization grant. Proxy `VerifiedCallerFromContext` carries authenticated
+identity through resource and operation denials; failed authentication has no
+verified caller. API-key claims identify their parent key, never its creator as
+the current user. Peer destinations independently verify the capability.
+
+Resume performs one bounded indexed ownership lookup before claiming or
+publishing a replacement VM. The result is reused within the request for token
+production. It must be synchronous because publishing a replacement with a
+human owner would remove the machine access boundary.
 
 ## Durable lifecycle handoff
 
@@ -50,13 +67,18 @@ The authorized control-plane/provisioning actor owns these fenced operations:
 | Disable | Invalidate every credential and block new issuance. |
 | Restore | Reuse the same principal during the authorized same-tenant seven-day recovery window and issue fresh credentials; old generations remain invalid. |
 
-Every mutating request carries an operation ID, expected generation, canonical
-permission/audience policy, credential digest, and replacement target where
-applicable. The authority stores a digest of those inputs and the resulting
-credential ID atomically. A matching response-loss retry returns that recorded
-result; a conflicting reuse, stale generation, invalid replacement, or retry
-after a later disable is denied without mutation. Rotation validates and locks
-the active current-generation replacement before revoking exactly that row.
+Credential issue, rotate, and restore requests carry an operation ID and
+expected generation; rotation also binds the replacement target. The server
+supplies the permission/audience policy and hashes the supplied credential.
+The authority stores the input digest and resulting credential ID atomically.
+A matching response-loss retry returns the recorded credential with its current
+state and original expiry, including revoked state after disable. Conflicting
+reuse, stale generation on a new operation, or an invalid replacement is denied
+without mutation. Ensure uses the immutable tenant/team tuple; credential
+revoke is monotonic and idempotent. Disable also requires an operation ID and expected generation;
+its durable result prevents a delayed retry from disabling a restored
+generation. Rotation validates and locks the active current-generation
+replacement before revoking exactly that row.
 
 Runtime machine credentials cannot invoke these operations or change tenant,
 team, owner, scope, or template associations. Secret payloads and credential
@@ -69,7 +91,68 @@ or continuation checks the local generation/expiry snapshot without a
 per-frame database call. Durable revoke/disable invalidation closes matching
 registrations immediately, while bounded freshness refresh fails closed when
 the authority store is unavailable. Deployment must measure the multi-instance
-result against the 30-second maximum.
+result against the 30-second maximum. Local response transports and remote
+edge bridges close on cancellation, including when a client stops reading.
+
+Machine API bodies are limited to 1 MiB and read under a five-second socket
+deadline before credential verification. Authority lookups have a separate
+bounded deadline; neither limit shortens VM startup. Runtime machine request
+capture is excluded from error reporting to protect credential material.
+
+## Operator administration transport
+
+Provisioning and credential-delivery owners invoke the sandbox API over TLS
+using `Authorization: Bearer <operator credential>` backed by
+`OPERATOR_API_TOKEN`. The infrastructure `INTERNAL_API_TOKEN`, tenant API keys,
+and runtime machine credentials cannot administer identity. Requests carrying
+`X-QM-Machine-Credential` are rejected even when an operator token is also
+present. The operator token must never be delivered to a hosted runtime.
+
+All routes below are under `/internal/machine-identity`:
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /principals` | JSON `team_id`, `hosted_tenant_id`, `approved_template_id`; returns the immutable principal and current generation. |
+| `GET /principals/{principal_id}` | Returns `principal_id`, `team_id`, `hosted_tenant_id`, `status`, and `generation` for lifecycle fencing. |
+| `POST /principals/{principal_id}/credentials/issue` | Fenced credential request; returns credential metadata. |
+| `POST /principals/{principal_id}/credentials/rotate` | Fenced credential request plus `replacement_credential_id`; replaces only that credential. |
+| `POST /principals/{principal_id}/credentials/restore` | Fenced credential request; restores the same principal within its recovery window. |
+| `POST /principals/{principal_id}/disable` | JSON `operation_id` and `expected_generation`; disables the principal and its credentials once for that fence; returns 204. |
+| `POST /credentials/{credential_id}/revoke` | Revokes that credential; returns 204. |
+
+A fenced credential request contains `operation_id` (a nonzero UUID),
+`expected_generation` (the positive generation just read), and
+`credential_material` (canonical unpadded base64url of 32 cryptographically
+random bytes). The external delivery owner generates the material once,
+stores it securely before invocation, and reuses the exact material and
+operation ID after a lost response. The runtime presents that encoded string
+as its machine credential. Secrets belong only in the TLS-protected request
+body, never in URLs or logs. Responses contain only `credential_id`,
+`principal_id`, `lineage_id`, `state`, `expires_at`, and
+`revocation_generation`; they never return credential material. The server
+supplies operation permissions, audiences, expiry, and lineage policy.
+
+JSON bodies are limited to 4 KiB and reject unknown fields or trailing values.
+Invalid request fields return 400; missing/wrong operator authentication returns
+401; a mixed runtime/admin identity returns 403; state/fence conflicts return
+409; unavailable or unconfigured authority returns 503. Readiness gates apply
+to principal creation, issuance, rotation and restore. Revocation, disablement,
+and principal reads remain available when issuance is disabled. Operator
+callers must handle an uncertain result by reconciling or retrying the same
+operation rather than creating a second credential.
+
+Invocation scheduling, protected delivery to the dedicated runtime, activation
+of the replacement credential, shutdown/quarantine, and client rollout belong
+to their respective control-plane owners. A successful local API test does not
+establish that those integrations are deployed. After PR creation and before
+production issuance, rollout, or completion, record staging evidence for:
+
+- multi-instance revocation and active-stream closure within 30 seconds of the
+  durable commit, including lost notifications and unavailable authority;
+- operator invocation, response-loss retries, rotation, creator offboarding,
+  disablement and same-tenant restore with fresh credentials;
+- recreated sandbox ownership, legacy/downgrade refusal, approved-template
+  enforcement, compatible clients, and safe attribution on both API and proxy.
 
 ## Ownership and rollout seam
 

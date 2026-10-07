@@ -20,10 +20,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.Use(
 		SecurityHeaders(),
 		TeamCreationReadDeadline(),
+		machineAdministrationReadDeadline(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),
 		ErrorHandler(),
 		sentrygin.New(sentrygin.Options{Repanic: true}),
+		machineAdministrationPrivacy(),
 	)
 
 	api := r.Group("/")
@@ -176,6 +178,15 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.GET("/abuse/trusted-identities", h.ListPlatformAbuseTrustedIdentities)
 		operator.POST("/abuse/trusted-identities", h.AddPlatformAbuseTrustedIdentity)
 		operator.POST("/abuse/trusted-identities/:identity_id/revoke", h.RevokePlatformAbuseTrustedIdentity)
+	}
+
+	machineAdministration := operator.Group("/machine-identity", machineAdministrationAuthorization())
+	{
+		machineAdministration.POST("/principals", h.EnsureMachinePrincipal)
+		machineAdministration.GET("/principals/:principal_id", h.GetMachinePrincipal)
+		machineAdministration.POST("/principals/:principal_id/credentials/:action", h.MutateMachineCredential)
+		machineAdministration.POST("/principals/:principal_id/disable", h.DisableMachinePrincipal)
+		machineAdministration.POST("/credentials/:credential_id/revoke", h.RevokeMachineCredential)
 	}
 
 	// Internal endpoints — authenticated via a shared token (not per-team

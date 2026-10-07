@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
@@ -114,10 +115,21 @@ func (a *DBMachineAuthority) ResolveMachineCredential(ctx context.Context, raw s
 	if strings.TrimSpace(raw) == "" {
 		return auth.CallerContext{}, auth.ErrInvalidMachineIdentity
 	}
+	// A delayed pre-revocation observation cannot authorize a request after
+	// the freshness bound, even if the store ignores cancellation.
+	lookupDeadline := time.Now().Add(3 * time.Second)
+	ctx, cancel := context.WithDeadline(ctx, lookupDeadline)
+	defer cancel()
 	digest := sha256.Sum256([]byte(raw))
 	row, err := a.Queries.LookupMachineCredentialByHash(ctx, digest[:])
+	if ctx.Err() != nil || !time.Now().Before(lookupDeadline) {
+		return auth.CallerContext{}, ErrMachineAuthorityUnavailable
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return auth.CallerContext{}, auth.ErrInvalidMachineIdentity
+	}
 	if err != nil {
-		return auth.CallerContext{}, err
+		return auth.CallerContext{}, errors.Join(ErrMachineAuthorityUnavailable, err)
 	}
 	permissions := make([]auth.MachineOperation, 0, len(row.Credential.Permissions))
 	for _, rawPermission := range row.Credential.Permissions {
@@ -179,10 +191,7 @@ func lifecycleLineage(operationID uuid.UUID) uuid.UUID {
 }
 
 func lifecycleExpiry(now time.Time) time.Time {
-	// Round the server-generated expiry to a stable hour so response-loss
-	// retries reuse the same persisted authority inputs.
-	base := now.Add(24 * time.Hour)
-	return base.Truncate(time.Hour).Add(time.Hour)
+	return now.Add(24 * time.Hour)
 }
 
 func (a *DBMachineAuthority) EnsurePrincipal(ctx context.Context, teamID, tenantID, templateID uuid.UUID, _ string) (auth.MachinePrincipal, error) {
@@ -215,7 +224,7 @@ func (a *DBMachineAuthority) IssueCredentialFenced(ctx context.Context, principa
 	if a.Now != nil {
 		now = a.Now()
 	}
-	row, err := a.Queries.IssueMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	row, err := a.Queries.IssueMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID, GeneratedExpiry: true})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}
@@ -238,7 +247,7 @@ func (a *DBMachineAuthority) RotateCredentialFenced(ctx context.Context, princip
 	if a.Now != nil {
 		now = a.Now()
 	}
-	row, err := a.Queries.RotateMachineCredentialTargeted(ctx, principalID, replacementID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	row, err := a.Queries.RotateMachineCredentialTargeted(ctx, principalID, replacementID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID, GeneratedExpiry: true})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}
@@ -253,10 +262,17 @@ func (a *DBMachineAuthority) RevokeCredential(ctx context.Context, credentialID 
 }
 
 func (a *DBMachineAuthority) DisablePrincipal(ctx context.Context, principalID uuid.UUID, _ string) error {
+	return fmt.Errorf("machine disable requires an explicit generation and operation fence")
+}
+
+func (a *DBMachineAuthority) DisablePrincipalFenced(ctx context.Context, principalID uuid.UUID, expectedGeneration int64, operationID uuid.UUID) error {
 	if !authorizedControlPlane(ctx) {
 		return auth.ErrMachineCapabilityDenied
 	}
-	return a.Queries.DisableMachinePrincipal(ctx, principalID)
+	if a == nil || a.Queries == nil {
+		return ErrMachineAuthorityUnavailable
+	}
+	return a.Queries.DisableMachinePrincipalFenced(ctx, principalID, db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
 }
 
 func (a *DBMachineAuthority) RestorePrincipal(_ context.Context, _ uuid.UUID, _ string) (auth.MachineCredential, error) {
@@ -275,7 +291,7 @@ func (a *DBMachineAuthority) RestorePrincipalFenced(ctx context.Context, princip
 	if a.Now != nil {
 		now = a.Now()
 	}
-	row, err := a.Queries.RestoreMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	row, err := a.Queries.RestoreMachineCredentialFenced(ctx, principalID, lifecycleLineage(operationID), digest[:], lifecycleExpiry(now), trustedMachineOperations(), "sandbox-api", db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID, GeneratedExpiry: true})
 	if err != nil {
 		return auth.MachineCredential{}, err
 	}

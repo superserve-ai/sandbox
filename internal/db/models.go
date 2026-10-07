@@ -739,8 +739,25 @@ type MachineCredential struct {
 	RevocationGeneration int64              `json:"revocation_generation"`
 	Permissions          []string           `json:"permissions"`
 	Audience             string             `json:"audience"`
+	SecretHash           []byte             `json:"secret_hash"`
 	IssuedAt             time.Time          `json:"issued_at"`
 	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type MachineLifecycleOperation struct {
+	PrincipalID             uuid.UUID   `json:"principal_id"`
+	OperationID             uuid.UUID   `json:"operation_id"`
+	OperationKind           string      `json:"operation_kind"`
+	ExpectedGeneration      int64       `json:"expected_generation"`
+	InputDigest             []byte      `json:"input_digest"`
+	LineageID               uuid.UUID   `json:"lineage_id"`
+	CredentialDigest        []byte      `json:"credential_digest"`
+	ReplacementCredentialID pgtype.UUID `json:"replacement_credential_id"`
+	ExpiresAt               time.Time   `json:"expires_at"`
+	Permissions             []string    `json:"permissions"`
+	Audience                string      `json:"audience"`
+	ResultCredentialID      pgtype.UUID `json:"result_credential_id"`
+	CreatedAt               time.Time   `json:"created_at"`
 }
 
 type MachinePrincipal struct {

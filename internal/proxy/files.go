@@ -191,7 +191,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 	if !ok {
 		return
 	}
-	boundRequest, cleanup, sessionOK := h.bindMachineRequest(r, token)
+	boundRequest, cleanup, sessionOK := h.bindMachineRequest(w, r, token)
 	if !sessionOK {
 		(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
 		return

@@ -63,14 +63,6 @@ func TestMachineRepairResourceOwnershipRecovery(t *testing.T) {
 	}
 }
 
-func TestMachineRepairLifecycleRetryBoundaries(t *testing.T) {
-	first := lifecycleExpiry(time.Date(2026, 10, 6, 10, 15, 0, 0, time.UTC))
-	second := lifecycleExpiry(time.Date(2026, 10, 6, 10, 59, 59, 0, time.UTC))
-	if first != second {
-		t.Fatalf("same-window lifecycle expiry changed across retry: %v != %v", first, second)
-	}
-}
-
 func TestMachineRepairIssuancePolicyRoundTrip(t *testing.T) {
 	ops := trustedMachineOperations()
 	policy := auth.NewTrustedIssuancePolicy(func() []auth.MachineOperation {

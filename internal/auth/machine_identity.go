@@ -43,6 +43,8 @@ const (
 	MachineOperationFileList      MachineOperation = "file:list"
 	MachineOperationFileImport    MachineOperation = "file:import"
 	MachineOperationFileExport    MachineOperation = "file:export"
+	TeamOperationDesktopRead      MachineOperation = "desktop:read"
+	TeamOperationDesktopWrite     MachineOperation = "desktop:write"
 )
 
 type PrincipalStatus string
@@ -151,7 +153,7 @@ type MachineCapability struct {
 	ExpiresAt            time.Time          `json:"expires_at"`
 	RevocationGeneration uint64             `json:"revocation_generation"`
 	// CallerKind is "machine" for lineage-bound machine authority and
-	// "human" for a separately verified human parent session. Human claims
+	// "human" for a verified human session, or "api_key" for a team key. Team claims
 	// never impersonate the machine owner.
 	CallerKind         string    `json:"caller_kind,omitempty"`
 	ActorID            uuid.UUID `json:"actor_id,omitempty"`
@@ -233,12 +235,24 @@ func (o SandboxOwnership) Validate() error {
 }
 
 func (c MachineCapability) ValidateAt(now time.Time) error {
-	human := c.CallerKind == "human" && c.ActorID != uuid.Nil
+	switch c.CallerKind {
+	case "", "machine", "human", "api_key":
+	default:
+		return ErrMachineCapabilityDenied
+	}
+	if c.IsTeamCapability() && (c.PrincipalID != uuid.Nil || c.CredentialID != uuid.Nil || c.LineageID != uuid.Nil || c.RevocationGeneration != 0) {
+		return ErrMachineCapabilityDenied
+	}
+	if c.CallerKind == "api_key" && (c.ParentCredentialID == uuid.Nil || c.ActorID != uuid.Nil) {
+		return ErrMachineCapabilityDenied
+	}
+
+	human := (c.CallerKind == "human" && c.ActorID != uuid.Nil) || (c.CallerKind == "api_key" && c.ParentCredentialID != uuid.Nil)
 	if (!human && (c.PrincipalID == uuid.Nil || c.CredentialID == uuid.Nil || c.LineageID == uuid.Nil || c.RevocationGeneration == 0)) || c.TeamID == uuid.Nil || c.SandboxID == uuid.Nil || c.Audience == "" || c.ExpiresAt.IsZero() || !now.Before(c.ExpiresAt) || len(c.Operations) == 0 {
 		return ErrMachineCapabilityDenied
 	}
 	for _, operation := range c.Operations {
-		if !isKnownMachineOperation(operation) {
+		if !isKnownMachineOperation(operation) && !(c.IsTeamCapability() && isTeamDesktopOperation(operation)) {
 			return ErrMachineCapabilityDenied
 		}
 	}
@@ -253,7 +267,7 @@ func DeriveHumanCapability(actorID, teamID, sandboxID uuid.UUID, audience string
 		return MachineCapability{}, ErrMachineCapabilityDenied
 	}
 	for _, op := range operations {
-		if !isKnownMachineOperation(op) {
+		if !isKnownMachineOperation(op) && !isTeamDesktopOperation(op) {
 			return MachineCapability{}, ErrMachineCapabilityDenied
 		}
 	}
@@ -267,6 +281,26 @@ func DeriveHumanCapabilityWithParent(actorID, parentCredentialID, teamID, sandbo
 	}
 	capability.ParentCredentialID = parentCredentialID
 	return capability, nil
+}
+
+// IsTeamCapability distinguishes authenticated team authority from machine lineage.
+func (c MachineCapability) IsTeamCapability() bool {
+	return c.CallerKind == "human" || c.CallerKind == "api_key"
+}
+
+// DeriveAPIKeyCapability carries the authenticated key, not its creator as a
+// verified human. A child cannot outlive a finite parent credential.
+func DeriveAPIKeyCapability(parentID, teamID, sandboxID uuid.UUID, audience string, operations []MachineOperation, expiresAt, parentExpiresAt, now time.Time) (MachineCapability, error) {
+	if !parentExpiresAt.IsZero() && parentExpiresAt.Before(expiresAt) {
+		expiresAt = parentExpiresAt
+	}
+	c := MachineCapability{CallerKind: "api_key", ParentCredentialID: parentID,
+		TeamID: teamID, SandboxID: sandboxID, Audience: audience,
+		Operations: slices.Clone(operations), ExpiresAt: expiresAt}
+	if err := c.ValidateAt(now); err != nil {
+		return MachineCapability{}, err
+	}
+	return c, nil
 }
 
 // VerifyMachineCapability checks a signed, server-issued capability. The
@@ -652,6 +686,10 @@ func ValidateMachineCreate(caller CallerContext, templateID *uuid.UUID, snapshot
 	return nil
 }
 
+func isTeamDesktopOperation(operation MachineOperation) bool {
+	return operation == TeamOperationDesktopRead || operation == TeamOperationDesktopWrite
+}
+
 func isKnownMachineOperation(operation MachineOperation) bool {
 	switch operation {
 	case MachineOperationCreate, MachineOperationList, MachineOperationRead,
@@ -680,12 +718,13 @@ type PrincipalLifecycle interface {
 }
 
 // FencedPrincipalLifecycle is the production form of the handoff. The
-// expected generation and operation identity are mandatory for every
-// mutating request; callers may not replay a completed transition against a
+// expected generation and operation identity fence issuance and principal
+// transitions; callers may not replay a completed transition against a
 // newer disable/restore generation.
 type FencedPrincipalLifecycle interface {
 	PrincipalLifecycle
 	IssueCredentialFenced(context.Context, uuid.UUID, string, int64, uuid.UUID) (MachineCredential, error)
 	RotateCredentialFenced(context.Context, uuid.UUID, uuid.UUID, string, int64, uuid.UUID) (MachineCredential, error)
 	RestorePrincipalFenced(context.Context, uuid.UUID, string, int64, uuid.UUID) (MachineCredential, error)
+	DisablePrincipalFenced(context.Context, uuid.UUID, int64, uuid.UUID) error
 }

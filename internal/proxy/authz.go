@@ -23,6 +23,18 @@ type authzFailure struct {
 }
 
 type machineCapabilityContextKey struct{}
+type verifiedCallerContextKey struct{}
+
+func VerifiedCallerFromContext(ctx context.Context) (auth.CallerContext, bool) {
+	caller, ok := ctx.Value(verifiedCallerContextKey{}).(auth.CallerContext)
+	return caller, ok
+}
+
+func retainVerifiedCaller(r *http.Request, caller *auth.CallerContext) {
+	if caller != nil {
+		*r = *r.WithContext(context.WithValue(r.Context(), verifiedCallerContextKey{}, *caller))
+	}
+}
 
 func (f *authzFailure) write(w http.ResponseWriter) {
 	if f.Code != "" {
@@ -69,7 +81,7 @@ func (h *Handler) authorizeSandboxRequest(
 	var verifiedCapability *auth.MachineCapability
 	if strings.HasPrefix(token, "mcap.") {
 		capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
-		if err == nil && capability.CallerKind != "human" {
+		if err == nil && !capability.IsTeamCapability() {
 			if h.machineAuthority == nil {
 				return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}
 			}
@@ -86,6 +98,10 @@ func (h *Handler) authorizeSandboxRequest(
 		}
 	}
 
+	var verifiedCaller *auth.CallerContext
+	if verifiedCapability != nil {
+		verifiedCaller = callerContextFromCapability(*verifiedCapability)
+	}
 	info, err := h.resolver.Lookup(ctx, requestSandboxID)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
@@ -93,12 +109,14 @@ func (h *Handler) authorizeSandboxRequest(
 				Status:  http.StatusNotFound,
 				Message: "sandbox not found",
 				Code:    "sandbox_route_stale",
+				Caller:  verifiedCaller,
 			}
 		}
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusServiceUnavailable,
 			Message: "sandbox unavailable",
 			Code:    "sandbox_unavailable",
+			Caller:  verifiedCaller,
 		}
 	}
 	ownershipState := info.OwnershipState
@@ -121,7 +139,7 @@ func (h *Handler) authorizeSandboxRequest(
 		// machine principal and team. Missing attestation fails closed rather
 		// than falling back to the human owner or public headers.
 		capabilityTeam := verifiedCapability.TeamID.String()
-		if verifiedCapability.CallerKind == "human" {
+		if verifiedCapability.IsTeamCapability() {
 			if info.TeamID == "" || capabilityTeam != info.TeamID || ownershipState == auth.OwnershipUnknown {
 				return InstanceInfo{}, &authzFailure{Status: http.StatusForbidden, Message: "sandbox ownership could not be verified", Code: "sandbox_ownership_denied", Caller: callerContextFromCapability(*verifiedCapability)}
 			}
@@ -129,7 +147,7 @@ func (h *Handler) authorizeSandboxRequest(
 			return InstanceInfo{}, &authzFailure{Status: http.StatusForbidden, Message: "machine sandbox ownership could not be verified", Code: "sandbox_ownership_denied", Caller: callerContextFromCapability(*verifiedCapability)}
 		}
 		credentialID := verifiedCapability.CredentialID
-		if verifiedCapability.CallerKind == "human" {
+		if verifiedCapability.IsTeamCapability() {
 			credentialID = verifiedCapability.ParentCredentialID
 		}
 		info.MachineCaller = &auth.CallerContext{
@@ -146,6 +164,7 @@ func (h *Handler) authorizeSandboxRequest(
 			Status:  http.StatusServiceUnavailable,
 			Message: fmt.Sprintf("sandbox is %s", info.Status),
 			Code:    "sandbox_unavailable",
+			Caller:  verifiedCaller,
 		}
 	}
 
@@ -154,7 +173,7 @@ func (h *Handler) authorizeSandboxRequest(
 
 func callerContextFromCapability(capability auth.MachineCapability) *auth.CallerContext {
 	credentialID := capability.CredentialID
-	if capability.CallerKind == "human" {
+	if capability.IsTeamCapability() {
 		credentialID = capability.ParentCredentialID
 	}
 	return &auth.CallerContext{
@@ -205,6 +224,14 @@ func verifyMachineProxyOperation(token string, signingKey []byte, sandboxID, met
 		return true
 	}
 	operation, ok := machineOperationForProxyPath(method, path)
+	if !ok && method == http.MethodPost {
+		switch path {
+		case desktopScreenshotPath, desktopStreamPath:
+			operation, ok = auth.TeamOperationDesktopRead, true
+		case desktopSendPointerPath, desktopSendKeyPath, desktopScrollPath, desktopResizePath, desktopSendActionsPath:
+			operation, ok = auth.TeamOperationDesktopWrite, true
+		}
+	}
 	return ok && VerifyMachineOperation(token, signingKey, sandboxID, operation, time.Now())
 }
 
@@ -220,7 +247,7 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 	if err != nil {
 		return parent, func() {}, false
 	}
-	if capability.CallerKind == "human" {
+	if capability.IsTeamCapability() {
 		// Human child claims are bounded by their typed capability expiry and
 		// carry no machine credential lineage to register in the machine fence.
 		ctx, cancel := context.WithDeadline(parent, capability.ExpiresAt)
@@ -262,12 +289,17 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 			if capability.ExpiresAt.Before(deadline) {
 				deadline = capability.ExpiresAt
 			}
-			wait := time.Until(deadline) - 100*time.Millisecond
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				h.sessions.Expire(id)
+				return
+			}
+			wait := remaining / 2
 			if wait > time.Second {
 				wait = time.Second
 			}
-			if wait < 0 {
-				wait = 0
+			if wait < time.Millisecond {
+				wait = time.Millisecond
 			}
 			timer := time.NewTimer(wait)
 			select {
@@ -281,7 +313,7 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 					err        error
 				}
 				resultCh := make(chan refreshResult, 1)
-				refreshCtx, refreshCancel := context.WithTimeout(context.Background(), time.Second)
+				refreshCtx, refreshCancel := context.WithTimeout(ctx, time.Second)
 				go func() {
 					generation, nextUntil, refreshErr := h.refreshMachineAuthority(refreshCtx, capability)
 					resultCh <- refreshResult{generation: generation, until: nextUntil, err: refreshErr}
@@ -296,6 +328,7 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 					h.sessions.Expire(id)
 					return
 				case <-ctx.Done():
+					hardDeadline.Stop()
 					refreshCancel()
 					return
 				}
@@ -310,6 +343,7 @@ func (h *Handler) machineSessionContext(parent context.Context, token string) (c
 					freshUntil = capability.ExpiresAt
 				}
 			case <-ctx.Done():
+				timer.Stop()
 				return
 			}
 		}
@@ -343,12 +377,36 @@ func (h *Handler) refreshMachineAuthority(ctx context.Context, capability auth.M
 	return h.lookupMachineAuthority(ctx, capability)
 }
 
-func (h *Handler) bindMachineRequest(r *http.Request, token string) (*http.Request, func(), bool) {
+func (h *Handler) bindMachineRequest(w http.ResponseWriter, r *http.Request, token string) (*http.Request, func(), bool) {
 	ctx, cleanup, ok := h.machineSessionContext(r.Context(), token)
 	if !ok {
 		return r, cleanup, false
 	}
-	return r.WithContext(withMachineCapability(ctx, token, h.seedKey)), cleanup, true
+	if !strings.HasPrefix(token, "mcap.") {
+		return r.WithContext(ctx), cleanup, true
+	}
+	// Canceling the upstream request does not interrupt a blocked downstream
+	// Write or request-body Read. Deadline the actual client transport too.
+	controller := http.NewResponseController(w)
+	finished := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(finished)
+		_ = controller.SetReadDeadline(time.Now())
+		_ = controller.SetWriteDeadline(time.Now())
+	})
+	var once sync.Once
+	finish := func() {
+		once.Do(func() {
+			// Join cancellation before this writer can belong to a later
+			// keepalive request. Normal completion must stop the callback
+			// before cleanup cancels the session context.
+			if !stop() {
+				<-finished
+			}
+			cleanup()
+		})
+	}
+	return r.WithContext(withMachineCapability(ctx, token, h.seedKey)), finish, true
 }
 
 func withMachineCapability(ctx context.Context, token string, signingKey []byte) context.Context {

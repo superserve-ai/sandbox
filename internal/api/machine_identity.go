@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -15,6 +17,8 @@ import (
 )
 
 const machineCallerContextKey = "machine_caller"
+const machineRequestBodyLimit = 1 << 20
+const machineAuthorityTimeout = 5 * time.Second
 
 // MachineCredentialResolver is implemented by the owning control-plane
 // integration. It returns verified durable identity; it must not return raw
@@ -24,6 +28,10 @@ type MachineCredentialResolver interface {
 }
 
 func MachineCredentialAuth(resolver MachineCredentialResolver) gin.HandlerFunc {
+	return machineCredentialAuthWithClock(resolver, time.Now)
+}
+
+func machineCredentialAuthWithClock(resolver MachineCredentialResolver, now func() time.Time) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Start the shared auth phase before resolving the durable machine
 		// authority so machine lookup latency and failure paths remain visible
@@ -35,6 +43,12 @@ func MachineCredentialAuth(resolver MachineCredentialResolver) gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		if !bufferMachineRequestBody(c) {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
+			c.Abort()
+			return
+		}
 		if resolver == nil {
 			c.Set("auth_duration", time.Since(authStart))
 			recordMachineAuthFailure(c, authStart)
@@ -42,7 +56,14 @@ func MachineCredentialAuth(resolver MachineCredentialResolver) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		caller, err := resolver.ResolveMachineCredential(c.Request.Context(), raw)
+		lookupStart := now()
+		lookupCtx, cancel := context.WithTimeout(c.Request.Context(), machineAuthorityTimeout)
+		caller, err := resolver.ResolveMachineCredential(lookupCtx, raw)
+		lookupErr := lookupCtx.Err()
+		cancel()
+		if lookupErr != nil || now().Sub(lookupStart) >= machineAuthorityTimeout {
+			err = ErrMachineAuthorityUnavailable
+		}
 		if errors.Is(err, ErrMachineAuthorityUnavailable) {
 			c.Set("auth_duration", time.Since(authStart))
 			recordMachineAuthFailure(c, authStart)
@@ -50,13 +71,14 @@ func MachineCredentialAuth(resolver MachineCredentialResolver) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if err != nil || caller.ValidateAt(time.Now()) != nil {
+		if err != nil || caller.ValidateAt(now()) != nil {
 			c.Set("auth_duration", time.Since(authStart))
 			recordMachineAuthFailure(c, authStart)
 			respondError(c, ErrUnauthorized)
 			c.Abort()
 			return
 		}
+		c.Set("verified_machine_caller", caller)
 		op, mapped := auth.OperationForHTTP(c.Request.Method, c.Request.URL.Path)
 		if !mapped || !caller.Policy.Allows(op) || !containsMachinePermission(caller.Permissions, op) {
 			c.Set("auth_duration", time.Since(authStart))
@@ -72,6 +94,45 @@ func MachineCredentialAuth(resolver MachineCredentialResolver) gin.HandlerFunc {
 	}
 }
 
+// Read the bounded body before authenticating so a slow upload cannot preserve
+// an authority decision made before revocation. The deadline ends before any
+// downstream lifecycle work, including VM startup.
+func bufferMachineRequestBody(c *gin.Context) bool {
+	if c.Request.Body == nil || c.Request.Body == http.NoBody {
+		return true
+	}
+	controller := http.NewResponseController(c.Writer)
+	if err := controller.SetReadDeadline(time.Now().Add(machineAuthorityTimeout)); err != nil {
+		c.Request.Close = true
+		c.Header("Connection", "close")
+		respondErrorMsg(c, "service_unavailable", "Machine request transport is unavailable.", http.StatusServiceUnavailable)
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, machineRequestBodyLimit+1))
+	if err != nil || len(body) > machineRequestBodyLimit {
+		c.Request.Close = true
+		c.Header("Connection", "close")
+		_ = controller.SetReadDeadline(time.Now())
+		status, code := http.StatusBadRequest, "invalid_request"
+		if len(body) > machineRequestBodyLimit {
+			status, code = http.StatusRequestEntityTooLarge, "request_too_large"
+		} else if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+			status, code = http.StatusRequestTimeout, "request_timeout"
+		}
+		respondErrorMsg(c, code, "Machine request body could not be read.", status)
+		return false
+	}
+	_ = c.Request.Body.Close()
+	if err := controller.SetReadDeadline(time.Time{}); err != nil {
+		c.Request.Close = true
+		c.Header("Connection", "close")
+		respondErrorMsg(c, "service_unavailable", "Machine request transport is unavailable.", http.StatusServiceUnavailable)
+		return false
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	return true
+}
+
 func recordMachineAuthFailure(c *gin.Context, started time.Time) {
 	op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath())
 	if !ok {
@@ -80,6 +141,14 @@ func recordMachineAuthFailure(c *gin.Context, started time.Time) {
 	RecordLatencyPhases(c.Request.Context(), op, "", map[string]time.Duration{
 		"auth": time.Since(started), "total": time.Since(started),
 	})
+}
+
+// VerifiedMachineCallerFromContext exposes authenticated identity to attribution
+// even when route authorization denies the request. It never grants authority.
+func VerifiedMachineCallerFromContext(c *gin.Context) (auth.CallerContext, bool) {
+	value, ok := c.Get("verified_machine_caller")
+	caller, valid := value.(auth.CallerContext)
+	return caller, ok && valid
 }
 
 func setMachineCaller(c *gin.Context, caller auth.CallerContext) {

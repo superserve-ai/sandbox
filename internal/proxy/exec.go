@@ -84,7 +84,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	if !ok {
 		return
 	}
-	boundRequest, cleanup, sessionOK := h.bindMachineRequest(r, token)
+	boundRequest, cleanup, sessionOK := h.bindMachineRequest(w, r, token)
 	if !sessionOK {
 		(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
 		return

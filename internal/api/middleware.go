@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -77,8 +78,13 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		// force it through human API-key/creator lookup or synthesize actor_id.
 		if _, machine := machineCallerFromContext(c); machine {
 			defer func() {
-				if _, owned := c.Get(phaseSeriesOwnedKey); owned { return }
-				op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath()); if !ok { return }
+				if _, owned := c.Get(phaseSeriesOwnedKey); owned {
+					return
+				}
+				op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath())
+				if !ok {
+					return
+				}
 				RecordLatencyPhases(c.Request.Context(), op, "", map[string]time.Duration{"auth": time.Since(startedAt), "total": time.Since(startedAt)})
 			}()
 			c.Set("auth_ms", time.Since(startedAt).Milliseconds())
@@ -225,6 +231,9 @@ func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
 	c.Set("api_key_id", entry.id)
 	c.Set("api_key_name", entry.name)
 	c.Set("api_key_scopes", entry.scopes)
+	if entry.expiresAt.Valid {
+		c.Set("api_key_expires_at", entry.expiresAt.Time)
+	}
 	c.Set("team_id", entry.teamID)
 	if entry.createdBy.Valid && entry.name != consoleImpersonationKeyName {
 		c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
@@ -246,7 +255,7 @@ func RequestLogger() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 
-		if raw != "" && c.FullPath() != "/internal/teams" {
+		if raw != "" && c.FullPath() != "/internal/teams" && !strings.HasPrefix(c.Request.URL.Path, "/internal/machine-identity") {
 			path = path + "?" + raw
 		}
 

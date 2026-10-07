@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,23 +15,23 @@ import (
 type repairAuthority struct {
 	principal, credential uuid.UUID
 	deadline              time.Time
-	fail                  bool
+	fail                  atomic.Bool
 }
 
 func (a *repairAuthority) Lookup(context.Context, uuid.UUID, uuid.UUID) (uint64, error) {
-	if a.fail {
+	if a.fail.Load() {
 		return 0, context.DeadlineExceeded
 	}
 	return 1, nil
 }
 func (a *repairAuthority) LookupSnapshot(context.Context, uuid.UUID, uuid.UUID) (uint64, time.Time, error) {
-	if a.fail {
+	if a.fail.Load() {
 		return 0, time.Time{}, context.DeadlineExceeded
 	}
 	return 1, a.deadline, nil
 }
 func (a *repairAuthority) RefreshSnapshot(context.Context, uuid.UUID, uuid.UUID) (uint64, time.Time, error) {
-	if a.fail {
+	if a.fail.Load() {
 		return 0, time.Time{}, context.DeadlineExceeded
 	}
 	a.deadline = time.Now().Add(80 * time.Millisecond)
@@ -80,7 +81,7 @@ func TestMachineRepairAuthorityFreshness(t *testing.T) {
 		t.Fatal("session admission failed")
 	}
 	defer cleanup()
-	a.fail = true
+	a.fail.Store(true)
 	select {
 	case <-ctx.Done():
 	case <-time.After(500 * time.Millisecond):
@@ -113,7 +114,7 @@ func TestMachineRepairProactiveAuthorityRefresh(t *testing.T) {
 		t.Fatal("healthy authority was closed at the original freshness deadline")
 	default:
 	}
-	a.fail = true
+	a.fail.Store(true)
 	select {
 	case <-ctx.Done():
 	case <-time.After(500 * time.Millisecond):

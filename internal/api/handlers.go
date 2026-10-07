@@ -907,6 +907,17 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 
+	// Every recovery caller uses durable resource ownership, including automatic
+	// resume by a team API key. This bounded read must precede VM publication.
+	owner, ownerErr := h.requestSandboxOwner(c, sandboxID, teamID)
+	if ownerErr != nil && !errors.Is(ownerErr, pgx.ErrNoRows) {
+		respondError(c, ErrInternal)
+		return "", false
+	}
+	if ownerErr == nil {
+		c.Set("restore_owner_id", "machine:"+owner.OwnerPrincipalID.String())
+	}
+
 	// One statement for the claim and the boot inputs; see ClaimResume.
 	claimParams := db.ClaimResumeParams{
 		ID:      sandboxID,
@@ -1673,14 +1684,6 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		tLookupDone = time.Now()
 		return true
 	}
-	// Stateless restore must preserve immutable durable ownership even when a
-	// human/admin initiates the resume. Resolve it before any VMD side effect.
-	if owner, ownerErr := h.DB.GetMachineSandboxOwner(c.Request.Context(), sandboxID, teamID); ownerErr == nil {
-		c.Set("restore_owner_id", "machine:"+owner.OwnerPrincipalID.String())
-	} else if !errors.Is(ownerErr, pgx.ErrNoRows) {
-		respondError(c, ErrInternal)
-		return
-	}
 	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID, settled); !ok {
 		return
 	}
@@ -1700,8 +1703,6 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		// machine caller receives only a lineage-bound capability.
 		if machineResp, ok := h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at")); ok && machineResp.AccessToken != "" {
 			resp["access_token"] = machineResp.AccessToken
-		} else if _, machine := machineCallerFromContext(c); !machine {
-			resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
 		} else {
 			return
 		}
@@ -2389,7 +2390,7 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 		if h.DB == nil {
 			return resp
 		}
-		owner, err := h.DB.GetMachineSandboxOwner(c.Request.Context(), s.ID, caller.TeamID)
+		owner, err := h.requestSandboxOwner(c, s.ID, caller.TeamID)
 		if err != nil || owner.OwnerPrincipalID != caller.PrincipalID || owner.TeamID != caller.TeamID {
 			// Ownership is authoritative durable state. A missing/unknown row is
 			// not ordinary ownership and must not produce a usable capability.
@@ -2413,15 +2414,16 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 	// owner relation proves this is a machine sandbox. A lookup error or
 	// unknown ownership never falls back to a legacy token.
 	if h.DB != nil && h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
-		if owner, err := h.DB.GetMachineSandboxOwner(c.Request.Context(), s.ID, s.TeamID); err == nil {
+		if owner, err := h.requestSandboxOwner(c, s.ID, s.TeamID); err == nil {
 			if actor := actorIDFromContext(c); actor != nil && owner.TeamID == s.TeamID {
 				now := timeNow(h)
 				parentID, _ := uuid.Parse(c.GetString("api_key_id"))
-				capability, capErr := auth.DeriveHumanCapabilityWithParent(*actor, parentID, s.TeamID, s.ID, "sandbox-proxy", []auth.MachineOperation{
+				capability, capErr := auth.DeriveAPIKeyCapability(parentID, s.TeamID, s.ID, "sandbox-proxy", []auth.MachineOperation{
 					auth.MachineOperationRead, auth.MachineOperationReconnect,
 					auth.MachineOperationCommandRun, auth.MachineOperationCommandRead, auth.MachineOperationCommandWrite, auth.MachineOperationCommandSignal,
 					auth.MachineOperationFileRead, auth.MachineOperationFileWrite,
-				}, now.Add(15*time.Minute), now)
+					auth.TeamOperationDesktopRead, auth.TeamOperationDesktopWrite,
+				}, now.Add(15*time.Minute), c.GetTime("api_key_expires_at"), now)
 				if capErr == nil {
 					if token, signErr := auth.SignMachineCapability(capability, h.Config.SandboxAccessTokenSeed, now); signErr == nil {
 						resp.AccessToken = token
@@ -2434,6 +2436,9 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return resp
 		}
+	}
+	if h.DB == nil {
+		return resp
 	}
 	return h.sandboxToResponseWithToken(s, observedAt)
 }
@@ -2739,36 +2744,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 				Str("sandbox_id", sandboxID.String()).
 				Msg("RBAC sandbox token permission check failed")
 		} else if canWrite {
-			// Machine-owned sandboxes never fall back to creator-derived legacy
-			// tokens. An authorized human receives a typed child capability that
-			// carries the verified actor and team instead of impersonating the
-			// machine owner.
-			if h.DB != nil {
-				if owner, ownerErr := h.DB.GetMachineSandboxOwner(c.Request.Context(), sandbox.ID, teamID); ownerErr == nil {
-					if actor := actorIDFromContext(c); actor != nil && owner.TeamID == teamID {
-						now := timeNow(h)
-						parentID, _ := uuid.Parse(c.GetString("api_key_id"))
-						capability, capErr := auth.DeriveHumanCapabilityWithParent(*actor, parentID, teamID, sandbox.ID, "sandbox-proxy", []auth.MachineOperation{
-							auth.MachineOperationRead, auth.MachineOperationReconnect,
-							auth.MachineOperationCommandRun, auth.MachineOperationCommandRead, auth.MachineOperationCommandWrite, auth.MachineOperationCommandSignal,
-							auth.MachineOperationFileRead, auth.MachineOperationFileWrite,
-						}, now.Add(15*time.Minute), now)
-						if capErr == nil && h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
-							if token, signErr := auth.SignMachineCapability(capability, h.Config.SandboxAccessTokenSeed, now); signErr == nil {
-								resp.AccessToken = token
-								resp.RoutingHint = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, sandbox.ID.String(), sandbox.HostID, h.Config.EdgeProxyDomain, c.GetTime("routing_observed_at"), sandbox.RoutingVersion)
-							}
-						}
-					}
-				}
-			}
-			if resp.AccessToken == "" && h.DB != nil {
-				// Ordinary sandboxes retain legacy compatibility only after the
-				// ownership lookup positively establishes that no machine row exists.
-				if _, ownerErr := h.DB.GetMachineSandboxOwner(c.Request.Context(), sandbox.ID, teamID); ownerErr != nil {
-					resp = h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
-				}
-			}
+			resp = h.sandboxResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
 			resp.PreviewAccess = row.Access
 		}
 	}

@@ -38,6 +38,7 @@ import (
 
 type stubVMD struct {
 	restoreLimits vmdclient.ResourceLimits
+	restoreOwner  string
 	// restoreIgnoresRules is a vmd that predates rules on restore.
 	restoreIgnoresRules bool
 	destroyFn           func(ctx context.Context, id string, force bool) error
@@ -143,8 +144,9 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, s.resumeAttest, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, owner, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
 	s.restoreLimits = limits
+	s.restoreOwner = owner
 	protocol := preview.HostCapabilityPorts
 	if s.restorePreviewProtocol != nil {
 		protocol = *s.restorePreviewProtocol
@@ -333,6 +335,9 @@ func (b *mockBatch) Close() error {
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "FROM sandbox_machine_owner") {
+		return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
+	}
 	if strings.Contains(sql, "-- name: SandboxSnapshotCaptureInFlight :one") {
 		return scalarBoolRow(m.captureInFlight)
 	}

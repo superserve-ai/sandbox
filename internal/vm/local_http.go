@@ -114,7 +114,11 @@ type instanceResponse struct {
 	PreviewPortTokenVersions map[string]int64  `json:"preview_port_token_versions,omitempty"`
 }
 
-func ownershipState(machineOwned bool, principalID, ownerID string) string {
+func ownershipState(machineOwned bool, principalID, ownerID string, ordinaryOwned ...bool) string {
+	ordinary := len(ordinaryOwned) > 0 && ordinaryOwned[0]
+	if machineOwned && ordinary {
+		return "unknown"
+	}
 	if machineOwned {
 		// A machine attestation without its principal is not ordinary
 		// ownership. Treat malformed or incomplete attestation as unknown so
@@ -124,7 +128,10 @@ func ownershipState(machineOwned bool, principalID, ownerID string) string {
 		}
 		return "unknown"
 	}
-	if ownerID != "" {
+	if principalID != "" {
+		return "unknown"
+	}
+	if ordinary || ownerID != "" {
 		return "ordinary"
 	}
 	return "unknown"
@@ -190,7 +197,7 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		OwnerID:                  info.OwnerID,
 		MachineOwned:             info.MachineOwned,
 		MachineOwnerPrincipalID:  info.MachineOwnerPrincipalID,
-		OwnershipState:           ownershipState(info.MachineOwned, info.MachineOwnerPrincipalID, info.OwnerID),
+		OwnershipState:           ownershipState(info.MachineOwned, info.MachineOwnerPrincipalID, info.OwnerID, info.OrdinaryOwned),
 		PreviewAccess:            info.PreviewAccess,
 		PreviewPorts:             previewPortsToJSON(info.PreviewPorts),
 		PreviewPortAccess:        previewPortAccessToJSON(info.PreviewPorts),

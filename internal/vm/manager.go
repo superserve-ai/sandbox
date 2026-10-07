@@ -150,6 +150,7 @@ type VMInstance struct {
 	// Machine ownership is an explicit control-plane attestation. Empty
 	// principal means ownership is unknown and proxies must fail closed.
 	MachineOwned            bool
+	OrdinaryOwned           bool // explicit control-plane attestation without a known creating user
 	MachineOwnerPrincipalID string
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
@@ -3686,10 +3687,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.RUnlock()
 	restoreFromPaused := false
 	var prevPausedAt time.Time
+	var prevOwnership *VMRecord
 	if prev != nil {
 		prev.mu.RLock()
 		restoreFromPaused = prev.Status == StatusPaused
 		prevPausedAt = prev.PausedAt
+		prevOwnership = explicitOwnershipRecord(prev)
 		prev.mu.RUnlock()
 	}
 	if wakeProtocolFloorRaised() {
@@ -3799,13 +3802,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		PreviewPolicyRevision:      previewPolicyRevision,
 		PreviewTokenPolicyRevision: inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision),
 	}
-	if principalID, ok := strings.CutPrefix(ownerID, "machine:"); ok && principalID != "" {
-		if _, err := uuid.Parse(principalID); err == nil {
-			inst.MachineOwned = true
-			inst.MachineOwnerPrincipalID = principalID
-			inst.OwnerID = ""
-		}
-	}
+	setOwnershipFromTrustedMarker(inst, ownerID)
+	restoreOwnershipFromRecord(inst, prevOwnership)
 	m.vms[vmID] = inst
 	m.indexVM(vmID, inst)
 	m.mu.Unlock()
@@ -6286,6 +6284,7 @@ type InstanceInfo struct {
 	TeamID                  string
 	OwnerID                 string
 	MachineOwned            bool
+	OrdinaryOwned           bool
 	MachineOwnerPrincipalID string
 
 	PreviewAccess string
@@ -6317,6 +6316,7 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		TeamID:                  inst.TeamID,
 		OwnerID:                 inst.OwnerID,
 		MachineOwned:            inst.MachineOwned,
+		OrdinaryOwned:           inst.OrdinaryOwned,
 		MachineOwnerPrincipalID: inst.MachineOwnerPrincipalID,
 
 		PreviewAccess: previewAccess,

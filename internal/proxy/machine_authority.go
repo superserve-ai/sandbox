@@ -16,12 +16,16 @@ import (
 // request and stream admission. Revoked/disabled rows are misses; an outage
 // never extends an expired snapshot and no frame performs durable I/O.
 type CachedMachineAuthority struct {
-	pool   *pgxpool.Pool
+	pool   machineAuthorityQuerier
 	ttl    time.Duration
 	mu     sync.Mutex
 	items  map[machineAuthorityKey]machineAuthorityEntry
 	epoch  uint64
 	flight singleflight.Group
+}
+
+type machineAuthorityQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
 type machineAuthorityKey struct{ principal, credential uuid.UUID }
@@ -33,7 +37,7 @@ type machineAuthorityEntry struct {
 var errAuthoritySnapshotExpired = errors.New("machine authority snapshot expired")
 
 func NewCachedMachineAuthority(pool *pgxpool.Pool, ttl time.Duration) *CachedMachineAuthority {
-	if ttl <= 0 {
+	if ttl <= 0 || ttl > 5*time.Second {
 		ttl = 5 * time.Second
 	}
 	a := &CachedMachineAuthority{pool: pool, ttl: ttl, items: make(map[machineAuthorityKey]machineAuthorityEntry)}
@@ -64,22 +68,36 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 	now := time.Now()
 	key := machineAuthorityKey{principal: principalID, credential: credentialID}
 	a.mu.Lock()
-	if !force {
-		if entry, ok := a.items[key]; ok && now.Before(entry.expiresAt) {
-			a.mu.Unlock()
-			return entry.generation, entry.expiresAt, nil
-		}
+	if entry, ok := a.items[key]; ok && a.usable(entry, now, force) {
+		a.mu.Unlock()
+		return entry.generation, entry.expiresAt, nil
 	}
 	epoch := a.epoch
 	a.mu.Unlock()
 	v, err, _ := a.flight.Do(keyString(key), func() (any, error) {
 		observedAt := time.Now()
+		a.mu.Lock()
+		if a.epoch != epoch {
+			a.mu.Unlock()
+			return authoritySnapshot{}, errors.New("machine authority invalidated")
+		}
+		// A previous flight may have finished after this caller's first cache
+		// check. Reuse it instead of serializing one durable read per stream.
+		if entry, ok := a.items[key]; ok && a.usable(entry, observedAt, force) {
+			a.mu.Unlock()
+			return authoritySnapshot{generation: entry.generation, expiresAt: entry.expiresAt}, nil
+		}
+		a.mu.Unlock()
+		ctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
 		var generation int64
 		err := a.pool.QueryRow(ctx, `SELECT c.revocation_generation FROM machine_credential c JOIN machine_principal p ON p.id=c.principal_id WHERE c.id=$1 AND c.principal_id=$2 AND c.state='active' AND c.expires_at>now() AND p.status='active' AND c.revocation_generation=p.generation`, credentialID, principalID).Scan(&generation)
 		deadline := observedAt.Add(a.ttl)
 		if err != nil {
 			a.mu.Lock()
-			delete(a.items, key)
+			if a.epoch == epoch {
+				delete(a.items, key)
+			}
 			a.mu.Unlock()
 			if errors.Is(err, pgx.ErrNoRows) {
 				return authoritySnapshot{}, errors.New("machine authority denied")
@@ -104,6 +122,14 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 	}
 	snapshot := v.(authoritySnapshot)
 	return snapshot.generation, snapshot.expiresAt, nil
+}
+
+// Refresh early enough to renew healthy streams, but share each observation
+// across staggered timers as well as concurrent calls. Admission may use the
+// full freshness window; continuation refreshes after half the window.
+func (a *CachedMachineAuthority) usable(entry machineAuthorityEntry, now time.Time, refresh bool) bool {
+	remaining := entry.expiresAt.Sub(now)
+	return remaining > 0 && (!refresh || remaining > a.ttl/2)
 }
 
 type authoritySnapshot struct {
