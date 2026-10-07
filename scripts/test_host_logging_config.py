@@ -524,6 +524,20 @@ RUN apt-get update \\
                 preparation = None
                 for resource in policy['resources']:
                     if resource['id'] == 'reconcile-and-validate':
+                        # OS Config invokes SHELL files with /bin/sh; their
+                        # Bash shebang does not choose the interpreter.
+                        for action in ('validate', 'enforce'):
+                            spec = resource['exec'][0][action][0]
+                            if spec['file']:
+                                path = spec['file'][0]['local_path']
+                            else:
+                                path = '/fixture/' + action + '-entrypoint.sh'
+                                pathlib.Path(path).write_text(spec['script'])
+                            result = subprocess.run(['/bin/sh', path], capture_output=True, text=True)
+                            # With no host identity, the real Bash program must
+                            # reach its identity check and fail closed there.
+                            assert result.returncode == 1, result.stderr
+                            assert 'host-identity.json' in result.stderr, result.stderr
                         break
                     if resource['exec']:
                         preparation = resource['exec'][0]
