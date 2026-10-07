@@ -206,6 +206,11 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
         run: go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_Storage(ReceiptFence|Settlement)' ./internal/billing
 
+      - name: Run billing finalization scheduling race contracts
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_Finalization' ./internal/billing
+
       - name: Run storage report refresh race contract
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
