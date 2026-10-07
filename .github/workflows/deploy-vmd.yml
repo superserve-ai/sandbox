@@ -55,6 +55,7 @@ on:
       - 'internal/db/**'
       - 'internal/egresspolicy/**'
       - 'internal/hostidentity/**'
+      - 'internal/mining/**'
       - 'internal/network/**'
       - 'internal/presence/**'
       - 'internal/preview/**'

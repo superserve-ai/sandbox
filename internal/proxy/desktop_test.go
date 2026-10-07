@@ -97,6 +97,7 @@ func TestDesktopProxy_AllowsOnlyDesktopRPCs(t *testing.T) {
 		desktopScrollPath,
 		desktopResizePath,
 		desktopSendActionsPath,
+		desktopStepPath,
 	}
 	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
@@ -233,6 +234,7 @@ func TestDesktopProxy_RoutableThroughOwnershipRouter(t *testing.T) {
 	paths := []string{
 		desktopScreenshotPath, desktopStreamPath, desktopSendPointerPath,
 		desktopSendKeyPath, desktopScrollPath, desktopResizePath, desktopSendActionsPath,
+		desktopStepPath,
 	}
 	for _, p := range paths {
 		if !env.handler.canRouteBoxdRequest(env.request(http.MethodPost, p, env.validToken(), nil), env.sandboxID) {

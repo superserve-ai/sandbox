@@ -15,6 +15,7 @@ const (
 	desktopScrollPath      = boxdpbconnect.DesktopServiceScrollProcedure
 	desktopResizePath      = boxdpbconnect.DesktopServiceResizeProcedure
 	desktopSendActionsPath = boxdpbconnect.DesktopServiceSendActionsProcedure
+	desktopStepPath        = boxdpbconnect.DesktopServiceStepProcedure
 
 	// Sized above the largest request boxd itself accepts on the wire: a
 	// SendActions batch of 64 actions × 64KiB text is 4MiB decoded, and

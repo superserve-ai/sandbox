@@ -177,7 +177,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = @team_id
   AND s.destroyed_at IS NULL
   AND s.metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR s.status = ANY(sqlc.narg('statuses')::sandbox_status[]))
   AND (sqlc.narg('name_search')::text IS NULL
        OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY s.created_at DESC
@@ -192,7 +192,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = @team_id
   AND s.destroyed_at IS NULL
   AND s.metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR s.status = ANY(sqlc.narg('statuses')::sandbox_status[]))
   AND (sqlc.narg('name_search')::text IS NULL
        OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY s.created_at ASC
@@ -206,7 +206,7 @@ OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 -- which the planner can satisfy from an index.
 --
 -- Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
--- to match everything), status equality, and a case-insensitive name
+-- to match everything), status membership, and a case-insensitive name
 -- substring. Sort column/direction come from @sort_by + @sort_dir: exactly one
 -- guarded CASE term is active per query (the sort params are constant across
 -- rows, so every other term evaluates to NULL for all rows and acts as a
@@ -220,7 +220,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = @team_id
   AND s.destroyed_at IS NULL
   AND s.metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR s.status = ANY(sqlc.narg('statuses')::sandbox_status[]))
   AND (sqlc.narg('name_search')::text IS NULL
        OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY
@@ -240,7 +240,7 @@ SELECT COUNT(*) FROM sandbox
 WHERE team_id = @team_id
   AND destroyed_at IS NULL
   AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR status = ANY(sqlc.narg('statuses')::sandbox_status[]))
   AND (sqlc.narg('name_search')::text IS NULL
        OR name ILIKE '%' || sqlc.narg('name_search')::text || '%');
 

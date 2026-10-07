@@ -195,6 +195,13 @@ service DesktopService {
   // failing action; the error names its index, and later actions never run.
   rpc SendActions(ActionBatch) returns (ActionBatchResponse);
 
+  // Step executes an ordered action batch exactly as SendActions does, then
+  // captures the frame before releasing the input lock, so an agent turn is
+  // one round trip and the frame reflects exactly this batch. The frame is
+  // captured even when the batch stops at a failing action, so the caller
+  // can see the state its input left behind.
+  rpc Step(StepRequest) returns (StepResponse);
+
   // SendPointer moves the pointer and/or presses/releases/clicks a button.
   rpc SendPointer(PointerEvent) returns (PointerResponse);
 
@@ -323,6 +330,30 @@ message ActionBatchResponse {
   // Number of actions that executed successfully (always the full batch on a
   // non-error response).
   uint32 executed = 1;
+}
+
+message StepRequest {
+  repeated Action actions = 1;
+  FrameFormat format = 2;
+  // Milliseconds to wait between the last action and the capture, for
+  // applications that repaint after the input lands. 0 captures immediately;
+  // values above the server maximum (currently 2000) are rejected.
+  uint32 settle_ms = 3;
+}
+
+// StepResponse keeps a failed action and a failed capture apart from each
+// other and from success, because input is not idempotent: neither outcome
+// may read as "nothing happened".
+message StepResponse {
+  // Number of actions that executed. Equals the batch size unless
+  // action_error is set, in which case it is also the failing action's index.
+  uint32 executed = 1;
+  // Why the batch stopped early. Empty when every action ran.
+  string action_error = 2;
+  // Frame captured after the batch stopped; unset when capture failed.
+  ScreenshotResponse screenshot = 3;
+  // Why no frame was captured. The executed actions were still delivered.
+  string capture_error = 4;
 }
 
 // Named DesktopResizeRequest/Response (not ResizeRequest/Response) to avoid

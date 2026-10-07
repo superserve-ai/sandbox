@@ -959,16 +959,16 @@ SELECT COUNT(*) FROM sandbox
 WHERE team_id = $1
   AND destroyed_at IS NULL
   AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR name ILIKE '%' || $4::text || '%')
 `
 
 type CountSandboxesByTeamPagedParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
 }
 
 // Total rows matching the same filters as ListSandboxesByTeamPaged (ignoring
@@ -977,7 +977,7 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 	row := q.db.QueryRow(ctx, countSandboxesByTeamPaged,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 	)
 	var count int64
@@ -2883,7 +2883,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY s.created_at ASC
@@ -2892,12 +2892,12 @@ OFFSET COALESCE($5::bigint, 0)
 `
 
 type ListSandboxesByTeamCreatedAscParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamCreatedAscRow struct {
@@ -2909,7 +2909,7 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedAsc,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.RowOffset,
 		arg.RowLimit,
@@ -2982,7 +2982,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY s.created_at DESC
@@ -2991,12 +2991,12 @@ OFFSET COALESCE($5::bigint, 0)
 `
 
 type ListSandboxesByTeamCreatedDescParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamCreatedDescRow struct {
@@ -3021,7 +3021,7 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedDesc,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.RowOffset,
 		arg.RowLimit,
@@ -3093,7 +3093,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY
@@ -3108,14 +3108,14 @@ OFFSET COALESCE($7::bigint, 0)
 `
 
 type ListSandboxesByTeamPagedParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	SortBy     string    `json:"sort_by"`
-	SortDir    string    `json:"sort_dir"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	SortBy     string          `json:"sort_by"`
+	SortDir    string          `json:"sort_dir"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamPagedRow struct {
@@ -3129,7 +3129,7 @@ type ListSandboxesByTeamPagedRow struct {
 // which the planner can satisfy from an index.
 //
 // Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
-// to match everything), status equality, and a case-insensitive name
+// to match everything), status membership, and a case-insensitive name
 // substring. Sort column/direction come from @sort_by + @sort_dir: exactly one
 // guarded CASE term is active per query (the sort params are constant across
 // rows, so every other term evaluates to NULL for all rows and acts as a
@@ -3140,7 +3140,7 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 	rows, err := q.db.Query(ctx, listSandboxesByTeamPaged,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.SortBy,
 		arg.SortDir,

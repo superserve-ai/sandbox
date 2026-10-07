@@ -117,6 +117,51 @@ func TestDesktopX11Backend_RealXServer(t *testing.T) {
 	}
 }
 
+// Step against a real server: the batch lands through XTest and the frame is
+// captured on the same connection, in one call.
+func TestDesktopStep_RealXServer(t *testing.T) {
+	for _, bin := range []string{"Xvnc", "xdotool"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	display := startXvnc(t, 640, 480)
+	t.Setenv("DISPLAY", display)
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	resp, err := s.Step(ctx, connect.NewRequest(&pb.StepRequest{
+		Actions: []*pb.Action{{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{
+			X: 321, Y: 54,
+			Button: pb.PointerButton_POINTER_BUTTON_LEFT,
+			Action: pb.PointerAction_POINTER_ACTION_CLICK,
+		}}}},
+		SettleMs: 20,
+	}))
+	if err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	if resp.Msg.GetExecuted() != 1 || resp.Msg.GetActionError() != "" || resp.Msg.GetCaptureError() != "" {
+		t.Fatalf("executed=%d action_error=%q capture_error=%q", resp.Msg.GetExecuted(), resp.Msg.GetActionError(), resp.Msg.GetCaptureError())
+	}
+	shot := resp.Msg.GetScreenshot()
+	if shot.GetWidth() != 640 || shot.GetHeight() != 480 || len(shot.GetImage()) == 0 {
+		t.Fatalf("screenshot = %dx%d, %d bytes; want 640x480 with data", shot.GetWidth(), shot.GetHeight(), len(shot.GetImage()))
+	}
+	if s.x11.backend == nil {
+		t.Fatal("step did not go through the X11 backend")
+	}
+	probe := exec.Command("xdotool", "getmouselocation")
+	probe.Env = append(os.Environ(), "DISPLAY="+display)
+	out, err := probe.Output()
+	if err != nil {
+		t.Fatalf("xdotool getmouselocation: %v", err)
+	}
+	if got := string(out); !strings.HasPrefix(got, "x:321 y:54 ") {
+		t.Fatalf("pointer after Step: %q, want x:321 y:54", got)
+	}
+}
+
 // A reachable display with a screen it does not have must be an init error
 // and a shell fallback, not a panic in boxd.
 func TestX11Backend_RejectsMissingScreen(t *testing.T) {
