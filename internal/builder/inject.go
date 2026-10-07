@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"io"
@@ -121,24 +122,17 @@ func injectGuestAgent(rootfsDir, boxdBinaryPath string, freezeWorkload bool, log
 		return 0, fmt.Errorf("write /etc/resolv.conf: %w", err)
 	}
 
-	// Public Canonical apt mirrors are intermittently throttled / unreachable
-	// during the May 2026 archive outages, which produces partial .deb
-	// downloads and dpkg failures inside build VMs. Rewrite to
-	// nova.clouds.archive.ubuntu.com (Canonical's cloud-targeted mirror,
-	// which has a separate sync path and has stayed reachable through the
-	// event) so apt-get works.
-	if err := rewriteAptSources(rootfsDir, logger); err != nil {
+	// Canonical's public apt mirrors are intermittently throttled or
+	// unreachable, which surfaces inside build VMs as hung fetches, partial
+	// .deb downloads and steps running past their deadline. Point the image
+	// at a mirror the builder has just verified instead (aptmirror.go).
+	mirror := selectAptMirror(context.Background(), os.Getenv(aptMirrorEnv), logger)
+	if err := rewriteAptSources(rootfsDir, mirror, logger); err != nil {
 		return 0, fmt.Errorf("rewrite apt sources: %w", err)
 	}
 
 	return binSize, nil
 }
-
-// Replacement mirror for canonicalUbuntuMirrors. nova.clouds is Canonical's
-// cloud-targeted mirror; it has a separate upstream sync path from the public
-// archive and was the only Ubuntu mirror to stay at 100% uptime through the
-// May 2026 archive.ubuntu.com / security.ubuntu.com outages.
-const ubuntuMirrorHost = "nova.clouds.archive.ubuntu.com"
 
 // Ubuntu-only. deb.debian.org is on a separate mirror network and currently
 // unaffected.
@@ -148,12 +142,21 @@ var canonicalUbuntuMirrors = []string{
 }
 
 const aptRewriteHeader = `# Rewritten by Superserve template builder.
-# Public Canonical mirrors (archive.ubuntu.com / security.ubuntu.com) are
-# intermittently throttled and serve partial responses during the ongoing
-# archive outages, which surfaces as dpkg errors on truncated .deb files.
-# nova.clouds.archive.ubuntu.com is Canonical's cloud-targeted mirror and
-# serves the same archive contents over a separate, healthy sync path.
+# Canonical's public mirrors (archive.ubuntu.com / security.ubuntu.com) are
+# intermittently throttled or unreachable, which surfaces as hung fetches
+# and dpkg errors on truncated .deb files. This image fetches from a mirror
+# the builder verified at build time instead; it serves the same archive.
 `
+
+// aptAcquireConf bounds how long apt waits on one request. Its default of
+// 120 seconds, times the retries, is what turns a mirror node that accepts
+// connections but never answers into a build step past its deadline.
+const aptAcquireConf = `// Written by Superserve template builder.
+Acquire::http::Timeout "30";
+Acquire::Retries "3";
+`
+
+const aptAcquireConfPath = "etc/apt/apt.conf.d/99superserve-acquire"
 
 // injectProxyCA writes the secretsproxy CA into the rootfs trust store.
 // No-op when caCertPath is empty.
@@ -206,10 +209,10 @@ func injectProxyCA(rootfsDir, caCertPath string, logger *zerolog.Logger) error {
 
 // rewriteAptSources rewrites http:// and https:// references to
 // canonicalUbuntuMirrors in /etc/apt/sources.list and
-// /etc/apt/sources.list.d/{*.list,*.sources} to point at ubuntuMirrorHost.
-// No-op when /etc/apt is absent or when no file references a canonical
-// hostname.
-func rewriteAptSources(rootfsDir string, logger *zerolog.Logger) error {
+// /etc/apt/sources.list.d/{*.list,*.sources} to point at mirror, and bounds
+// apt's per-request wait (aptAcquireConf). No-op when /etc/apt is absent;
+// files that reference no canonical hostname are left alone.
+func rewriteAptSources(rootfsDir, mirror string, logger *zerolog.Logger) error {
 	aptDir := filepath.Join(rootfsDir, "etc/apt")
 	if _, err := os.Stat(aptDir); err != nil {
 		if os.IsNotExist(err) {
@@ -218,13 +221,21 @@ func rewriteAptSources(rootfsDir string, logger *zerolog.Logger) error {
 		return fmt.Errorf("stat %s: %w", aptDir, err)
 	}
 
+	confPath := filepath.Join(rootfsDir, aptAcquireConfPath)
+	if err := os.MkdirAll(filepath.Dir(confPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(confPath), err)
+	}
+	if err := os.WriteFile(confPath, []byte(aptAcquireConf), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", confPath, err)
+	}
+
 	files, err := findAptSourceFiles(aptDir)
 	if err != nil {
 		return fmt.Errorf("scan apt source files: %w", err)
 	}
 	var rewritten []string
 	for _, path := range files {
-		changed, err := rewriteAptFile(path)
+		changed, err := rewriteAptFile(path, mirror)
 		if err != nil {
 			return fmt.Errorf("rewrite %s: %w", path, err)
 		}
@@ -238,7 +249,7 @@ func rewriteAptSources(rootfsDir string, logger *zerolog.Logger) error {
 	}
 	if len(rewritten) > 0 && logger != nil {
 		logger.Info().
-			Str("mirror", ubuntuMirrorHost).
+			Str("mirror", mirror).
 			Strs("files", rewritten).
 			Msg("rewrote apt sources to alternate Ubuntu mirror")
 	}
@@ -278,7 +289,7 @@ func findAptSourceFiles(aptDir string) ([]string, error) {
 // rewriteAptFile rewrites one apt sources file in place. Returns changed=true
 // only when the file matched a canonical hostname and was overwritten.
 // Idempotent: re-running on an already-rewritten file is a no-op.
-func rewriteAptFile(path string) (bool, error) {
+func rewriteAptFile(path, mirror string) (bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false, err
@@ -310,7 +321,7 @@ func rewriteAptFile(path string) (bool, error) {
 	rewritten := contents
 	for _, host := range canonicalUbuntuMirrors {
 		for _, scheme := range schemes {
-			rewritten = strings.ReplaceAll(rewritten, scheme+host, "http://"+ubuntuMirrorHost)
+			rewritten = strings.ReplaceAll(rewritten, scheme+host, "http://"+mirror)
 		}
 	}
 

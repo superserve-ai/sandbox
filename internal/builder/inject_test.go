@@ -1,6 +1,10 @@
 package builder
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,7 +100,7 @@ func TestRewriteAptSources(t *testing.T) {
 			"deb http://archive.ubuntu.com/ubuntu noble main\n"+
 			"deb http://security.ubuntu.com/ubuntu noble-security main\n")
 
-		if err := rewriteAptSources(root, nil); err != nil {
+		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -113,9 +117,9 @@ func TestRewriteAptSources(t *testing.T) {
 				t.Errorf("stale URL %q still present after rewrite:\n%s", stale, body)
 			}
 		}
-		if strings.Count(body, ubuntuMirrorHost) != 2 {
+		if strings.Count(body, fallbackAptMirror) != 2 {
 			t.Errorf("expected replacement mirror hostname in 2 deb lines, got %d:\n%s",
-				strings.Count(body, ubuntuMirrorHost), body)
+				strings.Count(body, fallbackAptMirror), body)
 		}
 	})
 
@@ -127,12 +131,12 @@ func TestRewriteAptSources(t *testing.T) {
 			"Suites: noble noble-updates\n"+
 			"Components: main universe\n")
 
-		if err := rewriteAptSources(root, nil); err != nil {
+		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
 		got := readTestFile(t, filepath.Join(root, "etc/apt/sources.list.d/ubuntu.sources"))
-		if !strings.Contains(got, "URIs: http://"+ubuntuMirrorHost+"/ubuntu/") {
+		if !strings.Contains(got, "URIs: http://"+fallbackAptMirror+"/ubuntu/") {
 			t.Errorf("URIs line not rewritten:\n%s", got)
 		}
 	})
@@ -145,7 +149,7 @@ func TestRewriteAptSources(t *testing.T) {
 			"deb https://my.private.mirror/ubuntu noble main\n"
 		writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"), original)
 
-		if err := rewriteAptSources(root, nil); err != nil {
+		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -161,7 +165,7 @@ func TestRewriteAptSources(t *testing.T) {
 			"deb https://archive.ubuntu.com/ubuntu noble main\n"+
 				"deb https://security.ubuntu.com/ubuntu noble-security main\n")
 
-		if err := rewriteAptSources(root, nil); err != nil {
+		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -175,9 +179,9 @@ func TestRewriteAptSources(t *testing.T) {
 				t.Errorf("stale URL %q still present after rewrite:\n%s", stale, body)
 			}
 		}
-		if strings.Count(body, "http://"+ubuntuMirrorHost) != 2 {
+		if strings.Count(body, "http://"+fallbackAptMirror) != 2 {
 			t.Errorf("expected http://%s twice in body (HTTPS downgraded), got %d:\n%s",
-				ubuntuMirrorHost, strings.Count(body, "http://"+ubuntuMirrorHost), body)
+				fallbackAptMirror, strings.Count(body, "http://"+fallbackAptMirror), body)
 		}
 	})
 
@@ -189,7 +193,7 @@ func TestRewriteAptSources(t *testing.T) {
 				"deb http://security.ubuntu.com/ubuntu noble-security main\n"+
 				"deb http://my.private.mirror/ubuntu noble main\n")
 
-		if err := rewriteAptSources(root, nil); err != nil {
+		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
 			t.Fatalf("rewriteAptSources: %v", err)
 		}
 
@@ -212,12 +216,12 @@ func TestRewriteAptSources(t *testing.T) {
 		writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"),
 			"deb http://archive.ubuntu.com/ubuntu noble main\n")
 
-		if err := rewriteAptSources(root, nil); err != nil {
+		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
 			t.Fatalf("first rewrite: %v", err)
 		}
 		first := readTestFile(t, filepath.Join(root, "etc/apt/sources.list"))
 
-		if err := rewriteAptSources(root, nil); err != nil {
+		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
 			t.Fatalf("second rewrite: %v", err)
 		}
 		second := readTestFile(t, filepath.Join(root, "etc/apt/sources.list"))
@@ -229,7 +233,7 @@ func TestRewriteAptSources(t *testing.T) {
 
 	t.Run("no-op when /etc/apt is absent", func(t *testing.T) {
 		root := t.TempDir() // empty
-		if err := rewriteAptSources(root, nil); err != nil {
+		if err := rewriteAptSources(root, fallbackAptMirror, nil); err != nil {
 			t.Errorf("expected nil error for missing /etc/apt, got: %v", err)
 		}
 	})
@@ -256,4 +260,50 @@ func readTestFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+func TestRewriteAptSources_BoundsAptRequests(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"), "deb http://archive.ubuntu.com/ubuntu noble main\n")
+	if err := rewriteAptSources(root, "europe-west1.gce.archive.ubuntu.com", nil); err != nil {
+		t.Fatalf("rewriteAptSources: %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(root, "etc/apt/sources.list")); !strings.Contains(got, "deb http://europe-west1.gce.archive.ubuntu.com/ubuntu noble main") {
+		t.Errorf("sources not pointed at the chosen mirror:\n%s", got)
+	}
+	conf := readTestFile(t, filepath.Join(root, aptAcquireConfPath))
+	if !strings.Contains(conf, `Acquire::http::Timeout "30";`) || !strings.Contains(conf, `Acquire::Retries "3";`) {
+		t.Errorf("acquire conf missing the timeout or retries:\n%s", conf)
+	}
+}
+
+func TestChooseAptMirror(t *testing.T) {
+	metadata := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Metadata-Flavor") != "Google" {
+			http.Error(w, "missing header", http.StatusForbidden)
+			return
+		}
+		_, _ = io.WriteString(w, "projects/123456789/zones/europe-west1-b")
+	}))
+	defer metadata.Close()
+	up := func(context.Context, string) bool { return true }
+	down := func(context.Context, string) bool { return false }
+	ctx := context.Background()
+
+	if got := chooseAptMirror(ctx, "mirror.example.com", metadata.URL, down, nil); got != "mirror.example.com" {
+		t.Errorf("override: got %q", got)
+	}
+	if got := chooseAptMirror(ctx, "", metadata.URL, up, nil); got != "europe-west1.gce.archive.ubuntu.com" {
+		t.Errorf("regional mirror: got %q", got)
+	}
+	if got := chooseAptMirror(ctx, "", metadata.URL, down, nil); got != fallbackAptMirror {
+		t.Errorf("regional mirror down: got %q, want the fallback", got)
+	}
+	// Off GCE the metadata server does not exist; the fallback is used
+	// without a probe.
+	probed := false
+	spy := func(context.Context, string) bool { probed = true; return true }
+	if got := chooseAptMirror(ctx, "", "http://127.0.0.1:1/zone", spy, nil); got != fallbackAptMirror || probed {
+		t.Errorf("off GCE: got %q (probed=%v), want the fallback without probing", got, probed)
+	}
 }
