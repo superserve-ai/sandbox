@@ -99,7 +99,7 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
   project               = var.project_id
   display_name          = "${var.host_logging_alerts.display_prefix} / ${each.value.instance_name} / delivery lag"
   combiner              = "OR"
-  enabled               = true
+  enabled               = each.value.freshness_alerts_enabled
   notification_channels = var.notification_channel_ids
 
   lifecycle {
@@ -154,7 +154,7 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   project               = var.project_id
   display_name          = "${var.host_logging_alerts.display_prefix} / ${each.value.instance_name} / missing heartbeat"
   combiner              = "OR"
-  enabled               = true
+  enabled               = each.value.freshness_alerts_enabled
   notification_channels = var.notification_channel_ids
 
   lifecycle {
