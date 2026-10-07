@@ -274,6 +274,22 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 		t.Fatalf("%s: terminal received %q, want %q", label, got, want)
 	}
 
+	// Consecutive requests on scratch keycodes: a binding made by one
+	// request must still mean the same thing when a later request runs,
+	// since the application may not have consumed the earlier events yet.
+	// Two fitting requests type exactly; one that would need a keycode
+	// taken back declines instead, with nothing typed.
+	send(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "αβγδεζ"}})
+	want += "αβγδεζ"
+	expect("consecutive scratch requests", "ηθικλμ\n")
+	if _, err := s.SendKey(ctx, connect.NewRequest(&pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "νξοπρστυφχψω\n"}})); err == nil {
+		t.Fatal("a request needing more scratch keycodes than remain should have declined")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if out, _ := os.ReadFile(typed); string(out) != want {
+		t.Fatalf("a declined request still typed: %q", out)
+	}
+
 	// A native non-Latin layout: its keys carry legacy keysyms, which the
 	// X11 path must find by code point rather than bind scratch keycodes
 	// for (there are not enough of those for an alphabet).

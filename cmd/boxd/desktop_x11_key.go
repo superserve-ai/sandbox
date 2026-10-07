@@ -133,14 +133,16 @@ type x11Keymap struct {
 	// direct resolves a keysym the layout types natively: column 0 plain,
 	// column 1 with Shift held.
 	direct map[uint32]keystroke
-	// spare are keycodes with no keysyms of their own, least recently bound
-	// first. A bound one stays bound until the pool wraps around, so a
-	// repeated character never rebinds and applications are never asked to
-	// re-read the map between a key press and its release. One empty
-	// keycode is left out of the pool for xdotool, whose fallback path
-	// binds an unused keycode of its own.
+	// spare are keycodes with no keysyms of their own that have never been
+	// pressed. A binding, once made, lasts for the life of the backend: an
+	// application reads the keyboard map lazily, so rebinding a keycode it
+	// may still hold events for would change what those events mean, and
+	// nothing in the protocol says when it has consumed them. When the pool
+	// is used up, further characters go to xdotool. One empty keycode is
+	// left out of the pool for xdotool, whose fallback path binds an unused
+	// keycode of its own.
 	spare []xproto.Keycode
-	// bound is the keysym each scratch keycode currently types.
+	// bound is the keysym each scratch keycode types.
 	bound map[xproto.Keycode]uint32
 	// idleLocks are the modifier bits of Num Lock and Scroll Lock: locks
 	// that change nothing about the keycodes the key path sends.
@@ -184,9 +186,7 @@ type keyBind struct {
 }
 
 // keySegment is one request's strokes with the scratch bindings they need,
-// all applied before the first press. A keycode is never rebound within a
-// request: applications read the keyboard map lazily, so a rebind could
-// change what an earlier stroke of the same request means to them.
+// all applied before the first press.
 type keySegment struct {
 	binds  []keyBind
 	events []keyEvent
@@ -194,10 +194,9 @@ type keySegment struct {
 
 // buildKeymap lowers a core keyboard mapping to lookup tables. modifiers
 // are the keycodes of the server's modifier map. prev is the map built last
-// time, if any: its scratch keycodes stay bound only if the
-// fetched row is still the single-keysym key that was installed (otherwise
-// the row decides), and they rejoin the pool in its order so the least
-// recently used one is still evicted first.
+// time, if any: its scratch keycodes stay bound only if the fetched row is
+// still the single-keysym key that was installed (otherwise the row
+// decides, and a keycode another client has rewritten is theirs now).
 func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifiers []xproto.Keycode, prev *x11Keymap) *x11Keymap {
 	km := &x11Keymap{perCode: perCode, direct: map[uint32]keystroke{}, bound: map[xproto.Keycode]uint32{}}
 	var bound map[xproto.Keycode]uint32
@@ -280,15 +279,6 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifier
 			km.direct[alias] = st
 		}
 	}
-	// Bound scratch keycodes rejoin the pool after the empty ones, in the
-	// order they were last used.
-	if prev != nil {
-		for _, code := range prev.spare {
-			if _, ok := km.bound[code]; ok {
-				km.spare = append(km.spare, code)
-			}
-		}
-	}
 	return km
 }
 
@@ -352,46 +342,33 @@ type keyPlanner struct {
 	km    *x11Keymap
 	spare []xproto.Keycode
 	bound map[xproto.Keycode]uint32
-	used  map[xproto.Keycode]bool
 	cur   keySegment
 }
 
 func newKeyPlanner(km *x11Keymap) *keyPlanner {
 	p := &keyPlanner{km: km, spare: append([]xproto.Keycode(nil), km.spare...),
-		bound: make(map[xproto.Keycode]uint32, len(km.bound)), used: map[xproto.Keycode]bool{}}
+		bound: make(map[xproto.Keycode]uint32, len(km.bound))}
 	for code, ks := range km.bound {
 		p.bound[code] = ks
 	}
 	return p
 }
 
-func (p *keyPlanner) touch(code xproto.Keycode) {
-	for i, c := range p.spare {
-		if c == code {
-			p.spare = append(append(p.spare[:i:i], p.spare[i+1:]...), code)
-			break
-		}
-	}
-	p.used[code] = true
-}
-
-// scratch returns a keycode bound to ks, binding the least recently used
-// spare when none is. When that spare was already typed with in this
-// request the pool is exhausted: the request declines rather than rebind
-// a keycode an application may not have consumed yet.
+// scratch returns the keycode bound to ks, binding a never-pressed spare
+// when there is none. With no spare left the request declines: a bound
+// keycode is never taken back (see x11Keymap).
 func (p *keyPlanner) scratch(ks uint32) (xproto.Keycode, error) {
 	for code, bks := range p.bound {
 		if bks == ks {
-			p.touch(code)
 			return code, nil
 		}
 	}
-	if len(p.spare) == 0 || p.used[p.spare[0]] {
+	if len(p.spare) == 0 {
 		return 0, fmt.Errorf("no spare keycode for keysym 0x%x: %w", ks, errBackendKept)
 	}
 	code := p.spare[0]
+	p.spare = p.spare[1:]
 	p.bound[code] = ks
-	p.touch(code)
 	p.cur.binds = append(p.cur.binds, keyBind{code: code, keysym: ks})
 	return code, nil
 }

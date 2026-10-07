@@ -174,27 +174,22 @@ func TestPlanKey_UnmappedCharactersBindScratchKeycodesOnce(t *testing.T) {
 	eventsEqual(t, segs[0].events, tapEvents(kcSpare0))
 }
 
-// A keycode is never rebound within one request: when the pool runs out
-// the request declines, with nothing bound.
+// A keycode is never rebound, within or across requests: when the pool
+// runs out the request declines, with nothing bound.
 func TestPlanKey_ExhaustedPoolDeclines(t *testing.T) {
 	km := testKeymap(1)
-	_, err := planKey(km, xkbState{}, textEvent("éà"))
-	if !errors.Is(err, errBackendKept) {
+	if _, err := planKey(km, xkbState{}, textEvent("éà")); !errors.Is(err, errBackendKept) {
 		t.Fatalf("err = %v, want errBackendKept", err)
 	}
 	if len(km.bound) != 0 {
 		t.Errorf("a declined plan bound %v", km.bound)
 	}
-	// The same characters fit across two requests: the first binds é, the
-	// second evicts it for à.
 	if _, err := planKey(km, xkbState{}, textEvent("é")); err != nil {
 		t.Fatal(err)
 	}
-	segs, err := planKey(km, xkbState{}, textEvent("à"))
-	if err != nil {
-		t.Fatal(err)
+	if _, err := planKey(km, xkbState{}, textEvent("à")); !errors.Is(err, errBackendKept) {
+		t.Fatalf("err = %v, want errBackendKept: é keeps its keycode", err)
 	}
-	bindsEqual(t, segs[0].binds, []keyBind{{kcSpare0, 0xe0}})
 }
 
 // A native layout key carries a legacy keysym; text written by code point
@@ -401,8 +396,8 @@ func TestBuildKeymap_KeepsScratchBindingsAcrossReload(t *testing.T) {
 	if _, direct := reloaded.direct[0xe9]; direct {
 		t.Error("scratch keycode was promoted to a layout key")
 	}
-	if reloaded.bound[kcSpare0] != 0xe9 || len(reloaded.spare) != 2 {
-		t.Errorf("bound = %v, spare = %v; want é kept on %d and both keycodes in the pool", reloaded.bound, reloaded.spare, kcSpare0)
+	if reloaded.bound[kcSpare0] != 0xe9 || fmt.Sprint(reloaded.spare) != fmt.Sprint([]xproto.Keycode{kcSpare1}) {
+		t.Errorf("bound = %v, spare = %v; want é kept on %d and only %d still free", reloaded.bound, reloaded.spare, kcSpare0, kcSpare1)
 	}
 
 	// A reload that no longer types é on that keycode drops the binding:
@@ -541,8 +536,8 @@ func TestBuildKeymap_ModifierKeycodesOfferOnlyModifierKeysyms(t *testing.T) {
 // KP_1 shares its key with KP_End and Num Lock picks between them, so it
 // must never go through that key with Shift: a scratch keycode instead.
 func TestPlanKey_KeypadKeysUseScratchKeycodes(t *testing.T) {
-	km := testKeymap(1)
 	for _, name := range []string{"KP_1", "KP_End"} {
+		km := testKeymap(1)
 		segs, err := planKey(km, xkbState{}, chordEvent(name))
 		if err != nil {
 			t.Fatal(err)
@@ -639,33 +634,24 @@ func TestXkbStateFromReply(t *testing.T) {
 	}
 }
 
-// The keymap is rebuilt from a fresh fetch before every request, so the
-// pool's order has to come from the previous map, not from map iteration.
-func TestBuildKeymap_KeepsLRUOrderAcrossRebuilds(t *testing.T) {
+// A scratch binding is for the life of the backend: a pressed keycode is
+// never rebound, because an application may still be holding its events.
+func TestPlanKey_ScratchBindingsAreNeverRecycled(t *testing.T) {
 	km := testKeymap(2)
 	if _, err := planKey(km, xkbState{}, textEvent("éà")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := planKey(km, xkbState{}, textEvent("é")); err != nil {
-		t.Fatal(err)
+	if _, err := planKey(km, xkbState{}, textEvent("ü")); !errors.Is(err, errBackendKept) {
+		t.Fatalf("err = %v, want errBackendKept: the pool is full and nothing may be evicted", err)
 	}
-	syms := make([]xproto.Keysym, 0, 12*2)
-	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0xe9, 0xc9}, {0xe0, 0xc0}, {0, 0}} {
-		syms = append(syms, r[0], r[1])
-	}
-	for i := 0; i < 20; i++ {
-		rebuilt := buildKeymap(8, 2, syms, nil, km)
-		if fmt.Sprint(rebuilt.spare) != fmt.Sprint(km.spare) {
-			t.Fatalf("rebuild %d reordered the pool: %v, was %v", i, rebuilt.spare, km.spare)
-		}
-		km = rebuilt
-	}
-	// à was used longest ago, so a new character evicts it, not é.
-	segs, err := planKey(km, xkbState{}, textEvent("ü"))
+	segs, err := planKey(km, xkbState{}, textEvent("àé"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	bindsEqual(t, segs[0].binds, []keyBind{{kcSpare1, 0xfc}})
+	if len(segs[0].binds) != 0 {
+		t.Errorf("binds = %v, want none: both are still bound", segs[0].binds)
+	}
+	eventsEqual(t, segs[0].events, append(tapEvents(kcSpare1), tapEvents(kcSpare0)...))
 }
 
 // A replacement backend inherits the dropped one's scratch bindings, so
