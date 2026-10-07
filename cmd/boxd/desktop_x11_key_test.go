@@ -508,6 +508,13 @@ func TestPlanKey_UppercaseWithoutRoundTripKeepsItsKeysym(t *testing.T) {
 	if scratchRowIntact([]xproto.Keysym{'i', 'I'}, dotI) {
 		t.Error("[i, I] is a different key and must not count as İ")
 	}
+	// Levels must be in canonical order: [é, é] has no shifted É any more.
+	if scratchRowIntact([]xproto.Keysym{0xe9, 0xe9}, 0xe9) {
+		t.Error("[é, é] was accepted as the bound é key")
+	}
+	if !scratchRowIntact([]xproto.Keysym{0xe9, 0xc9, 0xe9, 0xc9}, 0xe9) {
+		t.Error("[é, É, é, É] (two groups) was rejected")
+	}
 }
 
 // A keycode in the modifier map offers its modifier keysym and nothing
@@ -576,6 +583,11 @@ func TestBuildKeymap_FindsIdleLockBitsAndStateIgnoresThem(t *testing.T) {
 	reply[8] |= xproto.ModMaskControl
 	if got := xkbStateFromReply(reply, km.idleLocks); !got.held {
 		t.Errorf("state = %+v, want held for Control alongside Num Lock", got)
+	}
+	// Num Lock depressed (not just locked) is a modifier being held.
+	reply[8], reply[9], reply[11] = 1<<4, 1<<4, 0
+	if got := xkbStateFromReply(reply, km.idleLocks); !got.held {
+		t.Errorf("state = %+v, want held for a depressed Num Lock", got)
 	}
 }
 

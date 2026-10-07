@@ -105,12 +105,15 @@ func (b *x11Backend) xkbRequest(req []byte) ([]byte, error) {
 
 // xkbStateFromReply reads a raw XkbGetState reply: after the 8-byte header
 // come mods, baseMods, latchedMods, lockedMods, then the effective group.
-// Modifier bits in idle are disregarded.
+// Modifier bits in idle are disregarded while only locked.
 func xkbStateFromReply(reply []byte, idle byte) xkbState {
 	if len(reply) < 13 {
 		return xkbState{}
 	}
-	effective, base, latched, locked := reply[8]&^idle, reply[9]&^idle, reply[10]&^idle, reply[11]&^idle
+	effective, base, latched, locked := reply[8], reply[9], reply[10], reply[11]
+	// An idle lock (Num Lock, Scroll Lock) is disregarded only while it is
+	// merely locked; depressed or latched, it is a modifier like any other.
+	effective &^= idle & locked &^ (base | latched)
 	// Key clears a locked Shift or Lock itself; any other modifier in effect
 	// (held, latched, or locked by a sticky-keys client), or Shift and Lock
 	// when depressed rather than locked, counts as held.
@@ -285,9 +288,10 @@ func modifierKeysym(ks uint32) bool {
 }
 
 // scratchRowIntact reports whether a fetched row is still the single-keysym
-// key bound to ks: the server exports a cased letter back as its
-// lower/upper pair (with the lowercase form first), so those are the only
-// symbols allowed besides NoSymbol.
+// key bound to ks: the installed form, or the server's export of a cased
+// letter as its lower/upper pair in that order (lower on even levels,
+// upper on odd), with NoSymbol anywhere. Any other shape is another
+// client's key.
 func scratchRowIntact(row []xproto.Keysym, ks uint32) bool {
 	lower, upper := ks, ks
 	if casedLetter(ks) {
@@ -297,8 +301,12 @@ func scratchRowIntact(row []xproto.Keysym, ks uint32) bool {
 	if len(row) == 0 || (uint32(row[0]) != ks && uint32(row[0]) != lower) {
 		return false
 	}
-	for _, sym := range row[1:] {
-		if s := uint32(sym); s != 0 && s != ks && s != lower && s != upper {
+	for i, sym := range row[1:] {
+		want := upper
+		if i%2 == 1 { // row index i+1 is even
+			want = lower
+		}
+		if s := uint32(sym); s != 0 && s != want {
 			return false
 		}
 	}
