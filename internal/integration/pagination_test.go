@@ -259,3 +259,43 @@ func TestIntegration_ListTemplates_Pagination(t *testing.T) {
 		t.Errorf("bad owner status = %d, want 400", w.Code)
 	}
 }
+
+func TestIntegration_ListSandboxes_MultipleStatuses(t *testing.T) {
+	teamID, apiKey := seedTeamAndKey(t)
+	otherTeam, _ := seedTeamAndKey(t)
+	r := newRouter(t)
+	base := time.Now().Add(-time.Hour)
+	insertSandboxAt(t, teamID, "alpha", "active", base)
+	insertSandboxAt(t, teamID, "bravo", "paused", base.Add(time.Minute))
+	insertSandboxAt(t, teamID, "charlie", "resuming", base.Add(2*time.Minute))
+	insertSandboxAt(t, teamID, "delta", "failed", base.Add(3*time.Minute))
+	insertSandboxAt(t, otherTeam, "foreign", "active", base)
+	for _, tc := range []struct {
+		query string
+		want  []string
+		total string
+	}{
+		{"status=active,resuming&limit=1", []string{"charlie"}, "2"},
+		{"status=active&status=resuming&order=asc&limit=1&offset=1", []string{"charlie"}, "2"},
+		{"status=active,resuming,active&sort=name&order=asc&limit=1", []string{"alpha"}, "2"},
+		{"status=active,resuming&q=alpha&limit=1", []string{"alpha"}, "1"},
+		{"status=active,resuming&offset=2&limit=1", []string{}, "2"},
+		{"status=starting,migrating", []string{}, "0"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			w := do(r, "GET", "/sandboxes?"+tc.query, apiKey, "")
+			rows := decodeArray(t, w)
+			if !eqStrings(names(rows), tc.want) {
+				t.Errorf("names = %v, want %v", names(rows), tc.want)
+			}
+			if got := w.Header().Get("X-Total-Count"); got != tc.total {
+				t.Errorf("total = %s, want %s", got, tc.total)
+			}
+		})
+	}
+	for _, status := range []string{"active,invalid", "active,", "active&status=invalid"} {
+		if w := do(r, "GET", "/sandboxes?status="+status, apiKey, ""); w.Code != 400 {
+			t.Errorf("invalid status %s: code = %d", status, w.Code)
+		}
+	}
+}

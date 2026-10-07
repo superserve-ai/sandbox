@@ -109,7 +109,8 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 		desktopSendKeyPath,
 		desktopScrollPath,
 		desktopResizePath,
-		desktopSendActionsPath:
+		desktopSendActionsPath,
+		desktopStepPath:
 		h.serveDesktop(w, r, instanceID)
 	default:
 		http.NotFound(w, r)

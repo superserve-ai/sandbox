@@ -79,6 +79,7 @@ class SteadyFrontendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'infra/envs/staging/us-central1').mkdir(parents=True)
+            (root / 'control-plane-identity/use4').mkdir(parents=True)
             shim = root / 'terraform'
             shim.write_text('''#!/bin/sh
 case "$1" in
@@ -105,7 +106,7 @@ esac
                     applied = root / 'applied'
                     applied.unlink(missing_ok=True)
                     env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
-                               GITHUB_WORKSPACE=str(ROOT), GITHUB_STEP_SUMMARY=str(root / 'summary'),
+                               GITHUB_WORKSPACE=str(ROOT), RUNNER_TEMP=str(root), GITHUB_STEP_SUMMARY=str(root / 'summary'),
                                PLAN_FIXTURE=str(fixture), APPLY_RECEIPT=str(applied),
                                PLAN_SETTING=str(root / 'setting'), TF_VAR_proxy_generation_frontends_enabled=selected)
                     result = subprocess.run(['bash', '-eu', '-c', script], cwd=root, env=env,

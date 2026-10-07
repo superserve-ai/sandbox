@@ -129,3 +129,9 @@ variable "alert_runbook_base_url" {
     error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
   }
 }
+
+variable "notification_channel_ids" {
+  description = "Existing Cloud Monitoring notification channels for staging alerts."
+  type        = list(string)
+  default     = []
+}

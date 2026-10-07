@@ -122,6 +122,7 @@ jobs:
           # Database roles are cluster-wide, so this package remains after the
           # ordered integration/migration command in the same isolated job.
           go test -v -tags integration -count=1 -race -timeout 10m ./cmd/seed-templates/
+          go test -v -tags integration -count=1 -race -timeout 1m -run '^TestQMKeyUsage$' ./internal/api
 
   proxy-database-contracts:
     name: Proxy Database Contracts
@@ -204,6 +205,11 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
         run: go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_Storage(ReceiptFence|Settlement)' ./internal/billing
+
+      - name: Run billing finalization scheduling race contracts
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_Finalization' ./internal/billing
 
       - name: Run storage report refresh race contract
         env:

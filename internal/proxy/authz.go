@@ -228,7 +228,7 @@ func verifyMachineProxyOperation(token string, signingKey []byte, sandboxID, met
 		switch path {
 		case desktopScreenshotPath, desktopStreamPath:
 			operation, ok = auth.TeamOperationDesktopRead, true
-		case desktopSendPointerPath, desktopSendKeyPath, desktopScrollPath, desktopResizePath, desktopSendActionsPath:
+		case desktopSendPointerPath, desktopSendKeyPath, desktopScrollPath, desktopResizePath, desktopSendActionsPath, desktopStepPath:
 			operation, ok = auth.TeamOperationDesktopWrite, true
 		}
 	}
@@ -483,7 +483,8 @@ func (h *Handler) canRouteBoxdRequest(r *http.Request, sandboxID string) bool {
 		desktopSendKeyPath,
 		desktopScrollPath,
 		desktopResizePath,
-		desktopSendActionsPath:
+		desktopSendActionsPath,
+		desktopStepPath:
 		if !h.desktopEnabled {
 			return false
 		}

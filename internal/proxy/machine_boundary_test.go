@@ -207,7 +207,7 @@ func TestTeamDesktopCapabilityAdmission(t *testing.T) {
 		allowed      bool
 	}{
 		{desktopScreenshotPath, http.MethodPost, true}, {desktopStreamPath, http.MethodPost, true},
-		{desktopSendKeyPath, http.MethodPost, false}, {desktopScreenshotPath, http.MethodGet, false},
+		{desktopSendKeyPath, http.MethodPost, false}, {desktopStepPath, http.MethodPost, false}, {desktopScreenshotPath, http.MethodGet, false},
 		{desktopScreenshotPath + "/unknown", http.MethodPost, false},
 	} {
 		req := httptest.NewRequest(tc.method, "http://sandbox.test"+tc.path, nil)

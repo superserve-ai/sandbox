@@ -27,6 +27,7 @@ import (
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
@@ -1045,6 +1046,9 @@ func main() {
 		log,
 	)
 	egressProxy.SetHostID(cfg.HostID)
+	if os.Getenv("VMD_MINING_POLICY_CONFIG") != "" {
+		egressProxy.EnableMiningStreamTracking()
+	}
 	mgr.SetEgressProxy(egressProxy)
 	netMgr.SetEgressProxy(egressProxy)
 	st.mark("vm_manager_init", true, -1)
@@ -1574,6 +1578,10 @@ func main() {
 	maxStreams, _ := strconv.Atoi(envOrDefault("VMD_MAX_CONCURRENT_STREAMS", "2000"))
 	grpcServer := grpc.NewServer(
 		grpc.MaxConcurrentStreams(uint32(maxStreams)),
+		// Clients ping idle connections every 30s; accept that and ping back so
+		// a dead connection is dropped on both ends.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 20 * time.Second, PermitWithoutStream: true}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 60 * time.Second, Timeout: 20 * time.Second}),
 		grpc.MaxRecvMsgSize(64<<20), // 64 MiB
 		grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			if !startupReady.Load() {
@@ -1842,6 +1850,7 @@ func main() {
 	// logging. If DATABASE_URL is unset, the reconciler falls back to a
 	// BoltDB ↔ systemd comparison only.
 	var reconcilerDB *dbq.Queries
+	var reloadMiningPolicy func()
 	if cfg.DatabaseURL != "" {
 		dbCfg, dbErr := pgxpool.ParseConfig(cfg.DatabaseURL)
 		if dbErr != nil {
@@ -1885,6 +1894,7 @@ func main() {
 			return nil
 		})
 		log.Info().Msg("reconciler DB connection ready")
+		reloadMiningPolicy = startMiningProtection(ctx, postReady, cfg, dbPool, egressProxy, lc, log, recorder, mgr)
 
 		// Per-connection egress logging. Drops on a full buffer rather than
 		// back-pressuring the proxy's data path.
@@ -1897,6 +1907,7 @@ func main() {
 	} else {
 		log.Warn().Msg("DATABASE_URL unset — reconciler will run in BoltDB↔systemd-only mode")
 		st.mark("db_connect", false, -1)
+		reloadMiningPolicy = startMiningProtection(ctx, postReady, cfg, nil, egressProxy, lc, log, recorder, mgr)
 	}
 
 	// ---- Continuous reconciler ----
@@ -2125,6 +2136,9 @@ func main() {
 		for {
 			select {
 			case <-hupCh:
+				if reloadMiningPolicy != nil {
+					reloadMiningPolicy()
+				}
 				if blockList != nil && blocklistPath != "" {
 					log.Info().Msg("SIGHUP: reloading egress blocklist config")
 					blockList.Reload(blocklistPath)

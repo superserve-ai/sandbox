@@ -270,29 +270,44 @@ func encodeFramePNG(frame *image.RGBA) ([]byte, error) {
 // working while a viewer holds a long-lived Stream open. Dimensions come from
 // the PNG header rather than a second xdotool round trip.
 func (s *desktopService) Screenshot(ctx context.Context, req *connect.Request[pb.ScreenshotRequest]) (*connect.Response[pb.ScreenshotResponse], error) {
-	format := req.Msg.GetFormat()
-	if format == pb.FrameFormat_FRAME_FORMAT_UNSPECIFIED {
-		format = pb.FrameFormat_FRAME_FORMAT_PNG
+	format, err := screenshotFormat(req.Msg.GetFormat())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	if format != pb.FrameFormat_FRAME_FORMAT_PNG {
-		return nil, connect.NewError(connect.CodeInvalidArgument,
-			fmt.Errorf("unsupported frame format %v: only PNG is supported", format))
-	}
-
-	img, err := s.captureScreenshot(ctx)
+	resp, err := s.screenshotResponse(ctx, format)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
+	return connect.NewResponse(resp), nil
+}
+
+// screenshotFormat resolves a requested frame format; only PNG exists today.
+func screenshotFormat(format pb.FrameFormat) (pb.FrameFormat, error) {
+	switch format {
+	case pb.FrameFormat_FRAME_FORMAT_UNSPECIFIED, pb.FrameFormat_FRAME_FORMAT_PNG:
+		return pb.FrameFormat_FRAME_FORMAT_PNG, nil
+	default:
+		return 0, fmt.Errorf("unsupported frame format %v: only PNG is supported", format)
+	}
+}
+
+// screenshotResponse captures one frame and reads its dimensions from the
+// PNG header. Shared by Screenshot and Step.
+func (s *desktopService) screenshotResponse(ctx context.Context, format pb.FrameFormat) (*pb.ScreenshotResponse, error) {
+	img, err := s.captureScreenshot(ctx)
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := png.DecodeConfig(bytes.NewReader(img))
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("decode screenshot header: %w", err))
+		return nil, fmt.Errorf("decode screenshot header: %w", err)
 	}
-	return connect.NewResponse(&pb.ScreenshotResponse{
+	return &pb.ScreenshotResponse{
 		Image:  img,
 		Width:  uint32(cfg.Width),
 		Height: uint32(cfg.Height),
 		Format: format,
-	}), nil
+	}, nil
 }
 
 // captureScreenshot returns the current frame as PNG bytes: the persistent
@@ -533,13 +548,34 @@ func keyArgs(msg *pb.KeyEvent) ([]string, error) {
 		if len(in.Text) > maxTextLength || strings.IndexByte(in.Text, 0) >= 0 {
 			return nil, fmt.Errorf("text is invalid or exceeds %d bytes", maxTextLength)
 		}
+		text, err := normalizeKeyText(in.Text)
+		if err != nil {
+			return nil, err
+		}
 		// Modifiers don't apply to literal text entry. --delay 0 drops
 		// xdotool's default 12ms/char pacing, which is for human visibility;
-		// at that rate a long paste takes seconds.
-		return []string{"type", "--delay", "0", "--", in.Text}, nil
+		// at that rate a long paste takes seconds. --clearmodifiers lifts an
+		// active Caps or Shift Lock for the duration, so the text comes out
+		// as written (the X11 path does the same itself).
+		return []string{"type", "--delay", "0", "--clearmodifiers", "--", text}, nil
 	default:
 		return nil, errors.New("one of key or text is required")
 	}
+}
+
+// execKey delivers a validated key event through the persistent connection
+// when it can plan the keystrokes, else through xdotool. The X11 path only
+// declines before sending anything, so the fallback never replays input.
+func (s *desktopService) execKey(ctx context.Context, ev *pb.KeyEvent, fallbackArgs []string) error {
+	inputCtx, cancel := context.WithTimeout(ctx, xdotoolTimeout)
+	defer cancel()
+	attempted, err := s.runX11(inputCtx, func(_ context.Context, b *x11Backend) error {
+		return b.Key(ev)
+	})
+	if attempted && !errors.Is(err, errBackendKept) {
+		return err
+	}
+	return s.runXdotool(ctx, fallbackArgs...)
 }
 
 func (s *desktopService) SendKey(ctx context.Context, req *connect.Request[pb.KeyEvent]) (*connect.Response[pb.KeyResponse], error) {
@@ -549,7 +585,7 @@ func (s *desktopService) SendKey(ctx context.Context, req *connect.Request[pb.Ke
 	}
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
-	if err := s.runXdotool(ctx, args...); err != nil {
+	if err := s.execKey(ctx, req.Msg, args); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&pb.KeyResponse{}), nil
@@ -644,7 +680,8 @@ func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, er
 			if err != nil {
 				return nil, fmt.Errorf("action %d: %w", i, err)
 			}
-			lowered[i] = func(ctx context.Context) error { return s.runXdotool(ctx, args...) }
+			ev := a.Key
+			lowered[i] = func(ctx context.Context) error { return s.execKey(ctx, ev, args) }
 		case *pb.Action_Scroll:
 			cmds, err := scrollCommands(a.Scroll.GetDx(), a.Scroll.GetDy())
 			if err != nil {
@@ -673,6 +710,58 @@ func (s *desktopService) SendActions(ctx context.Context, req *connect.Request[p
 		}
 	}
 	return connect.NewResponse(&pb.ActionBatchResponse{Executed: uint32(len(lowered))}), nil
+}
+
+// ---------------------------------------------------------------------------
+// Step — action batch plus frame in one request
+// ---------------------------------------------------------------------------
+
+// maxStepSettle caps the pause between a batch and its capture. The input
+// lock is held across it, so a long settle would stall every other input.
+const maxStepSettle = 2 * time.Second
+
+func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepRequest]) (*connect.Response[pb.StepResponse], error) {
+	format, err := screenshotFormat(req.Msg.GetFormat())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	settle := time.Duration(req.Msg.GetSettleMs()) * time.Millisecond
+	if settle > maxStepSettle {
+		return nil, connect.NewError(connect.CodeInvalidArgument,
+			fmt.Errorf("settle_ms %d exceeds max %d", req.Msg.GetSettleMs(), maxStepSettle/time.Millisecond))
+	}
+	lowered, err := s.lowerActions(req.Msg.GetActions())
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+
+	// The lock also covers the settle and the capture, so the frame shows
+	// the state this batch produced and nothing that arrived after it.
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	resp := &pb.StepResponse{Executed: uint32(len(lowered))}
+	for i, run := range lowered {
+		if err := run(ctx); err != nil {
+			resp.Executed = uint32(i)
+			resp.ActionError = fmt.Sprintf("action %d failed after %d executed: %v", i, i, err)
+			break
+		}
+	}
+	if settle > 0 {
+		select {
+		case <-time.After(settle):
+		case <-ctx.Done():
+		}
+	}
+	// Input already landed by now, so a capture failure is reported in the
+	// response rather than as an RPC error the caller might retry.
+	shot, err := s.screenshotResponse(ctx, format)
+	if err != nil {
+		resp.CaptureError = err.Error()
+	} else {
+		resp.Screenshot = shot
+	}
+	return connect.NewResponse(resp), nil
 }
 
 func abs32(v int32) int64 {

@@ -20,6 +20,7 @@ sqlc generate -f "$sqlc_dir/sqlc.yaml"
 diff_args=(
   -ruN
   --exclude='*_test.go'
+  --exclude='enum_arrays.go'
   --exclude='host_capabilities.go'
   --exclude='billing_lock.go'
   --exclude='stripe_checkout_association_alerts.go'

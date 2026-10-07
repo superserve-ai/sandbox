@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# The same desired-state renderer handles compliance and activation.
+# --check does not modify services, delivery state, or active files.
+# Persisted stores: storage: file_storage/cursor and storage: file_storage/queue.
+exec bash /var/lib/superserve/host-logging/reconcile.sh --check

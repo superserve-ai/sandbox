@@ -131,6 +131,361 @@ def validate_identity_replacement(change, vm_change, references, host):
     unchanged(before, after, unknown)
 
 
+HOST_LOGGING_RESOURCES = {
+    'google_os_config_os_policy_assignment.host_logging',
+    'google_project_iam_member.log_writer',
+    'google_storage_bucket_iam_member.artifact_reader',
+    'google_storage_bucket_object.otel_config',
+    'google_storage_bucket_object.otel_service',
+    'google_storage_bucket_object.reconcile_script',
+    'google_storage_bucket_object.validate_script',
+    'google_storage_bucket_object.legacy_migration_target',
+    'terraform_data.legacy_migration',
+}
+
+HOST_LOGGING_ALERT_RESOURCES = {
+    'google_logging_metric.host_logging_heartbeat',
+    'google_logging_metric.host_logging_delivery_lag',
+    'google_monitoring_alert_policy.host_logging_export_failures',
+    'google_monitoring_alert_policy.host_logging_lag',
+    'google_monitoring_alert_policy.host_logging_heartbeat',
+}
+
+
+def _references(value):
+    """Collect Terraform expression references without trusting values."""
+    found = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == 'references' and isinstance(child, list):
+                found.extend(item for item in child if isinstance(item, str))
+            found.extend(_references(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_references(child))
+    return found
+
+
+_IDENTITY_KEYS = {
+    'host_id', 'instance_id', 'instance_name', 'incarnation', 'self_link',
+}
+_DERIVED_METADATA_KEYS = _IDENTITY_KEYS | {'id', 'etag', 'generation'}
+_IDENTITY_SUBSTITUTION_KEYS = {'content', 'filter', 'query', 'documentation'}
+
+
+def _identity_only_change(before, after, unknown, old_id, new_id=None, path=()):
+    """Reject functional host-logging changes during an identity replacement.
+
+    Terraform may recompute a selected VM identity and strings that embed it,
+    but a replacement must not smuggle a new selector, script, package, IAM
+    grant, or alert behavior through the same plan.
+    """
+    leaf = path[-1] if path else None
+    if unknown is True:
+        # Unknown functional content is never justified by an old instance ID
+        # appearing somewhere in the rendered value. Only provider metadata and
+        # explicitly identity-bearing fields may be recomputed by Terraform.
+        require(leaf in _DERIVED_METADATA_KEYS,
+                'Unexpected unknown host logging field: ' + str(path))
+        return
+    if isinstance(before, dict) or isinstance(after, dict):
+        left = before if isinstance(before, dict) else {}
+        right = after if isinstance(after, dict) else {}
+        pending = unknown if isinstance(unknown, dict) else {}
+        for key in left.keys() | right.keys() | pending.keys():
+            _identity_only_change(left.get(key), right.get(key), pending.get(key), old_id,
+                                  new_id, path + (key,))
+        return
+    if isinstance(before, list) or isinstance(after, list):
+        left = before if isinstance(before, list) else []
+        right = after if isinstance(after, list) else []
+        pending = unknown if isinstance(unknown, list) else []
+        require(len(left) == len(right), 'Host logging list shape changed: ' + str(path))
+        for index, (old, new) in enumerate(zip(left, right)):
+            _identity_only_change(old, new, pending[index] if index < len(pending) else None,
+                                  old_id, new_id, path + (index,))
+        return
+    if before == after:
+        return
+    if leaf in _DERIVED_METADATA_KEYS:
+        # A dependency may only carry the identity selected by the VM change.
+        # Do not accept an arbitrary identity-looking value from an artifact;
+        # an unknown replacement ID remains unknown until the provider resolves
+        # the selected VM itself.
+        if before != after:
+            require(new_id is not None and str(after) == str(new_id),
+                    'Host logging identity does not follow the selected VM')
+        return
+    if (isinstance(before, str) and isinstance(after, str)
+            and leaf in _IDENTITY_SUBSTITUTION_KEYS and old_id and old_id in before):
+        prefix, separator, suffix = before.partition(old_id)
+        expected = prefix + (str(new_id) if new_id is not None else after[len(prefix):len(after) - len(suffix) or None]) + suffix
+        require(separator and after == expected,
+                'Unrelated host logging content change: ' + str(path))
+        return
+    require(False, 'Unrelated host logging change during replacement: ' + str(path))
+
+
+def _nested(value, path):
+    for key in path:
+        if not isinstance(value, (dict, list)):
+            return None
+        value = value[key] if isinstance(value, dict) else value[key]
+    return value
+
+
+def _identity_only_monitoring_change(change, vm_change, identity_path):
+    """Allow an existing host alert to substitute only the selected VM ID."""
+    require(change['actions'] == ['update'],
+            'Host logging monitoring resources may only update in place')
+    old_id = (vm_change.get('before') or {}).get('instance_id')
+    new_id = (vm_change.get('after') or {}).get('instance_id')
+    before, after = change.get('before') or {}, change.get('after') or {}
+    unknown = change.get('after_unknown') or {}
+    old_filter = _nested(before, identity_path)
+    if vm_change.get('actions') == ['create']:
+        prior_ids = set(re.findall(r'resource\.labels\.instance_id\s*=\s*"([0-9]+)"', old_filter or ''))
+        prior_ids.update(re.findall(r'"collector_host_id"\s*=\s*"([0-9]+)"', old_filter or ''))
+        require(len(prior_ids) == 1,
+                'Host logging monitoring filter must select one previous VM')
+        old_id = next(iter(prior_ids))
+    require(isinstance(old_filter, str) and old_id and str(old_id) in old_filter,
+            'Host logging monitoring filter must select the previous VM')
+
+    def unchanged(left, right, pending, path=()):
+        if path == identity_path:
+            # Terraform hides the whole interpolated string when the VM ID is
+            # unknown, including any simultaneous window/predicate changes.
+            require(pending is not True,
+                    'Unresolved host logging alert query/filter: identity-only change cannot be verified; '
+                    'use a separately reviewed, evidence-gated logging rollout')
+            if left == right:
+                return
+            require(isinstance(left, str) and isinstance(right, str) and new_id,
+                    'Host logging monitoring identity is unresolved')
+            require(left.count(str(old_id)) == 1 and
+                    right == left.replace(str(old_id), str(new_id), 1),
+                    'Unrelated host logging monitoring filter change')
+            return
+        if pending is True:
+            require(path and path[-1] in _DERIVED_METADATA_KEYS,
+                    'Unexpected unknown host logging monitoring field: ' + str(path))
+            return
+        if isinstance(left, dict) or isinstance(right, dict):
+            left_map = left if isinstance(left, dict) else {}
+            right_map = right if isinstance(right, dict) else {}
+            pending_map = pending if isinstance(pending, dict) else {}
+            for key in left_map.keys() | right_map.keys() | pending_map.keys():
+                unchanged(left_map.get(key), right_map.get(key), pending_map.get(key), path + (key,))
+            return
+        if isinstance(left, list) or isinstance(right, list):
+            left_list = left if isinstance(left, list) else []
+            right_list = right if isinstance(right, list) else []
+            pending_list = pending if isinstance(pending, list) else []
+            require(len(left_list) == len(right_list),
+                    'Host logging monitoring list shape changed: ' + str(path))
+            for index, (old, new) in enumerate(zip(left_list, right_list)):
+                unchanged(old, new, pending_list[index] if index < len(pending_list) else None,
+                          path + (index,))
+            return
+        require(left == right, 'Unrelated host logging monitoring change: ' + str(path))
+
+    unchanged(before, after, unknown)
+
+
+def validate_host_logging_alert_update(change, vm_change, config, host, region):
+    """Permit only the selected VM identity to flow into logging alerts."""
+    address = change.get('address', '')
+    resource = address[len('module.observability.'):].split('[', 1)[0]
+    require(resource in HOST_LOGGING_ALERT_RESOURCES,
+            'Unexpected host logging alert dependency: ' + address)
+    selected = re.search(r'\["([^"]+)"\]$', address)
+    require(selected and selected.group(1) == host,
+            'Host logging alert must belong to the selected VM')
+    references = _references(config.get('module_calls', {}).get('observability', {})
+                             .get('expressions', {}).get('host_logging_alerts', {}))
+    identity_refs = {reference for reference in references
+                     if re.fullmatch(r'module\.sandbox_host(?:_b|_c)?\.instance_id', reference)}
+    require(f'module.{host}.instance_id' in identity_refs,
+            'Host logging alert must follow the selected VM identity')
+    permitted = {f'module.{candidate}.instance_id' for candidate in HOSTS[region]}
+    require(identity_refs.issubset(permitted),
+            'Host logging alert references an unselected VM identity')
+    if resource.startswith('google_logging_metric.'):
+        path = ('filter',)
+    elif resource == 'google_monitoring_alert_policy.host_logging_export_failures':
+        path = ('conditions', 0, 'condition_matched_log', 0, 'filter')
+    elif resource == 'google_monitoring_alert_policy.host_logging_lag':
+        path = ('conditions', 0, 'condition_prometheus_query_language', 0, 'query')
+    else:
+        path = ('conditions', 0, 'condition_prometheus_query_language', 0, 'query')
+    _identity_only_monitoring_change(change['change'], vm_change, path)
+
+
+def _migration_target(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        return decoded if isinstance(decoded, dict) else None
+    return None
+
+
+def _identity_only_migration_target(before, after, unknown, old_id, new_id, path=()):
+    """Keep east migration controls fixed while updating selected VM IDs."""
+    if unknown is True:
+        # A replacement VM ID can be unknown until apply, but no migration
+        # control or rendered content may be unknown.
+        require(len(path) >= 2 and path[-2] == 'instance_ids' and
+                isinstance(path[-1], int) and str(before) == str(old_id) and
+                old_id and new_id is None,
+                'Unexpected unknown east migration field: ' + str(path))
+        return
+    if isinstance(before, dict) or isinstance(after, dict):
+        left = before if isinstance(before, dict) else {}
+        right = after if isinstance(after, dict) else {}
+        pending = unknown if isinstance(unknown, dict) else {}
+        for key in left.keys() | right.keys() | pending.keys():
+            if key == 'phase':
+                require(left.get(key) == right.get(key) == 'preserve',
+                        'Host replacement must keep east migration in preserve phase')
+            _identity_only_migration_target(left.get(key), right.get(key), pending.get(key),
+                                            old_id, new_id, path + (key,))
+        return
+    if isinstance(before, list) or isinstance(after, list):
+        left = before if isinstance(before, list) else []
+        right = after if isinstance(after, list) else []
+        pending = unknown if isinstance(unknown, list) else []
+        require(len(left) == len(right), 'East migration list shape changed: ' + str(path))
+        for index, (old, new) in enumerate(zip(left, right)):
+            _identity_only_migration_target(old, new,
+                                            pending[index] if index < len(pending) else None,
+                                            old_id, new_id, path + (index,))
+        return
+    if before == after:
+        return
+    if len(path) >= 2 and path[-2] == 'instance_ids':
+        require(str(before) == str(old_id) and
+                (new_id is not None and str(after) == str(new_id)),
+                'East migration target does not follow the selected VM')
+        return
+    require(False, 'Unrelated east migration change: ' + str(path))
+
+
+def validate_host_logging_migration_update(change, vm_change):
+    resource = change.get('address', '').split('[', 1)[0].split('module.host_logging.', 1)[-1]
+    actions = change['change']['actions']
+    require(actions == ['update'],
+            'East migration resources may only update in place during replacement')
+    old_id = (vm_change.get('before') or {}).get('instance_id')
+    new_id = (vm_change.get('after') or {}).get('instance_id')
+    before = change['change'].get('before') or {}
+    after = change['change'].get('after') or {}
+    unknown = change['change'].get('after_unknown') or {}
+    if resource == 'terraform_data.legacy_migration':
+        _identity_only_migration_target(before.get('input'), after.get('input'),
+                                        unknown.get('input'), old_id, new_id)
+        return
+    require(resource == 'google_storage_bucket_object.legacy_migration_target',
+            'Unexpected east migration resource: ' + resource)
+    # An unknown JSON string hides all controls, even when a separate state
+    # target validates successfully. Dependency presence does not prove that
+    # the artifact uses the same expression or value.
+    require(unknown.get('content') is not True,
+            'Unresolved east migration target: identity-only change cannot be verified; '
+            'use a separately reviewed, evidence-gated logging rollout')
+    upload_metadata = {'generation', 'crc32c', 'md5hash'}
+
+    def has_unknown(value):
+        if isinstance(value, dict):
+            return any(has_unknown(child) for child in value.values())
+        if isinstance(value, list):
+            return any(has_unknown(child) for child in value)
+        return value is True
+
+    for key in before.keys() | after.keys() | unknown.keys():
+        if key == 'content' or key in upload_metadata and unknown.get(key) is True:
+            continue
+        require(not has_unknown(unknown.get(key)) and before.get(key) == after.get(key),
+                'Unrelated or unknown east migration artifact field: ' + key)
+    left = _migration_target(before.get('content'))
+    right = _migration_target(after.get('content'))
+    require(left is not None and right is not None,
+            'East migration target content must remain structured')
+    _identity_only_migration_target(left, right, {}, old_id, new_id)
+
+
+def validate_host_logging_update(change, vm_change, config, host, region):
+    """Allow only selected-host-bound logging dependencies in a VM plan.
+
+    Host creation/replacement can change identity-derived values embedded in
+    rendered OTel artifacts and assignments. Keep those updates inside the
+    Terraform-owned host-logging module, require the selected host reference,
+    and reject any functional policy/IAM mutation or unconstrained unknown.
+    """
+    address = change.get('address', '')
+    prefix = 'module.host_logging.'
+    require(address.startswith(prefix), 'Host logging dependency escaped its module')
+    resource = address[len(prefix):].split('[', 1)[0]
+    require(resource in HOST_LOGGING_RESOURCES,
+            'Unexpected host logging dependency: ' + address)
+    calls = config.get('module_calls', {}).get('host_logging', {})
+    references = _references(calls.get('expressions', {}))
+    identity_refs = {reference for reference in references
+                     if re.fullmatch(r'module\.sandbox_host(?:_b|_c)?\.instance_id', reference)}
+    require(f'module.{host}.instance_id' in identity_refs,
+            'Host logging assignment must follow the selected VM identity')
+    permitted = {f'module.{candidate}.instance_id' for candidate in HOSTS[region]}
+    require(identity_refs.issubset(permitted),
+            'Host logging assignment references an unselected VM identity')
+
+    if resource in {
+        'google_storage_bucket_object.legacy_migration_target',
+        'terraform_data.legacy_migration',
+    }:
+        validate_host_logging_migration_update(change, vm_change)
+        return
+
+    actions = change['change']['actions']
+    # Provisioning is not a host-logging rollout. Existing assignment,
+    # artifacts, and IAM bindings may update only when the selected VM identity
+    # is the sole changed input. This applies to both create recovery and
+    # replacement; creating a policy or grant here would bypass its independent
+    # functional review.
+    require(actions in (['no-op'], ['read'], ['update']),
+            'Host logging policy/artifact creation or replacement is unsupported during provisioning')
+    before = change['change'].get('before')
+    after = change['change'].get('after')
+    # Identity authority comes from the selected VM change, never from the
+    # first identity-looking field found in a rendered artifact.  On create
+    # recovery the retained identity adapter is independently validated by the
+    # provisioning guard; host-logging content must therefore already be
+    # equivalent unless it contains an explicitly VM-bound identity path.
+    vm_before = vm_change.get('before') or {}
+    vm_after = vm_change.get('after') or {}
+    old_id = vm_before.get('instance_id')
+    new_id = vm_after.get('instance_id')
+    _identity_only_change(before, after, change['change'].get('after_unknown'),
+                          old_id, new_id)
+    if resource in {
+        'google_project_iam_member.log_writer',
+        'google_storage_bucket_iam_member.artifact_reader',
+    }:
+        # Runtime identities are stable across replacement. A bare delete
+        # would remove access for an unrelated principal; provisioning permits
+        # only an in-place identity-derived update.
+        require(actions in (['no-op'], ['read'], ['update']),
+                'Host logging identity binding has an unsupported mutation')
+    else:
+        # Assignment and versioned artifacts must update in place. A destroy
+        # would discard the last working delivery policy during replacement.
+        require(actions in (['no-op'], ['read'], ['update']),
+                'Host logging policy/artifact replacement is destructive')
+
+
 def validate_plan(plan, host, image, operation, region, run_id=None):
     """Reject mutations outside the selected host and its validated dependencies."""
     require(plan.get('errored') is not True, 'Terraform plan errored')
@@ -201,6 +556,14 @@ def validate_plan(plan, host, image, operation, region, run_id=None):
                     'expressions', {}).get(variable, {}).get('references', [])
                 validate_monitoring_update(item['change'], change, references, host, condition_type)
                 continue
+        if addr.startswith('module.observability.'):
+            resource = addr[len('module.observability.'):].split('[', 1)[0]
+            if resource in HOST_LOGGING_ALERT_RESOURCES:
+                validate_host_logging_alert_update(item, change, config, host, region)
+                continue
+        if addr.startswith('module.host_logging.'):
+            validate_host_logging_update(item, change, config, host, region)
+            continue
         raise ValueError(f'Unrelated mutation in full plan: {addr}: {actions}')
     inline = after.get('attached_disk') or []
     require(any((d.get('source') or '').split('/')[-1] == disk['name'] for d in inline) or

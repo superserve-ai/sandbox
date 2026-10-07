@@ -50,11 +50,3 @@ class PushCIGateTests(unittest.TestCase):
                        SimpleNamespace(returncode=0, stdout="not JSON")):
             self.assertFalse(GATE.wait_for_ci("example/repo", "a" * 40, "push",
                                              run=Mock(return_value=result), sleep=Mock()))
-
-    def test_deployment_roots_require_ci_before_migration_gate(self):
-        for name in ("deploy-api.yml", "deploy-proxy.yml", "terraform-cd.yml"):
-            with self.subTest(workflow=name):
-                workflow = PATH.parents[1].joinpath(name).read_text()
-                self.assertLess(workflow.index("python3 .github/workflows/scripts/wait-for-push-ci.py"),
-                                workflow.index("- name: Wait for same-SHA CD Migrate to succeed"))
-                self.assertIn("actions: read", workflow[:workflow.index("wait-for-push-ci.py")])

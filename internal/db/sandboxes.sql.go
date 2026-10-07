@@ -360,15 +360,7 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 
 const claimAutoDeleteSandboxes = `-- name: ClaimAutoDeleteSandboxes :many
 WITH due AS (
-  SELECT s.id
-  FROM sandbox s
-  WHERE s.destroyed_at IS NULL
-    AND s.status = 'paused'
-    AND s.auto_delete_at IS NOT NULL
-    AND s.auto_delete_at < now()
-  ORDER BY s.auto_delete_at ASC
-  LIMIT $1
-  FOR UPDATE OF s SKIP LOCKED
+  SELECT unnest($1::uuid[]) AS id
 ),
 destroyed AS (
   UPDATE sandbox
@@ -417,9 +409,9 @@ FROM destroyed d
 `
 
 type ClaimAutoDeleteSandboxesParams struct {
-	BatchSize           int32     `json:"batch_size"`
-	RevocationExpiresAt time.Time `json:"revocation_expires_at"`
-	LeaseSeconds        int32     `json:"lease_seconds"`
+	SandboxIds          []uuid.UUID `json:"sandbox_ids"`
+	RevocationExpiresAt time.Time   `json:"revocation_expires_at"`
+	LeaseSeconds        int32       `json:"lease_seconds"`
 }
 
 type ClaimAutoDeleteSandboxesRow struct {
@@ -443,7 +435,7 @@ type ClaimAutoDeleteSandboxesRow struct {
 // after the claim can't strand a deleted sandbox with a live JWT or an open
 // interval. Returns the columns the caller needs for VM/artifact teardown.
 func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDeleteSandboxesParams) ([]ClaimAutoDeleteSandboxesRow, error) {
-	rows, err := q.db.Query(ctx, claimAutoDeleteSandboxes, arg.BatchSize, arg.RevocationExpiresAt, arg.LeaseSeconds)
+	rows, err := q.db.Query(ctx, claimAutoDeleteSandboxes, arg.SandboxIds, arg.RevocationExpiresAt, arg.LeaseSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -962,17 +954,17 @@ WHERE s.team_id = $1
   AND o.owner_principal_id = $2
   AND s.destroyed_at IS NULL
   AND s.metadata @> $3
-  AND ($4::text IS NULL OR s.status::text = $4::text)
+  AND ($4::sandbox_status[] IS NULL OR s.status = ANY($4::sandbox_status[]))
   AND ($5::text IS NULL
        OR s.name ILIKE '%' || $5::text || '%')
 `
 
 type CountSandboxesByMachineOwnerParams struct {
-	TeamID           uuid.UUID `json:"team_id"`
-	OwnerPrincipalID uuid.UUID `json:"owner_principal_id"`
-	Metadata         []byte    `json:"metadata"`
-	Status           *string   `json:"status"`
-	NameSearch       *string   `json:"name_search"`
+	TeamID           uuid.UUID       `json:"team_id"`
+	OwnerPrincipalID uuid.UUID       `json:"owner_principal_id"`
+	Metadata         []byte          `json:"metadata"`
+	Statuses         []SandboxStatus `json:"statuses"`
+	NameSearch       *string         `json:"name_search"`
 }
 
 func (q *Queries) CountSandboxesByMachineOwner(ctx context.Context, arg CountSandboxesByMachineOwnerParams) (int64, error) {
@@ -980,7 +972,7 @@ func (q *Queries) CountSandboxesByMachineOwner(ctx context.Context, arg CountSan
 		arg.TeamID,
 		arg.OwnerPrincipalID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 	)
 	var column_1 int64
@@ -993,16 +985,16 @@ SELECT COUNT(*) FROM sandbox
 WHERE team_id = $1
   AND destroyed_at IS NULL
   AND metadata @> $2
-  AND ($3::text IS NULL OR status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR name ILIKE '%' || $4::text || '%')
 `
 
 type CountSandboxesByTeamPagedParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
 }
 
 // Total rows matching the same filters as ListSandboxesByTeamPaged (ignoring
@@ -1011,7 +1003,7 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 	row := q.db.QueryRow(ctx, countSandboxesByTeamPaged,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 	)
 	var count int64
@@ -2029,6 +2021,19 @@ func (q *Queries) EnsureSandboxPreviewPolicy(ctx context.Context, arg EnsureSand
 	return err
 }
 
+const fenceRetainedStorageHost = `-- name: FenceRetainedStorageHost :exec
+SELECT pg_advisory_xact_lock(hashtextextended('retained-storage-owner:' || $1::text, 0))
+`
+
+// Step two: the lifetime fence a sandbox update takes once per row, taken up
+// front instead. Callers acquire these in a fixed order, so no two claims can
+// hold one another's next fence. Re-entrant, so the row trigger's own
+// acquisition during the claim costs nothing.
+func (q *Queries) FenceRetainedStorageHost(ctx context.Context, hostID string) error {
+	_, err := q.db.Exec(ctx, fenceRetainedStorageHost, hostID)
+	return err
+}
+
 const finalizePause = `-- name: FinalizePause :one
 WITH target AS (
   -- FOR UPDATE is load-bearing: the data-modifying CTEs below run even
@@ -2919,7 +2924,7 @@ WHERE s.team_id = $1
   AND o.owner_principal_id = $2
   AND s.destroyed_at IS NULL
   AND s.metadata @> $3
-  AND ($4::text IS NULL OR s.status::text = $4::text)
+  AND ($4::sandbox_status[] IS NULL OR s.status = ANY($4::sandbox_status[]))
   AND ($5::text IS NULL
        OR s.name ILIKE '%' || $5::text || '%')
 ORDER BY
@@ -2934,15 +2939,15 @@ OFFSET COALESCE($8::bigint, 0)
 `
 
 type ListSandboxesByMachineOwnerParams struct {
-	TeamID           uuid.UUID `json:"team_id"`
-	OwnerPrincipalID uuid.UUID `json:"owner_principal_id"`
-	Metadata         []byte    `json:"metadata"`
-	Status           *string   `json:"status"`
-	NameSearch       *string   `json:"name_search"`
-	SortBy           string    `json:"sort_by"`
-	SortDir          string    `json:"sort_dir"`
-	RowOffset        *int64    `json:"row_offset"`
-	RowLimit         *int64    `json:"row_limit"`
+	TeamID           uuid.UUID       `json:"team_id"`
+	OwnerPrincipalID uuid.UUID       `json:"owner_principal_id"`
+	Metadata         []byte          `json:"metadata"`
+	Statuses         []SandboxStatus `json:"statuses"`
+	NameSearch       *string         `json:"name_search"`
+	SortBy           string          `json:"sort_by"`
+	SortDir          string          `json:"sort_dir"`
+	RowOffset        *int64          `json:"row_offset"`
+	RowLimit         *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByMachineOwnerRow struct {
@@ -2958,7 +2963,7 @@ func (q *Queries) ListSandboxesByMachineOwner(ctx context.Context, arg ListSandb
 		arg.TeamID,
 		arg.OwnerPrincipalID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.SortBy,
 		arg.SortDir,
@@ -3032,7 +3037,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY s.created_at ASC
@@ -3041,12 +3046,12 @@ OFFSET COALESCE($5::bigint, 0)
 `
 
 type ListSandboxesByTeamCreatedAscParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamCreatedAscRow struct {
@@ -3058,7 +3063,7 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedAsc,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.RowOffset,
 		arg.RowLimit,
@@ -3131,7 +3136,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY s.created_at DESC
@@ -3140,12 +3145,12 @@ OFFSET COALESCE($5::bigint, 0)
 `
 
 type ListSandboxesByTeamCreatedDescParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamCreatedDescRow struct {
@@ -3170,7 +3175,7 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 	rows, err := q.db.Query(ctx, listSandboxesByTeamCreatedDesc,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.RowOffset,
 		arg.RowLimit,
@@ -3242,7 +3247,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.metadata @> $2
-  AND ($3::text IS NULL OR s.status::text = $3::text)
+  AND ($3::sandbox_status[] IS NULL OR s.status = ANY($3::sandbox_status[]))
   AND ($4::text IS NULL
        OR s.name ILIKE '%' || $4::text || '%')
 ORDER BY
@@ -3257,14 +3262,14 @@ OFFSET COALESCE($7::bigint, 0)
 `
 
 type ListSandboxesByTeamPagedParams struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Metadata   []byte    `json:"metadata"`
-	Status     *string   `json:"status"`
-	NameSearch *string   `json:"name_search"`
-	SortBy     string    `json:"sort_by"`
-	SortDir    string    `json:"sort_dir"`
-	RowOffset  *int64    `json:"row_offset"`
-	RowLimit   *int64    `json:"row_limit"`
+	TeamID     uuid.UUID       `json:"team_id"`
+	Metadata   []byte          `json:"metadata"`
+	Statuses   []SandboxStatus `json:"statuses"`
+	NameSearch *string         `json:"name_search"`
+	SortBy     string          `json:"sort_by"`
+	SortDir    string          `json:"sort_dir"`
+	RowOffset  *int64          `json:"row_offset"`
+	RowLimit   *int64          `json:"row_limit"`
 }
 
 type ListSandboxesByTeamPagedRow struct {
@@ -3278,7 +3283,7 @@ type ListSandboxesByTeamPagedRow struct {
 // which the planner can satisfy from an index.
 //
 // Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
-// to match everything), status equality, and a case-insensitive name
+// to match everything), status membership, and a case-insensitive name
 // substring. Sort column/direction come from @sort_by + @sort_dir: exactly one
 // guarded CASE term is active per query (the sort params are constant across
 // rows, so every other term evaluates to NULL for all rows and acts as a
@@ -3289,7 +3294,7 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 	rows, err := q.db.Query(ctx, listSandboxesByTeamPaged,
 		arg.TeamID,
 		arg.Metadata,
-		arg.Status,
+		arg.Statuses,
 		arg.NameSearch,
 		arg.SortBy,
 		arg.SortDir,
@@ -3345,6 +3350,46 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 			&i.Sandbox.SourceSnapshotID,
 			&i.PreviewAccess,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockAutoDeleteDue = `-- name: LockAutoDeleteDue :many
+SELECT s.id, s.host_id
+FROM sandbox s
+WHERE s.destroyed_at IS NULL
+  AND s.status = 'paused'
+  AND s.auto_delete_at IS NOT NULL
+  AND s.auto_delete_at < now()
+ORDER BY s.auto_delete_at ASC
+LIMIT $1
+FOR UPDATE OF s SKIP LOCKED
+`
+
+type LockAutoDeleteDueRow struct {
+	ID     uuid.UUID `json:"id"`
+	HostID string    `json:"host_id"`
+}
+
+// Step one of the auto-delete claim: take the rows, and report the hosts whose
+// lifetime fence the claim will touch. Separate from the claim so the caller
+// can take those fences in a fixed order; see FenceRetainedStorageHost.
+func (q *Queries) LockAutoDeleteDue(ctx context.Context, batchSize int32) ([]LockAutoDeleteDueRow, error) {
+	rows, err := q.db.Query(ctx, lockAutoDeleteDue, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LockAutoDeleteDueRow{}
+	for rows.Next() {
+		var i LockAutoDeleteDueRow
+		if err := rows.Scan(&i.ID, &i.HostID); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

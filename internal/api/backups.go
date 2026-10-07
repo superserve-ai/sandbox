@@ -325,6 +325,13 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			}
 			return err
 		}
+		// Snapshot rows are deleted only for a destroyed sandbox, and coverage
+		// is read for live paused ones, so a report arriving after teardown has
+		// nothing to link. Returning here keeps it off the rows that deletion
+		// takes next, which is what put the two in a lock cycle.
+		if row.DestroyedAt.Valid {
+			return nil
+		}
 		// A transitional status means a FinalizePause may commit this
 		// sandbox's next snapshot row at any moment (it takes the same
 		// row lock we now hold): 'pausing' on the normal path, and
@@ -455,6 +462,13 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			return
 		}
 		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			// Same contract as a finalize in flight: the host keeps the entry
+			// outboxed and redelivers, so a lost lock race costs a retry
+			// rather than an alert.
+			respondErrorMsg(c, "lock_contention", "backup report lost a lock race; retry", http.StatusServiceUnavailable)
+			return
+		}
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
 			// The owner row does not exist here (a sandbox this control
 			// plane never knew, or one hard-removed out of band). The

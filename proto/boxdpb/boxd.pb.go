@@ -2501,6 +2501,145 @@ func (x *ActionBatchResponse) GetExecuted() uint32 {
 	return 0
 }
 
+type StepRequest struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Actions []*Action              `protobuf:"bytes,1,rep,name=actions,proto3" json:"actions,omitempty"`
+	Format  FrameFormat            `protobuf:"varint,2,opt,name=format,proto3,enum=superserve.boxd.v1.FrameFormat" json:"format,omitempty"`
+	// Milliseconds to wait between the last action and the capture, for
+	// applications that repaint after the input lands. 0 captures immediately;
+	// values above the server maximum (currently 2000) are rejected.
+	SettleMs      uint32 `protobuf:"varint,3,opt,name=settle_ms,json=settleMs,proto3" json:"settle_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepRequest) Reset() {
+	*x = StepRequest{}
+	mi := &file_proto_boxd_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepRequest) ProtoMessage() {}
+
+func (x *StepRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_boxd_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepRequest.ProtoReflect.Descriptor instead.
+func (*StepRequest) Descriptor() ([]byte, []int) {
+	return file_proto_boxd_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *StepRequest) GetActions() []*Action {
+	if x != nil {
+		return x.Actions
+	}
+	return nil
+}
+
+func (x *StepRequest) GetFormat() FrameFormat {
+	if x != nil {
+		return x.Format
+	}
+	return FrameFormat_FRAME_FORMAT_UNSPECIFIED
+}
+
+func (x *StepRequest) GetSettleMs() uint32 {
+	if x != nil {
+		return x.SettleMs
+	}
+	return 0
+}
+
+// StepResponse keeps a failed action and a failed capture apart from each
+// other and from success, because input is not idempotent: neither outcome
+// may read as "nothing happened".
+type StepResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Number of actions that executed. Equals the batch size unless
+	// action_error is set, in which case it is also the failing action's index.
+	Executed uint32 `protobuf:"varint,1,opt,name=executed,proto3" json:"executed,omitempty"`
+	// Why the batch stopped early. Empty when every action ran.
+	ActionError string `protobuf:"bytes,2,opt,name=action_error,json=actionError,proto3" json:"action_error,omitempty"`
+	// Frame captured after the batch stopped; unset when capture failed.
+	Screenshot *ScreenshotResponse `protobuf:"bytes,3,opt,name=screenshot,proto3" json:"screenshot,omitempty"`
+	// Why no frame was captured. The executed actions were still delivered.
+	CaptureError  string `protobuf:"bytes,4,opt,name=capture_error,json=captureError,proto3" json:"capture_error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StepResponse) Reset() {
+	*x = StepResponse{}
+	mi := &file_proto_boxd_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StepResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StepResponse) ProtoMessage() {}
+
+func (x *StepResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_boxd_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StepResponse.ProtoReflect.Descriptor instead.
+func (*StepResponse) Descriptor() ([]byte, []int) {
+	return file_proto_boxd_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *StepResponse) GetExecuted() uint32 {
+	if x != nil {
+		return x.Executed
+	}
+	return 0
+}
+
+func (x *StepResponse) GetActionError() string {
+	if x != nil {
+		return x.ActionError
+	}
+	return ""
+}
+
+func (x *StepResponse) GetScreenshot() *ScreenshotResponse {
+	if x != nil {
+		return x.Screenshot
+	}
+	return nil
+}
+
+func (x *StepResponse) GetCaptureError() string {
+	if x != nil {
+		return x.CaptureError
+	}
+	return ""
+}
+
 // Named DesktopResizeRequest/Response (not ResizeRequest/Response) to avoid
 // colliding with ProcessService's pid-scoped ResizeRequest — both live in the
 // same proto package.
@@ -2514,7 +2653,7 @@ type DesktopResizeRequest struct {
 
 func (x *DesktopResizeRequest) Reset() {
 	*x = DesktopResizeRequest{}
-	mi := &file_proto_boxd_proto_msgTypes[41]
+	mi := &file_proto_boxd_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2526,7 +2665,7 @@ func (x *DesktopResizeRequest) String() string {
 func (*DesktopResizeRequest) ProtoMessage() {}
 
 func (x *DesktopResizeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_boxd_proto_msgTypes[41]
+	mi := &file_proto_boxd_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2539,7 +2678,7 @@ func (x *DesktopResizeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesktopResizeRequest.ProtoReflect.Descriptor instead.
 func (*DesktopResizeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_boxd_proto_rawDescGZIP(), []int{41}
+	return file_proto_boxd_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *DesktopResizeRequest) GetWidth() uint32 {
@@ -2564,7 +2703,7 @@ type DesktopResizeResponse struct {
 
 func (x *DesktopResizeResponse) Reset() {
 	*x = DesktopResizeResponse{}
-	mi := &file_proto_boxd_proto_msgTypes[42]
+	mi := &file_proto_boxd_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2576,7 +2715,7 @@ func (x *DesktopResizeResponse) String() string {
 func (*DesktopResizeResponse) ProtoMessage() {}
 
 func (x *DesktopResizeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_boxd_proto_msgTypes[42]
+	mi := &file_proto_boxd_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2589,7 +2728,7 @@ func (x *DesktopResizeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DesktopResizeResponse.ProtoReflect.Descriptor instead.
 func (*DesktopResizeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_boxd_proto_rawDescGZIP(), []int{42}
+	return file_proto_boxd_proto_rawDescGZIP(), []int{44}
 }
 
 var File_proto_boxd_proto protoreflect.FileDescriptor
@@ -2726,7 +2865,18 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\vActionBatch\x124\n" +
 	"\aactions\x18\x01 \x03(\v2\x1a.superserve.boxd.v1.ActionR\aactions\"1\n" +
 	"\x13ActionBatchResponse\x12\x1a\n" +
-	"\bexecuted\x18\x01 \x01(\rR\bexecuted\"D\n" +
+	"\bexecuted\x18\x01 \x01(\rR\bexecuted\"\x99\x01\n" +
+	"\vStepRequest\x124\n" +
+	"\aactions\x18\x01 \x03(\v2\x1a.superserve.boxd.v1.ActionR\aactions\x127\n" +
+	"\x06format\x18\x02 \x01(\x0e2\x1f.superserve.boxd.v1.FrameFormatR\x06format\x12\x1b\n" +
+	"\tsettle_ms\x18\x03 \x01(\rR\bsettleMs\"\xba\x01\n" +
+	"\fStepResponse\x12\x1a\n" +
+	"\bexecuted\x18\x01 \x01(\rR\bexecuted\x12!\n" +
+	"\faction_error\x18\x02 \x01(\tR\vactionError\x12F\n" +
+	"\n" +
+	"screenshot\x18\x03 \x01(\v2&.superserve.boxd.v1.ScreenshotResponseR\n" +
+	"screenshot\x12#\n" +
+	"\rcapture_error\x18\x04 \x01(\tR\fcaptureError\"D\n" +
 	"\x14DesktopResizeRequest\x12\x14\n" +
 	"\x05width\x18\x01 \x01(\rR\x05width\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\"\x17\n" +
@@ -2756,12 +2906,13 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\aListDir\x12\".superserve.boxd.v1.ListDirRequest\x1a#.superserve.boxd.v1.ListDirResponse\x12R\n" +
 	"\aMakeDir\x12\".superserve.boxd.v1.MakeDirRequest\x1a#.superserve.boxd.v1.MakeDirResponse\x12O\n" +
 	"\x06Remove\x12!.superserve.boxd.v1.RemoveRequest\x1a\".superserve.boxd.v1.RemoveResponse\x12I\n" +
-	"\x04Move\x12\x1f.superserve.boxd.v1.MoveRequest\x1a .superserve.boxd.v1.MoveResponse2\xdc\x04\n" +
+	"\x04Move\x12\x1f.superserve.boxd.v1.MoveRequest\x1a .superserve.boxd.v1.MoveResponse2\xa7\x05\n" +
 	"\x0eDesktopService\x12[\n" +
 	"\n" +
 	"Screenshot\x12%.superserve.boxd.v1.ScreenshotRequest\x1a&.superserve.boxd.v1.ScreenshotResponse\x12F\n" +
 	"\x06Stream\x12\x1f.superserve.boxd.v1.FrameConfig\x1a\x19.superserve.boxd.v1.Frame0\x01\x12W\n" +
-	"\vSendActions\x12\x1f.superserve.boxd.v1.ActionBatch\x1a'.superserve.boxd.v1.ActionBatchResponse\x12T\n" +
+	"\vSendActions\x12\x1f.superserve.boxd.v1.ActionBatch\x1a'.superserve.boxd.v1.ActionBatchResponse\x12I\n" +
+	"\x04Step\x12\x1f.superserve.boxd.v1.StepRequest\x1a .superserve.boxd.v1.StepResponse\x12T\n" +
 	"\vSendPointer\x12 .superserve.boxd.v1.PointerEvent\x1a#.superserve.boxd.v1.PointerResponse\x12H\n" +
 	"\aSendKey\x12\x1c.superserve.boxd.v1.KeyEvent\x1a\x1f.superserve.boxd.v1.KeyResponse\x12M\n" +
 	"\x06Scroll\x12\x1f.superserve.boxd.v1.ScrollEvent\x1a\".superserve.boxd.v1.ScrollResponse\x12]\n" +
@@ -2780,7 +2931,7 @@ func file_proto_boxd_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_boxd_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_proto_boxd_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
+var file_proto_boxd_proto_msgTypes = make([]protoimpl.MessageInfo, 46)
 var file_proto_boxd_proto_goTypes = []any{
 	(FrameFormat)(0),              // 0: superserve.boxd.v1.FrameFormat
 	(PointerButton)(0),            // 1: superserve.boxd.v1.PointerButton
@@ -2826,12 +2977,14 @@ var file_proto_boxd_proto_goTypes = []any{
 	(*Action)(nil),                // 41: superserve.boxd.v1.Action
 	(*ActionBatch)(nil),           // 42: superserve.boxd.v1.ActionBatch
 	(*ActionBatchResponse)(nil),   // 43: superserve.boxd.v1.ActionBatchResponse
-	(*DesktopResizeRequest)(nil),  // 44: superserve.boxd.v1.DesktopResizeRequest
-	(*DesktopResizeResponse)(nil), // 45: superserve.boxd.v1.DesktopResizeResponse
-	nil,                           // 46: superserve.boxd.v1.StartRequest.EnvsEntry
+	(*StepRequest)(nil),           // 44: superserve.boxd.v1.StepRequest
+	(*StepResponse)(nil),          // 45: superserve.boxd.v1.StepResponse
+	(*DesktopResizeRequest)(nil),  // 46: superserve.boxd.v1.DesktopResizeRequest
+	(*DesktopResizeResponse)(nil), // 47: superserve.boxd.v1.DesktopResizeResponse
+	nil,                           // 48: superserve.boxd.v1.StartRequest.EnvsEntry
 }
 var file_proto_boxd_proto_depIdxs = []int32{
-	46, // 0: superserve.boxd.v1.StartRequest.envs:type_name -> superserve.boxd.v1.StartRequest.EnvsEntry
+	48, // 0: superserve.boxd.v1.StartRequest.envs:type_name -> superserve.boxd.v1.StartRequest.EnvsEntry
 	4,  // 1: superserve.boxd.v1.StartRequest.pty:type_name -> superserve.boxd.v1.PtyConfig
 	5,  // 2: superserve.boxd.v1.PtyConfig.size:type_name -> superserve.boxd.v1.TerminalSize
 	7,  // 3: superserve.boxd.v1.ProcessEvent.start:type_name -> superserve.boxd.v1.StartEvent
@@ -2854,43 +3007,48 @@ var file_proto_boxd_proto_depIdxs = []int32{
 	37, // 20: superserve.boxd.v1.Action.key:type_name -> superserve.boxd.v1.KeyEvent
 	39, // 21: superserve.boxd.v1.Action.scroll:type_name -> superserve.boxd.v1.ScrollEvent
 	41, // 22: superserve.boxd.v1.ActionBatch.actions:type_name -> superserve.boxd.v1.Action
-	3,  // 23: superserve.boxd.v1.ProcessService.Start:input_type -> superserve.boxd.v1.StartRequest
-	11, // 24: superserve.boxd.v1.ProcessService.SendInput:input_type -> superserve.boxd.v1.SendInputRequest
-	13, // 25: superserve.boxd.v1.ProcessService.Resize:input_type -> superserve.boxd.v1.ResizeRequest
-	15, // 26: superserve.boxd.v1.ProcessService.Signal:input_type -> superserve.boxd.v1.SignalRequest
-	17, // 27: superserve.boxd.v1.FilesystemService.Stat:input_type -> superserve.boxd.v1.StatRequest
-	19, // 28: superserve.boxd.v1.FilesystemService.ListDir:input_type -> superserve.boxd.v1.ListDirRequest
-	22, // 29: superserve.boxd.v1.FilesystemService.MakeDir:input_type -> superserve.boxd.v1.MakeDirRequest
-	24, // 30: superserve.boxd.v1.FilesystemService.Remove:input_type -> superserve.boxd.v1.RemoveRequest
-	26, // 31: superserve.boxd.v1.FilesystemService.Move:input_type -> superserve.boxd.v1.MoveRequest
-	28, // 32: superserve.boxd.v1.DesktopService.Screenshot:input_type -> superserve.boxd.v1.ScreenshotRequest
-	30, // 33: superserve.boxd.v1.DesktopService.Stream:input_type -> superserve.boxd.v1.FrameConfig
-	42, // 34: superserve.boxd.v1.DesktopService.SendActions:input_type -> superserve.boxd.v1.ActionBatch
-	35, // 35: superserve.boxd.v1.DesktopService.SendPointer:input_type -> superserve.boxd.v1.PointerEvent
-	37, // 36: superserve.boxd.v1.DesktopService.SendKey:input_type -> superserve.boxd.v1.KeyEvent
-	39, // 37: superserve.boxd.v1.DesktopService.Scroll:input_type -> superserve.boxd.v1.ScrollEvent
-	44, // 38: superserve.boxd.v1.DesktopService.Resize:input_type -> superserve.boxd.v1.DesktopResizeRequest
-	6,  // 39: superserve.boxd.v1.ProcessService.Start:output_type -> superserve.boxd.v1.ProcessEvent
-	12, // 40: superserve.boxd.v1.ProcessService.SendInput:output_type -> superserve.boxd.v1.SendInputResponse
-	14, // 41: superserve.boxd.v1.ProcessService.Resize:output_type -> superserve.boxd.v1.ResizeResponse
-	16, // 42: superserve.boxd.v1.ProcessService.Signal:output_type -> superserve.boxd.v1.SignalResponse
-	18, // 43: superserve.boxd.v1.FilesystemService.Stat:output_type -> superserve.boxd.v1.StatResponse
-	20, // 44: superserve.boxd.v1.FilesystemService.ListDir:output_type -> superserve.boxd.v1.ListDirResponse
-	23, // 45: superserve.boxd.v1.FilesystemService.MakeDir:output_type -> superserve.boxd.v1.MakeDirResponse
-	25, // 46: superserve.boxd.v1.FilesystemService.Remove:output_type -> superserve.boxd.v1.RemoveResponse
-	27, // 47: superserve.boxd.v1.FilesystemService.Move:output_type -> superserve.boxd.v1.MoveResponse
-	29, // 48: superserve.boxd.v1.DesktopService.Screenshot:output_type -> superserve.boxd.v1.ScreenshotResponse
-	31, // 49: superserve.boxd.v1.DesktopService.Stream:output_type -> superserve.boxd.v1.Frame
-	43, // 50: superserve.boxd.v1.DesktopService.SendActions:output_type -> superserve.boxd.v1.ActionBatchResponse
-	36, // 51: superserve.boxd.v1.DesktopService.SendPointer:output_type -> superserve.boxd.v1.PointerResponse
-	38, // 52: superserve.boxd.v1.DesktopService.SendKey:output_type -> superserve.boxd.v1.KeyResponse
-	40, // 53: superserve.boxd.v1.DesktopService.Scroll:output_type -> superserve.boxd.v1.ScrollResponse
-	45, // 54: superserve.boxd.v1.DesktopService.Resize:output_type -> superserve.boxd.v1.DesktopResizeResponse
-	39, // [39:55] is the sub-list for method output_type
-	23, // [23:39] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	41, // 23: superserve.boxd.v1.StepRequest.actions:type_name -> superserve.boxd.v1.Action
+	0,  // 24: superserve.boxd.v1.StepRequest.format:type_name -> superserve.boxd.v1.FrameFormat
+	29, // 25: superserve.boxd.v1.StepResponse.screenshot:type_name -> superserve.boxd.v1.ScreenshotResponse
+	3,  // 26: superserve.boxd.v1.ProcessService.Start:input_type -> superserve.boxd.v1.StartRequest
+	11, // 27: superserve.boxd.v1.ProcessService.SendInput:input_type -> superserve.boxd.v1.SendInputRequest
+	13, // 28: superserve.boxd.v1.ProcessService.Resize:input_type -> superserve.boxd.v1.ResizeRequest
+	15, // 29: superserve.boxd.v1.ProcessService.Signal:input_type -> superserve.boxd.v1.SignalRequest
+	17, // 30: superserve.boxd.v1.FilesystemService.Stat:input_type -> superserve.boxd.v1.StatRequest
+	19, // 31: superserve.boxd.v1.FilesystemService.ListDir:input_type -> superserve.boxd.v1.ListDirRequest
+	22, // 32: superserve.boxd.v1.FilesystemService.MakeDir:input_type -> superserve.boxd.v1.MakeDirRequest
+	24, // 33: superserve.boxd.v1.FilesystemService.Remove:input_type -> superserve.boxd.v1.RemoveRequest
+	26, // 34: superserve.boxd.v1.FilesystemService.Move:input_type -> superserve.boxd.v1.MoveRequest
+	28, // 35: superserve.boxd.v1.DesktopService.Screenshot:input_type -> superserve.boxd.v1.ScreenshotRequest
+	30, // 36: superserve.boxd.v1.DesktopService.Stream:input_type -> superserve.boxd.v1.FrameConfig
+	42, // 37: superserve.boxd.v1.DesktopService.SendActions:input_type -> superserve.boxd.v1.ActionBatch
+	44, // 38: superserve.boxd.v1.DesktopService.Step:input_type -> superserve.boxd.v1.StepRequest
+	35, // 39: superserve.boxd.v1.DesktopService.SendPointer:input_type -> superserve.boxd.v1.PointerEvent
+	37, // 40: superserve.boxd.v1.DesktopService.SendKey:input_type -> superserve.boxd.v1.KeyEvent
+	39, // 41: superserve.boxd.v1.DesktopService.Scroll:input_type -> superserve.boxd.v1.ScrollEvent
+	46, // 42: superserve.boxd.v1.DesktopService.Resize:input_type -> superserve.boxd.v1.DesktopResizeRequest
+	6,  // 43: superserve.boxd.v1.ProcessService.Start:output_type -> superserve.boxd.v1.ProcessEvent
+	12, // 44: superserve.boxd.v1.ProcessService.SendInput:output_type -> superserve.boxd.v1.SendInputResponse
+	14, // 45: superserve.boxd.v1.ProcessService.Resize:output_type -> superserve.boxd.v1.ResizeResponse
+	16, // 46: superserve.boxd.v1.ProcessService.Signal:output_type -> superserve.boxd.v1.SignalResponse
+	18, // 47: superserve.boxd.v1.FilesystemService.Stat:output_type -> superserve.boxd.v1.StatResponse
+	20, // 48: superserve.boxd.v1.FilesystemService.ListDir:output_type -> superserve.boxd.v1.ListDirResponse
+	23, // 49: superserve.boxd.v1.FilesystemService.MakeDir:output_type -> superserve.boxd.v1.MakeDirResponse
+	25, // 50: superserve.boxd.v1.FilesystemService.Remove:output_type -> superserve.boxd.v1.RemoveResponse
+	27, // 51: superserve.boxd.v1.FilesystemService.Move:output_type -> superserve.boxd.v1.MoveResponse
+	29, // 52: superserve.boxd.v1.DesktopService.Screenshot:output_type -> superserve.boxd.v1.ScreenshotResponse
+	31, // 53: superserve.boxd.v1.DesktopService.Stream:output_type -> superserve.boxd.v1.Frame
+	43, // 54: superserve.boxd.v1.DesktopService.SendActions:output_type -> superserve.boxd.v1.ActionBatchResponse
+	45, // 55: superserve.boxd.v1.DesktopService.Step:output_type -> superserve.boxd.v1.StepResponse
+	36, // 56: superserve.boxd.v1.DesktopService.SendPointer:output_type -> superserve.boxd.v1.PointerResponse
+	38, // 57: superserve.boxd.v1.DesktopService.SendKey:output_type -> superserve.boxd.v1.KeyResponse
+	40, // 58: superserve.boxd.v1.DesktopService.Scroll:output_type -> superserve.boxd.v1.ScrollResponse
+	47, // 59: superserve.boxd.v1.DesktopService.Resize:output_type -> superserve.boxd.v1.DesktopResizeResponse
+	43, // [43:60] is the sub-list for method output_type
+	26, // [26:43] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_proto_boxd_proto_init() }
@@ -2930,7 +3088,7 @@ func file_proto_boxd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_boxd_proto_rawDesc), len(file_proto_boxd_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   44,
+			NumMessages:   46,
 			NumExtensions: 0,
 			NumServices:   3,
 		},
