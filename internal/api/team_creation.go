@@ -338,7 +338,7 @@ func verifyTeamCreationAssertion(raw string, keys map[string]ed25519.PublicKey, 
 // net/http may drain an unread body after even an authentication/rate rejection.
 func TeamCreationReadDeadline() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if c.Request.Method == http.MethodPost && c.Request.URL.Path == "/internal/teams" {
+		if c.Request.Method == http.MethodPost && (c.Request.URL.Path == "/internal/teams" || c.Request.URL.Path == "/internal/qm/authorize") {
 			err := http.NewResponseController(c.Writer).SetReadDeadline(time.Now().Add(5 * time.Second))
 			if err != nil && !errors.Is(err, http.ErrNotSupported) {
 				teamCreationError(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)

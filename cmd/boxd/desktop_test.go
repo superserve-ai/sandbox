@@ -227,7 +227,7 @@ func TestKeyArgs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := []string{"type", "--delay", "0", "--", "hello world"}
+		want := []string{"type", "--delay", "0", "--clearmodifiers", "--", "hello world"}
 		if !equalStrings(got, want) {
 			t.Errorf("keyArgs = %v, want %v", got, want)
 		}
@@ -1116,7 +1116,7 @@ exit 0
 		t.Fatalf("read log: %v", err)
 	}
 	want := "mousemove 10 20 click 1\n" +
-		"type --delay 0 -- hi\n" +
+		"type --delay 0 --clearmodifiers -- hi\n" +
 		"click --repeat 3 --delay 0 5\n"
 	if string(got) != want {
 		t.Errorf("xdotool invocations:\n%s\nwant:\n%s", got, want)

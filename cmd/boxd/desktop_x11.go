@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"net"
@@ -57,6 +58,13 @@ type x11Backend struct {
 	sock      net.Conn
 	root      xproto.Window
 	hasXfixes bool
+	// keys is the last keyboard mapping fetched (desktop_x11_key.go); it
+	// is refreshed on every key request and kept only for the scratch
+	// bindings it records.
+	keys *x11Keymap
+	// xkb is whether the XKEYBOARD extension was found, with its opcode.
+	xkb       xkbProbe
+	xkbOpcode byte
 }
 
 // parseDisplay resolves a DISPLAY value to the socket to dial and the screen
@@ -137,6 +145,12 @@ func (b *x11Backend) sync() error {
 	if _, err := xproto.GetInputFocus(b.conn).Reply(); err != nil {
 		return err
 	}
+	return b.drainEvents()
+}
+
+// drainEvents consumes everything the server has already sent, without a
+// round trip, surfacing errors raised for unchecked requests.
+func (b *x11Backend) drainEvents() error {
 	for {
 		ev, xerr := b.conn.PollForEvent()
 		if xerr != nil {
@@ -363,6 +377,9 @@ type x11Holder struct {
 	lastProbe time.Time
 	probing   bool // a dial is in flight; concurrent callers use the shell path
 	disabled  bool // tests force the shell path
+	// keys is the last backend's keymap, kept so its scratch bindings (which
+	// live on in the server) stay recognized as ours after a reconnect.
+	keys *x11Keymap
 }
 
 // dialX11 connects under ctx and x11DialTimeout. The socket is opened here
@@ -418,9 +435,12 @@ func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 		h.mu.Unlock()
 		return nil
 	}
-	if h.backend != nil && h.display != display {
-		h.backend.Close()
-		h.backend = nil
+	if h.display != display {
+		if h.backend != nil {
+			h.backend.Close()
+			h.backend = nil
+		}
+		h.keys = nil // a different server, different bindings
 	}
 	if h.backend != nil {
 		backend := h.backend
@@ -444,6 +464,7 @@ func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 	if err != nil {
 		return nil
 	}
+	backend.keys = h.keys
 	h.backend = backend
 	return backend
 }
@@ -456,6 +477,9 @@ func (h *x11Holder) drop(backend *x11Backend) {
 	if h.backend == backend && backend != nil {
 		backend.Close()
 		h.backend = nil
+		if backend.keys != nil {
+			h.keys = backend.keys
+		}
 	}
 }
 
@@ -479,7 +503,7 @@ func (s *desktopService) runX11(ctx context.Context, op func(context.Context, *x
 	go func() { done <- op(ctx, backend) }()
 	select {
 	case err := <-done:
-		if err != nil {
+		if err != nil && !errors.Is(err, errBackendKept) {
 			s.x11.drop(backend)
 		}
 		return true, err
