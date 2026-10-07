@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -184,6 +185,9 @@ func newReaperHandlers(dbtx *reaperMockDBTX, vmd *stubVMD) *Handlers {
 	return &Handlers{
 		VMD: vmd,
 		DB:  db.New(dbtx),
+		beginReaperTx: func(context.Context) (pgx.Tx, error) {
+			return reaperFakeTx{db: dbtx}, nil
+		},
 	}
 }
 
@@ -764,21 +768,29 @@ func TestReaper_AutoDeleteLeavesTheReclaimToTheSweeper(t *testing.T) {
 	h := newReaperHandlers(
 		&reaperMockDBTX{
 			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
-				if !strings.Contains(sql, "auto_delete_at") {
+				switch {
+				case strings.Contains(sql, "name: LockAutoDeleteDue"):
+					return &scanRows{rows: []func(dest ...any) error{func(dest ...any) error {
+						*dest[0].(*uuid.UUID) = sandboxID
+						*dest[1].(*string) = "host-a"
+						return nil
+					}}}, nil
+				case strings.Contains(sql, "name: ClaimAutoDeleteSandboxes"):
+					if v, ok := args[2].(int32); ok {
+						atomic.StoreInt32(&lease, v)
+					}
+					return &scanRows{rows: []func(dest ...any) error{func(dest ...any) error {
+						*dest[0].(*uuid.UUID) = sandboxID
+						*dest[1].(*uuid.UUID) = uuid.New()
+						*dest[2].(*string) = "sbx-expired"
+						*dest[3].(*string) = "host-a"
+						*dest[4].(**string) = nil
+						*dest[5].(*pgtype.UUID) = pgtype.UUID{}
+						return nil
+					}}}, nil
+				default:
 					return newIDRows(nil), nil
 				}
-				if v, ok := args[2].(int32); ok {
-					atomic.StoreInt32(&lease, v)
-				}
-				return &scanRows{rows: []func(dest ...any) error{func(dest ...any) error {
-					*dest[0].(*uuid.UUID) = sandboxID
-					*dest[1].(*uuid.UUID) = uuid.New()
-					*dest[2].(*string) = "sbx-expired"
-					*dest[3].(*string) = "host-a"
-					*dest[4].(**string) = nil
-					*dest[5].(*pgtype.UUID) = pgtype.UUID{}
-					return nil
-				}}}, nil
 			},
 			queryRowFn: func(context.Context, string, ...any) pgx.Row { return activityRow() },
 		},
@@ -796,5 +808,46 @@ func TestReaper_AutoDeleteLeavesTheReclaimToTheSweeper(t *testing.T) {
 	}
 	if atomic.LoadInt32(&destroyed) != 0 {
 		t.Fatal("the reaper reclaimed the host inline; that is the sweeper's")
+	}
+}
+
+// The reaper's claim runs in its own transaction so its lifetime fences span
+// the whole batch. Mock DBTX cannot satisfy pgx.Tx, so embed it and forward
+// only what the claim uses.
+type reaperFakeTx struct {
+	pgx.Tx
+	db db.DBTX
+}
+
+func (t reaperFakeTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return t.db.Exec(ctx, sql, args...)
+}
+func (t reaperFakeTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return t.db.Query(ctx, sql, args...)
+}
+func (t reaperFakeTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return t.db.QueryRow(ctx, sql, args...)
+}
+func (t reaperFakeTx) Commit(context.Context) error   { return nil }
+func (t reaperFakeTx) Rollback(context.Context) error { return nil }
+
+// Every claim must fence the same hosts in the same order, whatever order its
+// rows arrive in, or two batches can each hold the other's next fence.
+func TestFenceOrderIsSortedAndDeduplicated(t *testing.T) {
+	host := func(ids ...string) []db.LockAutoDeleteDueRow {
+		rows := make([]db.LockAutoDeleteDueRow, 0, len(ids))
+		for _, id := range ids {
+			rows = append(rows, db.LockAutoDeleteDueRow{ID: uuid.New(), HostID: id})
+		}
+		return rows
+	}
+	forward := fenceOrder(host("h-b", "h-a", "h-b", "h-c", "h-a"))
+	reverse := fenceOrder(host("h-c", "h-a", "h-b", "h-a"))
+	want := []string{"h-a", "h-b", "h-c"}
+	if !slices.Equal(forward, want) || !slices.Equal(reverse, want) {
+		t.Fatalf("fenceOrder = %v and %v, want %v from both", forward, reverse, want)
+	}
+	if got := fenceOrder(host("", "h-a", "")); !slices.Equal(got, []string{"h-a"}) {
+		t.Fatalf("fenceOrder with hostless rows = %v, want only the hosted one", got)
 	}
 }
