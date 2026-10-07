@@ -62,13 +62,15 @@ if [ ! -f /etc/sysctl.d/90-sandbox-conntrack.conf ]; then
     'net.netfilter.nf_conntrack_buckets = 1048576' \
     'net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 30' \
     'net.netfilter.nf_conntrack_udp_timeout = 15' > /etc/sysctl.d/.90-sandbox-conntrack.conf.tmp
-  # Persisted only once every value applied: a failed apply leaves the
-  # temp file and the next run retries instead of reporting a sized host.
+  # Persisted only once every value applied; a failed apply fails the
+  # bootstrap, keeping the temp file for the retry, so an unsized host is
+  # never reported ready.
   if sysctl -q -p /etc/sysctl.d/.90-sandbox-conntrack.conf.tmp; then
     mv /etc/sysctl.d/.90-sandbox-conntrack.conf.tmp /etc/sysctl.d/90-sandbox-conntrack.conf
     sysctl -q --system || true
   else
-    echo "conntrack sysctls did not apply; leaving the temp file for the next run" >&2
+    echo "conntrack sysctls did not apply; host left unsized, temp file kept for the next run" >&2
+    exit 1
   fi
 fi
 
