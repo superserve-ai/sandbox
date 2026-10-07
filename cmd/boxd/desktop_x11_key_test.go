@@ -555,30 +555,69 @@ func TestPlanKey_NonPrintableLevelTwoUsesScratch(t *testing.T) {
 	eventsEqual(t, segs[0].events, tapEvents(kcSpare0))
 }
 
+// Num Lock lives on Mod2 here; locked or not, it never counts as held.
+func TestBuildKeymap_FindsIdleLockBitsAndStateIgnoresThem(t *testing.T) {
+	var syms []xproto.Keysym
+	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {0xff7f, 0}, {0, 0}, {0, 0}} {
+		syms = append(syms, r[0], r[1])
+	}
+	numLock := xproto.Keycode(8 + 9)
+	mods := make([]xproto.Keycode, 8*2) // two keycodes per modifier
+	mods[0], mods[2*2], mods[4*2] = kcShift, kcControl, numLock
+	km := buildKeymap(8, 2, syms, mods, nil)
+	if km.idleLocks != 1<<4 {
+		t.Fatalf("idleLocks = %#x, want Mod2", km.idleLocks)
+	}
+	reply := make([]byte, 32)
+	reply[8], reply[11] = 1<<4, 1<<4
+	if got := xkbStateFromReply(reply, km.idleLocks); got.held {
+		t.Errorf("state = %+v, want Num Lock ignored", got)
+	}
+	reply[8] |= xproto.ModMaskControl
+	if got := xkbStateFromReply(reply, km.idleLocks); !got.held {
+		t.Errorf("state = %+v, want held for Control alongside Num Lock", got)
+	}
+}
+
+// A chord already holding Shift_R gets no extra Shift_L.
+func TestPlanKey_ChordHoldingShiftRNeedsNoShiftL(t *testing.T) {
+	var syms []xproto.Keysym
+	for _, r := range [][2]xproto.Keysym{{'a', 'A'}, {'u', 'U'}, {'1', '!'}, {' ', 0}, {0xff0d, 0}, {keysymShiftL, 0}, {0xffe3, 0}, {0xff9c, 0xffb1}, {0xff13, 0xff6b}, {keysymShiftR, 0}, {0, 0}, {0, 0}} {
+		syms = append(syms, r[0], r[1])
+	}
+	shiftR := xproto.Keycode(8 + 9)
+	km := buildKeymap(8, 2, syms, nil, nil)
+	segs, err := planKey(km, xkbState{}, chordEvent("A", "Shift_R"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsEqual(t, segs[0].events, events(shiftR, true, kcA, true, kcA, false, shiftR, false))
+}
+
 func TestXkbStateFromReply(t *testing.T) {
 	reply := make([]byte, 32)
 	reply[0], reply[1] = 1, 3 // reply, deviceID
 	reply[8] = xproto.ModMaskLock | xproto.ModMaskShift | xproto.ModMaskControl
 	reply[11] = xproto.ModMaskLock | xproto.ModMaskShift
 	reply[12] = 1
-	if got := xkbStateFromReply(reply); got != (xkbState{group: 1, capsLock: true, shiftLock: true, held: true}) {
+	if got := xkbStateFromReply(reply, 0); got != (xkbState{group: 1, capsLock: true, shiftLock: true, held: true}) {
 		t.Errorf("state = %+v, want group 1, both locks and a held Control", got)
 	}
 	reply[8] = xproto.ModMaskLock | xproto.ModMaskShift // only the locks are in effect
-	if got := xkbStateFromReply(reply); got.held {
+	if got := xkbStateFromReply(reply, 0); got.held {
 		t.Errorf("state = %+v, want nothing held when only locks are in effect", got)
 	}
 	// A locked Control (sticky keys) is not something Key clears: held.
 	reply[8], reply[11] = xproto.ModMaskControl, xproto.ModMaskControl
-	if got := xkbStateFromReply(reply); !got.held {
+	if got := xkbStateFromReply(reply, 0); !got.held {
 		t.Errorf("state = %+v, want held for a locked Control", got)
 	}
 	// Shift depressed (base) while also locked: still held.
 	reply[8], reply[9], reply[11] = xproto.ModMaskShift, xproto.ModMaskShift, xproto.ModMaskShift
-	if got := xkbStateFromReply(reply); !got.held {
+	if got := xkbStateFromReply(reply, 0); !got.held {
 		t.Errorf("state = %+v, want held for a depressed Shift", got)
 	}
-	if got := xkbStateFromReply(reply[:8]); got != (xkbState{}) {
+	if got := xkbStateFromReply(reply[:8], 0); got != (xkbState{}) {
 		t.Errorf("short reply = %+v, want zero state", got)
 	}
 }

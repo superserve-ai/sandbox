@@ -40,11 +40,12 @@ type xkbState struct {
 	held      bool
 }
 
-// xkbGetState asks the server for the keyboard state. Without the
-// extension the state cannot be known, so the key path declines and
-// xdotool keeps that server. Hand-encoded: xgb ships no XKB bindings and
-// this is the one XKB request the key path needs.
-func (b *x11Backend) xkbGetState() (xkbState, error) {
+// xkbGetState asks the server for the keyboard state; idle are modifier
+// bits to disregard (see x11Keymap.idleLocks). Without the extension the
+// state cannot be known, so the key path declines and xdotool keeps that
+// server. Hand-encoded: xgb ships no XKB bindings and this is the one XKB
+// request the key path needs.
+func (b *x11Backend) xkbGetState(idle byte) (xkbState, error) {
 	if b.xkb == xkbUnprobed {
 		ext, err := xproto.QueryExtension(b.conn, 9, "XKEYBOARD").Reply()
 		if err != nil {
@@ -77,7 +78,7 @@ func (b *x11Backend) xkbGetState() (xkbState, error) {
 	if err != nil {
 		return xkbState{}, fmt.Errorf("XkbGetState: %w", err)
 	}
-	return xkbStateFromReply(reply), nil
+	return xkbStateFromReply(reply, idle), nil
 }
 
 // xkbSetLocks sets the modifier locks in affect to locks:
@@ -104,11 +105,12 @@ func (b *x11Backend) xkbRequest(req []byte) ([]byte, error) {
 
 // xkbStateFromReply reads a raw XkbGetState reply: after the 8-byte header
 // come mods, baseMods, latchedMods, lockedMods, then the effective group.
-func xkbStateFromReply(reply []byte) xkbState {
+// Modifier bits in idle are disregarded.
+func xkbStateFromReply(reply []byte, idle byte) xkbState {
 	if len(reply) < 13 {
 		return xkbState{}
 	}
-	effective, base, latched, locked := reply[8], reply[9], reply[10], reply[11]
+	effective, base, latched, locked := reply[8]&^idle, reply[9]&^idle, reply[10]&^idle, reply[11]&^idle
 	// Key clears a locked Shift or Lock itself; any other modifier in effect
 	// (held, latched, or locked by a sticky-keys client), or Shift and Lock
 	// when depressed rather than locked, counts as held.
@@ -137,11 +139,24 @@ type x11Keymap struct {
 	spare []xproto.Keycode
 	// bound is the keysym each scratch keycode currently types.
 	bound map[xproto.Keycode]uint32
+	// idleLocks are the modifier bits of Num Lock and Scroll Lock: locks
+	// that change nothing about the keycodes the key path sends.
+	idleLocks byte
 }
 
 type keystroke struct {
 	code  xproto.Keycode
 	shift bool
+}
+
+// isShift reports whether code is one of the layout's Shift keys.
+func (km *x11Keymap) isShift(code xproto.Keycode) bool {
+	for _, ks := range []uint32{keysymShiftL, keysymShiftR} {
+		if st, ok := km.direct[ks]; ok && st.code == code {
+			return true
+		}
+	}
+	return false
 }
 
 // shift is the keycode that holds Shift: the left key when the layout has
@@ -196,9 +211,15 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifier
 	// A keycode can sit in the modifier map with no keysyms at all;
 	// pressing it would still toggle that modifier, so it is never scratch.
 	modifier := map[xproto.Keycode]bool{}
-	for _, code := range modifiers {
-		if code != 0 {
-			modifier[code] = true
+	modBit := map[xproto.Keycode]byte{}
+	perMod := len(modifiers) / 8 // keycodes per modifier, 8 modifiers
+	for i, code := range modifiers {
+		if code == 0 {
+			continue
+		}
+		modifier[code] = true
+		if perMod > 0 {
+			modBit[code] |= 1 << (i / perMod)
 		}
 	}
 	for i := 0; (i+1)*perCode <= len(syms); i++ {
@@ -220,6 +241,11 @@ func buildKeymap(min xproto.Keycode, perCode int, syms []xproto.Keysym, modifier
 				km.spare = append(km.spare, code)
 			}
 			continue
+		}
+		for _, sym := range row {
+			if ks := uint32(sym); ks == 0xff7f || ks == 0xff14 { // Num_Lock, Scroll_Lock
+				km.idleLocks |= modBit[code]
+			}
 		}
 		// A modifier keycode is usable as the modifier it carries (Shift_L,
 		// Control_L) and nothing else: pressing it for a character would
@@ -496,9 +522,9 @@ func (p *keyPlanner) chord(modifiers []string, key string) error {
 	for _, code := range mods {
 		p.emit(code, true)
 	}
-	if shift, ok := p.km.shift(); ok && st.shift {
+	if _, ok := p.km.shift(); ok && st.shift {
 		for _, code := range mods {
-			if code == shift {
+			if p.km.isShift(code) {
 				st.shift = false
 			}
 		}
@@ -561,7 +587,7 @@ func (b *x11Backend) Key(ev *pb.KeyEvent) error {
 	if err != nil {
 		return err
 	}
-	state, err := b.xkbGetState()
+	state, err := b.xkbGetState(km.idleLocks)
 	if err != nil {
 		return err
 	}

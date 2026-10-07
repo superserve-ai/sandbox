@@ -286,7 +286,7 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	}
 	toggleCaps()
 	expect("with Caps Lock", "Mixed Case 42!\n")
-	if state, err := s.x11.backend.xkbGetState(); err != nil || !state.capsLock {
+	if state, err := s.x11.backend.xkbGetState(0); err != nil || !state.capsLock {
 		t.Fatalf("Caps Lock was not restored: %+v, %v", state, err)
 	}
 	toggleCaps()
@@ -324,11 +324,11 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 	// Shift locked: literal text is typed with the lock cleared and the
 	// lock is back afterwards.
 	xkbLatchLockState(t, display, xproto.ModMaskShift, xproto.ModMaskShift, false, 0)
-	if state, err := s.x11.backend.xkbGetState(); err != nil || !state.shiftLock {
+	if state, err := s.x11.backend.xkbGetState(0); err != nil || !state.shiftLock {
 		t.Fatalf("state after Shift lock = %+v, %v; want shiftLock", state, err)
 	}
 	expect("with Shift Lock", "1a\n")
-	if state, err := s.x11.backend.xkbGetState(); err != nil || !state.shiftLock {
+	if state, err := s.x11.backend.xkbGetState(0); err != nil || !state.shiftLock {
 		t.Fatalf("Shift lock was not restored: %+v, %v", state, err)
 	}
 	xkbLatchLockState(t, display, xproto.ModMaskShift, 0, false, 0)
@@ -345,7 +345,7 @@ func TestDesktopKeys_RealXServer(t *testing.T) {
 		t.Fatalf("setxkbmap: %v: %s", err, out)
 	}
 	xkbLatchLockState(t, display, 0, 0, true, 1)
-	if state, err := s.x11.backend.xkbGetState(); err != nil || state.group != 1 {
+	if state, err := s.x11.backend.xkbGetState(0); err != nil || state.group != 1 {
 		t.Fatalf("state after lock = %+v, %v; want group 1", state, err)
 	}
 	desktopHelperPath = old
