@@ -241,6 +241,8 @@ jobs:
           terraform plan -input=false \
             -target=google_project_iam_member.cd_credentials_key_iam \
             -target=google_project_iam_member.cd_host_logging \
+            -target=google_project_iam_member.cd_host_logging_views \
+            -target=google_compute_project_metadata_item.enable_osconfig \
             -target=google_project_service.cloud_ids \
             -target=google_project_service.compute \
             -target=google_project_service.logging \
@@ -253,7 +255,8 @@ jobs:
 
       - name: Wait for host logging permissions
         run: |
-          python3 .github/workflows/scripts/wait_host_logging_iam.py --project "${{ vars.GCP_PROJECT }}" --zone us-west2-a --zone us-east4-c
+          python3 .github/workflows/scripts/wait_host_logging_iam.py --project "${{ vars.GCP_PROJECT }}" --zone us-west2-a --zone us-east4-c \
+            --require-log-view-admin --require-vm-manager
 
       - name: Wait for credentials key IAM propagation
         run: python3 .github/workflows/scripts/wait_credentials_key_iam.py --project "${{ vars.GCP_PROJECT }}"

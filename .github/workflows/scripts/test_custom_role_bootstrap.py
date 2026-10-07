@@ -96,6 +96,39 @@ esac
                     self.assertEqual(result.returncode, expected, result.stderr)
                     self.assertEqual(int(counter.read_text()), calls)
 
+    def test_production_bootstraps_both_further_host_logging_prerequisites(self):
+        text = WORKFLOW.read_text()
+        bootstrap = text.split('  production-us-central1-bootstrap:\n')[1].split('\n  production-us-west2-infra:')[0]
+        for target in ('google_project_iam_member.cd_host_logging_views',
+                       'google_compute_project_metadata_item.enable_osconfig'):
+            self.assertIn('-target=' + target, bootstrap)
+        gate = bootstrap.split('wait_host_logging_iam.py')[1]
+        self.assertIn('--require-log-view-admin', gate)
+        self.assertIn('--require-vm-manager', gate)
+        self.assertLess(bootstrap.index('terraform apply'), bootstrap.index('wait_host_logging_iam.py'))
+
+        config = (WORKFLOW.parents[2] / 'infra/envs/production/us-central1/cd-host-logging-iam.tf').read_text()
+        self.assertIn('resource "google_project_iam_member" "cd_host_logging_views"', config)
+        self.assertIn('resource "google_compute_project_metadata_item" "enable_osconfig"', config)
+        self.assertIn('key     = "enable-osconfig"', config)
+        self.assertIn('value   = "TRUE"', config)
+
+        west = WORKFLOW.with_name('terraform-rollout-production.yml').read_text()
+        for target in ('google_project_iam_member.cd_host_logging_views',
+                       'google_compute_project_metadata_item.enable_osconfig'):
+            self.assertIn('-target=' + target, west)
+        self.assertIn('--require-vm-manager', west.split('wait_host_logging_iam.py')[1])
+
+        # The staging project already has both, and its CD account holds
+        # neither grant, so the staging callers must not ask for them.
+        for workflow in ('terraform-rollout-staging.yml',):
+            staging = WORKFLOW.with_name(workflow).read_text()
+            self.assertNotIn('--require-vm-manager', staging)
+            self.assertNotIn('--require-log-view-admin', staging)
+        staging_job = text.split('  staging-us-central1-infra:', 1)[1].split('  staging-us-central1-api:', 1)[0]
+        self.assertNotIn('--require-vm-manager', staging_job)
+        self.assertNotIn('--require-log-view-admin', staging_job)
+
 
 if __name__ == '__main__':
     unittest.main()

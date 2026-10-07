@@ -61,6 +61,48 @@ class HostLoggingPermissionTest(unittest.TestCase):
                 host_iam.wait_for_permissions('example-project', ['example-zone'])
             sleep.assert_not_called()
 
+    @patch.object(host_iam.subprocess, 'check_output', return_value='example-token')
+    def test_staging_callers_do_not_require_the_production_prerequisites(self, token):
+        with patch.object(host_iam.urllib.request, 'urlopen', side_effect=[
+            response({'permissions': host_iam.PERMISSIONS}), response({}),
+        ]) as send:
+            self.assertTrue(host_iam.ready('example-project', ['example-zone']))
+        requests = [call.args[0] for call in send.call_args_list]
+        self.assertEqual(json.loads(requests[0].data)['permissions'], host_iam.PERMISSIONS)
+        self.assertNotIn('compute.googleapis.com', ' '.join(r.full_url for r in requests))
+
+    @patch.object(host_iam.subprocess, 'check_output', return_value='example-token')
+    def test_log_view_admin_is_required_before_the_east_apply(self, token):
+        required = host_iam.PERMISSIONS + host_iam.LOG_VIEW_PERMISSIONS
+        for missing in host_iam.LOG_VIEW_PERMISSIONS:
+            with self.subTest(missing=missing), patch.object(host_iam.urllib.request, 'urlopen',
+                return_value=response({'permissions': [p for p in required if p != missing]})) as send:
+                self.assertFalse(host_iam.ready('example-project', ['example-zone'], log_views=True))
+                self.assertEqual(send.call_count, 1)
+        with patch.object(host_iam.urllib.request, 'urlopen', side_effect=[
+            response({'permissions': required}), response({}),
+        ]) as send:
+            self.assertTrue(host_iam.ready('example-project', ['example-zone'], log_views=True))
+        self.assertEqual(json.loads(send.call_args_list[0].args[0].data)['permissions'], required)
+
+    @patch.object(host_iam.subprocess, 'check_output', return_value='example-token')
+    def test_granted_iam_does_not_bypass_vm_manager(self, token):
+        project = {'commonInstanceMetadata': {'items': [{'key': 'enable-osconfig', 'value': 'FALSE'}]}}
+        for metadata in (project, {'commonInstanceMetadata': {}}, {}):
+            with self.subTest(metadata=metadata), patch.object(host_iam.urllib.request, 'urlopen', side_effect=[
+                response({'permissions': host_iam.PERMISSIONS}), response(metadata),
+            ]) as send:
+                self.assertFalse(host_iam.ready('example-project', ['example-zone'], vm_manager=True))
+                # Refused before the zonal reads, which succeed while it is off.
+                self.assertEqual(send.call_count, 2)
+        enabled = {'commonInstanceMetadata': {'items': [{'key': 'enable-osconfig', 'value': 'TRUE'}]}}
+        with patch.object(host_iam.urllib.request, 'urlopen', side_effect=[
+            response({'permissions': host_iam.PERMISSIONS}), response(enabled), response({}),
+        ]) as send:
+            self.assertTrue(host_iam.ready('example-project', ['example-zone'], vm_manager=True))
+        self.assertEqual(send.call_args_list[1].args[0].full_url,
+                         'https://compute.googleapis.com/compute/v1/projects/example-project')
+
 
 if __name__ == '__main__':
     unittest.main()
