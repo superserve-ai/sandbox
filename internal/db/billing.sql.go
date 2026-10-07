@@ -2014,16 +2014,27 @@ func (q *Queries) ListBillingUsageExportsForPeriod(ctx context.Context, arg List
 }
 
 const listExportedTeamBillingPeriods = `-- name: ListExportedTeamBillingPeriods :many
-WITH ranked AS (
+WITH exported_teams AS (
+    SELECT team_id, max(period_end) AS latest_exported_end
+    FROM team_billing_period
+    WHERE finalized_at IS NULL AND status = 'exported'
+    GROUP BY team_id
+), candidates AS MATERIALIZED (
+    -- Fence the expensive completeness check behind exported-team discovery.
+    -- Earlier unfinalized periods must still participate in team ordering.
+    SELECT p.team_id, p.period_start, p.period_end, p.status, p.blocked_reason, p.blocked_at, p.approved_by, p.approved_at, p.exported_at, p.finalized_at, p.created_at, p.updated_at, p.gross_charges_usd, p.credits_applied_usd, p.net_invoice_amount_usd
+    FROM team_billing_period p
+    JOIN exported_teams e ON e.team_id = p.team_id
+    WHERE p.finalized_at IS NULL AND p.period_end <= e.latest_exported_end
+), ranked AS (
     SELECT
-        team_billing_period.team_id, team_billing_period.period_start, team_billing_period.period_end, team_billing_period.status, team_billing_period.blocked_reason, team_billing_period.blocked_at, team_billing_period.approved_by, team_billing_period.approved_at, team_billing_period.exported_at, team_billing_period.finalized_at, team_billing_period.created_at, team_billing_period.updated_at, team_billing_period.gross_charges_usd, team_billing_period.credits_applied_usd, team_billing_period.net_invoice_amount_usd,
+        candidates.team_id, candidates.period_start, candidates.period_end, candidates.status, candidates.blocked_reason, candidates.blocked_at, candidates.approved_by, candidates.approved_at, candidates.exported_at, candidates.finalized_at, candidates.created_at, candidates.updated_at, candidates.gross_charges_usd, candidates.credits_applied_usd, candidates.net_invoice_amount_usd,
         ROW_NUMBER() OVER (
             PARTITION BY team_id
             ORDER BY period_end ASC, period_start ASC
         ) AS team_rank
-    FROM team_billing_period
-    WHERE finalized_at IS NULL
-      AND storage_reports_complete_through(team_id, period_end)
+    FROM candidates
+    WHERE storage_reports_complete_through(team_id, period_end)
 )
 SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, team_rank
 FROM ranked

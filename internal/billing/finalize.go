@@ -34,6 +34,8 @@ var ErrStorageUsageUnavailable = errors.New("storage usage is unavailable")
 const (
 	defaultBillingFinalizationPollInterval = 1 * time.Minute
 	defaultBillingFinalizationBatchSize    = 25
+	defaultBillingFinalizationTickTimeout  = 45 * time.Second
+	billingFinalizationDiscoveryTimeout    = 5 * time.Second
 )
 
 type FinalizeTeamBillingPeriodResult struct {
@@ -45,6 +47,7 @@ type FinalizeTeamBillingPeriodResult struct {
 type BillingFinalizationConfig struct {
 	PollInterval       time.Duration
 	BatchSize          int
+	TickTimeout        time.Duration
 	ResolveActiveMeter ActiveMeterResolver
 }
 
@@ -52,15 +55,17 @@ func DefaultBillingFinalizationConfig() BillingFinalizationConfig {
 	return BillingFinalizationConfig{
 		PollInterval: defaultBillingFinalizationPollInterval,
 		BatchSize:    defaultBillingFinalizationBatchSize,
+		TickTimeout:  defaultBillingFinalizationTickTimeout,
 	}
 }
 
 func StartBillingFinalizationService(ctx context.Context, pool *pgxpool.Pool, cfg BillingFinalizationConfig) {
 	cfg = normalizeBillingFinalizationConfig(cfg)
-	workerID := strconv.FormatInt(time.Now().UnixNano(), 36)
+	workerID := uuid.NewString()
 	log.Info().
 		Str("worker_id", workerID).
 		Dur("poll_interval", cfg.PollInterval).
+		Dur("tick_timeout", cfg.TickTimeout).
 		Int("batch_size", cfg.BatchSize).
 		Msg("billing period finalization service starting")
 	go runBillingFinalizationLoop(ctx, pool, cfg, workerID)
@@ -593,8 +598,7 @@ func validateSummaryPricingRatesForFinalization(rows []db.ListActivePricingRates
 }
 
 func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, batchSize int, resolvers ...ActiveMeterResolver) (int, error) {
-	q := db.New(pool)
-	rows, err := q.ListExportedTeamBillingPeriods(ctx, int32(batchSize))
+	rows, err := listExportedBillingPeriods(ctx, pool, batchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -602,6 +606,10 @@ func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, bat
 	finalized := 0
 	var errs []error
 	for _, period := range rows {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
 		if _, err := FinalizeTeamBillingPeriodWithCredits(ctx, pool, period.TeamID, period.PeriodStart, period.PeriodEnd, resolvers...); err != nil {
 			errs = append(errs, fmt.Errorf("team %s period %s-%s: %w", period.TeamID, period.PeriodStart.Format(time.RFC3339), period.PeriodEnd.Format(time.RFC3339), err))
 			continue
@@ -611,32 +619,91 @@ func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, bat
 	return finalized, errors.Join(errs...)
 }
 
+func listExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, batchSize int) ([]db.ListExportedTeamBillingPeriodsRow, error) {
+	ctx, cancel := context.WithTimeout(ctx, billingFinalizationDiscoveryTimeout)
+	defer cancel()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Second)
+		defer cleanupCancel()
+		_ = tx.Rollback(cleanupCtx)
+	}()
+	// Also bound server work if the client disconnects or cancellation is delayed.
+	deadline, _ := ctx.Deadline()
+	timeout := max(time.Until(deadline).Milliseconds(), 1)
+	if _, err := tx.Exec(ctx, `SELECT set_config('statement_timeout', $1, true)`, fmt.Sprintf("%dms", timeout)); err != nil {
+		return nil, err
+	}
+	rows, err := db.New(tx).ListExportedTeamBillingPeriods(ctx, int32(batchSize))
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 func runBillingFinalizationLoop(ctx context.Context, pool *pgxpool.Pool, cfg BillingFinalizationConfig, workerID string) {
-	runBillingFinalizationTick(ctx, pool, cfg, workerID)
-
-	ticker := time.NewTicker(cfg.PollInterval)
-	defer ticker.Stop()
-
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+		runBillingFinalizationTick(ctx, pool, cfg, workerID)
+		timer := time.NewTimer(cfg.PollInterval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			log.Info().Str("worker_id", workerID).Msg("billing period finalization service stopped")
 			return
-		case <-ticker.C:
-			runBillingFinalizationTick(ctx, pool, cfg, workerID)
+		case <-timer.C:
 		}
 	}
 }
 
 func runBillingFinalizationTick(ctx context.Context, pool *pgxpool.Pool, cfg BillingFinalizationConfig, workerID string) {
-	finalized, err := FinalizeExportedBillingPeriods(ctx, pool, cfg.BatchSize, cfg.ResolveActiveMeter)
+	ctx, cancel := context.WithTimeout(ctx, cfg.TickTimeout)
+	defer cancel()
+	started := time.Now()
+	// Keep the claim through the runtime budget plus a cooldown. Do not release
+	// on failure: another replica would immediately retry the same expensive work.
+	claimed, err := claimBillingFinalizationLease(ctx, pool, workerID, cfg.TickTimeout+cfg.PollInterval)
 	if err != nil {
-		log.Warn().Err(err).Str("worker_id", workerID).Msg("billing period finalization tick failed")
+		log.Warn().Err(err).Str("worker_id", workerID).Msg("billing period finalization lease claim failed")
 		return
 	}
-	if finalized > 0 {
-		log.Info().Str("worker_id", workerID).Int("finalized", finalized).Msg("billing period finalization tick completed")
+	if !claimed {
+		return
 	}
+	finalized, err := FinalizeExportedBillingPeriods(ctx, pool, cfg.BatchSize, cfg.ResolveActiveMeter)
+	if err != nil {
+		log.Warn().Err(err).Str("worker_id", workerID).Int("finalized", finalized).Dur("duration", time.Since(started)).Msg("billing period finalization tick failed")
+		return
+	}
+	log.Info().Str("worker_id", workerID).Int("finalized", finalized).Dur("duration", time.Since(started)).Msg("billing period finalization tick completed")
+}
+
+func claimBillingFinalizationLease(ctx context.Context, pool *pgxpool.Pool, workerID string, leaseFor time.Duration) (bool, error) {
+	// A separate name shares the billing scheduler lease table, not the hourly lease.
+	// Even the current holder must wait for expiry before starting another batch.
+	const query = `
+INSERT INTO billing_rollup_scheduler_lease (name, locked_by, locked_until)
+VALUES ('finalization', $1, statement_timestamp() + $2 * interval '1 second')
+ON CONFLICT (name) DO UPDATE
+SET locked_by = EXCLUDED.locked_by,
+    locked_until = EXCLUDED.locked_until,
+    updated_at = statement_timestamp()
+WHERE billing_rollup_scheduler_lease.locked_until <= statement_timestamp()
+RETURNING true`
+	var claimed bool
+	err := pool.QueryRow(ctx, query, workerID, leaseFor.Seconds()).Scan(&claimed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return claimed, err
 }
 
 func normalizeBillingFinalizationConfig(cfg BillingFinalizationConfig) BillingFinalizationConfig {
@@ -645,6 +712,9 @@ func normalizeBillingFinalizationConfig(cfg BillingFinalizationConfig) BillingFi
 	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = defaultBillingFinalizationBatchSize
+	}
+	if cfg.TickTimeout <= 0 {
+		cfg.TickTimeout = defaultBillingFinalizationTickTimeout
 	}
 	return cfg
 }
