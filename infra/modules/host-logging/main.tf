@@ -95,6 +95,21 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
     resource_groups {
       inventory_filters { os_short_name = "ubuntu" }
 
+      # File resources do not create their destination's parent directory.
+      resources {
+        id = "host-logging-directory"
+        exec {
+          validate {
+            interpreter = "SHELL"
+            script      = "if [ -d '${local.state_dir}' ] && [ \"$(stat -c '%u:%g:%a' '${local.state_dir}')\" = '0:0:700' ]; then exit 100; else exit 101; fi"
+          }
+          enforce {
+            interpreter = "SHELL"
+            script      = "install -d -o root -g root -m 0700 '${local.state_dir}' && exit 100"
+          }
+        }
+      }
+
       resources {
         id = "otel-logs-config"
         file {

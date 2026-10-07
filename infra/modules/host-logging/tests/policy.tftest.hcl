@@ -36,17 +36,17 @@ run "host_logging_contract" {
   }
 
   assert {
-    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].state == "CONTENTS_MATCH"
+    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[1].file[0].state == "CONTENTS_MATCH"
     error_message = "the candidate configuration must enforce candidate contents"
   }
 
   assert {
-    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].path == "/var/lib/superserve/host-logging/otel-logs.yaml.candidate"
+    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[1].file[0].path == "/var/lib/superserve/host-logging/otel-logs.yaml.candidate"
     error_message = "candidate path must remain outside the active configuration"
   }
 
   assert {
-    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].file[0].gcs[0].generation != null
+    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[1].file[0].file[0].gcs[0].generation != null
     error_message = "candidate source must retain its generation-pinned GCS object"
   }
 
