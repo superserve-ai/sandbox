@@ -2115,9 +2115,10 @@ func main() {
 	// sample walks the fleet under the allocator lock, which must not contend
 	// with pool fill, reattach, or a first slot-allocating request pre-ready.
 	mgr.StartNetnsLeakSampler(ctx, time.Minute)
-	// Sampled inside the shortest conntrack expiry (15s UDP) so a burst cannot
-	// fill and drain the table unseen; the drop counters cover the rest.
-	telemetry.StartHostConntrackSampler(ctx, recorder, cfg.HostID, 15*time.Second)
+	// Sampled well inside the shortest conntrack expiry (15s UDP) so a burst
+	// cannot fill and drain the table between two reads, even on a kernel
+	// without the procfs drop counters.
+	telemetry.StartHostConntrackSampler(ctx, recorder, cfg.HostID, 5*time.Second)
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)
