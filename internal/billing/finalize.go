@@ -598,6 +598,13 @@ func validateSummaryPricingRatesForFinalization(rows []db.ListActivePricingRates
 }
 
 func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, batchSize int, resolvers ...ActiveMeterResolver) (int, error) {
+	return finalizeExportedBillingPeriods(ctx, pool, batchSize, func(ctx context.Context, period db.ListExportedTeamBillingPeriodsRow) error {
+		_, err := FinalizeTeamBillingPeriodWithCredits(ctx, pool, period.TeamID, period.PeriodStart, period.PeriodEnd, resolvers...)
+		return err
+	})
+}
+
+func finalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, batchSize int, finalize func(context.Context, db.ListExportedTeamBillingPeriodsRow) error) (int, error) {
 	rows, err := listExportedBillingPeriods(ctx, pool, batchSize)
 	if err != nil {
 		return 0, err
@@ -610,7 +617,16 @@ func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, bat
 			errs = append(errs, err)
 			break
 		}
-		if _, err := FinalizeTeamBillingPeriodWithCredits(ctx, pool, period.TeamID, period.PeriodStart, period.PeriodEnd, resolvers...); err != nil {
+		// Commit priority before work starts: cancellation or a process crash must
+		// not let the same slow teams monopolize the next replica's tick budget.
+		if _, err := pool.Exec(ctx, `INSERT INTO billing_finalization_attempt(team_id,last_attempt_at)
+VALUES($1,clock_timestamp())
+ON CONFLICT(team_id) DO UPDATE
+SET last_attempt_at=GREATEST(billing_finalization_attempt.last_attempt_at,EXCLUDED.last_attempt_at)`, period.TeamID); err != nil {
+			errs = append(errs, fmt.Errorf("record finalization attempt for team %s: %w", period.TeamID, err))
+			break
+		}
+		if err := finalize(ctx, period); err != nil {
 			errs = append(errs, fmt.Errorf("team %s period %s-%s: %w", period.TeamID, period.PeriodStart.Format(time.RFC3339), period.PeriodEnd.Format(time.RFC3339), err))
 			continue
 		}

@@ -2036,11 +2036,12 @@ WITH exported_teams AS (
     FROM candidates
     WHERE storage_reports_complete_through(team_id, period_end)
 )
-SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, team_rank
+SELECT ranked.team_id, ranked.period_start, ranked.period_end, ranked.status, ranked.blocked_reason, ranked.blocked_at, ranked.approved_by, ranked.approved_at, ranked.exported_at, ranked.finalized_at, ranked.created_at, ranked.updated_at, ranked.gross_charges_usd, ranked.credits_applied_usd, ranked.net_invoice_amount_usd, ranked.team_rank
 FROM ranked
+LEFT JOIN billing_finalization_attempt attempt ON attempt.team_id = ranked.team_id
 WHERE team_rank = 1
   AND status = 'exported'
-ORDER BY period_end ASC, period_start ASC, team_id ASC
+ORDER BY attempt.last_attempt_at ASC NULLS FIRST, period_end ASC, period_start ASC, ranked.team_id ASC
 LIMIT $1
 `
 

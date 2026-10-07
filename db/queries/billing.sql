@@ -1037,11 +1037,12 @@ WITH exported_teams AS (
     FROM candidates
     WHERE storage_reports_complete_through(team_id, period_end)
 )
-SELECT *
+SELECT ranked.*
 FROM ranked
+LEFT JOIN billing_finalization_attempt attempt ON attempt.team_id = ranked.team_id
 WHERE team_rank = 1
   AND status = 'exported'
-ORDER BY period_end ASC, period_start ASC, team_id ASC
+ORDER BY attempt.last_attempt_at ASC NULLS FIRST, period_end ASC, period_start ASC, ranked.team_id ASC
 LIMIT sqlc.arg(batch_size);
 
 -- name: GrantTeamCredit :one

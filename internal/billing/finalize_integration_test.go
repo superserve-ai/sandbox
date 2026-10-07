@@ -4,6 +4,8 @@ package billing
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -49,6 +51,7 @@ func finalizationTestPool(t *testing.T) *pgxpool.Pool {
 	if _, err := pool.Exec(t.Context(), `
 CREATE TABLE team_billing_period (LIKE public.team_billing_period INCLUDING DEFAULTS INCLUDING INDEXES);
 CREATE TABLE billing_rollup_scheduler_lease (LIKE public.billing_rollup_scheduler_lease INCLUDING ALL);
+CREATE TABLE billing_finalization_attempt (LIKE public.billing_finalization_attempt INCLUDING ALL);
 CREATE TABLE completeness_fixture (team_id uuid, period_end timestamptz, complete bool);
 CREATE SEQUENCE completeness_calls;
 CREATE FUNCTION storage_reports_complete_through(t uuid, boundary timestamptz) RETURNS bool
@@ -204,5 +207,73 @@ PERFORM nextval('completeness_calls'); PERFORM pg_sleep(10); RETURN false; END $
 	runBillingFinalizationTick(t.Context(), pool, cfg, uuid.NewString())
 	if calls := finalizationCompletenessCalls(t, pool); calls != 1 {
 		t.Fatalf("completeness calls after timeout/retry = %d, want one", calls)
+	}
+}
+
+func TestIntegration_FinalizationSlowFailuresDoNotStarveOtherTeams(t *testing.T) {
+	for _, batchSize := range []int{25, 2} {
+		t.Run(fmt.Sprintf("batch_%d", batchSize), func(t *testing.T) {
+			pool := finalizationTestPool(t)
+			ctx := t.Context()
+			end := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+			slowFirst, slowSecond, healthy := uuid.New(), uuid.New(), uuid.New()
+			finalizationFixture(t, pool, slowFirst, end, "exported", true)
+			finalizationFixture(t, pool, slowSecond, end.Add(time.Hour), "exported", true)
+			finalizationFixture(t, pool, healthy, end.Add(2*time.Hour), "exported", true)
+			finalizationFixture(t, pool, slowFirst, end.Add(3*time.Hour), "exported", true)
+			var attempted []uuid.UUID
+			finalize := func(ctx context.Context, period db.ListExportedTeamBillingPeriodsRow) error {
+				attempted = append(attempted, period.TeamID)
+				if period.TeamID == healthy {
+					_, err := pool.Exec(ctx, `UPDATE team_billing_period SET status='finalized',finalized_at=now() WHERE team_id=$1`, healthy)
+					return err
+				}
+				if period.TeamID == slowFirst && !period.PeriodEnd.Equal(end) {
+					t.Fatal("attempted a later period before the team's earlier failure resolved")
+				}
+				periodCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+				defer cancel()
+				<-periodCtx.Done()
+				return periodCtx.Err()
+			}
+			runClaimedTick := func(pool *pgxpool.Pool) int {
+				t.Helper()
+				tickCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
+				defer cancel()
+				claimed, err := claimBillingFinalizationLease(tickCtx, pool, uuid.NewString(), time.Minute)
+				if err != nil || !claimed {
+					t.Fatalf("claim = %v, %v", claimed, err)
+				}
+				finalized, err := finalizeExportedBillingPeriods(tickCtx, pool, batchSize, finalize)
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("slow batch error = %v, want deadline exceeded", err)
+				}
+				return finalized
+			}
+			if finalized := runClaimedTick(pool); finalized != 0 {
+				t.Fatalf("first tick finalized %d periods", finalized)
+			}
+			if len(attempted) != 2 || attempted[0] != slowFirst || attempted[1] != slowSecond {
+				t.Fatalf("first tick attempts = %v, want the two slow teams", attempted)
+			}
+			// A new process and lease owner must resume fairly using only durable state.
+			restarted, err := pgxpool.NewWithConfig(ctx, pool.Config())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.Close()
+			pool.Close()
+			pool = restarted
+			if _, err := pool.Exec(ctx, `UPDATE billing_rollup_scheduler_lease SET locked_until=now()-interval '1 second' WHERE name='finalization'`); err != nil {
+				t.Fatal(err)
+			}
+			attempted = nil
+			if finalized := runClaimedTick(pool); finalized != 1 {
+				t.Fatalf("second tick finalized %d periods, want healthy team to progress", finalized)
+			}
+			if len(attempted) < 2 || attempted[0] != healthy || attempted[1] != slowFirst {
+				t.Fatalf("second tick attempts = %v, want healthy team first and oldest attempt next", attempted)
+			}
+		})
 	}
 }
