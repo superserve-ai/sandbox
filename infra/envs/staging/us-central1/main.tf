@@ -772,7 +772,7 @@ module "host_logging" {
       service_account_email = google_service_account.vmd_runtime.email
     }
   }
-  depends_on = [module.sandbox_host, module.sandbox_host_b, google_project_service.host_log_os_config, google_project_service.host_log_telemetry]
+  depends_on = [module.sandbox_host, module.sandbox_host_b, google_project_service.host_log_os_config, google_project_service.host_log_telemetry, google_project_iam_member.cd_host_logging]
 }
 
 # Durability tier for the host's local artifacts (sandbox snapshots, template
