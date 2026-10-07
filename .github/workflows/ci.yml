@@ -122,6 +122,7 @@ jobs:
           # Database roles are cluster-wide, so this package remains after the
           # ordered integration/migration command in the same isolated job.
           go test -v -tags integration -count=1 -race -timeout 10m ./cmd/seed-templates/
+          go test -v -tags integration -count=1 -race -timeout 1m -run '^TestQMKeyUsage$' ./internal/api
 
   proxy-database-contracts:
     name: Proxy Database Contracts
