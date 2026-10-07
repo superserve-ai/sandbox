@@ -35,6 +35,8 @@ func (r *captureTelemetryRecorder) RecordCapacityShadow(context.Context, telemet
 }
 func (r *captureTelemetryRecorder) RecordHostCapacity(context.Context, telemetry.HostCapacity) {
 }
+func (r *captureTelemetryRecorder) RecordHostConntrack(context.Context, telemetry.HostConntrack) {
+}
 func (r *captureTelemetryRecorder) RecordBackupCoverage(context.Context, []telemetry.BackupCoverage) {
 }
 func (r *captureTelemetryRecorder) RecordDBPoolStats(context.Context, telemetry.DBPoolStats) {}

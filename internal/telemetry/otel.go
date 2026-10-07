@@ -97,6 +97,11 @@ type OTelRecorder struct {
 	hostVCPU                 metric.Int64Gauge
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
+	hostConntrackEntries     metric.Int64Gauge
+	hostConntrackMax         metric.Int64Gauge
+	hostConntrackBuckets     metric.Int64Gauge
+	hostConntrackSynTimeout  metric.Int64Gauge
+	hostConntrackUDPTimeout  metric.Int64Gauge
 	// Observable, uniquely in this file: coverage is published by one
 	// lease-elected replica per cell, and a synchronous gauge retains
 	// its last value per process, so a replica that lost leadership
@@ -249,6 +254,21 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.hostSandboxes, err = meter.Int64Gauge("host_capacity_running_sandboxes"); err != nil {
+		return nil, err
+	}
+	if r.hostConntrackEntries, err = meter.Int64Gauge("host_conntrack_entries"); err != nil {
+		return nil, err
+	}
+	if r.hostConntrackMax, err = meter.Int64Gauge("host_conntrack_max"); err != nil {
+		return nil, err
+	}
+	if r.hostConntrackBuckets, err = meter.Int64Gauge("host_conntrack_buckets"); err != nil {
+		return nil, err
+	}
+	if r.hostConntrackSynTimeout, err = meter.Int64Gauge("host_conntrack_tcp_syn_sent_timeout_seconds"); err != nil {
+		return nil, err
+	}
+	if r.hostConntrackUDPTimeout, err = meter.Int64Gauge("host_conntrack_udp_timeout_seconds"); err != nil {
 		return nil, err
 	}
 	if r.backupUncoveredPaused, err = meter.Int64ObservableGauge("backup_uncovered_paused_sandboxes"); err != nil {
@@ -538,6 +558,19 @@ func (r *OTelRecorder) RecordHostResolution(ctx context.Context, h HostResolutio
 		attribute.String("result", safeResult(h.Result)),
 	)...)
 	r.hostResolutionDuration.Record(ctx, h.Duration.Seconds(), opt)
+}
+
+// RecordHostConntrack publishes the table fill and its settings per host.
+func (r *OTelRecorder) RecordHostConntrack(ctx context.Context, c HostConntrack) {
+	if r == nil {
+		return
+	}
+	opt := metric.WithAttributes(r.attrs(attribute.String("host_id", safeHostID(c.HostID)))...)
+	r.hostConntrackEntries.Record(ctx, c.Entries, opt)
+	r.hostConntrackMax.Record(ctx, c.Max, opt)
+	r.hostConntrackBuckets.Record(ctx, c.Buckets, opt)
+	r.hostConntrackSynTimeout.Record(ctx, c.TCPSynSentTimeoutSecs, opt)
+	r.hostConntrackUDPTimeout.Record(ctx, c.UDPTimeoutSecs, opt)
 }
 
 func (r *OTelRecorder) RecordHostCapacity(ctx context.Context, c HostCapacity) {

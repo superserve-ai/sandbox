@@ -2115,6 +2115,7 @@ func main() {
 	// sample walks the fleet under the allocator lock, which must not contend
 	// with pool fill, reattach, or a first slot-allocating request pre-ready.
 	mgr.StartNetnsLeakSampler(ctx, time.Minute)
+	telemetry.StartHostConntrackSampler(ctx, recorder, cfg.HostID, time.Minute)
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)
