@@ -247,3 +247,52 @@ func TestMachineAuthorityDenialIsDistinctFromOutage(t *testing.T) {
 		}
 	}
 }
+
+func TestMachineAuthoritySharedRefreshSurvivesCallerCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &countingAuthorityDB{blocked: make(chan struct{})}
+		cache := NewCachedMachineAuthority(nil, 5*time.Second)
+		cache.pool = store
+		p, c := uuid.New(), uuid.New()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		leader, sibling := make(chan error, 1), make(chan error, 1)
+		go func() { _, _, err := cache.RefreshSnapshot(ctx, p, c); leader <- err }()
+		synctest.Wait()
+		go func() { _, _, err := cache.RefreshSnapshot(context.Background(), p, c); sibling <- err }()
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		if err := <-leader; !errors.Is(err, context.Canceled) {
+			t.Fatalf("disconnected caller did not stop waiting: %v", err)
+		}
+		select {
+		case err := <-sibling:
+			t.Fatalf("sibling lost its shared observation: %v", err)
+		default:
+		}
+		close(store.blocked)
+		if err := <-sibling; err != nil {
+			t.Fatalf("healthy sibling refresh failed: %v", err)
+		}
+		if store.calls.Load() != 1 {
+			t.Fatalf("refresh was not coalesced: %d queries", store.calls.Load())
+		}
+		if generation, _, err := cache.LookupSnapshot(context.Background(), p, c); err != nil || generation != 1 || store.calls.Load() != 1 {
+			t.Fatalf("shared observation was not cached: generation=%d err=%v", generation, err)
+		}
+	})
+}
+
+func TestMachineAuthoritySharedRefreshStillTimesOut(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &countingAuthorityDB{blocked: make(chan struct{})}
+		cache := NewCachedMachineAuthority(nil, 5*time.Second)
+		cache.pool = store
+		started := time.Now()
+		_, _, err := cache.RefreshSnapshot(context.Background(), uuid.New(), uuid.New())
+		if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) != time.Second || len(cache.items) != 0 {
+			t.Fatalf("shared query lost its bound: elapsed=%s err=%v", time.Since(started), err)
+		}
+	})
+}
