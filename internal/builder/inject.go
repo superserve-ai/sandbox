@@ -152,10 +152,12 @@ const aptRewriteHeader = `# Rewritten by Superserve template builder.
 `
 
 // aptAcquireConf bounds how long apt waits on one request. Its default of
-// 120 seconds, times the retries, is what turns a mirror node that accepts
-// connections but never answers into a build step past its deadline.
+// 120 seconds, times the retries, is what turns a mirror backend that
+// accepts a connection and then stalls into a build step past its deadline;
+// at 10 seconds a stalled connection costs seconds and the retry lands on
+// another backend.
 const aptAcquireConf = `// Written by Superserve template builder.
-Acquire::http::Timeout "30";
+Acquire::http::Timeout "10";
 Acquire::Retries "3";
 `
 

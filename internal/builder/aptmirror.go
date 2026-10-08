@@ -2,6 +2,7 @@ package builder
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"path"
@@ -21,17 +22,22 @@ const aptMirrorEnv = "TEMPLATE_APT_MIRROR"
 
 const gceMetadataZoneURL = "http://metadata.google.internal/computeMetadata/v1/instance/zone"
 
+// gceMirrorRegions are Google regions whose Ubuntu mirrors are tried, after
+// the host's own region, when that one fails the transfer probe. A mirror
+// can be reachable yet have a backend that stalls one connection in several,
+// and the next region over serves the same archive a few hundred ms away.
+var gceMirrorRegions = []string{"us-east4", "us-west2", "us-west1", "us-central1", "europe-west1"}
+
 // selectAptMirror picks the Ubuntu mirror build VMs fetch packages from: the
-// configured override, else Google's mirror for the region this host runs
-// in when it answers, else Canonical's cloud mirror. Canonical's public
-// mirrors are partially unreachable often enough that a build pulling from
-// them can run past its step deadline; Google's in-region mirror has not
-// been.
+// configured override, else the first Google mirror (own region first) that
+// passes the transfer probe, else Canonical's cloud mirror. Canonical's
+// public mirrors are partially unreachable often enough that a build pulling
+// from them can run past its step deadline.
 func selectAptMirror(ctx context.Context, override string, logger *zerolog.Logger) string {
-	return chooseAptMirror(ctx, override, gceMetadataZoneURL, mirrorAnswers, logger)
+	return chooseAptMirror(ctx, override, gceMetadataZoneURL, mirrorTransfers, logger)
 }
 
-func chooseAptMirror(ctx context.Context, override, metadataURL string, answers func(context.Context, string) bool, logger *zerolog.Logger) string {
+func chooseAptMirror(ctx context.Context, override, metadataURL string, transfers func(context.Context, string) bool, logger *zerolog.Logger) string {
 	if override != "" {
 		return override
 	}
@@ -42,14 +48,25 @@ func chooseAptMirror(ctx context.Context, override, metadataURL string, answers 
 		}
 		return fallbackAptMirror
 	}
-	host := region + ".gce.archive.ubuntu.com"
-	if !answers(ctx, host) {
-		if logger != nil {
-			logger.Warn().Str("mirror", host).Str("fallback", fallbackAptMirror).Msg("regional apt mirror did not answer; using the fallback")
+	candidates := []string{region}
+	for _, r := range gceMirrorRegions {
+		if r != region {
+			candidates = append(candidates, r)
 		}
-		return fallbackAptMirror
 	}
-	return host
+	for _, r := range candidates {
+		host := r + ".gce.archive.ubuntu.com"
+		if transfers(ctx, host) {
+			if r != region && logger != nil {
+				logger.Warn().Str("mirror", host).Str("region", region).Msg("own region's apt mirror failed the transfer probe; using another region's")
+			}
+			return host
+		}
+	}
+	if logger != nil {
+		logger.Warn().Str("fallback", fallbackAptMirror).Msg("no Google apt mirror passed the transfer probe; using the fallback")
+	}
+	return fallbackAptMirror
 }
 
 // gceRegion returns the region of the GCE instance the builder runs on
@@ -82,17 +99,46 @@ func gceRegion(ctx context.Context, metadataURL string) string {
 	return zone[:i]
 }
 
-func mirrorAnswers(ctx context.Context, host string) bool {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+// mirrorProbePath is a large file every Ubuntu mirror serves with range
+// support, so the probe moves real bytes rather than asking for headers.
+const mirrorProbePath = "/ubuntu/ls-lR.gz"
+
+const (
+	mirrorProbeFetches = 4
+	mirrorProbeBytes   = 1 << 20
+	mirrorProbeTimeout = 3 * time.Second
+)
+
+// mirrorTransfers reports whether host completed mirrorProbeFetches ranged
+// fetches of mirrorProbeBytes each, every one within mirrorProbeTimeout.
+// Each fetch is its own connection, so a backend that stalls some fraction
+// of connections has that many chances to show itself.
+func mirrorTransfers(ctx context.Context, host string) bool {
+	for i := 0; i < mirrorProbeFetches; i++ {
+		if !mirrorTransfer(ctx, host, int64(i)*mirrorProbeBytes) {
+			return false
+		}
+	}
+	return true
+}
+
+func mirrorTransfer(ctx context.Context, host string, offset int64) bool {
+	ctx, cancel := context.WithTimeout(ctx, mirrorProbeTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://"+host+"/ubuntu/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+host+mirrorProbePath, nil)
 	if err != nil {
 		return false
 	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+mirrorProbeBytes-1))
+	req.Close = true
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return false
 	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		return false
+	}
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, mirrorProbeBytes))
+	return err == nil && n == mirrorProbeBytes
 }

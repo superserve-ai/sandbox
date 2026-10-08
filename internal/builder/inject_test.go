@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -8,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestInjectProxyCA(t *testing.T) {
@@ -287,7 +290,7 @@ func TestRewriteAptSources_BoundsAptRequests(t *testing.T) {
 		t.Errorf("sources not pointed at the chosen mirror:\n%s", got)
 	}
 	conf := readTestFile(t, filepath.Join(root, aptAcquireConfPath))
-	if !strings.Contains(conf, `Acquire::http::Timeout "30";`) || !strings.Contains(conf, `Acquire::Retries "3";`) {
+	if !strings.Contains(conf, `Acquire::http::Timeout "10";`) || !strings.Contains(conf, `Acquire::Retries "3";`) {
 		t.Errorf("acquire conf missing the timeout or retries:\n%s", conf)
 	}
 }
@@ -312,7 +315,20 @@ func TestChooseAptMirror(t *testing.T) {
 		t.Errorf("regional mirror: got %q", got)
 	}
 	if got := chooseAptMirror(ctx, "", metadata.URL, down, nil); got != fallbackAptMirror {
-		t.Errorf("regional mirror down: got %q, want the fallback", got)
+		t.Errorf("every mirror down: got %q, want the fallback", got)
+	}
+	// A region whose mirror fails the probe is passed over for the next
+	// Google region before Canonical's mirror is considered.
+	var tried []string
+	onlyEast := func(_ context.Context, host string) bool {
+		tried = append(tried, host)
+		return host == "us-east4.gce.archive.ubuntu.com"
+	}
+	if got := chooseAptMirror(ctx, "", metadata.URL, onlyEast, nil); got != "us-east4.gce.archive.ubuntu.com" {
+		t.Errorf("own region failing: got %q, want the next region's mirror", got)
+	}
+	if len(tried) != 2 || tried[0] != "europe-west1.gce.archive.ubuntu.com" {
+		t.Errorf("probe order: %v, want own region first then the next one", tried)
 	}
 	// Off GCE the metadata server does not exist; the fallback is used
 	// without a probe.
@@ -320,5 +336,42 @@ func TestChooseAptMirror(t *testing.T) {
 	spy := func(context.Context, string) bool { probed = true; return true }
 	if got := chooseAptMirror(ctx, "", "http://127.0.0.1:1/zone", spy, nil); got != fallbackAptMirror || probed {
 		t.Errorf("off GCE: got %q (probed=%v), want the fallback without probing", got, probed)
+	}
+}
+
+// The probe must move bytes over several connections: a mirror whose
+// backend stalls some connections passes a HEAD and fails this.
+func TestMirrorTransfers(t *testing.T) {
+	payload := make([]byte, mirrorProbeBytes*mirrorProbeFetches)
+	var requests atomic.Int32
+	stallThird := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != mirrorProbePath {
+			http.NotFound(w, r)
+			return
+		}
+		n := requests.Add(1)
+		if stallThird && n == 3 {
+			w.Header().Set("Content-Range", "bytes 0-0/1")
+			w.WriteHeader(http.StatusPartialContent)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done() // never send the body
+			return
+		}
+		http.ServeContent(w, r, "ls-lR.gz", time.Time{}, bytes.NewReader(payload))
+	}))
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "http://")
+	if !mirrorTransfers(context.Background(), host) {
+		t.Fatal("healthy mirror failed the transfer probe")
+	}
+	requests.Store(0)
+	stallThird = true
+	start := time.Now()
+	if mirrorTransfers(context.Background(), host) {
+		t.Fatal("a mirror that stalls a connection passed the transfer probe")
+	}
+	if elapsed := time.Since(start); elapsed > mirrorProbeTimeout+2*time.Second {
+		t.Errorf("stalled probe took %v, want it bounded by the per-fetch timeout", elapsed)
 	}
 }
