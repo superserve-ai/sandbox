@@ -1296,7 +1296,11 @@ WITH tpl AS (
   WHERE t.id = $13
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
-  FOR KEY SHARE
+    AND t.snapshot_path IS NOT DISTINCT FROM $16
+    AND t.mem_path IS NOT DISTINCT FROM $17
+    AND t.base_path IS NOT DISTINCT FROM $18
+    AND t.delta_path IS NOT DISTINCT FROM $19
+  FOR SHARE
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
   SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
@@ -1377,10 +1381,22 @@ type CreateSandboxFromTemplateRow struct {
 	RoutingObservedAt    time.Time          `json:"routing_observed_at"`
 }
 
-// CreateSandbox variant that holds FOR KEY SHARE on the template row
-// during the INSERT, serializing with SoftDeleteTemplateIfUnused's FOR
-// UPDATE. Returns 0 rows if the template is missing, deleted, or not
-// visible to the caller.
+// CreateSandbox variant that locks the template row during the INSERT,
+// serializing with SoftDeleteTemplateIfUnused and with the promotion of a
+// new generation. Returns 0 rows if the template is missing, deleted, not
+// visible, or no longer serving the generation the caller read.
+//
+// The path match is what makes a reference reliable. The caller boots the VM
+// from these paths in parallel with this INSERT, so between its read and this
+// row there is a live user of that generation with nothing recording it. If a
+// rebuild lands in that window the row would pin paths the collector is free
+// to delete, and unlinking them does not disturb the running VM: the sandbox
+// commits and breaks later, at a pause or a resume. Matching here keeps the
+// generation current until the row that references it exists.
+//
+// FOR SHARE, not FOR KEY SHARE: promotion rewrites the path columns, which is
+// a non-key UPDATE and takes FOR NO KEY UPDATE. That conflicts with FOR SHARE
+// and not with FOR KEY SHARE.
 func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandboxFromTemplateParams) (CreateSandboxFromTemplateRow, error) {
 	row := q.db.QueryRow(ctx, createSandboxFromTemplate,
 		arg.ID,
@@ -1457,10 +1473,14 @@ WITH tpl AS (
   WHERE t.id = $1
     AND t.deleted_at IS NULL
     AND (t.team_id = $2 OR t.team_id = $3)
-  FOR KEY SHARE
+    AND t.snapshot_path IS NOT DISTINCT FROM $4
+    AND t.mem_path IS NOT DISTINCT FROM $5
+    AND t.base_path IS NOT DISTINCT FROM $6
+    AND t.delta_path IS NOT DISTINCT FROM $7
+  FOR SHARE
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
-  SELECT $4, $2, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, tpl_id, $15, $16, $17, $18, disk_mib, $19, true FROM tpl
+  SELECT $8, $2, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, tpl_id, $4, $5, $6, $7, disk_mib, $19, true FROM tpl
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -1480,6 +1500,10 @@ type CreateSandboxFromTemplateWithSecretsParams struct {
 	TemplateID        uuid.UUID     `json:"template_id"`
 	TeamID            uuid.UUID     `json:"team_id"`
 	SystemTeamID      uuid.UUID     `json:"system_team_id"`
+	SnapshotPath      *string       `json:"snapshot_path"`
+	MemPath           *string       `json:"mem_path"`
+	BasePath          *string       `json:"base_path"`
+	DeltaPath         *string       `json:"delta_path"`
 	ID                uuid.UUID     `json:"id"`
 	Name              string        `json:"name"`
 	Status            SandboxStatus `json:"status"`
@@ -1491,10 +1515,6 @@ type CreateSandboxFromTemplateWithSecretsParams struct {
 	SnapshotID        pgtype.UUID   `json:"snapshot_id"`
 	TimeoutSeconds    *int32        `json:"timeout_seconds"`
 	Metadata          []byte        `json:"metadata"`
-	SnapshotPath      *string       `json:"snapshot_path"`
-	MemPath           *string       `json:"mem_path"`
-	BasePath          *string       `json:"base_path"`
-	DeltaPath         *string       `json:"delta_path"`
 	AutoDeleteSeconds *int32        `json:"auto_delete_seconds"`
 	PreviewAccess     string        `json:"preview_access"`
 	SecretIds         []uuid.UUID   `json:"secret_ids"`
@@ -1554,6 +1574,10 @@ func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg 
 		arg.TemplateID,
 		arg.TeamID,
 		arg.SystemTeamID,
+		arg.SnapshotPath,
+		arg.MemPath,
+		arg.BasePath,
+		arg.DeltaPath,
 		arg.ID,
 		arg.Name,
 		arg.Status,
@@ -1565,10 +1589,6 @@ func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg 
 		arg.SnapshotID,
 		arg.TimeoutSeconds,
 		arg.Metadata,
-		arg.SnapshotPath,
-		arg.MemPath,
-		arg.BasePath,
-		arg.DeltaPath,
 		arg.AutoDeleteSeconds,
 		arg.PreviewAccess,
 		arg.SecretIds,

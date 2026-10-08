@@ -1189,6 +1189,31 @@ func (q *Queries) SoftDeleteTemplateIfUnused(ctx context.Context, arg SoftDelete
 	return i, err
 }
 
+const templateStillServable = `-- name: TemplateStillServable :one
+SELECT EXISTS(
+  SELECT 1 FROM template
+  WHERE id = $1 AND deleted_at IS NULL
+    AND (team_id = $2 OR team_id = $3)
+)
+`
+
+type TemplateStillServableParams struct {
+	TemplateID   uuid.UUID `json:"template_id"`
+	TeamID       uuid.UUID `json:"team_id"`
+	SystemTeamID uuid.UUID `json:"system_team_id"`
+}
+
+// Run only when a create's INSERT returned no rows, to tell a template that is
+// gone from one that has merely moved to a newer generation. The first is a
+// 404; the second is a race the caller retries, and reporting it as a missing
+// template would be both wrong and unretryable.
+func (q *Queries) TemplateStillServable(ctx context.Context, arg TemplateStillServableParams) (bool, error) {
+	row := q.db.QueryRow(ctx, templateStillServable, arg.TemplateID, arg.TeamID, arg.SystemTeamID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const tryDispatchBuild = `-- name: TryDispatchBuild :execrows
 WITH target_host AS (
     SELECT h.status FROM host h WHERE h.id = $2 FOR SHARE

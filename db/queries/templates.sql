@@ -46,6 +46,17 @@ WHERE id = $1
 SELECT * FROM template
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
+-- name: TemplateStillServable :one
+-- Run only when a create's INSERT returned no rows, to tell a template that is
+-- gone from one that has merely moved to a newer generation. The first is a
+-- 404; the second is a race the caller retries, and reporting it as a missing
+-- template would be both wrong and unretryable.
+SELECT EXISTS(
+  SELECT 1 FROM template
+  WHERE id = @template_id AND deleted_at IS NULL
+    AND (team_id = @team_id OR team_id = @system_team_id)
+);
+
 -- name: GetTemplateBasePath :one
 -- Team-blind read for the post-destroy GC: the sandbox's team may not own
 -- the template (system templates), so we can't use GetTemplateForOwner.
