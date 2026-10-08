@@ -130,6 +130,68 @@ func TestSandboxOwnershipCacheBoundedFreshness(t *testing.T) {
 	})
 }
 
+func TestLegacyVMDOrdinaryOwnershipProof(t *testing.T) {
+	seed := []byte("legacy-vmd-ownership-test-signing-key")
+	sandbox, team, creator, principal := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	cases := []struct {
+		name    string
+		creator string
+		fields  map[string]any
+		db      sandboxOwnerTestDB
+		want    int
+		reads   int64
+	}{
+		{name: "legacy creator", creator: creator, want: 200, reads: 1},
+		{name: "legacy ownerless", want: 200, reads: 1},
+		{name: "legacy machine association", creator: creator, db: sandboxOwnerTestDB{principal: &principal, team: &team}, want: 401, reads: 1},
+		{name: "legacy unavailable proof", creator: creator, db: sandboxOwnerTestDB{err: errors.New("unavailable")}, want: 503, reads: 1},
+		{name: "legacy missing sandbox", creator: creator, db: sandboxOwnerTestDB{err: pgx.ErrNoRows}, want: 503, reads: 1},
+		{name: "explicit unknown creator", creator: creator, fields: map[string]any{"ownership_state": "unknown"}, want: 401},
+		{name: "explicit empty state", creator: creator, fields: map[string]any{"ownership_state": ""}, want: 503},
+		{name: "explicit null state", fields: map[string]any{"ownership_state": nil}, want: 503},
+		{name: "explicit invalid state", fields: map[string]any{"ownership_state": "invalid"}, want: 503},
+		{name: "machine flag", creator: creator, fields: map[string]any{"machine_owned": true}, want: 401},
+		{name: "machine principal", creator: creator, fields: map[string]any{"machine_owner_principal_id": principal}, want: 401},
+		{name: "reserved machine creator", creator: "machine:" + principal, want: 401},
+	}
+	for i := range cases {
+		tc := &cases[i]
+		t.Run(tc.name, func(t *testing.T) {
+			server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/instances/__healthcheck__" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				attestPreviewProtocol(w)
+				body := map[string]any{"vm_ip": "10.0.0.2", "status": "running", "team_id": team, "owner_id": tc.creator}
+				for field, value := range tc.fields {
+					body[field] = value
+				}
+				_ = json.NewEncoder(w).Encode(body)
+			}))
+			defer server.Close()
+			resolver := NewVMDResolver(server.URL)
+			if ready, err := resolver.ReadyWithMachineIdentity(context.Background()); err != nil || ready {
+				t.Fatalf("legacy VMD readiness = %v, %v", ready, err)
+			}
+			store := NewCachedSandboxOwnership(nil)
+			store.pool = &tc.db
+			h := NewHandler(nil, resolver, zerolog.Nop()).WithAuth(seed).WithSandboxOwnership(store)
+			info, failure := h.authorizeSandboxRequest(context.Background(), auth.ComputeAccessToken(seed, sandbox), sandbox)
+			code := http.StatusOK
+			if failure != nil {
+				code = failure.Status
+			}
+			if code != tc.want || tc.db.calls.Load() != tc.reads {
+				t.Fatalf("status=%d reads=%d failure=%+v; want status=%d reads=%d", code, tc.db.calls.Load(), failure, tc.want, tc.reads)
+			}
+			if code == http.StatusOK && (info.OwnershipState != auth.OwnershipOrdinary || info.OwnerID != tc.creator) {
+				t.Fatalf("ordinary proof changed creator attribution: %+v", info)
+			}
+		})
+	}
+}
+
 func TestSandboxOwnershipRejectsDelayedResult(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cache := NewCachedSandboxOwnership(nil)
