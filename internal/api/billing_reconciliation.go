@@ -4,7 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math/rand/v2"
+	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,47 +24,92 @@ const (
 	billingPauseWorkers                   = 10
 	billingPauseCap                 int32 = 1000 // per pass; a follow-up pass picks up the rest
 	billingTrialEligibilityPageSize int32 = 256
+	// Long enough that a slow page cannot let a second replica in behind the
+	// holder, short enough that a crashed one is replaced within a few ticks.
+	trialEligibilityLeaseSeconds = 120
+	trialEligibilitySweepName    = "billing-trial-eligibility"
 )
 
 func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 	h.scheduleTrialCreditWarningDiscovery(ctx)
-	// Paused and historical trials also need refreshed verdicts before resume,
-	// but only one bounded page is refreshed per tick. The cursor continues
-	// across ticks so a large population makes progress without restarting at
-	// the UUID prefix or monopolizing the database.
-	h.trialEligibilityMu.Lock()
-	afterID := pgtype.UUID{Bytes: h.trialEligibilityAfter, Valid: h.trialEligibilityAfterValid}
-	h.trialEligibilityMu.Unlock()
+	// One replica refreshes per tick. Run by every replica this fans out
+	// once each, so the population is swept N times over with nothing
+	// shared, and a page position held in process memory would restart a
+	// successor at the UUID prefix. The lease elects the runner and carries
+	// the cursor it advances, so a handover resumes mid-population.
+	afterID, err := h.DB.ClaimSweepLease(ctx, db.ClaimSweepLeaseParams{
+		Name: trialEligibilitySweepName, LockedBy: sweepHolderID(),
+		LeaseSeconds: int32(trialEligibilityLeaseSeconds),
+	})
+	if err != nil {
+		// No row means another replica holds the lease: this tick is theirs.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			log.Error().Err(err).Msg("billing: claim trial eligibility sweep lease failed")
+			return
+		}
+		h.reconcileActiveIneligibleTeams(ctx)
+		return
+	}
 	teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{AfterTeamID: afterID, BatchLimit: billingTrialEligibilityPageSize})
 	if err != nil {
 		log.Error().Err(err).Msg("billing: list active trial teams failed")
 		return
 	}
+	// A short page is the end of the population, and so is an empty one: a
+	// full prior page may have ended exactly on the final row. Both restart
+	// the cursor so newly eligible teams are not hidden behind a stale one.
+	// Dispatch stops at the tick deadline, so the cursor may only advance as
+	// far as the page actually got: moving it to the last team of a page cut
+	// short would skip every team the pass never reached. Teams are dispatched
+	// in order, so the completed set is a prefix and its end is the resume
+	// point.
+	done := make([]atomic.Bool, len(teams))
+	dispatched := 0
 	if len(teams) > 0 {
-		dispatchBounded(ctx, teams, 10, func(teamID uuid.UUID) {
-			if err := h.DB.RefreshTeamTrialEligibility(ctx, teamID); err != nil {
-				log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")
-				return
+		sem := make(chan struct{}, 10)
+		var wg sync.WaitGroup
+	dispatch:
+		for i, teamID := range teams {
+			select {
+			case <-ctx.Done():
+				break dispatch
+			case sem <- struct{}{}:
 			}
-			h.pauseBillingIneligibleTeam(ctx, teamID)
-		})
-		h.trialEligibilityMu.Lock()
-		if len(teams) < int(billingTrialEligibilityPageSize) {
-			h.trialEligibilityAfter = uuid.Nil
-			h.trialEligibilityAfterValid = false
-		} else {
-			h.trialEligibilityAfter = teams[len(teams)-1]
-			h.trialEligibilityAfterValid = true
+			dispatched = i + 1
+			wg.Add(1)
+			go func(i int, teamID uuid.UUID) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := h.DB.RefreshTeamTrialEligibility(ctx, teamID); err != nil {
+					log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")
+					return
+				}
+				h.pauseBillingIneligibleTeam(ctx, teamID)
+				done[i].Store(true)
+			}(i, teamID)
 		}
-		h.trialEligibilityMu.Unlock()
-	} else {
-		// A full page on the prior tick may have ended exactly at the final
-		// row; restart the next sweep so newly eligible teams are not hidden
-		// behind a stale cursor.
-		h.trialEligibilityMu.Lock()
-		h.trialEligibilityAfter = uuid.Nil
-		h.trialEligibilityAfterValid = false
-		h.trialEligibilityMu.Unlock()
+		wg.Wait()
+	}
+	progress := 0
+	for progress < dispatched && done[progress].Load() {
+		progress++
+	}
+	switch {
+	case len(teams) == 0:
+		// End of the population, reached either because a full page stopped
+		// exactly on the final row or because the remainder disappeared between
+		// pages. Either way the cursor must clear, or it stays at the highest
+		// UUID and nothing is ever refreshed again.
+		h.advanceTrialEligibilityCursor(ctx, pgtype.UUID{})
+	case progress == 0:
+		// A page with work in it that finished none: leave the cursor where a
+		// later tick retries the same teams.
+	case progress == len(teams) && len(teams) < int(billingTrialEligibilityPageSize):
+		// End of the population; the next sweep starts over so teams that
+		// became eligible meanwhile are not hidden behind a stale cursor.
+		h.advanceTrialEligibilityCursor(ctx, pgtype.UUID{})
+	default:
+		h.advanceTrialEligibilityCursor(ctx, pgtype.UUID{Bytes: teams[progress-1], Valid: true})
 	}
 	h.reconcileActiveIneligibleTeams(ctx)
 }
@@ -206,4 +256,31 @@ func (h *Handlers) scheduleBillingEligibilityReconciliation(ctx context.Context,
 		}
 		h.pauseBillingIneligibleTeam(qctx, account.TeamID)
 	})
+}
+
+// sweepHolderID names this process in a sweep lease row, stable for its
+// lifetime so the holder's own renewal is recognised as a renewal. The pid
+// separates replicas sharing a hostname; the random suffix separates
+// processes within a test binary.
+var sweepHolderID = sync.OnceValue(func() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown-host"
+	}
+	return fmt.Sprintf("%s-%d-%08x", host, os.Getpid(), rand.Uint32())
+})
+
+// advanceTrialEligibilityCursor persists the resume point on its own budget.
+// The pass context carries the tick deadline and dispatch stops when it
+// expires, so writing progress through it would fail exactly when there is
+// progress worth keeping, and every later tick would restart at the same
+// position. The holder fence still applies.
+func (h *Handlers) advanceTrialEligibilityCursor(ctx context.Context, next pgtype.UUID) {
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := h.DB.AdvanceSweepCursor(saveCtx, db.AdvanceSweepCursorParams{
+		Name: trialEligibilitySweepName, LockedBy: sweepHolderID(), CursorID: next,
+	}); err != nil {
+		log.Error().Err(err).Msg("billing: advance trial eligibility cursor failed")
+	}
 }

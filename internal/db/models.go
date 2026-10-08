@@ -1311,6 +1311,14 @@ type StripeWebhookProcessingLease struct {
 	ExpiresAt  time.Time `json:"expires_at"`
 }
 
+type SweepLease struct {
+	Name        string      `json:"name"`
+	LockedBy    string      `json:"locked_by"`
+	LockedUntil time.Time   `json:"locked_until"`
+	CursorID    pgtype.UUID `json:"cursor_id"`
+	UpdatedAt   time.Time   `json:"updated_at"`
+}
+
 type Team struct {
 	ID                   uuid.UUID `json:"id"`
 	Name                 string    `json:"name"`
