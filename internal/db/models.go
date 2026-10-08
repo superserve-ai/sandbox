@@ -479,6 +479,11 @@ type BillingExportWork struct {
 	NextCorrectionAt  time.Time          `json:"next_correction_at"`
 }
 
+type BillingFinalizationAttempt struct {
+	TeamID        uuid.UUID `json:"team_id"`
+	LastAttemptAt time.Time `json:"last_attempt_at"`
+}
+
 type BillingIncrementalPeriod struct {
 	TeamID                 uuid.UUID          `json:"team_id"`
 	PeriodStart            time.Time          `json:"period_start"`
