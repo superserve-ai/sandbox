@@ -86,18 +86,23 @@ class RevisionTests(unittest.TestCase):
                                  {"GITHUB_EVENT_NAME": "push"}, {"RESUME_RUN_ID": "123"}):
                     with self.assertRaises(gate.GateError):
                         gate.verify_revision(dict(env, **override))
-            # A SQL change followed by an application-only commit still cannot
-            # use trusted main's migrations as proof for this branch.
-            (migrations / "20990102000000_branch.sql").write_text("SELECT 2;\n")
-            git("add", ".")
-            git("commit", "-qm", "branch schema")
-            (root / "app.txt").write_text("another application edit\n")
-            git("add", ".")
-            git("commit", "-qm", "application after schema")
-            tip = git("rev-parse", "HEAD")
-            with patch.object(gate, "api", return_value={"object": {"sha": main}}), \
-                    patch.object(gate.subprocess, "run", side_effect=command), self.assertRaises(gate.GateError):
-                gate.verify_revision(dict(env, GITHUB_SHA=tip, DEPLOYMENT_REVISION=tip))
+            # An inherited SQL or preparation-helper change cannot use main's
+            # migrations as proof, even after an application-only commit.
+            for path in (migrations / "20990102000000_branch.sql",
+                         root / "scripts/snapshot_reference_index.py"):
+                with self.subTest(path=path.relative_to(root)):
+                    git("reset", "--hard", branch)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("-- changed migration input\n")
+                    git("add", ".")
+                    git("commit", "-qm", "branch migration input")
+                    (root / "app.txt").write_text("another application edit\n")
+                    git("add", ".")
+                    git("commit", "-qm", "application after migration input")
+                    tip = git("rev-parse", "HEAD")
+                    with patch.object(gate, "api", return_value={"object": {"sha": main}}), \
+                            patch.object(gate.subprocess, "run", side_effect=command), self.assertRaises(gate.GateError):
+                        gate.verify_revision(dict(env, GITHUB_SHA=tip, DEPLOYMENT_REVISION=tip))
 
 
 def job_blocks(workflow):
