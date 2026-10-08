@@ -1518,3 +1518,24 @@ SELECT begin_stripe_checkout_with_publication_decision(
 -- name: StripeCheckoutPublicationFailed :one
 SELECT stripe_checkout_publication_failed(sqlc.arg(team_id)::uuid,
     sqlc.arg(generation)::timestamptz, sqlc.arg(user_id)::uuid)::boolean AS publication_failed;
+
+-- name: ClaimSweepLease :one
+-- One statement decides election and hands back the shared page position.
+-- The WHERE admits only an expired lease or the current holder, and the
+-- verdict is whether a row came back, so two contenders cannot both win.
+INSERT INTO sweep_lease (name, locked_by, locked_until)
+VALUES (sqlc.arg(name), sqlc.arg(locked_by), now() + make_interval(secs => sqlc.arg(lease_seconds)::int))
+ON CONFLICT (name) DO UPDATE
+SET locked_by = EXCLUDED.locked_by,
+    locked_until = EXCLUDED.locked_until,
+    updated_at = now()
+WHERE sweep_lease.locked_until <= now()
+   OR sweep_lease.locked_by = EXCLUDED.locked_by
+RETURNING cursor_id;
+
+-- name: AdvanceSweepCursor :exec
+-- Guarded by holder: a replica whose lease lapsed mid-page must not move
+-- the cursor its successor is already working from.
+UPDATE sweep_lease
+SET cursor_id = sqlc.narg(cursor_id), updated_at = now()
+WHERE name = sqlc.arg(name) AND locked_by = sqlc.arg(locked_by);

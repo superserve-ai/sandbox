@@ -20,7 +20,8 @@ func (r *captureRecorder) RecordVMDCall(_ context.Context, call VMDCall) {
 	r.vmdCalls = append(r.vmdCalls, call)
 }
 
-func (r *captureRecorder) RecordHostCapacity(context.Context, HostCapacity) {}
+func (r *captureRecorder) RecordHostCapacity(context.Context, HostCapacity)   {}
+func (r *captureRecorder) RecordHostConntrack(context.Context, HostConntrack) {}
 
 func (r *captureRecorder) RecordBackupCoverage(context.Context, []BackupCoverage) {}
 

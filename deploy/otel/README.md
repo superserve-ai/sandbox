@@ -172,3 +172,42 @@ Phase 2 does not enable production OTEL export yet. Before that rollout:
 3. Verify dashboard queries against staging for at least one sustained deployment window.
 4. Confirm collector failure metrics stay quiet under normal traffic.
 5. Re-run the banned-label validation queries in the production metrics scope.
+
+## VMD egress capacity
+
+The egress proxy uses VMD's existing OTLP provider. See
+[egress capacity rollout](../egress-capacity.md) for configuration and validation.
+Metrics include `host_id`, `service.name`, and `environment` with the existing
+process identity resource. No sandbox, team, hostname or destination labels are
+added. Disabling telemetry never disables connection admission.
+
+| Metric | Meaning |
+| --- | --- |
+| `egress_connections_active` | Admitted connections still undergoing inspection, dialing, or relay/cleanup; up/down sum. |
+| `egress_connection_limit` | Configured finite host limit, also emitted in observation mode. |
+| `egress_enforced` | 1 when the host cap is active, otherwise 0. |
+| `egress_rejections_total` | Counter by `reason`: `host`, `sandbox`, `accept_error`, `other`. Accept errors are failed accepts, not an exact client count. |
+| `egress_duration_seconds` | Histogram by `stage` (`dns`, `dial`) and `result` (`success`, `error`, `timeout`). Dial duration includes DNS; DNS observes the actual lookup, without a second query. Literal-IP dials have no DNS sample. |
+| `egress_resource_value` | Last available background sample by `resource`. |
+| `egress_resource_available` | 1/0 validity of the current resource sample. Always join this with the resource value. |
+
+Resources sampled every 15 seconds: `process_fds`, `process_fd_limit`,
+`conntrack_count`, `conntrack_max`, `ephemeral_port_range`, `tcp_inuse`, and
+`tcp_time_wait`. FD values are process scoped; conntrack/socket/port values are
+for VMD's network namespace. The port range is the configured range size, not
+available ports. TCP in-use/TIME_WAIT counts are pressure proxies; they cannot
+be divided by the port range to derive an exact utilization percentage. No
+full connection/conntrack table is scanned. Missing/unreadable counters have
+availability 0, not a healthy zero value; ignore any retained prior sample.
+
+In existing Prometheus observability, scope queries to a host and environment:
+
+- `rate(egress_rejections_total{reason="host"}[5m])` shows host admission pressure.
+- `egress_connections_active / egress_connection_limit` shows admitted load versus
+  the configured cap; interpret it alongside `egress_enforced`.
+- Compare `egress_resource_value{resource="process_fds"}` with its process limit,
+  and conntrack count with conntrack max, only where their matching
+  `egress_resource_available` series equals 1.
+- Use `histogram_quantile` over `egress_duration_seconds_bucket` by stage/result
+  to distinguish DNS/dial latency and timeouts. Connection failures can also be
+  policy rejections; do not infer upstream unavailability from the error count alone.
