@@ -207,7 +207,7 @@ func run() error {
 	}
 	var routingReady func() bool
 	router := proxy.NewRoutingHandler(domains, localHostID, ownership, peers, proxyHandler, log, routingRecorder)
-	if dbPool != nil {
+	if dbPool != nil && routingEnabled == "1" {
 		directory := &proxy.HostDirectory{}
 		backgroundConfig := dbPool.Config()
 		backgroundConfig.MaxConns = 1
@@ -224,14 +224,17 @@ func run() error {
 		routingReady = routingBootstrapGate(func() bool { return directory.Ready() && revocations.Ready() }, time.Second)
 	}
 	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
-	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
-	if dbPool != nil {
-		mux = newProxyMuxWithReadiness(proxyHandler, withRoutingBootstrap(router, routingReady), func(ctx context.Context) bool {
+	var routingDataPlane http.Handler = router
+	var routingDependencies func(context.Context) bool
+	if dbPool != nil && routingEnabled == "1" {
+		routingDataPlane = withRoutingBootstrap(router, routingReady)
+		routingDependencies = func(ctx context.Context) bool {
 			ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			defer cancel()
 			return routingReady() && dbPool.Ping(ctx) == nil
-		})
+		}
 	}
+	mux, localMux := newDataPlaneMuxesWithReadiness(proxyHandler, routingDataPlane, routingEnabled == "1", routingDependencies)
 	var localSrv *http.Server
 	var localConnections *proxy.DrainConnections
 	var localErr <-chan error
@@ -497,10 +500,16 @@ func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
 }
 
 func newDataPlaneMuxes(local *proxy.Handler, router http.Handler, routingEnabled bool) (publicMux, localMux *http.ServeMux) {
+	return newDataPlaneMuxesWithReadiness(local, router, routingEnabled, nil)
+}
+
+func newDataPlaneMuxesWithReadiness(local *proxy.Handler, router http.Handler, routingEnabled bool, routingDependencies func(context.Context) bool) (publicMux, localMux *http.ServeMux) {
+	// A database may be configured solely for machine identity. Its presence
+	// must not enable peer routing or routing-only health dependencies.
 	if !routingEnabled {
 		return newProxyMux(local), newProxyMux(local)
 	}
-	return newProxyMuxWithHandler(local, router), newProxyMux(local)
+	return newProxyMuxWithReadiness(local, router, routingDependencies), newProxyMux(local)
 }
 
 func newProxyMuxWithHandler(proxyHandler *proxy.Handler, dataPlane http.Handler) *http.ServeMux {

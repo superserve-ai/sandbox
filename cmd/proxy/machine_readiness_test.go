@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -42,5 +43,25 @@ func TestMachineReadinessProbeRejectsLegacyOnlyPeerDisabledProxy(t *testing.T) {
 	public.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://localhost/health", nil))
 	if response.Code != http.StatusOK {
 		t.Fatal("machine prerequisite changed legacy health response")
+	}
+}
+
+func TestMachineDatabaseReadinessDoesNotEnablePeerRouting(t *testing.T) {
+	resolver := &listenerResolver{}
+	local := proxy.NewHandler([]string{"sandbox.test"}, resolver, zerolog.Nop())
+	peerCalls, databaseReadinessCalls := 0, 0
+	router := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { peerCalls++; w.WriteHeader(http.StatusBadGateway) })
+	databaseReady := func(context.Context) bool { databaseReadinessCalls++; return false }
+	public, private := newDataPlaneMuxesWithReadiness(local, router, false, databaseReady)
+	for _, listener := range []http.Handler{public, private} {
+		response := httptest.NewRecorder()
+		listener.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://8080-12345678-1234-1234-1234-123456789abc.sandbox.test/", nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("local request routed incorrectly: %d", response.Code)
+		}
+		listener.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://localhost/health", nil))
+	}
+	if resolver.calls != 2 || peerCalls != 0 || databaseReadinessCalls != 0 {
+		t.Fatalf("lookups: local=%d peer=%d routing DB=%d", resolver.calls, peerCalls, databaseReadinessCalls)
 	}
 }
