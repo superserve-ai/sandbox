@@ -29,33 +29,39 @@ const gceMetadataZoneURL = "http://metadata.google.internal/computeMetadata/v1/i
 var gceMirrorRegions = []string{"us-east4", "us-west2", "us-west1", "us-central1", "europe-west1"}
 
 // selectAptMirror picks the Ubuntu mirror build VMs fetch packages from: the
-// configured override, else the first Google mirror (own region first) that
-// passes the transfer probe, else Canonical's cloud mirror. Canonical's
-// public mirrors are partially unreachable often enough that a build pulling
-// from them can run past its step deadline.
+// configured override, else the host's own Google regional mirror when it
+// passes the transfer probe, else the first other Google region that does,
+// else Canonical's cloud mirror. Canonical's public mirrors are partially
+// unreachable often enough that a build pulling from them can run past its
+// step deadline. The selection is synchronous on the build path, so its
+// duration and outcome are logged.
 func selectAptMirror(ctx context.Context, override string, logger *zerolog.Logger) string {
-	return chooseAptMirror(ctx, override, gceMetadataZoneURL, mirrorTransfers, mirrorSelectDeadline, logger)
+	start := time.Now()
+	host, outcome := chooseAptMirror(ctx, override, gceMetadataZoneURL, mirrorTransfers, mirrorSelectDeadline)
+	if logger != nil {
+		logger.Info().Str("mirror", host).Str("outcome", outcome).Dur("duration", time.Since(start)).Msg("apt mirror selected")
+	}
+	return host
 }
 
 // mirrorSelectDeadline bounds the whole selection: the own region's probe,
 // then, only if that fails, the other regions probed together.
 const mirrorSelectDeadline = 25 * time.Second
 
-func chooseAptMirror(ctx context.Context, override, metadataURL string, transfers func(context.Context, string) bool, deadline time.Duration, logger *zerolog.Logger) string {
+// chooseAptMirror returns the mirror host and how it was chosen: override,
+// off_gce, own_region, other_region or fallback.
+func chooseAptMirror(ctx context.Context, override, metadataURL string, transfers func(context.Context, string) bool, deadline time.Duration) (string, string) {
 	if override != "" {
-		return override
+		return override, "override"
 	}
 	region := gceRegion(ctx, metadataURL)
 	if region == "" {
-		if logger != nil {
-			logger.Info().Str("mirror", fallbackAptMirror).Msg("not on GCE; using the fallback apt mirror")
-		}
-		return fallbackAptMirror
+		return fallbackAptMirror, "off_gce"
 	}
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 	if own := region + ".gce.archive.ubuntu.com"; transfers(ctx, own) {
-		return own
+		return own, "own_region"
 	}
 	// The healthy case costs one probe; only a failing region fans out.
 	var others []string
@@ -71,16 +77,10 @@ func chooseAptMirror(ctx context.Context, override, metadataURL string, transfer
 	}
 	for i, host := range others {
 		if <-results[i] {
-			if logger != nil {
-				logger.Warn().Str("mirror", host).Str("region", region).Msg("own region's apt mirror failed the transfer probe; using another region's")
-			}
-			return host
+			return host, "other_region"
 		}
 	}
-	if logger != nil {
-		logger.Warn().Str("fallback", fallbackAptMirror).Msg("no Google apt mirror passed the transfer probe; using the fallback")
-	}
-	return fallbackAptMirror
+	return fallbackAptMirror, "fallback"
 }
 
 // gceRegion returns the region of the GCE instance the builder runs on
