@@ -193,7 +193,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = @team_id
   AND s.destroyed_at IS NULL
   AND s.metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR s.status = ANY(sqlc.narg('statuses')::sandbox_status[]))
   AND (sqlc.narg('name_search')::text IS NULL
        OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY s.created_at DESC
@@ -208,7 +208,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = @team_id
   AND s.destroyed_at IS NULL
   AND s.metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR s.status = ANY(sqlc.narg('statuses')::sandbox_status[]))
   AND (sqlc.narg('name_search')::text IS NULL
        OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY s.created_at ASC
@@ -222,7 +222,7 @@ OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 -- which the planner can satisfy from an index.
 --
 -- Filters (all optional, AND'd): metadata containment (@> — pass '{}'::jsonb
--- to match everything), status equality, and a case-insensitive name
+-- to match everything), status membership, and a case-insensitive name
 -- substring. Sort column/direction come from @sort_by + @sort_dir: exactly one
 -- guarded CASE term is active per query (the sort params are constant across
 -- rows, so every other term evaluates to NULL for all rows and acts as a
@@ -236,7 +236,7 @@ LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
 WHERE s.team_id = @team_id
   AND s.destroyed_at IS NULL
   AND s.metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR s.status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR s.status = ANY(sqlc.narg('statuses')::sandbox_status[]))
   AND (sqlc.narg('name_search')::text IS NULL
        OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
 ORDER BY
@@ -256,7 +256,7 @@ SELECT COUNT(*) FROM sandbox
 WHERE team_id = @team_id
   AND destroyed_at IS NULL
   AND metadata @> @metadata
-  AND (sqlc.narg('status')::text IS NULL OR status::text = sqlc.narg('status')::text)
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR status = ANY(sqlc.narg('statuses')::sandbox_status[]))
   AND (sqlc.narg('name_search')::text IS NULL
        OR name ILIKE '%' || sqlc.narg('name_search')::text || '%');
 
@@ -1286,6 +1286,27 @@ SET timeout_seconds = sqlc.narg(timeout_seconds),
     updated_at = now()
 WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL AND status <> 'migrating';
 
+-- name: LockAutoDeleteDue :many
+-- Step one of the auto-delete claim: take the rows, and report the hosts whose
+-- lifetime fence the claim will touch. Separate from the claim so the caller
+-- can take those fences in a fixed order; see FenceRetainedStorageHost.
+SELECT s.id, s.host_id
+FROM sandbox s
+WHERE s.destroyed_at IS NULL
+  AND s.status = 'paused'
+  AND s.auto_delete_at IS NOT NULL
+  AND s.auto_delete_at < now()
+ORDER BY s.auto_delete_at ASC
+LIMIT sqlc.arg(batch_size)
+FOR UPDATE OF s SKIP LOCKED;
+
+-- name: FenceRetainedStorageHost :exec
+-- Step two: the lifetime fence a sandbox update takes once per row, taken up
+-- front instead. Callers acquire these in a fixed order, so no two claims can
+-- hold one another's next fence. Re-entrant, so the row trigger's own
+-- acquisition during the claim costs nothing.
+SELECT pg_advisory_xact_lock(hashtextextended('retained-storage-owner:' || sqlc.arg(host_id)::text, 0));
+
 -- name: ClaimAutoDeleteSandboxes :many
 -- Atomically soft-deletes paused sandboxes whose auto-delete deadline has
 -- passed. Deliberately narrower than DestroySandbox: it claims from 'paused'
@@ -1299,15 +1320,7 @@ WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL AND statu
 -- after the claim can't strand a deleted sandbox with a live JWT or an open
 -- interval. Returns the columns the caller needs for VM/artifact teardown.
 WITH due AS (
-  SELECT s.id
-  FROM sandbox s
-  WHERE s.destroyed_at IS NULL
-    AND s.status = 'paused'
-    AND s.auto_delete_at IS NOT NULL
-    AND s.auto_delete_at < now()
-  ORDER BY s.auto_delete_at ASC
-  LIMIT sqlc.arg(batch_size)
-  FOR UPDATE OF s SKIP LOCKED
+  SELECT unnest(sqlc.arg(sandbox_ids)::uuid[]) AS id
 ),
 destroyed AS (
   UPDATE sandbox

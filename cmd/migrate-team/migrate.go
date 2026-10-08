@@ -1065,6 +1065,9 @@ func roleIDsByName(ctx context.Context, pool querier) (map[string]string, error)
 var validationExemptTables = map[string]bool{
 	"sandbox_revocation":  true,
 	"revoked_proxy_token": true,
+	// Both cells can record attempts while billing rows are copied. This is
+	// scheduling metadata, merged monotonically, not accounting authority.
+	"billing_finalization_attempt": true,
 }
 
 var checksumExemptTables = map[string]bool{
@@ -1128,6 +1131,10 @@ var conflictTargets = map[string]string{
 }
 
 func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (string, error) {
+	if table == "billing_finalization_attempt" {
+		return `ON CONFLICT (team_id) DO UPDATE SET last_attempt_at =
+GREATEST(billing_finalization_attempt.last_attempt_at, EXCLUDED.last_attempt_at)`, nil
+	}
 	if insertOnlyTables[table] {
 		return "ON CONFLICT DO NOTHING", nil
 	}
@@ -1881,6 +1888,7 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	for _, name := range []string{
 		"activity", "sandbox_revocation", "revoked_proxy_token",
 		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+		"billing_finalization_attempt",
 	} {
 		spec, ok := tableByName(name)
 		if !ok {
@@ -2121,6 +2129,7 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		for _, name := range []string{
 			"activity", "sandbox_revocation", "revoked_proxy_token",
 			"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+			"billing_finalization_attempt",
 		} {
 			spec, ok := tableByName(name)
 			if !ok {

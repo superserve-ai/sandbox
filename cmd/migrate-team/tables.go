@@ -131,6 +131,7 @@ var migratedTables = []tableSpec{
 	{"team_billing_period", "team_id = $1"},
 	{"team_billing_usage", "team_id = $1"},
 	{"team_billing_usage_hourly", "team_id = $1"},
+	{"billing_finalization_attempt", "team_id = $1"},
 	{"billing_period_anomaly", "team_id = $1"},
 	{"billing_rollup_job", "team_id = $1"},
 	{"billing_rollup_team_backfill_state", "team_id = $1"},

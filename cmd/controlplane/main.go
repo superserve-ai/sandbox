@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/abuse"
@@ -50,6 +51,10 @@ import (
 // startup gate that answers Unavailable until the daemon is serving —
 // with margin.
 const retryUnavailableWindow = 15 * time.Second
+
+// vmdKeepalive pings each vmd connection so one the network has silently
+// dropped is replaced within seconds rather than on the next RPC's deadline.
+var vmdKeepalive = keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 10 * time.Second, PermitWithoutStream: true}
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -137,6 +142,10 @@ func run() error {
 	// uses unnamed prepared statements (which don't persist) while still using
 	// the extended protocol for typed/binary parameter encoding.
 	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		dbq.RegisterEnumArrays(conn.TypeMap())
+		return nil
+	}
 	if v := os.Getenv("DB_MAX_CONNS"); v != "" {
 		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
 			poolCfg.MaxConns = int32(n)
@@ -185,6 +194,7 @@ func run() error {
 	// Connect to VMD via gRPC.
 	grpcConn, err := grpc.NewClient(cfg.VMDAddress,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(vmdKeepalive),
 		grpc.WithUnaryInterceptor(retryUnavailableUnaryInterceptor(retryUnavailableWindow)),
 	)
 	if err != nil {
@@ -250,6 +260,7 @@ func run() error {
 		// deadHost is chained outside retry, so it sees the post-retry outcome only.
 		conn, err := grpc.NewClient(addr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithKeepaliveParams(vmdKeepalive),
 			grpc.WithChainUnaryInterceptor(
 				deadHostUnaryInterceptor(onDead),
 				retryUnavailableUnaryInterceptor(retryUnavailableWindow),

@@ -115,6 +115,367 @@ class ProvisionPlanTests(unittest.TestCase):
                 provision.validate_plan(self.identity_plan(region), 'sandbox_host_b',
                                         'opaque-image', 'replace', region)
 
+    def host_logging_plan(self, region='us-central1', host='sandbox_host_b'):
+        plan = fixture(region=region, host=host)
+        plan['resource_changes'].append(dict(
+            address='module.host_logging.google_os_config_os_policy_assignment.host_logging',
+            change=dict(actions=['update'], before={'name': 'host-logging'},
+                        after={'name': 'host-logging'})))
+        plan['configuration'] = {'root_module': {'module_calls': {
+            'host_logging': {'expressions': {
+                'enrolled_hosts': {'references': [f'module.{host}.instance_id']}
+            }}}}}
+        return plan
+
+    def test_replacement_allows_selected_host_logging_dependencies(self):
+        provision.validate_plan(self.host_logging_plan(), 'sandbox_host_b',
+                                'opaque-image', 'replace', 'us-central1')
+
+    def host_logging_alert_plan(self, resource, host='sandbox_host_c', region='us-east4', unresolved=False):
+        plan = fixture(region=region, host=host)
+        plan['resource_changes'][0]['change']['before'] = {'instance_id': '123456'}
+        old = 'resource.labels.instance_id="123456"'
+        if resource.startswith('google_logging_metric.'):
+            path = ('filter',)
+            before = {'filter': f'resource.type="gce_instance" AND {old}'}
+            after = {}
+            unknown = {'filter': True}
+        elif resource.endswith('host_logging_export_failures'):
+            path = ('conditions', 0, 'condition_matched_log', 0, 'filter')
+            before = {'conditions': [{'condition_matched_log': [{'filter': old}]}]}
+            after = {'conditions': [{'condition_matched_log': [{}]}]}
+            unknown = {'conditions': [{'condition_matched_log': [{'filter': True}]}]}
+        elif resource.endswith('host_logging_lag'):
+            path = ('conditions', 0, 'condition_prometheus_query_language', 0, 'query')
+            before = {'conditions': [{'condition_prometheus_query_language': [{'query': old}]}]}
+            after = {'conditions': [{'condition_prometheus_query_language': [{}]}]}
+            unknown = {'conditions': [{'condition_prometheus_query_language': [{'query': True}]}]}
+        else:
+            path = ('conditions', 0, 'condition_prometheus_query_language', 0, 'query')
+            before = {'conditions': [{'condition_prometheus_query_language': [{'query': old}]}]}
+            after = {'conditions': [{'condition_prometheus_query_language': [{}]}]}
+            unknown = {'conditions': [{'condition_prometheus_query_language': [{'query': True}]}]}
+        if not unresolved:
+            plan['resource_changes'][0]['change']['after']['instance_id'] = '789012'
+            after = copy.deepcopy(before)
+            cursor = after
+            for key in path[:-1]:
+                cursor = cursor[key]
+            cursor[path[-1]] = cursor[path[-1]].replace('123456', '789012')
+            unknown = {}
+        plan['resource_changes'].append(dict(
+            address=f'module.observability.{resource}["{host}"]',
+            change=dict(actions=['update'], before=before, after=after,
+                        after_unknown=unknown)))
+        plan['configuration'] = {'root_module': {'module_calls': {
+            'observability': {'expressions': {
+                'host_logging_alerts': {'references': [f'module.{host}.instance_id']}
+            }}}}}
+        return plan, path
+
+    def test_replacement_allows_selected_host_logging_alerts(self):
+        for resource in sorted(provision.HOST_LOGGING_ALERT_RESOURCES):
+            with self.subTest(resource=resource):
+                plan, _ = self.host_logging_alert_plan(resource)
+                provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_create_recovery_allows_selected_host_logging_alert_identity(self):
+        for resource in sorted(provision.HOST_LOGGING_ALERT_RESOURCES):
+            with self.subTest(resource=resource):
+                plan, _ = self.host_logging_alert_plan(resource)
+                plan['resource_changes'][0]['change'].update(actions=['create'], before=None)
+                provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'create', 'us-east4')
+
+    def test_unresolved_logging_alerts_fail_closed_for_create_and_replace(self):
+        for resource in sorted(provision.HOST_LOGGING_ALERT_RESOURCES):
+            for operation in ('create', 'replace'):
+                with self.subTest(resource=resource, operation=operation):
+                    plan, _ = self.host_logging_alert_plan(resource, unresolved=True)
+                    if operation == 'create':
+                        plan['resource_changes'][0]['change'].update(actions=['create'], before=None)
+                    with self.assertRaisesRegex(ValueError, 'identity-only change cannot be verified'):
+                        provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', operation, 'us-east4')
+
+    def test_terraform_replacement_hides_functional_alert_changes(self):
+        # Generated by scripts/fixtures/generate_host_logging_unknown_alert.py
+        # with Terraform's built-in provider; no cloud credentials or resources.
+        cases = json.loads((ROOT / 'scripts/fixtures/host_logging_unknown_alert.json').read_text())['cases']
+        self.assertIn('[5m]', cases['window_change']['known']['query']['before'])
+        self.assertIn('[60m]', cases['window_change']['known']['query']['after'])
+        self.assertIn('heartbeat="false"', cases['predicate_change']['known']['filter']['after'])
+        for case_name, case in cases.items():
+            for resource in sorted(provision.HOST_LOGGING_ALERT_RESOURCES):
+                with self.subTest(case=case_name, resource=resource):
+                    plan, path = self.host_logging_alert_plan(resource, unresolved=True)
+                    field = path[-1]
+                    output = case['replacement'][field]
+                    # A functional change and an unchanged template are
+                    # indistinguishable at the unknown rendered string.
+                    self.assertEqual(output, cases['identity_only']['replacement'][field])
+                    self.assertIs(output['after_unknown'], True)
+                    change = plan['resource_changes'][-1]['change']
+                    for section, value in (('before', output['before']),
+                                           ('after', output.get('after')),
+                                           ('after_unknown', output['after_unknown'])):
+                        cursor = change[section]
+                        for key in path[:-1]:
+                            cursor = cursor[key]
+                        cursor[field] = value
+                    with self.assertRaisesRegex(ValueError, 'identity-only change cannot be verified'):
+                        provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_logging_alert_exception_remains_identity_only(self):
+        for resource in sorted(provision.HOST_LOGGING_ALERT_RESOURCES):
+            with self.subTest(resource=resource):
+                plan, path = self.host_logging_alert_plan(resource)
+                item = plan['resource_changes'][-1]
+                item['change']['actions'] = ['delete', 'create']
+                with self.assertRaises(ValueError):
+                    provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+                plan, _ = self.host_logging_alert_plan(resource)
+                plan['resource_changes'][-1]['address'] = plan['resource_changes'][-1]['address'].replace(
+                    '["sandbox_host_c"]', '["sandbox_host_b"]')
+                with self.assertRaises(ValueError):
+                    provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+                plan, path = self.host_logging_alert_plan(resource)
+                item = plan['resource_changes'][-1]
+                cursor = item['change']['after']
+                for key in path[:-1]:
+                    cursor = cursor[key]
+                # Resolve the unknown identity to an unrelated known value.
+                cursor[path[-1]] = 'resource.labels.instance_id="654321"'
+                item['change']['after_unknown'] = {}
+                with self.assertRaises(ValueError):
+                    provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_logging_alert_rejects_routing_duration_and_query_mutations(self):
+        # Notification routing is functional policy, even when the identity
+        # filter is the only expected replacement change.
+        plan, _ = self.host_logging_alert_plan(
+            'google_monitoring_alert_policy.host_logging_export_failures')
+        item = plan['resource_changes'][-1]
+        item['change']['before']['notification_channels'] = ['channel-a']
+        item['change']['after']['notification_channels'] = ['channel-b']
+        with self.assertRaises(ValueError):
+            provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+        # The lag condition is PromQL. Its duration and query body remain
+        # functional controls and cannot be changed by host provisioning.
+        plan, path = self.host_logging_alert_plan(
+            'google_monitoring_alert_policy.host_logging_lag')
+        item = plan['resource_changes'][-1]
+        before_parent = item['change']['before']
+        after_parent = item['change']['after']
+        for key in path[:-1]:
+            before_parent = before_parent[key]
+            after_parent = after_parent[key]
+        before_parent['duration'] = '300s'
+        after_parent['duration'] = '600s'
+        with self.assertRaises(ValueError):
+            provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+        plan, path = self.host_logging_alert_plan(
+            'google_monitoring_alert_policy.host_logging_lag')
+        item = plan['resource_changes'][-1]
+        plan['resource_changes'][0]['change']['after']['instance_id'] = '789012'
+        query_parent = item['change']['after']
+        for key in path[:-1]:
+            query_parent = query_parent[key]
+        query_parent[path[-1]] = '"collector_host_id" = "123456" AND vector(1)'
+        item['change']['after_unknown'] = {}
+        with self.assertRaises(ValueError):
+            provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def migration_replacement_plan(self):
+        plan = self.host_logging_plan('us-east4', 'sandbox_host_c')
+        plan['resource_changes'][0]['change']['before'] = {'instance_id': '123456'}
+        old = '123456'
+        target_before = {
+            'baseline': None, 'deadline': None, 'drained_instance_ids': [],
+            'initialize_instance_ids': [], 'instance_ids': [old],
+            'legacy_policy_name': 'legacy-policy', 'phase': 'preserve',
+            'retired': '{}', 'verified_instance_ids': [],
+        }
+        target_after = copy.deepcopy(target_before)
+        target_after['instance_ids'] = [None]
+        migration = dict(
+            address='module.host_logging.terraform_data.legacy_migration[0]',
+            change=dict(actions=['update'], before={'input': target_before},
+                        after={'input': target_after},
+                        after_unknown={'input': {'instance_ids': [True]}}))
+        artifact_before = json.dumps(target_before, sort_keys=True)
+        artifact = dict(
+            address='module.host_logging.google_storage_bucket_object.legacy_migration_target[0]',
+            change=dict(actions=['update'], before={'content': artifact_before},
+                        after={'content': None}, after_unknown={'content': True}))
+        plan['resource_changes'].extend([migration, artifact])
+        return plan
+
+    def test_unresolved_east_migration_target_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, 'migration target.*cannot be verified'):
+            provision.validate_plan(self.migration_replacement_plan(), 'sandbox_host_c',
+                                    'opaque-image', 'replace', 'us-east4')
+
+    def known_migration_replacement_plan(self):
+        plan = self.migration_replacement_plan()
+        new = '789012'
+        plan['resource_changes'][0]['change']['after']['instance_id'] = new
+        migration = plan['resource_changes'][-2]['change']
+        migration['after']['input']['instance_ids'] = [new]
+        migration['after_unknown']['input']['instance_ids'] = [False]
+        artifact = plan['resource_changes'][-1]['change']
+        before = json.loads(artifact['before']['content'])
+        before['instance_ids'] = [new]
+        artifact['after'] = {'content': json.dumps(before, sort_keys=True)}
+        artifact['after_unknown'] = {}
+        return plan
+
+    def test_east_migration_target_allows_known_selected_identity_substitution(self):
+        plan = self.known_migration_replacement_plan()
+        artifact = plan['resource_changes'][-1]['change']
+        artifact['before'].update(bucket='original-bucket', name='migration.json',
+                                  generation=1, crc32c='old-crc', md5hash='old-hash')
+        artifact['after'].update(bucket='original-bucket', name='migration.json')
+        artifact['after_unknown'].update(generation=True, crc32c=True, md5hash=True)
+        provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_terraform_replacement_hides_migration_artifact_changes(self):
+        cases = json.loads((ROOT / 'scripts/fixtures/host_logging_unknown_migration.json').read_text())['cases']
+        for name, case in cases.items():
+            with self.subTest(case=name):
+                if name != 'identity_only':
+                    self.assertNotEqual(case['known']['artifact']['before'], case['known']['artifact']['after'])
+                output = case['replacement']['artifact']
+                self.assertEqual(output, cases['identity_only']['replacement']['artifact'])
+                self.assertIs(output['after_unknown'], True)
+                plan = self.migration_replacement_plan()
+                migration = case['replacement']['migration']
+                self.assertEqual(migration['after']['input']['phase'], 'preserve')
+                plan['resource_changes'][-2]['change'] = migration
+                artifact = plan['resource_changes'][-1]['change']
+                artifact.update(before={'content': output['before']},
+                                after={'content': output.get('after')},
+                                after_unknown={'content': output['after_unknown']})
+                with self.assertRaisesRegex(ValueError, 'migration target.*cannot be verified'):
+                    provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_east_migration_artifact_fields_cannot_change(self):
+        for field in ('bucket', 'name', 'source', 'content_type', 'kms_key_name',
+                      'metadata', 'cache_control', 'detect_md5hash', 'temporary_hold',
+                      'storage_class'):
+            for unresolved in (False, True):
+                with self.subTest(field=field, unresolved=unresolved):
+                    plan = self.known_migration_replacement_plan()
+                    artifact = plan['resource_changes'][-1]['change']
+                    old, new = ('original', 'changed') if field != 'metadata' else ({'id': 'original'}, {'id': 'changed'})
+                    artifact['before'][field] = old
+                    artifact['after'][field] = None if unresolved else new
+                    if unresolved:
+                        artifact['after_unknown'][field] = True
+                    with self.assertRaisesRegex(ValueError, 'migration artifact field'):
+                        provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_known_migration_artifact_cannot_change_controls(self):
+        for field, value in [('phase', 'overlap'), ('baseline', 'logging: {}'),
+                             ('deadline', '2099-01-01T00:00:00Z')]:
+            with self.subTest(field=field):
+                plan = self.known_migration_replacement_plan()
+                artifact = plan['resource_changes'][-1]['change']
+                content = json.loads(artifact['after']['content'])
+                content[field] = value
+                artifact['after']['content'] = json.dumps(content)
+                with self.assertRaises(ValueError):
+                    provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_east_migration_replacement_cannot_activate_or_change_controls(self):
+        for mutation in ('phase', 'baseline', 'create'):
+            with self.subTest(mutation=mutation):
+                plan = self.known_migration_replacement_plan()
+                item = plan['resource_changes'][-2]
+                if mutation == 'phase':
+                    item['change']['after']['input']['phase'] = 'overlap'
+                elif mutation == 'baseline':
+                    item['change']['after']['input']['baseline'] = 'unreviewed'
+                else:
+                    item['change']['actions'] = ['create']
+                    item['change']['before'] = None
+                with self.assertRaises(ValueError):
+                    provision.validate_plan(plan, 'sandbox_host_c', 'opaque-image', 'replace', 'us-east4')
+
+    def test_create_allows_selected_host_logging_dependencies(self):
+        """A recovered create may update only the selected host's policy inputs."""
+        plan = self.host_logging_plan()
+        vm_change = plan['resource_changes'][0]['change']
+        vm_change.update(actions=['create'], before=None)
+        provision.validate_plan(plan, 'sandbox_host_b', 'opaque-image', 'create', 'us-central1')
+
+        # The VM being created is the sole identity authority.  A dependency
+        # that claims an unrelated module must still be rejected even though
+        # the new provider ID is unknown during planning.
+        invalid = copy.deepcopy(plan)
+        invalid['configuration']['root_module']['module_calls']['host_logging']['expressions'][
+            'enrolled_hosts']['references'] = ['module.sandbox_host.instance_id']
+        with self.assertRaisesRegex(ValueError, 'selected VM identity'):
+            provision.validate_plan(invalid, 'sandbox_host_b', 'opaque-image', 'create', 'us-central1')
+
+        unknown = copy.deepcopy(plan)
+        unknown['resource_changes'][-1]['change']['after_unknown'] = {'policy': True}
+        with self.assertRaisesRegex(ValueError, 'Unexpected unknown host logging field'):
+            provision.validate_plan(unknown, 'sandbox_host_b', 'opaque-image', 'create', 'us-central1')
+
+    def test_create_rejects_host_logging_policy_and_iam_mutations(self):
+        for address in (
+                'module.host_logging.google_os_config_os_policy_assignment.host_logging',
+                'module.host_logging.google_project_iam_member.log_writer'):
+            with self.subTest(address=address):
+                plan = self.host_logging_plan()
+                plan['resource_changes'][0]['change'].update(actions=['create'], before=None)
+                item = plan['resource_changes'][-1]
+                item['address'] = address
+                item['change'].update(actions=['create'], before=None)
+                with self.assertRaisesRegex(ValueError, 'creation or replacement'):
+                    provision.validate_plan(plan, 'sandbox_host_b', 'opaque-image',
+                                            'create', 'us-central1')
+
+    def test_replacement_rejects_unknown_host_logging_content(self):
+        plan = self.host_logging_plan()
+        item = plan['resource_changes'][-1]
+        item['change']['before'] = {'content': 'instance_id=123456'}
+        item['change']['after'] = {'content': None}
+        item['change']['after_unknown'] = {'content': True}
+        with self.assertRaisesRegex(ValueError, 'unknown host logging field'):
+            provision.validate_plan(plan, 'sandbox_host_b', 'opaque-image',
+                                    'replace', 'us-central1')
+
+    def test_host_logging_dependency_remains_narrowly_bound(self):
+        for mutation in ('wrong_reference', 'wrong_resource', 'destructive',
+                         'policy', 'selector', 'iam'):
+            with self.subTest(mutation=mutation):
+                plan = self.host_logging_plan()
+                item = plan['resource_changes'][-1]
+                if mutation == 'wrong_reference':
+                    item_config = plan['configuration']['root_module']['module_calls']['host_logging']
+                    item_config['expressions']['enrolled_hosts']['references'] = ['module.other.instance_id']
+                elif mutation == 'wrong_resource':
+                    item['address'] = 'module.host_logging.google_compute_instance.unrelated'
+                elif mutation == 'policy':
+                    item['change']['before']['policy'] = 'stable'
+                    item['change']['after']['policy'] = 'changed'
+                elif mutation == 'selector':
+                    item['change']['before']['instance_filter'] = {'labels': {'component': 'vmd'}}
+                    item['change']['after']['instance_filter'] = {'labels': {'component': 'other'}}
+                elif mutation == 'iam':
+                    item['address'] = 'module.host_logging.google_project_iam_member.log_writer'
+                    item['change']['before']['member'] = 'serviceAccount:runtime@example.test'
+                    item['change']['after']['member'] = 'serviceAccount:other@example.test'
+                else:
+                    item['change']['actions'] = ['delete', 'create']
+                with self.assertRaises(ValueError):
+                    provision.validate_plan(plan, 'sandbox_host_b', 'opaque-image',
+                                           'replace', 'us-central1')
+
     def test_identity_replacement_rejects_changed_or_unknown_inputs(self):
         fields = self.identity_plan('us-central1')['resource_changes'][-1]['change'][
             'before']['triggers_replace'][0].keys() - {'instance_id'}

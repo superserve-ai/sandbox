@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"hash/maphash"
 	"image"
 	"net"
 	"strconv"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jezek/xgb"
+	"github.com/jezek/xgb/damage"
 	"github.com/jezek/xgb/xfixes"
 	"github.com/jezek/xgb/xproto"
 	"github.com/jezek/xgb/xtest"
@@ -57,6 +60,23 @@ type x11Backend struct {
 	sock      net.Conn
 	root      xproto.Window
 	hasXfixes bool
+	// keys is the last keyboard mapping fetched (desktop_x11_key.go); it
+	// is refreshed on every key request and kept only for the scratch
+	// bindings it records.
+	keys *x11Keymap
+	// xkb is whether the XKEYBOARD extension was found, with its opcode.
+	xkb       xkbProbe
+	xkbOpcode byte
+	// damage is the root window's DAMAGE object, 0 when the extension is
+	// missing. The server reports once when the region becomes non-empty;
+	// snapshot empties it again. damaged records a report newer than
+	// watchSeq (the last snapshot's read) seen while draining events.
+	damage   damage.Damage
+	damaged  bool
+	watchSeq uint16
+	// readHook runs between snapshot's frame read and its event drain;
+	// tests use it to interleave repaints with that window.
+	readHook func()
 }
 
 // parseDisplay resolves a DISPLAY value to the socket to dial and the screen
@@ -115,6 +135,15 @@ func newX11Backend(conn *xgb.Conn, screen int) (*x11Backend, error) {
 			b.hasXfixes = true
 		}
 	}
+	// Change detection likewise: without DAMAGE, Step keeps a fixed settle.
+	if err := damage.Init(conn); err == nil {
+		if _, err := damage.QueryVersion(conn, 1, 1).Reply(); err == nil {
+			if id, err := damage.NewDamageId(conn); err == nil &&
+				damage.CreateChecked(conn, id, xproto.Drawable(b.root), damage.ReportLevelNonEmpty).Check() == nil {
+				b.damage = id
+			}
+		}
+	}
 	return b, nil
 }
 
@@ -137,13 +166,29 @@ func (b *x11Backend) sync() error {
 	if _, err := xproto.GetInputFocus(b.conn).Reply(); err != nil {
 		return err
 	}
+	_, err := b.drainEvents()
+	return err
+}
+
+// drainEvents consumes everything the server has already sent, without a
+// round trip, surfacing errors raised for unchecked requests. A damage
+// report newer than watchSeq sets damaged; stale reports whether an older
+// one was seen.
+func (b *x11Backend) drainEvents() (stale bool, err error) {
 	for {
 		ev, xerr := b.conn.PollForEvent()
 		if xerr != nil {
-			return fmt.Errorf("x server rejected input: %v", xerr)
+			return stale, fmt.Errorf("x server rejected input: %v", xerr)
 		}
 		if ev == nil {
-			return nil
+			return stale, nil
+		}
+		if n, ok := ev.(damage.NotifyEvent); ok {
+			if int16(n.Sequence-b.watchSeq) >= 0 {
+				b.damaged = true
+			} else {
+				stale = true
+			}
 		}
 	}
 }
@@ -265,32 +310,134 @@ func (b *x11Backend) Geometry() (width, height uint32, err error) {
 // Capture reads the root window as an RGBA frame with the cursor composited
 // in (when XFixes is available). PNG encoding is the caller's concern.
 func (b *x11Backend) Capture() (*image.RGBA, error) {
-	geom, err := xproto.GetGeometry(b.conn, xproto.Drawable(b.root)).Reply()
-	if err != nil {
-		return nil, fmt.Errorf("root geometry: %w", err)
-	}
-	if rawFrameTooLarge(geom.Width, geom.Height) {
-		return nil, errFrameTooLarge
-	}
-	img, err := xproto.GetImage(b.conn, xproto.ImageFormatZPixmap, xproto.Drawable(b.root),
-		0, 0, geom.Width, geom.Height, 0xffffffff).Reply()
-	if err != nil {
-		return nil, fmt.Errorf("get image: %w", err)
-	}
-	if img.Depth != 24 && img.Depth != 32 {
-		return nil, fmt.Errorf("unsupported root depth %d", img.Depth)
-	}
-	frame, err := bgrxToRGBA(img.Data, int(geom.Width), int(geom.Height))
+	frame, _, err := b.rawFrame()
 	if err != nil {
 		return nil, err
 	}
-	if b.hasXfixes {
-		if cursor, err := xfixes.GetCursorImage(b.conn).Reply(); err == nil {
-			compositeCursor(frame, cursor.CursorImage, int(cursor.Width), int(cursor.Height),
-				int(cursor.X)-int(cursor.Xhot), int(cursor.Y)-int(cursor.Yhot))
+	b.drawCursor(frame)
+	return frame, nil
+}
+
+// rawFrame reads the root window without the cursor, returning the frame
+// and the sequence number of the read. Change detection compares raw
+// frames, so moving the pointer alone is not a repaint.
+func (b *x11Backend) rawFrame() (*image.RGBA, uint16, error) {
+	geom, err := xproto.GetGeometry(b.conn, xproto.Drawable(b.root)).Reply()
+	if err != nil {
+		return nil, 0, fmt.Errorf("root geometry: %w", err)
+	}
+	if rawFrameTooLarge(geom.Width, geom.Height) {
+		return nil, 0, errFrameTooLarge
+	}
+	cookie := xproto.GetImage(b.conn, xproto.ImageFormatZPixmap, xproto.Drawable(b.root),
+		0, 0, geom.Width, geom.Height, 0xffffffff)
+	img, err := cookie.Reply()
+	if err != nil {
+		return nil, 0, fmt.Errorf("get image: %w", err)
+	}
+	if img.Depth != 24 && img.Depth != 32 {
+		return nil, 0, fmt.Errorf("unsupported root depth %d", img.Depth)
+	}
+	frame, err := bgrxToRGBA(img.Data, int(geom.Width), int(geom.Height))
+	if err != nil {
+		return nil, 0, err
+	}
+	return frame, cookie.Sequence, nil
+}
+
+func (b *x11Backend) drawCursor(frame *image.RGBA) {
+	if !b.hasXfixes {
+		return
+	}
+	if cursor, err := xfixes.GetCursorImage(b.conn).Reply(); err == nil {
+		compositeCursor(frame, cursor.CursorImage, int(cursor.Width), int(cursor.Height),
+			int(cursor.X)-int(cursor.Xhot), int(cursor.Y)-int(cursor.Yhot))
+	}
+}
+
+// errNoChangeWatch declines change detection on a server without DAMAGE;
+// the backend stays usable for everything else.
+var errNoChangeWatch = fmt.Errorf("%w: no DAMAGE extension", errBackendKept)
+
+// changeWatchPoll is how often the wait checks for a damage report.
+const changeWatchPoll = 2 * time.Millisecond
+
+var frameHashSeed = maphash.MakeSeed()
+
+// snapshot empties the damage region, reads the frame and hashes it. Reports
+// older than the read describe repaints the frame includes and are dropped;
+// newer ones leave b.damaged set. raced means a report arrived between the
+// empty and the read: the region is non-empty again, so a later repaint
+// would go unreported until the next snapshot.
+func (b *x11Backend) snapshot() (frame *image.RGBA, hash uint64, raced bool, err error) {
+	damage.Subtract(b.conn, b.damage, 0, 0)
+	frame, seq, err := b.rawFrame()
+	if err != nil {
+		return nil, 0, false, err
+	}
+	b.watchSeq = seq
+	b.damaged = false
+	if b.readHook != nil {
+		b.readHook()
+	}
+	if raced, err = b.drainEvents(); err != nil {
+		return nil, 0, false, err
+	}
+	return frame, maphash.Bytes(frameHashSeed, frame.Pix), raced, nil
+}
+
+// armChangeWatch returns the hash of the frame as it is now, with the
+// damage region empty so the next repaint is reported. Callers run the
+// actions after this and then captureChanged.
+func (b *x11Backend) armChangeWatch() (uint64, error) {
+	if b.damage == 0 {
+		return 0, errNoChangeWatch
+	}
+	for attempt := 0; ; attempt++ {
+		_, hash, raced, err := b.snapshot()
+		if err != nil {
+			return 0, err
+		}
+		// A busy display can race every time; captureChanged's first
+		// snapshot re-arms, so give up rather than spin here.
+		if !raced || attempt == 2 {
+			b.damaged = b.damaged || raced
+			return hash, nil
 		}
 	}
-	return frame, nil
+}
+
+// captureChanged waits until a repaint leaves the frame different from
+// baseline, or until deadline, and returns the frame as it is then.
+func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadline time.Time) (*image.RGBA, bool, error) {
+	for {
+		for !b.damaged {
+			if _, err := b.drainEvents(); err != nil {
+				return nil, false, err
+			}
+			if b.damaged || !time.Now().Before(deadline) {
+				break
+			}
+			select {
+			case <-time.After(min(changeWatchPoll, time.Until(deadline))):
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			}
+		}
+		frame, hash, raced, err := b.snapshot()
+		if err != nil {
+			return nil, false, err
+		}
+		if hash != baseline || !time.Now().Before(deadline) {
+			b.drawCursor(frame)
+			return frame, hash != baseline, nil
+		}
+		// Same pixels: an application repainted without visible change. A
+		// report that arrived after this read, or a raced one, means the
+		// region is non-empty again and nothing further will be reported,
+		// so it must stay pending.
+		b.damaged = b.damaged || raced
+	}
 }
 
 // rawFrameTooLarge reports whether a display's raw frame would exceed
@@ -363,6 +510,9 @@ type x11Holder struct {
 	lastProbe time.Time
 	probing   bool // a dial is in flight; concurrent callers use the shell path
 	disabled  bool // tests force the shell path
+	// keys is the last backend's keymap, kept so its scratch bindings (which
+	// live on in the server) stay recognized as ours after a reconnect.
+	keys *x11Keymap
 }
 
 // dialX11 connects under ctx and x11DialTimeout. The socket is opened here
@@ -418,9 +568,12 @@ func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 		h.mu.Unlock()
 		return nil
 	}
-	if h.backend != nil && h.display != display {
-		h.backend.Close()
-		h.backend = nil
+	if h.display != display {
+		if h.backend != nil {
+			h.backend.Close()
+			h.backend = nil
+		}
+		h.keys = nil // a different server, different bindings
 	}
 	if h.backend != nil {
 		backend := h.backend
@@ -444,6 +597,7 @@ func (h *x11Holder) get(ctx context.Context, display string) *x11Backend {
 	if err != nil {
 		return nil
 	}
+	backend.keys = h.keys
 	h.backend = backend
 	return backend
 }
@@ -456,6 +610,9 @@ func (h *x11Holder) drop(backend *x11Backend) {
 	if h.backend == backend && backend != nil {
 		backend.Close()
 		h.backend = nil
+		if backend.keys != nil {
+			h.keys = backend.keys
+		}
 	}
 }
 
@@ -479,7 +636,7 @@ func (s *desktopService) runX11(ctx context.Context, op func(context.Context, *x
 	go func() { done <- op(ctx, backend) }()
 	select {
 	case err := <-done:
-		if err != nil {
+		if err != nil && !errors.Is(err, errBackendKept) {
 			s.x11.drop(backend)
 		}
 		return true, err
