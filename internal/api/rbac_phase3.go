@@ -94,6 +94,11 @@ func (h *Handlers) requireTeamSandboxWrite(c *gin.Context, teamID uuid.UUID) boo
 			return false
 		}
 		if _, machine := machineCallerFromContext(c); machine {
+			// Explicit resume atomically checks ownership in ClaimResume; a
+			// separate read would duplicate its successful-path database work.
+			if operation == auth.MachineOperationResume {
+				return true
+			}
 			if raw := c.Param("sandbox_id"); raw != "" {
 				id, err := parsePublicSandboxID(raw)
 				if err != nil {

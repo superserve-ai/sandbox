@@ -208,7 +208,7 @@ func run() error {
 	}
 	var routingReady func() bool
 	router := proxy.NewRoutingHandler(domains, localHostID, ownership, peers, proxyHandler, log, routingRecorder)
-	if dbPool != nil {
+	if dbPool != nil && routingEnabled == "1" {
 		directory := &proxy.HostDirectory{}
 		backgroundConfig := dbPool.Config()
 		backgroundConfig.MaxConns = 1
@@ -225,14 +225,17 @@ func run() error {
 		routingReady = routingBootstrapGate(func() bool { return directory.Ready() && revocations.Ready() }, time.Second)
 	}
 	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
-	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
-	if dbPool != nil {
-		mux = newProxyMuxWithReadiness(proxyHandler, withRoutingBootstrap(router, routingReady), func(ctx context.Context) bool {
+	var routingDataPlane http.Handler = router
+	var routingDependencies func(context.Context) bool
+	if dbPool != nil && routingEnabled == "1" {
+		routingDataPlane = withRoutingBootstrap(router, routingReady)
+		routingDependencies = func(ctx context.Context) bool {
 			ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			defer cancel()
 			return routingReady() && dbPool.Ping(ctx) == nil
-		})
+		}
 	}
+	mux, localMux := newDataPlaneMuxesWithReadiness(proxyHandler, routingDataPlane, routingEnabled == "1", routingDependencies)
 	var localSrv *http.Server
 	var localConnections *proxy.DrainConnections
 	var localErr <-chan error
@@ -360,7 +363,7 @@ func newRedirectMux(proxyHandler *proxy.Handler, readiness http.Handler) *http.S
 	redirectMux := http.NewServeMux()
 	redirectMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" && !proxyHandler.ServesHost(r.Host) {
-			if r.Host == "proxy-readiness.invalid" {
+			if r.Host == "proxy-readiness.invalid" || r.Host == "proxy-machine-readiness.invalid" {
 				readiness.ServeHTTP(w, r)
 				return
 			}
@@ -432,10 +435,12 @@ func peerTransportRequired(routingEnabled, peerAddr string) bool {
 }
 
 type proxyHealthResponse struct {
-	Generation    string   `json:"generation"`
-	Capabilities  []string `json:"capabilities"`
-	FilesEnabled  bool     `json:"files_enabled"`
-	ResolverReady bool     `json:"resolver_ready"`
+	Generation              string   `json:"generation"`
+	Capabilities            []string `json:"capabilities"`
+	FilesEnabled            bool     `json:"files_enabled"`
+	ResolverReady           bool     `json:"resolver_ready"`
+	MachineIdentityReady    bool     `json:"machine_identity_ready"`
+	MachineIdentityRevision string   `json:"machine_identity_revision"`
 }
 
 func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string) (*pgxpool.Pool, error) {
@@ -496,10 +501,16 @@ func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
 }
 
 func newDataPlaneMuxes(local *proxy.Handler, router http.Handler, routingEnabled bool) (publicMux, localMux *http.ServeMux) {
+	return newDataPlaneMuxesWithReadiness(local, router, routingEnabled, nil)
+}
+
+func newDataPlaneMuxesWithReadiness(local *proxy.Handler, router http.Handler, routingEnabled bool, routingDependencies func(context.Context) bool) (publicMux, localMux *http.ServeMux) {
+	// A database may be configured solely for machine identity. Its presence
+	// must not enable peer routing or routing-only health dependencies.
 	if !routingEnabled {
 		return newProxyMux(local), newProxyMux(local)
 	}
-	return newProxyMuxWithHandler(local, router), newProxyMux(local)
+	return newProxyMuxWithReadiness(local, router, routingDependencies), newProxyMux(local)
 }
 
 func newProxyMuxWithHandler(proxyHandler *proxy.Handler, dataPlane http.Handler) *http.ServeMux {
@@ -544,22 +555,25 @@ func newProxyMuxWithReadiness(proxyHandler *proxy.Handler, dataPlane http.Handle
 			dataPlane.ServeHTTP(w, r)
 			return
 		}
-		resolverReady := proxyHandler.ResolverReady(r.Context())
+		resolverReady, machineVMDReady := proxyHandler.ResolverReadiness(r.Context())
 		if dependencies != nil {
 			resolverReady = dependencies(r.Context()) && resolverReady
 		}
+		machineReady := resolverReady && machineVMDReady && proxyHandler.MachineIdentityReady(r.Context())
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Proxy-Generation", generation)
 		w.Header().Set("X-Proxy-Resolver-Ready", strconv.FormatBool(resolverReady))
 		w.Header().Set("Content-Type", "application/json")
-		if r.Host == "proxy-readiness.invalid" && !resolverReady {
+		if (r.Host == "proxy-readiness.invalid" && !resolverReady) || (r.Host == "proxy-machine-readiness.invalid" && !machineReady) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		_ = json.NewEncoder(w).Encode(proxyHealthResponse{
-			Generation:    generation,
-			Capabilities:  proxyHandler.PreviewCapabilities(),
-			FilesEnabled:  proxyHandler.FilesEnabled(),
-			ResolverReady: resolverReady,
+			Generation:              generation,
+			Capabilities:            proxyHandler.PreviewCapabilities(),
+			FilesEnabled:            proxyHandler.FilesEnabled(),
+			ResolverReady:           resolverReady,
+			MachineIdentityReady:    machineReady,
+			MachineIdentityRevision: proxy.MachineIdentityRevision,
 		})
 	})
 	mux.Handle("/", dataPlane)

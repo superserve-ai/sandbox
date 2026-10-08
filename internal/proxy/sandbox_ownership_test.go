@@ -43,7 +43,7 @@ func TestOwnerlessLegacySandboxAdmissionRequiresDurableProof(t *testing.T) {
 	seed := []byte("ownership-fallback-test-signing-key-00")
 	sandbox, team, principal := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	wrongTeam := uuid.NewString()
-	for _, tc := range []struct {
+	cases := []struct {
 		name                              string
 		db                                sandboxOwnerTestDB
 		machine                           bool
@@ -60,7 +60,9 @@ func TestOwnerlessLegacySandboxAdmissionRequiresDurableProof(t *testing.T) {
 		{name: "contradictory principal", attestedPrincipal: principal, want: 401},
 		{name: "contradictory creator", creator: "creator", want: 401},
 		{name: "unverified token", token: "invalid", want: 401},
-	} {
+	}
+	for i := range cases {
+		tc := &cases[i]
 		t.Run(tc.name, func(t *testing.T) {
 			server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				attestPreviewProtocol(w)

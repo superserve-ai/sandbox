@@ -889,6 +889,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// establish a paused target, preserving missing/state responses and the
 	// existing pause-settle window without adding I/O to allowed resumes.
 	if decision.Outcome == "blocked" && settled != nil {
+		if !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
+			return "", false
+		}
 		tWait := time.Now()
 		paused := settled()
 		tStart = tStart.Add(time.Since(tWait))
@@ -913,7 +916,20 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		TeamID:  teamID,
 		LockKey: sandboxID.String(),
 	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		if caller.PrincipalID == uuid.Nil || caller.TeamID != teamID {
+			respondError(c, ErrForbidden)
+			return "", false
+		}
+		claimParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
+	}
 	claimed, err := h.DB.ClaimResume(c.Request.Context(), claimParams)
+	// Only a failed machine claim needs a second read to distinguish denied
+	// ownership from an owner's pause that is still settling. Do this before
+	// polling or exposing another principal's sandbox state.
+	if errors.Is(err, pgx.ErrNoRows) && claimParams.MachinePrincipalID.Valid && !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
+		return "", false
+	}
 	if err == pgx.ErrNoRows && settled != nil {
 		// The caller's wait is its lookup, not this claim.
 		tWait := time.Now()
@@ -3925,6 +3941,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	})
 
 	sandbox.Status = db.SandboxStatusActive
+	if machineRequest {
+		// The insertion result has joined, committed sandbox and ownership,
+		// and completed required VMD attestations. Reuse that immutable fact
+		// on this request goroutine instead of reading it back for the token.
+		owner := db.MachineSandboxOwnerRow{SandboxID: sandbox.ID, OwnerPrincipalID: machineCaller.PrincipalID, TeamID: teamID}
+		c.Set("machine_resource_owner", requestOwnerResult{sandboxID: sandbox.ID, teamID: teamID, owner: owner})
+	}
 	c.Set("routing_observed_at", routingObservedAt)
 	resp, ok := h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
 	if !ok {

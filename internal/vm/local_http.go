@@ -13,6 +13,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
@@ -139,6 +140,7 @@ func ownershipState(machineOwned bool, principalID, ownerID string, ordinaryOwne
 
 // handleInstance handles GET /instances/{instanceID}.
 func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set(auth.VMDMachineIdentityHeader, auth.MachineIdentityRevision)
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -152,6 +154,13 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 
 	info, ok := s.mgr.LookupInstance(instanceID)
 	if !ok {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
+	if (info.MachineOwned || info.MachineOwnerPrincipalID != "") &&
+		r.Header.Get(auth.ProxyMachineIdentityHeader) != auth.MachineIdentityRevision {
+		// An old proxy ignores ownership fields and would accept a legacy
+		// sandbox-only token. Withhold the route even for malformed owners.
 		http.Error(w, "instance not found", http.StatusNotFound)
 		return
 	}

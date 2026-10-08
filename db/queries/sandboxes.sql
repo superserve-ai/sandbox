@@ -671,7 +671,8 @@ RETURNING *;
 -- The auto-delete deadline stays on the row: the reaper acts on paused rows
 -- only, a failed resume returns the row to paused with the deadline it had,
 -- and activation clears it.
--- 0 rows: not paused, or another resume claimed it.
+-- A machine caller supplies its principal so the claim itself enforces ownership.
+-- 0 rows: owner mismatch, not paused, or another resume claimed it.
 UPDATE sandbox
 SET status = 'resuming', updated_at = now()
 FROM (
@@ -710,6 +711,9 @@ FROM (
 ) x
 WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+  AND (sqlc.narg('machine_principal_id')::uuid IS NULL
+       OR (x.machine_owner_principal_id = sqlc.narg('machine_principal_id')
+           AND x.machine_owner_team_id = sandbox.team_id))
 RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
