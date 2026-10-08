@@ -776,8 +776,8 @@ const claimResume = `-- name: ClaimResume :one
 UPDATE sandbox
 SET status = 'resuming', updated_at = now()
 FROM (
-  SELECT $1::uuid AS id
-  FROM (SELECT pg_advisory_xact_lock(hashtext($2::text)::bigint)) locked
+  SELECT $2::uuid AS id
+  FROM (SELECT pg_advisory_xact_lock(hashtext($3::text)::bigint)) locked
 ) lk, (
   SELECT sb.id,
          s.path AS snap_path,
@@ -807,10 +807,13 @@ FROM (
       ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
     WHERE pp.sandbox_id = sb.id AND g.token_version > 0
   ) pp ON true
-  WHERE sb.id = $1 AND sb.team_id = $3
+  WHERE sb.id = $2 AND sb.team_id = $4
 ) x
 WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+  AND ($1::uuid IS NULL
+       OR (x.machine_owner_principal_id = $1
+           AND x.machine_owner_team_id = sandbox.team_id))
 RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.failed_at, sandbox.had_secret_bindings, sandbox.secret_env_fingerprint, sandbox.secret_env_ip, sandbox.secret_env_injected_at, sandbox.secret_env_expires_at, sandbox.pause_op_id, sandbox.pause_op_started_at, sandbox.pause_op_lease_until, sandbox.pause_op_lease_version, sandbox.pause_op_attention_at, sandbox.pause_op_trigger, sandbox.pause_op_actor_id, sandbox.routing_version, sandbox.source_snapshot_id,
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
@@ -820,9 +823,10 @@ RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcp
 `
 
 type ClaimResumeParams struct {
-	ID      uuid.UUID `json:"id"`
-	LockKey string    `json:"lock_key"`
-	TeamID  uuid.UUID `json:"team_id"`
+	MachinePrincipalID pgtype.UUID `json:"machine_principal_id"`
+	ID                 uuid.UUID   `json:"id"`
+	LockKey            string      `json:"lock_key"`
+	TeamID             uuid.UUID   `json:"team_id"`
 }
 
 type ClaimResumeRow struct {
@@ -855,9 +859,15 @@ type ClaimResumeRow struct {
 // The auto-delete deadline stays on the row: the reaper acts on paused rows
 // only, a failed resume returns the row to paused with the deadline it had,
 // and activation clears it.
-// 0 rows: not paused, or another resume claimed it.
+// A machine caller supplies its principal so the claim itself enforces ownership.
+// 0 rows: owner mismatch, not paused, or another resume claimed it.
 func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
-	row := q.db.QueryRow(ctx, claimResume, arg.ID, arg.LockKey, arg.TeamID)
+	row := q.db.QueryRow(ctx, claimResume,
+		arg.MachinePrincipalID,
+		arg.ID,
+		arg.LockKey,
+		arg.TeamID,
+	)
 	var i ClaimResumeRow
 	err := row.Scan(
 		&i.Sandbox.ID,

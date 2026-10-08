@@ -45,16 +45,25 @@ func (d *boundaryOwnerDB) QueryRow(ctx context.Context, query string, args ...an
 }
 
 func TestSharedResumePreservesMachineOwner(t *testing.T) {
-	for _, scenario := range []string{"machine", "ordinary", "ordinary_actorless", "claim_failure"} {
+	for _, scenario := range []string{"machine", "ordinary", "ordinary_actorless", "machine_caller", "machine_denied", "claim_failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			sandbox, team, principal, snapID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 			sb := pausedSandboxWithSnapshot(sandbox, team, snapID)
 			snap := db.Snapshot{ID: snapID, SandboxID: sandbox, TeamID: team, Path: "/snapshots/example.snap", Trigger: "pause"}
 			claims := 0
 			m := &boundaryOwnerDB{principal: principal, mockDBTX: &mockDBTX{
-				queryRowFn: func(_ context.Context, q string, _ ...any) pgx.Row {
+				queryRowFn: func(_ context.Context, q string, args ...any) pgx.Row {
 					if strings.Contains(q, "'resuming'") {
 						claims++
+						if scenario == "machine_caller" || scenario == "machine_denied" {
+							fence := args[0].(pgtype.UUID)
+							if !fence.Valid || fence.Bytes == uuid.Nil {
+								t.Fatal("machine claim omitted principal fence")
+							}
+							if scenario == "machine_denied" {
+								return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
+							}
+						}
 						if scenario == "claim_failure" {
 							return &mockRow{scanFn: func(...any) error { return errors.New("claim unavailable") }}
 						}
@@ -63,7 +72,7 @@ func TestSharedResumePreservesMachineOwner(t *testing.T) {
 							if err := row.Scan(dest...); err != nil {
 								return err
 							}
-							if scenario == "machine" {
+							if scenario == "machine" || scenario == "machine_caller" {
 								*dest[50].(*bool) = true
 								*dest[51].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
 								*dest[52].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
@@ -93,7 +102,29 @@ func TestSharedResumePreservesMachineOwner(t *testing.T) {
 				c.Set("actor_id", actor)
 			}
 			c.Set("team_id", team.String())
-			_, ok := h.resumePausedSandbox(c, &sb, team, nil)
+			if scenario == "machine_caller" || scenario == "machine_denied" {
+				c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandbox.String()+"/resume", nil)
+				c.Params = gin.Params{{Key: "sandbox_id", Value: sandbox.String()}}
+				caller := machineRequestCaller(time.Now())
+				caller.TeamID, caller.PrincipalID = team, principal
+				caller.Permissions, caller.Policy = []auth.MachineOperation{auth.MachineOperationResume}, auth.NewMachinePolicy(auth.MachineOperationResume)
+				if scenario == "machine_denied" {
+					caller.PrincipalID = uuid.New()
+					m.failure = nil
+				}
+				setMachineCaller(c, caller)
+				if !h.requireTeamSandboxWrite(c, team) || m.reads != 0 {
+					t.Fatal("machine resume performed ownership pre-read")
+				}
+			}
+			settledCalls := 0
+			_, ok := h.resumePausedSandbox(c, &sb, team, func() bool { settledCalls++; return false })
+			if scenario == "machine_denied" {
+				if ok || c.Writer.Status() != http.StatusForbidden || claims != 1 || m.reads != 1 || vmdCalls != 0 || settledCalls != 0 {
+					t.Fatal("wrong-owner claim exposed state or reached VMD")
+				}
+				return
+			}
 			if scenario == "claim_failure" {
 				_, cached := c.Get("machine_resource_owner")
 				if ok || claims != 1 || vmdCalls != 0 || cached {
@@ -102,7 +133,7 @@ func TestSharedResumePreservesMachineOwner(t *testing.T) {
 				return
 			}
 			wantOwner := actor.String()
-			if scenario == "machine" {
+			if scenario == "machine" || scenario == "machine_caller" {
 				wantOwner = "machine:" + principal.String()
 			} else if scenario == "ordinary_actorless" {
 				wantOwner = "ordinary:attested"
@@ -111,7 +142,7 @@ func TestSharedResumePreservesMachineOwner(t *testing.T) {
 				t.Fatalf("restore lost immutable owner: ok=%v owner=%q", ok, vmd.restoreOwner)
 			}
 			_, err := h.requestSandboxOwner(c, sandbox, team)
-			if m.reads != 0 || (scenario == "machine" && err != nil) || (strings.HasPrefix(scenario, "ordinary") && !errors.Is(err, pgx.ErrNoRows)) {
+			if m.reads != 0 || ((scenario == "machine" || scenario == "machine_caller") && err != nil) || (strings.HasPrefix(scenario, "ordinary") && !errors.Is(err, pgx.ErrNoRows)) {
 				t.Fatalf("claim ownership not reused: reads=%d err=%v", m.reads, err)
 			}
 		})

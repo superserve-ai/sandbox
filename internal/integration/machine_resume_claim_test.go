@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -28,6 +29,19 @@ func TestMachineResumeClaimCarriesImmutableOwnership(t *testing.T) {
 				}
 			}
 			params := db.ClaimResumeParams{ID: sandboxID, TeamID: teamID, LockKey: sandboxID.String()}
+			other := machineRepairPrincipal(t, testQueries, teamID)
+			denied := params
+			denied.MachinePrincipalID = pgtype.UUID{Bytes: other.ID, Valid: true}
+			if _, err := testQueries.ClaimResume(ctx, denied); !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("foreign machine claimed sandbox: %v", err)
+			}
+			unchanged, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+			if err != nil || unchanged.Status != db.SandboxStatusPaused {
+				t.Fatalf("denied claim changed status: %s %v", unchanged.Status, err)
+			}
+			if machine {
+				params.MachinePrincipalID = pgtype.UUID{Bytes: principalID, Valid: true}
+			}
 			claim, err := testQueries.ClaimResume(ctx, params)
 			if err != nil {
 				t.Fatal(err)
