@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/blocklist"
 	"github.com/superserve-ai/sandbox/internal/egresspolicy"
-	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 // upstreamDialTimeout is the maximum time to wait for upstream connections.
@@ -31,12 +32,17 @@ const upstreamDialTimeout = 30 * time.Second
 //   - TLS port:   inspects SNI (Server Name Indication)
 //   - Other port: CIDR-only (no protocol inspection)
 //
-// Traffic is redirected to these ports by nftables REDIRECT rules in each
-// sandbox's network namespace.
+// Host firewall REDIRECT rules currently send TCP 80/443 here. Other outbound
+// traffic is subject to separate host controls, not this proxy budget.
 type EgressProxy struct {
-	httpPort  uint16
-	tlsPort   uint16
-	otherPort uint16
+	egressConnections
+	capacity     EgressCapacity
+	metrics      *telemetry.EgressRecorder
+	originalDst  func(net.Conn) (net.IP, int, error)
+	dialUpstream func(context.Context, *net.Dialer, string) (net.Conn, error)
+	httpPort     uint16
+	tlsPort      uint16
+	otherPort    uint16
 
 	log     zerolog.Logger
 	hostID  string
@@ -74,7 +80,12 @@ type EgressRules struct {
 
 func NewEgressProxy(httpPort, tlsPort, otherPort uint16, maxConns int, log zerolog.Logger) *EgressProxy {
 	return &EgressProxy{
-		httpPort:           httpPort,
+		httpPort:    httpPort,
+		capacity:    EgressCapacity{MaxConnections: DefaultEgressMaxConnections},
+		originalDst: getOriginalDst,
+		dialUpstream: func(ctx context.Context, d *net.Dialer, address string) (net.Conn, error) {
+			return d.DialContext(ctx, "tcp", address)
+		},
 		tlsPort:            tlsPort,
 		otherPort:          otherPort,
 		log:                log.With().Str("component", "egress-proxy").Logger(),
@@ -119,6 +130,7 @@ func (p *EgressProxy) RegisterSandbox(hostIP, sandboxID string) {
 	defer p.mu.Unlock()
 	if r, ok := p.rules[hostIP]; ok {
 		if r.SandboxID != sandboxID {
+			p.limiter.Remove(hostIP)
 			copy := *r
 			copy.SandboxID = sandboxID
 			p.rules[hostIP] = &copy
@@ -139,12 +151,14 @@ func (p *EgressProxy) SetRules(hostIP string, rules *EgressRules) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if rules == nil {
+		p.limiter.Remove(hostIP)
 		delete(p.rules, hostIP)
 	} else if current := p.rules[hostIP]; current != nil && current.SandboxID != "" && current.SandboxID == rules.SandboxID {
 		// Policy edits retain the registration identity used by mining attribution.
 		// Readers snapshot rules under this same lock.
 		*current = *rules
 	} else {
+		p.limiter.Remove(hostIP)
 		copy := *rules
 		p.rules[hostIP] = &copy
 	}
@@ -154,8 +168,8 @@ func (p *EgressProxy) SetRules(hostIP string, rules *EgressRules) {
 func (p *EgressProxy) RemoveRules(hostIP string) {
 	p.mu.Lock()
 	delete(p.rules, hostIP)
-	p.mu.Unlock()
 	p.limiter.Remove(hostIP)
+	p.mu.Unlock()
 }
 
 func (p *EgressProxy) getRules(hostIP string) *EgressRules {
@@ -187,14 +201,22 @@ func (p *EgressProxy) Start(ctx context.Context) error {
 		Uint16("other_port", p.otherPort).
 		Msg("egress proxy started")
 
-	// Wait for first error or context cancellation. The deferred cancel()
-	// ensures all listeners are shut down if one fails.
+	// Join listeners before waiting for handlers, so no Add can race Wait.
+	var first error
 	select {
-	case err := <-errCh:
-		return err
+	case first = <-errCh:
+		cancel()
+		for i := 0; i < 2; i++ {
+			<-errCh
+		}
 	case <-ctx.Done():
-		return nil
+		cancel()
+		for i := 0; i < 3; i++ {
+			<-errCh
+		}
 	}
+	p.workers.Wait()
+	return first
 }
 
 func (p *EgressProxy) listen(ctx context.Context, port uint16, handler func(context.Context, net.Conn)) error {
@@ -204,10 +226,11 @@ func (p *EgressProxy) listen(ctx context.Context, port uint16, handler func(cont
 		return fmt.Errorf("listen on port %d: %w", port, err)
 	}
 
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
+	defer ln.Close()
+	stop := context.AfterFunc(ctx, func() { ln.Close() })
+	defer stop()
+	var backoff time.Duration
+	var lastAcceptLog time.Time
 
 	for {
 		conn, err := ln.Accept()
@@ -215,10 +238,23 @@ func (p *EgressProxy) listen(ctx context.Context, port uint16, handler func(cont
 			if ctx.Err() != nil {
 				return nil
 			}
-			p.log.Warn().Err(err).Uint16("port", port).Msg("accept error")
+			if time.Since(lastAcceptLog) >= 30*time.Second {
+				lastAcceptLog = time.Now()
+				p.log.Warn().Err(err).Uint16("port", port).Msg("accept error")
+			}
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else {
+				backoff = min(backoff*2, time.Second)
+			}
+			p.metrics.Reject("accept_error")
+			if !acceptBackoff(ctx, backoff) {
+				return nil
+			}
 			continue
 		}
-		go func() { defer sentrylog.Recover("net-conn"); handler(ctx, conn) }()
+		backoff = 0
+		p.dispatch(ctx, conn, handler)
 	}
 }
 
@@ -245,7 +281,7 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 	defer conn.Close()
 
 	// Get original destination before REDIRECT.
-	dstIP, dstPort, err := getOriginalDst(conn)
+	dstIP, dstPort, err := p.originalDst(conn)
 	if err != nil {
 		p.log.Debug().Err(err).Msg("failed to get original dst")
 		return
@@ -254,14 +290,19 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 	// Identify sandbox by source IP.
 	srcAddr := conn.RemoteAddr().String()
 	srcHost, _, _ := net.SplitHostPort(srcAddr)
-	rules := p.getRules(srcHost)
+	rules, miningRegistration, release, acquired := p.acquireSandbox(srcHost)
+	if !acquired {
+		p.metrics.Reject("sandbox")
+		return
+	}
+	// Release after both sockets and tracking callbacks have been cleaned up.
+	defer release()
+	defer conn.Close()
 	var sandboxID string
 	if rules != nil {
 		sandboxID = rules.SandboxID
 	}
-	var miningRegistration *EgressRules
 	if p.miningStreams != nil {
-		_, miningRegistration = p.miningRegistration(srcHost)
 		earlyDone := p.trackEarlyMining(srcHost, sandboxID, miningRegistration, conn)
 		defer earlyDone()
 	}
@@ -282,14 +323,6 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		defer done()
 	}
 
-	// Connection limit check.
-	_, acquired := p.limiter.TryAcquire(srcHost, p.maxConnsPerSandbox)
-	if !acquired {
-		sandboxLog.Warn().Str("src", srcHost).Msg("connection limit exceeded")
-		return
-	}
-	defer p.limiter.Release(srcHost)
-
 	// Extract hostname if we have a protocol inspector.
 	// Read enough data to inspect the protocol header. HTTP Host and TLS
 	// ClientHello are both in the first flight, so we read until we have
@@ -302,7 +335,7 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		tmp := make([]byte, 4096)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		for {
-			n, err := conn.Read(tmp)
+			n, err := conn.Read(tmp[:min(len(tmp), 4096-len(buf))])
 			if n > 0 {
 				buf = append(buf, tmp[:n]...)
 			}
@@ -425,7 +458,15 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		},
 	}
 
-	upstream, err := dialer.DialContext(ctx, "tcp", upstreamAddr)
+	// httptrace observes net.Dialer's actual lookup without resolving twice.
+	var dnsStart time.Time
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) { dnsStart = time.Now() },
+		DNSDone:  func(info httptrace.DNSDoneInfo) { p.metrics.Duration("dns", time.Since(dnsStart), info.Err) },
+	})
+	dialStart := time.Now()
+	upstream, err := p.dialUpstream(ctx, dialer, upstreamAddr)
+	p.metrics.Duration("dial", time.Since(dialStart), err)
 	if err != nil {
 		sandboxLog.Debug().Err(err).Str("upstream", upstreamAddr).Msg("dial failed")
 		if sandboxID != "" {
@@ -445,7 +486,7 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 		}
 		return
 	}
-	defer upstream.Close()
+	defer closeOnCancel(ctx, upstream)()
 	upstreamDone := p.trackEarlyMining(srcHost, sandboxID, miningRegistration, upstream)
 	defer upstreamDone()
 	if activeMining := p.mining.Load(); activeMining != nil {
@@ -459,6 +500,7 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 	// If we peeked data, write it to upstream first.
 	sent := int64(len(peekedData))
 	if len(peekedData) > 0 {
+		upstream.SetWriteDeadline(time.Now().Add(upstreamDialTimeout))
 		if _, err := upstream.Write(peekedData); err != nil {
 			if sandboxID != "" {
 				flow.Verdict = "failed"
@@ -467,6 +509,8 @@ func (p *EgressProxy) handleConn(ctx context.Context, conn net.Conn, protocol st
 			return
 		}
 	}
+
+	upstream.SetWriteDeadline(time.Time{})
 
 	// Bidirectional proxy.
 	start := time.Now()

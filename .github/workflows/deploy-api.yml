@@ -74,6 +74,7 @@ on:
       - 'supabase/shared-auth-history/**'
       - 'supabase/shared-auth-migrations/**'
       - 'scripts/migrate_database.py'
+      - 'scripts/snapshot_reference_index.py'
       - 'scripts/retained_storage_recovery.py'
       - 'scripts/recovery_evidence.py'
       - 'scripts/migration-requirements.txt'

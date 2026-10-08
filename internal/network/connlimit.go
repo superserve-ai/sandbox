@@ -1,82 +1,59 @@
 package network
 
-import (
-	"sync"
-	"sync/atomic"
-)
+import "sync"
 
-// ConnectionLimiter tracks and limits per-sandbox concurrent TCP connections.
+type connectionCounter struct{ active int64 }
+
+// ConnectionLimiter counts live acquisitions, including retired registrations.
+// Release handles retain their counter even after its address is reused.
 type ConnectionLimiter struct {
 	mu          sync.Mutex
-	connections map[string]*atomic.Int64
+	connections map[string]*connectionCounter
 }
 
 func NewConnectionLimiter() *ConnectionLimiter {
-	return &ConnectionLimiter{
-		connections: make(map[string]*atomic.Int64),
-	}
+	return &ConnectionLimiter{connections: make(map[string]*connectionCounter)}
 }
 
-func (l *ConnectionLimiter) getCounter(sandboxID string) *atomic.Int64 {
+// TryAcquire returns an idempotent release handle. Negative limits are unlimited;
+// zero rejects every attempt. The caller must close its sockets before release.
+func (l *ConnectionLimiter) TryAcquire(key string, limit int) (func(), bool) {
+	l.mu.Lock()
+	c := l.connections[key]
+	if c == nil {
+		c = &connectionCounter{}
+	}
+	if limit >= 0 && c.active >= int64(limit) {
+		l.mu.Unlock()
+		return nil, false
+	}
+	c.active++
+	l.connections[key] = c
+	l.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			c.active--
+			if c.active == 0 && l.connections[key] == c {
+				delete(l.connections, key)
+			}
+		})
+	}, true
+}
+
+func (l *ConnectionLimiter) Remove(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	c, ok := l.connections[sandboxID]
-	if !ok {
-		c = &atomic.Int64{}
-		l.connections[sandboxID] = c
-	}
-	return c
+	delete(l.connections, key)
 }
 
-// TryAcquire attempts to acquire a connection slot.
-// Returns (current count, true) on success, (current count, false) if limit exceeded.
-// A negative maxLimit means unlimited. Zero means all connections blocked.
-func (l *ConnectionLimiter) TryAcquire(sandboxID string, maxLimit int) (int64, bool) {
-	counter := l.getCounter(sandboxID)
-	for {
-		current := counter.Load()
-		if maxLimit >= 0 && current >= int64(maxLimit) {
-			return current, false
-		}
-		if counter.CompareAndSwap(current, current+1) {
-			return current + 1, true
-		}
-	}
-}
-
-// Release decrements the connection count for a sandbox.
-func (l *ConnectionLimiter) Release(sandboxID string) {
+func (l *ConnectionLimiter) Count(key string) int64 {
 	l.mu.Lock()
-	counter, ok := l.connections[sandboxID]
-	l.mu.Unlock()
-	if !ok {
-		return
+	defer l.mu.Unlock()
+	if c := l.connections[key]; c != nil {
+		return c.active
 	}
-	for {
-		current := counter.Load()
-		if current <= 0 {
-			return
-		}
-		if counter.CompareAndSwap(current, current-1) {
-			return
-		}
-	}
-}
-
-// Remove removes a sandbox's connection tracking entry entirely.
-func (l *ConnectionLimiter) Remove(sandboxID string) {
-	l.mu.Lock()
-	delete(l.connections, sandboxID)
-	l.mu.Unlock()
-}
-
-// Count returns the current connection count for a sandbox.
-func (l *ConnectionLimiter) Count(sandboxID string) int64 {
-	l.mu.Lock()
-	counter, ok := l.connections[sandboxID]
-	l.mu.Unlock()
-	if !ok {
-		return 0
-	}
-	return counter.Load()
+	return 0
 }
