@@ -359,6 +359,7 @@ BUNDLE_FILES = [
     "deploy/sandboxes.slice",
     "deploy/needrestart-superserve.conf",
     "deploy/apt-no-auto-upgrades.conf",
+    "deploy/sandbox-conntrack.conf",
     "deploy/maintenance-watch.sh",
     "deploy/superserve-maintenance-watch.service",
     "deploy/superserve-maintenance-watch.timer",
@@ -774,6 +775,12 @@ def main() -> int:
             sudo install -m 0644 {extract_dir}/deploy/firecracker@.service /etc/systemd/system/firecracker@.service
             sudo install -m 0644 {extract_dir}/deploy/firecracker-netns@.service /etc/systemd/system/firecracker-netns@.service
             sudo install -m 0644 {extract_dir}/deploy/sandboxes.slice /etc/systemd/system/sandboxes.slice
+            # Conntrack sizing (deploy/sandbox-conntrack.conf): applied now and on
+            # every boot; the module must be loaded for the keys to exist.
+            echo nf_conntrack | sudo tee /etc/modules-load.d/sandbox-conntrack.conf > /dev/null
+            sudo modprobe nf_conntrack
+            sudo install -m 0644 {extract_dir}/deploy/sandbox-conntrack.conf /etc/sysctl.d/90-sandbox-conntrack.conf
+            sudo sysctl -q -p /etc/sysctl.d/90-sandbox-conntrack.conf
             # Upsert the maintenance-watch webhook into its own env file so the
             # watcher never sources vmd's tokens. Empty = skip: the watcher
             # still runs and logs notices to the journal, it just can't page.
