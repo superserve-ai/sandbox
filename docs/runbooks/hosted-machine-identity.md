@@ -32,9 +32,11 @@ The proxy resolver/VMD attestation for a machine-owned sandbox must include
 Machine capabilities are rejected when any binding is absent or mismatched;
 the proxy never infers ownership from a human `owner_id`. A VMD response also
 attests `ownership_state` as `machine`, `ordinary`, or `unknown`. For an existing
-ownerless record with no machine attestation, the proxy verifies its live team
-and owner association through the restricted database role after verifying the
-request token. Only confirmed absence establishes ordinary ownership. These
+ownerless record with no machine attestation, or an old VMD response that omits
+the ownership field and carries an ordinary creator UUID, the proxy verifies
+its live team and owner association through the restricted database role after
+verifying the request token. This supports proxy-first upgrades without treating
+the creator as ownership proof. Only confirmed absence establishes ordinary ownership. These
 reads have a 500ms deadline, share a bounded five-second cache, and never run
 per frame or during VM startup. Missing configuration or lookup failure denies
 access; explicit or contradictory machine attestations cannot be downgraded.

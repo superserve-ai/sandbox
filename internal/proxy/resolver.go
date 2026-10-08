@@ -39,6 +39,10 @@ type InstanceInfo struct {
 	// becomes ordinary by inference; legacy callers must receive an explicit
 	// ordinary attestation from a capable producer.
 	OwnershipState auth.OwnershipState
+	// Only old HTTP responses omit the field. Preserve that distinction so a
+	// creator-backed legacy record can obtain durable proof without weakening
+	// an explicit unknown or malformed attestation.
+	legacyOwnershipState bool
 	// MachineOwnerPrincipalID is the durable owner attestation returned by
 	// the control plane/VMD for machine-owned sandboxes. It is required for
 	// machine capability authorization; an absent value fails closed.
@@ -221,13 +225,13 @@ type vmdResponse struct {
 	OwnerID   string `json:"owner_id"`
 	// MachineOwned is an explicit control-plane/VMD attestation. The proxy
 	// never infers machine ownership from OwnerID or caller-provided metadata.
-	MachineOwned             bool                `json:"machine_owned"`
-	MachineOwnerPrincipalID  string              `json:"machine_owner_principal_id"`
-	OwnershipState           auth.OwnershipState `json:"ownership_state"`
-	PreviewAccess            string              `json:"preview_access"`
-	PreviewPorts             map[string]bool     `json:"preview_ports"`
-	PreviewPortAccess        map[string]string   `json:"preview_port_access"`
-	PreviewPortTokenVersions map[string]int64    `json:"preview_port_token_versions"`
+	MachineOwned             bool              `json:"machine_owned"`
+	MachineOwnerPrincipalID  string            `json:"machine_owner_principal_id"`
+	OwnershipState           json.RawMessage   `json:"ownership_state"`
+	PreviewAccess            string            `json:"preview_access"`
+	PreviewPorts             map[string]bool   `json:"preview_ports"`
+	PreviewPortAccess        map[string]string `json:"preview_port_access"`
+	PreviewPortTokenVersions map[string]int64  `json:"preview_port_token_versions"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64) (InstanceInfo, error) {
@@ -269,15 +273,26 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 		return InstanceInfo{}, fmt.Errorf("resolver: decode response: %w", err)
 	}
 
-	ownershipState := raw.OwnershipState
-	if ownershipState == "" {
+	var ownershipState auth.OwnershipState
+	legacyOwnershipState := len(raw.OwnershipState) == 0
+	if legacyOwnershipState {
 		ownershipState = auth.OwnershipUnknown
+	} else {
+		if err := json.Unmarshal(raw.OwnershipState, &ownershipState); err != nil {
+			return InstanceInfo{}, fmt.Errorf("resolver: invalid ownership attestation: %w", err)
+		}
+		switch ownershipState {
+		case auth.OwnershipUnknown, auth.OwnershipOrdinary, auth.OwnershipMachine:
+		default:
+			return InstanceInfo{}, errors.New("resolver: invalid ownership attestation")
+		}
 	}
 	info := InstanceInfo{
 		VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt,
 		TeamID: raw.TeamID, OwnerID: raw.OwnerID, MachineOwned: raw.MachineOwned,
 		MachineOwnerPrincipalID:  raw.MachineOwnerPrincipalID,
 		OwnershipState:           ownershipState,
+		legacyOwnershipState:     legacyOwnershipState,
 		PreviewAccess:            raw.PreviewAccess,
 		PreviewPorts:             decodePreviewPorts(raw.PreviewPorts),
 		PreviewPortAccess:        decodePreviewPortAccess(raw.PreviewPorts, raw.PreviewPortAccess),

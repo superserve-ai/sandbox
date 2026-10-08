@@ -112,8 +112,14 @@ func (a *CachedSandboxOwnership) lookup(ctx context.Context, sandboxID, teamID s
 }
 
 func (h *Handler) attestUnclassifiedSandbox(ctx context.Context, sandboxID string, info InstanceInfo) (InstanceInfo, error) {
-	if info.OwnershipState != auth.OwnershipUnknown || info.MachineOwned || info.MachineOwnerPrincipalID != "" || info.OwnerID != "" {
+	if info.OwnershipState != auth.OwnershipUnknown || info.MachineOwned || info.MachineOwnerPrincipalID != "" {
 		return info, nil
+	}
+	if info.OwnerID != "" {
+		creator, err := uuid.Parse(info.OwnerID)
+		if !info.legacyOwnershipState || err != nil || creator == uuid.Nil {
+			return info, nil
+		}
 	}
 	principal, err := h.sandboxOwnership.lookup(ctx, sandboxID, info.TeamID)
 	if err != nil {
