@@ -74,6 +74,9 @@ type x11Backend struct {
 	damage   damage.Damage
 	damaged  bool
 	watchSeq uint16
+	// readHook runs between snapshot's frame read and its event drain;
+	// tests use it to interleave repaints with that window.
+	readHook func()
 }
 
 // parseDisplay resolves a DISPLAY value to the socket to dial and the screen
@@ -374,6 +377,9 @@ func (b *x11Backend) snapshot() (frame *image.RGBA, hash uint64, raced bool, err
 	}
 	b.watchSeq = seq
 	b.damaged = false
+	if b.readHook != nil {
+		b.readHook()
+	}
 	if raced, err = b.drainEvents(); err != nil {
 		return nil, 0, false, err
 	}
@@ -426,8 +432,11 @@ func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadli
 			b.drawCursor(frame)
 			return frame, hash != baseline, nil
 		}
-		// Same pixels: an application repainted without visible change.
-		b.damaged = raced
+		// Same pixels: an application repainted without visible change. A
+		// report that arrived after this read, or a raced one, means the
+		// region is non-empty again and nothing further will be reported,
+		// so it must stay pending.
+		b.damaged = b.damaged || raced
 	}
 }
 

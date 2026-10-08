@@ -228,6 +228,71 @@ func TestDesktopStepWaitForChange_RealXServer(t *testing.T) {
 	}
 }
 
+// A repaint that lands after a snapshot's read but before its event drain
+// is the one DAMAGE will not report again (the region is already non-empty),
+// so a same-pixel repaint followed by a real one must not wait out the
+// settle. The hook interleaves both repaints into that window.
+func TestDesktopStepWaitForChange_RepaintDuringSnapshot_RealXServer(t *testing.T) {
+	for _, bin := range []string{"Xvnc", "xdotool", "xsetroot"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	display := startXvnc(t, 640, 480)
+	t.Setenv("DISPLAY", display)
+	paint := func(color string) {
+		t.Helper()
+		cmd := exec.Command("xsetroot", "-solid", color)
+		cmd.Env = append(os.Environ(), "DISPLAY="+display)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("xsetroot %s: %v: %s", color, err, out)
+		}
+	}
+	paint("#102030")
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := s.SendPointer(ctx, connect.NewRequest(&pb.PointerEvent{X: 100, Y: 100, Action: pb.PointerAction_POINTER_ACTION_MOVE})); err != nil {
+		t.Fatalf("SendPointer: %v", err)
+	}
+	backend := s.x11.backend
+	if backend == nil || backend.damage == 0 {
+		t.Fatal("no DAMAGE watch on the X11 backend")
+	}
+	reads := 0
+	backend.readHook = func() {
+		reads++
+		switch reads {
+		case 1: // arming: a repaint with identical pixels, reported after the read
+			paint("#102030")
+		case 2: // the capture after it: a real change, again after the read
+			paint("#ff0000")
+		default:
+			return
+		}
+		// Round-trip so the report is queued before the drain runs.
+		if _, err := xproto.GetInputFocus(backend.conn).Reply(); err != nil {
+			t.Errorf("sync after repaint: %v", err)
+		}
+	}
+	start := time.Now()
+	resp, err := s.Step(ctx, connect.NewRequest(&pb.StepRequest{
+		Actions: []*pb.Action{{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{
+			X: 101, Y: 100, Action: pb.PointerAction_POINTER_ACTION_MOVE,
+		}}}},
+		SettleMs: 1500, WaitForChange: true,
+	}))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	if resp.Msg.GetCaptureError() != "" || !resp.Msg.GetChanged() || elapsed > 500*time.Millisecond {
+		t.Fatalf("changed=%v capture_error=%q after %v (reads=%d), want the red frame well before the 1500ms bound",
+			resp.Msg.GetChanged(), resp.Msg.GetCaptureError(), elapsed, reads)
+	}
+	t.Logf("changed frame after %v with %d snapshot reads", elapsed, reads)
+}
+
 // Keyboard input against a real server, read back through a terminal: the
 // desktop helpers are hidden so only the XTest path can deliver it.
 func TestDesktopKeys_RealXServer(t *testing.T) {
