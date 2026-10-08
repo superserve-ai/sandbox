@@ -391,6 +391,7 @@ func seedFixture(t *testing.T) *fixture {
 		VALUES ($1, $2, $3, 'completed', $4)`, f.team, base, base.Add(time.Hour), base.Add(2*time.Hour))
 	mustExec(t, srcPool, `
 		INSERT INTO billing_rollup_team_backfill_state (team_id, next_hour_start) VALUES ($1, $2)`, f.team, base.Add(2*time.Hour))
+	mustExec(t, srcPool, `INSERT INTO billing_finalization_attempt(team_id,last_attempt_at) VALUES ($1,$2)`, f.team, base.Add(3*time.Hour))
 
 	mustExec(t, srcPool, `INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'tenant_usage_dashboard', true)`, f.team)
 	// Explicit TRUE rollup flag: the copy must hold dest rollups FALSE for
@@ -526,6 +527,7 @@ func seedFixture(t *testing.T) *fixture {
 		"billing_period_anomaly":                   1,
 		"billing_rollup_job":                       1,
 		"billing_rollup_team_backfill_state":       1,
+		"billing_finalization_attempt":             1,
 		"team_feature_flag":                        2,
 		"team_billing_account":                     0,
 		"team_storage_billing_activation":          0,
@@ -1098,6 +1100,11 @@ func TestTeamMigration(t *testing.T) {
 		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
 			t.Fatalf("copy: %v", err)
 		}
+		sourceAttempt := scanString(t, srcPool, `SELECT last_attempt_at::text FROM billing_finalization_attempt WHERE team_id=$1`, f.team)
+		destAttempt := scanString(t, dstPool, `SELECT last_attempt_at::text FROM billing_finalization_attempt WHERE team_id=$1`, f.team)
+		if sourceAttempt != destAttempt {
+			t.Fatalf("finalization priority changed during migration: source=%s dest=%s", sourceAttempt, destAttempt)
+		}
 		if got := scanString(t, dstPool, `SELECT routing_version::text FROM sandbox WHERE id = $1`, f.sb1); got != "1" {
 			t.Fatalf("new destination ownership version=%s, want 1", got)
 		}
@@ -1553,6 +1560,39 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("attempt priority merges without blocking validation", func(t *testing.T) {
+		destAttempt := time.Now().UTC().Truncate(time.Microsecond)
+		mustExec(t, dstPool, `UPDATE billing_finalization_attempt SET last_attempt_at=$2 WHERE team_id=$1`, f.team, destAttempt)
+		spec, ok := tableByName("billing_finalization_attempt")
+		if !ok {
+			t.Fatal("attempt state missing from migration manifest")
+		}
+		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, f.team, nil); err != nil {
+			t.Fatal(err)
+		}
+		assertAttempt := func(want time.Time) {
+			t.Helper()
+			var got time.Time
+			if err := dstPool.QueryRow(ctx, `SELECT last_attempt_at FROM billing_finalization_attempt WHERE team_id=$1`, f.team).Scan(&got); err != nil {
+				t.Fatal(err)
+			}
+			if !got.Equal(want) {
+				t.Fatalf("destination attempt = %v, want %v", got, want)
+			}
+		}
+		assertAttempt(destAttempt)
+		// A destination-only attempt can appear after copy without any billing change.
+		mustExec(t, srcPool, `DELETE FROM billing_finalization_attempt WHERE team_id=$1`, f.team)
+		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
+			t.Fatalf("independent attempt blocked validation: %v", err)
+		}
+		sourceAttempt := destAttempt.Add(time.Second)
+		mustExec(t, srcPool, `INSERT INTO billing_finalization_attempt(team_id,last_attempt_at) VALUES($1,$2)`, f.team, sourceAttempt)
+		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
+			t.Fatalf("advanced attempt blocked validation: %v", err)
+		}
+	})
+
 	t.Run("detach removes only the membership rows", func(t *testing.T) {
 		// Re-impose the copy's rollup hold on the dest (an earlier subtest
 		// released it via the standalone phase): detach is the cutover
@@ -1564,6 +1604,9 @@ func TestTeamMigration(t *testing.T) {
 		cfg.confirmTeamName = "migration-drill"
 		if err := run(ctx, cfg); err != nil {
 			t.Fatalf("detach: %v", err)
+		}
+		if sourceAttempt, destAttempt := scanString(t, srcPool, `SELECT last_attempt_at::text FROM billing_finalization_attempt WHERE team_id=$1`, f.team), scanString(t, dstPool, `SELECT last_attempt_at::text FROM billing_finalization_attempt WHERE team_id=$1`, f.team); sourceAttempt != destAttempt {
+			t.Fatalf("cutover lost latest attempt: source=%s dest=%s", sourceAttempt, destAttempt)
 		}
 
 		var rollups bool

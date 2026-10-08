@@ -227,7 +227,7 @@ func TestKeyArgs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := []string{"type", "--delay", "0", "--", "hello world"}
+		want := []string{"type", "--delay", "0", "--clearmodifiers", "--", "hello world"}
 		if !equalStrings(got, want) {
 			t.Errorf("keyArgs = %v, want %v", got, want)
 		}
@@ -1116,7 +1116,7 @@ exit 0
 		t.Fatalf("read log: %v", err)
 	}
 	want := "mousemove 10 20 click 1\n" +
-		"type --delay 0 -- hi\n" +
+		"type --delay 0 --clearmodifiers -- hi\n" +
 		"click --repeat 3 --delay 0 5\n"
 	if string(got) != want {
 		t.Errorf("xdotool invocations:\n%s\nwant:\n%s", got, want)
@@ -1189,7 +1189,7 @@ func TestCaptureScreenshot_RejectsOversizeFrame(t *testing.T) {
 	s := newDesktopService(&sandboxContext{})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	_, err := s.captureScreenshot(ctx)
+	_, err := s.captureScreenshot(ctx, nil)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("captureScreenshot: err = %v, want size-limit error", err)
 	}
@@ -1230,11 +1230,11 @@ func TestCaptureScreenshot_BoundedConcurrency(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := s.captureScreenshot(ctx); err == nil {
+	if _, err := s.captureScreenshot(ctx, nil); err == nil {
 		t.Fatal("capture ran with every slot taken")
 	}
 	<-s.captureSlots
-	if _, err := s.captureScreenshot(context.Background()); err != nil {
+	if _, err := s.captureScreenshot(context.Background(), nil); err != nil {
 		t.Fatalf("capture after a slot freed: %v", err)
 	}
 	if got := len(s.captureSlots); got != maxConcurrentCaptures-1 {
@@ -1344,6 +1344,27 @@ func TestStep_CaptureFailureIsReportedNotRaised(t *testing.T) {
 	}
 	if resp.Msg.GetScreenshot() != nil || resp.Msg.GetCaptureError() == "" {
 		t.Errorf("screenshot=%v capture_error=%q, want no frame and a capture error", resp.Msg.GetScreenshot(), resp.Msg.GetCaptureError())
+	}
+}
+
+// Without a display backend nothing can compare frames, so the request
+// degrades to the fixed settle it would have had otherwise.
+func TestStep_WaitForChangeWithoutX11KeepsTheSettle(t *testing.T) {
+	stepFakeBins(t, "")
+	client := newDesktopTestServer(t)
+	start := time.Now()
+	resp, err := client.Step(context.Background(), connect.NewRequest(&pb.StepRequest{
+		Actions: stepBatch(), SettleMs: 80, WaitForChange: true,
+	}))
+	if err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
+		t.Errorf("returned after %v, want the 80ms settle honored", elapsed)
+	}
+	if resp.Msg.GetChanged() || resp.Msg.GetScreenshot().GetWidth() != 5 || resp.Msg.GetCaptureError() != "" {
+		t.Errorf("changed=%v screenshot=%v capture_error=%q, want an unchanged frame",
+			resp.Msg.GetChanged(), resp.Msg.GetScreenshot(), resp.Msg.GetCaptureError())
 	}
 }
 

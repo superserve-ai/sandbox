@@ -176,7 +176,7 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 	var lastFrameHash uint64
 	for {
 		frameStart := time.Now()
-		img, err := s.captureScreenshot(ctx)
+		img, err := s.captureScreenshot(ctx, nil)
 		switch {
 		case ctx.Err() != nil:
 			// Best-effort; the client may already be gone.
@@ -274,7 +274,7 @@ func (s *desktopService) Screenshot(ctx context.Context, req *connect.Request[pb
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
 	}
-	resp, err := s.screenshotResponse(ctx, format)
+	resp, err := s.screenshotResponse(ctx, format, nil)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
@@ -293,8 +293,8 @@ func screenshotFormat(format pb.FrameFormat) (pb.FrameFormat, error) {
 
 // screenshotResponse captures one frame and reads its dimensions from the
 // PNG header. Shared by Screenshot and Step.
-func (s *desktopService) screenshotResponse(ctx context.Context, format pb.FrameFormat) (*pb.ScreenshotResponse, error) {
-	img, err := s.captureScreenshot(ctx)
+func (s *desktopService) screenshotResponse(ctx context.Context, format pb.FrameFormat, watch *frameWatch) (*pb.ScreenshotResponse, error) {
+	img, err := s.captureScreenshot(ctx, watch)
 	if err != nil {
 		return nil, err
 	}
@@ -310,11 +310,39 @@ func (s *desktopService) screenshotResponse(ctx context.Context, format pb.Frame
 	}, nil
 }
 
+// frameWatch is a change wait armed before a Step's actions: the frame hash
+// to compare against and how long to wait for a different one. changed is
+// set by the capture.
+type frameWatch struct {
+	baseline uint64
+	deadline time.Time
+	changed  bool
+}
+
+// armFrameWatch snapshots the display for a later change comparison. nil
+// means the backend cannot compare (no X11 connection or no DAMAGE), and
+// the caller keeps a fixed settle.
+func (s *desktopService) armFrameWatch(ctx context.Context) *frameWatch {
+	armCtx, cancel := context.WithTimeout(ctx, screenshotTimeout)
+	defer cancel()
+	w := &frameWatch{}
+	attempted, err := s.runX11(armCtx, func(_ context.Context, b *x11Backend) error {
+		var err error
+		w.baseline, err = b.armChangeWatch()
+		return err
+	})
+	if !attempted || err != nil {
+		return nil
+	}
+	return w
+}
+
 // captureScreenshot returns the current frame as PNG bytes: the persistent
 // X11 backend (in-process capture + encode, cursor composited) when
-// available, else ImageMagick's `import`. Bound to a per-capture timeout
-// derived from ctx so one wedged capture can't stall the stream forever.
-func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) {
+// available, else ImageMagick's `import`. With watch, the X11 capture waits
+// for a changed frame first. Bound to a per-capture timeout derived from
+// ctx so one wedged capture can't stall the stream forever.
+func (s *desktopService) captureScreenshot(ctx context.Context, watch *frameWatch) ([]byte, error) {
 	// One slot per capture on either backend: the X11 path also holds a
 	// full frame plus its PNG encoding in memory.
 	select {
@@ -328,8 +356,14 @@ func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) 
 	capCtx, cancel := context.WithTimeout(ctx, screenshotTimeout)
 	defer cancel()
 	var encoded []byte
-	attempted, err := s.runX11(capCtx, func(_ context.Context, b *x11Backend) error {
-		frame, err := b.Capture()
+	attempted, err := s.runX11(capCtx, func(ctx context.Context, b *x11Backend) error {
+		var frame *image.RGBA
+		var err error
+		if watch != nil {
+			frame, watch.changed, err = b.captureChanged(ctx, watch.baseline, watch.deadline)
+		} else {
+			frame, err = b.Capture()
+		}
 		if err != nil {
 			return err
 		}
@@ -346,6 +380,15 @@ func (s *desktopService) captureScreenshot(ctx context.Context) ([]byte, error) 
 		return nil, capCtx.Err()
 	}
 	// A read is safe to redo through the shell path.
+	if watch != nil {
+		// The backend that armed the watch is gone; the shell path cannot
+		// compare, so it keeps the settle instead.
+		select {
+		case <-time.After(time.Until(watch.deadline)):
+		case <-capCtx.Done():
+			return nil, capCtx.Err()
+		}
+	}
 
 	cmd, err := s.commandContext(capCtx, "import", "-window", "root", "png:-")
 	if err != nil {
@@ -548,13 +591,34 @@ func keyArgs(msg *pb.KeyEvent) ([]string, error) {
 		if len(in.Text) > maxTextLength || strings.IndexByte(in.Text, 0) >= 0 {
 			return nil, fmt.Errorf("text is invalid or exceeds %d bytes", maxTextLength)
 		}
+		text, err := normalizeKeyText(in.Text)
+		if err != nil {
+			return nil, err
+		}
 		// Modifiers don't apply to literal text entry. --delay 0 drops
 		// xdotool's default 12ms/char pacing, which is for human visibility;
-		// at that rate a long paste takes seconds.
-		return []string{"type", "--delay", "0", "--", in.Text}, nil
+		// at that rate a long paste takes seconds. --clearmodifiers lifts an
+		// active Caps or Shift Lock for the duration, so the text comes out
+		// as written (the X11 path does the same itself).
+		return []string{"type", "--delay", "0", "--clearmodifiers", "--", text}, nil
 	default:
 		return nil, errors.New("one of key or text is required")
 	}
+}
+
+// execKey delivers a validated key event through the persistent connection
+// when it can plan the keystrokes, else through xdotool. The X11 path only
+// declines before sending anything, so the fallback never replays input.
+func (s *desktopService) execKey(ctx context.Context, ev *pb.KeyEvent, fallbackArgs []string) error {
+	inputCtx, cancel := context.WithTimeout(ctx, xdotoolTimeout)
+	defer cancel()
+	attempted, err := s.runX11(inputCtx, func(_ context.Context, b *x11Backend) error {
+		return b.Key(ev)
+	})
+	if attempted && !errors.Is(err, errBackendKept) {
+		return err
+	}
+	return s.runXdotool(ctx, fallbackArgs...)
 }
 
 func (s *desktopService) SendKey(ctx context.Context, req *connect.Request[pb.KeyEvent]) (*connect.Response[pb.KeyResponse], error) {
@@ -564,7 +628,7 @@ func (s *desktopService) SendKey(ctx context.Context, req *connect.Request[pb.Ke
 	}
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
-	if err := s.runXdotool(ctx, args...); err != nil {
+	if err := s.execKey(ctx, req.Msg, args); err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&pb.KeyResponse{}), nil
@@ -659,7 +723,8 @@ func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, er
 			if err != nil {
 				return nil, fmt.Errorf("action %d: %w", i, err)
 			}
-			lowered[i] = func(ctx context.Context) error { return s.runXdotool(ctx, args...) }
+			ev := a.Key
+			lowered[i] = func(ctx context.Context) error { return s.execKey(ctx, ev, args) }
 		case *pb.Action_Scroll:
 			cmds, err := scrollCommands(a.Scroll.GetDx(), a.Scroll.GetDy())
 			if err != nil {
@@ -698,6 +763,9 @@ func (s *desktopService) SendActions(ctx context.Context, req *connect.Request[p
 // lock is held across it, so a long settle would stall every other input.
 const maxStepSettle = 2 * time.Second
 
+// defaultChangeWait bounds wait_for_change when the request sets no settle.
+const defaultChangeWait = time.Second
+
 func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepRequest]) (*connect.Response[pb.StepResponse], error) {
 	format, err := screenshotFormat(req.Msg.GetFormat())
 	if err != nil {
@@ -708,6 +776,9 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 		return nil, connect.NewError(connect.CodeInvalidArgument,
 			fmt.Errorf("settle_ms %d exceeds max %d", req.Msg.GetSettleMs(), maxStepSettle/time.Millisecond))
 	}
+	if req.Msg.GetWaitForChange() && settle == 0 {
+		settle = defaultChangeWait
+	}
 	lowered, err := s.lowerActions(req.Msg.GetActions())
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
@@ -717,6 +788,10 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 	// the state this batch produced and nothing that arrived after it.
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
+	var watch *frameWatch
+	if req.Msg.GetWaitForChange() {
+		watch = s.armFrameWatch(ctx)
+	}
 	resp := &pb.StepResponse{Executed: uint32(len(lowered))}
 	for i, run := range lowered {
 		if err := run(ctx); err != nil {
@@ -725,7 +800,9 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 			break
 		}
 	}
-	if settle > 0 {
+	if watch != nil {
+		watch.deadline = time.Now().Add(settle)
+	} else if settle > 0 {
 		select {
 		case <-time.After(settle):
 		case <-ctx.Done():
@@ -733,11 +810,12 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 	}
 	// Input already landed by now, so a capture failure is reported in the
 	// response rather than as an RPC error the caller might retry.
-	shot, err := s.screenshotResponse(ctx, format)
+	shot, err := s.screenshotResponse(ctx, format, watch)
 	if err != nil {
 		resp.CaptureError = err.Error()
 	} else {
 		resp.Screenshot = shot
+		resp.Changed = watch != nil && watch.changed
 	}
 	return connect.NewResponse(resp), nil
 }

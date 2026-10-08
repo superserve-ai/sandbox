@@ -2,9 +2,11 @@ package api
 
 import (
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func pageCtx(t *testing.T, rawQuery string) *gin.Context {
@@ -133,6 +135,30 @@ func TestResolveTotal(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("total = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseSandboxStatusFilter(t *testing.T) {
+	for _, tc := range []struct {
+		query   string
+		want    []db.SandboxStatus
+		invalid bool
+	}{
+		{"", nil, false}, {"status=", nil, false},
+		{"status=active", []db.SandboxStatus{"active"}, false},
+		{"status=active,paused&status=active,resuming", []db.SandboxStatus{"active", "paused", "resuming"}, false},
+		{"status=active,unknown", nil, true}, {"status=active,", nil, true},
+		{"status=active&status=", nil, true},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			got, err := parseSandboxStatusFilter(pageCtx(t, tc.query).Request.URL.Query()["status"])
+			if (err != nil) != tc.invalid {
+				t.Fatalf("error = %v, invalid = %v", err, tc.invalid)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("statuses = %v, want %v", got, tc.want)
 			}
 		})
 	}

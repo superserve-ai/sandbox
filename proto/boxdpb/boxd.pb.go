@@ -2508,7 +2508,15 @@ type StepRequest struct {
 	// Milliseconds to wait between the last action and the capture, for
 	// applications that repaint after the input lands. 0 captures immediately;
 	// values above the server maximum (currently 2000) are rejected.
-	SettleMs      uint32 `protobuf:"varint,3,opt,name=settle_ms,json=settleMs,proto3" json:"settle_ms,omitempty"`
+	// With wait_for_change this is the longest wait instead, and 0 selects
+	// the server default (currently 1000).
+	SettleMs uint32 `protobuf:"varint,3,opt,name=settle_ms,json=settleMs,proto3" json:"settle_ms,omitempty"`
+	// Capture the first frame whose pixels differ from the frame before the
+	// batch, rather than sleeping settle_ms. Returns once a repaint produced
+	// different pixels, or after settle_ms with the frame as it is then. A
+	// changed frame proves the display repainted, not that the application
+	// finished; callers still need their own completion checks.
+	WaitForChange bool `protobuf:"varint,4,opt,name=wait_for_change,json=waitForChange,proto3" json:"wait_for_change,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2564,6 +2572,13 @@ func (x *StepRequest) GetSettleMs() uint32 {
 	return 0
 }
 
+func (x *StepRequest) GetWaitForChange() bool {
+	if x != nil {
+		return x.WaitForChange
+	}
+	return false
+}
+
 // StepResponse keeps a failed action and a failed capture apart from each
 // other and from success, because input is not idempotent: neither outcome
 // may read as "nothing happened".
@@ -2577,7 +2592,10 @@ type StepResponse struct {
 	// Frame captured after the batch stopped; unset when capture failed.
 	Screenshot *ScreenshotResponse `protobuf:"bytes,3,opt,name=screenshot,proto3" json:"screenshot,omitempty"`
 	// Why no frame was captured. The executed actions were still delivered.
-	CaptureError  string `protobuf:"bytes,4,opt,name=capture_error,json=captureError,proto3" json:"capture_error,omitempty"`
+	CaptureError string `protobuf:"bytes,4,opt,name=capture_error,json=captureError,proto3" json:"capture_error,omitempty"`
+	// Whether the frame differs from the one before the batch. Only set when
+	// wait_for_change was requested and the display backend could compare.
+	Changed       bool `protobuf:"varint,5,opt,name=changed,proto3" json:"changed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2638,6 +2656,13 @@ func (x *StepResponse) GetCaptureError() string {
 		return x.CaptureError
 	}
 	return ""
+}
+
+func (x *StepResponse) GetChanged() bool {
+	if x != nil {
+		return x.Changed
+	}
+	return false
 }
 
 // Named DesktopResizeRequest/Response (not ResizeRequest/Response) to avoid
@@ -2865,18 +2890,20 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\vActionBatch\x124\n" +
 	"\aactions\x18\x01 \x03(\v2\x1a.superserve.boxd.v1.ActionR\aactions\"1\n" +
 	"\x13ActionBatchResponse\x12\x1a\n" +
-	"\bexecuted\x18\x01 \x01(\rR\bexecuted\"\x99\x01\n" +
+	"\bexecuted\x18\x01 \x01(\rR\bexecuted\"\xc1\x01\n" +
 	"\vStepRequest\x124\n" +
 	"\aactions\x18\x01 \x03(\v2\x1a.superserve.boxd.v1.ActionR\aactions\x127\n" +
 	"\x06format\x18\x02 \x01(\x0e2\x1f.superserve.boxd.v1.FrameFormatR\x06format\x12\x1b\n" +
-	"\tsettle_ms\x18\x03 \x01(\rR\bsettleMs\"\xba\x01\n" +
+	"\tsettle_ms\x18\x03 \x01(\rR\bsettleMs\x12&\n" +
+	"\x0fwait_for_change\x18\x04 \x01(\bR\rwaitForChange\"\xd4\x01\n" +
 	"\fStepResponse\x12\x1a\n" +
 	"\bexecuted\x18\x01 \x01(\rR\bexecuted\x12!\n" +
 	"\faction_error\x18\x02 \x01(\tR\vactionError\x12F\n" +
 	"\n" +
 	"screenshot\x18\x03 \x01(\v2&.superserve.boxd.v1.ScreenshotResponseR\n" +
 	"screenshot\x12#\n" +
-	"\rcapture_error\x18\x04 \x01(\tR\fcaptureError\"D\n" +
+	"\rcapture_error\x18\x04 \x01(\tR\fcaptureError\x12\x18\n" +
+	"\achanged\x18\x05 \x01(\bR\achanged\"D\n" +
 	"\x14DesktopResizeRequest\x12\x14\n" +
 	"\x05width\x18\x01 \x01(\rR\x05width\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\"\x17\n" +

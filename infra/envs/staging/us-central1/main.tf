@@ -203,6 +203,7 @@ module "api" {
   service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
+    COMPUTE_RESTRICTIONS_SOURCE = "database"
     API_PORT                    = "8080"
     TEAM_CREATION_REGION        = "use"
     TEAM_CREATION_PUBLIC_KEYS   = var.team_creation_public_keys
@@ -412,7 +413,9 @@ module "sandbox_host" {
   can_ip_forward        = true
 
   metadata = {
-    startup-script = <<-EOT
+    enable-osconfig = "TRUE"
+    enable-oslogin  = "TRUE"
+    startup-script  = <<-EOT
       #!/bin/bash
       # Restore runtime and private configuration before admission.
       # Identity-gated units prevent activation until identity is installed.
@@ -486,6 +489,8 @@ module "sandbox_host_b" {
   can_ip_forward = true
 
   metadata = {
+    enable-osconfig = "TRUE"
+    enable-oslogin  = "TRUE"
     # cloud-init runs bootcmd on every boot before any service starts, so
     # the identity is already this host's own by the time vmd can launch.
     # A daemon that came up under another host's HOST_ID would heartbeat
@@ -639,8 +644,9 @@ module "observability" {
 
   runbook_urls = module.alert_runbooks.urls
 
-  project_id  = local.project_id
-  environment = local.environment
+  project_id               = local.project_id
+  environment              = local.environment
+  notification_channel_ids = var.notification_channel_ids
   # Backup pipeline alerts, same set as the production cells so staging
   # validates the queries before they matter. The disabled-host alert
   # stays off here: staging toggles BACKUP_BUCKET deliberately.
@@ -666,6 +672,23 @@ module "observability" {
   host_disk_alerts = {
     host_id        = module.sandbox_host_b.instance_name
     display_prefix = "Infrastructure / ${module.sandbox_host_b.instance_name}"
+  }
+  host_logging_alerts = {
+    display_prefix = "Host logging / staging"
+    expected_hosts = {
+      sandbox_host = {
+        instance_name     = module.sandbox_host.instance_name
+        instance_id       = module.sandbox_host.instance_id
+        collector_host_id = module.sandbox_host.instance_name
+        # Pending retirement; retain policy definitions and export-error coverage.
+        freshness_alerts_enabled = false
+      }
+      sandbox_host_b = {
+        instance_name     = module.sandbox_host_b.instance_name
+        instance_id       = module.sandbox_host_b.instance_id
+        collector_host_id = module.sandbox_host_b.instance_name
+      }
+    }
   }
   dashboards = {
     sandbox_operations = {
@@ -716,6 +739,45 @@ module "observability" {
   labels = local.common_labels
 }
 
+# One dedicated zonal assignment owns the OTel logs service for both staging
+# serving hosts. The standalone OTel collector remains the application-metrics
+# path and is not modified here.
+module "host_logging" {
+  source = "../../../modules/host-logging"
+
+  project_id        = local.project_id
+  zone              = local.zone
+  environment       = local.environment
+  region            = local.region
+  assignment_name   = "superserve-otel-host-logging-us-central1-a"
+  legacy_transition = "preserve"
+  selector_labels = {
+    application = "sandbox-host"
+    environment = local.environment
+    region      = local.region
+  }
+  enrolled_hosts = {
+    sandbox_host = {
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
+      # This legacy host's provider identity is not available in Terraform;
+      # reconciliation defers to its installed identity file rather than
+      # fabricating one from the VM name.
+      host_id               = "deferred-to-installed-identity"
+      incarnation           = "deferred-to-installed-identity"
+      service_account_email = module.iam.service_account_emails["superserve_api"]
+    }
+    sandbox_host_b = {
+      instance_name         = module.sandbox_host_b.instance_name
+      instance_id           = module.sandbox_host_b.instance_id
+      host_id               = var.build_host_id
+      incarnation           = "installed-host-identity"
+      service_account_email = google_service_account.vmd_runtime.email
+    }
+  }
+  depends_on = [module.sandbox_host, module.sandbox_host_b, google_project_service.host_log_os_config, google_project_service.host_log_telemetry, google_project_iam_member.cd_host_logging, terraform_data.host_logging_enablement]
+}
+
 # Durability tier for the host's local artifacts (sandbox snapshots, template
 # builds); mirrors the production cells so the uploader and restore tooling
 # exercise the same IAM shape (write-only host, dedicated GC identity) before
@@ -752,4 +814,16 @@ resource "google_service_account_iam_member" "controlplane_backup_gc" {
   service_account_id = "projects/${local.project_id}/serviceAccounts/${module.backup_storage.gc_service_account_email}"
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = "serviceAccount:${google_service_account.controlplane_runtime.email}"
+}
+
+resource "google_project_service" "host_log_telemetry" {
+  project            = local.project_id
+  service            = "telemetry.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_project_service" "host_log_os_config" {
+  project            = local.project_id
+  service            = "osconfig.googleapis.com"
+  disable_on_destroy = false
 }

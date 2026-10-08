@@ -1015,22 +1015,34 @@ VALUES (
 RETURNING *;
 
 -- name: ListExportedTeamBillingPeriods :many
-WITH ranked AS (
+WITH exported_teams AS (
+    SELECT team_id, max(period_end) AS latest_exported_end
+    FROM team_billing_period
+    WHERE finalized_at IS NULL AND status = 'exported'
+    GROUP BY team_id
+), candidates AS MATERIALIZED (
+    -- Fence the expensive completeness check behind exported-team discovery.
+    -- Earlier unfinalized periods must still participate in team ordering.
+    SELECT p.*
+    FROM team_billing_period p
+    JOIN exported_teams e ON e.team_id = p.team_id
+    WHERE p.finalized_at IS NULL AND p.period_end <= e.latest_exported_end
+), ranked AS (
     SELECT
-        team_billing_period.*,
+        candidates.*,
         ROW_NUMBER() OVER (
             PARTITION BY team_id
             ORDER BY period_end ASC, period_start ASC
         ) AS team_rank
-    FROM team_billing_period
-    WHERE finalized_at IS NULL
-      AND storage_reports_complete_through(team_id, period_end)
+    FROM candidates
+    WHERE storage_reports_complete_through(team_id, period_end)
 )
-SELECT *
+SELECT ranked.*
 FROM ranked
+LEFT JOIN billing_finalization_attempt attempt ON attempt.team_id = ranked.team_id
 WHERE team_rank = 1
   AND status = 'exported'
-ORDER BY period_end ASC, period_start ASC, team_id ASC
+ORDER BY attempt.last_attempt_at ASC NULLS FIRST, period_end ASC, period_start ASC, ranked.team_id ASC
 LIMIT sqlc.arg(batch_size);
 
 -- name: GrantTeamCredit :one
@@ -1254,29 +1266,34 @@ ORDER BY g.team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ListTrialCreditWarningTeams :many
-WITH consuming_teams AS (
-    SELECT s.team_id
-    FROM sandbox s
-    WHERE s.destroyed_at IS NULL AND s.status = 'active'
-      AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-    UNION
-    SELECT i.team_id
-    FROM sandbox_storage_interval i
-    -- A zero-sized overlay can still retain billable shared artifacts.
-    WHERE i.ended_at IS NULL AND i.started_at < now()
-      AND i.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-      AND storage_billing_activated(i.team_id)
-    UNION
-    SELECT i.team_id FROM retained_storage_interval i
-    WHERE i.ended_at IS NULL AND i.started_at < now()
-      AND i.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-      AND storage_billing_activated(i.team_id)
+-- Fence the trial team set before evaluating activation or probing consumption;
+-- interval counts must not multiply per-team billing eligibility reads.
+WITH trial_teams AS MATERIALIZED (
+    SELECT DISTINCT g.team_id
+    FROM team_credit_grant g
+    LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+    WHERE a.trial_ended_at IS NULL
+      AND g.reason = 'signup trial credit'
+      AND g.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+), candidates AS MATERIALIZED (
+    SELECT team_id, storage_billing_activated(team_id) AS storage_active
+    FROM trial_teams
 )
 SELECT c.team_id
-FROM consuming_teams c
-LEFT JOIN team_billing_account a ON a.team_id = c.team_id
-WHERE a.trial_ended_at IS NULL
-  AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = c.team_id AND g.reason = 'signup trial credit')
+FROM candidates c
+WHERE EXISTS (
+    SELECT 1 FROM sandbox s
+    WHERE s.team_id = c.team_id AND s.destroyed_at IS NULL AND s.status = 'active'
+) OR (c.storage_active AND (
+    -- A zero-sized overlay can still retain billable shared artifacts.
+    -- Ordered probes keep negative lookups on team indexes under fleet skew.
+    (SELECT i.sandbox_id FROM sandbox_storage_interval i
+     WHERE i.team_id = c.team_id AND i.ended_at IS NULL AND i.started_at < now()
+     ORDER BY i.sandbox_id LIMIT 1) IS NOT NULL
+    OR (SELECT i.started_at FROM retained_storage_interval i
+        WHERE i.team_id = c.team_id AND i.ended_at IS NULL AND i.started_at < now()
+        ORDER BY i.started_at LIMIT 1) IS NOT NULL
+))
 ORDER BY c.team_id
 LIMIT sqlc.arg(batch_limit);
 

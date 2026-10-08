@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/netip"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -155,11 +154,12 @@ type Handlers struct {
 	SignupRestrictions    *abuse.SignupEvaluator
 	VMD                   VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
 	DB                    *db.Queries
-	Pool                  *pgxpool.Pool    // required by paths that need their own transaction (e.g. build-concurrency admission)
-	PromotionAuthPool     *pgxpool.Pool    // shared Auth source of original signup evidence
-	legacyStorageAccepted sync.Map         // legacyStorageAckKey -> last durably accepted report ID
-	legacyStorageInFlight sync.Map         // legacyStorageAckKey -> report ID with an active inline attempt or retry
-	BackupGC              backup.BlobAdmin // deletes from the cell's backup bucket; nil leaves the purge job off
+	Pool                  *pgxpool.Pool                         // required by paths that need their own transaction (e.g. build-concurrency admission)
+	beginReaperTx         func(context.Context) (pgx.Tx, error) // nil outside tests; the reaper opens its own from Pool
+	PromotionAuthPool     *pgxpool.Pool                         // shared Auth source of original signup evidence
+	legacyStorageAccepted sync.Map                              // legacyStorageAckKey -> last durably accepted report ID
+	legacyStorageInFlight sync.Map                              // legacyStorageAckKey -> report ID with an active inline attempt or retry
+	BackupGC              backup.BlobAdmin                      // deletes from the cell's backup bucket; nil leaves the purge job off
 	Config                *config.Config
 	Hosts                 HostRegistry // when set, routes VMD calls via host_id
 	Scheduler             Scheduler    // when set, picks host on create
@@ -2364,9 +2364,7 @@ var sandboxSortColumns = []string{"created_at", "name", "status"}
 
 // sandboxStatusFilterValues are the values ListSandboxes accepts for
 // `?status=`, sourced from the sqlc-generated sandbox_status constants. An
-// unknown value would silently match zero rows in the SQL's text comparison,
-// so the handler rejects it with a 400 instead — mirroring the owner filter
-// on /templates.
+// unknown value is rejected with a 400 before the database enum conversion.
 var sandboxStatusFilterValues = []string{
 	string(db.SandboxStatusStarting),
 	string(db.SandboxStatusActive),
@@ -2418,11 +2416,9 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
-	statusFilter := nullableStr(c.Query("status"))
-	if statusFilter != nil && !slices.Contains(sandboxStatusFilterValues, *statusFilter) {
-		respondErrorMsg(c, "bad_request",
-			"status must be one of: "+strings.Join(sandboxStatusFilterValues, ", "),
-			http.StatusBadRequest)
+	statusFilter, err := parseSandboxStatusFilter(c.Request.URL.Query()["status"])
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 	nameSearch := searchTerm(c.Query("q"))
@@ -2446,7 +2442,7 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		rows, err = h.DB.ListSandboxesByTeamCreatedAsc(ctx, db.ListSandboxesByTeamCreatedAscParams{
 			TeamID:     teamID,
 			Metadata:   metadataJSON,
-			Status:     statusFilter,
+			Statuses:   statusFilter,
 			NameSearch: nameSearch,
 			RowOffset:  pg.Offset,
 			RowLimit:   pg.Limit,
@@ -2460,7 +2456,7 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		rows, err = h.DB.ListSandboxesByTeamCreatedDesc(ctx, db.ListSandboxesByTeamCreatedDescParams{
 			TeamID:     teamID,
 			Metadata:   metadataJSON,
-			Status:     statusFilter,
+			Statuses:   statusFilter,
 			NameSearch: nameSearch,
 			RowOffset:  pg.Offset,
 			RowLimit:   pg.Limit,
@@ -2474,7 +2470,7 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		rows, err = h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
 			TeamID:     teamID,
 			Metadata:   metadataJSON,
-			Status:     statusFilter,
+			Statuses:   statusFilter,
 			NameSearch: nameSearch,
 			SortBy:     pg.SortBy,
 			SortDir:    pg.SortDir,
@@ -2496,7 +2492,7 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		return h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
 			TeamID:     teamID,
 			Metadata:   metadataJSON,
-			Status:     statusFilter,
+			Statuses:   statusFilter,
 			NameSearch: nameSearch,
 		})
 	})
