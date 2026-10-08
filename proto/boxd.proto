@@ -338,7 +338,15 @@ message StepRequest {
   // Milliseconds to wait between the last action and the capture, for
   // applications that repaint after the input lands. 0 captures immediately;
   // values above the server maximum (currently 2000) are rejected.
+  // With wait_for_change this is the longest wait instead, and 0 selects
+  // the server default (currently 1000).
   uint32 settle_ms = 3;
+  // Capture the first frame whose pixels differ from the frame before the
+  // batch, rather than sleeping settle_ms. Returns once a repaint produced
+  // different pixels, or after settle_ms with the frame as it is then. A
+  // changed frame proves the display repainted, not that the application
+  // finished; callers still need their own completion checks.
+  bool wait_for_change = 4;
 }
 
 // StepResponse keeps a failed action and a failed capture apart from each
@@ -354,6 +362,9 @@ message StepResponse {
   ScreenshotResponse screenshot = 3;
   // Why no frame was captured. The executed actions were still delivered.
   string capture_error = 4;
+  // Whether the frame differs from the one before the batch. Only set when
+  // wait_for_change was requested and the display backend could compare.
+  bool changed = 5;
 }
 
 // Named DesktopResizeRequest/Response (not ResizeRequest/Response) to avoid

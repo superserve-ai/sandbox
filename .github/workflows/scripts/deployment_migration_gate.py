@@ -14,6 +14,7 @@ MIGRATION_INPUTS = (
     "supabase/migrations", "supabase/shared-auth-history", "supabase/shared-auth-migrations",
     "supabase/recovery", "scripts/migrate_database.py", "scripts/retained_storage_recovery.py",
     "scripts/recovery_evidence.py", "scripts/migration-requirements.txt",
+    "scripts/snapshot_reference_index.py",
 )
 
 
