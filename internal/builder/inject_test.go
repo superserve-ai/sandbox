@@ -334,8 +334,24 @@ func TestChooseAptMirror(t *testing.T) {
 	if got, outcome := chooseAptMirror(ctx, "", metadata.URL, ownOnly, 5*time.Second); got != "europe-west1.gce.archive.ubuntu.com" || outcome != "own_region" || probes.Load() != 1 {
 		t.Errorf("own region passing: got %q (%s) after %d probes, want it alone", got, outcome, probes.Load())
 	}
-	hang := func(ctx context.Context, _ string) bool { <-ctx.Done(); return false }
+	// Among the other regions the first to pass wins: a slow probe ahead of
+	// it in the list does not hold the selection.
+	slowThenFast := func(ctx context.Context, host string) bool {
+		if host == "us-west1.gce.archive.ubuntu.com" {
+			return true
+		}
+		<-ctx.Done()
+		return false
+	}
 	start := time.Now()
+	if got, outcome := chooseAptMirror(ctx, "", metadata.URL, slowThenFast, 5*time.Second); got != "us-west1.gce.archive.ubuntu.com" || outcome != "other_region" {
+		t.Errorf("fast later region: got %q (%s)", got, outcome)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("fast later region took %v, want no wait on the slow regions ahead of it", elapsed)
+	}
+	hang := func(ctx context.Context, _ string) bool { <-ctx.Done(); return false }
+	start = time.Now()
 	if got, outcome := chooseAptMirror(ctx, "", metadata.URL, hang, 200*time.Millisecond); got != fallbackAptMirror || outcome != "fallback" {
 		t.Errorf("every probe hanging: got %q (%s), want the fallback", got, outcome)
 	}

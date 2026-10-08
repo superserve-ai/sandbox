@@ -63,21 +63,24 @@ func chooseAptMirror(ctx context.Context, override, metadataURL string, transfer
 	if own := region + ".gce.archive.ubuntu.com"; transfers(ctx, own) {
 		return own, "own_region"
 	}
-	// The healthy case costs one probe; only a failing region fans out.
-	var others []string
+	// The healthy case costs one probe; only a failing region fans out, and
+	// the first region to pass wins so a slow probe never holds up a fast one.
+	type result struct {
+		host string
+		ok   bool
+	}
+	results := make(chan result, len(gceMirrorRegions))
+	n := 0
 	for _, r := range gceMirrorRegions {
-		if r != region {
-			others = append(others, r+".gce.archive.ubuntu.com")
+		if r == region {
+			continue
 		}
+		n++
+		go func(host string) { results <- result{host, transfers(ctx, host)} }(r + ".gce.archive.ubuntu.com")
 	}
-	results := make([]chan bool, len(others))
-	for i, host := range others {
-		results[i] = make(chan bool, 1)
-		go func(host string, out chan<- bool) { out <- transfers(ctx, host) }(host, results[i])
-	}
-	for i, host := range others {
-		if <-results[i] {
-			return host, "other_region"
+	for ; n > 0; n-- {
+		if res := <-results; res.ok {
+			return res.host, "other_region"
 		}
 	}
 	return fallbackAptMirror, "fallback"
