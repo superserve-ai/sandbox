@@ -57,6 +57,25 @@ func (q *Queries) ActivateTeamBilling(ctx context.Context, arg ActivateTeamBilli
 	return err
 }
 
+const advanceSweepCursor = `-- name: AdvanceSweepCursor :exec
+UPDATE sweep_lease
+SET cursor_id = $1, updated_at = now()
+WHERE name = $2 AND locked_by = $3
+`
+
+type AdvanceSweepCursorParams struct {
+	CursorID pgtype.UUID `json:"cursor_id"`
+	Name     string      `json:"name"`
+	LockedBy string      `json:"locked_by"`
+}
+
+// Guarded by holder: a replica whose lease lapsed mid-page must not move
+// the cursor its successor is already working from.
+func (q *Queries) AdvanceSweepCursor(ctx context.Context, arg AdvanceSweepCursorParams) error {
+	_, err := q.db.Exec(ctx, advanceSweepCursor, arg.CursorID, arg.Name, arg.LockedBy)
+	return err
+}
+
 const applyTeamCreditGrant = `-- name: ApplyTeamCreditGrant :one
 UPDATE team_credit_grant
 SET remaining_usd = remaining_usd - $1,
@@ -413,6 +432,34 @@ func (q *Queries) ClaimStripeWebhookProcessingLease(ctx context.Context, arg Cla
 	var token uuid.UUID
 	err := row.Scan(&token)
 	return token, err
+}
+
+const claimSweepLease = `-- name: ClaimSweepLease :one
+INSERT INTO sweep_lease (name, locked_by, locked_until)
+VALUES ($1, $2, now() + make_interval(secs => $3::int))
+ON CONFLICT (name) DO UPDATE
+SET locked_by = EXCLUDED.locked_by,
+    locked_until = EXCLUDED.locked_until,
+    updated_at = now()
+WHERE sweep_lease.locked_until <= now()
+   OR sweep_lease.locked_by = EXCLUDED.locked_by
+RETURNING cursor_id
+`
+
+type ClaimSweepLeaseParams struct {
+	Name         string `json:"name"`
+	LockedBy     string `json:"locked_by"`
+	LeaseSeconds int32  `json:"lease_seconds"`
+}
+
+// One statement decides election and hands back the shared page position.
+// The WHERE admits only an expired lease or the current holder, and the
+// verdict is whether a row came back, so two contenders cannot both win.
+func (q *Queries) ClaimSweepLease(ctx context.Context, arg ClaimSweepLeaseParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, claimSweepLease, arg.Name, arg.LockedBy, arg.LeaseSeconds)
+	var cursor_id pgtype.UUID
+	err := row.Scan(&cursor_id)
+	return cursor_id, err
 }
 
 const claimTeamCommercialBillingAnchor = `-- name: ClaimTeamCommercialBillingAnchor :one
