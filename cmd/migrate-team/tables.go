@@ -127,10 +127,11 @@ var migratedTables = []tableSpec{
 	{"retained_storage_cutover", "team_id = $1"},
 	{"retained_storage_interval", "team_id = $1"},
 	{"retained_storage_measurement_obligation", "team_id = $1"},
+	// Period state must precede cached usage so frozen imports retain their quantity.
+	{"team_billing_period", "team_id = $1"},
 	{"team_billing_usage", "team_id = $1"},
 	{"team_billing_usage_hourly", "team_id = $1"},
 	{"billing_finalization_attempt", "team_id = $1"},
-	{"team_billing_period", "team_id = $1"},
 	{"billing_period_anomaly", "team_id = $1"},
 	{"billing_rollup_job", "team_id = $1"},
 	{"billing_rollup_team_backfill_state", "team_id = $1"},
@@ -177,4 +178,17 @@ func tableByName(name string) (tableSpec, bool) {
 		}
 	}
 	return tableSpec{}, false
+}
+
+// sourceRowExpression freezes uncaptured source semantics in the copied row.
+// The checksum path uses exactly the same expression; no source rows mutate.
+func sourceRowExpression(table string) string {
+	switch table {
+	case "template":
+		return `to_jsonb(t)||jsonb_build_object('legacy_storage_rootfs_ref',COALESCE(t.legacy_storage_rootfs_ref,jsonb_build_object('path',t.rootfs_path,'snapshot',t.snapshot_path,'mem',t.mem_path)))`
+	case "sandbox":
+		return `to_jsonb(t)||jsonb_build_object('legacy_storage_refs',legacy_storage_reference(t.template_id,t.base_path,t.delta_path,t.legacy_storage_refs,t.snapshot_path,t.mem_path))`
+	default:
+		return "to_jsonb(t)"
+	}
 }

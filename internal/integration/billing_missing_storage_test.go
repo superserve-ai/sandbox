@@ -26,10 +26,10 @@ func TestIntegration_BillingMissingLegacyStorage(t *testing.T) {
 		{"tracking only", false, -1, false, http.StatusOK},
 		{"subscribed without storage activation", true, -1, false, http.StatusOK},
 		{"missing history before activation", true, 2 * time.Hour, false, http.StatusOK},
-		{"missing billable measurements", true, 0, false, http.StatusServiceUnavailable},
+		{"missing billable measurements", true, 0, false, http.StatusOK},
 		{"measured zero", false, -1, true, http.StatusOK},
 		{"placeholder without activation", true, -1, false, http.StatusOK},
-		{"placeholder with activation", true, 0, false, http.StatusServiceUnavailable},
+		{"placeholder with activation", true, 0, false, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			team, key, _ := seedTeamAndKeyWithRole(t, "viewer")
@@ -89,12 +89,6 @@ func TestIntegration_BillingMissingLegacyStorage(t *testing.T) {
 				w := do(router, http.MethodGet, path, key, "")
 				if w.Code != tc.wantStatus {
 					t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
-				}
-				if tc.wantStatus == http.StatusServiceUnavailable {
-					if !strings.Contains(w.Body.String(), "storage_unavailable") {
-						t.Fatalf("missing billable usage must fail closed: %s", w.Body.String())
-					}
-					continue
 				}
 				var body map[string]any
 				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {

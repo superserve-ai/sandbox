@@ -97,7 +97,10 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
 storage AS (
- SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)::numeric AS storage_mib_seconds
+ SELECT CASE WHEN d.complete AND NOT d.blocked THEN d.known_mib_seconds END::numeric AS storage_mib_seconds,
+ CASE WHEN NOT d.blocked THEN d.known_mib_seconds END::numeric AS known_storage_mib_seconds,
+ d.complete::boolean AS storage_complete,d.blocked::boolean AS storage_blocked
+ FROM storage_usage_detail(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz) d
 )
 SELECT
     sqlc.arg(team_id)::uuid AS team_id,
@@ -106,6 +109,8 @@ SELECT
     compute.vcpu_seconds,
     (compute.memory_mib_seconds / 1024.0)::numeric AS memory_gib_seconds,
     (storage.storage_mib_seconds / 1024.0)::numeric AS storage_gib_seconds,
+    (storage.known_storage_mib_seconds / 1024.0)::numeric AS known_storage_gib_seconds,
+    storage.storage_complete,storage.storage_blocked,
     (billable_storage_mib_seconds(sqlc.arg(team_id),sqlc.arg(period_start),sqlc.arg(period_end))/1024.0)::numeric AS billable_storage_gib_seconds
 FROM compute, storage;
 
@@ -141,7 +146,8 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
 storage AS (
- SELECT billable_storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)::numeric AS storage_mib_seconds
+ SELECT CASE WHEN NOT d.blocked THEN d.known_mib_seconds END::numeric AS storage_mib_seconds,
+ d.complete::boolean AS storage_complete FROM billable_storage_usage_detail(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz) d
 ),
 usage AS (
     SELECT
@@ -150,13 +156,13 @@ usage AS (
         sqlc.arg(period_end)::timestamptz AS period_end,
         compute.vcpu_seconds,
         compute.memory_mib_seconds,
-        storage.storage_mib_seconds
+        storage.storage_mib_seconds,storage.storage_complete
     FROM compute, storage
 ),
 upserted AS (
     INSERT INTO team_billing_usage (
         team_id, period_start, period_end,
-        vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+        vcpu_seconds, memory_mib_seconds, storage_mib_seconds, storage_complete
     )
     SELECT
         usage.team_id,
@@ -164,7 +170,7 @@ upserted AS (
         usage.period_end,
         usage.vcpu_seconds,
         usage.memory_mib_seconds,
-        usage.storage_mib_seconds
+        usage.storage_mib_seconds,usage.storage_complete
     FROM usage
     WHERE NOT EXISTS (
         SELECT 1
@@ -184,12 +190,13 @@ upserted AS (
     SET vcpu_seconds = EXCLUDED.vcpu_seconds,
         memory_mib_seconds = EXCLUDED.memory_mib_seconds,
         storage_mib_seconds = EXCLUDED.storage_mib_seconds,
+        storage_complete = EXCLUDED.storage_complete,
         updated_at = now()
     WHERE team_billing_usage.finalized_at IS NULL
       AND team_billing_usage.exported_at IS NULL
     RETURNING
         team_id, period_start, period_end,
-        vcpu_seconds, memory_mib_seconds, storage_mib_seconds,
+        vcpu_seconds, memory_mib_seconds, storage_mib_seconds, storage_complete,
         finalized_at, exported_at, updated_at
 ),
 immutable_existing AS (
@@ -199,7 +206,7 @@ immutable_existing AS (
         existing.period_end,
         existing.vcpu_seconds,
         existing.memory_mib_seconds,
-        existing.storage_mib_seconds,
+        existing.storage_mib_seconds,existing.storage_complete,
         existing.finalized_at,
         existing.exported_at,
         existing.updated_at
@@ -242,7 +249,9 @@ WITH compute AS (
       AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
 ),
 storage AS (
- SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(hour_start)::timestamptz,sqlc.arg(hour_end)::timestamptz)::numeric AS storage_mib_seconds
+ SELECT CASE WHEN d.complete AND NOT d.blocked THEN d.known_mib_seconds END::numeric AS storage_mib_seconds,
+ d.known_mib_seconds::numeric AS known_storage_mib_seconds,d.complete::boolean AS storage_complete,d.blocked::boolean AS storage_blocked
+ FROM storage_usage_detail(sqlc.arg(team_id)::uuid,sqlc.arg(hour_start)::timestamptz,sqlc.arg(hour_end)::timestamptz) d
 ),
 usage AS (
     SELECT
@@ -251,15 +260,15 @@ usage AS (
         sqlc.arg(hour_end)::timestamptz AS hour_end,
         compute.vcpu_seconds,
         compute.memory_mib_seconds,
-        storage.storage_mib_seconds
+        storage.storage_mib_seconds,storage.known_storage_mib_seconds,storage.storage_complete
     FROM compute, storage
     WHERE feature_enabled('billing_hourly_rollups', sqlc.arg(team_id)::uuid)
       AND storage_reports_complete_through(sqlc.arg(team_id)::uuid, sqlc.arg(hour_end)::timestamptz)
-      AND storage.storage_mib_seconds IS NOT NULL
+      AND NOT storage.storage_blocked
 )
 INSERT INTO team_billing_usage_hourly (
     team_id, hour_start, hour_end,
-    vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+    vcpu_seconds, memory_mib_seconds, storage_mib_seconds,known_storage_mib_seconds,storage_complete
 )
 SELECT
     usage.team_id,
@@ -267,13 +276,14 @@ SELECT
     usage.hour_end,
     usage.vcpu_seconds,
     usage.memory_mib_seconds,
-    usage.storage_mib_seconds
+    usage.storage_mib_seconds,usage.known_storage_mib_seconds,usage.storage_complete
 FROM usage
 ON CONFLICT (team_id, hour_start) DO UPDATE
 SET hour_end = EXCLUDED.hour_end,
     vcpu_seconds = EXCLUDED.vcpu_seconds,
     memory_mib_seconds = EXCLUDED.memory_mib_seconds,
     storage_mib_seconds = EXCLUDED.storage_mib_seconds,
+    known_storage_mib_seconds=EXCLUDED.known_storage_mib_seconds,storage_complete=EXCLUDED.storage_complete,
     updated_at = now()
 RETURNING *;
 
@@ -1167,7 +1177,7 @@ FROM recent_compute b
  UNION ALL SELECT started_at,COALESCE(ended_at,now()) FROM recent_retained WHERE started_at<now()
   ) intervals
 )
-SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 OR (SELECT count(*) FROM recent_retained)>1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated(sqlc.arg(team_id)) THEN storage_mib_seconds(sqlc.arg(team_id)::uuid,GREATEST((SELECT started_at FROM sample_window),(SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id))),now())/1024.0*rates.storage ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
+SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 OR (SELECT count(*) FROM recent_retained)>1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated(sqlc.arg(team_id)) THEN billable_storage_mib_seconds(sqlc.arg(team_id)::uuid,GREATEST((SELECT started_at FROM sample_window),(SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id))),now())/1024.0*rates.storage ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
        sample_bounds.started_at, sample_bounds.ended_at,
        EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
 FROM compute, rates, sample_bounds;
@@ -1452,10 +1462,12 @@ JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_en
  GROUP BY b.bucket_start,b.bucket_end
 ), storage AS (
  SELECT b.bucket_start,b.bucket_end,
- storage_mib_seconds(sqlc.arg(team_id)::uuid,b.bucket_start,b.bucket_end,false)::numeric AS storage_mib_seconds
- FROM buckets b
+ CASE WHEN d.complete AND NOT d.blocked THEN d.known_mib_seconds END::numeric AS storage_mib_seconds,
+ CASE WHEN NOT d.blocked THEN d.known_mib_seconds END::numeric AS known_storage_mib_seconds,
+ d.complete::boolean AS storage_complete,d.blocked::boolean AS storage_blocked
+ FROM buckets b CROSS JOIN LATERAL storage_usage_detail(sqlc.arg(team_id)::uuid,b.bucket_start,b.bucket_end,false) d
 )
-SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(billable_storage_mib_seconds(sqlc.arg(team_id),c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
+SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(s.known_storage_mib_seconds/1024.0)::numeric known_storage_gib_seconds,s.storage_complete,s.storage_blocked,(billable_storage_mib_seconds(sqlc.arg(team_id),c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
 
 

@@ -364,7 +364,7 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 		RETURNING id`, teamID, artifactPath).Scan(&templateID); err != nil {
 		t.Fatalf("seed artifact warning template: %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `
+	if _, err := seedLegacyStoragePins(t, ctx, `
 		UPDATE sandbox SET template_id = $2, base_path = $3 WHERE id = $1`, sandboxID, templateID, artifactPath); err != nil {
 		t.Fatalf("seed artifact warning sandbox template: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 		t.Fatalf("seed retained artifact usage: %v", err)
 	}
 	sharedSandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "trial-warning-artifact-shared")
-	if _, err := testPool.Exec(ctx, `
+	if _, err := seedLegacyStoragePins(t, ctx, `
 		UPDATE sandbox SET template_id = $2, base_path = $3 WHERE id = $1`, sharedSandboxID, templateID, artifactPath); err != nil {
 		t.Fatalf("seed shared artifact warning sandbox template: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 	if err != nil || !spent.Valid || spent.Float64 < 21599 || spent.Float64 > 21601 {
 		t.Fatalf("artifact-only spend = %v, error = %v, want 21600 USD", spent, err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET template_id = NULL WHERE team_id = $1`, teamID); err != nil {
+	if _, err := seedLegacyStoragePins(t, ctx, `UPDATE sandbox SET template_id = NULL WHERE team_id = $1`, teamID); err != nil {
 		t.Fatal(err)
 	}
 	sample, err = testQueries.GetRecentTrialBurnSample(ctx, teamID)
@@ -462,7 +462,7 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 		t.Fatalf("unresolved retained base returned numeric spend: %v", sample.SpentUsd)
 	}
 	// Removing the template link does not release the retained base path.
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET base_path = NULL WHERE team_id = $1`, teamID); err != nil {
+	if _, err := seedLegacyStoragePins(t, ctx, `UPDATE sandbox SET base_path = NULL WHERE team_id = $1`, teamID); err != nil {
 		t.Fatal(err)
 	}
 	sample, err = testQueries.GetRecentTrialBurnSample(ctx, teamID)

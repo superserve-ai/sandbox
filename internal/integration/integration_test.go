@@ -3816,7 +3816,7 @@ func TestIntegration_GetTeamBillingUsageDeduplicatesSharedArtifact(t *testing.T)
 	const artifactPath = "/tmp/test/shared-rootfs.ext4"
 	const artifactBytes = int64(8 * 1024 * 1024)
 	for i, sandboxID := range sandboxIDs {
-		if _, err := testPool.Exec(ctx, `
+		if _, err := seedLegacyStoragePins(t, ctx, `
 			UPDATE sandbox
 			SET created_at = $2, base_path = $4, delta_path = NULL
 			WHERE id = $1 AND team_id = $3
@@ -3887,7 +3887,7 @@ func TestIntegration_GetTeamBillingUsageStartsArtifactRetentionAtStorageBoundary
 	periodEnd := periodStart.Add(time.Minute)
 	const artifactPath = "/tmp/test/boundary-rootfs.ext4"
 	const artifactBytes = int64(8 * 1024 * 1024)
-	if _, err := testPool.Exec(ctx, `
+	if _, err := seedLegacyStoragePins(t, ctx, `
 		UPDATE sandbox
 		SET created_at = $2, base_path = $4, delta_path = NULL
 		WHERE id = $1 AND team_id = $3
@@ -3955,7 +3955,7 @@ func TestIntegration_GetTeamBillingUsagePreservesUnmeasuredArtifact(t *testing.T
 	periodEnd := periodStart.Add(time.Minute)
 	const artifactPath = "/tmp/test/unmeasured-rootfs.ext4"
 	const logicalArtifactBytes = int64(64 * 1024 * 1024)
-	if _, err := testPool.Exec(ctx, `
+	if _, err := seedLegacyStoragePins(t, ctx, `
 		UPDATE sandbox
 		SET created_at = $2, base_path = $4, delta_path = NULL
 		WHERE id = $1 AND team_id = $3

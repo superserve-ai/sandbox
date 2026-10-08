@@ -380,9 +380,10 @@ func seedFixture(t *testing.T) *fixture {
 			INSERT INTO team_billing_usage_hourly (team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds)
 			VALUES ($1, $2, $3, 1800.5, 1843712.25, 7372800.125)`, f.team, hour, hour.Add(time.Hour))
 	}
+	// Re-copy supports an already-frozen close; mutable overlaps are refused.
 	mustExec(t, srcPool, `
 		INSERT INTO team_billing_period (team_id, period_start, period_end, status, approved_by, approved_at)
-		VALUES ($1, $2, $3, 'approved', $4, $5)`, f.team, base, base.Add(24*time.Hour), f.owner, base.Add(25*time.Hour))
+		VALUES ($1, $2, $3, 'exporting', $4, $5)`, f.team, base, base.Add(24*time.Hour), f.owner, base.Add(25*time.Hour))
 	mustExec(t, srcPool, `
 		INSERT INTO billing_period_anomaly (team_id, period_start, period_end, severity, kind, sandbox_id)
 		VALUES ($1, $2, $3, 'warning', 'drill', $4)`, f.team, base, base.Add(24*time.Hour), f.sb1)

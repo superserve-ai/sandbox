@@ -43,7 +43,7 @@ func TestRetainedStorageSeriesPreservesFractionalLegacyArtifacts(t *testing.T) {
 	const path = "/example/fractional-rootfs.ext4"
 	exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES($1,$2,$3,$4,'pause')`,
 		snapshot, f.sandboxID, team, "/example/fractional-snapshot")
-	exec(`UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`,
+	seedLegacyStoragePinsExec(t, `UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`,
 		f.sandboxID, start, snapshot, path)
 	exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
  VALUES($1,'rootfs.ext4',$2,1048576,4096,$3)`, snapshot, path, strings.Repeat("0", 64))
@@ -119,7 +119,7 @@ func TestRetainedStorageLegacyArtifactUnionPreservesPreCutoverHistory(t *testing
  VALUES($1,$2,'legacy-reference','paused',$3,1,1024,8,$4,$5)`, otherSandbox, team, otherHost, mid, path)
 			exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES
  ($1,$2,$3,$4,'pause'),($5,$6,$3,$4,'pause')`, firstSnapshot, f.sandboxID, team, path, secondSnapshot, otherSandbox)
-			exec(`UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`, f.sandboxID, start, firstSnapshot, path)
+			seedLegacyStoragePinsExec(t, `UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`, f.sandboxID, start, firstSnapshot, path)
 			exec(`UPDATE sandbox SET snapshot_id=$2 WHERE id=$1`, otherSandbox, secondSnapshot)
 			exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
  VALUES($1,'rootfs.ext4',$3,1048576,1048576,$4),($2,'rootfs.ext4',$3,$5,$5,$4)`, firstSnapshot, secondSnapshot, path, strings.Repeat("0", 64), tc.secondBytes)
@@ -187,7 +187,7 @@ func TestRetainedStorageTemplateDeltaCutoverParity(t *testing.T) {
 			}
 			exec(`INSERT INTO template(id,team_id,name,status,build_spec,vcpu,memory_mib,disk_mib)
  VALUES($1,$2,'delta-cutover','ready','{}'::jsonb,1,1024,1024)`, template, team)
-			exec(`UPDATE sandbox SET created_at=$2,template_id=$3,base_path=NULL,delta_path='/example/template/delta.ext4' WHERE id=$1`, f.sandboxID, start, template)
+			seedLegacyStoragePinsExec(t, `UPDATE sandbox SET created_at=$2,template_id=$3,base_path=NULL,delta_path='/example/template/delta.ext4' WHERE id=$1`, f.sandboxID, start, template)
 			exec(`INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
  VALUES($1,'delta.ext4','/example/template/delta.ext4',1048576,1048576,$2)`, template, strings.Repeat("0", 64))
 			exec(`SET LOCAL session_replication_role=replica`)
@@ -258,7 +258,7 @@ func TestRetainedStorageReassignmentClosesLegacyArtifacts(t *testing.T) {
 				_, _ = testPool.Exec(context.Background(), `DELETE FROM retained_storage_cutover WHERE host_id=$1`, f.hostID)
 			})
 			exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES($1,$2,$3,$4,'pause')`, snapshot, f.sandboxID, team, path)
-			exec(`UPDATE sandbox SET host_id=$2,created_at=$3,snapshot_id=$4,base_path=$5 WHERE id=$1`, f.sandboxID, sourceHost, start, snapshot, path)
+			seedLegacyStoragePinsExec(t, `UPDATE sandbox SET host_id=$2,created_at=$3,snapshot_id=$4,base_path=$5 WHERE id=$1`, f.sandboxID, sourceHost, start, snapshot, path)
 			exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
  VALUES($1,'rootfs.ext4',$2,1048576,1048576,$3)`, snapshot, path, strings.Repeat("0", 64))
 			// The first sample must stop contributing artifacts at the later
@@ -1195,8 +1195,8 @@ VALUES($1,$2,2,1024,$3,$4,'paused')`, computeSandbox, team, start, end)
 	}
 	router := newBillingRouter(t, nil)
 	seriesResponse := do(router, http.MethodGet, "/billing/usage-series?start="+start.Format(time.RFC3339)+"&end="+end.Format(time.RFC3339)+"&granularity=hour&timezone=UTC", unknownKey, "")
-	if seriesResponse.Code != http.StatusServiceUnavailable || !strings.Contains(seriesResponse.Body.String(), "storage_unavailable") {
-		t.Fatalf("unknown storage series response = %d %s, want storage_unavailable", seriesResponse.Code, seriesResponse.Body.String())
+	if seriesResponse.Code != http.StatusOK || !strings.Contains(seriesResponse.Body.String(), `"measurement_status":"partial"`) || !strings.Contains(seriesResponse.Body.String(), `"usage":null`) {
+		t.Fatalf("unknown storage series response = %d %s, want explicit partial usage", seriesResponse.Code, seriesResponse.Body.String())
 	}
 	admin := seedPlatformAdminProfile(t)
 	platformResponse := doInternal(newInternalRouterWithNow(t, func() time.Time { return end }), http.MethodGet, "/internal/billing?search="+unknownTeam.String(), admin.String(), "")
@@ -1204,8 +1204,8 @@ VALUES($1,$2,2,1024,$3,$4,'paused')`, computeSandbox, team, start, end)
 		t.Fatalf("unknown storage platform response = %d %s", platformResponse.Code, platformResponse.Body.String())
 	}
 	platformBody := decodePlatformBilling(t, platformResponse.Body.Bytes())
-	if len(platformBody.Rows) != 1 || platformBody.Rows[0].Error == nil || platformBody.Rows[0].Error.Code != "storage_unavailable" {
-		t.Fatalf("unknown storage platform row = %+v, want storage_unavailable error", platformBody.Rows)
+	if len(platformBody.Rows) != 1 || platformBody.Rows[0].Error != nil || platformBody.Rows[0].Summary["storage_measurement_status"] != "partial" || platformBody.Rows[0].Summary["storage_mib_seconds"] != nil || platformBody.Rows[0].Summary["known_storage_mib_seconds"] != float64(0) {
+		t.Fatalf("unknown storage platform row = %+v, want explicit partial usage", platformBody.Rows)
 	}
 }
 
@@ -1317,7 +1317,7 @@ func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
 		legacyOwner := uuid.New()
 		snapshotA, snapshotB := uuid.New(), uuid.New()
 		const path = "/example/rollback-shared-rootfs.ext4"
-		exec(`UPDATE sandbox SET created_at=$2,base_path=$3 WHERE id=$1`, f.sandboxID, start, path)
+		seedLegacyStoragePinsExec(t, `UPDATE sandbox SET created_at=$2,base_path=$3 WHERE id=$1`, f.sandboxID, start, path)
 		exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,base_path,snapshot_id)
  VALUES($1,$2,'rollback-legacy-owner','paused',$3,1,1024,2,$4,$5,NULL)`, legacyOwner, team, f.hostID, start, path)
 		exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES
@@ -1366,7 +1366,7 @@ func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
 			snapshot, second := uuid.New(), uuid.New()
 			const path = "/example/rollback-base.ext4"
 			exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES($1,$2,$3,$4,'pause')`, snapshot, f.sandboxID, team, path)
-			exec(`UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`, f.sandboxID, start, snapshot, path)
+			seedLegacyStoragePinsExec(t, `UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`, f.sandboxID, start, snapshot, path)
 			exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,base_path,snapshot_id)
  VALUES($1,$2,'example-rollback','paused',$3,1,1024,2,$4,$5,$6)`, second, team, f.hostID, secondStart, path, snapshot)
 			exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
@@ -1449,7 +1449,7 @@ func TestRetainedStorageTemplateRebuildKeepsPersistedBaselineGeneration(t *testi
 	exec(`SET LOCAL session_replication_role=replica`)
 	exec(`UPDATE artifact_manifest SET allocation_eligible_at=$2 WHERE template_id=$1`, templateID, start)
 	exec(`SET LOCAL session_replication_role=origin`)
-	exec(`UPDATE sandbox SET created_at=$2,template_id=$3,snapshot_path=$4,base_path=NULL,delta_path=NULL WHERE id=$1`, f.sandboxID, start, templateID, oldSnapshotPath)
+	seedLegacyStoragePinsExec(t, `UPDATE sandbox SET created_at=$2,template_id=$3,snapshot_path=$4,base_path=NULL,delta_path=NULL WHERE id=$1`, f.sandboxID, start, templateID, oldSnapshotPath)
 	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,template_id,snapshot_path)
  VALUES($1,$2,'example-rollback-generation','paused',$3,1,1024,2,$4,$5,$6)`, rollbackOwner, team, f.hostID, start.Add(10*time.Second), templateID, newSnapshotPath)
 	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)

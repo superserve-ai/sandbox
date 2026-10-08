@@ -131,13 +131,56 @@ an existing measurement only for its exact build, attempt, and artifact path;
 it cannot certify zero on its own. Frozen usage and exported events are not
 rewritten, and this migration does not activate storage charging.
 
-Raw storage remains unknown when a relevant template allocation is unknown.
-Before activation, billing continues to show compute usage and charges with
-storage usage unavailable. After activation, the existing fail-closed storage
-billing behavior remains in place; partial billing is a separate change.
-
 The team migration tool refuses to copy team-owned template manifests with
 known allocations or measurement evidence. Its generic insert path cannot
 preserve their original eligibility timestamps. The refusal occurs before
 source fencing or destination copying; keep the evidence intact. Faithful
 transfer requires separate migration support.
+
+### Partial legacy storage measurements
+
+Apply the partial-storage migration before deploying its API binary. It adds
+nullable completeness metadata without classifying historical cached rows.
+Old close and export writers derive the payable quantity and completeness in
+one database snapshot, so the schema can precede the binary rollout.
+
+An unknown legacy template contribution is excluded while measured private
+storage and other measured shared artifacts remain payable. Full raw storage
+usage stays null; summary and series add `known_usage` and
+`measurement_status` (`complete`, `partial`, or `blocked`). Platform rows add
+`known_storage_mib_seconds` and `storage_measurement_status`. Costs use the
+known subtotal after activation. Before activation, payable storage stays zero
+while tracked usage can remain partial. Measured zero is complete; unknown is
+not a zero measurement.
+
+Receipt, host ownership, retained epoch, and report completion failures still
+block settlement. This behavior only isolates missing legacy template evidence.
+Shared paths retain their existing union semantics, split at new measurement
+eligibility boundaries. No endpoint averaging or historical catch-up is added.
+
+Legacy references are captured without rewriting the sandbox fleet. A template
+rebuild preserves its prior fallback and original snapshot/memory pins for
+uncaptured old owners. A fallback is known only when those original pins match;
+a template rebuilt before capture cannot identify an older sandbox. A pause
+freezes the old reference decision before changing its runnable image paths.
+New sandbox fallback capture requires matching pinned snapshot and memory paths. Template,
+base, and delta pins cannot change after sandbox creation. Team migration
+materializes source references in both copy and checksum paths; retries retain
+the same authority. Reconstructing an unidentified path later cannot change a
+previously excluded interval. A retry refuses a preexisting destination close
+while the source close is mutable, or when its storage quantity or classification conflicts with a frozen
+source close, before copying period state. Quiesce billing writers and reconcile
+that destination operationally before retrying. Destination billing writers
+must remain stopped throughout copy and validation; the migration holds hourly
+rollups, but that hold alone does not stop manual closes or export workers.
+Initial imports and identical frozen retries are supported. Mutable or
+conflicting repeat imports require operational reconciliation and are refused
+before any destination writes.
+
+Hourly rollups persist the known subtotal separately from nullable full usage.
+Consumed export measurements and period close record nullable completeness;
+aggregates prioritize partial, then unclassified, then complete. Authoritative
+closed quantities and completeness remain unchanged, including imported historical
+rows. Observation caches still track legitimate corrections without changing
+settled quantities or exported events. This migration does not activate storage
+billing.

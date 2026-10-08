@@ -772,7 +772,7 @@ func lockBillingPeriodForFinalization(ctx context.Context, tx pgx.Tx, teamID uui
 
 func lockBillingUsageForFinalization(ctx context.Context, tx pgx.Tx, teamID uuid.UUID, periodStart, periodEnd time.Time) (db.TeamBillingUsage, error) {
 	row := tx.QueryRow(ctx, `
-		SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at
+		SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at,storage_complete
 		FROM team_billing_usage
 		WHERE team_id = $1
 		  AND period_start = $2
@@ -790,6 +790,7 @@ func lockBillingUsageForFinalization(ctx context.Context, tx pgx.Tx, teamID uuid
 		&usage.FinalizedAt,
 		&usage.ExportedAt,
 		&usage.UpdatedAt,
+		&usage.StorageComplete,
 	); err != nil {
 		return db.TeamBillingUsage{}, err
 	}

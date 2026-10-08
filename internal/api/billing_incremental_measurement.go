@@ -96,15 +96,15 @@ func (h *Handlers) seedExportMeasurements(ctx context.Context, team uuid.UUID, a
 
 func seedExportMeasurementPage(ctx context.Context, tx pgx.Tx, team uuid.UUID, start time.Time, through pgtype.Timestamptz) (int, time.Time, error) {
 	rows, err := tx.Query(ctx, `WITH page AS MATERIALIZED (
-        SELECT hour_start,hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds
+        SELECT hour_start,hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds,known_storage_mib_seconds,storage_complete
         FROM team_billing_usage_hourly WHERE team_id=$1 AND hour_start>$2
         AND hour_start<=$4
         ORDER BY hour_start LIMIT $3
         ) SELECT p.hour_start, q.team_id IS NULL OR (NOT q.pending AND
-        ROW(p.hour_end,p.vcpu_seconds,p.memory_mib_seconds,p.storage_mib_seconds)
-        IS DISTINCT FROM ROW(q.hour_end,q.vcpu_seconds,q.memory_mib_seconds,q.storage_mib_seconds))
+        ROW(p.hour_end,p.vcpu_seconds,p.memory_mib_seconds,p.storage_mib_seconds,p.known_storage_mib_seconds,p.storage_complete)
+        IS DISTINCT FROM ROW(q.hour_end,q.vcpu_seconds,q.memory_mib_seconds,q.storage_mib_seconds,q.known_storage_mib_seconds,q.storage_complete))
         FROM page p LEFT JOIN LATERAL (
-        SELECT team_id,pending,hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds
+        SELECT team_id,pending,hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds,known_storage_mib_seconds,storage_complete
         FROM billing_export_measurement_queue WHERE team_id=$1 AND hour_start=p.hour_start LIMIT 1
         ) q ON true ORDER BY p.hour_start`, team, start, exportMeasurementBatch, through)
 	if err != nil {
@@ -171,11 +171,12 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 		return false, err
 	}
 	var end time.Time
-	var cpu, memory, storage pgtype.Numeric
+	var cpu, memory, storage, knownStorage pgtype.Numeric
+	var storageComplete *bool
 	var effective pgtype.Timestamptz
-	err = tx.QueryRow(ctx, `SELECT hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds,
+	err = tx.QueryRow(ctx, `SELECT hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds,known_storage_mib_seconds,storage_complete,
         (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
-        FROM team_billing_usage_hourly WHERE team_id=$1 AND hour_start=$2`, team, hour).Scan(&end, &cpu, &memory, &storage, &effective)
+        FROM team_billing_usage_hourly WHERE team_id=$1 AND hour_start=$2`, team, hour).Scan(&end, &cpu, &memory, &storage, &knownStorage, &storageComplete, &effective)
 	if err != nil {
 		return false, err
 	}
@@ -184,6 +185,9 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 		return false, nil
 	}
 	storageSnapshot := storage
+	if knownStorage.Valid {
+		storage = knownStorage
+	}
 	at := hour
 	if at.Before(anchor) {
 		at = anchor
@@ -224,8 +228,8 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 			return false, err
 		}
 		if immutable {
-			// Mutable caches are clipped by their trigger. Frozen caches bypass it,
-			// so compare exact storage here instead of the floored hourly rollup.
+			// Compare exact observed storage against the frozen close, rather than
+			// the floored hourly rollup, before updating correction caches.
 			if effective.Valid && effective.Time.Before(until) {
 				if err = tx.QueryRow(ctx, `SELECT billable_storage_mib_seconds($1,$2,$3)`, team, at, until).Scan(&s); err != nil {
 					return false, err
@@ -277,8 +281,8 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 		}
 		at = until
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_export_measurement_queue SET pending=false,hour_end=$3,vcpu_seconds=$4,memory_mib_seconds=$5,storage_mib_seconds=$6
-        WHERE team_id=$1 AND hour_start=$2`, team, hour, end, cpu, memory, storageSnapshot); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_export_measurement_queue SET pending=false,hour_end=$3,vcpu_seconds=$4,memory_mib_seconds=$5,storage_mib_seconds=$6,known_storage_mib_seconds=$7,storage_complete=$8
+        WHERE team_id=$1 AND hour_start=$2`, team, hour, end, cpu, memory, storageSnapshot, knownStorage, storageComplete); err != nil {
 		return false, err
 	}
 	return true, tx.Commit(ctx)

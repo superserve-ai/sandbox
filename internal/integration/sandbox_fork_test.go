@@ -60,7 +60,7 @@ func TestIntegration_CreateSandbox_FromSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', host_id = $2, base_path = '/templates/t/base.ext4',
+	if _, err := seedLegacyStoragePins(t, ctx, `UPDATE sandbox SET status = 'active', host_id = $2, base_path = '/templates/t/base.ext4',
 		disk_mib = 4096, vcpu_count = 2, memory_mib = 2048, timeout_seconds = 900,
 		network_config = '{"egress":{"allowed_cidrs":["10.0.0.0/8"],"denied_cidrs":[],"allowed_domains":[]}}' WHERE id = $1`, sourceID, hostID); err != nil {
 		t.Fatal(err)
@@ -192,7 +192,7 @@ func TestIntegration_SnapshotDeleteWaitsForAForkInsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
+	if _, err := seedLegacyStoragePins(t, ctx, `UPDATE sandbox SET status = 'active', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
 		t.Fatal(err)
 	}
 	snap, err := testQueries.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
@@ -244,7 +244,7 @@ func TestIntegration_SnapshotRecordsBindingsUnderTheSecretWriteLock(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
+	if _, err := seedLegacyStoragePins(t, ctx, `UPDATE sandbox SET status = 'active', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
 		t.Fatal(err)
 	}
 	secretID := seedSecret(t, teamID)
@@ -315,7 +315,7 @@ func TestIntegration_SecretAttachWaitsOutASnapshotCapture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', ip_address = '192.0.2.10', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
+	if _, err := seedLegacyStoragePins(t, ctx, `UPDATE sandbox SET status = 'active', ip_address = '192.0.2.10', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
 		t.Fatal(err)
 	}
 	secretID := seedSecret(t, teamID)
@@ -365,7 +365,7 @@ func TestIntegration_CaptureWaitsOutAnAttachAndItsUndo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
+	if _, err := seedLegacyStoragePins(t, ctx, `UPDATE sandbox SET status = 'active', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
 		t.Fatal(err)
 	}
 	secretID := seedSecret(t, teamID)

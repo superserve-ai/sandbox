@@ -96,16 +96,18 @@ type billingSummaryPermissions struct {
 }
 
 type billingSummaryResource struct {
-	ResourceKey string   `json:"resource_key"`
-	Resource    string   `json:"resource"`
-	DisplayName string   `json:"display_name"`
-	SortOrder   int      `json:"sort_order"`
-	Unit        string   `json:"unit"`
-	DisplayUnit string   `json:"display_unit"`
-	Usage       *float64 `json:"usage"`
-	Tracked     bool     `json:"tracked"`
-	Billable    bool     `json:"billable"`
-	ChargeUSD   float64  `json:"charge_usd"`
+	ResourceKey       string   `json:"resource_key"`
+	Resource          string   `json:"resource"`
+	DisplayName       string   `json:"display_name"`
+	SortOrder         int      `json:"sort_order"`
+	Unit              string   `json:"unit"`
+	DisplayUnit       string   `json:"display_unit"`
+	Usage             *float64 `json:"usage"`
+	Tracked           bool     `json:"tracked"`
+	Billable          bool     `json:"billable"`
+	ChargeUSD         float64  `json:"charge_usd"`
+	KnownUsage        *float64 `json:"known_usage,omitempty"`
+	MeasurementStatus string   `json:"measurement_status,omitempty"`
 }
 
 type billingUsageResource struct {
@@ -394,6 +396,17 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		storageBillingEnabled,
 	)
 	summaryResources := billingSummaryResourcesFromState(resourceStates, vcpuSeconds, memoryGibSeconds, storageGibSeconds, charges)
+	knownStorage, err := nullableNumericFloat64(usage.KnownStorageGibSeconds)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	for i := range summaryResources {
+		if summaryResources[i].ResourceKey == "storage_gib" {
+			summaryResources[i].KnownUsage = knownStorage
+			summaryResources[i].MeasurementStatus = storageMeasurementStatus(usage.StorageComplete, usage.StorageBlocked)
+		}
+	}
 	creditSource, creditStatus := "local_trial", "available"
 	var stripeBalance, stripeApplied, stripeRemaining *float64
 	var creditsApplied, creditsRemaining, expectedInvoice *float64
@@ -516,10 +529,12 @@ func billingAccountHasStripeCreditState(account db.GetTeamBillingAccountRow) boo
 }
 
 type billingUsageSeriesResource struct {
-	Usage    *float64 `json:"usage"`
-	CostUSD  float64  `json:"cost_usd"`
-	Tracked  bool     `json:"tracked"`
-	Billable bool     `json:"billable"`
+	Usage             *float64 `json:"usage"`
+	CostUSD           float64  `json:"cost_usd"`
+	Tracked           bool     `json:"tracked"`
+	Billable          bool     `json:"billable"`
+	KnownUsage        *float64 `json:"known_usage,omitempty"`
+	MeasurementStatus string   `json:"measurement_status,omitempty"`
 }
 type billingUsageSeriesBucket struct {
 	Start          time.Time                  `json:"start"`
@@ -606,12 +621,13 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 		cpu, cpuErr := numericFloat64(u.VcpuSeconds)
 		mem, memErr := numericFloat64(u.MemoryGibSeconds)
 		storage, storageErr := nullableNumericFloat64(u.StorageGibSeconds)
+		knownStorage, knownErr := nullableNumericFloat64(u.KnownStorageGibSeconds)
 		payableStorage, payableStorageErr := numericFloat64(u.BillableStorageGibSeconds)
 		if cpuErr != nil || memErr != nil {
 			respondError(c, ErrInternal)
 			return
 		}
-		if storageErr != nil || payableStorageErr != nil {
+		if storageErr != nil || payableStorageErr != nil || knownErr != nil {
 			respondErrorMsg(c, "storage_unavailable", "Storage usage is temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -635,7 +651,7 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 		if storageState.Billable {
 			billedTotal += sc
 		}
-		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{&cpu, cc, cpuState.Tracked, cpuState.Billable}, Memory: billingUsageSeriesResource{&mem, mc, memoryState.Tracked, memoryState.Billable}, Storage: billingUsageSeriesResource{storage, sc, storageState.Tracked, storageState.Billable}, BilledTotalUSD: billedTotal})
+		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{Usage: &cpu, CostUSD: cc, Tracked: cpuState.Tracked, Billable: cpuState.Billable}, Memory: billingUsageSeriesResource{Usage: &mem, CostUSD: mc, Tracked: memoryState.Tracked, Billable: memoryState.Billable}, Storage: billingUsageSeriesResource{Usage: storage, CostUSD: sc, Tracked: storageState.Tracked, Billable: storageState.Billable, KnownUsage: knownStorage, MeasurementStatus: storageMeasurementStatus(u.StorageComplete, u.StorageBlocked)}, BilledTotalUSD: billedTotal})
 	}
 	setPrivateBillingCacheHeaders(c)
 	c.JSON(http.StatusOK, gin.H{"start": start, "end": end, "granularity": c.Query("granularity"), "timezone": c.Query("timezone"), "buckets": result})
@@ -1100,4 +1116,14 @@ func billingTrialRunway(row db.GetTeamTrialRunwayRow, eligible bool, state strin
 	default:
 		return "unknown", &observed
 	}
+}
+
+func storageMeasurementStatus(complete, blocked bool) string {
+	if blocked {
+		return "blocked"
+	}
+	if !complete {
+		return "partial"
+	}
+	return "complete"
 }
