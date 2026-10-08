@@ -82,6 +82,7 @@ type Handler struct {
 	// machineAuthority is the bounded-freshness durable revocation resolver.
 	// Machine capabilities fail closed when a proxy has not been configured
 	// with it; legacy tokens remain available only to ordinary sandboxes.
+	machineReadiness            machineReadinessState
 	sandboxOwnership            *CachedSandboxOwnership
 	machineAuthority            auth.RevocationAuthority
 	machineAuthoritySnapshotter interface {
@@ -212,8 +213,21 @@ func (h *Handler) FilesEnabled() bool {
 
 // ResolverReady verifies the configured resolver endpoint without touching a sandbox.
 func (h *Handler) ResolverReady(ctx context.Context) bool {
+	ordinary, _ := h.ResolverReadiness(ctx)
+	return ordinary
+}
+
+// ResolverReadiness returns reachability and machine protocol compatibility
+// from one observation; legacy resolvers cannot attest machine readiness.
+func (h *Handler) ResolverReadiness(ctx context.Context) (ordinary, machine bool) {
+	if resolver, ok := h.resolver.(interface {
+		ReadyWithMachineIdentity(context.Context) (bool, error)
+	}); ok {
+		compatible, err := resolver.ReadyWithMachineIdentity(ctx)
+		return err == nil, compatible && err == nil
+	}
 	resolver, ok := h.resolver.(interface{ Ready(context.Context) error })
-	return ok && resolver.Ready(ctx) == nil
+	return ok && resolver.Ready(ctx) == nil, false
 }
 
 // WithAnalytics enables data-plane usage events (exec/files).

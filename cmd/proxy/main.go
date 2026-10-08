@@ -359,7 +359,7 @@ func newRedirectMux(proxyHandler *proxy.Handler, readiness http.Handler) *http.S
 	redirectMux := http.NewServeMux()
 	redirectMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" && !proxyHandler.ServesHost(r.Host) {
-			if r.Host == "proxy-readiness.invalid" {
+			if r.Host == "proxy-readiness.invalid" || r.Host == "proxy-machine-readiness.invalid" {
 				readiness.ServeHTTP(w, r)
 				return
 			}
@@ -431,10 +431,12 @@ func peerTransportRequired(routingEnabled, peerAddr string) bool {
 }
 
 type proxyHealthResponse struct {
-	Generation    string   `json:"generation"`
-	Capabilities  []string `json:"capabilities"`
-	FilesEnabled  bool     `json:"files_enabled"`
-	ResolverReady bool     `json:"resolver_ready"`
+	Generation              string   `json:"generation"`
+	Capabilities            []string `json:"capabilities"`
+	FilesEnabled            bool     `json:"files_enabled"`
+	ResolverReady           bool     `json:"resolver_ready"`
+	MachineIdentityReady    bool     `json:"machine_identity_ready"`
+	MachineIdentityRevision string   `json:"machine_identity_revision"`
 }
 
 func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string) (*pgxpool.Pool, error) {
@@ -542,22 +544,25 @@ func newProxyMuxWithReadiness(proxyHandler *proxy.Handler, dataPlane http.Handle
 			dataPlane.ServeHTTP(w, r)
 			return
 		}
-		resolverReady := proxyHandler.ResolverReady(r.Context())
+		resolverReady, machineVMDReady := proxyHandler.ResolverReadiness(r.Context())
 		if dependencies != nil {
 			resolverReady = dependencies(r.Context()) && resolverReady
 		}
+		machineReady := resolverReady && machineVMDReady && proxyHandler.MachineIdentityReady(r.Context())
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Proxy-Generation", generation)
 		w.Header().Set("X-Proxy-Resolver-Ready", strconv.FormatBool(resolverReady))
 		w.Header().Set("Content-Type", "application/json")
-		if r.Host == "proxy-readiness.invalid" && !resolverReady {
+		if (r.Host == "proxy-readiness.invalid" && !resolverReady) || (r.Host == "proxy-machine-readiness.invalid" && !machineReady) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		_ = json.NewEncoder(w).Encode(proxyHealthResponse{
-			Generation:    generation,
-			Capabilities:  proxyHandler.PreviewCapabilities(),
-			FilesEnabled:  proxyHandler.FilesEnabled(),
-			ResolverReady: resolverReady,
+			Generation:              generation,
+			Capabilities:            proxyHandler.PreviewCapabilities(),
+			FilesEnabled:            proxyHandler.FilesEnabled(),
+			ResolverReady:           resolverReady,
+			MachineIdentityReady:    machineReady,
+			MachineIdentityRevision: proxy.MachineIdentityRevision,
 		})
 	})
 	mux.Handle("/", dataPlane)

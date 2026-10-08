@@ -2,6 +2,7 @@ package vm
 
 import (
 	"encoding/json"
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -70,6 +71,7 @@ func TestRecoveredOwnershipLocalHTTP(t *testing.T) {
 			server := NewLocalHTTPServer(m, m.log)
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodGet, "/instances/"+inst.ID, nil)
+			r.Header.Set(auth.ProxyMachineIdentityHeader, auth.MachineIdentityRevision)
 			server.handleInstance(w, r)
 			if w.Code != http.StatusOK {
 				t.Fatalf("status %d: %s", w.Code, w.Body.String())

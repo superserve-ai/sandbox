@@ -119,24 +119,32 @@ type VMDResolver struct {
 	group singleflight.Group
 }
 
-// Ready verifies that the configured VMD endpoint is reachable. A 404 is
-// expected for the synthetic instance, but still proves the resolver path.
+// Ready verifies that the configured VMD endpoint is reachable.
 func (r *VMDResolver) Ready(ctx context.Context) error {
+	_, err := r.ReadyWithMachineIdentity(ctx)
+	return err
+}
+
+// ReadyWithMachineIdentity uses the same synthetic lookup for reachability and
+// version evidence. An old VMD's 404 remains ordinary-ready but cannot attest
+// that machine ownership metadata will be produced safely.
+func (r *VMDResolver) ReadyWithMachineIdentity(ctx context.Context) (bool, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, r.vmdAddr+"/instances/__healthcheck__", nil)
 	if err != nil {
-		return err
+		return false, err
 	}
+	req.Header.Set(auth.ProxyMachineIdentityHeader, auth.MachineIdentityRevision)
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("resolver probe returned %d", resp.StatusCode)
+		return false, fmt.Errorf("resolver probe returned %d", resp.StatusCode)
 	}
-	return nil
+	return resp.Header.Get(auth.VMDMachineIdentityHeader) == auth.MachineIdentityRevision, nil
 }
 
 // WithPreviewTokens declares that the owning proxy handler has a valid seed
@@ -228,6 +236,7 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 	if err != nil {
 		return InstanceInfo{}, fmt.Errorf("resolver: build request: %w", err)
 	}
+	req.Header.Set(auth.ProxyMachineIdentityHeader, auth.MachineIdentityRevision)
 	req.Header.Set(preview.ProxyProtocolHeader, preview.HostCapabilityPorts)
 	capabilities := preview.HostCapabilityPortAccess
 	if r.previewTokens {

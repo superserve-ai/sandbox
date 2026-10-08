@@ -200,6 +200,19 @@ and route gate, the `mcap.v1` verifier, and the proxy session registry must be
 deployed as one compatible set. A serving instance is **ready** only when its
 health/readiness check reports all four surfaces present, the authority lookup
 is available, and the proxy is configured with the machine revocation resolver.
+Before enabling issuance or admitting a rollback target, probe `/health` on
+**every serving proxy** with `Host: proxy-machine-readiness.invalid`. Require
+HTTP 200, `machine_identity_ready: true`, and
+`machine_identity_revision: machine-identity-v1`. This probe includes the
+ordinary resolver/routing checks and bounded machine-authority/ownership
+schema reads using the restricted database role. Missing database
+configuration, missing compatible schema/permissions, or an unavailable
+lookup remains incompatible. Ordinary `/health` success alone is not machine
+readiness evidence. The existing VMD probe must attest the matching ownership
+protocol. VMD also withholds machine records from proxies that do not declare
+that protocol, preventing an older verifier from accepting legacy tokens for
+a machine sandbox.
+
 The deployment must also provide `QM_MACHINE_AUTH_CONFIGURED_ENVIRONMENT`; the
 activation record's `environment` must exactly match that independently supplied
 value. Unsupported revisions or arbitrary non-empty environment values remain
