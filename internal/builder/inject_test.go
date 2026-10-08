@@ -308,34 +308,52 @@ func TestChooseAptMirror(t *testing.T) {
 	down := func(context.Context, string) bool { return false }
 	ctx := context.Background()
 
-	if got := chooseAptMirror(ctx, "mirror.example.com", metadata.URL, down, nil); got != "mirror.example.com" {
+	if got := chooseAptMirror(ctx, "mirror.example.com", metadata.URL, down, time.Second, nil); got != "mirror.example.com" {
 		t.Errorf("override: got %q", got)
 	}
-	if got := chooseAptMirror(ctx, "", metadata.URL, up, nil); got != "europe-west1.gce.archive.ubuntu.com" {
+	if got := chooseAptMirror(ctx, "", metadata.URL, up, time.Second, nil); got != "europe-west1.gce.archive.ubuntu.com" {
 		t.Errorf("regional mirror: got %q", got)
 	}
-	if got := chooseAptMirror(ctx, "", metadata.URL, down, nil); got != fallbackAptMirror {
+	if got := chooseAptMirror(ctx, "", metadata.URL, down, time.Second, nil); got != fallbackAptMirror {
 		t.Errorf("every mirror down: got %q, want the fallback", got)
 	}
 	// A region whose mirror fails the probe is passed over for the next
 	// Google region before Canonical's mirror is considered.
-	var tried []string
-	onlyEast := func(_ context.Context, host string) bool {
-		tried = append(tried, host)
-		return host == "us-east4.gce.archive.ubuntu.com"
-	}
-	if got := chooseAptMirror(ctx, "", metadata.URL, onlyEast, nil); got != "us-east4.gce.archive.ubuntu.com" {
+	onlyEast := func(_ context.Context, host string) bool { return host == "us-east4.gce.archive.ubuntu.com" }
+	if got := chooseAptMirror(ctx, "", metadata.URL, onlyEast, time.Second, nil); got != "us-east4.gce.archive.ubuntu.com" {
 		t.Errorf("own region failing: got %q, want the next region's mirror", got)
 	}
-	if len(tried) != 2 || tried[0] != "europe-west1.gce.archive.ubuntu.com" {
-		t.Errorf("probe order: %v, want own region first then the next one", tried)
+	// Candidates are probed together: a passing own region returns without
+	// waiting on the others, and nothing passing is bounded by the deadline
+	// rather than by the sum of every probe.
+	slowOthers := func(ctx context.Context, host string) bool {
+		if host == "europe-west1.gce.archive.ubuntu.com" {
+			return true
+		}
+		<-ctx.Done()
+		return false
+	}
+	start := time.Now()
+	if got := chooseAptMirror(ctx, "", metadata.URL, slowOthers, 5*time.Second, nil); got != "europe-west1.gce.archive.ubuntu.com" {
+		t.Errorf("own region passing: got %q", got)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("own region passing took %v, want no wait on the other candidates", elapsed)
+	}
+	hang := func(ctx context.Context, _ string) bool { <-ctx.Done(); return false }
+	start = time.Now()
+	if got := chooseAptMirror(ctx, "", metadata.URL, hang, 200*time.Millisecond, nil); got != fallbackAptMirror {
+		t.Errorf("every probe hanging: got %q, want the fallback", got)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("every probe hanging took %v, want the selection deadline", elapsed)
 	}
 	// Off GCE the metadata server does not exist; the fallback is used
 	// without a probe.
-	probed := false
-	spy := func(context.Context, string) bool { probed = true; return true }
-	if got := chooseAptMirror(ctx, "", "http://127.0.0.1:1/zone", spy, nil); got != fallbackAptMirror || probed {
-		t.Errorf("off GCE: got %q (probed=%v), want the fallback without probing", got, probed)
+	var probed atomic.Bool
+	spy := func(context.Context, string) bool { probed.Store(true); return true }
+	if got := chooseAptMirror(ctx, "", "http://127.0.0.1:1/zone", spy, time.Second, nil); got != fallbackAptMirror || probed.Load() {
+		t.Errorf("off GCE: got %q (probed=%v), want the fallback without probing", got, probed.Load())
 	}
 }
 

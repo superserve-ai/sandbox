@@ -34,10 +34,15 @@ var gceMirrorRegions = []string{"us-east4", "us-west2", "us-west1", "us-central1
 // public mirrors are partially unreachable often enough that a build pulling
 // from them can run past its step deadline.
 func selectAptMirror(ctx context.Context, override string, logger *zerolog.Logger) string {
-	return chooseAptMirror(ctx, override, gceMetadataZoneURL, mirrorTransfers, logger)
+	return chooseAptMirror(ctx, override, gceMetadataZoneURL, mirrorTransfers, mirrorSelectDeadline, logger)
 }
 
-func chooseAptMirror(ctx context.Context, override, metadataURL string, transfers func(context.Context, string) bool, logger *zerolog.Logger) string {
+// mirrorSelectDeadline bounds the whole selection. Candidates are probed
+// concurrently and consulted in preference order, so the wait is one probe
+// when the own region passes and at most this when nothing does.
+const mirrorSelectDeadline = 15 * time.Second
+
+func chooseAptMirror(ctx context.Context, override, metadataURL string, transfers func(context.Context, string) bool, deadline time.Duration, logger *zerolog.Logger) string {
 	if override != "" {
 		return override
 	}
@@ -54,9 +59,16 @@ func chooseAptMirror(ctx context.Context, override, metadataURL string, transfer
 			candidates = append(candidates, r)
 		}
 	}
-	for _, r := range candidates {
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	results := make([]chan bool, len(candidates))
+	for i, r := range candidates {
+		results[i] = make(chan bool, 1)
+		go func(host string, out chan<- bool) { out <- transfers(ctx, host) }(r+".gce.archive.ubuntu.com", results[i])
+	}
+	for i, r := range candidates {
 		host := r + ".gce.archive.ubuntu.com"
-		if transfers(ctx, host) {
+		if <-results[i] {
 			if r != region && logger != nil {
 				logger.Warn().Str("mirror", host).Str("region", region).Msg("own region's apt mirror failed the transfer probe; using another region's")
 			}
