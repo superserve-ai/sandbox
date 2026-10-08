@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -152,7 +153,16 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string, slot int)
 			defer netns.Set(root)
 			dialer := net.Dialer{Timeout: 300 * time.Millisecond}
 			if source != "" {
-				dialer.LocalAddr = &net.UDPAddr{IP: net.ParseIP(source)}
+				if network == "tcp" {
+					addr, err := net.ResolveTCPAddr("tcp", source)
+					if err != nil {
+						ch <- result{e: err}
+						return
+					}
+					dialer.LocalAddr = addr
+				} else {
+					dialer.LocalAddr = &net.UDPAddr{IP: net.ParseIP(source)}
+				}
 			}
 			c, e := dialer.Dial(network, address)
 			ch <- result{c, e}
@@ -205,6 +215,19 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string, slot int)
 		t.Fatal(err)
 	}
 	defer listener.Close()
+	// A guest can choose the control service's source port. Prove the
+	// negative containment probe is usable before the policy takes effect.
+	portProbe, err := dialFrom("tcp", listener.Addr().String(), net.JoinHostPort(sourceIP, "49983"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	portPeer, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	portProbe.(*net.TCPConn).SetLinger(0)
+	portProbe.Close()
+	portPeer.Close()
 	tcp, err := dial("tcp", listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -325,6 +348,62 @@ func testMiningKernelContainment(t *testing.T, triggerProtocol string, slot int)
 	if conn, err := dial("tcp", listener.Addr().String()); err == nil {
 		conn.Close()
 		t.Fatal("new TCP mirror bypassed containment")
+	}
+	if conn, err := dialFrom("tcp", listener.Addr().String(), net.JoinHostPort(sourceIP, "49983")); err == nil {
+		conn.Close()
+		t.Fatal("guest-initiated connection using control source port bypassed containment")
+	} else {
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("control-port probe failed without testing containment: %v", err)
+		}
+	}
+	// The host must still be able to open boxd RPCs after containment so the
+	// ordinary freeze/snapshot path can pause the guest safely.
+	type listenResult struct {
+		listener net.Listener
+		err      error
+	}
+	controlReady := make(chan listenResult, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := netns.Set(guest); err != nil {
+			controlReady <- listenResult{err: err}
+			return
+		}
+		defer netns.Set(root)
+		listener, err := net.Listen("tcp", net.JoinHostPort(sourceIP, "49983"))
+		controlReady <- listenResult{listener, err}
+	}()
+	control := <-controlReady
+	if control.err != nil {
+		t.Fatal(control.err)
+	}
+	defer control.listener.Close()
+	hostControl, err := net.DialTimeout("tcp", control.listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("containment blocked host control connection: %v", err)
+	}
+	defer hostControl.Close()
+	guestControl, err := control.listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guestControl.Close()
+	hostControl.SetDeadline(time.Now().Add(time.Second))
+	guestControl.SetDeadline(time.Now().Add(time.Second))
+	if _, err := hostControl.Write([]byte("freeze")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guestControl.Read(make([]byte, 6)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guestControl.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hostControl.Read(make([]byte, 2)); err != nil {
+		t.Fatalf("containment blocked host control reply: %v", err)
 	}
 	// The set is intentionally still present. A replacement occupant must pass
 	// even before background cleanup and while Submit remains blocked. This
