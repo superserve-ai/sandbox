@@ -165,6 +165,69 @@ func TestDesktopStep_RealXServer(t *testing.T) {
 	}
 }
 
+// Change detection against a real server: a keystroke into a terminal
+// comes back as soon as it is painted, and input that paints nothing waits
+// out the settle and says so.
+func TestDesktopStepWaitForChange_RealXServer(t *testing.T) {
+	for _, bin := range []string{"Xvnc", "xdotool", "xterm"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	display := startXvnc(t, 640, 480)
+	t.Setenv("DISPLAY", display)
+	term := exec.Command("xterm", "-geometry", "80x24+0+0", "-e", "sh", "-c", "cat > /dev/null")
+	term.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := term.Start(); err != nil {
+		t.Fatalf("start xterm: %v", err)
+	}
+	t.Cleanup(func() { _ = term.Process.Kill(); _ = term.Wait() })
+	wait := exec.Command("xdotool", "search", "--sync", "--class", "xterm")
+	wait.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := wait.Run(); err != nil {
+		t.Fatalf("xterm window did not appear: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// Focus follows the pointer without a window manager.
+	if _, err := s.SendPointer(ctx, connect.NewRequest(&pb.PointerEvent{X: 100, Y: 100, Action: pb.PointerAction_POINTER_ACTION_CLICK})); err != nil {
+		t.Fatalf("SendPointer: %v", err)
+	}
+	step := func(action *pb.Action, settleMs uint32) (*pb.StepResponse, time.Duration) {
+		t.Helper()
+		start := time.Now()
+		resp, err := s.Step(ctx, connect.NewRequest(&pb.StepRequest{
+			Actions: []*pb.Action{action}, SettleMs: settleMs, WaitForChange: true,
+		}))
+		if err != nil {
+			t.Fatalf("Step: %v", err)
+		}
+		if resp.Msg.GetExecuted() != 1 || resp.Msg.GetActionError() != "" || resp.Msg.GetCaptureError() != "" {
+			t.Fatalf("executed=%d action_error=%q capture_error=%q", resp.Msg.GetExecuted(), resp.Msg.GetActionError(), resp.Msg.GetCaptureError())
+		}
+		return resp.Msg, time.Since(start)
+	}
+
+	typed, typedAfter := step(&pb.Action{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "x"}}}}, 1500)
+	if !typed.GetChanged() || typedAfter > 500*time.Millisecond {
+		t.Errorf("typing into the terminal: changed=%v after %v, want a changed frame well before the 1500ms bound", typed.GetChanged(), typedAfter)
+	}
+	still, elapsed := step(&pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 100, Y: 100, Action: pb.PointerAction_POINTER_ACTION_MOVE}}}, 300)
+	if still.GetChanged() || elapsed < 300*time.Millisecond {
+		t.Errorf("pointer move in place: changed=%v after %v, want an unchanged frame after the full 300ms", still.GetChanged(), elapsed)
+	}
+	t.Logf("changed frame after %v; unchanged frame after %v", typedAfter, elapsed)
+	if still.GetScreenshot().GetWidth() != 640 || len(still.GetScreenshot().GetImage()) == 0 {
+		t.Errorf("unchanged step returned no frame: %v", still.GetScreenshot())
+	}
+	if s.x11.backend == nil || s.x11.backend.damage == 0 {
+		t.Fatal("change detection did not go through the DAMAGE watch")
+	}
+}
+
 // Keyboard input against a real server, read back through a terminal: the
 // desktop helpers are hidden so only the XTest path can deliver it.
 func TestDesktopKeys_RealXServer(t *testing.T) {
