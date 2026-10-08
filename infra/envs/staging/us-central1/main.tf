@@ -680,6 +680,8 @@ module "observability" {
         instance_name     = module.sandbox_host.instance_name
         instance_id       = module.sandbox_host.instance_id
         collector_host_id = module.sandbox_host.instance_name
+        # Pending retirement; retain policy definitions and export-error coverage.
+        freshness_alerts_enabled = false
       }
       sandbox_host_b = {
         instance_name     = module.sandbox_host_b.instance_name

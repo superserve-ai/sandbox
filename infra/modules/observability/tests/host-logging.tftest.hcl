@@ -125,3 +125,43 @@ run "replacement_and_retired_hosts" {
     error_message = "The absence query must select the replacement identity."
   }
 }
+
+run "pause_only_selected_host_freshness" {
+  command = plan
+  variables {
+    project_id               = "example-project"
+    environment              = "staging"
+    notification_channel_ids = ["projects/example-project/notificationChannels/123"]
+    runbook_urls = {
+      host_logging_export    = "https://example.invalid/export"
+      host_logging_lag       = "https://example.invalid/lag"
+      host_logging_heartbeat = "https://example.invalid/heartbeat"
+    }
+    host_logging_alerts = {
+      display_prefix = "Example"
+      expected_hosts = {
+        pending_retirement = { instance_name = "example-old", instance_id = "123", freshness_alerts_enabled = false }
+        serving            = { instance_name = "example-serving", instance_id = "456" }
+      }
+    }
+  }
+  assert {
+    condition = (
+      !google_monitoring_alert_policy.host_logging_heartbeat["pending_retirement"].enabled &&
+      !google_monitoring_alert_policy.host_logging_lag["pending_retirement"].enabled &&
+      google_monitoring_alert_policy.host_logging_export_failures["pending_retirement"].enabled &&
+      google_monitoring_alert_policy.host_logging_heartbeat["serving"].enabled &&
+      google_monitoring_alert_policy.host_logging_lag["serving"].enabled &&
+      google_monitoring_alert_policy.host_logging_export_failures["serving"].enabled
+    )
+    error_message = "Pausing one host's freshness must retain its export-error alert and every serving-host alert."
+  }
+  assert {
+    condition = (
+      keys(google_logging_metric.host_logging_heartbeat) == ["pending_retirement", "serving"] &&
+      google_monitoring_alert_policy.host_logging_heartbeat["pending_retirement"].notification_channels == var.notification_channel_ids &&
+      google_monitoring_alert_policy.host_logging_lag["pending_retirement"].notification_channels == var.notification_channel_ids
+    )
+    error_message = "Paused policies must retain their metrics and notification channels for re-enablement."
+  }
+}
