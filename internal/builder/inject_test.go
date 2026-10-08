@@ -337,7 +337,10 @@ func TestChooseAptMirror(t *testing.T) {
 	// Among the other regions the first to pass wins: a slow probe ahead of
 	// it in the list does not hold the selection.
 	slowThenFast := func(ctx context.Context, host string) bool {
-		if host == "us-west1.gce.archive.ubuntu.com" {
+		switch host {
+		case "europe-west1.gce.archive.ubuntu.com":
+			return false
+		case "us-west1.gce.archive.ubuntu.com":
 			return true
 		}
 		<-ctx.Done()
