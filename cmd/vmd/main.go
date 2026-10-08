@@ -925,10 +925,15 @@ func main() {
 	// process as two separate GMP targets.
 	otelInstanceID := telemetry.NewInstanceID()
 	recorder := telemetry.NewNoopRecorder()
+	otelExportInterval := 15 * time.Second
 	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
-		otelExportInterval, err := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
+		var err error
+		otelExportInterval, err = time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("invalid OTEL_EXPORT_INTERVAL")
+		}
+		if otelExportInterval <= 0 {
+			otelExportInterval = 15 * time.Second // the recorder's own default
 		}
 		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
 			HostID:         cfg.HostID,
@@ -1045,6 +1050,33 @@ func main() {
 		maxConnsPerSandbox,
 		log,
 	)
+	egressCapacity, err := egressCapacityConfig(os.Getenv)
+	if err != nil {
+		log.Fatal().Err(err).Msg("invalid egress capacity configuration")
+	}
+	if egressCapacity.Enforce {
+		var limits syscall.Rlimit
+		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limits); err != nil {
+			log.Fatal().Err(err).Msg("read egress FD headroom")
+		}
+		if err := validateEgressFDHeadroom(egressCapacity, limits.Cur); err != nil {
+			log.Fatal().Err(err).Msg("invalid egress FD headroom")
+		}
+	}
+	egressMetrics, err := telemetry.NewEgressRecorder(recorder)
+	if err != nil {
+		log.Warn().Err(err).Msg("egress metrics unavailable")
+	}
+	if err := egressProxy.ConfigureCapacity(egressCapacity, egressMetrics); err != nil {
+		log.Fatal().Err(err).Msg("invalid egress capacity")
+	}
+	if egressMetrics != nil {
+		lc.start("egress capacity metrics", func() error {
+			egressMetrics.Sample(ctx, egressCapacity.MaxConnections, egressCapacity.Enforce)
+			return nil
+		})
+	}
+	log.Info().Int("max_connections", egressCapacity.MaxConnections).Bool("enforce", egressCapacity.Enforce).Msg("egress capacity configured")
 	egressProxy.SetHostID(cfg.HostID)
 	if os.Getenv("VMD_MINING_POLICY_CONFIG") != "" {
 		egressProxy.EnableMiningStreamTracking()
@@ -2115,6 +2147,10 @@ func main() {
 	// sample walks the fleet under the allocator lock, which must not contend
 	// with pool fill, reattach, or a first slot-allocating request pre-ready.
 	mgr.StartNetnsLeakSampler(ctx, time.Minute)
+	// Sampled well inside the shortest conntrack expiry (15s UDP) so a burst
+	// cannot fill and drain the table between two reads, and the peak over
+	// one export interval is exported so the burst survives last-value gauges.
+	telemetry.StartHostConntrackSampler(ctx, recorder, cfg.HostID, 5*time.Second, otelExportInterval)
 
 	// ---- Wait for signal or service failure ----
 	sigCh := make(chan os.Signal, 1)

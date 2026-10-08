@@ -225,6 +225,10 @@ jobs:
           # Fleet defaults for paused-network reclaim live in deployment
           # config, not the binary. Operators can override them per host in
           # /etc/sandbox/vmd.env after deployment.
+          # Enforcement remains off until the rollout owner records staging evidence.
+          VMD_EGRESS_MAX_CONNECTIONS: ${{ vars.VMD_EGRESS_MAX_CONNECTIONS }}
+          VMD_EGRESS_ENFORCE: ${{ vars.VMD_EGRESS_ENFORCE || 'false' }}
+          VMD_EGRESS_ROLLOUT_APPROVAL: ${{ vars.VMD_EGRESS_ROLLOUT_APPROVAL }}
           VMD_PAUSED_NETWORK_RECLAIM: "true"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
@@ -349,6 +353,10 @@ jobs:
           # Fleet defaults for paused-network reclaim live in deployment
           # config, not the binary. Operators can override them per host in
           # /etc/sandbox/vmd.env after deployment.
+          # Enforcement remains off until the rollout owner records staging evidence.
+          VMD_EGRESS_MAX_CONNECTIONS: ${{ vars.VMD_EGRESS_MAX_CONNECTIONS }}
+          VMD_EGRESS_ENFORCE: ${{ vars.VMD_EGRESS_ENFORCE || 'false' }}
+          VMD_EGRESS_ROLLOUT_APPROVAL: ${{ vars.VMD_EGRESS_ROLLOUT_APPROVAL }}
           VMD_PAUSED_NETWORK_RECLAIM: "true"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
@@ -429,6 +437,10 @@ jobs:
           # Fleet defaults for paused-network reclaim live in deployment
           # config, not the binary. Operators can override them per host in
           # /etc/sandbox/vmd.env after deployment.
+          # Enforcement remains off until the rollout owner records staging evidence.
+          VMD_EGRESS_MAX_CONNECTIONS: ${{ vars.VMD_EGRESS_MAX_CONNECTIONS }}
+          VMD_EGRESS_ENFORCE: ${{ vars.VMD_EGRESS_ENFORCE || 'false' }}
+          VMD_EGRESS_ROLLOUT_APPROVAL: ${{ vars.VMD_EGRESS_ROLLOUT_APPROVAL }}
           VMD_PAUSED_NETWORK_RECLAIM: "true"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"

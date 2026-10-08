@@ -16,7 +16,9 @@ Env vars:
                        GCP_REGION before deploying to a standby
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
-  SHA                  required — commit SHA (only first 8 chars used)
+  SHA                  required — commit SHA (full SHA binds egress rollout approval)
+  DEPLOY_CELL          optional — actual target cell; only staging exempts
+                       egress enforcement from release/limit rollout approval
   SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
   BACKUP_BUCKET        optional — the cell's artifact backup bucket. Upserted
                        into vmd.env when set; empty = skip, leaving the
@@ -377,8 +379,76 @@ def check_bundle_parity() -> None:
         sys.exit(f"deploy-vmd.py: installed by the remote script but not bundled: {missing}")
 
 
+def egress_capacity_settings(env):
+    maximum = env.get("VMD_EGRESS_MAX_CONNECTIONS", "")
+    enforce = env.get("VMD_EGRESS_ENFORCE", "")
+    if maximum and (not maximum.isascii() or not maximum.isdecimal() or not 0 < int(maximum) <= 2147483647):
+        raise ValueError("VMD_EGRESS_MAX_CONNECTIONS must be a positive integer <= 2147483647")
+    if enforce not in ("", "true", "false"):
+        raise ValueError("VMD_EGRESS_ENFORCE must be true or false")
+    return maximum, enforce
+
+
+def egress_capacity_preflight(env):
+    maximum, enforce = egress_capacity_settings(env)
+    args = " ".join(shlex.quote(v) for v in (
+        maximum, enforce, env.get("DEPLOY_CELL", ""),
+        env.get("SHA", ""), env.get("VMD_EGRESS_ROLLOUT_APPROVAL", ""),
+    ))
+    # Interpret only simple scalar assignments; never source host environment
+    # contents. Escaped/multiline syntax must be normalized before line updates.
+    script = textwrap.dedent(r"""
+        import pathlib
+        import re
+        import sys
+
+        maximum, enforce, cell, sha, approval = sys.argv[1:]
+        wanted = set()
+        if not maximum:
+            wanted.add("VMD_EGRESS_MAX_CONNECTIONS")
+        if not enforce:
+            wanted.add("VMD_EGRESS_ENFORCE")
+        values = {}
+        path = pathlib.Path("/etc/sandbox/vmd.env")
+        text = path.read_text() if path.exists() else ""
+        for raw in text.splitlines():
+            line = raw.strip()
+            # Reading or rewriting physical lines is unsafe in multiline/escaped
+            # lexical contexts, even when the assignment is unrelated to egress.
+            # Reject backslashes in comments too: continuation semantics differ
+            # across supported systemd generations.
+            if chr(92) in line:
+                sys.exit("Normalize escaped host environment syntax before egress deployment")
+            if not line or line.startswith(("#", ";")):
+                continue
+            match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$", line)
+            if not match:
+                continue
+            value = match[2].strip()
+            if value.startswith((chr(34), chr(39))):
+                if len(value) < 2 or value[-1] != value[0] or value[0] in value[1:-1]:
+                    sys.exit("Normalize multiline/complex quoted host environment syntax before egress deployment")
+                value = value[1:-1]
+            if match[1] in wanted:
+                if not re.fullmatch(r"[A-Za-z0-9]+", value):
+                    sys.exit("Unsupported inherited egress setting; supply explicit deployment values")
+                values[match[1]] = value
+        maximum = maximum or values.get("VMD_EGRESS_MAX_CONNECTIONS", "4096")
+        enforce = enforce or values.get("VMD_EGRESS_ENFORCE", "false")
+        if not maximum.isascii() or not maximum.isdecimal() or len(maximum) > 10 or not 0 < int(maximum) <= 2147483647:
+            sys.exit("Invalid effective egress capacity")
+        if enforce not in ("true", "false"):
+            sys.exit("Invalid effective egress enforcement")
+        if enforce == "true" and cell != "staging":
+            if not re.fullmatch(r"[0-9a-f]{40}", sha) or approval != sha + ":" + maximum:
+                sys.exit("Egress enforcement requires reviewed staging evidence and release:limit rollout approval")
+    """)
+    return "\nset -eu\nsudo python3 - " + args + " <<'EGRESS_PREFLIGHT'\n" + script + "\nEGRESS_PREFLIGHT\n"
+
 def main() -> int:
     check_bundle_parity()
+    egress_preflight = egress_capacity_preflight(os.environ)
+    egress_update = egress_capacity_update(os.environ)
     project = os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
     label = os.environ.get("VMD_LABEL", "component=vmd")
@@ -548,7 +618,7 @@ def main() -> int:
         q_host_id_line = shlex.quote(f"HOST_ID={name}")
         q_host_region_line = shlex.quote(f"HOST_REGION={deployment_host_region(region, zone)}")
 
-        input_preflight = host_identity_preflight() + runtime_input_preflight(control_plane_url, database_url, internal_api_token)
+        input_preflight = host_identity_preflight() + runtime_input_preflight(control_plane_url, database_url, internal_api_token) + egress_preflight
         # Identity is mandatory even when all runtime inputs are supplied.
         run_or_die([
             "gcloud", "compute", "ssh", name,
@@ -1113,6 +1183,9 @@ def main() -> int:
                 echo {q_dns_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
+            # Egress capacity was validated before uploading or modifying the host.
+            {egress_update}
+
             # Upsert the paused-network reclaim policy. These values are
             # supplied by deployment config so the daemon never bakes in host
             # defaults.
@@ -1598,6 +1671,17 @@ def main() -> int:
 
     print(f"Deployed VMD to {len(instances)} instance(s). sha={sha}")
     return 0
+
+
+def egress_capacity_update(env):
+    maximum, enforce = egress_capacity_settings(env)
+    commands = []
+    for key, value in (("VMD_EGRESS_MAX_CONNECTIONS", maximum), ("VMD_EGRESS_ENFORCE", enforce)):
+        if value:
+            commands.append(f"sudo sed -i '/^[[:space:]]*{key}[[:space:]]*=/d' /etc/sandbox/vmd.env")
+            commands.append(f"echo {shlex.quote(key + '=' + value)} | sudo tee -a /etc/sandbox/vmd.env > /dev/null")
+    return "\n".join(commands)
+
 
 
 if __name__ == "__main__":

@@ -205,7 +205,7 @@ re-enter after invalidation.
 ## Compatibility and activation gate
 
 The supported serving revision is `machine-identity-v1`: the schema migration
-`20261008000001_hosted_machine_identity.sql`, the API `CallerContext` resolver
+`20261008202845_hosted_machine_identity.sql`, the API `CallerContext` resolver
 and route gate, the `mcap.v1` verifier, and the proxy session registry must be
 deployed as one compatible set. A serving instance is **ready** only when its
 health/readiness check reports all four surfaces present, the authority lookup
