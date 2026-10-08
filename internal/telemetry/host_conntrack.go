@@ -20,8 +20,12 @@ const (
 // HostConntrack is one sample of the host's connection-tracking table: how
 // full it is against its ceiling, and the expiry settings that drain it.
 type HostConntrack struct {
-	HostID                string
-	Entries               int64
+	HostID  string
+	Entries int64
+	// EntriesPeak is the highest Entries seen over the last peak window, so a
+	// burst that fills and drains between two metric exports still shows in
+	// the exported value; last-value gauges would otherwise lose it.
+	EntriesPeak           int64
 	Max                   int64
 	Buckets               int64
 	TCPSynSentTimeoutSecs int64
@@ -40,7 +44,8 @@ type HostConntrack struct {
 // the fill ratio warns ahead of it, the drop counters record it even when a
 // burst fits between samples, and the settings catch a host that came up
 // without the fleet's sizing.
-func StartHostConntrackSampler(ctx context.Context, recorder Recorder, hostID string, interval time.Duration) {
+// peakWindow should cover at least one metric export interval.
+func StartHostConntrackSampler(ctx context.Context, recorder Recorder, hostID string, interval, peakWindow time.Duration) {
 	if recorder == nil || interval <= 0 {
 		return
 	}
@@ -48,12 +53,14 @@ func StartHostConntrackSampler(ctx context.Context, recorder Recorder, hostID st
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		warnedDrops := false
+		var recent []entrySample
 		for {
 			c, err := readHostConntrack(conntrackSysctlDir)
 			if err != nil {
 				log.Warn().Err(err).Msg("conntrack sample skipped")
 			} else {
 				c.HostID = hostID
+				recent, c.EntriesPeak = peakEntries(append(recent, entrySample{time.Now(), c.Entries}), time.Now(), peakWindow)
 				c.Drops, c.EarlyDrops, err = readConntrackDrops(conntrackStatPath)
 				c.DropsKnown = err == nil
 				if err != nil && !warnedDrops {
@@ -138,4 +145,26 @@ func readConntrackDrops(path string) (drops, early int64, err error) {
 		early += e
 	}
 	return drops, early, nil
+}
+
+type entrySample struct {
+	at time.Time
+	v  int64
+}
+
+// peakEntries drops samples older than window and returns the rest with the
+// highest value among them.
+func peakEntries(samples []entrySample, now time.Time, window time.Duration) ([]entrySample, int64) {
+	kept := samples[:0]
+	var peak int64
+	for _, s := range samples {
+		if now.Sub(s.at) > window {
+			continue
+		}
+		kept = append(kept, s)
+		if s.v > peak {
+			peak = s.v
+		}
+	}
+	return kept, peak
 }

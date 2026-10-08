@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestReadHostConntrack(t *testing.T) {
@@ -46,5 +47,19 @@ func TestReadConntrackDrops(t *testing.T) {
 	drops, early, err := readConntrackDrops(stat)
 	if err != nil || drops != 0x1a || early != 1 {
 		t.Fatalf("drops=%d early=%d err=%v; want 26, 1, nil", drops, early, err)
+	}
+}
+
+func TestPeakEntriesKeepsTheWindowHigh(t *testing.T) {
+	now := time.Unix(1000, 0)
+	samples := []entrySample{
+		{now.Add(-20 * time.Second), 900000}, // outside the window: forgotten
+		{now.Add(-10 * time.Second), 250000}, // the burst
+		{now.Add(-5 * time.Second), 3000},
+		{now, 2800},
+	}
+	kept, peak := peakEntries(samples, now, 15*time.Second)
+	if peak != 250000 || len(kept) != 3 {
+		t.Fatalf("peak=%d kept=%d; want 250000, 3", peak, len(kept))
 	}
 }

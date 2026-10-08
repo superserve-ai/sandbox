@@ -98,6 +98,7 @@ type OTelRecorder struct {
 	hostMemoryMiB            metric.Int64Gauge
 	hostSandboxes            metric.Int64Gauge
 	hostConntrackEntries     metric.Int64Gauge
+	hostConntrackEntriesPeak metric.Int64Gauge
 	hostConntrackMax         metric.Int64Gauge
 	hostConntrackBuckets     metric.Int64Gauge
 	hostConntrackSynTimeout  metric.Int64Gauge
@@ -259,6 +260,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.hostConntrackEntries, err = meter.Int64Gauge("host_conntrack_entries"); err != nil {
+		return nil, err
+	}
+	if r.hostConntrackEntriesPeak, err = meter.Int64Gauge("host_conntrack_entries_peak"); err != nil {
 		return nil, err
 	}
 	if r.hostConntrackMax, err = meter.Int64Gauge("host_conntrack_max"); err != nil {
@@ -575,6 +579,7 @@ func (r *OTelRecorder) RecordHostConntrack(ctx context.Context, c HostConntrack)
 	}
 	opt := metric.WithAttributes(r.attrs(attribute.String("host_id", safeHostID(c.HostID)))...)
 	r.hostConntrackEntries.Record(ctx, c.Entries, opt)
+	r.hostConntrackEntriesPeak.Record(ctx, c.EntriesPeak, opt)
 	r.hostConntrackMax.Record(ctx, c.Max, opt)
 	r.hostConntrackBuckets.Record(ctx, c.Buckets, opt)
 	r.hostConntrackSynTimeout.Record(ctx, c.TCPSynSentTimeoutSecs, opt)
