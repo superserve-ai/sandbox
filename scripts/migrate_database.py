@@ -334,6 +334,8 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
         # can provision shared Auth or repair a missing history entry.
         verify_history(history_row(cli, database_url, project, deadline), target)
         if action == "push":
+            import snapshot_reference_index
+            snapshot_reference_index.prepare(database_url, root, deadline)
             cli_run(cli, database_url, project, ["db", "push", "--yes", "--include-roles"], deadline)
         elif action == "list":
             cli_run(cli, database_url, project, ["migration", "list"], deadline)
