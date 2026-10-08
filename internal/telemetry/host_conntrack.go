@@ -46,19 +46,26 @@ type HostConntrack struct {
 // without the fleet's sizing.
 // peakWindow should cover at least one metric export interval.
 func StartHostConntrackSampler(ctx context.Context, recorder Recorder, hostID string, interval, peakWindow time.Duration) {
-	if recorder == nil || interval <= 0 {
+	if _, noop := recorder.(noopRecorder); recorder == nil || noop || interval <= 0 {
 		return
+	}
+	if peakWindow < interval {
+		peakWindow = interval
 	}
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		warnedDrops := false
+		warnedSample, warnedDrops := false, false
 		var recent []entrySample
 		for {
 			c, err := readHostConntrack(conntrackSysctlDir)
 			if err != nil {
-				log.Warn().Err(err).Msg("conntrack sample skipped")
+				if !warnedSample {
+					warnedSample = true
+					log.Warn().Err(err).Msg("conntrack unavailable; samples skipped until it is")
+				}
 			} else {
+				warnedSample = false
 				c.HostID = hostID
 				recent, c.EntriesPeak = peakEntries(append(recent, entrySample{time.Now(), c.Entries}), time.Now(), peakWindow)
 				c.Drops, c.EarlyDrops, err = readConntrackDrops(conntrackStatPath)

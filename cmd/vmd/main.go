@@ -932,6 +932,9 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("invalid OTEL_EXPORT_INTERVAL")
 		}
+		if otelExportInterval <= 0 {
+			otelExportInterval = 15 * time.Second // the recorder's own default
+		}
 		otelRecorder, err := telemetry.NewOTelRecorder(ctx, telemetry.OTelConfig{
 			HostID:         cfg.HostID,
 			InstanceID:     otelInstanceID,
