@@ -127,16 +127,32 @@ func NewMiningPacketGate(log zerolog.Logger) (*MiningPacketGate, error) {
 		}
 	}
 	accept := nftables.ChainPolicyAccept
-	chain := n.AddChain(&nftables.Chain{Name: "egress", Table: g.table, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityRef(-310), Policy: &accept})
+	guard := n.AddChain(&nftables.Chain{Name: "source_guard", Table: g.table, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityRef(-310), Policy: &accept})
 	base := func() []expr.Any {
 		return flatten(nfprotoIPv4(), []expr.Any{&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1}, &expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: []byte("veth-")}}, ipv4SrcInPrefix(vmIPRange))
 	}
-	n.AddRule(&nftables.Rule{Table: g.table, Chain: chain, Exprs: flatten(nfprotoIPv4(), []expr.Any{
+	n.AddRule(&nftables.Rule{Table: g.table, Chain: guard, Exprs: flatten(nfprotoIPv4(), []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
 		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: []byte("veth-")},
 		&expr.Payload{DestRegister: 2, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
 		&expr.Lookup{SourceRegister: 1, SetName: validSources.Name, SetID: validSources.ID, Invert: true},
 	}, verdictDrop())})
+	// Source validation runs before conntrack. Containment runs after it so
+	// replies to host-originated boxd RPCs can reach the host during pause.
+	// Requiring reply direction and a local destination prevents guests from
+	// escaping containment by binding the control service's source port.
+	chain := n.AddChain(&nftables.Chain{Name: "egress", Table: g.table, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityMangle, Policy: &accept})
+	n.AddRule(&nftables.Rule{Table: g.table, Chain: chain, Exprs: flatten(base(), []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: []byte{unix.IPPROTO_TCP}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 0, Len: 2},
+		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: binary.BigEndian.AppendUint16(nil, 49983)},
+		&expr.Ct{Key: expr.CtKeyDIRECTION, Register: 1},
+		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: []byte{1}},
+		&expr.Fib{Register: 1, FlagDADDR: true, ResultADDRTYPE: true},
+		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: binary.NativeEndian.AppendUint32(nil, unix.RTN_LOCAL)},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	})})
 	// Assignment tokens are installed in the background. A packet carries the
 	// token assigned when it entered the queue; delayed packets cannot accuse a
 	// later occupant of the same IP. Marks are cleared in the verdict.
