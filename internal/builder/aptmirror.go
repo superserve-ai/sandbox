@@ -37,10 +37,9 @@ func selectAptMirror(ctx context.Context, override string, logger *zerolog.Logge
 	return chooseAptMirror(ctx, override, gceMetadataZoneURL, mirrorTransfers, mirrorSelectDeadline, logger)
 }
 
-// mirrorSelectDeadline bounds the whole selection. Candidates are probed
-// concurrently and consulted in preference order, so the wait is one probe
-// when the own region passes and at most this when nothing does.
-const mirrorSelectDeadline = 15 * time.Second
+// mirrorSelectDeadline bounds the whole selection: the own region's probe,
+// then, only if that fails, the other regions probed together.
+const mirrorSelectDeadline = 25 * time.Second
 
 func chooseAptMirror(ctx context.Context, override, metadataURL string, transfers func(context.Context, string) bool, deadline time.Duration, logger *zerolog.Logger) string {
 	if override != "" {
@@ -53,23 +52,26 @@ func chooseAptMirror(ctx context.Context, override, metadataURL string, transfer
 		}
 		return fallbackAptMirror
 	}
-	candidates := []string{region}
-	for _, r := range gceMirrorRegions {
-		if r != region {
-			candidates = append(candidates, r)
-		}
-	}
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	results := make([]chan bool, len(candidates))
-	for i, r := range candidates {
-		results[i] = make(chan bool, 1)
-		go func(host string, out chan<- bool) { out <- transfers(ctx, host) }(r+".gce.archive.ubuntu.com", results[i])
+	if own := region + ".gce.archive.ubuntu.com"; transfers(ctx, own) {
+		return own
 	}
-	for i, r := range candidates {
-		host := r + ".gce.archive.ubuntu.com"
+	// The healthy case costs one probe; only a failing region fans out.
+	var others []string
+	for _, r := range gceMirrorRegions {
+		if r != region {
+			others = append(others, r+".gce.archive.ubuntu.com")
+		}
+	}
+	results := make([]chan bool, len(others))
+	for i, host := range others {
+		results[i] = make(chan bool, 1)
+		go func(host string, out chan<- bool) { out <- transfers(ctx, host) }(host, results[i])
+	}
+	for i, host := range others {
 		if <-results[i] {
-			if r != region && logger != nil {
+			if logger != nil {
 				logger.Warn().Str("mirror", host).Str("region", region).Msg("own region's apt mirror failed the transfer probe; using another region's")
 			}
 			return host

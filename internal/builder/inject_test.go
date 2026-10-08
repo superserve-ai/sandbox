@@ -323,25 +323,19 @@ func TestChooseAptMirror(t *testing.T) {
 	if got := chooseAptMirror(ctx, "", metadata.URL, onlyEast, time.Second, nil); got != "us-east4.gce.archive.ubuntu.com" {
 		t.Errorf("own region failing: got %q, want the next region's mirror", got)
 	}
-	// Candidates are probed together: a passing own region returns without
-	// waiting on the others, and nothing passing is bounded by the deadline
-	// rather than by the sum of every probe.
-	slowOthers := func(ctx context.Context, host string) bool {
-		if host == "europe-west1.gce.archive.ubuntu.com" {
-			return true
-		}
-		<-ctx.Done()
-		return false
+	// A passing own region is the only probe made; the other regions are
+	// probed together only after it fails, and nothing passing is bounded
+	// by the deadline rather than by the sum of every probe.
+	var probes atomic.Int32
+	ownOnly := func(_ context.Context, host string) bool {
+		probes.Add(1)
+		return host == "europe-west1.gce.archive.ubuntu.com"
 	}
-	start := time.Now()
-	if got := chooseAptMirror(ctx, "", metadata.URL, slowOthers, 5*time.Second, nil); got != "europe-west1.gce.archive.ubuntu.com" {
-		t.Errorf("own region passing: got %q", got)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("own region passing took %v, want no wait on the other candidates", elapsed)
+	if got := chooseAptMirror(ctx, "", metadata.URL, ownOnly, 5*time.Second, nil); got != "europe-west1.gce.archive.ubuntu.com" || probes.Load() != 1 {
+		t.Errorf("own region passing: got %q after %d probes, want it alone", got, probes.Load())
 	}
 	hang := func(ctx context.Context, _ string) bool { <-ctx.Done(); return false }
-	start = time.Now()
+	start := time.Now()
 	if got := chooseAptMirror(ctx, "", metadata.URL, hang, 200*time.Millisecond, nil); got != fallbackAptMirror {
 		t.Errorf("every probe hanging: got %q, want the fallback", got)
 	}
