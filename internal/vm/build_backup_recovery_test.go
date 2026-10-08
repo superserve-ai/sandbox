@@ -425,3 +425,37 @@ func TestCollectBuildManifestFlagsBasenameCollision(t *testing.T) {
 		t.Fatal("deduping the same path must stay complete")
 	}
 }
+
+// The covered gate used to sit at the end of the enqueue, so a settled
+// build still paid a hashing slot — the two shared with pause backups —
+// before being declined. With every slot held, the sweep must still
+// finish: it asks before it queues for one.
+func TestTemplateSweepSkipsSettledBuildWithoutAHashingSlot(t *testing.T) {
+	root := t.TempDir()
+	dir := writeAdoptableBuildFixture(t, root, "tpl", "build-tpl")
+
+	stamper := &Manager{}
+	stamper.SetBackupEnqueue(func(backup.Task) error { return nil })
+	stamper.backupBuildArtifacts(context.Background(), "tpl", "build-tpl", dir, "", nil, zerolog.Nop())
+
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	m.SetBackupEnqueue(func(backup.Task) error { return nil })
+	m.SetBackupCovered(func(backup.Task) (bool, error) { return true, nil })
+
+	// Pause rehashing owns every slot for the duration.
+	slots := m.ensureRehashSlots()
+	for range cap(slots) {
+		slots <- struct{}{}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		m.runTemplateBackupSweep(zerolog.Nop())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sweep queued for a hashing slot to decline a settled build")
+	}
+}

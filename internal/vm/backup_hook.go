@@ -1534,21 +1534,16 @@ func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority, pa
 	}
 }
 
-// enqueueTemplateBackup hands a completed template build's hashed artifact
-// set to the backup pipeline, reporting whether the generation is covered
-// (enqueued now, still pending, or already completed). Same contract as
-// enqueueBackup: a nil hook (backup disabled) is a no-op, and the enqueue
-// is a local journal write that must never fail the build; the caller
-// owns retrying a failed write. Template builds ride the checkpoint
-// priority: a template is rebuildable, so a multi-GiB build upload must
-// never head-of-line block a pause generation, which is unique user data.
-func (m *Manager) enqueueTemplateBackup(templateID, buildID, snapshotDir string, manifest []ManifestEntry) bool {
+// templateBackupTask builds the generation a finished build is enqueued
+// under. Shared with the settled check so the two can never disagree
+// about which generation a build is asking about.
+func (m *Manager) templateBackupTask(templateID, buildID, snapshotDir string, manifest []ManifestEntry) (backup.Task, bool) {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
-		return false
+		return backup.Task{}, false
 	}
 	runtime, err := readBuildMetaJSON(snapshotDir)
 	if err != nil {
-		return false
+		return backup.Task{}, false
 	}
 	files := make([]backup.TaskFile, 0, len(manifest))
 	for _, e := range manifest {
@@ -1566,7 +1561,7 @@ func (m *Manager) enqueueTemplateBackup(templateID, buildID, snapshotDir string,
 			Size:   e.SizeBytes,
 		})
 	}
-	task := backup.Task{
+	return backup.Task{
 		BuildIncarnation: m.buildIncarnation,
 		TemplateRuntime: &backup.TemplateRuntime{RootfsPath: runtime.RootfsPath, SnapshotPath: runtime.SnapshotPath,
 			MemPath: runtime.MemFilePath, BasePath: runtime.BasePath, DeltaPath: runtime.DeltaPath, SizeBytes: runtime.SizeBytes},
@@ -1575,6 +1570,37 @@ func (m *Manager) enqueueTemplateBackup(templateID, buildID, snapshotDir string,
 		Generation: backup.GenerationKey(files),
 		Files:      files,
 		Priority:   backup.PriorityCheckpoint,
+	}, true
+}
+
+// templateBackupSettled reports whether a build's generation is already
+// pending or completed. The sweep asks before taking a hashing slot: the
+// journal owns a pending generation's retries, and a generation it has
+// never seen returns false so the caller still does the work.
+func (m *Manager) templateBackupSettled(templateID, buildID, snapshotDir string, manifest []ManifestEntry) bool {
+	if m.backupCovered == nil {
+		return false
+	}
+	task, ok := m.templateBackupTask(templateID, buildID, snapshotDir, manifest)
+	if !ok {
+		return false
+	}
+	covered, err := m.backupCovered(task)
+	return err == nil && covered
+}
+
+// enqueueTemplateBackup hands a completed template build's hashed artifact
+// set to the backup pipeline, reporting whether the generation is covered
+// (enqueued now, still pending, or already completed). Same contract as
+// enqueueBackup: a nil hook (backup disabled) is a no-op, and the enqueue
+// is a local journal write that must never fail the build; the caller
+// owns retrying a failed write. Template builds ride the checkpoint
+// priority: a template is rebuildable, so a multi-GiB build upload must
+// never head-of-line block a pause generation, which is unique user data.
+func (m *Manager) enqueueTemplateBackup(templateID, buildID, snapshotDir string, manifest []ManifestEntry) bool {
+	task, ok := m.templateBackupTask(templateID, buildID, snapshotDir, manifest)
+	if !ok {
+		return false
 	}
 	// A generation whose objects cannot be vouched for abandons on every
 	// attempt, and this sweep is what keeps offering it: checked here

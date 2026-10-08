@@ -63,9 +63,10 @@ variable "host_logging_alerts" {
       # incarnation stay separate.
       # Retired hosts remain in inventory with active=false until their alert
       # state is closed.
-      collector_host_id = optional(string)
-      incarnation       = optional(string)
-      active            = optional(bool, true)
+      collector_host_id        = optional(string)
+      incarnation              = optional(string)
+      active                   = optional(bool, true)
+      freshness_alerts_enabled = optional(bool, true)
     }))
   })
   default = null

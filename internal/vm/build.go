@@ -456,25 +456,12 @@ func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMI
 // same contract as in backupBuildArtifacts: consulted right before the
 // enqueue, false drops the work silently.
 func (m *Manager) finishBuildBackupEnqueue(ctx context.Context, templateID, buildVMID, snapshotDir string, entries []ManifestEntry, guard func() bool, log zerolog.Logger) {
-	metaPath := filepath.Join(snapshotDir, buildMetaFilename)
-	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-	defer cancel()
-	sum, size, err := hashFile(hctx, metaPath)
+	meta, err := buildMetaEntry(ctx, snapshotDir)
 	if err != nil {
 		log.Warn().Err(err).Msg("hashing build.meta.json failed; build not enqueued for backup")
 		return
 	}
-	allocated := int64(-1)
-	if value, ok := allocatedBytes(metaPath); ok {
-		allocated = value
-	}
-	entries = append(entries, ManifestEntry{
-		FileName:       buildMetaFilename,
-		Path:           metaPath,
-		SizeBytes:      size,
-		AllocatedBytes: allocated,
-		SHA256:         sum,
-	})
+	entries = append(entries, meta)
 	if guard != nil && !guard() {
 		return
 	}
@@ -638,55 +625,83 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 		if !guard() {
 			return
 		}
-		stamped, err := readStampedBuildDigests(dir)
-		if err != nil || len(stamped) == 0 {
-			log.Info().Err(err).
-				Msg("adopted build has no stamped digests; running backup hashing")
+		entries, reason := stampedBuildManifest(dir, res.BasePath)
+		if reason != "" {
+			log.Info().Str("reason", reason).
+				Msg("stamped digests unusable; running backup hashing")
 			m.backupBuildArtifacts(rctx, templateID, buildVMID, dir, res.BasePath, guard, log)
 			return
-		}
-		entries := make([]ManifestEntry, 0, len(stamped)+1)
-		for _, d := range stamped {
-			path := filepath.Join(dir, d.Name)
-			fi, statErr := os.Stat(path)
-			if statErr != nil {
-				// The base image lives in the run dir, not the snapshot
-				// dir; anything else unresolvable means the stamp no
-				// longer matches the disk, so re-hash from scratch.
-				if res.BasePath != "" && d.Name == filepath.Base(res.BasePath) {
-					path = res.BasePath
-					fi, statErr = os.Stat(path)
-				}
-				if statErr != nil {
-					log.Warn().Str("artifact", d.Name).
-						Msg("stamped artifact not on disk; running backup hashing")
-					m.backupBuildArtifacts(rctx, templateID, buildVMID, dir, res.BasePath, guard, log)
-					return
-				}
-			}
-			if fi.Size() != d.SizeBytes {
-				log.Warn().Str("artifact", d.Name).
-					Int64("stamped", d.SizeBytes).Int64("on_disk", fi.Size()).
-					Msg("stamped artifact size diverged; running backup hashing")
-				m.backupBuildArtifacts(rctx, templateID, buildVMID, dir, res.BasePath, guard, log)
-				return
-			}
-			allocated := int64(-1)
-			if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-				allocated = stat.Blocks * 512
-			}
-			entries = append(entries, ManifestEntry{
-				FileName:       d.Name,
-				Path:           path,
-				SizeBytes:      d.SizeBytes,
-				AllocatedBytes: allocated,
-				SHA256:         d.SHA256,
-			})
 		}
 		log.Info().Int("files", len(entries)).
 			Msg("adopted build re-enqueued for backup from stamped digests")
 		m.finishBuildBackupEnqueue(rctx, templateID, buildVMID, dir, entries, guard, log)
 	}()
+}
+
+// buildMetaEntry hashes build.meta.json, the manifest member that pins a
+// generation to the build record itself.
+func buildMetaEntry(ctx context.Context, snapshotDir string) (ManifestEntry, error) {
+	metaPath := filepath.Join(snapshotDir, buildMetaFilename)
+	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	sum, size, err := hashFile(hctx, metaPath)
+	if err != nil {
+		return ManifestEntry{}, err
+	}
+	allocated := int64(-1)
+	if value, ok := allocatedBytes(metaPath); ok {
+		allocated = value
+	}
+	return ManifestEntry{
+		FileName:       buildMetaFilename,
+		Path:           metaPath,
+		SizeBytes:      size,
+		AllocatedBytes: allocated,
+		SHA256:         sum,
+	}, nil
+}
+
+// stampedBuildManifest rebuilds a finished build's manifest from the
+// digests stamped into its directory, without rehashing. A non-empty
+// reason means the stamps no longer describe the disk and the caller
+// must hash instead.
+func stampedBuildManifest(dir, basePath string) ([]ManifestEntry, string) {
+	stamped, err := readStampedBuildDigests(dir)
+	if err != nil || len(stamped) == 0 {
+		return nil, "no stamped digests"
+	}
+	entries := make([]ManifestEntry, 0, len(stamped)+1)
+	for _, d := range stamped {
+		path := filepath.Join(dir, d.Name)
+		fi, statErr := os.Stat(path)
+		if statErr != nil {
+			// The base image lives in the run dir, not the snapshot dir;
+			// anything else unresolvable means the stamp no longer matches
+			// the disk, so re-hash from scratch.
+			if basePath != "" && d.Name == filepath.Base(basePath) {
+				path = basePath
+				fi, statErr = os.Stat(path)
+			}
+			if statErr != nil {
+				return nil, "stamped artifact " + d.Name + " not on disk"
+			}
+		}
+		if fi.Size() != d.SizeBytes {
+			return nil, "stamped artifact " + d.Name + " size diverged"
+		}
+		allocated := int64(-1)
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			allocated = stat.Blocks * 512
+		}
+		entries = append(entries, ManifestEntry{
+			FileName:       d.Name,
+			Path:           path,
+			SizeBytes:      d.SizeBytes,
+			AllocatedBytes: allocated,
+			SHA256:         d.SHA256,
+		})
+	}
+	return entries, ""
 }
 
 // reconcileHandle lets a rebuild registration cancel an in-flight
@@ -751,6 +766,17 @@ func (m *Manager) runTemplateBackupSweep(log zerolog.Logger) {
 		res, err := readBuildMetaJSON(dir)
 		if err != nil || !buildArtifactsPresent(res) {
 			continue // half-written or partially deleted build: not adoptable
+		}
+		// The covered gate sits at the end of the enqueue, so a settled
+		// build would otherwise pay a hashing slot, a stat of every
+		// artifact and a rehash whenever its stamps are gone, on every
+		// pass, only to be declined. Ask here, where the loop is serial
+		// and holds nothing.
+		if entries, reason := stampedBuildManifest(dir, res.BasePath); reason == "" {
+			if meta, metaErr := buildMetaEntry(context.Background(), dir); metaErr == nil &&
+				m.templateBackupSettled(templateID, buildVMID, dir, append(entries, meta)) {
+				continue
+			}
 		}
 		m.reconcileAdoptedBuildBackupMode(BuildStatusSnapshot{
 			BuildVMID:  buildVMID,

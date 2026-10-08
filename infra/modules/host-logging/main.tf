@@ -208,13 +208,14 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "reconcile-and-validate"
         exec {
+          # OS Config's SHELL interpreter uses /bin/sh regardless of a file's shebang.
           validate {
             interpreter = "SHELL"
-            file { local_path = "${local.state_dir}/validate.sh" }
+            script      = "exec /bin/bash '${local.state_dir}/validate.sh'"
           }
           enforce {
             interpreter = "SHELL"
-            file { local_path = "${local.state_dir}/reconcile.sh" }
+            script      = "exec /bin/bash '${local.state_dir}/reconcile.sh'"
           }
         }
       }
