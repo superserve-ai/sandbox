@@ -253,6 +253,7 @@ type Recorder interface {
 	RecordHostResolution(context.Context, HostResolution)
 	RecordCapacityShadow(context.Context, CapacityShadow)
 	RecordHostCapacity(context.Context, HostCapacity)
+	RecordHostConntrack(context.Context, HostConntrack)
 	RecordBackupCoverage(context.Context, []BackupCoverage)
 	RecordDBPoolStats(context.Context, DBPoolStats)
 	RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)
@@ -284,6 +285,7 @@ func (noopRecorder) RecordVMDCall(context.Context, VMDCall)                     
 func (noopRecorder) RecordHostResolution(context.Context, HostResolution)                   {}
 func (noopRecorder) RecordCapacityShadow(context.Context, CapacityShadow)                   {}
 func (noopRecorder) RecordHostCapacity(context.Context, HostCapacity)                       {}
+func (noopRecorder) RecordHostConntrack(context.Context, HostConntrack)                     {}
 func (noopRecorder) RecordBackupCoverage(context.Context, []BackupCoverage)                 {}
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}
 func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}
