@@ -21,6 +21,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -284,5 +285,96 @@ func TestMachineAdministrationDisableRequiresFence(t *testing.T) {
 		if response.Code != http.StatusConflict {
 			t.Fatalf("disable fence conflict got %d", response.Code)
 		}
+	}
+}
+
+func TestMachineAdministrationPersistedTemplateAttestation(t *testing.T) {
+	for _, scenario := range []string{"same_binding", "mismatched_binding", "missing_binding", "stale_principal", "missing_principal"} {
+		t.Run(scenario, func(t *testing.T) {
+			principal, team, tenant, requested := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			persisted := pgtype.UUID{Bytes: requested, Valid: true}
+			if scenario == "mismatched_binding" {
+				persisted.Bytes = uuid.New()
+			}
+			if scenario == "missing_binding" {
+				// Invalid database UUIDs must remain null, even with nonzero backing bytes.
+				persisted.Valid = false
+			}
+			generation, status := int64(7), string(auth.PrincipalActive)
+			calls := 0
+			queries := db.New(&mockDBTX{queryRowFn: func(_ context.Context, query string, args ...any) pgx.Row {
+				calls++
+				if strings.Contains(query, "ensure_machine_principal") {
+					if len(args) != 3 || args[0] != team || args[1] != tenant || args[2] != (pgtype.UUID{Bytes: requested, Valid: true}) {
+						t.Fatalf("ensure changed the requested binding: %v", args)
+					}
+				} else if !strings.Contains(query, "FROM machine_principal WHERE id=$1") || len(args) != 1 || args[0] != principal {
+					t.Fatalf("unexpected attestation query: %s", query)
+				}
+				return &mockRow{scanFn: func(dest ...any) error {
+					if scenario == "missing_principal" {
+						return pgx.ErrNoRows
+					}
+					*dest[0].(*uuid.UUID), *dest[1].(*uuid.UUID), *dest[2].(*uuid.UUID) = principal, team, tenant
+					*dest[3].(*string), *dest[4].(*int64), *dest[5].(*pgtype.UUID) = status, generation, persisted
+					return nil
+				}}
+			}})
+			authority := NewDBMachineAuthority(queries)
+			authority.Enable()
+			authority.SetEligibility(AuthorityEligibility{ContractRevision: "machine-identity-v1", Environment: "test", ConfiguredEnvironment: "test", SchemaReady: true, OwnershipReady: true, VerifierReady: true, OperatorReady: true})
+			router := machineAdminRouter(t, authority)
+			body, err := json.Marshal(map[string]any{"team_id": team, "hosted_tenant_id": tenant, "approved_template_id": requested})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, method := range []string{http.MethodPost, http.MethodGet} {
+				path := "/internal/machine-identity/principals"
+				if method == http.MethodGet {
+					path += "/" + principal.String()
+					if scenario == "stale_principal" {
+						generation++
+						status = string(auth.PrincipalDisabled)
+					}
+				}
+				response := machineAdminRequest(router, method, path, string(body), "test-operator-only", false)
+				if calls != i+1 {
+					t.Fatalf("expected one database operation per request, got %d", calls)
+				}
+				if scenario == "missing_principal" {
+					if response.Code != http.StatusConflict || strings.Contains(response.Body.String(), "approved_template_id") {
+						t.Fatalf("missing principal yielded attestation: %d %s", response.Code, response.Body)
+					}
+					continue
+				}
+				if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+					t.Fatalf("attestation response: %d %s", response.Code, response.Body)
+				}
+				var result map[string]json.RawMessage
+				if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+					t.Fatal(err)
+				}
+				wantTemplate := "null"
+				if persisted.Valid {
+					wantTemplate = `"` + uuid.UUID(persisted.Bytes).String() + `"`
+				}
+				if string(result["approved_template_id"]) != wantTemplate {
+					t.Fatalf("response must attest stored binding %s: %s", wantTemplate, response.Body)
+				}
+				var identity struct {
+					PrincipalID uuid.UUID `json:"principal_id"`
+					TeamID      uuid.UUID `json:"team_id"`
+					TenantID    uuid.UUID `json:"hosted_tenant_id"`
+					Generation  int64     `json:"generation"`
+					Status      string    `json:"status"`
+				}
+				if err := json.Unmarshal(response.Body.Bytes(), &identity); err != nil {
+					t.Fatal(err)
+				}
+				if identity.PrincipalID != principal || identity.TeamID != team || identity.TenantID != tenant || identity.Generation != generation || identity.Status != status {
+					t.Fatalf("response lost current persisted identity: %s", response.Body)
+				}
+			}
+		})
 	}
 }

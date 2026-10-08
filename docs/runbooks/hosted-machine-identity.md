@@ -120,13 +120,21 @@ All routes below are under `/internal/machine-identity`:
 
 | Method and path | Request and result |
 | --- | --- |
-| `POST /principals` | JSON `team_id`, `hosted_tenant_id`, `approved_template_id`; returns the immutable principal and current generation. |
-| `GET /principals/{principal_id}` | Returns `principal_id`, `team_id`, `hosted_tenant_id`, `status`, and `generation` for lifecycle fencing. |
+| `POST /principals` | JSON `team_id`, `hosted_tenant_id`, `approved_template_id`; returns the principal, current generation, and persisted template binding. |
+| `GET /principals/{principal_id}` | Returns `principal_id`, `team_id`, `hosted_tenant_id`, `status`, `generation`, and nullable `approved_template_id` for lifecycle fencing and template attestation. |
 | `POST /principals/{principal_id}/credentials/issue` | Fenced credential request; returns credential metadata. |
 | `POST /principals/{principal_id}/credentials/rotate` | Fenced credential request plus `replacement_credential_id`; replaces only that credential. |
 | `POST /principals/{principal_id}/credentials/restore` | Fenced credential request; restores the same principal within its recovery window. |
 | `POST /principals/{principal_id}/disable` | JSON `operation_id` and `expected_generation`; disables the principal and its credentials once for that fence; returns 204. |
 | `POST /credentials/{credential_id}/revoke` | Revokes that credential; returns 204. |
+
+Both principal responses report the stored `approved_template_id` as a UUID
+string or explicit `null`. Ensure preserves an existing non-null binding even
+when the request supplies another template; the response never echoes the
+request as proof. Before issuance, callers must validate the returned binding
+and principal identity against their approved target and hold on missing, null,
+or mismatched values. A read is an observation of current state, not a lock
+against subsequent lifecycle changes.
 
 A fenced credential request contains `operation_id` (a nonzero UUID),
 `expected_generation` (the positive generation just read), and

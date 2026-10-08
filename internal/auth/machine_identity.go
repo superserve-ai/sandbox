@@ -65,11 +65,12 @@ const (
 // MachinePrincipal is the durable identity for one hosted tenant. It is
 // deliberately separate from a human membership or creator identifier.
 type MachinePrincipal struct {
-	PrincipalID    uuid.UUID
-	TeamID         uuid.UUID
-	HostedTenantID uuid.UUID
-	Status         PrincipalStatus
-	Generation     uint64
+	ApprovedTemplateID *uuid.UUID
+	PrincipalID        uuid.UUID
+	TeamID             uuid.UUID
+	HostedTenantID     uuid.UUID
+	Status             PrincipalStatus
+	Generation         uint64
 }
 
 // MachineCredential is the non-secret authority record. Secret material is
