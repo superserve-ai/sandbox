@@ -45,7 +45,7 @@ func (a *DBMachineAuthority) ReadPrincipal(ctx context.Context, id uuid.UUID) (a
 	if err != nil {
 		return auth.MachinePrincipal{}, err
 	}
-	return auth.MachinePrincipal{PrincipalID: row.ID, TeamID: row.TeamID, HostedTenantID: row.HostedTenantID, Status: auth.PrincipalStatus(row.Status), Generation: uint64(row.Generation)}, nil
+	return machinePrincipalFromRow(row), nil
 }
 
 // Bound socket reads even on rejected requests: net/http can drain an unread
@@ -166,7 +166,7 @@ func machineAdministrationError(c *gin.Context, err error) {
 }
 
 func machinePrincipalResponse(p auth.MachinePrincipal) gin.H {
-	return gin.H{"principal_id": p.PrincipalID, "team_id": p.TeamID, "hosted_tenant_id": p.HostedTenantID, "status": p.Status, "generation": p.Generation}
+	return gin.H{"principal_id": p.PrincipalID, "team_id": p.TeamID, "hosted_tenant_id": p.HostedTenantID, "status": p.Status, "generation": p.Generation, "approved_template_id": p.ApprovedTemplateID}
 }
 
 func (h *Handlers) EnsureMachinePrincipal(c *gin.Context) {

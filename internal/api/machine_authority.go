@@ -194,6 +194,19 @@ func lifecycleExpiry(now time.Time) time.Time {
 	return now.Add(24 * time.Hour)
 }
 
+func machinePrincipalFromRow(row db.MachinePrincipalRow) auth.MachinePrincipal {
+	var approvedTemplateID *uuid.UUID
+	if row.ApprovedTemplateID.Valid {
+		value := uuid.UUID(row.ApprovedTemplateID.Bytes)
+		approvedTemplateID = &value
+	}
+	return auth.MachinePrincipal{
+		PrincipalID: row.ID, TeamID: row.TeamID, HostedTenantID: row.HostedTenantID,
+		Status: auth.PrincipalStatus(row.Status), Generation: uint64(row.Generation),
+		ApprovedTemplateID: approvedTemplateID,
+	}
+}
+
 func (a *DBMachineAuthority) EnsurePrincipal(ctx context.Context, teamID, tenantID, templateID uuid.UUID, _ string) (auth.MachinePrincipal, error) {
 	if !authorizedControlPlane(ctx) {
 		return auth.MachinePrincipal{}, auth.ErrMachineCapabilityDenied
@@ -205,7 +218,7 @@ func (a *DBMachineAuthority) EnsurePrincipal(ctx context.Context, teamID, tenant
 	if err != nil {
 		return auth.MachinePrincipal{}, err
 	}
-	return auth.MachinePrincipal{PrincipalID: row.ID, TeamID: row.TeamID, HostedTenantID: row.HostedTenantID, Status: auth.PrincipalStatus(row.Status), Generation: uint64(row.Generation)}, nil
+	return machinePrincipalFromRow(row), nil
 }
 
 func (a *DBMachineAuthority) IssueCredential(_ context.Context, _ uuid.UUID, _ string) (auth.MachineCredential, error) {
