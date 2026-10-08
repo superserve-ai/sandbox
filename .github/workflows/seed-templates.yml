@@ -94,7 +94,7 @@ jobs:
     name: Seed Staging
     runs-on: ubuntu-latest
     environment: staging
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -112,7 +112,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          DEADLINE=$(( $(date +%s) + 900 ))
+          # Deploy VMD takes 28-37 min end to end, so a budget below that fails
+          # whenever both workflows are triggered by the same commit and this job
+          # is not queued behind an earlier seed run.
+          DEADLINE=$(( $(date +%s) + 2400 ))
           while true; do
             RUN=$(gh run list --workflow=deploy-vmd.yml --commit="${{ github.sha }}" --limit 1 --json status,conclusion --jq '.[0]')
             if [ -z "$RUN" ] || [ "$RUN" = "null" ]; then
@@ -187,7 +190,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          DEADLINE=$(( $(date +%s) + 900 ))
+          # Deploy VMD takes 28-37 min end to end, so a budget below that fails
+          # whenever both workflows are triggered by the same commit and this job
+          # is not queued behind an earlier seed run.
+          DEADLINE=$(( $(date +%s) + 2400 ))
           while true; do
             RUN=$(gh run list --workflow=deploy-vmd.yml --commit="${{ github.sha }}" --limit 1 --json status,conclusion --jq '.[0]')
             if [ -z "$RUN" ] || [ "$RUN" = "null" ]; then
