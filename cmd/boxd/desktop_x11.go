@@ -322,15 +322,38 @@ func (b *x11Backend) Capture() (*image.RGBA, error) {
 // and the sequence number of the read. Change detection compares raw
 // frames, so moving the pointer alone is not a repaint.
 func (b *x11Backend) rawFrame() (*image.RGBA, uint16, error) {
+	return b.rawRect(0, 0)
+}
+
+// paintSample bounds the region the repaint wait reads, so it works on
+// displays whose whole frame would exceed maxRawFrameBytes; the top-left
+// corner is where a desktop's panel lands.
+const paintSample = 2048
+
+// rawSample reads the top-left of the root, at most paintSample square.
+func (b *x11Backend) rawSample() (*image.RGBA, uint16, error) {
+	return b.rawRect(paintSample, paintSample)
+}
+
+// rawRect reads the top-left of the root clipped to maxW×maxH; zero means
+// unclipped.
+func (b *x11Backend) rawRect(maxW, maxH uint16) (*image.RGBA, uint16, error) {
 	geom, err := xproto.GetGeometry(b.conn, xproto.Drawable(b.root)).Reply()
 	if err != nil {
 		return nil, 0, fmt.Errorf("root geometry: %w", err)
 	}
-	if rawFrameTooLarge(geom.Width, geom.Height) {
+	w, h := geom.Width, geom.Height
+	if maxW > 0 && w > maxW {
+		w = maxW
+	}
+	if maxH > 0 && h > maxH {
+		h = maxH
+	}
+	if rawFrameTooLarge(w, h) {
 		return nil, 0, errFrameTooLarge
 	}
 	cookie := xproto.GetImage(b.conn, xproto.ImageFormatZPixmap, xproto.Drawable(b.root),
-		0, 0, geom.Width, geom.Height, 0xffffffff)
+		0, 0, w, h, 0xffffffff)
 	img, err := cookie.Reply()
 	if err != nil {
 		return nil, 0, fmt.Errorf("get image: %w", err)
@@ -338,7 +361,7 @@ func (b *x11Backend) rawFrame() (*image.RGBA, uint16, error) {
 	if img.Depth != 24 && img.Depth != 32 {
 		return nil, 0, fmt.Errorf("unsupported root depth %d", img.Depth)
 	}
-	frame, err := bgrxToRGBA(img.Data, int(geom.Width), int(geom.Height))
+	frame, err := bgrxToRGBA(img.Data, int(w), int(h))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -370,8 +393,13 @@ var frameHashSeed = maphash.MakeSeed()
 // empty and the read: the region is non-empty again, so a later repaint
 // would go unreported until the next snapshot.
 func (b *x11Backend) snapshot() (frame *image.RGBA, hash uint64, raced bool, err error) {
+	return b.snapshotWith(b.rawFrame)
+}
+
+// snapshotWith is snapshot over any read of the root, such as rawSample.
+func (b *x11Backend) snapshotWith(read func() (*image.RGBA, uint16, error)) (frame *image.RGBA, hash uint64, raced bool, err error) {
 	damage.Subtract(b.conn, b.damage, 0, 0)
-	frame, seq, err := b.rawFrame()
+	frame, seq, err := read()
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -421,11 +449,16 @@ func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadli
 // captureChangedRaw is captureChanged before the cursor is drawn in, with
 // the frame's hash, for callers that go on comparing frames.
 func (b *x11Backend) captureChangedRaw(ctx context.Context, baseline uint64, deadline time.Time) (*image.RGBA, uint64, bool, error) {
+	return b.captureChangedWith(ctx, b.rawFrame, baseline, deadline)
+}
+
+// captureChangedWith is captureChangedRaw over any read of the root.
+func (b *x11Backend) captureChangedWith(ctx context.Context, read func() (*image.RGBA, uint16, error), baseline uint64, deadline time.Time) (*image.RGBA, uint64, bool, error) {
 	for {
 		if _, err := b.awaitDamage(ctx, deadline); err != nil {
 			return nil, 0, false, err
 		}
-		frame, hash, raced, err := b.snapshot()
+		frame, hash, raced, err := b.snapshotWith(read)
 		if err != nil {
 			return nil, 0, false, err
 		}
@@ -498,7 +531,7 @@ func (b *x11Backend) markRepaint() error {
 func (b *x11Backend) awaitPainted(ctx context.Context, marked bool, deadline time.Time) (bool, error) {
 	if b.damage == 0 || !marked {
 		for {
-			frame, _, err := b.rawFrame()
+			frame, _, err := b.rawSample()
 			if err != nil {
 				return false, err
 			}
@@ -519,14 +552,14 @@ func (b *x11Backend) awaitPainted(ctx context.Context, marked bool, deadline tim
 	// mark, must stay pending so the first wait below re-reads at once and
 	// compares against this blank rather than accepting the report as a
 	// repaint.
-	frame, _, err := b.rawFrame()
+	frame, _, err := b.rawSample()
 	if err != nil {
 		return false, err
 	}
 	if painted(frame) {
 		return true, nil
 	}
-	frame, _, changed, err := b.captureChangedRaw(ctx, maphash.Bytes(frameHashSeed, frame.Pix), deadline)
+	frame, _, changed, err := b.captureChangedWith(ctx, b.rawSample, maphash.Bytes(frameHashSeed, frame.Pix), deadline)
 	if err != nil {
 		return false, err
 	}

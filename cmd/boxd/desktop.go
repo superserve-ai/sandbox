@@ -439,7 +439,7 @@ func (s *desktopService) captureScreenshot(ctx context.Context, format pb.FrameF
 		if readErr != nil {
 			return nil, shellCaptureError(x11Err, fmt.Errorf("import -window root: read: %w", readErr))
 		}
-		return nil, fmt.Errorf("import -window root: screenshot exceeds %d bytes", maxScreenshotBytes)
+		return nil, shellCaptureError(x11Err, fmt.Errorf("import -window root: screenshot exceeds %d bytes", maxScreenshotBytes))
 	}
 	if err := cmd.Wait(); err != nil {
 		return nil, shellCaptureError(x11Err, wrapExecErrOutput("import -window root", stderr.Bytes(), err))
