@@ -120,6 +120,10 @@ type BuildSupervisor struct {
 	log        zerolog.Logger
 	analytics  *analytics.Client   // when set, emits build-outcome events; nil is a no-op
 	onFinalize func(tpl uuid.UUID) // when set, runs after a build lands new template paths; nil is a no-op
+
+	// reconcileOffset is where the next orphan-reconcile pass starts walking
+	// the cell's hosts. Owned by the single reconcile goroutine.
+	reconcileOffset int
 }
 
 // WithPublicationStore enables durable generation recovery after producer loss.
@@ -615,23 +619,45 @@ func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
 		s.log.Warn().Err(err).Msg("reconcile: list hosts")
 		return
 	}
-	s.reconcileHostsPass(passCtx, hosts, live, snapshotTime, reconcileHostTimeout)
+	s.reconcileRotatedPass(passCtx, hosts, live, snapshotTime, reconcileHostTimeout)
 }
 
-// reconcileHostsPass walks the hosts in turn. A host that is unreachable or
-// unresponsive must not cost the rest their reclamation, so each gets its own
-// deadline, and its own deletion budget so one host's backlog cannot starve
-// the others.
-func (s *BuildSupervisor) reconcileHostsPass(ctx context.Context, hosts []string, live map[string]struct{}, snapshotTime time.Time, perHost time.Duration) {
+// reconcileRotatedPass resumes the walk where the last one was cut off. Hosts
+// come back in a stable order, so a prefix slow enough to exhaust the pass
+// deadline would otherwise consume every pass and the hosts behind it would
+// never be reclaimed.
+func (s *BuildSupervisor) reconcileRotatedPass(ctx context.Context, hosts []string, live map[string]struct{}, snapshotTime time.Time, perHost time.Duration) {
+	visited := s.reconcileHostsPass(ctx, hostsRotated(hosts, s.reconcileOffset), live, snapshotTime, perHost)
+	if len(hosts) > 0 {
+		s.reconcileOffset = (s.reconcileOffset + visited) % len(hosts)
+	}
+}
+
+// hostsRotated starts the order at offset and wraps, so a truncated pass can
+// hand the next one the hosts it never reached.
+func hostsRotated(hosts []string, offset int) []string {
+	if len(hosts) == 0 {
+		return nil
+	}
+	offset %= len(hosts)
+	return append(append([]string{}, hosts[offset:]...), hosts[:offset]...)
+}
+
+// reconcileHostsPass walks the hosts in turn and reports how many it reached.
+// A host that is unreachable or unresponsive must not cost the rest their
+// reclamation, so each gets its own deadline, and its own deletion budget so
+// one host's backlog cannot starve the others.
+func (s *BuildSupervisor) reconcileHostsPass(ctx context.Context, hosts []string, live map[string]struct{}, snapshotTime time.Time, perHost time.Duration) int {
 	for i, hostID := range hosts {
 		if ctx.Err() != nil {
 			s.log.Warn().Int("unvisited", len(hosts)-i).Msg("reconcile: pass deadline reached")
-			return
+			return i
 		}
 		hostCtx, cancel := context.WithTimeout(ctx, perHost)
 		s.reconcileHost(hostCtx, hostID, live, snapshotTime)
 		cancel()
 	}
+	return len(hosts)
 }
 
 // reconcileHosts names the hosts whose disks this pass walks. Builds are

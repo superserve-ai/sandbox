@@ -119,3 +119,50 @@ func TestReconcileHostsPassBoundsEachHost(t *testing.T) {
 		t.Fatalf("deleted = %v, want %v", deleted, want)
 	}
 }
+
+func TestHostsRotated(t *testing.T) {
+	hosts := []string{"a", "b", "c"}
+	for offset, want := range map[int][]string{
+		0: {"a", "b", "c"},
+		1: {"b", "c", "a"},
+		2: {"c", "a", "b"},
+		3: {"a", "b", "c"},
+	} {
+		if got := hostsRotated(hosts, offset); !reflect.DeepEqual(got, want) {
+			t.Fatalf("hostsRotated(offset %d) = %v, want %v", offset, got, want)
+		}
+	}
+	if got := hostsRotated(nil, 2); got != nil {
+		t.Fatalf("hostsRotated(nil) = %v", got)
+	}
+}
+
+// Hosts come back in a stable order, so a prefix slow enough to exhaust the
+// pass deadline would consume every pass and the hosts behind it would never
+// be reclaimed. Each pass has to resume where the last one was cut off.
+func TestReconcileRotatedPassResumesWhereItWasCutOff(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	hosts := []string{"a", "b", "c"}
+	var deleted []string
+	s := &BuildSupervisor{cfg: BuildSupervisorConfig{Cell: "cell-1"}, log: zerolog.Nop()}
+
+	// One host per pass: the first one served spends the whole pass deadline,
+	// which is what a stalling prefix does on the real timer.
+	for pass := 0; pass < len(hosts); pass++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.resolve = func(_ context.Context, hostID string) (vmdclient.Client, error) {
+			cancel()
+			return hostReconcileClient{
+				onDisk:  []vmdclient.BuildArtifactEntry{{TemplateID: "tpl", BuildID: "build-" + hostID, MTimeUnix: stale.Unix()}},
+				deleted: &deleted,
+			}, nil
+		}
+		s.reconcileRotatedPass(ctx, hosts, map[string]struct{}{}, time.Now(), time.Minute)
+		cancel()
+	}
+
+	want := []string{"tpl/build-a", "tpl/build-b", "tpl/build-c"}
+	if !reflect.DeepEqual(deleted, want) {
+		t.Fatalf("deleted = %v, want %v: a truncated pass must hand on the hosts it never reached", deleted, want)
+	}
+}
