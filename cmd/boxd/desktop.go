@@ -824,12 +824,14 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 	// the state this batch produced and nothing that arrived after it.
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
+	resp := &pb.StepResponse{Executed: uint32(len(lowered))}
+	phase := time.Now()
 	var watch *frameWatch
 	if req.Msg.GetWaitForChange() {
 		watch = s.armFrameWatch(ctx)
 	}
-	resp := &pb.StepResponse{Executed: uint32(len(lowered))}
-	phase := time.Now()
+	// Arming reads and hashes a frame; it is capture work done early.
+	armMs := millisSince(&phase)
 	for i, run := range lowered {
 		if err := run(ctx); err != nil {
 			resp.Executed = uint32(i)
@@ -850,7 +852,7 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 	// Input already landed by now, so a capture failure is reported in the
 	// response rather than as an RPC error the caller might retry.
 	shot, err := s.screenshotResponse(ctx, format, watch)
-	resp.CaptureMs = millisSince(&phase)
+	resp.CaptureMs = armMs + millisSince(&phase)
 	if err != nil {
 		resp.CaptureError = err.Error()
 	} else {
@@ -870,8 +872,8 @@ func millisSince(from *time.Time) uint32 {
 }
 
 // resizeRepaintWait bounds how long Resize waits for clients to draw at the
-// new size. A display with nothing to draw (no window manager) waits it out.
-const resizeRepaintWait = 3 * time.Second
+// new size. A display where nothing draws after the switch waits it out.
+const resizeRepaintWait = 2 * time.Second
 
 // awaitRepaint blocks until the display shows something other than a blank
 // frame, or until bound; without a display backend it returns at once. A

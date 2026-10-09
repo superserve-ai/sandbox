@@ -369,8 +369,8 @@ message StepResponse {
   // wait_for_change was requested and the display backend could compare.
   bool changed = 5;
   // Where the request's time went, in milliseconds: running the actions,
-  // the fixed settle, and the capture (which includes any wait for a
-  // changed frame).
+  // the fixed settle, and the capture (which includes arming the change
+  // watch before the batch and any wait for a changed frame).
   uint32 actions_ms = 6;
   uint32 settle_ms = 7;
   uint32 capture_ms = 8;

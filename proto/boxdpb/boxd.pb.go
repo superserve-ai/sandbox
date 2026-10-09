@@ -2602,8 +2602,8 @@ type StepResponse struct {
 	// wait_for_change was requested and the display backend could compare.
 	Changed bool `protobuf:"varint,5,opt,name=changed,proto3" json:"changed,omitempty"`
 	// Where the request's time went, in milliseconds: running the actions,
-	// the fixed settle, and the capture (which includes any wait for a
-	// changed frame).
+	// the fixed settle, and the capture (which includes arming the change
+	// watch before the batch and any wait for a changed frame).
 	ActionsMs     uint32 `protobuf:"varint,6,opt,name=actions_ms,json=actionsMs,proto3" json:"actions_ms,omitempty"`
 	SettleMs      uint32 `protobuf:"varint,7,opt,name=settle_ms,json=settleMs,proto3" json:"settle_ms,omitempty"`
 	CaptureMs     uint32 `protobuf:"varint,8,opt,name=capture_ms,json=captureMs,proto3" json:"capture_ms,omitempty"`

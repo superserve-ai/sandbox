@@ -345,6 +345,35 @@ func TestDesktopResize_ReturnsOncePainted_RealXServer(t *testing.T) {
 	}
 }
 
+// A client whose whole picture is one colour still ends the wait when it
+// repaints after the switch; only a display nobody draws on waits it out.
+func TestDesktopResize_OneColourRepaintEndsTheWait_RealXServer(t *testing.T) {
+	for _, bin := range []string{"Xvnc", "xdotool", "xsetroot"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	display := startXvnc(t, 640, 480)
+	t.Setenv("DISPLAY", display)
+	painter := exec.Command("sh", "-c", "while true; do xsetroot -solid '#102030'; sleep 0.1; done")
+	painter.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := painter.Start(); err != nil {
+		t.Fatalf("start painter: %v", err)
+	}
+	t.Cleanup(func() { _ = painter.Process.Kill(); _ = painter.Wait() })
+	time.Sleep(300 * time.Millisecond)
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := s.Resize(ctx, connect.NewRequest(&pb.DesktopResizeRequest{Width: 800, Height: 600})); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > resizeRepaintWait/2 {
+		t.Fatalf("Resize took %v with a one-colour client repainting, want well under the %v bound", elapsed, resizeRepaintWait)
+	}
+}
+
 // Keyboard input against a real server, read back through a terminal: the
 // desktop helpers are hidden so only the XTest path can deliver it.
 func TestDesktopKeys_RealXServer(t *testing.T) {
