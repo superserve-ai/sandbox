@@ -22,16 +22,32 @@ SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxFromTemplate :one
--- CreateSandbox variant that holds FOR KEY SHARE on the template row
--- during the INSERT, serializing with SoftDeleteTemplateIfUnused's FOR
--- UPDATE. Returns 0 rows if the template is missing, deleted, or not
--- visible to the caller.
+-- CreateSandbox variant that locks the template row during the INSERT,
+-- serializing with SoftDeleteTemplateIfUnused and with the promotion of a
+-- new generation. Returns 0 rows if the template is missing, deleted, not
+-- visible, or no longer serving the generation the caller read.
+--
+-- The path match is what makes a reference reliable. The caller boots the VM
+-- from these paths in parallel with this INSERT, so between its read and this
+-- row there is a live user of that generation with nothing recording it. If a
+-- rebuild lands in that window the row would pin paths the collector is free
+-- to delete, and unlinking them does not disturb the running VM: the sandbox
+-- commits and breaks later, at a pause or a resume. Matching here keeps the
+-- generation current until the row that references it exists.
+--
+-- FOR SHARE, not FOR KEY SHARE: promotion rewrites the path columns, which is
+-- a non-key UPDATE and takes FOR NO KEY UPDATE. That conflicts with FOR SHARE
+-- and not with FOR KEY SHARE.
 WITH tpl AS (
   SELECT t.id AS tpl_id, t.disk_mib FROM template t
   WHERE t.id = $13
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
-  FOR KEY SHARE
+    AND t.snapshot_path IS NOT DISTINCT FROM $16
+    AND t.mem_path IS NOT DISTINCT FROM $17
+    AND t.base_path IS NOT DISTINCT FROM $18
+    AND t.delta_path IS NOT DISTINCT FROM $19
+  FOR SHARE
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
   SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
@@ -76,7 +92,11 @@ WITH tpl AS (
   WHERE t.id = @template_id
     AND t.deleted_at IS NULL
     AND (t.team_id = @team_id OR t.team_id = @system_team_id)
-  FOR KEY SHARE
+    AND t.snapshot_path IS NOT DISTINCT FROM @snapshot_path
+    AND t.mem_path IS NOT DISTINCT FROM @mem_path
+    AND t.base_path IS NOT DISTINCT FROM @base_path
+    AND t.delta_path IS NOT DISTINCT FROM @delta_path
+  FOR SHARE
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
   SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds, true FROM tpl

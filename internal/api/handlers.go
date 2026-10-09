@@ -2057,6 +2057,21 @@ func (h *Handlers) teardownVM(ctx context.Context, sandboxID uuid.UUID, hostID s
 // at sandboxBasePath was the last reference and the template has moved on.
 // Nothing to do is not an error; a step that did not run is, so the reclaim
 // is retried rather than recorded complete with the dir still there.
+// refusedInsertResponse turns the reachability probe's outcome into the answer
+// a create gets when its insert was refused. A probe that failed leaves the
+// template unknown rather than absent, and the three outcomes differ in what
+// the caller should do: retry the request, read the template again, or stop.
+func refusedInsertResponse(probeErr error, servable bool) (code, message string, status int) {
+	switch {
+	case probeErr != nil:
+		return "service_unavailable", sandboxCreateTransientResponseMessage, http.StatusServiceUnavailable
+	case servable:
+		return "template_rebuilt", "Template was rebuilt during create; retry", http.StatusConflict
+	default:
+		return "not_found", "Template not found", http.StatusNotFound
+	}
+}
+
 func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sandboxBasePath *string, sandboxTemplateID pgtype.UUID) error {
 	if sandboxBasePath == nil || !sandboxTemplateID.Valid {
 		return nil
@@ -3312,14 +3327,33 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	dbErr := insertRes.err
 
 	// 0 rows from the source's insert = the template or snapshot was deleted
-	// mid-create.
+	// mid-create, or the template moved to a newer generation while this
+	// create held the paths it read.
 	sourceRace := (templateID.Valid || sourceSnapshotID != uuid.Nil) && errors.Is(dbErr, pgx.ErrNoRows)
 	respondSourceGone := func() {
 		if sourceSnapshotID != uuid.Nil {
 			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
 			return
 		}
-		respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+		// Only on this path, so the probe costs nothing on a normal create. A
+		// template that is still servable was rebuilt under us: saying "not
+		// found" about a template that exists is both wrong and unretryable,
+		// and the cached entry would hand the next attempt the same stale
+		// generation.
+		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		servable, probeErr := h.DB.TemplateStillServable(probeCtx, db.TemplateStillServableParams{
+			TemplateID: templateID.Bytes, TeamID: teamID, SystemTeamID: h.systemTeamID(),
+		})
+		probeCancel()
+		// The cached entry named the generation this insert just refused, so it
+		// is stale whichever way the probe went.
+		InvalidateTemplateCache(templateID.Bytes)
+		if probeErr != nil {
+			log.Warn().Err(probeErr).Str("template_id", uuid.UUID(templateID.Bytes).String()).
+				Msg("create: template reachability unknown after a refused insert")
+		}
+		code, msg, status := refusedInsertResponse(probeErr, servable)
+		respondErrorMsg(c, code, msg, status)
 	}
 
 	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
