@@ -559,10 +559,20 @@ func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// Long enough that one pass over the cell's hosts cannot let a second
-// replica in behind the holder, short enough that a crashed one is replaced
-// within a couple of intervals.
-const reconcileLeaseSeconds = 600
+const (
+	// Long enough that one pass over the cell's hosts cannot let a second
+	// replica in behind the holder, short enough that a crashed one is
+	// replaced within a couple of intervals.
+	reconcileLeaseSeconds = 600
+
+	// A daemon that accepts the connection and then stalls would otherwise
+	// hold the pass on the process-lifetime context, and every replica that
+	// inherits the lease after it expires would stall on the same host, so
+	// each host gets a bounded slice and the pass as a whole stays inside
+	// the lease that makes it the only one running.
+	reconcileHostTimeout = 60 * time.Second
+	reconcilePassTimeout = (reconcileLeaseSeconds / 2) * time.Second
+)
 
 // reconcileOrphanBuilds diffs each producer host's disk against the DB live
 // set; the snapshot-time guard prevents racing with builds started mid-run.
@@ -588,29 +598,39 @@ func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
 		return
 	}
 
+	passCtx, cancel := context.WithTimeout(ctx, reconcilePassTimeout)
+	defer cancel()
+
 	snapshotTime := time.Now()
 	// Attempt vm ids are unique per attempt, so one live set is correct for
 	// every host and is collected once rather than per host.
-	live, err := s.collectLiveBuildKeys(ctx)
+	live, err := s.collectLiveBuildKeys(passCtx)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("reconcile: collect live set")
 		return
 	}
 
-	hosts, err := s.reconcileHosts(ctx)
+	hosts, err := s.reconcileHosts(passCtx)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("reconcile: list hosts")
 		return
 	}
-	s.reconcileHostsPass(ctx, hosts, live, snapshotTime)
+	s.reconcileHostsPass(passCtx, hosts, live, snapshotTime, reconcileHostTimeout)
 }
 
-// reconcileHostsPass walks the hosts in turn. A host that is unreachable this
-// pass must not cost the rest their reclamation, and each host spends its own
-// deletion budget so one host's backlog cannot starve the others.
-func (s *BuildSupervisor) reconcileHostsPass(ctx context.Context, hosts []string, live map[string]struct{}, snapshotTime time.Time) {
-	for _, hostID := range hosts {
-		s.reconcileHost(ctx, hostID, live, snapshotTime)
+// reconcileHostsPass walks the hosts in turn. A host that is unreachable or
+// unresponsive must not cost the rest their reclamation, so each gets its own
+// deadline, and its own deletion budget so one host's backlog cannot starve
+// the others.
+func (s *BuildSupervisor) reconcileHostsPass(ctx context.Context, hosts []string, live map[string]struct{}, snapshotTime time.Time, perHost time.Duration) {
+	for i, hostID := range hosts {
+		if ctx.Err() != nil {
+			s.log.Warn().Int("unvisited", len(hosts)-i).Msg("reconcile: pass deadline reached")
+			return
+		}
+		hostCtx, cancel := context.WithTimeout(ctx, perHost)
+		s.reconcileHost(hostCtx, hostID, live, snapshotTime)
+		cancel()
 	}
 }
 

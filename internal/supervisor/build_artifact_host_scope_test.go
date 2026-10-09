@@ -35,9 +35,14 @@ type hostReconcileClient struct {
 	vmdclient.Client
 	onDisk  []vmdclient.BuildArtifactEntry
 	deleted *[]string
+	stall   bool
 }
 
-func (c hostReconcileClient) ListBuildArtifacts(context.Context) ([]vmdclient.BuildArtifactEntry, error) {
+func (c hostReconcileClient) ListBuildArtifacts(ctx context.Context) ([]vmdclient.BuildArtifactEntry, error) {
+	if c.stall {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return c.onDisk, nil
 }
 
@@ -70,9 +75,46 @@ func TestReconcileHostsPassIsIndependentPerHost(t *testing.T) {
 	}
 
 	live := map[string]struct{}{}
-	s.reconcileHostsPass(context.Background(), []string{"a", "unreachable", "b"}, live, time.Now())
+	s.reconcileHostsPass(context.Background(), []string{"a", "unreachable", "b"}, live, time.Now(), time.Minute)
 
 	want := []string{"tpl/build-a-1", "tpl/build-b-1"}
+	if !reflect.DeepEqual(deleted, want) {
+		t.Fatalf("deleted = %v, want %v", deleted, want)
+	}
+}
+
+// A daemon that accepts the connection and then never answers is the case the
+// unreachable check cannot catch: without a deadline of its own it holds the
+// whole pass on the supervisor's process-lifetime context, and every replica
+// that takes the lease after it expires stalls on the same host, so the rest
+// of the cell is never reclaimed.
+func TestReconcileHostsPassBoundsEachHost(t *testing.T) {
+	stale := time.Now().Add(-time.Hour)
+	var deleted []string
+	s := &BuildSupervisor{
+		cfg: BuildSupervisorConfig{Cell: "cell-1"},
+		log: zerolog.Nop(),
+		resolve: func(_ context.Context, hostID string) (vmdclient.Client, error) {
+			return hostReconcileClient{
+				stall:   hostID == "stalled",
+				onDisk:  []vmdclient.BuildArtifactEntry{{TemplateID: "tpl", BuildID: "build-" + hostID, MTimeUnix: stale.Unix()}},
+				deleted: &deleted,
+			}, nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.reconcileHostsPass(context.Background(), []string{"a", "stalled", "b"}, map[string]struct{}{}, time.Now(), 50*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a stalled host held the pass")
+	}
+
+	want := []string{"tpl/build-a", "tpl/build-b"}
 	if !reflect.DeepEqual(deleted, want) {
 		t.Fatalf("deleted = %v, want %v", deleted, want)
 	}
