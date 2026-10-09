@@ -317,7 +317,7 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	payload := map[string]any{
 		"from":    n.from,
 		"to":      []string{to},
-		"subject": "Verify your team on Superserve",
+		"subject": "You're approaching your sandbox limit",
 		"html":    quotaEmailHTML(a),
 	}
 	body, err := json.Marshal(payload)
@@ -363,19 +363,19 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	}
 }
 
-// quotaEmailHTML renders the team-verification email body inside the shared shell.
+// quotaEmailHTML renders the quota alert email body inside the shared shell.
 func quotaEmailHTML(a QuotaAlert) string {
-	body := fmt.Sprintf(`<h1 style="font-family:'Instrument Sans',Helvetica,Arial,sans-serif;color:#e5e5e5;font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0 0 24px 0;">Verify your team on Superserve</h1>
+	body := fmt.Sprintf(`<h1 style="font-family:'Instrument Sans',Helvetica,Arial,sans-serif;color:#e5e5e5;font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0 0 24px 0;">You're approaching your sandbox limit</h1>
 <p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">We're glad to see increasing usage on your Superserve account. For security reasons, we limit the number of active sandboxes on new accounts to <strong style="color:#e5e5e5;">%d</strong>. To request a higher limit, book a meeting using the link below, or reply to this email with:</p>
 <ul style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;padding-left:20px;">
 <li>a link to your website or domain</li>
 <li>a company email address</li>
 <li>a brief description of your use case</li>
 </ul>
-<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">We review every request and aim to respond within 48 hours. Our goal is to provide infinite compute to power your agents, and this verification helps us allocate capacity safely and responsibly across all our customers.</p>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">We review every request and aim to respond within 48 hours. Our goal is to provide infinite compute to power your agents, and this review helps us allocate capacity safely and responsibly across all our customers.</p>
 <a href="%s" style="background-color:#e5e5e5;color:#0a0a0a;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:14px 24px;margin:28px 0 0 0;">Book a Meeting</a>`,
 		a.Limit, emailMeetingURL)
-	return emailShell("Verify your team on Superserve", body)
+	return emailShell("You're approaching your sandbox limit", body)
 }
 
 // emailShell wraps body HTML in the shared Superserve email chrome — logo header,
