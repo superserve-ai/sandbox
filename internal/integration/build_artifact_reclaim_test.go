@@ -198,3 +198,93 @@ func TestIntegration_SupersededGenerationStaysPinnedUntilItsUploadIsAccepted(t *
 		t.Fatal("the generation stayed pinned after its upload reached the bucket")
 	}
 }
+
+// The orphan reconciler deletes what is on disk and absent from its live set,
+// so a live set naming every generation ever promoted deletes nothing. The
+// keys it takes from the attempts must cover only generations still owed.
+func TestIntegration_LiveBuildKeysReleaseSupersededGenerations(t *testing.T) {
+	ctx := context.Background()
+	older, cell := executionFixture(t)
+	executionHost(t, cell, "active")
+	olderAttempt := claimExecution(t, older, cell)
+	admitExecution(t, olderAttempt)
+	if !finalizeExecution(t, older.ID, olderAttempt) {
+		t.Fatal("first generation was refused")
+	}
+	if !recordExecution(t, olderAttempt) {
+		t.Fatal("first generation publication rejected")
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET vcpu = vcpu + 1 WHERE id = $1`, older.TemplateID); err != nil {
+		t.Fatal(err)
+	}
+	newer := rebuildFor(t, older)
+	newerAttempt := claimExecution(t, newer, cell)
+	admitExecution(t, newerAttempt)
+	if !finalizeExecution(t, newer.ID, newerAttempt) {
+		t.Fatal("second generation was refused")
+	}
+
+	keys, err := testQueries.ProtectedBuildAttemptKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := map[string]bool{}
+	for _, k := range keys {
+		held[k] = true
+	}
+	superseded := older.TemplateID.String() + "/" + olderAttempt.VMID
+	current := newer.TemplateID.String() + "/" + newerAttempt.VMID
+	if held[superseded] {
+		t.Fatal("the live set still names a superseded generation, so the reconciler can never delete it")
+	}
+	if !held[current] {
+		t.Fatal("the live set dropped the generation the template is serving")
+	}
+}
+
+// Deleting a template that has build executions leaves its host artifacts
+// behind for the reconciler, so the live set must release them: both the
+// attempt rule and the template-pointer input are scoped to live templates.
+func TestIntegration_DeletedTemplateReleasesItsGeneration(t *testing.T) {
+	ctx := context.Background()
+	tb, cell := executionFixture(t)
+	executionHost(t, cell, "active")
+	attempt := claimExecution(t, tb, cell)
+	admitExecution(t, attempt)
+	if !finalizeExecution(t, tb.ID, attempt) {
+		t.Fatal("generation was refused")
+	}
+	if !recordExecution(t, attempt) {
+		t.Fatal("publication rejected")
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE template SET deleted_at = now() WHERE id = $1`, tb.TemplateID); err != nil {
+		t.Fatal(err)
+	}
+
+	protected, err := testQueries.BuildArtifactProtected(ctx, attempt.VMID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protected {
+		t.Fatal("a deleted template's generation is still pinned; its artifacts can never be reclaimed")
+	}
+	keys, err := testQueries.ProtectedBuildAttemptKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
+		if k == tb.TemplateID.String()+"/"+attempt.VMID {
+			t.Fatal("the live set still names a deleted template's generation")
+		}
+	}
+	paths, err := testQueries.ListAllTemplateBasePaths(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range paths {
+		if p.ID == tb.TemplateID {
+			t.Fatal("the reconciler's template pointers still include a deleted template")
+		}
+	}
+}

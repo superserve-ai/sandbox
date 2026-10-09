@@ -623,9 +623,10 @@ func applyDeletions(ctx context.Context, log zerolog.Logger, vmd buildArtifactDe
 }
 
 // collectLiveBuildKeys returns "<templateID>/<buildID>" keys for build
-// dirs that must be preserved: in-flight + each template's current
-// base_path + sandbox pins to prior builds. status='ready' is not a
-// signal here — see ListInFlightBuilds.
+// dirs that must be preserved: attempts still owed their artifacts,
+// in-flight builds, sandbox and snapshot pins, and each template's
+// current base_path. Promotion alone is not a signal — a generation the
+// template has moved off and nothing references is reclaimable.
 func (s *BuildSupervisor) collectLiveBuildKeys(ctx context.Context) (map[string]struct{}, error) {
 	live := map[string]struct{}{}
 	keys, err := s.q.ProtectedBuildAttemptKeys(ctx)
