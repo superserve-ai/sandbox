@@ -112,13 +112,17 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 			ttfb = time.Since(tProxy)
 			ttfbMs = ttfb.Milliseconds()
 			upstreamStatus = resp.StatusCode
+			if streaming && resp.StatusCode < 400 {
+				logSessionStart(r.Context(), resp.StatusCode)
+			}
 			boxdSpawnMs = headerMs(resp, "X-Boxd-Spawn-Ms")
 			boxdRunMs = headerMs(resp, "X-Boxd-Run-Ms")
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
-			h.log.Error().Err(proxyErr).
-				Str("instance", instanceID).
+			logRequestOutcome(req.Context(), "transport_error")
+			h.log.Error().
+				Str("instance", logSandboxID(instanceID)).
 				Str("target", target.Host).
 				Bool("streaming", streaming).
 				Msg("exec: upstream error")
@@ -134,7 +138,7 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	rp.ServeHTTP(w, r)
 
 	h.log.Info().
-		Str("sandbox_id", instanceID).
+		Str("sandbox_id", logSandboxID(instanceID)).
 		Bool("streaming", streaming).
 		Int("status", upstreamStatus).
 		Int64("auth_ms", tAuthDone.Sub(tStart).Milliseconds()).

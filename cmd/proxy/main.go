@@ -25,6 +25,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/proxy"
+	"github.com/superserve-ai/sandbox/internal/requestlog"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
@@ -39,7 +40,7 @@ func main() {
 func run() error {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})
-	log := zerolog.New(multi).With().
+	log := zerolog.New(multi).Hook(requestlog.CloudSeverityHook{}).With().
 		Timestamp().
 		Str("service", "proxy").
 		Logger()
@@ -251,7 +252,7 @@ func run() error {
 			log.Fatal().Err(err).Msg("local peer target bind failed")
 		}
 		// Peer traffic terminates at the local handler, never the public router.
-		localSrv = proxy.NewServer(target, localMux)
+		localSrv = proxy.NewServer(target, proxy.PeerRequestLogging(localMux))
 		localConnections = proxy.NewDrainConnections()
 		localSrv.ConnState = localConnections.ConnState
 		localErrCh := make(chan error, 1)
@@ -530,6 +531,7 @@ func withRoutingBootstrap(next http.Handler, ready func() bool) http.Handler {
 }
 
 func newProxyMuxWithReadiness(proxyHandler *proxy.Handler, dataPlane http.Handler, dependencies func(context.Context) bool) *http.ServeMux {
+	dataPlane = proxyHandler.RequestLogging(dataPlane)
 	generation := os.Getenv("PROXY_GENERATION")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

@@ -283,7 +283,7 @@ func TestRequestLogger_DoesNotBreakResponse(t *testing.T) {
 	}
 }
 
-func TestRequestLogger_LogsQueryParams(t *testing.T) {
+func TestRequestLogger_PreservesQueryForHandler(t *testing.T) {
 	r := gin.New()
 	r.Use(RequestLogger())
 	r.GET("/search", func(c *gin.Context) {

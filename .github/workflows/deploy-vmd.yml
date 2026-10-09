@@ -59,6 +59,7 @@ on:
       - 'internal/network/**'
       - 'internal/presence/**'
       - 'internal/preview/**'
+      - 'internal/requestlog/**'
       - 'internal/proxy/**'
       - 'internal/retainedstorage/**'
       - 'internal/secretsproxy/**'
