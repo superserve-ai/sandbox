@@ -288,3 +288,34 @@ func TestIntegration_DeletedTemplateReleasesItsGeneration(t *testing.T) {
 		}
 	}
 }
+
+// Readiness runs ahead of the upload and record_template_publication refuses
+// a deleted template's upload, so a template deleted in that window leaves an
+// attempt that can never obtain a publication. Protecting it on the missing
+// publication alone would hold its artifacts for the life of the host.
+func TestIntegration_DeletedTemplateReleasesAnUnpublishedGeneration(t *testing.T) {
+	ctx := context.Background()
+	tb, cell := executionFixture(t)
+	executionHost(t, cell, "active")
+	attempt := claimExecution(t, tb, cell)
+	admitExecution(t, attempt)
+	if !finalizeExecution(t, tb.ID, attempt) {
+		t.Fatal("generation was refused")
+	}
+
+	// Deleted before the upload lands, which is what makes it unreachable.
+	if _, err := testPool.Exec(ctx, `UPDATE template SET deleted_at = now() WHERE id = $1`, tb.TemplateID); err != nil {
+		t.Fatal(err)
+	}
+	if recordExecution(t, attempt) {
+		t.Fatal("fixture no longer covers the case: the deleted template accepted a publication")
+	}
+
+	protected, err := testQueries.BuildArtifactProtected(ctx, attempt.VMID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protected {
+		t.Fatal("a generation whose upload can never be recorded is pinned for good")
+	}
+}

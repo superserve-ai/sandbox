@@ -53,9 +53,6 @@ type BuildSupervisorConfig struct {
 	// per-team limits would allow it.
 	GlobalMaxConcurrentBuilds int32
 
-	// HostID scopes the legacy orphan reconciler; new dispatch uses Cell.
-	HostID string
-
 	// PendingTimeout is how long a build can wait in 'pending' before it's
 	// reaped as failed. Pending now only covers "waiting for the next
 	// supervisor tick to dispatch" — concurrency limits are enforced at
@@ -80,18 +77,17 @@ type BuildSupervisorConfig struct {
 	// 0 disables it (used by tests).
 	ReconcileInterval time.Duration
 
-	// MaxDeletesPerReconcile bounds per-tick deletion I/O; the remainder
-	// is picked up next tick. 0 means unbounded (used by tests).
+	// MaxDeletesPerReconcile bounds each host's per-tick deletion I/O; the
+	// remainder is picked up next tick. 0 means unbounded (used by tests).
 	MaxDeletesPerReconcile int
 }
 
 // DefaultBuildSupervisorConfig returns sensible defaults.
-func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
+func DefaultBuildSupervisorConfig() BuildSupervisorConfig {
 	return BuildSupervisorConfig{
 		Interval:                  1 * time.Second,
 		BatchSize:                 20,
 		GlobalMaxConcurrentBuilds: 10,
-		HostID:                    hostID,
 		PendingTimeout:            2 * time.Minute,
 		BuildTimeout:              30 * time.Minute,
 		RegisterGrace:             60 * time.Second,
@@ -211,7 +207,7 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 		Dur("interval", s.cfg.Interval).
 		Int32("batch_size", s.cfg.BatchSize).
 		Int32("global_max_concurrent", s.cfg.GlobalMaxConcurrentBuilds).
-		Str("host_id", s.cfg.HostID).
+		Str("cell", s.cfg.Cell).
 		Msg("build supervisor started")
 
 	ticker := time.NewTicker(s.cfg.Interval)
@@ -563,30 +559,105 @@ func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// reconcileOrphanBuilds diffs vmd's disk against the DB live set; the
-// snapshot-time guard prevents racing with builds started mid-run.
+// Long enough that one pass over the cell's hosts cannot let a second
+// replica in behind the holder, short enough that a crashed one is replaced
+// within a couple of intervals.
+const reconcileLeaseSeconds = 600
+
+// reconcileOrphanBuilds diffs each producer host's disk against the DB live
+// set; the snapshot-time guard prevents racing with builds started mid-run.
+//
+// One replica reconciles per tick. Run by every replica this would send the
+// same deletions to the same vmd, which holds its build registry lock while
+// it scans and unlinks, so the duplicates would serialize build operations
+// for no gain.
 func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
+	// A registry holding more than one region's hosts must not have one
+	// cell's supervisor walking another's disks.
+	if s.cfg.Cell == "" {
+		return
+	}
+	if _, err := s.q.ClaimSweepLease(ctx, db.ClaimSweepLeaseParams{
+		Name: "build-artifact-reconcile:" + s.cfg.Cell, LockedBy: db.SweepHolderID(),
+		LeaseSeconds: reconcileLeaseSeconds,
+	}); err != nil {
+		// No row means another replica holds the lease: this tick is theirs.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			s.log.Warn().Err(err).Msg("reconcile: claim lease")
+		}
+		return
+	}
+
 	snapshotTime := time.Now()
+	// Attempt vm ids are unique per attempt, so one live set is correct for
+	// every host and is collected once rather than per host.
 	live, err := s.collectLiveBuildKeys(ctx)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("reconcile: collect live set")
 		return
 	}
 
-	vmd, err := s.resolve(ctx, s.cfg.HostID)
+	hosts, err := s.reconcileHosts(ctx)
 	if err != nil {
-		s.log.Warn().Err(err).Str("host_id", s.cfg.HostID).Msg("reconcile: resolve vmd")
+		s.log.Warn().Err(err).Msg("reconcile: list hosts")
+		return
+	}
+	s.reconcileHostsPass(ctx, hosts, live, snapshotTime)
+}
+
+// reconcileHostsPass walks the hosts in turn. A host that is unreachable this
+// pass must not cost the rest their reclamation, and each host spends its own
+// deletion budget so one host's backlog cannot starve the others.
+func (s *BuildSupervisor) reconcileHostsPass(ctx context.Context, hosts []string, live map[string]struct{}, snapshotTime time.Time) {
+	for _, hostID := range hosts {
+		s.reconcileHost(ctx, hostID, live, snapshotTime)
+	}
+}
+
+// reconcileHosts names the hosts whose disks this pass walks. Builds are
+// dispatched to any eligible host in the cell, so walking a single host
+// leaves every other one's superseded generations on disk. A host that is
+// not active is skipped and picked up once it is, which leaves only a
+// retired host's artifacts unreclaimed — and that disk leaves with it.
+func (s *BuildSupervisor) reconcileHosts(ctx context.Context) ([]string, error) {
+	hosts, err := s.q.ListActiveHosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return hostsInCell(hosts, s.cfg.Cell), nil
+}
+
+// hostsInCell picks this cell's hosts out of a registry that may serve more
+// than one — pure so the scoping is testable without DB plumbing.
+func hostsInCell(hosts []db.Host, cell string) []string {
+	var out []string
+	for _, h := range hosts {
+		if cell != "" && h.Region == cell {
+			out = append(out, h.ID)
+		}
+	}
+	return out
+}
+
+// reconcileHost applies the live set to one host. Each host gets its own
+// deletion budget so a host with a large backlog cannot starve the others,
+// and a host that is unreachable this pass does not stop the rest.
+func (s *BuildSupervisor) reconcileHost(ctx context.Context, hostID string, live map[string]struct{}, snapshotTime time.Time) {
+	vmd, err := s.resolve(ctx, hostID)
+	if err != nil {
+		s.log.Warn().Err(err).Str("host_id", hostID).Msg("reconcile: resolve vmd")
 		return
 	}
 	onDisk, err := vmd.ListBuildArtifacts(ctx)
 	if err != nil {
-		s.log.Warn().Err(err).Msg("reconcile: ListBuildArtifacts")
+		s.log.Warn().Err(err).Str("host_id", hostID).Msg("reconcile: ListBuildArtifacts")
 		return
 	}
 
 	toDelete := reconcileDecision(onDisk, live, snapshotTime)
 	attempted, deleted := applyDeletions(ctx, s.log, vmd, toDelete, s.cfg.MaxDeletesPerReconcile)
 	s.log.Info().
+		Str("host_id", hostID).
 		Int("on_disk", len(onDisk)).
 		Int("live", len(live)).
 		Int("attempted", attempted).
