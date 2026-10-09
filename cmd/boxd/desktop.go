@@ -887,6 +887,10 @@ func (s *desktopService) markRepaint(ctx context.Context) bool {
 // switch, or until bound; without a display backend it returns at once. A
 // desktop that already redrew during the mode switch costs one read.
 func (s *desktopService) awaitRepaint(ctx context.Context, marked bool, bound time.Duration) {
+	// The bound also caps the X11 reads themselves: a server that stops
+	// replying mid-read must release the input lock at the deadline too.
+	ctx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
 	deadline := time.Now().Add(bound)
 	_, _ = s.runX11(ctx, func(ctx context.Context, b *x11Backend) error {
 		ok, err := b.awaitPainted(ctx, marked, deadline)
