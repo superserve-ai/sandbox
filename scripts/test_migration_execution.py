@@ -90,17 +90,30 @@ ANALYZE sandbox;
         self.push(error="snapshot reference index is invalid or mismatched")
         self.assertEqual(self.sql("SELECT count(*) FROM supabase_migrations.schema_migrations"), "1")
 
-    def test_interrupted_snapshot_index_is_not_silently_accepted(self):
+    def test_interrupted_snapshot_index_recovers_once_the_table_is_free(self):
         self.seed_snapshot_references()
         with psycopg.connect(self.url) as writer:
             writer.execute("UPDATE sandbox SET destroyed_at=now() WHERE id=42")
-            with self.assertRaisesRegex(migration.MigrationError, "preparation failed"):
-                self.invoke()
-        self.assertEqual(self.sql("SELECT NOT indisvalid FROM pg_index "
+            with patch.object(snapshot_index, "BUILD_TIMEOUT", 2):
+                # The build waits for the open writer on its own budget rather
+                # than being refused by the session's 250ms lock timeout.
+                started = time.monotonic()
+                with self.assertRaisesRegex(migration.MigrationError, "preparation failed"):
+                    self.invoke()
+                self.assertGreater(time.monotonic() - started, 1)
+                self.assertEqual(self.sql("SELECT NOT indisvalid FROM pg_index "
+                                          "WHERE indexrelid='idx_sandbox_snapshot_id'::regclass"), "t")
+                # A retry while the table is still held fails closed too, and
+                # records nothing.
+                with self.assertRaisesRegex(migration.MigrationError, "preparation failed"):
+                    self.invoke()
+            self.assertEqual(self.sql("SELECT count(*) FROM supabase_migrations.schema_migrations"), "1")
+        # Once the writer is gone the next run clears its own invalid index and
+        # rebuilds, instead of refusing every later migration on this database.
+        self.invoke()
+        self.assertEqual(self.sql("SELECT indisvalid FROM pg_index "
                                   "WHERE indexrelid='idx_sandbox_snapshot_id'::regclass"), "t")
-        with self.assertRaisesRegex(migration.MigrationError, "invalid or mismatched"):
-            self.invoke()
-        self.assertEqual(self.sql("SELECT count(*) FROM supabase_migrations.schema_migrations"), "1")
+        self.assertEqual(self.sql("SELECT count(*) FROM supabase_migrations.schema_migrations"), "2")
         self.sql("UPDATE sandbox SET destroyed_at=now() WHERE id=43")
 
     def test_concurrent_snapshot_index_has_a_separate_bounded_budget(self):
