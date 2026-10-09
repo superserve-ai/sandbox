@@ -822,10 +822,10 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 
 	// The lock also covers the settle and the capture, so the frame shows
 	// the state this batch produced and nothing that arrived after it.
+	phase := time.Now()
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
-	resp := &pb.StepResponse{Executed: uint32(len(lowered))}
-	phase := time.Now()
+	resp := &pb.StepResponse{Executed: uint32(len(lowered)), QueueMs: millisSince(&phase)}
 	var watch *frameWatch
 	if req.Msg.GetWaitForChange() {
 		watch = s.armFrameWatch(ctx)

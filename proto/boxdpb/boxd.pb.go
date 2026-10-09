@@ -2601,12 +2601,14 @@ type StepResponse struct {
 	// Whether the frame differs from the one before the batch. Only set when
 	// wait_for_change was requested and the display backend could compare.
 	Changed bool `protobuf:"varint,5,opt,name=changed,proto3" json:"changed,omitempty"`
-	// Where the request's time went, in milliseconds: running the actions,
-	// the fixed settle, and the capture (which includes arming the change
-	// watch before the batch and any wait for a changed frame).
+	// Where the request's time went, in milliseconds: waiting for the input
+	// lock behind other requests, running the actions, the fixed settle, and
+	// the capture (which includes arming the change watch before the batch
+	// and any wait for a changed frame).
 	ActionsMs     uint32 `protobuf:"varint,6,opt,name=actions_ms,json=actionsMs,proto3" json:"actions_ms,omitempty"`
 	SettleMs      uint32 `protobuf:"varint,7,opt,name=settle_ms,json=settleMs,proto3" json:"settle_ms,omitempty"`
 	CaptureMs     uint32 `protobuf:"varint,8,opt,name=capture_ms,json=captureMs,proto3" json:"capture_ms,omitempty"`
+	QueueMs       uint32 `protobuf:"varint,9,opt,name=queue_ms,json=queueMs,proto3" json:"queue_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2693,6 +2695,13 @@ func (x *StepResponse) GetSettleMs() uint32 {
 func (x *StepResponse) GetCaptureMs() uint32 {
 	if x != nil {
 		return x.CaptureMs
+	}
+	return 0
+}
+
+func (x *StepResponse) GetQueueMs() uint32 {
+	if x != nil {
+		return x.QueueMs
 	}
 	return 0
 }
@@ -2927,7 +2936,7 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\aactions\x18\x01 \x03(\v2\x1a.superserve.boxd.v1.ActionR\aactions\x127\n" +
 	"\x06format\x18\x02 \x01(\x0e2\x1f.superserve.boxd.v1.FrameFormatR\x06format\x12\x1b\n" +
 	"\tsettle_ms\x18\x03 \x01(\rR\bsettleMs\x12&\n" +
-	"\x0fwait_for_change\x18\x04 \x01(\bR\rwaitForChange\"\xaf\x02\n" +
+	"\x0fwait_for_change\x18\x04 \x01(\bR\rwaitForChange\"\xca\x02\n" +
 	"\fStepResponse\x12\x1a\n" +
 	"\bexecuted\x18\x01 \x01(\rR\bexecuted\x12!\n" +
 	"\faction_error\x18\x02 \x01(\tR\vactionError\x12F\n" +
@@ -2940,7 +2949,8 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"actions_ms\x18\x06 \x01(\rR\tactionsMs\x12\x1b\n" +
 	"\tsettle_ms\x18\a \x01(\rR\bsettleMs\x12\x1d\n" +
 	"\n" +
-	"capture_ms\x18\b \x01(\rR\tcaptureMs\"D\n" +
+	"capture_ms\x18\b \x01(\rR\tcaptureMs\x12\x19\n" +
+	"\bqueue_ms\x18\t \x01(\rR\aqueueMs\"D\n" +
 	"\x14DesktopResizeRequest\x12\x14\n" +
 	"\x05width\x18\x01 \x01(\rR\x05width\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\"\x17\n" +

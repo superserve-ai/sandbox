@@ -368,12 +368,14 @@ message StepResponse {
   // Whether the frame differs from the one before the batch. Only set when
   // wait_for_change was requested and the display backend could compare.
   bool changed = 5;
-  // Where the request's time went, in milliseconds: running the actions,
-  // the fixed settle, and the capture (which includes arming the change
-  // watch before the batch and any wait for a changed frame).
+  // Where the request's time went, in milliseconds: waiting for the input
+  // lock behind other requests, running the actions, the fixed settle, and
+  // the capture (which includes arming the change watch before the batch
+  // and any wait for a changed frame).
   uint32 actions_ms = 6;
   uint32 settle_ms = 7;
   uint32 capture_ms = 8;
+  uint32 queue_ms = 9;
 }
 
 // Named DesktopResizeRequest/Response (not ResizeRequest/Response) to avoid
