@@ -110,11 +110,13 @@ func (q *Queries) MarkBuildAttemptCleaned(ctx context.Context, id uuid.UUID) err
 	return err
 }
 
-// Preserve accepted versions as well as active/unreachable execution owners.
+// ProtectedBuildAttemptKeys lists the build dirs the reconciler must keep on
+// account of the attempt itself, under the same rule the destroy-time
+// collector applies. It previously kept every attempt that had ever been
+// promoted, which left the live set naming everything on disk.
 func (q *Queries) ProtectedBuildAttemptKeys(ctx context.Context) ([]string, error) {
 	rows, err := q.db.Query(ctx, `SELECT b.template_id::text||'/'||a.vm_id FROM template_build_attempt a
- JOIN template_build b ON b.id=a.build_id WHERE a.state IN ('claimed','admitted','uploading','ready')
- OR a.cleanup_pending OR EXISTS(SELECT 1 FROM template_build_publication p WHERE p.attempt_id=a.id)`)
+ JOIN template_build b ON b.id=a.build_id WHERE build_artifact_protected(a.vm_id)`)
 	if err != nil {
 		return nil, err
 	}
@@ -193,36 +195,10 @@ func (q *Queries) HasTemplateExecutions(ctx context.Context, template uuid.UUID)
 }
 
 // BuildArtifactProtected reports whether a build's own state still owes its
-// on-host artifacts. Being 'ready' records that an attempt WAS promoted, not
-// that it still IS the template's generation, and it never clears: reading it
-// as protection pinned every superseded generation on its host forever.
-//
-// What makes a superseded generation reclaimable is that the bucket holds it.
-// Readiness now runs ahead of the upload, so a promoted build with no
-// publication at all is still the only copy of itself and the uploader is
-// still reading these paths. The publication row is the durability signal:
-// it is written once every object is verified in the bucket. accepted_at is
-// adoption as the template's version, which a superseded generation is fenced
-// out of by design and which says nothing about whether its bytes are safe.
-//
-// Live references are deliberately not asked about here. They key on the exact
-// base_path, which is indexed, and callers already hold one: the destroy path
-// counts with CountActiveSandboxesAtBasePath, and a reconciler takes the whole
-// pinned set once per pass with ListPinnedBuildPaths. Matching a VM id as a
-// path substring would scan both tables per candidate.
+// on-host artifacts; see build_artifact_protected for the rule and why live
+// references are asked about separately.
 func (q *Queries) BuildArtifactProtected(ctx context.Context, vmID string) (bool, error) {
 	var exists bool
-	err := q.db.QueryRow(ctx, `SELECT EXISTS(
- SELECT 1 FROM template_build_attempt a JOIN template_build b ON b.id=a.build_id
- WHERE a.vm_id=$1 AND (
-     a.state IN ('claimed','admitted','uploading')
-  OR a.cleanup_pending
-  OR EXISTS(SELECT 1 FROM template t WHERE t.id=b.template_id AND t.deleted_at IS NULL
-            AND (t.base_path LIKE '%/'||a.vm_id||'/%'
-              OR t.rootfs_path LIKE '%/'||a.vm_id||'/%'
-              OR t.snapshot_path LIKE '%/'||a.vm_id||'/%'))
-  OR (a.state='ready' AND NOT EXISTS(SELECT 1 FROM template_build_publication p
-                                     WHERE p.attempt_id=a.id))
- ))`, vmID).Scan(&exists)
+	err := q.db.QueryRow(ctx, `SELECT build_artifact_protected($1)`, vmID).Scan(&exists)
 	return exists, err
 }

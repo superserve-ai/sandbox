@@ -4,9 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"math/rand/v2"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,7 +35,7 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 	// successor at the UUID prefix. The lease elects the runner and carries
 	// the cursor it advances, so a handover resumes mid-population.
 	afterID, err := h.DB.ClaimSweepLease(ctx, db.ClaimSweepLeaseParams{
-		Name: trialEligibilitySweepName, LockedBy: sweepHolderID(),
+		Name: trialEligibilitySweepName, LockedBy: db.SweepHolderID(),
 		LeaseSeconds: int32(trialEligibilityLeaseSeconds),
 	})
 	if err != nil {
@@ -258,18 +255,6 @@ func (h *Handlers) scheduleBillingEligibilityReconciliation(ctx context.Context,
 	})
 }
 
-// sweepHolderID names this process in a sweep lease row, stable for its
-// lifetime so the holder's own renewal is recognised as a renewal. The pid
-// separates replicas sharing a hostname; the random suffix separates
-// processes within a test binary.
-var sweepHolderID = sync.OnceValue(func() string {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		host = "unknown-host"
-	}
-	return fmt.Sprintf("%s-%d-%08x", host, os.Getpid(), rand.Uint32())
-})
-
 // advanceTrialEligibilityCursor persists the resume point on its own budget.
 // The pass context carries the tick deadline and dispatch stops when it
 // expires, so writing progress through it would fail exactly when there is
@@ -279,7 +264,7 @@ func (h *Handlers) advanceTrialEligibilityCursor(ctx context.Context, next pgtyp
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := h.DB.AdvanceSweepCursor(saveCtx, db.AdvanceSweepCursorParams{
-		Name: trialEligibilitySweepName, LockedBy: sweepHolderID(), CursorID: next,
+		Name: trialEligibilitySweepName, LockedBy: db.SweepHolderID(), CursorID: next,
 	}); err != nil {
 		log.Error().Err(err).Msg("billing: advance trial eligibility cursor failed")
 	}
