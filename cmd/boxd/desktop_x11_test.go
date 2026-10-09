@@ -43,6 +43,11 @@ func TestDesktopResize_RealXServer(t *testing.T) {
 		if err != nil || w != want[0] || h != want[1] {
 			t.Fatalf("after Resize(%dx%d): geometry %dx%d, err %v", want[0], want[1], w, h, err)
 		}
+		// Nothing draws on this bare server, so the repaint wait runs out;
+		// that is an answer, not a failure, and must not cost the connection.
+		if s.x11.backend == nil {
+			t.Fatalf("after Resize(%dx%d): X11 backend dropped by the repaint wait", want[0], want[1])
+		}
 	}
 }
 
