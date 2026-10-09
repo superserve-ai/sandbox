@@ -43,6 +43,11 @@ func TestDesktopResize_RealXServer(t *testing.T) {
 		if err != nil || w != want[0] || h != want[1] {
 			t.Fatalf("after Resize(%dx%d): geometry %dx%d, err %v", want[0], want[1], w, h, err)
 		}
+		// Nothing draws on this bare server, so the repaint wait runs out;
+		// that is an answer, not a failure, and must not cost the connection.
+		if s.x11.backend == nil {
+			t.Fatalf("after Resize(%dx%d): X11 backend dropped by the repaint wait", want[0], want[1])
+		}
 	}
 }
 
@@ -151,8 +156,19 @@ func TestDesktopStep_RealXServer(t *testing.T) {
 	if shot.GetWidth() != 640 || shot.GetHeight() != 480 || len(shot.GetImage()) == 0 {
 		t.Fatalf("screenshot = %dx%d, %d bytes; want 640x480 with data", shot.GetWidth(), shot.GetHeight(), len(shot.GetImage()))
 	}
+	if resp.Msg.GetSettleMs() < 20 || resp.Msg.GetCaptureMs() == 0 {
+		t.Errorf("timings actions=%d settle=%d capture=%d, want the 20ms settle and a capture time", resp.Msg.GetActionsMs(), resp.Msg.GetSettleMs(), resp.Msg.GetCaptureMs())
+	}
 	if s.x11.backend == nil {
 		t.Fatal("step did not go through the X11 backend")
+	}
+	jpegShot, err := s.Screenshot(ctx, connect.NewRequest(&pb.ScreenshotRequest{Format: pb.FrameFormat_FRAME_FORMAT_JPEG}))
+	if err != nil {
+		t.Fatalf("Screenshot(JPEG): %v", err)
+	}
+	img := jpegShot.Msg.GetImage()
+	if jpegShot.Msg.GetFormat() != pb.FrameFormat_FRAME_FORMAT_JPEG || len(img) < 4 || img[0] != 0xff || img[1] != 0xd8 || jpegShot.Msg.GetWidth() != 640 {
+		t.Fatalf("JPEG screenshot: format=%v width=%d head=% x", jpegShot.Msg.GetFormat(), jpegShot.Msg.GetWidth(), img[:min(4, len(img))])
 	}
 	probe := exec.Command("xdotool", "getmouselocation")
 	probe.Env = append(os.Environ(), "DISPLAY="+display)
@@ -291,6 +307,47 @@ func TestDesktopStepWaitForChange_RepaintDuringSnapshot_RealXServer(t *testing.T
 			resp.Msg.GetChanged(), resp.Msg.GetCaptureError(), elapsed, reads)
 	}
 	t.Logf("changed frame after %v with %d snapshot reads", elapsed, reads)
+}
+
+// With a window mapped, the display is painted again right after the mode
+// switch, so Resize must return long before its repaint bound.
+func TestDesktopResize_ReturnsOncePainted_RealXServer(t *testing.T) {
+	for _, bin := range []string{"Xvnc", "xdotool", "xterm"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	display := startXvnc(t, 640, 480)
+	t.Setenv("DISPLAY", display)
+	term := exec.Command("xterm", "-geometry", "60x20+10+10", "-e", "sh", "-c", "cat > /dev/null")
+	term.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := term.Start(); err != nil {
+		t.Fatalf("start xterm: %v", err)
+	}
+	t.Cleanup(func() { _ = term.Process.Kill(); _ = term.Wait() })
+	wait := exec.Command("xdotool", "search", "--sync", "--class", "xterm")
+	wait.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := wait.Run(); err != nil {
+		t.Fatalf("xterm window did not appear: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := s.Resize(ctx, connect.NewRequest(&pb.DesktopResizeRequest{Width: 800, Height: 600})); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > resizeRepaintWait/2 {
+		t.Fatalf("Resize took %v with a window to repaint, want well under the %v bound", elapsed, resizeRepaintWait)
+	}
+	shot, err := s.Screenshot(ctx, connect.NewRequest(&pb.ScreenshotRequest{}))
+	if err != nil {
+		t.Fatalf("Screenshot: %v", err)
+	}
+	if shot.Msg.GetWidth() != 800 {
+		t.Fatalf("screenshot width %d after resize, want 800", shot.Msg.GetWidth())
+	}
 }
 
 // Keyboard input against a real server, read back through a terminal: the

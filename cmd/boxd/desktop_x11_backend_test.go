@@ -388,3 +388,20 @@ func TestX11Holder_DisplayChangeDropsTheCachedBackendAndItsCooldown(t *testing.T
 		t.Fatal("a new display did not get its own probe")
 	}
 }
+
+func TestPainted(t *testing.T) {
+	blank := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for i := range blank.Pix {
+		blank.Pix[i] = 0x10
+	}
+	if painted(blank) {
+		t.Error("one-colour frame reported as painted")
+	}
+	blank.Pix[len(blank.Pix)-4] = 0x11 // one pixel differs
+	if !painted(blank) {
+		t.Error("frame with a differing pixel not reported as painted")
+	}
+	if painted(image.NewRGBA(image.Rect(0, 0, 0, 0))) {
+		t.Error("empty frame reported as painted")
+	}
+}

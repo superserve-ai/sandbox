@@ -1189,7 +1189,7 @@ func TestCaptureScreenshot_RejectsOversizeFrame(t *testing.T) {
 	s := newDesktopService(&sandboxContext{})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	_, err := s.captureScreenshot(ctx, nil)
+	_, err := s.captureScreenshot(ctx, pb.FrameFormat_FRAME_FORMAT_PNG, nil)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("captureScreenshot: err = %v, want size-limit error", err)
 	}
@@ -1230,11 +1230,11 @@ func TestCaptureScreenshot_BoundedConcurrency(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := s.captureScreenshot(ctx, nil); err == nil {
+	if _, err := s.captureScreenshot(ctx, pb.FrameFormat_FRAME_FORMAT_PNG, nil); err == nil {
 		t.Fatal("capture ran with every slot taken")
 	}
 	<-s.captureSlots
-	if _, err := s.captureScreenshot(context.Background(), nil); err != nil {
+	if _, err := s.captureScreenshot(context.Background(), pb.FrameFormat_FRAME_FORMAT_PNG, nil); err != nil {
 		t.Fatalf("capture after a slot freed: %v", err)
 	}
 	if got := len(s.captureSlots); got != maxConcurrentCaptures-1 {
@@ -1382,5 +1382,38 @@ func TestStep_ValidationErrorNeverShellsOut(t *testing.T) {
 		if !errors.As(err, &ce) || ce.Code() != connect.CodeInvalidArgument {
 			t.Errorf("%s: error = %v, want CodeInvalidArgument", name, err)
 		}
+	}
+}
+
+func TestEncodeFrame_JPEGIsSmallerAndDecodesToTheSameSize(t *testing.T) {
+	// Pseudo-random pixels so PNG cannot compress them away.
+	frame := image.NewRGBA(image.Rect(0, 0, 64, 48))
+	x := uint32(2463534242)
+	for i := range frame.Pix {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		frame.Pix[i] = byte(x)
+	}
+	pngBytes, err := encodeFrame(frame, pb.FrameFormat_FRAME_FORMAT_PNG)
+	if err != nil {
+		t.Fatalf("png: %v", err)
+	}
+	jpegBytes, err := encodeFrame(frame, pb.FrameFormat_FRAME_FORMAT_JPEG)
+	if err != nil {
+		t.Fatalf("jpeg: %v", err)
+	}
+	if len(jpegBytes) < 4 || jpegBytes[0] != 0xff || jpegBytes[1] != 0xd8 {
+		t.Fatalf("jpeg output does not start with the JPEG marker: % x", jpegBytes[:4])
+	}
+	cfg, kind, err := image.DecodeConfig(bytes.NewReader(jpegBytes))
+	if err != nil || kind != "jpeg" || cfg.Width != 64 || cfg.Height != 48 {
+		t.Fatalf("decoded %s %dx%d, err %v; want jpeg 64x48", kind, cfg.Width, cfg.Height, err)
+	}
+	if len(jpegBytes) >= len(pngBytes) {
+		t.Errorf("jpeg %d bytes is not smaller than png %d bytes for a noisy frame", len(jpegBytes), len(pngBytes))
+	}
+	if _, err := screenshotFormat(pb.FrameFormat_FRAME_FORMAT_JPEG); err != nil {
+		t.Errorf("JPEG rejected by screenshotFormat: %v", err)
 	}
 }
