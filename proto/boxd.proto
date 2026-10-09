@@ -220,6 +220,9 @@ service DesktopService {
 enum FrameFormat {
   FRAME_FORMAT_UNSPECIFIED = 0; // Server picks the default (PNG).
   FRAME_FORMAT_PNG = 1;
+  // Lossy, fixed quality; several times smaller and faster to encode than
+  // PNG, for loops where a model reads the frame.
+  FRAME_FORMAT_JPEG = 2;
 }
 
 message ScreenshotRequest {
@@ -365,6 +368,12 @@ message StepResponse {
   // Whether the frame differs from the one before the batch. Only set when
   // wait_for_change was requested and the display backend could compare.
   bool changed = 5;
+  // Where the request's time went, in milliseconds: running the actions,
+  // the fixed settle, and the capture (which includes any wait for a
+  // changed frame).
+  uint32 actions_ms = 6;
+  uint32 settle_ms = 7;
+  uint32 capture_ms = 8;
 }
 
 // Named DesktopResizeRequest/Response (not ResizeRequest/Response) to avoid

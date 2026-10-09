@@ -151,8 +151,19 @@ func TestDesktopStep_RealXServer(t *testing.T) {
 	if shot.GetWidth() != 640 || shot.GetHeight() != 480 || len(shot.GetImage()) == 0 {
 		t.Fatalf("screenshot = %dx%d, %d bytes; want 640x480 with data", shot.GetWidth(), shot.GetHeight(), len(shot.GetImage()))
 	}
+	if resp.Msg.GetSettleMs() < 20 || resp.Msg.GetCaptureMs() == 0 {
+		t.Errorf("timings actions=%d settle=%d capture=%d, want the 20ms settle and a capture time", resp.Msg.GetActionsMs(), resp.Msg.GetSettleMs(), resp.Msg.GetCaptureMs())
+	}
 	if s.x11.backend == nil {
 		t.Fatal("step did not go through the X11 backend")
+	}
+	jpegShot, err := s.Screenshot(ctx, connect.NewRequest(&pb.ScreenshotRequest{Format: pb.FrameFormat_FRAME_FORMAT_JPEG}))
+	if err != nil {
+		t.Fatalf("Screenshot(JPEG): %v", err)
+	}
+	img := jpegShot.Msg.GetImage()
+	if jpegShot.Msg.GetFormat() != pb.FrameFormat_FRAME_FORMAT_JPEG || len(img) < 4 || img[0] != 0xff || img[1] != 0xd8 || jpegShot.Msg.GetWidth() != 640 {
+		t.Fatalf("JPEG screenshot: format=%v width=%d head=% x", jpegShot.Msg.GetFormat(), jpegShot.Msg.GetWidth(), img[:min(4, len(img))])
 	}
 	probe := exec.Command("xdotool", "getmouselocation")
 	probe.Env = append(os.Environ(), "DISPLAY="+display)
