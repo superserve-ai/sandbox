@@ -62,6 +62,9 @@ func TestLoadDurableBuild(t *testing.T) {
 		if got.Result.RootfsAllocatedBytes == 0 || got.Result.BaseAllocatedBytes == 0 || got.Result.DeltaAllocatedBytes == 0 {
 			t.Fatalf("allocated bytes must be recomputed for adopted builds: %+v", got.Result)
 		}
+		if got.Result.AllocationsVerified {
+			t.Fatal("legacy metadata must not acquire verified-allocation capability on recovery")
+		}
 	})
 
 	t.Run("missing referenced artifact is not adopted", func(t *testing.T) {

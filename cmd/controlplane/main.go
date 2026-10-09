@@ -949,6 +949,7 @@ func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (v
 		BaseAllocatedBytes:      resp.GetBaseAllocatedBytes(),
 		DeltaAllocatedBytes:     resp.GetDeltaAllocatedBytes(),
 		AllocatedBytesSupported: resp.GetAllocatedBytesSupported(),
+		AllocationsVerified:     resp.GetAllocationsVerified(),
 		ErrorMessage:            resp.GetErrorMessage(),
 		StartedAtUnix:           resp.GetStartedAtUnix(),
 		EndedAtUnix:             resp.GetEndedAtUnix(),

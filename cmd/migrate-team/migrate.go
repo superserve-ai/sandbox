@@ -182,6 +182,9 @@ func restoreRollupFlag(ctx context.Context, dst *pgxpool.Pool, teamID uuid.UUID,
 // plan
 
 func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
+	if err := checkTemplateAllocationCopySupported(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 	for _, t := range migratedTables {
 		var n int64
 		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.effectiveCopyScope())
@@ -490,6 +493,23 @@ func retainedAccountingWindow(ctx context.Context, src querier, teamID uuid.UUID
 // ---------------------------------------------------------------------------
 // copy
 
+// Destination inserts establish new measurement eligibility; this copier cannot
+// transfer existing template allocation history without changing its meaning.
+func checkTemplateAllocationCopySupported(ctx context.Context, src querier, teamID uuid.UUID) error {
+	var unsupported bool
+	if err := src.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM artifact_manifest a JOIN template t ON t.id=a.template_id
+		WHERE t.team_id=$1 AND (a.allocated_bytes>0 OR a.allocation_eligible_at IS NOT NULL
+		 OR a.allocation_measured_at IS NOT NULL OR a.allocation_build_id IS NOT NULL
+		 OR a.allocation_attempt_id IS NOT NULL))`, teamID).Scan(&unsupported); err != nil {
+		return fmt.Errorf("check template allocation copy support: %w", err)
+	}
+	if unsupported {
+		return fmt.Errorf("refusing to copy: faithful transfer of template allocation history is unsupported; preserve the source evidence")
+	}
+	return nil
+}
+
 // rowTransform mutates a row (as a column→value map) before it is inserted
 // into the dest.
 type rowTransform func(row map[string]any) error
@@ -529,6 +549,9 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 			len(snapshots), strings.Join(snapshots, "\n  "))
 	}
 
+	if err := checkTemplateAllocationCopySupported(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 	// The dest host must exist and live in the dest region before any
 	// sandbox row points at it.
 	var hostRegion string
@@ -559,6 +582,9 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 		return err
 	}
 	if err := checkRetainedAccountingReady(ctx, sourceTx, cfg.teamID); err != nil {
+		return err
+	}
+	if err := checkTemplateAllocationCopySupported(ctx, sourceTx, cfg.teamID); err != nil {
 		return err
 	}
 	transforms, err := buildTransforms(ctx, sourceTx, dst, cfg)

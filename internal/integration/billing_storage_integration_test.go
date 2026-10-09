@@ -728,6 +728,7 @@ func TestIntegration_BillingStorageFractionalArtifactSettlement(t *testing.T) {
                 VALUES($1,'example-fractional','ready','{}',1,1024,1024,'/templates/'||$1::uuid::text||'/base.ext4')`, p.TeamID)
 			storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
                 SELECT id,'base.ext4',rootfs_path,1073745920,1073745920,repeat('0',64) FROM template WHERE team_id=$1`, p.TeamID)
+			seedHistoricalPositiveTeamAllocations(t, p.TeamID, p.Start)
 			storageExec(t, `UPDATE sandbox SET template_id=(SELECT id FROM template WHERE team_id=$1),base_path=(SELECT rootfs_path FROM template WHERE team_id=$1),created_at=$2,destroyed_at=NULL WHERE team_id=$1`, p.TeamID, p.Start)
 			storageExec(t, `UPDATE sandbox_storage_interval SET ended_at=NULL,end_reason=NULL WHERE team_id=$1`, p.TeamID)
 			payload := billing.ExportPayload{EventName: "storage_gib_hours", CustomerID: "cus_" + p.TeamID.String()}
@@ -1033,4 +1034,9 @@ func seedMeasuredZeroLegacyBaseline(t *testing.T, sandboxID uuid.UUID) {
 	storageExec(t, `UPDATE sandbox SET base_path=$2,delta_path=NULL WHERE id=$1`, sandboxID, path)
 	storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
 		SELECT template_id,$2,$2,0,0,repeat('0',64) FROM sandbox WHERE id=$1`, sandboxID, path)
+	var template uuid.UUID
+	if err := testPool.QueryRow(t.Context(), `SELECT template_id FROM sandbox WHERE id=$1`, sandboxID).Scan(&template); err != nil {
+		t.Fatal(err)
+	}
+	seedHistoricalTemplateEvidence(t, template, path, time.Unix(0, 0))
 }

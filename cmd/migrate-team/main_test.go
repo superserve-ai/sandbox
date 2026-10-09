@@ -634,6 +634,31 @@ func TestRetainedStorageCopyRetryClosesPreviousIntervals(t *testing.T) {
 	}
 }
 
+func TestTemplateAllocationMigrationRefusal(t *testing.T) {
+	ctx := t.Context()
+	team, template := uuid.New(), uuid.New()
+	mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "allocation-copy-"+team.String())
+	mustExec(t, srcPool, `INSERT INTO template(id,team_id,name,build_spec) VALUES($1,$2,'example-template','{}')`, template, team)
+	mustExec(t, srcPool, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
+	 VALUES($1,'base.ext4','/example/allocation-copy',4096,4096,repeat('0',64))`, template)
+	defer func() {
+		mustExec(t, srcPool, `DELETE FROM template WHERE id=$1`, template)
+		mustExec(t, srcPool, `DELETE FROM team WHERE id=$1`, team)
+	}()
+	cfg := config{teamID: team, destHostID: destHostID, destRegion: destRegion}
+	err := runCopy(ctx, srcPool, dstPool, cfg)
+	if err == nil || !strings.Contains(err.Error(), "transfer of template allocation history is unsupported") {
+		t.Fatalf("known allocation must refuse before copy: %v", err)
+	}
+	var changed bool
+	if err := srcPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripe_promotion_migration_fence WHERE team_id=$1)`, team).Scan(&changed); err != nil || changed {
+		t.Fatalf("refusal fenced source: %v %v", changed, err)
+	}
+	if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&changed); err != nil || changed {
+		t.Fatalf("refusal copied destination: %v %v", changed, err)
+	}
+}
+
 func TestRetainedStorageMigrationRefusal(t *testing.T) {
 	ctx := context.Background()
 	team := uuid.New()

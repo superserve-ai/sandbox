@@ -274,6 +274,7 @@ type BuildStatusResult struct {
 	BaseAllocatedBytes      int64  // populated on ready
 	DeltaAllocatedBytes     int64  // populated on ready
 	AllocatedBytesSupported bool   // true when the daemon populated allocation fields
+	AllocationsVerified     bool   // true only after all declared allocations were measured
 	ErrorMessage            string // populated on failed/cancelled
 	StartedAtUnix           int64
 	EndedAtUnix             int64
