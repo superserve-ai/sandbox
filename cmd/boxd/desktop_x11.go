@@ -410,10 +410,21 @@ func (b *x11Backend) armChangeWatch() (uint64, error) {
 // captureChanged waits until a repaint leaves the frame different from
 // baseline, or until deadline, and returns the frame as it is then.
 func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadline time.Time) (*image.RGBA, bool, error) {
+	frame, _, changed, err := b.captureChangedRaw(ctx, baseline, deadline)
+	if err != nil {
+		return nil, false, err
+	}
+	b.drawCursor(frame)
+	return frame, changed, nil
+}
+
+// captureChangedRaw is captureChanged before the cursor is drawn in, with
+// the frame's hash, for callers that go on comparing frames.
+func (b *x11Backend) captureChangedRaw(ctx context.Context, baseline uint64, deadline time.Time) (*image.RGBA, uint64, bool, error) {
 	for {
 		for !b.damaged {
 			if _, err := b.drainEvents(); err != nil {
-				return nil, false, err
+				return nil, 0, false, err
 			}
 			if b.damaged || !time.Now().Before(deadline) {
 				break
@@ -421,16 +432,15 @@ func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadli
 			select {
 			case <-time.After(min(changeWatchPoll, time.Until(deadline))):
 			case <-ctx.Done():
-				return nil, false, ctx.Err()
+				return nil, 0, false, ctx.Err()
 			}
 		}
 		frame, hash, raced, err := b.snapshot()
 		if err != nil {
-			return nil, false, err
+			return nil, 0, false, err
 		}
 		if hash != baseline || !time.Now().Before(deadline) {
-			b.drawCursor(frame)
-			return frame, hash != baseline, nil
+			return frame, hash, hash != baseline, nil
 		}
 		// Same pixels: an application repainted without visible change. A
 		// report that arrived after this read, or a raced one, means the
@@ -438,6 +448,65 @@ func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadli
 		// so it must stay pending.
 		b.damaged = b.damaged || raced
 	}
+}
+
+// painted reports whether the raw frame shows more than one colour. A
+// display right after a mode switch is one colour until clients redraw.
+func painted(frame *image.RGBA) bool {
+	pix := frame.Pix
+	if len(pix) < 4 {
+		return false
+	}
+	r, g, bl := pix[0], pix[1], pix[2]
+	for i := 4; i+2 < len(pix); i += 4 {
+		if pix[i] != r || pix[i+1] != g || pix[i+2] != bl {
+			return true
+		}
+	}
+	return false
+}
+
+// paintPoll is how often awaitPainted re-reads the frame on a server that
+// cannot report repaints.
+const paintPoll = 100 * time.Millisecond
+
+// awaitPainted returns once the frame shows more than one colour, or false
+// at deadline. A display that has already drawn costs one read; otherwise
+// each repaint report is checked as it arrives.
+func (b *x11Backend) awaitPainted(ctx context.Context, deadline time.Time) (bool, error) {
+	if b.damage == 0 {
+		for {
+			frame, _, err := b.rawFrame()
+			if err != nil {
+				return false, err
+			}
+			if painted(frame) {
+				return true, nil
+			}
+			if !time.Now().Before(deadline) {
+				return false, nil
+			}
+			select {
+			case <-time.After(min(paintPoll, time.Until(deadline))):
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		}
+	}
+	frame, hash, raced, err := b.snapshot()
+	if err != nil {
+		return false, err
+	}
+	b.damaged = b.damaged || raced
+	for !painted(frame) {
+		if !time.Now().Before(deadline) {
+			return false, nil
+		}
+		if frame, hash, _, err = b.captureChangedRaw(ctx, hash, deadline); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // rawFrameTooLarge reports whether a display's raw frame would exceed

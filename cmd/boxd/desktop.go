@@ -873,18 +873,15 @@ func millisSince(from *time.Time) uint32 {
 // new size. A display with nothing to draw (no window manager) waits it out.
 const resizeRepaintWait = 3 * time.Second
 
-// awaitRepaint blocks until the frame differs from the one it starts with,
-// or until bound; without a display backend it returns at once.
+// awaitRepaint blocks until the display shows something other than a blank
+// frame, or until bound; without a display backend it returns at once. A
+// desktop that already redrew during the mode switch costs one read.
 func (s *desktopService) awaitRepaint(ctx context.Context, bound time.Duration) {
-	watch := s.armFrameWatch(ctx)
-	if watch == nil {
-		return
-	}
-	watch.deadline = time.Now().Add(bound)
+	deadline := time.Now().Add(bound)
 	_, _ = s.runX11(ctx, func(ctx context.Context, b *x11Backend) error {
-		_, changed, err := b.captureChanged(ctx, watch.baseline, watch.deadline)
-		if err == nil && !changed {
-			log.Printf("desktop: no repaint within %v of resize", bound)
+		ok, err := b.awaitPainted(ctx, deadline)
+		if err == nil && !ok {
+			log.Printf("desktop: display still blank %v after resize", bound)
 		}
 		return err
 	})
@@ -1006,7 +1003,7 @@ func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.Des
 		))
 	}
 	// The switch leaves the display blank until clients repaint; a capture
-	// right after would show that, so wait for the first repaint, bounded.
+	// right after would show that, so wait until something is drawn, bounded.
 	s.awaitRepaint(resizeCtx, resizeRepaintWait)
 	actualWidth, actualHeight, err := s.displayGeometry(resizeCtx)
 	if err != nil {
