@@ -875,13 +875,21 @@ func millisSince(from *time.Time) uint32 {
 // new size. A display where nothing draws after the switch waits it out.
 const resizeRepaintWait = 2 * time.Second
 
-// awaitRepaint blocks until the display shows something other than a blank
-// frame, or until bound; without a display backend it returns at once. A
+// markRepaint drops the repaint reports queued before a mode switch, so
+// awaitRepaint only credits drawing done after it. False when the display
+// backend cannot report repaints.
+func (s *desktopService) markRepaint(ctx context.Context) bool {
+	attempted, err := s.runX11(ctx, func(_ context.Context, b *x11Backend) error { return b.markRepaint() })
+	return attempted && err == nil
+}
+
+// awaitRepaint blocks until the display shows something drawn since the
+// switch, or until bound; without a display backend it returns at once. A
 // desktop that already redrew during the mode switch costs one read.
-func (s *desktopService) awaitRepaint(ctx context.Context, bound time.Duration) {
+func (s *desktopService) awaitRepaint(ctx context.Context, marked bool, bound time.Duration) {
 	deadline := time.Now().Add(bound)
 	_, _ = s.runX11(ctx, func(ctx context.Context, b *x11Backend) error {
-		ok, err := b.awaitPainted(ctx, deadline)
+		ok, err := b.awaitPainted(ctx, marked, deadline)
 		if err == nil && !ok {
 			log.Printf("desktop: display still blank %v after resize", bound)
 		}
@@ -995,6 +1003,7 @@ func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.Des
 	if err != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("resolve xrandr: %w", err))
 	}
+	marked := s.markRepaint(resizeCtx)
 	if setModeOutput, setModeErr := setModeCmd.CombinedOutput(); setModeErr != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf(
 			"set desktop mode %s: %w (newmode: %s; addmode: %s)",
@@ -1006,7 +1015,7 @@ func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.Des
 	}
 	// The switch leaves the display blank until clients repaint; a capture
 	// right after would show that, so wait until something is drawn, bounded.
-	s.awaitRepaint(resizeCtx, resizeRepaintWait)
+	s.awaitRepaint(resizeCtx, marked, resizeRepaintWait)
 	actualWidth, actualHeight, err := s.displayGeometry(resizeCtx)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("verify resized display: %w", err))

@@ -479,12 +479,24 @@ func painted(frame *image.RGBA) bool {
 // cannot report repaints.
 const paintPoll = 100 * time.Millisecond
 
-// awaitPainted returns once the frame shows more than one colour or a
-// client has repainted since the call began, or false at deadline. A display
-// that has already drawn costs one read; a client whose finished picture is
-// one colour ends the wait with its repaint report.
-func (b *x11Backend) awaitPainted(ctx context.Context, deadline time.Time) (bool, error) {
+// markRepaint empties the damage region and drops the reports queued so
+// far, so that what awaitPainted sees after a mode switch was drawn after
+// this call. Declines without DAMAGE.
+func (b *x11Backend) markRepaint() error {
 	if b.damage == 0 {
+		return errNoChangeWatch
+	}
+	_, _, _, err := b.snapshot()
+	return err
+}
+
+// awaitPainted returns once the frame shows more than one colour or differs
+// from the blank the switch left (a client drew, even one colour), or false
+// at deadline. A display that has already drawn costs one read. A client
+// whose finished picture is the one colour the server refills with cannot
+// be told from nothing drawing and waits the deadline out.
+func (b *x11Backend) awaitPainted(ctx context.Context, marked bool, deadline time.Time) (bool, error) {
+	if b.damage == 0 || !marked {
 		for {
 			frame, _, err := b.rawFrame()
 			if err != nil {
@@ -503,16 +515,22 @@ func (b *x11Backend) awaitPainted(ctx context.Context, deadline time.Time) (bool
 			}
 		}
 	}
-	// A report that raced the read is a repaint after the call began, so it
-	// counts like one reported afterwards; the pixels it left do not matter.
-	frame, _, raced, err := b.snapshot()
+	// No Subtract here: the switch's own blanking report, queued since the
+	// mark, must stay pending so the first wait below re-reads at once and
+	// compares against this blank rather than accepting the report as a
+	// repaint.
+	frame, _, err := b.rawFrame()
 	if err != nil {
 		return false, err
 	}
-	if painted(frame) || raced {
+	if painted(frame) {
 		return true, nil
 	}
-	return b.awaitDamage(ctx, deadline)
+	frame, _, changed, err := b.captureChangedRaw(ctx, maphash.Bytes(frameHashSeed, frame.Pix), deadline)
+	if err != nil {
+		return false, err
+	}
+	return changed || painted(frame), nil
 }
 
 // rawFrameTooLarge reports whether a display's raw frame would exceed
