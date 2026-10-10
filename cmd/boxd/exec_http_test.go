@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 )
 
 func newProcessService() *processService {
@@ -429,3 +431,40 @@ func TestHandleExecStream_BadCommand_EmitsErrorEvent(t *testing.T) {
 		t.Errorf("last event finished = %v, want true", last["finished"])
 	}
 }
+
+func TestExec_NilProcessEventsDoesNotPanic(t *testing.T) {
+	s := newProcessService()
+
+	// 1. End-to-end execution requests succeed with working_dir provided.
+	body := `{"command":"/bin/sh","args":["-c","echo test"],"working_dir":"/tmp"}`
+	req1 := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
+	w1 := httptest.NewRecorder()
+	s.handleExec(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("handleExec status = %d, want 200; body: %s", w1.Code, w1.Body.String())
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/exec/stream", strings.NewReader(body))
+	w2 := httptest.NewRecorder()
+	s.handleExecStream(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("handleExecStream status = %d, want 200; body: %s", w2.Code, w2.Body.String())
+	}
+
+	// 2. Directly verify that nil Data/Output/End events do not cause a nil pointer panic when passed to parseProcessEvent.
+	nilEvents := []*pb.ProcessEvent{
+		nil,
+		{Event: &pb.ProcessEvent_Data{Data: nil}},
+		{Event: &pb.ProcessEvent_Data{Data: &pb.DataEvent{Output: nil}}},
+		{Event: &pb.ProcessEvent_End{End: nil}},
+	}
+
+	for _, ev := range nilEvents {
+		out, exitCode, isStart := parseProcessEvent(ev)
+		if out != nil || exitCode != nil || isStart {
+			t.Errorf("parseProcessEvent(%v) = (%v, %v, %v); want nil, nil, false", ev, out, exitCode, isStart)
+		}
+	}
+}
+
+
