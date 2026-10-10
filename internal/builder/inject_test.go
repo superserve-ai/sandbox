@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -8,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestInjectProxyCA(t *testing.T) {
@@ -287,7 +290,7 @@ func TestRewriteAptSources_BoundsAptRequests(t *testing.T) {
 		t.Errorf("sources not pointed at the chosen mirror:\n%s", got)
 	}
 	conf := readTestFile(t, filepath.Join(root, aptAcquireConfPath))
-	if !strings.Contains(conf, `Acquire::http::Timeout "30";`) || !strings.Contains(conf, `Acquire::Retries "3";`) {
+	if !strings.Contains(conf, `Acquire::http::Timeout "10";`) || !strings.Contains(conf, `Acquire::Retries "3";`) {
 		t.Errorf("acquire conf missing the timeout or retries:\n%s", conf)
 	}
 }
@@ -305,20 +308,101 @@ func TestChooseAptMirror(t *testing.T) {
 	down := func(context.Context, string) bool { return false }
 	ctx := context.Background()
 
-	if got := chooseAptMirror(ctx, "mirror.example.com", metadata.URL, down, nil); got != "mirror.example.com" {
+	if got, _ := chooseAptMirror(ctx, "mirror.example.com", metadata.URL, down, time.Second); got != "mirror.example.com" {
 		t.Errorf("override: got %q", got)
 	}
-	if got := chooseAptMirror(ctx, "", metadata.URL, up, nil); got != "europe-west1.gce.archive.ubuntu.com" {
+	if got, _ := chooseAptMirror(ctx, "", metadata.URL, up, time.Second); got != "europe-west1.gce.archive.ubuntu.com" {
 		t.Errorf("regional mirror: got %q", got)
 	}
-	if got := chooseAptMirror(ctx, "", metadata.URL, down, nil); got != fallbackAptMirror {
-		t.Errorf("regional mirror down: got %q, want the fallback", got)
+	if got, _ := chooseAptMirror(ctx, "", metadata.URL, down, time.Second); got != fallbackAptMirror {
+		t.Errorf("every mirror down: got %q, want the fallback", got)
+	}
+	// A region whose mirror fails the probe is passed over for the next
+	// Google region before Canonical's mirror is considered.
+	onlyEast := func(_ context.Context, host string) bool { return host == "us-east4.gce.archive.ubuntu.com" }
+	if got, _ := chooseAptMirror(ctx, "", metadata.URL, onlyEast, time.Second); got != "us-east4.gce.archive.ubuntu.com" {
+		t.Errorf("own region failing: got %q, want the next region's mirror", got)
+	}
+	// A passing own region is the only probe made; the other regions are
+	// probed together only after it fails, and nothing passing is bounded
+	// by the deadline rather than by the sum of every probe.
+	var probes atomic.Int32
+	ownOnly := func(_ context.Context, host string) bool {
+		probes.Add(1)
+		return host == "europe-west1.gce.archive.ubuntu.com"
+	}
+	if got, outcome := chooseAptMirror(ctx, "", metadata.URL, ownOnly, 5*time.Second); got != "europe-west1.gce.archive.ubuntu.com" || outcome != "own_region" || probes.Load() != 1 {
+		t.Errorf("own region passing: got %q (%s) after %d probes, want it alone", got, outcome, probes.Load())
+	}
+	// Among the other regions the first to pass wins: a slow probe ahead of
+	// it in the list does not hold the selection.
+	slowThenFast := func(ctx context.Context, host string) bool {
+		switch host {
+		case "europe-west1.gce.archive.ubuntu.com":
+			return false
+		case "us-west1.gce.archive.ubuntu.com":
+			return true
+		}
+		<-ctx.Done()
+		return false
+	}
+	start := time.Now()
+	if got, outcome := chooseAptMirror(ctx, "", metadata.URL, slowThenFast, 5*time.Second); got != "us-west1.gce.archive.ubuntu.com" || outcome != "other_region" {
+		t.Errorf("fast later region: got %q (%s)", got, outcome)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("fast later region took %v, want no wait on the slow regions ahead of it", elapsed)
+	}
+	hang := func(ctx context.Context, _ string) bool { <-ctx.Done(); return false }
+	start = time.Now()
+	if got, outcome := chooseAptMirror(ctx, "", metadata.URL, hang, 200*time.Millisecond); got != fallbackAptMirror || outcome != "fallback" {
+		t.Errorf("every probe hanging: got %q (%s), want the fallback", got, outcome)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("every probe hanging took %v, want the selection deadline", elapsed)
 	}
 	// Off GCE the metadata server does not exist; the fallback is used
 	// without a probe.
-	probed := false
-	spy := func(context.Context, string) bool { probed = true; return true }
-	if got := chooseAptMirror(ctx, "", "http://127.0.0.1:1/zone", spy, nil); got != fallbackAptMirror || probed {
-		t.Errorf("off GCE: got %q (probed=%v), want the fallback without probing", got, probed)
+	var probed atomic.Bool
+	spy := func(context.Context, string) bool { probed.Store(true); return true }
+	if got, _ := chooseAptMirror(ctx, "", "http://127.0.0.1:1/zone", spy, time.Second); got != fallbackAptMirror || probed.Load() {
+		t.Errorf("off GCE: got %q (probed=%v), want the fallback without probing", got, probed.Load())
+	}
+}
+
+// The probe must move bytes over several connections: a mirror whose
+// backend stalls some connections passes a HEAD and fails this.
+func TestMirrorTransfers(t *testing.T) {
+	payload := make([]byte, mirrorProbeBytes*mirrorProbeFetches)
+	var requests atomic.Int32
+	stallThird := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != mirrorProbePath {
+			http.NotFound(w, r)
+			return
+		}
+		n := requests.Add(1)
+		if stallThird && n == 3 {
+			w.Header().Set("Content-Range", "bytes 0-0/1")
+			w.WriteHeader(http.StatusPartialContent)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done() // never send the body
+			return
+		}
+		http.ServeContent(w, r, "ls-lR.gz", time.Time{}, bytes.NewReader(payload))
+	}))
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "http://")
+	if !mirrorTransfers(context.Background(), host) {
+		t.Fatal("healthy mirror failed the transfer probe")
+	}
+	requests.Store(0)
+	stallThird = true
+	start := time.Now()
+	if mirrorTransfers(context.Background(), host) {
+		t.Fatal("a mirror that stalls a connection passed the transfer probe")
+	}
+	if elapsed := time.Since(start); elapsed > mirrorProbeTimeout+2*time.Second {
+		t.Errorf("stalled probe took %v, want it bounded by the per-fetch timeout", elapsed)
 	}
 }

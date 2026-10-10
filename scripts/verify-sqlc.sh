@@ -23,6 +23,7 @@ diff_args=(
   --exclude='enum_arrays.go'
   --exclude='host_capabilities.go'
   --exclude='billing_lock.go'
+  --exclude='sweep_lease.go'
   --exclude='stripe_checkout_association_alerts.go'
   --exclude='template_build_execution.go'
   --exclude='template_build_input.go'

@@ -67,6 +67,9 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 	if a == nil || a.pool == nil || principalID == uuid.Nil || credentialID == uuid.Nil {
 		return 0, time.Time{}, errors.New("machine authority unavailable")
 	}
+	if err := ctx.Err(); err != nil {
+		return 0, time.Time{}, err
+	}
 	now := time.Now()
 	key := machineAuthorityKey{principal: principalID, credential: credentialID}
 	a.mu.Lock()
@@ -76,7 +79,7 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 	}
 	epoch := a.epoch
 	a.mu.Unlock()
-	v, err, _ := a.flight.Do(keyString(key), func() (any, error) {
+	result := a.flight.DoChan(keyString(key), func() (any, error) {
 		observedAt := time.Now()
 		a.mu.Lock()
 		if a.epoch != epoch {
@@ -90,10 +93,12 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 			return authoritySnapshot{generation: entry.generation, expiresAt: entry.expiresAt}, nil
 		}
 		a.mu.Unlock()
-		ctx, cancel := context.WithTimeout(ctx, time.Second)
+		// One disconnected stream must not cancel the durable observation shared
+		// by other streams. The query retains its own bounded lifetime.
+		queryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		defer cancel()
 		var generation int64
-		err := a.pool.QueryRow(ctx, `SELECT c.revocation_generation FROM machine_credential c JOIN machine_principal p ON p.id=c.principal_id WHERE c.id=$1 AND c.principal_id=$2 AND c.state='active' AND c.expires_at>now() AND p.status='active' AND c.revocation_generation=p.generation`, credentialID, principalID).Scan(&generation)
+		err := a.pool.QueryRow(queryCtx, `SELECT c.revocation_generation FROM machine_credential c JOIN machine_principal p ON p.id=c.principal_id WHERE c.id=$1 AND c.principal_id=$2 AND c.state='active' AND c.expires_at>now() AND p.status='active' AND c.revocation_generation=p.generation`, credentialID, principalID).Scan(&generation)
 		deadline := observedAt.Add(a.ttl)
 		if err != nil {
 			a.mu.Lock()
@@ -119,11 +124,16 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 		a.mu.Unlock()
 		return authoritySnapshot{generation: uint64(generation), expiresAt: deadline}, nil
 	})
-	if err != nil {
-		return 0, time.Time{}, err
+	select {
+	case <-ctx.Done():
+		return 0, time.Time{}, ctx.Err()
+	case completed := <-result:
+		if completed.Err != nil {
+			return 0, time.Time{}, completed.Err
+		}
+		snapshot := completed.Val.(authoritySnapshot)
+		return snapshot.generation, snapshot.expiresAt, nil
 	}
-	snapshot := v.(authoritySnapshot)
-	return snapshot.generation, snapshot.expiresAt, nil
 }
 
 // Refresh early enough to renew healthy streams, but share each observation

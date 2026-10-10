@@ -48,7 +48,7 @@ func (f *machineAdminFixture) ResolveMachineCredential(context.Context, string) 
 }
 func (f *machineAdminFixture) EnsurePrincipal(ctx context.Context, team, tenant, template uuid.UUID, _ string) (auth.MachinePrincipal, error) {
 	f.teamID, f.tenantID, f.templateID = team, tenant, template
-	return auth.MachinePrincipal{PrincipalID: uuid.New(), TeamID: team, HostedTenantID: tenant, Generation: 1, Status: auth.PrincipalActive}, f.called(ctx, "ensure")
+	return auth.MachinePrincipal{PrincipalID: uuid.New(), TeamID: team, HostedTenantID: tenant, Generation: 1, Status: auth.PrincipalActive, ApprovedTemplateID: &template}, f.called(ctx, "ensure")
 }
 func (f *machineAdminFixture) ReadPrincipal(ctx context.Context, principal uuid.UUID) (auth.MachinePrincipal, error) {
 	f.principalID = principal
@@ -140,11 +140,18 @@ func TestMachineAdministrationDispatchAndSecretSafety(t *testing.T) {
 	if response.Code != http.StatusOK || fixture.teamID != team || fixture.tenantID != tenant || fixture.templateID != template {
 		t.Fatalf("ensure dispatch: %d %s", response.Code, response.Body)
 	}
+	// The hosted issuer rejects any response whose keys differ from these.
+	principalKeys := []string{"approved_template_id", "generation", "hosted_tenant_id", "principal_id", "status", "team_id"}
+	requireExactKeys(t, response.Body.Bytes(), principalKeys)
+	if !strings.Contains(response.Body.String(), `"approved_template_id":"`+template.String()+`"`) {
+		t.Fatalf("ensure template: %s", response.Body)
+	}
 	path := "/internal/machine-identity/principals/" + principal.String()
 	response = machineAdminRequest(router, "GET", path, "", "test-operator-only", false)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"generation":7`) {
 		t.Fatalf("read fence: %d %s", response.Code, response.Body)
 	}
+	requireExactKeys(t, response.Body.Bytes(), principalKeys)
 	for _, action := range []string{"issue", "rotate", "restore"} {
 		request := machineCredentialRequest{OperationID: operation, ExpectedGeneration: 7, CredentialMaterial: material}
 		if action == "rotate" {
@@ -155,6 +162,7 @@ func TestMachineAdministrationDispatchAndSecretSafety(t *testing.T) {
 		if response.Code != http.StatusOK || fixture.calls[len(fixture.calls)-1] != action || fixture.principalID != principal || fixture.operationID != operation || fixture.generation != 7 || fixture.material != material {
 			t.Fatalf("%s dispatch: %d %s", action, response.Code, response.Body)
 		}
+		requireExactKeys(t, response.Body.Bytes(), []string{"credential_id", "expires_at", "lineage_id", "principal_id", "revocation_generation", "state"})
 		if strings.Contains(response.Body.String(), material) || response.Header().Get("Cache-Control") != "no-store" {
 			t.Fatal("credential material exposed or response cacheable")
 		}
@@ -283,6 +291,19 @@ func TestMachineAdministrationDisableRequiresFence(t *testing.T) {
 		response := machineAdminRequest(router, "POST", path, `{"operation_id":"`+operation+`","expected_generation":1}`, "test-operator-only", false)
 		if response.Code != http.StatusConflict {
 			t.Fatalf("disable fence conflict got %d", response.Code)
+		}
+	}
+}
+
+func requireExactKeys(t *testing.T, body []byte, want []string) {
+	t.Helper()
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(body, &got); err != nil || len(got) != len(want) {
+		t.Fatalf("response keys: %s", body)
+	}
+	for _, key := range want {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("response missing %q: %s", key, body)
 		}
 	}
 }

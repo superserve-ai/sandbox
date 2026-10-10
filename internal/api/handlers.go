@@ -182,13 +182,6 @@ type Handlers struct {
 	trialWarningAfter     uuid.UUID
 	trialWarningPending   map[uuid.UUID]struct{}
 
-	// trialEligibilityAfter advances one bounded eligibility page per sweep.
-	// Keeping the cursor on the handler prevents a large historical trial
-	// population from restarting at the UUID prefix every tick.
-	trialEligibilityMu         sync.Mutex
-	trialEligibilityAfter      uuid.UUID
-	trialEligibilityAfterValid bool
-
 	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
 	// (ActivateSandbox, FinalizePause) so tests can wait for quiescence;
 	// production never waits. Not a sync.WaitGroup: concurrent requests Add
@@ -794,6 +787,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		c.Set("routing_observed_at", row.RoutingObservedAt)
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
+			_, _ = cacheJoinedSandboxOwner(c, sandboxID, teamID, sandbox, row.MachineOwnershipPresent, row.MachineOwnerPrincipalID, row.MachineOwnerTeamID)
 			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
 			// The resume returns the post-restore access it pushed to VMD, so
@@ -2129,6 +2123,21 @@ func (h *Handlers) teardownVM(ctx context.Context, sandboxID uuid.UUID, hostID s
 // at sandboxBasePath was the last reference and the template has moved on.
 // Nothing to do is not an error; a step that did not run is, so the reclaim
 // is retried rather than recorded complete with the dir still there.
+// refusedInsertResponse turns the reachability probe's outcome into the answer
+// a create gets when its insert was refused. A probe that failed leaves the
+// template unknown rather than absent, and the three outcomes differ in what
+// the caller should do: retry the request, read the template again, or stop.
+func refusedInsertResponse(probeErr error, servable bool) (code, message string, status int) {
+	switch {
+	case probeErr != nil:
+		return "service_unavailable", sandboxCreateTransientResponseMessage, http.StatusServiceUnavailable
+	case servable:
+		return "template_rebuilt", "Template was rebuilt during create; retry", http.StatusConflict
+	default:
+		return "not_found", "Template not found", http.StatusNotFound
+	}
+}
+
 func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sandboxBasePath *string, sandboxTemplateID pgtype.UUID) error {
 	if sandboxBasePath == nil || !sandboxTemplateID.Valid {
 		return nil
@@ -2468,8 +2477,17 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 // is unavailable.
 func (h *Handlers) machineResponseForRequest(c *gin.Context, s db.Sandbox, observedAt time.Time) (sandboxResponse, bool) {
 	resp := h.sandboxResponseForRequest(c, s, observedAt)
-	if _, machine := machineCallerFromContext(c); machine && resp.AccessToken == "" {
+	if resp.AccessToken != "" {
+		return resp, true
+	}
+	if _, machine := machineCallerFromContext(c); machine {
 		respondErrorMsg(c, "machine_capability_unavailable", "machine capability unavailable", http.StatusServiceUnavailable)
+		return sandboxResponse{}, false
+	}
+	// Token-producing lifecycle calls must not succeed without the token when
+	// ownership could not be classified.
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		respondErrorMsg(c, "service_unavailable", "sandbox access token unavailable", http.StatusServiceUnavailable)
 		return sandboxResponse{}, false
 	}
 	return resp, true
@@ -2740,6 +2758,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	}
 	sandbox := row.Sandbox
 	c.Set("routing_observed_at", row.RoutingObservedAt)
+	_, _ = cacheJoinedSandboxOwner(c, sandboxID, teamID, sandbox, row.MachineOwnershipPresent, row.MachineOwnerPrincipalID, row.MachineOwnerTeamID)
 
 	resp := h.sandboxToResponse(sandbox)
 	resp.PreviewAccess = row.Access
@@ -3568,14 +3587,33 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	dbErr := insertRes.err
 
 	// 0 rows from the source's insert = the template or snapshot was deleted
-	// mid-create.
+	// mid-create, or the template moved to a newer generation while this
+	// create held the paths it read.
 	sourceRace := (templateID.Valid || sourceSnapshotID != uuid.Nil) && errors.Is(dbErr, pgx.ErrNoRows)
 	respondSourceGone := func() {
 		if sourceSnapshotID != uuid.Nil {
 			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
 			return
 		}
-		respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+		// Only on this path, so the probe costs nothing on a normal create. A
+		// template that is still servable was rebuilt under us: saying "not
+		// found" about a template that exists is both wrong and unretryable,
+		// and the cached entry would hand the next attempt the same stale
+		// generation.
+		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		servable, probeErr := h.DB.TemplateStillServable(probeCtx, db.TemplateStillServableParams{
+			TemplateID: templateID.Bytes, TeamID: teamID, SystemTeamID: h.systemTeamID(),
+		})
+		probeCancel()
+		// The cached entry named the generation this insert just refused, so it
+		// is stale whichever way the probe went.
+		InvalidateTemplateCache(templateID.Bytes)
+		if probeErr != nil {
+			log.Warn().Err(probeErr).Str("template_id", uuid.UUID(templateID.Bytes).String()).
+				Msg("create: template reachability unknown after a refused insert")
+		}
+		code, msg, status := refusedInsertResponse(probeErr, servable)
+		respondErrorMsg(c, code, msg, status)
 	}
 
 	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
@@ -3947,6 +3985,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// on this request goroutine instead of reading it back for the token.
 		owner := db.MachineSandboxOwnerRow{SandboxID: sandbox.ID, OwnerPrincipalID: machineCaller.PrincipalID, TeamID: teamID}
 		c.Set("machine_resource_owner", requestOwnerResult{sandboxID: sandbox.ID, teamID: teamID, owner: owner})
+	} else {
+		// A non-machine create never writes an owner row.
+		c.Set("machine_resource_owner", requestOwnerResult{sandboxID: sandbox.ID, teamID: teamID, err: pgx.ErrNoRows})
 	}
 	c.Set("routing_observed_at", routingObservedAt)
 	resp, ok := h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))

@@ -68,6 +68,7 @@ func (q *Queries) AcceptBuildPublication(ctx context.Context, id, attempt uuid.U
 	err := q.db.QueryRow(ctx, `SELECT accept_template_publication($1,$2)`, id, attempt).Scan(&ok)
 	return ok, err
 }
+
 // FinalizeTemplateBuild records readiness from the producer's own report. The
 // upload is a separate obligation, tracked by accepted_at.
 func (q *Queries) FinalizeTemplateBuild(ctx context.Context, id, attempt uuid.UUID, runtime json.RawMessage, rootfsAllocated, baseAllocated, deltaAllocated int64) (bool, error) {
@@ -109,11 +110,13 @@ func (q *Queries) MarkBuildAttemptCleaned(ctx context.Context, id uuid.UUID) err
 	return err
 }
 
-// Preserve accepted versions as well as active/unreachable execution owners.
+// ProtectedBuildAttemptKeys lists the build dirs the reconciler must keep on
+// account of the attempt itself, under the same rule the destroy-time
+// collector applies. It previously kept every attempt that had ever been
+// promoted, which left the live set naming everything on disk.
 func (q *Queries) ProtectedBuildAttemptKeys(ctx context.Context) ([]string, error) {
 	rows, err := q.db.Query(ctx, `SELECT b.template_id::text||'/'||a.vm_id FROM template_build_attempt a
- JOIN template_build b ON b.id=a.build_id WHERE a.state IN ('claimed','admitted','uploading','ready')
- OR a.cleanup_pending OR EXISTS(SELECT 1 FROM template_build_publication p WHERE p.attempt_id=a.id)`)
+ JOIN template_build b ON b.id=a.build_id WHERE build_artifact_protected(a.vm_id)`)
 	if err != nil {
 		return nil, err
 	}
@@ -190,9 +193,12 @@ func (q *Queries) HasTemplateExecutions(ctx context.Context, template uuid.UUID)
 	err := q.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM template_build b JOIN template_build_execution e ON e.build_id=b.id WHERE b.template_id=$1)`, template).Scan(&exists)
 	return exists, err
 }
+
+// BuildArtifactProtected reports whether a build's own state still owes its
+// on-host artifacts; see build_artifact_protected for the rule and why live
+// references are asked about separately.
 func (q *Queries) BuildArtifactProtected(ctx context.Context, vmID string) (bool, error) {
 	var exists bool
-	err := q.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM template_build_attempt a WHERE a.vm_id=$1 AND
- (a.state IN ('claimed','admitted','uploading','ready') OR a.cleanup_pending OR EXISTS(SELECT 1 FROM template_build_publication p WHERE p.attempt_id=a.id)))`, vmID).Scan(&exists)
+	err := q.db.QueryRow(ctx, `SELECT build_artifact_protected($1)`, vmID).Scan(&exists)
 	return exists, err
 }

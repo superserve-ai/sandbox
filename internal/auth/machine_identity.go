@@ -70,6 +70,8 @@ type MachinePrincipal struct {
 	HostedTenantID uuid.UUID
 	Status         PrincipalStatus
 	Generation     uint64
+	// Nil when the principal predates template binding.
+	ApprovedTemplateID *uuid.UUID
 }
 
 // MachineCredential is the non-secret authority record. Secret material is
