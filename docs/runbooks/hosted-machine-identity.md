@@ -120,8 +120,8 @@ All routes below are under `/internal/machine-identity`:
 
 | Method and path | Request and result |
 | --- | --- |
-| `POST /principals` | JSON `team_id`, `hosted_tenant_id`, `approved_template_id`; returns the immutable principal and current generation. |
-| `GET /principals/{principal_id}` | Returns `principal_id`, `team_id`, `hosted_tenant_id`, `status`, and `generation` for lifecycle fencing. |
+| `POST /principals` | JSON `team_id`, `hosted_tenant_id`, `approved_template_id`; returns the same fields as the read below. |
+| `GET /principals/{principal_id}` | Returns exactly `principal_id`, `team_id`, `hosted_tenant_id`, `status`, `generation`, and `approved_template_id` for lifecycle fencing. |
 | `POST /principals/{principal_id}/credentials/issue` | Fenced credential request; returns credential metadata. |
 | `POST /principals/{principal_id}/credentials/rotate` | Fenced credential request plus `replacement_credential_id`; replaces only that credential. |
 | `POST /principals/{principal_id}/credentials/restore` | Fenced credential request; restores the same principal within its recovery window. |
