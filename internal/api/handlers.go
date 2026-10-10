@@ -787,6 +787,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		c.Set("routing_observed_at", row.RoutingObservedAt)
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
+			_, _ = cacheJoinedSandboxOwner(c, sandboxID, teamID, sandbox, row.MachineOwnershipPresent, row.MachineOwnerPrincipalID, row.MachineOwnerTeamID)
 			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
 			// The resume returns the post-restore access it pushed to VMD, so
@@ -2476,8 +2477,17 @@ func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, obser
 // is unavailable.
 func (h *Handlers) machineResponseForRequest(c *gin.Context, s db.Sandbox, observedAt time.Time) (sandboxResponse, bool) {
 	resp := h.sandboxResponseForRequest(c, s, observedAt)
-	if _, machine := machineCallerFromContext(c); machine && resp.AccessToken == "" {
+	if resp.AccessToken != "" {
+		return resp, true
+	}
+	if _, machine := machineCallerFromContext(c); machine {
 		respondErrorMsg(c, "machine_capability_unavailable", "machine capability unavailable", http.StatusServiceUnavailable)
+		return sandboxResponse{}, false
+	}
+	// Token-producing lifecycle calls must not succeed without the token when
+	// ownership could not be classified.
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		respondErrorMsg(c, "service_unavailable", "sandbox access token unavailable", http.StatusServiceUnavailable)
 		return sandboxResponse{}, false
 	}
 	return resp, true
@@ -2748,6 +2758,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	}
 	sandbox := row.Sandbox
 	c.Set("routing_observed_at", row.RoutingObservedAt)
+	_, _ = cacheJoinedSandboxOwner(c, sandboxID, teamID, sandbox, row.MachineOwnershipPresent, row.MachineOwnerPrincipalID, row.MachineOwnerTeamID)
 
 	resp := h.sandboxToResponse(sandbox)
 	resp.PreviewAccess = row.Access
@@ -3974,6 +3985,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// on this request goroutine instead of reading it back for the token.
 		owner := db.MachineSandboxOwnerRow{SandboxID: sandbox.ID, OwnerPrincipalID: machineCaller.PrincipalID, TeamID: teamID}
 		c.Set("machine_resource_owner", requestOwnerResult{sandboxID: sandbox.ID, teamID: teamID, owner: owner})
+	} else {
+		// A non-machine create never writes an owner row.
+		c.Set("machine_resource_owner", requestOwnerResult{sandboxID: sandbox.ID, teamID: teamID, err: pgx.ErrNoRows})
 	}
 	c.Set("routing_observed_at", routingObservedAt)
 	resp, ok := h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))

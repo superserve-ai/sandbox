@@ -10,13 +10,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const getSandboxWithPreviewPolicyForRouting = `-- name: GetSandboxWithPreviewPolicyForRouting :one
 SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at,
-  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+  (mo.sandbox_id IS NOT NULL)::boolean AS machine_ownership_present,
+  mo.owner_principal_id AS machine_owner_principal_id,
+  mo.team_id AS machine_owner_team_id
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+LEFT JOIN sandbox_machine_owner mo ON mo.sandbox_id = s.id
 WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL
 `
 
@@ -26,13 +31,17 @@ type GetSandboxWithPreviewPolicyForRoutingParams struct {
 }
 
 type GetSandboxWithPreviewPolicyForRoutingRow struct {
-	Sandbox           Sandbox   `json:"sandbox"`
-	RoutingObservedAt time.Time `json:"routing_observed_at"`
-	Access            string    `json:"access"`
+	Sandbox                 Sandbox     `json:"sandbox"`
+	RoutingObservedAt       time.Time   `json:"routing_observed_at"`
+	Access                  string      `json:"access"`
+	MachineOwnershipPresent bool        `json:"machine_ownership_present"`
+	MachineOwnerPrincipalID pgtype.UUID `json:"machine_owner_principal_id"`
+	MachineOwnerTeamID      pgtype.UUID `json:"machine_owner_team_id"`
 }
 
 // GetSandbox plus the effective preview access, so read endpoints return
-// both in one round-trip.
+// both in one round-trip. Immutable machine ownership rides along so token
+// issuance needs no second lookup.
 func (q *Queries) GetSandboxWithPreviewPolicyForRouting(ctx context.Context, arg GetSandboxWithPreviewPolicyForRoutingParams) (GetSandboxWithPreviewPolicyForRoutingRow, error) {
 	row := q.db.QueryRow(ctx, getSandboxWithPreviewPolicyForRouting, arg.ID, arg.TeamID)
 	var i GetSandboxWithPreviewPolicyForRoutingRow
@@ -78,6 +87,9 @@ func (q *Queries) GetSandboxWithPreviewPolicyForRouting(ctx context.Context, arg
 		&i.Sandbox.SourceSnapshotID,
 		&i.RoutingObservedAt,
 		&i.Access,
+		&i.MachineOwnershipPresent,
+		&i.MachineOwnerPrincipalID,
+		&i.MachineOwnerTeamID,
 	)
 	return i, err
 }

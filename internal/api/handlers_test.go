@@ -2346,6 +2346,30 @@ func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 	}
 }
 
+func TestActivateSandbox_UnclassifiedOwnershipFailsInsteadOfOmittingToken(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive, HostID: "owner"}
+	mock := &mockDBTX{queryRowFn: func(context.Context, string, ...any) pgx.Row {
+		row := sandboxRow(sb)
+		scan := row.scanFn
+		row.scanFn = func(dest ...any) error {
+			err := scan(dest...)
+			if len(dest) == 44 {
+				// Owner columns without the presence flag cannot be classified.
+				*dest[42].(*pgtype.UUID) = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+			}
+			return err
+		}
+		return row
+	}}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Config: routingHintTestConfig()}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "access_token") {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
 	testActivateSandboxPausedResumesAndReturns200(t, nil)
 }
