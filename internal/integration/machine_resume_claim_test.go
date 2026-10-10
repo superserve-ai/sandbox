@@ -62,3 +62,24 @@ func TestMachineResumeClaimCarriesImmutableOwnership(t *testing.T) {
 		})
 	}
 }
+
+func TestMachinePauseClaimRequiresOwningPrincipal(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := seedActiveSandbox(t, teamID, "machine-pause")
+	owner := machineRepairPrincipal(t, testQueries, teamID)
+	if err := testQueries.CreateMachineSandboxOwner(ctx, sandboxID, owner.ID, teamID); err != nil {
+		t.Fatal(err)
+	}
+	params := db.BeginPauseParams{ID: sandboxID, TeamID: teamID, PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, LeaseSeconds: 60}
+	other := machineRepairPrincipal(t, testQueries, teamID)
+	denied := params
+	denied.MachinePrincipalID = pgtype.UUID{Bytes: other.ID, Valid: true}
+	if _, err := testQueries.BeginPause(ctx, denied); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("foreign machine paused sandbox: %v", err)
+	}
+	params.MachinePrincipalID = pgtype.UUID{Bytes: owner.ID, Valid: true}
+	if row, err := testQueries.BeginPause(ctx, params); err != nil || row.Status != db.SandboxStatusPausing {
+		t.Fatalf("owner pause claim: %s %v", row.Status, err)
+	}
+}

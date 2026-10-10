@@ -404,6 +404,11 @@ type SessionRegistry struct {
 	credentialFences map[uuid.UUID]uint64
 	principalFences  map[uuid.UUID]uint64
 	epoch            uint64
+	// invalidatedAt records the epoch of each credential or principal's latest
+	// revocation so only registrations for that authority lose the race;
+	// compaction raises floor to reject every older verification instead.
+	invalidatedAt map[uuid.UUID]uint64
+	floor         uint64
 }
 
 type sessionEntry struct {
@@ -417,7 +422,7 @@ func NewSessionRegistry(max int) *SessionRegistry {
 	if max < 1 {
 		max = 1
 	}
-	return &SessionRegistry{max: max, sessions: make(map[string]sessionEntry), credentialFences: make(map[uuid.UUID]uint64), principalFences: make(map[uuid.UUID]uint64)}
+	return &SessionRegistry{max: max, sessions: make(map[string]sessionEntry), credentialFences: make(map[uuid.UUID]uint64), principalFences: make(map[uuid.UUID]uint64), invalidatedAt: make(map[uuid.UUID]uint64)}
 }
 
 func (r *SessionRegistry) Register(id string, state RevocationState) error {
@@ -463,7 +468,7 @@ func (r *SessionRegistry) register(id string, state RevocationState, cancel cont
 }
 
 func (r *SessionRegistry) registerLocked(id string, state RevocationState, cancel context.CancelFunc, epoch uint64) error {
-	if epoch != r.epoch {
+	if epoch < r.floor || r.invalidatedAt[state.CredentialID] > epoch || r.invalidatedAt[state.PrincipalID] > epoch {
 		return ErrMachineCapabilityDenied
 	}
 	if fence := r.credentialFences[state.CredentialID]; fence >= state.RevocationGeneration {
@@ -516,23 +521,38 @@ func (r *SessionRegistry) Allows(id string, capability MachineCapability, now ti
 	return ok && entry.state.Allows(capability, now)
 }
 
+func (r *SessionRegistry) invalidateLocked(id uuid.UUID) {
+	r.epoch++
+	if r.invalidatedAt == nil {
+		r.invalidatedAt = make(map[uuid.UUID]uint64)
+	}
+	r.invalidatedAt[id] = r.epoch
+}
+
+// Fence retention is bounded, while the floor makes every verification that
+// began before this compaction fail registration. A fresh authority lookup is
+// therefore required before an old generation can re-enter.
+func (r *SessionRegistry) compactLocked() {
+	if len(r.credentialFences)+len(r.principalFences) <= 4096 {
+		return
+	}
+	r.epoch++
+	r.floor = r.epoch
+	r.credentialFences = make(map[uuid.UUID]uint64)
+	r.principalFences = make(map[uuid.UUID]uint64)
+	r.invalidatedAt = make(map[uuid.UUID]uint64)
+}
+
 func (r *SessionRegistry) RevokeCredential(credentialID uuid.UUID, generation uint64) int {
 	if r == nil {
 		return 0
 	}
 	r.mu.Lock()
-	r.epoch++
+	r.invalidateLocked(credentialID)
 	if generation > r.credentialFences[credentialID] {
 		r.credentialFences[credentialID] = generation
 	}
-	if len(r.credentialFences)+len(r.principalFences) > 4096 {
-		// Fence retention is bounded, while the epoch makes every verification
-		// that began before this compaction fail registration. A fresh authority
-		// lookup is therefore required before an old generation can re-enter.
-		r.epoch++
-		r.credentialFences = make(map[uuid.UUID]uint64)
-		r.principalFences = make(map[uuid.UUID]uint64)
-	}
+	r.compactLocked()
 	removed := 0
 	var cancels []context.CancelFunc
 	for id, entry := range r.sessions {
@@ -556,15 +576,11 @@ func (r *SessionRegistry) RevokePrincipal(principalID uuid.UUID, generation uint
 		return 0
 	}
 	r.mu.Lock()
-	r.epoch++
+	r.invalidateLocked(principalID)
 	if generation > r.principalFences[principalID] {
 		r.principalFences[principalID] = generation
 	}
-	if len(r.credentialFences)+len(r.principalFences) > 4096 {
-		r.epoch++
-		r.credentialFences = make(map[uuid.UUID]uint64)
-		r.principalFences = make(map[uuid.UUID]uint64)
-	}
+	r.compactLocked()
 	removed := 0
 	var cancels []context.CancelFunc
 	for id, entry := range r.sessions {

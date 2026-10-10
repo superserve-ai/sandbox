@@ -159,6 +159,11 @@ WITH paused AS (
     AND sandbox.team_id = $6
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
+    -- A machine caller may pause only a sandbox its principal owns.
+    AND ($7::uuid IS NULL
+         OR EXISTS (SELECT 1 FROM sandbox_machine_owner mo
+                    WHERE mo.sandbox_id = sandbox.id AND mo.team_id = sandbox.team_id
+                      AND mo.owner_principal_id = $7::uuid))
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
 ),
 closed_interval AS (
@@ -181,12 +186,13 @@ LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
 
 type BeginPauseParams struct {
-	PauseOpID    pgtype.UUID `json:"pause_op_id"`
-	LeaseSeconds int32       `json:"lease_seconds"`
-	Trigger      *string     `json:"trigger"`
-	ActorID      pgtype.UUID `json:"actor_id"`
-	ID           uuid.UUID   `json:"id"`
-	TeamID       uuid.UUID   `json:"team_id"`
+	PauseOpID          pgtype.UUID `json:"pause_op_id"`
+	LeaseSeconds       int32       `json:"lease_seconds"`
+	Trigger            *string     `json:"trigger"`
+	ActorID            pgtype.UUID `json:"actor_id"`
+	ID                 uuid.UUID   `json:"id"`
+	TeamID             uuid.UUID   `json:"team_id"`
+	MachinePrincipalID pgtype.UUID `json:"machine_principal_id"`
 }
 
 type BeginPauseRow struct {
@@ -249,6 +255,7 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 		arg.ActorID,
 		arg.ID,
 		arg.TeamID,
+		arg.MachinePrincipalID,
 	)
 	var i BeginPauseRow
 	err := row.Scan(

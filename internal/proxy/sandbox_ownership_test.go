@@ -204,3 +204,35 @@ func TestSandboxOwnershipRejectsDelayedResult(t *testing.T) {
 		}
 	})
 }
+
+func TestSandboxOwnershipLeaderCancellationSparesWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cache := NewCachedSandboxOwnership(nil)
+		db := &sandboxOwnerTestDB{delay: 100 * time.Millisecond}
+		cache.pool = db
+		sandbox, team := uuid.NewString(), uuid.NewString()
+		leader, cancel := context.WithCancel(context.Background())
+		leaderErr := make(chan error, 1)
+		go func() {
+			_, err := cache.lookup(leader, sandbox, team)
+			leaderErr <- err
+		}()
+		synctest.Wait()
+		siblingErr := make(chan error, 1)
+		go func() {
+			_, err := cache.lookup(context.Background(), sandbox, team)
+			siblingErr <- err
+		}()
+		synctest.Wait()
+		cancel()
+		if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+			t.Fatalf("leader error = %v", err)
+		}
+		if err := <-siblingErr; err != nil {
+			t.Fatalf("sibling failed with leader: %v", err)
+		}
+		if db.calls.Load() != 1 {
+			t.Fatalf("queries = %d, want one shared lookup", db.calls.Load())
+		}
+	})
+}

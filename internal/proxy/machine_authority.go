@@ -18,12 +18,17 @@ import (
 // request and stream admission. Revoked/disabled rows are misses; an outage
 // never extends an expired snapshot and no frame performs durable I/O.
 type CachedMachineAuthority struct {
-	pool   machineAuthorityQuerier
-	ttl    time.Duration
-	mu     sync.Mutex
-	items  map[machineAuthorityKey]machineAuthorityEntry
-	epoch  uint64
-	flight singleflight.Group
+	pool  machineAuthorityQuerier
+	ttl   time.Duration
+	mu    sync.Mutex
+	items map[machineAuthorityKey]machineAuthorityEntry
+	epoch uint64
+	// invalidated holds the epoch of each credential or principal's latest
+	// invalidation, so only fills for that authority are rejected. On overflow
+	// the map resets and floor rejects every fill that began before it.
+	invalidated map[uuid.UUID]uint64
+	floor       uint64
+	flight      singleflight.Group
 }
 
 type machineAuthorityQuerier interface {
@@ -82,7 +87,7 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 	result := a.flight.DoChan(keyString(key), func() (any, error) {
 		observedAt := time.Now()
 		a.mu.Lock()
-		if a.epoch != epoch {
+		if a.staleLocked(key, epoch) {
 			a.mu.Unlock()
 			return authoritySnapshot{}, errors.New("machine authority invalidated")
 		}
@@ -102,7 +107,7 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 		deadline := observedAt.Add(a.ttl)
 		if err != nil {
 			a.mu.Lock()
-			if a.epoch == epoch {
+			if !a.staleLocked(key, epoch) {
 				delete(a.items, key)
 			}
 			a.mu.Unlock()
@@ -115,7 +120,7 @@ func (a *CachedMachineAuthority) lookupSnapshot(ctx context.Context, principalID
 			return authoritySnapshot{}, errAuthoritySnapshotExpired
 		}
 		a.mu.Lock()
-		if a.epoch != epoch {
+		if a.staleLocked(key, epoch) {
 			a.mu.Unlock()
 			return authoritySnapshot{}, errors.New("machine authority invalidated")
 		}
@@ -162,12 +167,28 @@ func (a *CachedMachineAuthority) trimLocked() {
 	}
 }
 
+func (a *CachedMachineAuthority) staleLocked(key machineAuthorityKey, started uint64) bool {
+	return started < a.floor || a.invalidated[key.credential] > started || a.invalidated[key.principal] > started
+}
+
+func (a *CachedMachineAuthority) invalidateLocked(id uuid.UUID) {
+	a.epoch++
+	if len(a.invalidated) >= 4096 {
+		clear(a.invalidated)
+		a.floor = a.epoch
+	}
+	if a.invalidated == nil {
+		a.invalidated = make(map[uuid.UUID]uint64)
+	}
+	a.invalidated[id] = a.epoch
+}
+
 func (a *CachedMachineAuthority) InvalidateCredential(credentialID uuid.UUID) {
 	if a == nil {
 		return
 	}
 	a.mu.Lock()
-	a.epoch++
+	a.invalidateLocked(credentialID)
 	defer a.mu.Unlock()
 	for key := range a.items {
 		if key.credential == credentialID {
@@ -181,7 +202,7 @@ func (a *CachedMachineAuthority) InvalidatePrincipal(principalID uuid.UUID) {
 		return
 	}
 	a.mu.Lock()
-	a.epoch++
+	a.invalidateLocked(principalID)
 	defer a.mu.Unlock()
 	for key := range a.items {
 		if key.principal == principalID {

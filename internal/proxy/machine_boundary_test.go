@@ -296,3 +296,20 @@ func TestMachineAuthoritySharedRefreshStillTimesOut(t *testing.T) {
 		}
 	})
 }
+
+func TestMachineAuthorityInvalidationSparesUnrelatedFill(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &countingAuthorityDB{blocked: make(chan struct{})}
+		cache := NewCachedMachineAuthority(nil, time.Second)
+		cache.pool = store
+		done := make(chan error, 1)
+		go func() { _, _, err := cache.LookupSnapshot(context.Background(), uuid.New(), uuid.New()); done <- err }()
+		synctest.Wait()
+		cache.InvalidateCredential(uuid.New())
+		cache.InvalidatePrincipal(uuid.New())
+		close(store.blocked)
+		if err := <-done; err != nil {
+			t.Fatalf("unrelated invalidation failed a healthy fill: %v", err)
+		}
+	})
+}

@@ -29,7 +29,7 @@ type boundaryOwnerDB struct {
 }
 
 func (d *boundaryOwnerDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
-	if strings.Contains(query, "FROM sandbox_machine_owner") {
+	if strings.Contains(query, "owner_principal_id,team_id FROM sandbox_machine_owner WHERE") {
 		d.reads++
 		return &mockRow{scanFn: func(dest ...any) error {
 			if d.failure != nil {
@@ -197,6 +197,52 @@ func TestActorlessTeamKeyReceivesMachineSandboxCapability(t *testing.T) {
 		c.Set("api_key_id", "")
 		if response := h.sandboxResponseForRequest(c, db.Sandbox{ID: sandbox, TeamID: team}, now); response.AccessToken != "" {
 			t.Fatal("missing authenticated key received capability")
+		}
+	}
+}
+
+func TestMachineActivateEnforcesOwnershipFromRoutingRead(t *testing.T) {
+	for _, owned := range []bool{true, false} {
+		team, sandbox, principal := uuid.New(), uuid.New(), uuid.New()
+		sb := db.Sandbox{ID: sandbox, TeamID: team, Name: "sb", Status: db.SandboxStatusActive, HostID: "owner"}
+		mock := &mockDBTX{queryRowFn: func(context.Context, string, ...any) pgx.Row {
+			row := sandboxRow(sb)
+			scan := row.scanFn
+			row.scanFn = func(dest ...any) error {
+				err := scan(dest...)
+				if len(dest) == 44 {
+					*dest[41].(*bool) = true
+					*dest[42].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
+					*dest[43].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
+				}
+				return err
+			}
+			return row
+		}}
+		h := &Handlers{DB: db.New(mock), VMD: &stubVMD{}}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandbox.String()+"/activate", nil)
+		c.Params = gin.Params{{Key: "sandbox_id", Value: sandbox.String()}}
+		c.Set("team_id", team.String())
+		caller := machineRequestCaller(time.Now())
+		caller.TeamID, caller.PrincipalID = team, principal
+		if !owned {
+			caller.PrincipalID = uuid.New()
+		}
+		caller.Permissions, caller.Policy = []auth.MachineOperation{auth.MachineOperationActivate}, auth.NewMachinePolicy(auth.MachineOperationActivate)
+		setMachineCaller(c, caller)
+		// The mock answers a separate ownership read with no rows, so passing
+		// the gate proves activation relies on the joined read alone.
+		if !h.requireTeamSandboxWrite(c, team) {
+			t.Fatalf("owned=%v: activate pre-read ownership", owned)
+		}
+		got, _ := h.loadActiveOrResumeSandbox(c)
+		if owned && got == nil {
+			t.Fatalf("owner activation denied: %d", w.Code)
+		}
+		if !owned && (got != nil || w.Code != http.StatusForbidden) {
+			t.Fatalf("foreign activation status = %d", w.Code)
 		}
 	}
 }

@@ -43,4 +43,9 @@ func TestMachineRepairSessionFencing(t *testing.T) {
 	if err := r.RegisterWithCancelEpoch("late", state, nil, epoch); err == nil {
 		t.Fatal("stale verify/register epoch was admitted")
 	}
+	r.RevokePrincipal(uuid.New(), 1)
+	unrelated := RevocationState{PrincipalID: uuid.New(), CredentialID: uuid.New(), RevocationGeneration: 1, ExpiresAt: time.Now().Add(time.Minute)}
+	if err := r.RegisterWithCancelEpoch("unrelated", unrelated, nil, epoch); err != nil {
+		t.Fatalf("unrelated revocation rejected a verified session: %v", err)
+	}
 }
