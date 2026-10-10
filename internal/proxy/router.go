@@ -67,6 +67,10 @@ func (h *RoutingHandler) resolveSandbox(ctx context.Context, id string) (Sandbox
 }
 
 func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	logBoxdRequest(h.log, h.domains, w, r, h.serveHTTP)
+}
+
+func (h *RoutingHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	port, id, err := ParseRequest(r.Host, r.Header, h.domains)
 	if err != nil {
 		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)
@@ -140,6 +144,7 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// hijacked client and peer transports when this context is canceled.
 		ctx, cleanup, ok := local.machineSessionContext(r.Context(), token)
 		if !ok {
+			logSandboxAuth(r.Context(), "error", "")
 			(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
 			return
 		}
@@ -175,9 +180,16 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.log.Debug().Str("route", "remote").Str("route_outcome", "remote").Str("host_id", route.HostID).Msg("sandbox routed to peer")
 	defer stream.Close()
+	if record := requestRecordFrom(r.Context()); record != nil {
+		record.mu.Lock()
+		record.forwarded = true
+		r.Header.Set(peerRequestIDHeader, record.id)
+		record.mu.Unlock()
+	}
 	if err := bridgeRequestWithIdleTimeout(w, r, stream, h.halfCloseIdleTimeout); err != nil {
+		logRequestOutcome(r.Context(), "transport_error")
 		h.record(r.Context(), "peer_error", route.HostID)
-		h.log.Warn().Str("route_outcome", "peer_stream_error").Err(err).Msg("peer stream failed")
+		h.log.Warn().Str("route_outcome", "peer_stream_error").Msg("peer stream failed")
 		return
 	}
 	outcome := "remote"

@@ -19,10 +19,10 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// (unauthenticated flood protection), logging, panic recovery.
 	r.Use(
 		SecurityHeaders(),
+		RequestLogger(),
 		TeamCreationReadDeadline(),
 		machineAdministrationReadDeadline(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
-		RequestLogger(),
 		ErrorHandler(),
 		sentrygin.New(sentrygin.Options{Repanic: true}),
 		machineAdministrationPrivacy(),

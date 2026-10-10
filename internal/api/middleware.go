@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/requestlog"
 )
 
 const consoleImpersonationKeyName = "__console_impersonation__"
@@ -117,8 +117,10 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			}
 			RecordLatencyPhases(c.Request.Context(), op, "", phases)
 		}()
+		logAuthOutcome(c, "error")
 		apiKey := c.GetHeader("X-API-Key")
 		if apiKey == "" {
+			logAuthOutcome(c, "missing")
 			respondErrorMsg(c, "auth_failed", "Invalid or missing X-API-Key header.", http.StatusUnauthorized)
 			c.Abort()
 			return
@@ -188,11 +190,13 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 					"Authentication is temporarily unavailable. Please retry.",
 					http.StatusServiceUnavailable)
 			case errors.Is(err, pgx.ErrNoRows):
+				logAuthOutcome(c, "invalid")
 				// The real bad-key case — with per-cell databases it is also
 				// how a valid key presented to the wrong cell fails;
 				// respondAuthFailed names the right region when the key says so.
 				respondAuthFailed(c, apiKey)
 			case respondWrongRegion(c, apiKey):
+				logAuthOutcome(c, "invalid")
 				// A key tagged for another cell can never authenticate here,
 				// whatever the lookup said — the redirect hint already went out.
 			default:
@@ -212,6 +216,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		// time; re-check key expiry at THIS request's time, exactly like the
 		// cache-hit path does on every get.
 		if entry.expiresAt.Valid && !time.Now().Before(entry.expiresAt.Time) {
+			logAuthOutcome(c, "invalid")
 			respondAuthFailed(c, apiKey)
 			c.Abort()
 			return
@@ -228,6 +233,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 // context, shared by the cache-hit and lookup paths. The impersonation check
 // reads entry.name directly (not the gin key) so it cannot depend on Set order.
 func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
+	c.Set(logIdentityKey, requestlog.Identity{ActorType: "api_key", ActorID: entry.id, CredentialID: entry.id, TeamID: entry.teamID, AuthOutcome: "authenticated", AttributionStatus: "identified"})
 	c.Set("api_key_id", entry.id)
 	c.Set("api_key_name", entry.name)
 	c.Set("api_key_scopes", entry.scopes)
@@ -243,30 +249,41 @@ func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
 // RequestLogger returns a Gin middleware that logs each request using zerolog,
 // including method, path, status code, and latency.
 func RequestLogger() gin.HandlerFunc {
+	return requestLogger(&log.Logger)
+}
+
+func requestLogger(logger *zerolog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		path := c.Request.URL.Path
-		raw := c.Request.URL.RawQuery
 
 		c.Next()
 
 		latency := time.Since(start)
 		status := c.Writer.Status()
 		clientIP := c.ClientIP()
-		method := c.Request.Method
+		method := requestlog.Method(c.Request.Method)
+		route, path := requestLogPath(c)
 
-		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" && !strings.HasPrefix(c.Request.URL.Path, "/internal/machine-identity") {
-			path = path + "?" + raw
-		}
-
-		evt := log.Info()
+		evt := logger.Info()
 		if status >= 500 && !c.GetBool(stripeCheckoutAssociationPendingRequestKey) {
-			evt = log.Error()
+			evt = logger.Error()
 		} else if status >= 400 {
-			evt = log.Warn()
+			evt = logger.Warn()
 		}
 
-		evt.
+		switch outcome := c.GetString(logAuthorizationOutcomeKey); outcome {
+		case "allowed", "denied", "error", "not_evaluated":
+			evt.Str("authorization_outcome", outcome)
+		}
+		identity := logIdentity(c)
+		if identity.CredentialID != "" && c.GetString("api_key_id") == identity.CredentialID {
+			evt.Str("api_key_id", identity.CredentialID)
+		}
+		if id, err := parsePublicSandboxID(c.Param("sandbox_id")); err == nil {
+			evt.Str("sandbox_id", id.String())
+		}
+		identity.Log(evt).
+			Str("service", "sandbox-api").Str("plane", "control").Str("event_type", "request").Str("route", route).
 			Str("method", method).
 			Str("path", path).
 			Int("status", status).
@@ -294,9 +311,9 @@ func ErrorHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
 			if r := recover(); r != nil {
+				_, path := requestLogPath(c)
 				zerolog.Ctx(c.Request.Context()).Error().
-					Interface("panic", r).
-					Str("path", c.Request.URL.Path).
+					Str("path", path).
 					Msg("panic recovered")
 
 				respondErrorMsg(c, "internal_error",

@@ -80,18 +80,35 @@ func (h *Handler) authorizeSandboxRequest(
 
 	var verifiedCapability *auth.MachineCapability
 	if strings.HasPrefix(token, "mcap.") {
+		var authorityErr error
 		capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
 		if err == nil && !capability.IsTeamCapability() {
 			if h.machineAuthority == nil {
+				logSandboxAuth(ctx, "error", "")
 				return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}
 			}
-			capability, err = auth.VerifyMachineCapabilityWithAuthority(ctx, token, h.seedKey, time.Now(), h.machineAuthority)
+			capability, err = auth.VerifyMachineCapabilityWithAuthority(ctx, token, h.seedKey, time.Now(), func(ctx context.Context, principal, credential uuid.UUID) (uint64, error) {
+				generation, lookupErr := h.machineAuthority(ctx, principal, credential)
+				authorityErr = lookupErr
+				return generation, lookupErr
+			})
 		}
-		if err != nil || capability.SandboxID.String() != requestSandboxID || capability.Audience != "sandbox-proxy" {
+		if err != nil || capability.Audience != "sandbox-proxy" {
+			outcome := "invalid"
+			if authorityErr != nil && !errors.Is(authorityErr, auth.ErrMachineCapabilityDenied) {
+				// A store outage is distinct from an explicit authority denial.
+				outcome = "error"
+			}
+			logSandboxAuth(ctx, outcome, "")
+			return InstanceInfo{}, &authzFailure{Status: http.StatusUnauthorized, Message: "invalid machine capability"}
+		}
+		logVerifiedCaller(ctx, *callerContextFromCapability(capability))
+		if capability.SandboxID.String() != requestSandboxID {
 			return InstanceInfo{}, &authzFailure{Status: http.StatusUnauthorized, Message: "invalid machine capability"}
 		}
 		verifiedCapability = &capability
 	} else if !auth.VerifyAccessToken(h.seedKey, requestSandboxID, token) {
+		logSandboxAuth(ctx, "invalid", "")
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusUnauthorized,
 			Message: "invalid access token",
@@ -101,6 +118,9 @@ func (h *Handler) authorizeSandboxRequest(
 	var verifiedCaller *auth.CallerContext
 	if verifiedCapability != nil {
 		verifiedCaller = callerContextFromCapability(*verifiedCapability)
+	}
+	if verifiedCapability == nil {
+		logSandboxAuth(ctx, "authenticated", "")
 	}
 	info, err := h.resolver.Lookup(ctx, requestSandboxID)
 	if err != nil {
@@ -124,6 +144,7 @@ func (h *Handler) authorizeSandboxRequest(
 		return InstanceInfo{}, &authzFailure{Status: http.StatusServiceUnavailable,
 			Message: "sandbox ownership unavailable", Code: "sandbox_ownership_unavailable", Caller: verifiedCaller}
 	}
+	logResourceTeam(ctx, info.TeamID)
 	ownershipState := info.OwnershipState
 	if ownershipState == "" {
 		if info.MachineOwned && info.MachineOwnerPrincipalID != "" {
@@ -503,5 +524,9 @@ func (h *Handler) canRouteBoxdRequest(r *http.Request, sandboxID string) bool {
 		capability, err := auth.VerifyMachineCapability(token, h.seedKey, time.Now())
 		return err == nil && capability.SandboxID.String() == sandboxID && capability.Audience == "sandbox-proxy"
 	}
-	return auth.VerifyAccessToken(h.seedKey, sandboxID, token)
+	valid := auth.VerifyAccessToken(h.seedKey, sandboxID, token)
+	if valid {
+		logSandboxAuth(r.Context(), "authenticated", "")
+	}
+	return valid
 }
