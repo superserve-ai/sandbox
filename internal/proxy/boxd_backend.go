@@ -29,7 +29,14 @@ func (h *Handler) authorizeBoxdRequest(w http.ResponseWriter, r *http.Request, i
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
 	if fail != nil {
 		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg(logPrefix + ": auth failed")
+		retainVerifiedCaller(r, fail.Caller)
 		fail.write(w)
+		return InstanceInfo{}, false
+	}
+	retainVerifiedCaller(r, info.MachineCaller)
+	if !verifyMachineProxyOperation(token, h.seedKey, instanceID, r.Method, r.URL.Path) {
+		h.log.Warn().Str("sandbox_id", instanceID).Msg(logPrefix + ": machine operation denied")
+		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted", Code: "operation_denied", Caller: info.MachineCaller}).write(w)
 		return InstanceInfo{}, false
 	}
 	return info, true

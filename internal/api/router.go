@@ -20,10 +20,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.Use(
 		SecurityHeaders(),
 		TeamCreationReadDeadline(),
+		machineAdministrationReadDeadline(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),
 		ErrorHandler(),
 		sentrygin.New(sentrygin.Options{Repanic: true}),
+		machineAdministrationPrivacy(),
 	)
 
 	api := r.Group("/")
@@ -31,6 +33,15 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// customer gets a dedicated bucket regardless of source IP. Behind a
 	// load balancer the per-IP limit collapses tenants onto one bucket
 	// and becomes meaningless for fairness.
+	// Machine auth always runs before human API-key auth.  In particular, a
+	// request carrying the machine credential header must fail closed when the
+	// compatible resolver has not been wired yet; otherwise APIKeyAuth could
+	// accidentally treat that request as an ordinary human call.
+	var machineResolver MachineCredentialResolver
+	if h != nil {
+		machineResolver = h.MachineCredentials
+	}
+	api.Use(MachineCredentialAuth(machineResolver))
 	api.Use(APIKeyAuth(pool), TeamRateLimit(ctx, DefaultTeamRateLimitConfig()), SandboxLifecycleTelemetry())
 	{
 		// Sandbox lifecycle.
@@ -168,6 +179,15 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.GET("/abuse/trusted-identities", h.ListPlatformAbuseTrustedIdentities)
 		operator.POST("/abuse/trusted-identities", h.AddPlatformAbuseTrustedIdentity)
 		operator.POST("/abuse/trusted-identities/:identity_id/revoke", h.RevokePlatformAbuseTrustedIdentity)
+	}
+
+	machineAdministration := operator.Group("/machine-identity", machineAdministrationAuthorization())
+	{
+		machineAdministration.POST("/principals", h.EnsureMachinePrincipal)
+		machineAdministration.GET("/principals/:principal_id", h.GetMachinePrincipal)
+		machineAdministration.POST("/principals/:principal_id/credentials/:action", h.MutateMachineCredential)
+		machineAdministration.POST("/principals/:principal_id/disable", h.DisableMachinePrincipal)
+		machineAdministration.POST("/credentials/:credential_id/revoke", h.RevokeMachineCredential)
 	}
 
 	// Internal endpoints — authenticated via a shared token (not per-team

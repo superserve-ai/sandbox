@@ -147,6 +147,11 @@ type VMInstance struct {
 	Metadata         map[string]string
 	TeamID           string // owning team; carried for data-plane usage attribution
 	OwnerID          string // creating user; empty when unknown
+	// Machine ownership is an explicit control-plane attestation. Empty
+	// principal means ownership is unknown and proxies must fail closed.
+	MachineOwned            bool
+	OrdinaryOwned           bool // explicit control-plane attestation without a known creating user
+	MachineOwnerPrincipalID string
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -3682,10 +3687,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.RUnlock()
 	restoreFromPaused := false
 	var prevPausedAt time.Time
+	var prevOwnership *VMRecord
 	if prev != nil {
 		prev.mu.RLock()
 		restoreFromPaused = prev.Status == StatusPaused
 		prevPausedAt = prev.PausedAt
+		prevOwnership = explicitOwnershipRecord(prev)
 		prev.mu.RUnlock()
 	}
 	if wakeProtocolFloorRaised() {
@@ -3795,6 +3802,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		PreviewPolicyRevision:      previewPolicyRevision,
 		PreviewTokenPolicyRevision: inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision),
 	}
+	setOwnershipFromTrustedMarker(inst, ownerID)
+	restoreOwnershipFromRecord(inst, prevOwnership)
 	m.vms[vmID] = inst
 	m.indexVM(vmID, inst)
 	m.mu.Unlock()
@@ -6269,11 +6278,14 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 
 // InstanceInfo is a snapshot of a VM's address and status for proxy lookups.
 type InstanceInfo struct {
-	VMIP      string
-	Status    VMStatus
-	CreatedAt time.Time
-	TeamID    string
-	OwnerID   string
+	VMIP                    string
+	Status                  VMStatus
+	CreatedAt               time.Time
+	TeamID                  string
+	OwnerID                 string
+	MachineOwned            bool
+	OrdinaryOwned           bool
+	MachineOwnerPrincipalID string
 
 	PreviewAccess string
 	PreviewPorts  map[int32]PreviewPortPolicy
@@ -6298,11 +6310,14 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 	)
 	previewAccess := restrictivePreviewAccess(inst.PreviewAccess, previewPorts)
 	info := InstanceInfo{
-		VMIP:      inst.IP,
-		Status:    inst.Status,
-		CreatedAt: inst.CreatedAt,
-		TeamID:    inst.TeamID,
-		OwnerID:   inst.OwnerID,
+		VMIP:                    inst.IP,
+		Status:                  inst.Status,
+		CreatedAt:               inst.CreatedAt,
+		TeamID:                  inst.TeamID,
+		OwnerID:                 inst.OwnerID,
+		MachineOwned:            inst.MachineOwned,
+		OrdinaryOwned:           inst.OrdinaryOwned,
+		MachineOwnerPrincipalID: inst.MachineOwnerPrincipalID,
 
 		PreviewAccess: previewAccess,
 		PreviewPorts:  previewPorts,

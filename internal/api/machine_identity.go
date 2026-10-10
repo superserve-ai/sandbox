@@ -1,0 +1,234 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	"github.com/superserve-ai/sandbox/internal/auth"
+	"github.com/superserve-ai/sandbox/internal/db"
+)
+
+const machineCallerContextKey = "machine_caller"
+const machineRequestBodyLimit = 1 << 20
+const machineAuthorityTimeout = 5 * time.Second
+
+// MachineCredentialResolver is implemented by the owning control-plane
+// integration. It returns verified durable identity; it must not return raw
+// credential material or derive authority from human membership.
+type MachineCredentialResolver interface {
+	ResolveMachineCredential(context.Context, string) (auth.CallerContext, error)
+}
+
+func MachineCredentialAuth(resolver MachineCredentialResolver) gin.HandlerFunc {
+	return machineCredentialAuthWithClock(resolver, time.Now)
+}
+
+func machineCredentialAuthWithClock(resolver MachineCredentialResolver, now func() time.Time) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Start the shared auth phase before resolving the durable machine
+		// authority so machine lookup latency and failure paths remain visible
+		// to lifecycle instrumentation.
+		authStart := time.Now()
+		c.Set("auth_start", authStart)
+		raw := strings.TrimSpace(c.GetHeader("X-QM-Machine-Credential"))
+		if raw == "" {
+			c.Next()
+			return
+		}
+		if !bufferMachineRequestBody(c) {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
+			c.Abort()
+			return
+		}
+		if resolver == nil {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
+			respondError(c, ErrUnauthorized)
+			c.Abort()
+			return
+		}
+		lookupStart := now()
+		lookupCtx, cancel := context.WithTimeout(c.Request.Context(), machineAuthorityTimeout)
+		caller, err := resolver.ResolveMachineCredential(lookupCtx, raw)
+		lookupErr := lookupCtx.Err()
+		cancel()
+		if lookupErr != nil || now().Sub(lookupStart) >= machineAuthorityTimeout {
+			err = ErrMachineAuthorityUnavailable
+		}
+		if errors.Is(err, ErrMachineAuthorityUnavailable) {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
+			respondErrorMsg(c, "service_unavailable", "Machine authority is not ready.", http.StatusServiceUnavailable)
+			c.Abort()
+			return
+		}
+		if err != nil || caller.ValidateAt(now()) != nil {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
+			respondError(c, ErrUnauthorized)
+			c.Abort()
+			return
+		}
+		c.Set("verified_machine_caller", caller)
+		op, mapped := auth.OperationForHTTP(c.Request.Method, c.Request.URL.Path)
+		if !mapped || !caller.Policy.Allows(op) || !containsMachinePermission(caller.Permissions, op) {
+			c.Set("auth_duration", time.Since(authStart))
+			recordMachineAuthFailure(c, authStart)
+			respondError(c, ErrForbidden)
+			c.Abort()
+			return
+		}
+		setMachineCaller(c, caller)
+		c.Set("team_id", caller.TeamID.String())
+		c.Set("auth_duration", time.Since(authStart))
+		c.Next()
+	}
+}
+
+// Read the bounded body before authenticating so a slow upload cannot preserve
+// an authority decision made before revocation. The deadline ends before any
+// downstream lifecycle work, including VM startup.
+func bufferMachineRequestBody(c *gin.Context) bool {
+	if c.Request.Body == nil || c.Request.Body == http.NoBody {
+		return true
+	}
+	controller := http.NewResponseController(c.Writer)
+	if err := controller.SetReadDeadline(time.Now().Add(machineAuthorityTimeout)); err != nil {
+		c.Request.Close = true
+		c.Header("Connection", "close")
+		respondErrorMsg(c, "service_unavailable", "Machine request transport is unavailable.", http.StatusServiceUnavailable)
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, machineRequestBodyLimit+1))
+	if err != nil || len(body) > machineRequestBodyLimit {
+		c.Request.Close = true
+		c.Header("Connection", "close")
+		_ = controller.SetReadDeadline(time.Now())
+		status, code := http.StatusBadRequest, "invalid_request"
+		if len(body) > machineRequestBodyLimit {
+			status, code = http.StatusRequestEntityTooLarge, "request_too_large"
+		} else if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+			status, code = http.StatusRequestTimeout, "request_timeout"
+		}
+		respondErrorMsg(c, code, "Machine request body could not be read.", status)
+		return false
+	}
+	_ = c.Request.Body.Close()
+	if err := controller.SetReadDeadline(time.Time{}); err != nil {
+		c.Request.Close = true
+		c.Header("Connection", "close")
+		respondErrorMsg(c, "service_unavailable", "Machine request transport is unavailable.", http.StatusServiceUnavailable)
+		return false
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	return true
+}
+
+func recordMachineAuthFailure(c *gin.Context, started time.Time) {
+	op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath())
+	if !ok {
+		return
+	}
+	RecordLatencyPhases(c.Request.Context(), op, "", map[string]time.Duration{
+		"auth": time.Since(started), "total": time.Since(started),
+	})
+}
+
+// VerifiedMachineCallerFromContext exposes authenticated identity to attribution
+// even when route authorization denies the request. It never grants authority.
+func VerifiedMachineCallerFromContext(c *gin.Context) (auth.CallerContext, bool) {
+	value, ok := c.Get("verified_machine_caller")
+	caller, valid := value.(auth.CallerContext)
+	return caller, ok && valid
+}
+
+func setMachineCaller(c *gin.Context, caller auth.CallerContext) {
+	c.Set(machineCallerContextKey, caller)
+}
+
+func machineCallerFromContext(c *gin.Context) (auth.CallerContext, bool) {
+	v, ok := c.Get(machineCallerContextKey)
+	if !ok {
+		return auth.CallerContext{}, false
+	}
+	caller, ok := v.(auth.CallerContext)
+	return caller, ok
+}
+
+func machineOperationForRequest(c *gin.Context) (auth.MachineOperation, bool) {
+	return auth.OperationForHTTP(c.Request.Method, c.Request.URL.Path)
+}
+
+// requireMachineOperation is deliberately separate from human RBAC. Unknown
+// routes and missing caller context are denied; human requests continue down
+// the existing permission path.
+func (h *Handlers) requireMachineOperation(c *gin.Context, operation auth.MachineOperation) bool {
+	caller, machine := machineCallerFromContext(c)
+	if !machine {
+		return true
+	}
+	if caller.ValidateAt(timeNow(h)) != nil || !caller.Policy.Allows(operation) || !containsMachinePermission(caller.Permissions, operation) {
+		respondError(c, ErrForbidden)
+		return false
+	}
+	return true
+}
+
+func containsMachinePermission(permissions []auth.MachineOperation, want auth.MachineOperation) bool {
+	for _, permission := range permissions {
+		if permission == want {
+			return true
+		}
+	}
+	return false
+}
+
+func timeNow(h *Handlers) time.Time {
+	if h != nil && h.Now != nil {
+		return h.Now()
+	}
+	return time.Now()
+}
+
+func machineOwnerMatches(caller auth.CallerContext, owner db.MachineSandboxOwnerRow, sandboxID uuid.UUID, teamID uuid.UUID) bool {
+	return owner.SandboxID == sandboxID && owner.TeamID == teamID && owner.OwnerPrincipalID == caller.PrincipalID && caller.TeamID == teamID
+}
+
+func (h *Handlers) requireMachineSandboxOwner(c *gin.Context, sandboxID, teamID uuid.UUID) bool {
+	caller, machine := machineCallerFromContext(c)
+	if !machine {
+		return true
+	}
+	if h == nil || h.DB == nil {
+		respondError(c, ErrForbidden)
+		return false
+	}
+	owner, err := h.DB.GetMachineSandboxOwner(c.Request.Context(), sandboxID, teamID)
+	if err != nil || !machineOwnerMatches(caller, owner, sandboxID, teamID) {
+		respondError(c, ErrForbidden)
+		return false
+	}
+	return true
+}
+
+// machineCreateHeaders is an explicit deny-list for the public header paths
+// that previously acted as caller metadata. It is kept here so future route
+// additions cannot accidentally make those headers authoritative.
+func machineCreateHeaders(c *gin.Context) bool {
+	for _, header := range []string{"X-Actor-User-Id", "X-Machine-Principal", "X-Machine-Team", "X-Sandbox-Owner"} {
+		if strings.TrimSpace(c.GetHeader(header)) != "" {
+			respondErrorMsg(c, "forbidden", "machine identity is server-authenticated", http.StatusForbidden)
+			return false
+		}
+	}
+	return true
+}

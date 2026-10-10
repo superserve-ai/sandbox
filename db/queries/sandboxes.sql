@@ -253,6 +253,44 @@ ORDER BY
 LIMIT sqlc.narg('row_limit')::bigint
 OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
 
+-- Machine callers query their owner relation before pagination. This keeps
+-- page contents, totals, and work bounded by the requested page rather than
+-- materializing every historical ownership row in the handler.
+-- name: ListSandboxesByMachineOwner :many
+SELECT sqlc.embed(s),
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = @team_id
+  AND o.owner_principal_id = @owner_principal_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR s.status = ANY(sqlc.narg('statuses')::sandbox_status[]))
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%')
+ORDER BY
+  CASE WHEN @sort_by::text = 'name' AND @sort_dir::text = 'asc' THEN s.name END ASC,
+  CASE WHEN @sort_by::text = 'name' AND @sort_dir::text = 'desc' THEN s.name END DESC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'asc' THEN s.status::text END ASC,
+  CASE WHEN @sort_by::text = 'status' AND @sort_dir::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN @sort_by::text = 'created_at' AND @sort_dir::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
+LIMIT sqlc.narg('row_limit')::bigint
+OFFSET COALESCE(sqlc.narg('row_offset')::bigint, 0);
+
+-- name: CountSandboxesByMachineOwner :one
+SELECT COUNT(*)::bigint
+FROM sandbox s
+JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
+WHERE s.team_id = @team_id
+  AND o.owner_principal_id = @owner_principal_id
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> @metadata
+  AND (sqlc.narg('statuses')::sandbox_status[] IS NULL OR s.status = ANY(sqlc.narg('statuses')::sandbox_status[]))
+  AND (sqlc.narg('name_search')::text IS NULL
+       OR s.name ILIKE '%' || sqlc.narg('name_search')::text || '%');
+
 -- name: CountSandboxesByTeamPaged :one
 -- Total rows matching the same filters as ListSandboxesByTeamPaged (ignoring
 -- pagination + sort). Backs the X-Total-Count response header.
@@ -554,6 +592,11 @@ WITH paused AS (
     AND sandbox.team_id = sqlc.arg(team_id)
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
+    -- A machine caller may pause only a sandbox its principal owns.
+    AND (sqlc.narg('machine_principal_id')::uuid IS NULL
+         OR EXISTS (SELECT 1 FROM sandbox_machine_owner mo
+                    WHERE mo.sandbox_id = sandbox.id AND mo.team_id = sandbox.team_id
+                      AND mo.owner_principal_id = sqlc.narg('machine_principal_id')::uuid))
   RETURNING *
 ),
 closed_interval AS (
@@ -642,7 +685,8 @@ RETURNING *;
 
 -- name: ClaimResume :one
 -- The paused→resuming claim plus the boot inputs in one round trip:
--- snapshot paths, preview policy with published ports, template base path.
+-- snapshot paths, preview policy with published ports, template base path,
+-- and immutable machine ownership.
 -- The advisory lock is the one attach/detach take before re-reading
 -- status; held to statement end, so the returned row already reflects a
 -- binding mutation that beat the claim. It rides a FROM item joined on
@@ -652,7 +696,8 @@ RETURNING *;
 -- The auto-delete deadline stays on the row: the reaper acts on paused rows
 -- only, a failed resume returns the row to paused with the deadline it had,
 -- and activation clears it.
--- 0 rows: not paused, or another resume claimed it.
+-- A machine caller supplies its principal so the claim itself enforces ownership.
+-- 0 rows: owner mismatch, not paused, or another resume claimed it.
 UPDATE sandbox
 SET status = 'resuming', updated_at = now()
 FROM (
@@ -669,11 +714,15 @@ FROM (
          COALESCE(pp.ports, '{}')::int[] AS port_numbers,
          COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
          COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
-         t.base_path AS template_base_path
+         t.base_path AS template_base_path,
+         (mo.sandbox_id IS NOT NULL)::boolean AS machine_ownership_present,
+         mo.owner_principal_id AS machine_owner_principal_id,
+         mo.team_id AS machine_owner_team_id
   FROM sandbox sb
   LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
   LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
   LEFT JOIN template t ON t.id = sb.template_id
+  LEFT JOIN sandbox_machine_owner mo ON mo.sandbox_id = sb.id
   LEFT JOIN LATERAL (
     SELECT array_agg(pp.port ORDER BY pp.port) AS ports,
            array_agg(pp.access ORDER BY pp.port) AS accesses,
@@ -687,11 +736,15 @@ FROM (
 ) x
 WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+  AND (sqlc.narg('machine_principal_id')::uuid IS NULL
+       OR (x.machine_owner_principal_id = sqlc.narg('machine_principal_id')
+           AND x.machine_owner_team_id = sandbox.team_id))
 RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path, statement_timestamp()::timestamptz AS routing_observed_at;
+          x.template_base_path, statement_timestamp()::timestamptz AS routing_observed_at,
+          x.machine_ownership_present, x.machine_owner_principal_id, x.machine_owner_team_id;
 
 -- name: ResumePostBootCheck :one
 -- The two reads a resume makes after the boot, in one statement: the

@@ -73,6 +73,7 @@ func (h *Handler) captureDesktopUsage(instanceID, event string, info InstanceInf
 }
 
 func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceID string) {
+	token := r.Header.Get(accessTokenHeader)
 	if !h.desktopEnabled {
 		http.NotFound(w, r)
 		return
@@ -115,6 +116,13 @@ func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceI
 	if !ok {
 		return
 	}
+	boundRequest, cleanup, sessionOK := h.bindMachineRequest(w, r, token)
+	if !sessionOK {
+		(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
+		return
+	}
+	defer cleanup()
+	r = boundRequest
 
 	event := "desktop_input"
 	switch r.URL.Path {

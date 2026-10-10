@@ -192,9 +192,8 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, 
 		// the record. allow_recordless is the operator's attestation that
 		// the sandbox belongs to this host. Nothing can be defaulted
 		// without a record, so the shape and base disposition must be
-		// explicit, and the synthesized record carries no ownership or
-		// preview policy: the control plane re-establishes those before
-		// the row flips, and the default preview posture is private.
+		// explicit. Ownership uses the control plane's trusted marker;
+		// an omitted marker stays unknown. Preview defaults to private.
 		if !allowRecordless {
 			return nil, status.Errorf(codes.FailedPrecondition, "vm %s has no durable record on this host; revive only replaces known sandboxes (allow_recordless overrides with explicit shape and base)", vmID)
 		}
@@ -469,7 +468,7 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, 
 		inst.BackupGeneration = backupGeneration
 		seedRevivedRetainedDependencies(inst, prevRec)
 		inst.TeamID = prevRec.TeamID
-		inst.OwnerID = prevRec.OwnerID
+		restoreOwnershipFromRecord(inst, prevRec)
 		inst.PreviewAccess = prevRec.PreviewAccess
 		inst.PreviewPorts = previewPortsFromRecord(prevRec.PreviewPorts, prevRec.PreviewPortAccess, prevRec.PreviewPortTokenVersions)
 		inst.PreviewPolicyRevision = prevRec.PreviewPolicyRevision

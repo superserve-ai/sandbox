@@ -28,6 +28,7 @@ diff_args=(
   --exclude='template_build_execution.go'
   --exclude='template_build_input.go'
   --exclude='routing_records.go'
+  --exclude='machine_identity.go'
 )
 
 set +e

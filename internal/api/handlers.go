@@ -150,6 +150,10 @@ type HostRegistry interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
+	// MachineCredentials is optional until the compatible machine-identity
+	// rollout is deployed. When set, hosted QM credentials use the separate
+	// machine middleware and never become human actor IDs.
+	MachineCredentials    MachineCredentialResolver
 	ComputeRestrictions   *abuse.ComputeEvaluator
 	SignupRestrictions    *abuse.SignupEvaluator
 	VMD                   VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
@@ -770,8 +774,13 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			ID:     sandboxID,
 			TeamID: teamID,
 		})
+		caller, machine := machineCallerFromContext(c)
 		if err != nil {
-			if err == pgx.ErrNoRows {
+			if err == pgx.ErrNoRows && machine {
+				// Matches the ownership gate: a machine caller learns nothing
+				// about sandboxes it does not own.
+				respondError(c, ErrForbidden)
+			} else if err == pgx.ErrNoRows {
 				respondError(c, ErrSandboxNotFound)
 			} else {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxWithPreviewPolicy failed")
@@ -781,6 +790,11 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		}
 		sandbox := row.Sandbox
 		c.Set("routing_observed_at", row.RoutingObservedAt)
+		owner, ownerErr := cacheJoinedSandboxOwner(c, sandboxID, teamID, sandbox, row.MachineOwnershipPresent, row.MachineOwnerPrincipalID, row.MachineOwnerTeamID)
+		if machine && (ownerErr != nil || !machineOwnerMatches(caller, owner, sandboxID, teamID)) {
+			respondError(c, ErrForbidden)
+			return nil, ""
+		}
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
 			return &sandbox, row.Access
@@ -878,6 +892,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// establish a paused target, preserving missing/state responses and the
 	// existing pause-settle window without adding I/O to allowed resumes.
 	if decision.Outcome == "blocked" && settled != nil {
+		if !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
+			return "", false
+		}
 		tWait := time.Now()
 		paused := settled()
 		tStart = tStart.Add(time.Since(tWait))
@@ -902,7 +919,20 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		TeamID:  teamID,
 		LockKey: sandboxID.String(),
 	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		if caller.PrincipalID == uuid.Nil || caller.TeamID != teamID {
+			respondError(c, ErrForbidden)
+			return "", false
+		}
+		claimParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
+	}
 	claimed, err := h.DB.ClaimResume(c.Request.Context(), claimParams)
+	// Only a failed machine claim needs a second read to distinguish denied
+	// ownership from an owner's pause that is still settling. Do this before
+	// polling or exposing another principal's sandbox state.
+	if errors.Is(err, pgx.ErrNoRows) && claimParams.MachinePrincipalID.Valid && !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
+		return "", false
+	}
 	if err == pgx.ErrNoRows && settled != nil {
 		// The caller's wait is its lookup, not this claim.
 		tWait := time.Now()
@@ -944,6 +974,21 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}); err != nil {
 			l.Error().Err(err).Msg("RevertResumeToPaused failed — sandbox may be stuck in 'resuming'")
 		}
+	}
+
+	// The claim returns immutable ownership with the other boot inputs, so
+	// ordinary and machine restores do not pay for a separate authority read.
+	owner, ownerErr := cacheClaimedSandboxOwner(c, sandboxID, teamID, claimed)
+	if ownerErr != nil && !errors.Is(ownerErr, pgx.ErrNoRows) {
+		markRevert()
+		revertToPaused()
+		respondError(c, ErrInternal)
+		return "", false
+	}
+	if ownerErr == nil {
+		c.Set("restore_owner_id", "machine:"+owner.OwnerPrincipalID.String())
+	} else if actorIDFromContext(c) == nil {
+		c.Set("restore_owner_id", "ordinary:attested")
 	}
 
 	if !sandbox.SnapshotID.Valid {
@@ -1107,6 +1152,19 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			revertToPaused()
 			respondError(c, ErrInternal)
 			return "", false
+		}
+	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		if publisher, ok := vmd.(interface {
+			PublishSandboxOwnership(context.Context, string, uuid.UUID, uuid.UUID) error
+		}); ok {
+			if publishErr := publisher.PublishSandboxOwnership(c.Request.Context(), sandboxID.String(), caller.PrincipalID, teamID); publishErr != nil {
+				l.Error().Err(publishErr).Msg("publish machine sandbox ownership attestation after resume failed")
+				markRevert()
+				revertToPaused()
+				respondError(c, ErrInternal)
+				return "", false
+			}
 		}
 	}
 	tPostStart = time.Now()
@@ -1480,6 +1538,12 @@ func actorIDFromContext(c *gin.Context) *uuid.UUID {
 
 // ownerIDFromContext returns the actor's UUID as a string, or "" when unknown.
 func ownerIDFromContext(c *gin.Context) string {
+	if owner := c.GetString("restore_owner_id"); owner != "" {
+		return owner
+	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		return "machine:" + caller.PrincipalID.String()
+	}
 	if a := actorIDFromContext(c); a != nil {
 		return a.String()
 	}
@@ -1506,7 +1570,10 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 	if sandbox == nil {
 		return
 	}
-	resp := h.sandboxToResponseWithToken(*sandbox, c.GetTime("routing_observed_at"))
+	resp, ok := h.machineResponseForRequest(c, *sandbox, c.GetTime("routing_observed_at"))
+	if !ok {
+		return
+	}
 	resp.PreviewAccess = previewAccess
 	c.JSON(http.StatusOK, resp)
 }
@@ -1650,10 +1717,18 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		"id":     formatSandboxID(sandboxID),
 		"status": string(db.SandboxStatusActive),
 	}
+	if _, machine := machineCallerFromContext(c); machine && (h.Config == nil || h.Config.SandboxAccessTokenSeed == nil) {
+		respondErrorMsg(c, "machine_capability_unavailable", "machine capability unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
-		// The token HMAC stays keyed on the bare UUID: the proxy normalizes
-		// public IDs before verification.
-		resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
+		// The token HMAC stays keyed on the bare UUID for human sandboxes; a
+		// machine caller receives only a lineage-bound capability.
+		if machineResp, ok := h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at")); ok && machineResp.AccessToken != "" {
+			resp["access_token"] = machineResp.AccessToken
+		} else {
+			return
+		}
 		resp["routing_hint"] = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, sandboxID.String(), sandbox.HostID, h.Config.EdgeProxyDomain, c.GetTime("routing_observed_at"), sandbox.RoutingVersion)
 	}
 	c.JSON(http.StatusOK, resp)
@@ -2341,6 +2416,92 @@ func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox, observedAt time.Time
 	return resp
 }
 
+// sandboxResponseForRequest never emits a legacy sandbox-only token for a
+// machine-owned request.  Those tokens have no principal, lineage, scope, or
+// revocation generation and therefore cannot cross the machine boundary.
+func (h *Handlers) sandboxResponseForRequest(c *gin.Context, s db.Sandbox, observedAt time.Time) sandboxResponse {
+	resp := h.sandboxToResponse(s)
+	if caller, machine := machineCallerFromContext(c); machine {
+		if h.Config == nil || h.Config.SandboxAccessTokenSeed == nil {
+			return resp
+		}
+		if h.DB == nil {
+			return resp
+		}
+		owner, err := h.requestSandboxOwner(c, s.ID, caller.TeamID)
+		if err != nil || owner.OwnerPrincipalID != caller.PrincipalID || owner.TeamID != caller.TeamID {
+			// Ownership is authoritative durable state. A missing/unknown row is
+			// not ordinary ownership and must not produce a usable capability.
+			return resp
+		}
+		ownership := auth.SandboxOwnership{SandboxID: owner.SandboxID, OwnerPrincipalID: owner.OwnerPrincipalID, TeamID: owner.TeamID}
+		now := timeNow(h)
+		capability, err := auth.DeriveCapability(caller, ownership, s.ID, "sandbox-proxy", caller.Permissions, caller.ExpiresAt, now)
+		if err != nil {
+			return resp
+		}
+		token, err := auth.SignMachineCapability(capability, h.Config.SandboxAccessTokenSeed, now)
+		if err != nil {
+			return resp
+		}
+		resp.AccessToken = token
+		resp.RoutingHint = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, s.ID.String(), s.HostID, h.Config.EdgeProxyDomain, observedAt, s.RoutingVersion)
+		return resp
+	}
+	// Human/admin callers receive a typed child capability when the immutable
+	// owner relation proves this is a machine sandbox. A lookup error or
+	// unknown ownership never falls back to a legacy token.
+	if h.DB != nil && h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		if owner, err := h.requestSandboxOwner(c, s.ID, s.TeamID); err == nil {
+			if parentID, parseErr := uuid.Parse(c.GetString("api_key_id")); parseErr == nil && parentID != uuid.Nil && owner.TeamID == s.TeamID {
+				now := timeNow(h)
+				capability, capErr := auth.DeriveAPIKeyCapability(parentID, s.TeamID, s.ID, "sandbox-proxy", []auth.MachineOperation{
+					auth.MachineOperationRead, auth.MachineOperationReconnect,
+					auth.MachineOperationCommandRun, auth.MachineOperationCommandRead, auth.MachineOperationCommandWrite, auth.MachineOperationCommandSignal,
+					auth.MachineOperationFileRead, auth.MachineOperationFileWrite,
+					auth.TeamOperationDesktopRead, auth.TeamOperationDesktopWrite,
+				}, now.Add(15*time.Minute), c.GetTime("api_key_expires_at"), now)
+				if capErr == nil {
+					if token, signErr := auth.SignMachineCapability(capability, h.Config.SandboxAccessTokenSeed, now); signErr == nil {
+						resp.AccessToken = token
+						resp.RoutingHint = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, s.ID.String(), s.HostID, h.Config.EdgeProxyDomain, observedAt, s.RoutingVersion)
+						return resp
+					}
+				}
+			}
+			return resp
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return resp
+		}
+	}
+	if h.DB == nil {
+		return resp
+	}
+	return h.sandboxToResponseWithToken(s, observedAt)
+}
+
+// machineResponseForRequest makes capability derivation an explicit response
+// gate. A machine request must never receive a successful payload without a
+// reconnect capability when authority, ownership, signing, or audience data
+// is unavailable.
+func (h *Handlers) machineResponseForRequest(c *gin.Context, s db.Sandbox, observedAt time.Time) (sandboxResponse, bool) {
+	resp := h.sandboxResponseForRequest(c, s, observedAt)
+	if resp.AccessToken != "" {
+		return resp, true
+	}
+	if _, machine := machineCallerFromContext(c); machine {
+		respondErrorMsg(c, "machine_capability_unavailable", "machine capability unavailable", http.StatusServiceUnavailable)
+		return sandboxResponse{}, false
+	}
+	// Token-producing lifecycle calls must not succeed without the token when
+	// ownership could not be classified.
+	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
+		respondErrorMsg(c, "service_unavailable", "sandbox access token unavailable", http.StatusServiceUnavailable)
+		return sandboxResponse{}, false
+	}
+	return resp, true
+}
+
 // decodeMetadata unmarshals the jsonb bytes column into a string→string map.
 // On any decode error (which should be impossible because the column is
 // constrained to objects we wrote ourselves) we return an empty map rather
@@ -2432,6 +2593,11 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 	nameSearch := searchTerm(c.Query("q"))
 
 	ctx := c.Request.Context()
+	caller, machine := machineCallerFromContext(c)
+	if machine && pg.Limit == nil {
+		limit := int64(maxPageSize)
+		pg.Limit = &limit
+	}
 	// The default created_at sort is the hot path (and the only sort
 	// unpaginated SDK callers use), so it goes through the static-ORDER BY
 	// queries the planner can serve from idx_sandbox_team_created_active
@@ -2444,50 +2610,63 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		previewAccess string
 	}
 	var sandboxes []listRow
-	switch {
-	case pg.SortBy == "created_at" && pg.SortDir == "asc":
-		var rows []db.ListSandboxesByTeamCreatedAscRow
-		rows, err = h.DB.ListSandboxesByTeamCreatedAsc(ctx, db.ListSandboxesByTeamCreatedAscParams{
-			TeamID:     teamID,
-			Metadata:   metadataJSON,
-			Statuses:   statusFilter,
-			NameSearch: nameSearch,
-			RowOffset:  pg.Offset,
-			RowLimit:   pg.Limit,
+	if machine {
+		rows, ownerErr := h.DB.ListSandboxesByMachineOwner(ctx, db.ListSandboxesByMachineOwnerParams{
+			TeamID: teamID, OwnerPrincipalID: caller.PrincipalID, Metadata: metadataJSON,
+			Statuses: statusFilter, NameSearch: nameSearch, SortBy: pg.SortBy, SortDir: pg.SortDir,
+			RowOffset: pg.Offset, RowLimit: pg.Limit,
 		})
+		err = ownerErr
 		sandboxes = make([]listRow, len(rows))
 		for i, r := range rows {
 			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
 		}
-	case pg.SortBy == "created_at":
-		var rows []db.ListSandboxesByTeamCreatedDescRow
-		rows, err = h.DB.ListSandboxesByTeamCreatedDesc(ctx, db.ListSandboxesByTeamCreatedDescParams{
-			TeamID:     teamID,
-			Metadata:   metadataJSON,
-			Statuses:   statusFilter,
-			NameSearch: nameSearch,
-			RowOffset:  pg.Offset,
-			RowLimit:   pg.Limit,
-		})
-		sandboxes = make([]listRow, len(rows))
-		for i, r := range rows {
-			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
-		}
-	default:
-		var rows []db.ListSandboxesByTeamPagedRow
-		rows, err = h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
-			TeamID:     teamID,
-			Metadata:   metadataJSON,
-			Statuses:   statusFilter,
-			NameSearch: nameSearch,
-			SortBy:     pg.SortBy,
-			SortDir:    pg.SortDir,
-			RowOffset:  pg.Offset,
-			RowLimit:   pg.Limit,
-		})
-		sandboxes = make([]listRow, len(rows))
-		for i, r := range rows {
-			sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+	} else {
+		switch {
+		case pg.SortBy == "created_at" && pg.SortDir == "asc":
+			var rows []db.ListSandboxesByTeamCreatedAscRow
+			rows, err = h.DB.ListSandboxesByTeamCreatedAsc(ctx, db.ListSandboxesByTeamCreatedAscParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Statuses:   statusFilter,
+				NameSearch: nameSearch,
+				RowOffset:  pg.Offset,
+				RowLimit:   pg.Limit,
+			})
+			sandboxes = make([]listRow, len(rows))
+			for i, r := range rows {
+				sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+			}
+		case pg.SortBy == "created_at":
+			var rows []db.ListSandboxesByTeamCreatedDescRow
+			rows, err = h.DB.ListSandboxesByTeamCreatedDesc(ctx, db.ListSandboxesByTeamCreatedDescParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Statuses:   statusFilter,
+				NameSearch: nameSearch,
+				RowOffset:  pg.Offset,
+				RowLimit:   pg.Limit,
+			})
+			sandboxes = make([]listRow, len(rows))
+			for i, r := range rows {
+				sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+			}
+		default:
+			var rows []db.ListSandboxesByTeamPagedRow
+			rows, err = h.DB.ListSandboxesByTeamPaged(ctx, db.ListSandboxesByTeamPagedParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Statuses:   statusFilter,
+				NameSearch: nameSearch,
+				SortBy:     pg.SortBy,
+				SortDir:    pg.SortDir,
+				RowOffset:  pg.Offset,
+				RowLimit:   pg.Limit,
+			})
+			sandboxes = make([]listRow, len(rows))
+			for i, r := range rows {
+				sandboxes[i] = listRow{sandbox: r.Sandbox, previewAccess: r.PreviewAccess}
+			}
 		}
 	}
 	if err != nil {
@@ -2495,15 +2674,22 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-
-	total, err := resolveTotal(pg, len(sandboxes), func() (int64, error) {
-		return h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
-			TeamID:     teamID,
-			Metadata:   metadataJSON,
-			Statuses:   statusFilter,
-			NameSearch: nameSearch,
+	var total int64
+	if machine {
+		total, err = h.DB.CountSandboxesByMachineOwner(ctx, db.CountSandboxesByMachineOwnerParams{
+			TeamID: teamID, OwnerPrincipalID: caller.PrincipalID, Metadata: metadataJSON,
+			Statuses: statusFilter, NameSearch: nameSearch,
 		})
-	})
+	} else {
+		total, err = resolveTotal(pg, len(sandboxes), func() (int64, error) {
+			return h.DB.CountSandboxesByTeamPaged(ctx, db.CountSandboxesByTeamPagedParams{
+				TeamID:     teamID,
+				Metadata:   metadataJSON,
+				Statuses:   statusFilter,
+				NameSearch: nameSearch,
+			})
+		})
+	}
 	if err != nil {
 		log.Error().Err(err).Msg("DB CountSandboxesByTeamPaged failed")
 		respondError(c, ErrInternal)
@@ -2581,19 +2767,29 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	}
 	sandbox := row.Sandbox
 	c.Set("routing_observed_at", row.RoutingObservedAt)
+	_, _ = cacheJoinedSandboxOwner(c, sandboxID, teamID, sandbox, row.MachineOwnershipPresent, row.MachineOwnerPrincipalID, row.MachineOwnerTeamID)
 
 	resp := h.sandboxToResponse(sandbox)
 	resp.PreviewAccess = row.Access
-	canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
-	if permErr != nil {
-		log.Error().
-			Err(permErr).
-			Str("team_id", teamID.String()).
-			Str("sandbox_id", sandboxID.String()).
-			Msg("RBAC sandbox token permission check failed")
-	} else if canWrite {
-		resp = h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
+	if _, machine := machineCallerFromContext(c); machine {
+		var ok bool
+		resp, ok = h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
+		if !ok {
+			return
+		}
 		resp.PreviewAccess = row.Access
+	} else {
+		canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
+		if permErr != nil {
+			log.Error().
+				Err(permErr).
+				Str("team_id", teamID.String()).
+				Str("sandbox_id", sandboxID.String()).
+				Msg("RBAC sandbox token permission check failed")
+		} else if canWrite {
+			resp = h.sandboxResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
+			resp.PreviewAccess = row.Access
+		}
 	}
 	if !isConsoleImpersonation(c) {
 		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
@@ -2776,6 +2972,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "from_template and from_snapshot are mutually exclusive", http.StatusBadRequest)
 		return
 	}
+	if _, machine := machineCallerFromContext(c); machine && !machineCreateHeaders(c) {
+		return
+	}
 	// Nil is no snapshot's id, and below it means no snapshot was named.
 	var sourceSnapshotID uuid.UUID
 	if req.FromSnapshot != nil {
@@ -2785,6 +2984,33 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			return
 		}
 		sourceSnapshotID = id
+	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		// The control plane owns the resolved QM template.  Omitting
+		// from_template means "use that approved template", never the public
+		// default/alias path; an explicit value must be its stable UUID.
+		if req.FromTemplate == nil && caller.ApprovedTemplateID != nil {
+			approved := caller.ApprovedTemplateID.String()
+			req.FromTemplate = &approved
+		}
+		var templateID *uuid.UUID
+		if req.FromTemplate != nil {
+			id, parseErr := uuid.Parse(*req.FromTemplate)
+			if parseErr != nil {
+				respondErrorMsg(c, "forbidden", "machine template must be the approved resolved template", http.StatusForbidden)
+				return
+			}
+			templateID = &id
+		}
+		if err := auth.ValidateMachineCreate(caller, templateID, func() *uuid.UUID {
+			if sourceSnapshotID == uuid.Nil {
+				return nil
+			}
+			return &sourceSnapshotID
+		}(), len(req.Secrets)); err != nil {
+			respondErrorMsg(c, "forbidden", "machine sandbox creation is restricted to the approved template", http.StatusForbidden)
+			return
+		}
 	}
 
 	if err := validateTimeoutSeconds(req.TimeoutSeconds); err != nil {
@@ -2852,6 +3078,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
+		return
+	}
+	machineCaller, machineRequest := machineCallerFromContext(c)
+	if machineRequest && h.Pool == nil {
+		// Ownership must be committed with the machine sandbox row; a handler
+		// without a transaction-capable pool cannot safely create one.
+		respondErrorMsg(c, "service_unavailable", "machine sandbox creation is not available", http.StatusServiceUnavailable)
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
@@ -3134,9 +3367,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// any secret bindings in one statement. That keeps the legacy-public
 	// fallback unobservable for new sandboxes and leaves the quota admission's
 	// uncommitted window statement-sized (see the query comments).
-	insertWithBindings := func() (db.Sandbox, error) {
+	insertWithBindings := func(q *db.Queries) (db.Sandbox, error) {
 		if len(secretBindings) == 0 && sourceSnapshotID == uuid.Nil {
-			return runInsert(h.DB)
+			return runInsert(q)
 		}
 		secretIDs := make([]uuid.UUID, len(secretBindings))
 		envKeys := make([]string, len(secretBindings))
@@ -3148,7 +3381,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			proxyTokens[i] = secretMeta[i].ProxyToken
 		}
 		if sourceSnapshotID != uuid.Nil {
-			row, err := h.DB.CreateSandboxFromSnapshot(insertCtx, db.CreateSandboxFromSnapshotParams{
+			row, err := q.CreateSandboxFromSnapshot(insertCtx, db.CreateSandboxFromSnapshotParams{
 				SnapshotID:        sourceSnapshotID,
 				TeamID:            teamID,
 				ID:                sandboxID,
@@ -3167,7 +3400,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			return db.RoutingSandbox(row).Sandbox(), err
 		}
 		if templateID.Valid {
-			row, err := h.DB.CreateSandboxFromTemplateWithSecrets(insertCtx, db.CreateSandboxFromTemplateWithSecretsParams{
+			row, err := q.CreateSandboxFromTemplateWithSecrets(insertCtx, db.CreateSandboxFromTemplateWithSecretsParams{
 				TemplateID:        uuid.UUID(templateID.Bytes),
 				TeamID:            teamID,
 				SystemTeamID:      h.systemTeamID(),
@@ -3192,7 +3425,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			routingObservedAt = row.RoutingObservedAt
 			return db.RoutingSandbox(row).Sandbox(), err
 		}
-		row, err := h.DB.CreateSandboxWithSecrets(insertCtx, db.CreateSandboxWithSecretsParams{
+		row, err := q.CreateSandboxWithSecrets(insertCtx, db.CreateSandboxWithSecretsParams{
 			ID:                sandboxID,
 			TeamID:            teamID,
 			Name:              req.Name,
@@ -3216,7 +3449,37 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	go func() {
 		tInsertStart = time.Now()
 		// Quota is enforced by the sandbox_quota_on_insert trigger.
-		sb, err := insertWithBindings()
+		q := h.DB
+		var tx pgx.Tx
+		if machineRequest && h.Pool != nil {
+			var beginErr error
+			tx, beginErr = h.Pool.Begin(insertCtx)
+			if beginErr != nil {
+				insertCh <- insertResult{err: beginErr}
+				tInsertEnd = time.Now()
+				return
+			}
+			defer tx.Rollback(insertCtx)
+			q = h.DB.WithTx(tx)
+		}
+		sb, err := insertWithBindings(q)
+		if err == nil {
+			if machineRequest {
+				err = q.CreateMachineSandboxOwner(insertCtx, sb.ID, machineCaller.PrincipalID, teamID)
+			}
+		}
+		if err == nil && tx != nil {
+			err = tx.Commit(insertCtx)
+		}
+		if err == nil && machineRequest {
+			if publisher, ok := vmd.(interface {
+				PublishSandboxOwnership(context.Context, string, uuid.UUID, uuid.UUID) error
+			}); ok {
+				// Publication happens only after the sandbox/owner transaction
+				// commits; a failed attestation cannot yield a usable token.
+				err = publisher.PublishSandboxOwnership(insertCtx, sb.ID.String(), machineCaller.PrincipalID, teamID)
+			}
+		}
 		tInsertEnd = time.Now()
 		insertCh <- insertResult{sandbox: sb, err: err}
 	}()
@@ -3287,12 +3550,18 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		vmdErr                   error
 	)
 	if booted {
+		// This newly allocated ID is ordinary unless the authenticated create
+		// caller supplied machine authority. No creator identity is required.
+		createOwnerID := ownerIDFromContext(c)
+		if createOwnerID == "" {
+			createOwnerID = "ordinary:attested"
+		}
 		// Same shape the sandbox row is being inserted with (the image's, or
 		// the defaults) — declared so the daemon never has to ask Firecracker
 		// for it afterwards.
 		limits := vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID, Egress: restoreEgress}
 		ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr = retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
-			ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars, limits)
+			ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), createOwnerID, previewAccess, nil, 0, req.EnvVars, limits)
 			// A host that lost the snapshot's files boots its backup instead;
 			// the generation is kept so a retry adopts that boot.
 			if vmdclient.IsSavedSnapshotMissing(err) && limits.BackupGeneration == "" {
@@ -3304,7 +3573,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 					return ip, vcpu, memMiB, err
 				}
 				limits.BackupGeneration = gen
-				ip, vcpu, memMiB, protocol, applied, err = vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars, limits)
+				ip, vcpu, memMiB, protocol, applied, err = vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), createOwnerID, previewAccess, nil, 0, req.EnvVars, limits)
 			}
 			previewProtocol, rulesApplied = protocol, applied
 			return ip, vcpu, memMiB, err
@@ -3719,8 +3988,21 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	})
 
 	sandbox.Status = db.SandboxStatusActive
+	if machineRequest {
+		// The insertion result has joined, committed sandbox and ownership,
+		// and completed required VMD attestations. Reuse that immutable fact
+		// on this request goroutine instead of reading it back for the token.
+		owner := db.MachineSandboxOwnerRow{SandboxID: sandbox.ID, OwnerPrincipalID: machineCaller.PrincipalID, TeamID: teamID}
+		c.Set("machine_resource_owner", requestOwnerResult{sandboxID: sandbox.ID, teamID: teamID, owner: owner})
+	} else {
+		// A non-machine create never writes an owner row.
+		c.Set("machine_resource_owner", requestOwnerResult{sandboxID: sandbox.ID, teamID: teamID, err: pgx.ErrNoRows})
+	}
 	c.Set("routing_observed_at", routingObservedAt)
-	resp := h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
+	resp, ok := h.machineResponseForRequest(c, sandbox, c.GetTime("routing_observed_at"))
+	if !ok {
+		return
+	}
 	resp.PreviewAccess = previewAccess
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		// Echo the normalized rules, not the raw request, so the create
@@ -3809,13 +4091,21 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// names it in the row, in every host call, and as its backup token.
 	claimedAt := time.Now()
 	pauseOp := uuid.New()
-	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
+	pauseParams := db.BeginPauseParams{
 		ID:           sandboxID,
 		TeamID:       teamID,
 		PauseOpID:    pgtype.UUID{Bytes: pauseOp, Valid: true},
 		LeaseSeconds: pauseLeaseSeconds,
 		ActorID:      actorUUID(actorIDFromContext(c)),
-	})
+	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		if caller.PrincipalID == uuid.Nil || caller.TeamID != teamID {
+			respondError(c, ErrForbidden)
+			return
+		}
+		pauseParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
+	}
+	sandbox, err := h.DB.BeginPause(c.Request.Context(), pauseParams)
 	if err != nil && err != pgx.ErrNoRows {
 		// The reply may have been lost after the claim committed. The row then
 		// carries the operation this request minted, which nothing else can
@@ -3841,6 +4131,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		if err != pgx.ErrNoRows {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginPause failed")
 			respondError(c, ErrInternal)
+			return
+		}
+		// Only a failed machine claim reads ownership, before revealing state.
+		if pauseParams.MachinePrincipalID.Valid && !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
 			return
 		}
 		// Disambiguate: missing row (404) vs wrong state (409).

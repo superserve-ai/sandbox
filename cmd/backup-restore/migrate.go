@@ -25,6 +25,18 @@ import (
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
+// The immutable association is read in the existing batch, before publication.
+// Confirmed absence attests ordinary ownership without inventing a creator.
+const migrationShapesSQL = `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
+					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
+					s.snapshot_id::text,
+					COALESCE((SELECT sn.generation FROM snapshot sn WHERE sn.id = s.snapshot_id), 0)::bigint,
+					CASE WHEN mo.sandbox_id IS NULL THEN 'ordinary:attested'
+						WHEN mo.team_id = s.team_id THEN 'machine:' || mo.owner_principal_id::text
+						ELSE 'machine:' END
+				FROM sandbox s LEFT JOIN sandbox_machine_owner mo ON mo.sandbox_id = s.id
+				WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`
+
 // runMigrate moves paused sandboxes from one host to this one using the
 // filesystems a host restore materialized: for each sandbox it re-pins the
 // control-plane row here, cold-boots the restored disk through ReviveVM,
@@ -379,6 +391,7 @@ func runMigrate(args []string) int {
 	type shape struct {
 		vcpu, mem   int32
 		team        string
+		owner       string
 		origTimeout *int32
 		rules       egressRules
 		recorded    map[string]string
@@ -491,7 +504,7 @@ func runMigrate(args []string) int {
 					rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 					resp, err := vmd.ReviveVM(rctx, &vmdpb.ReviveVMRequest{
 						VmId: id, DiskPath: disk, BasePath: base, BlockMapPath: blockMap, StandaloneDisk: standalone, AllowRecordless: true,
-						TeamId: s.team, Vcpu: uint32(s.vcpu), MemMib: uint32(s.mem),
+						TeamId: s.team, OwnerId: s.owner, Vcpu: uint32(s.vcpu), MemMib: uint32(s.mem),
 						AllowedCidrs: s.rules.allowedCIDRs, DeniedCidrs: s.rules.deniedCIDRs, AllowedDomains: s.rules.allowedDomains,
 					})
 					cancel()
@@ -745,11 +758,7 @@ func runMigrate(args []string) int {
 			batch := queue[:n]
 			queue = queue[n:]
 			shapes := map[string]shape{}
-			sq, err := conn.Query(ctx, `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
-					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
-					s.snapshot_id::text,
-					COALESCE((SELECT sn.generation FROM snapshot sn WHERE sn.id = s.snapshot_id), 0)::bigint
-				FROM sandbox s WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
+			sq, err := conn.Query(ctx, migrationShapesSQL, batch, *fromHost)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 				return 1
@@ -758,7 +767,7 @@ func runMigrate(args []string) int {
 				var id, recorded string
 				var s shape
 				var raw []byte
-				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID, &s.generation); err != nil {
+				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID, &s.generation, &s.owner); err != nil {
 					sq.Close()
 					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 					return 1

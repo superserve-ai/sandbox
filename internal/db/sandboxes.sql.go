@@ -159,6 +159,11 @@ WITH paused AS (
     AND sandbox.team_id = $6
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
+    -- A machine caller may pause only a sandbox its principal owns.
+    AND ($7::uuid IS NULL
+         OR EXISTS (SELECT 1 FROM sandbox_machine_owner mo
+                    WHERE mo.sandbox_id = sandbox.id AND mo.team_id = sandbox.team_id
+                      AND mo.owner_principal_id = $7::uuid))
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
 ),
 closed_interval AS (
@@ -181,12 +186,13 @@ LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
 
 type BeginPauseParams struct {
-	PauseOpID    pgtype.UUID `json:"pause_op_id"`
-	LeaseSeconds int32       `json:"lease_seconds"`
-	Trigger      *string     `json:"trigger"`
-	ActorID      pgtype.UUID `json:"actor_id"`
-	ID           uuid.UUID   `json:"id"`
-	TeamID       uuid.UUID   `json:"team_id"`
+	PauseOpID          pgtype.UUID `json:"pause_op_id"`
+	LeaseSeconds       int32       `json:"lease_seconds"`
+	Trigger            *string     `json:"trigger"`
+	ActorID            pgtype.UUID `json:"actor_id"`
+	ID                 uuid.UUID   `json:"id"`
+	TeamID             uuid.UUID   `json:"team_id"`
+	MachinePrincipalID pgtype.UUID `json:"machine_principal_id"`
 }
 
 type BeginPauseRow struct {
@@ -249,6 +255,7 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 		arg.ActorID,
 		arg.ID,
 		arg.TeamID,
+		arg.MachinePrincipalID,
 	)
 	var i BeginPauseRow
 	err := row.Scan(
@@ -776,8 +783,8 @@ const claimResume = `-- name: ClaimResume :one
 UPDATE sandbox
 SET status = 'resuming', updated_at = now()
 FROM (
-  SELECT $1::uuid AS id
-  FROM (SELECT pg_advisory_xact_lock(hashtext($2::text)::bigint)) locked
+  SELECT $2::uuid AS id
+  FROM (SELECT pg_advisory_xact_lock(hashtext($3::text)::bigint)) locked
 ) lk, (
   SELECT sb.id,
          s.path AS snap_path,
@@ -789,11 +796,15 @@ FROM (
          COALESCE(pp.ports, '{}')::int[] AS port_numbers,
          COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
          COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
-         t.base_path AS template_base_path
+         t.base_path AS template_base_path,
+         (mo.sandbox_id IS NOT NULL)::boolean AS machine_ownership_present,
+         mo.owner_principal_id AS machine_owner_principal_id,
+         mo.team_id AS machine_owner_team_id
   FROM sandbox sb
   LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
   LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
   LEFT JOIN template t ON t.id = sb.template_id
+  LEFT JOIN sandbox_machine_owner mo ON mo.sandbox_id = sb.id
   LEFT JOIN LATERAL (
     SELECT array_agg(pp.port ORDER BY pp.port) AS ports,
            array_agg(pp.access ORDER BY pp.port) AS accesses,
@@ -803,40 +814,49 @@ FROM (
       ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
     WHERE pp.sandbox_id = sb.id AND g.token_version > 0
   ) pp ON true
-  WHERE sb.id = $1 AND sb.team_id = $3
+  WHERE sb.id = $2 AND sb.team_id = $4
 ) x
 WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+  AND ($1::uuid IS NULL
+       OR (x.machine_owner_principal_id = $1
+           AND x.machine_owner_team_id = sandbox.team_id))
 RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.failed_at, sandbox.had_secret_bindings, sandbox.secret_env_fingerprint, sandbox.secret_env_ip, sandbox.secret_env_injected_at, sandbox.secret_env_expires_at, sandbox.pause_op_id, sandbox.pause_op_started_at, sandbox.pause_op_lease_until, sandbox.pause_op_lease_version, sandbox.pause_op_attention_at, sandbox.pause_op_trigger, sandbox.pause_op_actor_id, sandbox.routing_version, sandbox.source_snapshot_id,
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path, statement_timestamp()::timestamptz AS routing_observed_at
+          x.template_base_path, statement_timestamp()::timestamptz AS routing_observed_at,
+          x.machine_ownership_present, x.machine_owner_principal_id, x.machine_owner_team_id
 `
 
 type ClaimResumeParams struct {
-	ID      uuid.UUID `json:"id"`
-	LockKey string    `json:"lock_key"`
-	TeamID  uuid.UUID `json:"team_id"`
+	MachinePrincipalID pgtype.UUID `json:"machine_principal_id"`
+	ID                 uuid.UUID   `json:"id"`
+	LockKey            string      `json:"lock_key"`
+	TeamID             uuid.UUID   `json:"team_id"`
 }
 
 type ClaimResumeRow struct {
-	Sandbox           Sandbox            `json:"sandbox"`
-	SnapPath          *string            `json:"snap_path"`
-	SnapMemPath       *string            `json:"snap_mem_path"`
-	SnapCreatedAt     pgtype.Timestamptz `json:"snap_created_at"`
-	Access            string             `json:"access"`
-	WireAccess        string             `json:"wire_access"`
-	Revision          int64              `json:"revision"`
-	PortNumbers       []int32            `json:"port_numbers"`
-	PortAccesses      []string           `json:"port_accesses"`
-	PortTokenVersions []int64            `json:"port_token_versions"`
-	TemplateBasePath  *string            `json:"template_base_path"`
-	RoutingObservedAt time.Time          `json:"routing_observed_at"`
+	Sandbox                 Sandbox            `json:"sandbox"`
+	SnapPath                *string            `json:"snap_path"`
+	SnapMemPath             *string            `json:"snap_mem_path"`
+	SnapCreatedAt           pgtype.Timestamptz `json:"snap_created_at"`
+	Access                  string             `json:"access"`
+	WireAccess              string             `json:"wire_access"`
+	Revision                int64              `json:"revision"`
+	PortNumbers             []int32            `json:"port_numbers"`
+	PortAccesses            []string           `json:"port_accesses"`
+	PortTokenVersions       []int64            `json:"port_token_versions"`
+	TemplateBasePath        *string            `json:"template_base_path"`
+	RoutingObservedAt       time.Time          `json:"routing_observed_at"`
+	MachineOwnershipPresent bool               `json:"machine_ownership_present"`
+	MachineOwnerPrincipalID pgtype.UUID        `json:"machine_owner_principal_id"`
+	MachineOwnerTeamID      pgtype.UUID        `json:"machine_owner_team_id"`
 }
 
 // The paused→resuming claim plus the boot inputs in one round trip:
-// snapshot paths, preview policy with published ports, template base path.
+// snapshot paths, preview policy with published ports, template base path,
+// and immutable machine ownership.
 // The advisory lock is the one attach/detach take before re-reading
 // status; held to statement end, so the returned row already reflects a
 // binding mutation that beat the claim. It rides a FROM item joined on
@@ -846,9 +866,15 @@ type ClaimResumeRow struct {
 // The auto-delete deadline stays on the row: the reaper acts on paused rows
 // only, a failed resume returns the row to paused with the deadline it had,
 // and activation clears it.
-// 0 rows: not paused, or another resume claimed it.
+// A machine caller supplies its principal so the claim itself enforces ownership.
+// 0 rows: owner mismatch, not paused, or another resume claimed it.
 func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
-	row := q.db.QueryRow(ctx, claimResume, arg.ID, arg.LockKey, arg.TeamID)
+	row := q.db.QueryRow(ctx, claimResume,
+		arg.MachinePrincipalID,
+		arg.ID,
+		arg.LockKey,
+		arg.TeamID,
+	)
 	var i ClaimResumeRow
 	err := row.Scan(
 		&i.Sandbox.ID,
@@ -901,6 +927,9 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.PortTokenVersions,
 		&i.TemplateBasePath,
 		&i.RoutingObservedAt,
+		&i.MachineOwnershipPresent,
+		&i.MachineOwnerPrincipalID,
+		&i.MachineOwnerTeamID,
 	)
 	return i, err
 }
@@ -941,6 +970,40 @@ SELECT (
 // dir is safe to GC.
 func (q *Queries) CountActiveSandboxesAtBasePath(ctx context.Context, basePath *string) (int64, error) {
 	row := q.db.QueryRow(ctx, countActiveSandboxesAtBasePath, basePath)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countSandboxesByMachineOwner = `-- name: CountSandboxesByMachineOwner :one
+SELECT COUNT(*)::bigint
+FROM sandbox s
+JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
+WHERE s.team_id = $1
+  AND o.owner_principal_id = $2
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $3
+  AND ($4::sandbox_status[] IS NULL OR s.status = ANY($4::sandbox_status[]))
+  AND ($5::text IS NULL
+       OR s.name ILIKE '%' || $5::text || '%')
+`
+
+type CountSandboxesByMachineOwnerParams struct {
+	TeamID           uuid.UUID       `json:"team_id"`
+	OwnerPrincipalID uuid.UUID       `json:"owner_principal_id"`
+	Metadata         []byte          `json:"metadata"`
+	Statuses         []SandboxStatus `json:"statuses"`
+	NameSearch       *string         `json:"name_search"`
+}
+
+func (q *Queries) CountSandboxesByMachineOwner(ctx context.Context, arg CountSandboxesByMachineOwnerParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countSandboxesByMachineOwner,
+		arg.TeamID,
+		arg.OwnerPrincipalID,
+		arg.Metadata,
+		arg.Statuses,
+		arg.NameSearch,
+	)
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
@@ -2890,6 +2953,121 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 	for rows.Next() {
 		var i ListSandboxesByHostRow
 		if err := rows.Scan(&i.ID, &i.Status, &i.SnapshotID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSandboxesByMachineOwner = `-- name: ListSandboxesByMachineOwner :many
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id,
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
+FROM sandbox s
+JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1
+  AND o.owner_principal_id = $2
+  AND s.destroyed_at IS NULL
+  AND s.metadata @> $3
+  AND ($4::sandbox_status[] IS NULL OR s.status = ANY($4::sandbox_status[]))
+  AND ($5::text IS NULL
+       OR s.name ILIKE '%' || $5::text || '%')
+ORDER BY
+  CASE WHEN $6::text = 'name' AND $7::text = 'asc' THEN s.name END ASC,
+  CASE WHEN $6::text = 'name' AND $7::text = 'desc' THEN s.name END DESC,
+  CASE WHEN $6::text = 'status' AND $7::text = 'asc' THEN s.status::text END ASC,
+  CASE WHEN $6::text = 'status' AND $7::text = 'desc' THEN s.status::text END DESC,
+  CASE WHEN $6::text = 'created_at' AND $7::text = 'asc' THEN s.created_at END ASC,
+  s.created_at DESC
+LIMIT $9::bigint
+OFFSET COALESCE($8::bigint, 0)
+`
+
+type ListSandboxesByMachineOwnerParams struct {
+	TeamID           uuid.UUID       `json:"team_id"`
+	OwnerPrincipalID uuid.UUID       `json:"owner_principal_id"`
+	Metadata         []byte          `json:"metadata"`
+	Statuses         []SandboxStatus `json:"statuses"`
+	NameSearch       *string         `json:"name_search"`
+	SortBy           string          `json:"sort_by"`
+	SortDir          string          `json:"sort_dir"`
+	RowOffset        *int64          `json:"row_offset"`
+	RowLimit         *int64          `json:"row_limit"`
+}
+
+type ListSandboxesByMachineOwnerRow struct {
+	Sandbox       Sandbox `json:"sandbox"`
+	PreviewAccess string  `json:"preview_access"`
+}
+
+// Machine callers query their owner relation before pagination. This keeps
+// page contents, totals, and work bounded by the requested page rather than
+// materializing every historical ownership row in the handler.
+func (q *Queries) ListSandboxesByMachineOwner(ctx context.Context, arg ListSandboxesByMachineOwnerParams) ([]ListSandboxesByMachineOwnerRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxesByMachineOwner,
+		arg.TeamID,
+		arg.OwnerPrincipalID,
+		arg.Metadata,
+		arg.Statuses,
+		arg.NameSearch,
+		arg.SortBy,
+		arg.SortDir,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxesByMachineOwnerRow{}
+	for rows.Next() {
+		var i ListSandboxesByMachineOwnerRow
+		if err := rows.Scan(
+			&i.Sandbox.ID,
+			&i.Sandbox.TeamID,
+			&i.Sandbox.Name,
+			&i.Sandbox.Status,
+			&i.Sandbox.VcpuCount,
+			&i.Sandbox.MemoryMib,
+			&i.Sandbox.HostID,
+			&i.Sandbox.IpAddress,
+			&i.Sandbox.Pid,
+			&i.Sandbox.SnapshotID,
+			&i.Sandbox.CreatedAt,
+			&i.Sandbox.UpdatedAt,
+			&i.Sandbox.DestroyedAt,
+			&i.Sandbox.NetworkConfig,
+			&i.Sandbox.TimeoutSeconds,
+			&i.Sandbox.Metadata,
+			&i.Sandbox.TemplateID,
+			&i.Sandbox.SnapshotPath,
+			&i.Sandbox.MemPath,
+			&i.Sandbox.BasePath,
+			&i.Sandbox.DeltaPath,
+			&i.Sandbox.DiskMib,
+			&i.Sandbox.AutoDeleteSeconds,
+			&i.Sandbox.AutoDeleteAt,
+			&i.Sandbox.FailedAt,
+			&i.Sandbox.HadSecretBindings,
+			&i.Sandbox.SecretEnvFingerprint,
+			&i.Sandbox.SecretEnvIp,
+			&i.Sandbox.SecretEnvInjectedAt,
+			&i.Sandbox.SecretEnvExpiresAt,
+			&i.Sandbox.PauseOpID,
+			&i.Sandbox.PauseOpStartedAt,
+			&i.Sandbox.PauseOpLeaseUntil,
+			&i.Sandbox.PauseOpLeaseVersion,
+			&i.Sandbox.PauseOpAttentionAt,
+			&i.Sandbox.PauseOpTrigger,
+			&i.Sandbox.PauseOpActorID,
+			&i.Sandbox.RoutingVersion,
+			&i.Sandbox.SourceSnapshotID,
+			&i.PreviewAccess,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

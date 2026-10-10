@@ -209,6 +209,29 @@ func run() error {
 	queries := dbq.New(dbPool)
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
+	// Machine identity is enabled only after the durable authority schema is
+	// present. This is the executable issuance/readiness gate for mixed-version
+	// rollouts; an unavailable authority fails closed instead of falling back to
+	// human API-key authentication.
+	machineAuthority := api.NewDBMachineAuthority(queries)
+	if err := machineAuthority.Ready(ctx); err != nil {
+		log.Warn().Err(err).Msg("machine identity authority is not ready; hosted issuance remains disabled")
+	} else {
+		// Issuance remains disabled until the deployment owner supplies all
+		// explicit compatibility/readiness predicates. Table existence alone is
+		// not an activation signal.
+		machineAuthority.SetEligibility(api.AuthorityEligibility{
+			ContractRevision:      os.Getenv("QM_MACHINE_AUTH_CONTRACT_REVISION"),
+			Environment:           os.Getenv("QM_MACHINE_AUTH_ENVIRONMENT"),
+			ConfiguredEnvironment: os.Getenv("QM_MACHINE_AUTH_CONFIGURED_ENVIRONMENT"),
+			SchemaReady:           true,
+			OwnershipReady:        os.Getenv("QM_MACHINE_AUTH_OWNERSHIP_READY") == "true",
+			VerifierReady:         os.Getenv("QM_MACHINE_AUTH_VERIFIER_READY") == "true",
+			OperatorReady:         os.Getenv("QM_MACHINE_AUTH_OPERATOR_READY") == "true",
+		})
+		machineAuthority.Enable()
+	}
+	handlers.MachineCredentials = machineAuthority
 	if apiKey, from := os.Getenv("RESEND_API_KEY"), os.Getenv("QUOTA_EMAIL_FROM"); apiKey != "" && from != "" {
 		handlers.TrialWarningSender = api.NewResendTrialCreditWarningSender(apiKey, from, queries)
 	}
