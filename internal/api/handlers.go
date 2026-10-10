@@ -774,8 +774,13 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			ID:     sandboxID,
 			TeamID: teamID,
 		})
+		caller, machine := machineCallerFromContext(c)
 		if err != nil {
-			if err == pgx.ErrNoRows {
+			if err == pgx.ErrNoRows && machine {
+				// Matches the ownership gate: a machine caller learns nothing
+				// about sandboxes it does not own.
+				respondError(c, ErrForbidden)
+			} else if err == pgx.ErrNoRows {
 				respondError(c, ErrSandboxNotFound)
 			} else {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxWithPreviewPolicy failed")
@@ -785,9 +790,13 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		}
 		sandbox := row.Sandbox
 		c.Set("routing_observed_at", row.RoutingObservedAt)
+		owner, ownerErr := cacheJoinedSandboxOwner(c, sandboxID, teamID, sandbox, row.MachineOwnershipPresent, row.MachineOwnerPrincipalID, row.MachineOwnerTeamID)
+		if machine && (ownerErr != nil || !machineOwnerMatches(caller, owner, sandboxID, teamID)) {
+			respondError(c, ErrForbidden)
+			return nil, ""
+		}
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
-			_, _ = cacheJoinedSandboxOwner(c, sandboxID, teamID, sandbox, row.MachineOwnershipPresent, row.MachineOwnerPrincipalID, row.MachineOwnerTeamID)
 			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
 			// The resume returns the post-restore access it pushed to VMD, so
