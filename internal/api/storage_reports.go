@@ -23,6 +23,7 @@ import (
 const (
 	storageReportBatchSize          = 32
 	storageReportChunkSize          = 500
+	storageReportChunksPerClaim     = 20
 	storageReportPoll               = 5 * time.Second
 	storageReportMaxAttempts        = 8
 	storageReportHandoffMaxAttempts = 8
@@ -528,24 +529,45 @@ func processOneStorageReport(ctx context.Context, pool *pgxpool.Pool) bool {
 		return false
 	}
 
-	var measurements []storageReportMeasurement
-	if err := json.Unmarshal(payload, &measurements); err != nil {
-		return finishStorageReport(ctx, pool, hostID, incarnationID, reportID, processingGeneration, fmt.Errorf("%w: decode payload: %v", errStorageReportInvalidPayload, err), true)
-	}
-	if nextIndex > len(measurements) {
-		return finishStorageReport(ctx, pool, hostID, incarnationID, reportID, processingGeneration, errStorageReportInvalidPayload, true)
-	}
-	end := nextIndex + storageReportChunkSize
-	if end > len(measurements) {
-		end = len(measurements)
-	}
-	if err := applyStorageReport(ctx, pool, hostID, incarnationID, reportID, processingGeneration, receivedAt, measurements[nextIndex:end], end, len(measurements)); err != nil {
+	err = applyStorageReportPayload(ctx, payload, nextIndex, func(measurements []storageReportMeasurement, end, total int, keepProcessing bool) error {
+		return applyStorageReportChunk(ctx, pool, hostID, incarnationID, reportID, processingGeneration, receivedAt, measurements, end, total, keepProcessing)
+	})
+	if err != nil {
 		return finishStorageReport(ctx, pool, hostID, incarnationID, reportID, processingGeneration, err, storageReportErrorIsTerminal(err))
 	}
 	return true
 }
 
+func applyStorageReportPayload(ctx context.Context, payload []byte, nextIndex int, apply func([]storageReportMeasurement, int, int, bool) error) error {
+	var measurements []storageReportMeasurement
+	if err := json.Unmarshal(payload, &measurements); err != nil {
+		return fmt.Errorf("%w: decode payload: %v", errStorageReportInvalidPayload, err)
+	}
+	if nextIndex < 0 || nextIndex > len(measurements) {
+		return errStorageReportInvalidPayload
+	}
+	for chunk := 0; chunk < storageReportChunksPerClaim; chunk++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := min(nextIndex+storageReportChunkSize, len(measurements))
+		keepProcessing := end < len(measurements) && chunk+1 < storageReportChunksPerClaim
+		if err := apply(measurements[nextIndex:end], end, len(measurements), keepProcessing); err != nil {
+			return err
+		}
+		if !keepProcessing {
+			return nil
+		}
+		nextIndex = end
+	}
+	return nil
+}
+
 func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, incarnationID, reportID uuid.UUID, processingGeneration int64, receivedAt time.Time, measurements []storageReportMeasurement, nextIndex, totalMeasurements int) error {
+	return applyStorageReportChunk(ctx, pool, hostID, incarnationID, reportID, processingGeneration, receivedAt, measurements, nextIndex, totalMeasurements, false)
+}
+
+func applyStorageReportChunk(ctx context.Context, pool *pgxpool.Pool, hostID string, incarnationID, reportID uuid.UUID, processingGeneration int64, receivedAt time.Time, measurements []storageReportMeasurement, nextIndex, totalMeasurements int, keepProcessing bool) error {
 	// The chunk holds sandbox rows shared with lifecycle mutations. Bound its
 	// total lifetime as well as individual lock waits; a timed-out chunk retries.
 	ctx, cancel := context.WithTimeout(ctx, storageReportChunkTimeout)
@@ -716,6 +738,11 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 	// corresponding report progress. The generation fences a worker whose
 	// expired lease was claimed again, even if the new owner is processing.
 	state := "pending"
+	if keepProcessing {
+		// Keep ownership between chunks and refresh the reclaim clock atomically
+		// with progress. Only the last chunk in a bounded claim yields the row.
+		state = "processing"
+	}
 	if nextIndex == totalMeasurements {
 		state = "processed"
 	}
@@ -758,9 +785,9 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 		var tag pgconn.CommandTag
 		tag, progressErr = tx.Exec(ctx, `
 			UPDATE host_storage_report
-			SET state='pending', next_measurement_index=$4, next_attempt_at=now(), last_error=NULL
+			SET state=$6, next_measurement_index=$4, next_attempt_at=now(), last_error=NULL
 			WHERE host_id=$1 AND incarnation_id=$2 AND report_id=$3 AND state='processing'
-			  AND processing_generation=$5`, hostID, incarnationID, reportID, nextIndex, processingGeneration)
+			  AND processing_generation=$5`, hostID, incarnationID, reportID, nextIndex, processingGeneration, state)
 		progressRows = tag.RowsAffected()
 	}
 	if progressErr != nil {
