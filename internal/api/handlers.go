@@ -4091,13 +4091,21 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// names it in the row, in every host call, and as its backup token.
 	claimedAt := time.Now()
 	pauseOp := uuid.New()
-	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
+	pauseParams := db.BeginPauseParams{
 		ID:           sandboxID,
 		TeamID:       teamID,
 		PauseOpID:    pgtype.UUID{Bytes: pauseOp, Valid: true},
 		LeaseSeconds: pauseLeaseSeconds,
 		ActorID:      actorUUID(actorIDFromContext(c)),
-	})
+	}
+	if caller, machine := machineCallerFromContext(c); machine {
+		if caller.PrincipalID == uuid.Nil || caller.TeamID != teamID {
+			respondError(c, ErrForbidden)
+			return
+		}
+		pauseParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
+	}
+	sandbox, err := h.DB.BeginPause(c.Request.Context(), pauseParams)
 	if err != nil && err != pgx.ErrNoRows {
 		// The reply may have been lost after the claim committed. The row then
 		// carries the operation this request minted, which nothing else can
@@ -4123,6 +4131,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		if err != pgx.ErrNoRows {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginPause failed")
 			respondError(c, ErrInternal)
+			return
+		}
+		// Only a failed machine claim reads ownership, before revealing state.
+		if pauseParams.MachinePrincipalID.Valid && !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
 			return
 		}
 		// Disambiguate: missing row (404) vs wrong state (409).

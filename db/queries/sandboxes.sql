@@ -592,6 +592,11 @@ WITH paused AS (
     AND sandbox.team_id = sqlc.arg(team_id)
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
+    -- A machine caller may pause only a sandbox its principal owns.
+    AND (sqlc.narg('machine_principal_id')::uuid IS NULL
+         OR EXISTS (SELECT 1 FROM sandbox_machine_owner mo
+                    WHERE mo.sandbox_id = sandbox.id AND mo.team_id = sandbox.team_id
+                      AND mo.owner_principal_id = sqlc.narg('machine_principal_id')::uuid))
   RETURNING *
 ),
 closed_interval AS (

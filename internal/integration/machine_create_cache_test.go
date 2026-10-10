@@ -30,7 +30,7 @@ type createCacheDB struct {
 }
 
 func (d *createCacheDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	if strings.Contains(sql, "FROM sandbox_machine_owner") {
+	if strings.Contains(sql, "owner_principal_id,team_id FROM sandbox_machine_owner WHERE") {
 		d.ownerReads.Add(1)
 		return createCacheErrorRow{}
 	}

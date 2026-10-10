@@ -29,7 +29,7 @@ type boundaryOwnerDB struct {
 }
 
 func (d *boundaryOwnerDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
-	if strings.Contains(query, "FROM sandbox_machine_owner") {
+	if strings.Contains(query, "owner_principal_id,team_id FROM sandbox_machine_owner WHERE") {
 		d.reads++
 		return &mockRow{scanFn: func(dest ...any) error {
 			if d.failure != nil {
