@@ -53,9 +53,6 @@ type BuildSupervisorConfig struct {
 	// per-team limits would allow it.
 	GlobalMaxConcurrentBuilds int32
 
-	// HostID scopes the legacy orphan reconciler; new dispatch uses Cell.
-	HostID string
-
 	// PendingTimeout is how long a build can wait in 'pending' before it's
 	// reaped as failed. Pending now only covers "waiting for the next
 	// supervisor tick to dispatch" — concurrency limits are enforced at
@@ -80,18 +77,17 @@ type BuildSupervisorConfig struct {
 	// 0 disables it (used by tests).
 	ReconcileInterval time.Duration
 
-	// MaxDeletesPerReconcile bounds per-tick deletion I/O; the remainder
-	// is picked up next tick. 0 means unbounded (used by tests).
+	// MaxDeletesPerReconcile bounds each host's per-tick deletion I/O; the
+	// remainder is picked up next tick. 0 means unbounded (used by tests).
 	MaxDeletesPerReconcile int
 }
 
 // DefaultBuildSupervisorConfig returns sensible defaults.
-func DefaultBuildSupervisorConfig(hostID string) BuildSupervisorConfig {
+func DefaultBuildSupervisorConfig() BuildSupervisorConfig {
 	return BuildSupervisorConfig{
 		Interval:                  1 * time.Second,
 		BatchSize:                 20,
 		GlobalMaxConcurrentBuilds: 10,
-		HostID:                    hostID,
 		PendingTimeout:            2 * time.Minute,
 		BuildTimeout:              30 * time.Minute,
 		RegisterGrace:             60 * time.Second,
@@ -124,6 +120,10 @@ type BuildSupervisor struct {
 	log        zerolog.Logger
 	analytics  *analytics.Client   // when set, emits build-outcome events; nil is a no-op
 	onFinalize func(tpl uuid.UUID) // when set, runs after a build lands new template paths; nil is a no-op
+
+	// reconcileOffset is where the next orphan-reconcile pass starts walking
+	// the cell's hosts. Owned by the single reconcile goroutine.
+	reconcileOffset int
 }
 
 // WithPublicationStore enables durable generation recovery after producer loss.
@@ -211,7 +211,7 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 		Dur("interval", s.cfg.Interval).
 		Int32("batch_size", s.cfg.BatchSize).
 		Int32("global_max_concurrent", s.cfg.GlobalMaxConcurrentBuilds).
-		Str("host_id", s.cfg.HostID).
+		Str("cell", s.cfg.Cell).
 		Msg("build supervisor started")
 
 	ticker := time.NewTicker(s.cfg.Interval)
@@ -563,30 +563,147 @@ func (s *BuildSupervisor) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// reconcileOrphanBuilds diffs vmd's disk against the DB live set; the
-// snapshot-time guard prevents racing with builds started mid-run.
+const (
+	// Long enough that one pass over the cell's hosts cannot let a second
+	// replica in behind the holder, short enough that a crashed one is
+	// replaced within a couple of intervals.
+	reconcileLeaseSeconds = 600
+
+	// A daemon that accepts the connection and then stalls would otherwise
+	// hold the pass on the process-lifetime context, and every replica that
+	// inherits the lease after it expires would stall on the same host, so
+	// each host gets a bounded slice and the pass as a whole stays inside
+	// the lease that makes it the only one running.
+	reconcileHostTimeout = 60 * time.Second
+	reconcilePassTimeout = (reconcileLeaseSeconds / 2) * time.Second
+)
+
+// reconcileOrphanBuilds diffs each producer host's disk against the DB live
+// set; the snapshot-time guard prevents racing with builds started mid-run.
+//
+// One replica reconciles per tick. Run by every replica this would send the
+// same deletions to the same vmd, which holds its build registry lock while
+// it scans and unlinks, so the duplicates would serialize build operations
+// for no gain.
 func (s *BuildSupervisor) reconcileOrphanBuilds(ctx context.Context) {
+	// A registry holding more than one region's hosts must not have one
+	// cell's supervisor walking another's disks.
+	if s.cfg.Cell == "" {
+		return
+	}
+	if _, err := s.q.ClaimSweepLease(ctx, db.ClaimSweepLeaseParams{
+		Name: "build-artifact-reconcile:" + s.cfg.Cell, LockedBy: db.SweepHolderID(),
+		LeaseSeconds: reconcileLeaseSeconds,
+	}); err != nil {
+		// No row means another replica holds the lease: this tick is theirs.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			s.log.Warn().Err(err).Msg("reconcile: claim lease")
+		}
+		return
+	}
+
+	passCtx, cancel := context.WithTimeout(ctx, reconcilePassTimeout)
+	defer cancel()
+
 	snapshotTime := time.Now()
-	live, err := s.collectLiveBuildKeys(ctx)
+	// Attempt vm ids are unique per attempt, so one live set is correct for
+	// every host and is collected once rather than per host.
+	live, err := s.collectLiveBuildKeys(passCtx)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("reconcile: collect live set")
 		return
 	}
 
-	vmd, err := s.resolve(ctx, s.cfg.HostID)
+	hosts, err := s.reconcileHosts(passCtx)
 	if err != nil {
-		s.log.Warn().Err(err).Str("host_id", s.cfg.HostID).Msg("reconcile: resolve vmd")
+		s.log.Warn().Err(err).Msg("reconcile: list hosts")
+		return
+	}
+	s.reconcileRotatedPass(passCtx, hosts, live, snapshotTime, reconcileHostTimeout)
+}
+
+// reconcileRotatedPass resumes the walk where the last one was cut off. Hosts
+// come back in a stable order, so a prefix slow enough to exhaust the pass
+// deadline would otherwise consume every pass and the hosts behind it would
+// never be reclaimed.
+func (s *BuildSupervisor) reconcileRotatedPass(ctx context.Context, hosts []string, live map[string]struct{}, snapshotTime time.Time, perHost time.Duration) {
+	visited := s.reconcileHostsPass(ctx, hostsRotated(hosts, s.reconcileOffset), live, snapshotTime, perHost)
+	if len(hosts) > 0 {
+		s.reconcileOffset = (s.reconcileOffset + visited) % len(hosts)
+	}
+}
+
+// hostsRotated starts the order at offset and wraps, so a truncated pass can
+// hand the next one the hosts it never reached.
+func hostsRotated(hosts []string, offset int) []string {
+	if len(hosts) == 0 {
+		return nil
+	}
+	offset %= len(hosts)
+	return append(append([]string{}, hosts[offset:]...), hosts[:offset]...)
+}
+
+// reconcileHostsPass walks the hosts in turn and reports how many it reached.
+// A host that is unreachable or unresponsive must not cost the rest their
+// reclamation, so each gets its own deadline, and its own deletion budget so
+// one host's backlog cannot starve the others.
+func (s *BuildSupervisor) reconcileHostsPass(ctx context.Context, hosts []string, live map[string]struct{}, snapshotTime time.Time, perHost time.Duration) int {
+	for i, hostID := range hosts {
+		if ctx.Err() != nil {
+			s.log.Warn().Int("unvisited", len(hosts)-i).Msg("reconcile: pass deadline reached")
+			return i
+		}
+		hostCtx, cancel := context.WithTimeout(ctx, perHost)
+		s.reconcileHost(hostCtx, hostID, live, snapshotTime)
+		cancel()
+	}
+	return len(hosts)
+}
+
+// reconcileHosts names the hosts whose disks this pass walks. Builds are
+// dispatched to any eligible host in the cell, so walking a single host
+// leaves every other one's superseded generations on disk. A host that is
+// not active is skipped and picked up once it is, which leaves only a
+// retired host's artifacts unreclaimed — and that disk leaves with it.
+func (s *BuildSupervisor) reconcileHosts(ctx context.Context) ([]string, error) {
+	hosts, err := s.q.ListActiveHosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return hostsInCell(hosts, s.cfg.Cell), nil
+}
+
+// hostsInCell picks this cell's hosts out of a registry that may serve more
+// than one — pure so the scoping is testable without DB plumbing.
+func hostsInCell(hosts []db.Host, cell string) []string {
+	var out []string
+	for _, h := range hosts {
+		if cell != "" && h.Region == cell {
+			out = append(out, h.ID)
+		}
+	}
+	return out
+}
+
+// reconcileHost applies the live set to one host. Each host gets its own
+// deletion budget so a host with a large backlog cannot starve the others,
+// and a host that is unreachable this pass does not stop the rest.
+func (s *BuildSupervisor) reconcileHost(ctx context.Context, hostID string, live map[string]struct{}, snapshotTime time.Time) {
+	vmd, err := s.resolve(ctx, hostID)
+	if err != nil {
+		s.log.Warn().Err(err).Str("host_id", hostID).Msg("reconcile: resolve vmd")
 		return
 	}
 	onDisk, err := vmd.ListBuildArtifacts(ctx)
 	if err != nil {
-		s.log.Warn().Err(err).Msg("reconcile: ListBuildArtifacts")
+		s.log.Warn().Err(err).Str("host_id", hostID).Msg("reconcile: ListBuildArtifacts")
 		return
 	}
 
 	toDelete := reconcileDecision(onDisk, live, snapshotTime)
 	attempted, deleted := applyDeletions(ctx, s.log, vmd, toDelete, s.cfg.MaxDeletesPerReconcile)
 	s.log.Info().
+		Str("host_id", hostID).
 		Int("on_disk", len(onDisk)).
 		Int("live", len(live)).
 		Int("attempted", attempted).
@@ -623,9 +740,10 @@ func applyDeletions(ctx context.Context, log zerolog.Logger, vmd buildArtifactDe
 }
 
 // collectLiveBuildKeys returns "<templateID>/<buildID>" keys for build
-// dirs that must be preserved: in-flight + each template's current
-// base_path + sandbox pins to prior builds. status='ready' is not a
-// signal here — see ListInFlightBuilds.
+// dirs that must be preserved: attempts still owed their artifacts,
+// in-flight builds, sandbox and snapshot pins, and each template's
+// current base_path. Promotion alone is not a signal — a generation the
+// template has moved off and nothing references is reclaimable.
 func (s *BuildSupervisor) collectLiveBuildKeys(ctx context.Context) (map[string]struct{}, error) {
 	live := map[string]struct{}{}
 	keys, err := s.q.ProtectedBuildAttemptKeys(ctx)

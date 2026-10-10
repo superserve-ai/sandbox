@@ -429,7 +429,7 @@ func run() error {
 		}
 		return c, err
 	}
-	buildCfg := supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID)
+	buildCfg := supervisor.DefaultBuildSupervisorConfig()
 	buildCfg.Cell = cfg.TemplateBuildRegion
 	buildCfg.PublicationBucket = cfg.TemplateBackupBucket
 	buildSupervisor := supervisor.NewBuildSupervisor(buildCfg, queries, buildResolver).
