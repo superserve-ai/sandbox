@@ -66,7 +66,7 @@ func (a *CachedSandboxOwnership) lookup(ctx context.Context, sandboxID, teamID s
 	if ok && time.Now().Before(cached.expiresAt) {
 		return cached.principal, nil
 	}
-	result, err, _ := a.flight.Do(key, func() (any, error) {
+	flight := a.flight.DoChan(key, func() (any, error) {
 		a.mu.Lock()
 		cached, ok := a.items[key]
 		a.mu.Unlock()
@@ -74,7 +74,8 @@ func (a *CachedSandboxOwnership) lookup(ctx context.Context, sandboxID, teamID s
 			return cached, nil
 		}
 		observedAt := time.Now()
-		lookupCtx, cancel := context.WithTimeout(ctx, ownershipLookupTimeout)
+		// A disconnected leader must not fail the waiters sharing this lookup.
+		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownershipLookupTimeout)
 		defer cancel()
 		var principal, ownerTeam *string
 		if err := a.pool.QueryRow(lookupCtx, sandboxOwnershipSQL, sandbox, team).Scan(&principal, &ownerTeam); err != nil {
@@ -105,10 +106,15 @@ func (a *CachedSandboxOwnership) lookup(ctx context.Context, sandboxID, teamID s
 		a.mu.Unlock()
 		return entry, nil
 	})
-	if err != nil {
-		return "", err
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result := <-flight:
+		if result.Err != nil {
+			return "", result.Err
+		}
+		return result.Val.(sandboxOwnershipEntry).principal, nil
 	}
-	return result.(sandboxOwnershipEntry).principal, nil
 }
 
 func (h *Handler) attestUnclassifiedSandbox(ctx context.Context, sandboxID string, info InstanceInfo) (InstanceInfo, error) {
