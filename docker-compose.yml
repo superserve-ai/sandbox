@@ -6,3 +6,6 @@ services:
     environment:
       API_PORT: "8080"
       VMD_GRPC_ADDRESS: host.docker.internal:50051
+      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:postgres@host.docker.internal:5432/sandbox_test?sslmode=disable}
+      ALLOW_EPHEMERAL_SEED: "1"
+
