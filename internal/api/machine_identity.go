@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -49,6 +50,7 @@ func machineCredentialAuthWithClock(resolver MachineCredentialResolver, now func
 			c.Abort()
 			return
 		}
+		logAuthOutcome(c, "error")
 		if resolver == nil {
 			c.Set("auth_duration", time.Since(authStart))
 			recordMachineAuthFailure(c, authStart)
@@ -72,6 +74,9 @@ func machineCredentialAuthWithClock(resolver MachineCredentialResolver, now func
 			return
 		}
 		if err != nil || caller.ValidateAt(now()) != nil {
+			if err == nil || errors.Is(err, auth.ErrInvalidMachineIdentity) || errors.Is(err, pgx.ErrNoRows) {
+				logAuthOutcome(c, "invalid")
+			}
 			c.Set("auth_duration", time.Since(authStart))
 			recordMachineAuthFailure(c, authStart)
 			respondError(c, ErrUnauthorized)

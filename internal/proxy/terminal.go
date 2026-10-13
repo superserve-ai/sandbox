@@ -187,10 +187,9 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 	// The token is carried in the Sec-WebSocket-Protocol header, NOT the
 	// URL. This keeps the token out of browser history, Referer headers,
 	// and URL-based logging. Note: the header itself may appear in
-	// request-level access logs (e.g., Application LB or CDN). This is
-	// acceptable because tokens are time-limited (1-2h) and logs are
-	// internal-only. Auth happens before upgrade so unauthenticated
-	// callers never get a WebSocket connection.
+	// request-level access logs (e.g., Application LB or CDN), so those
+	// collectors must also exclude credential carriers. Auth happens before
+	// upgrade so unauthenticated callers never get a WebSocket connection.
 	// See extractTerminalToken for the parser.
 	//
 	// Defence in depth: unconditionally scrub any ?t= query param before
@@ -205,13 +204,14 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 
 	token := extractTerminalToken(r)
 	if token == "" {
+		logSandboxAuth(r.Context(), "missing", "")
 		http.Error(w, "missing token (pass as Sec-WebSocket-Protocol: token.<value>)", http.StatusUnauthorized)
 		return
 	}
 
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
 	if fail != nil {
-		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("terminal: auth failed")
+		h.log.Warn().Str("sandbox_id", logSandboxID(instanceID)).Int("status", fail.Status).Msg("terminal: auth failed")
 		retainVerifiedCaller(r, fail.Caller)
 		fail.write(w)
 		return
@@ -258,9 +258,11 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 
 	ws, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
-		h.log.Warn().Err(err).Msg("terminal: WS upgrade failed")
+		h.log.Warn().Msg("terminal: WS upgrade failed")
 		return
 	}
+
+	logSessionStart(r.Context(), http.StatusSwitchingProtocols)
 
 	// Bound the size of any single input frame. Keystrokes are tiny;
 	// anything approaching 64 KiB is either a paste (legitimate but
@@ -290,7 +292,7 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 // exits. This is the simplest correct pattern for bidirectional bridging.
 func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procClient boxdpbconnect.ProcessServiceClient, instanceID string) {
 	l := h.log.With().
-		Str("sandbox_id", instanceID).
+		Str("sandbox_id", logSandboxID(instanceID)).
 		Logger()
 
 	// Scoped context so either direction's failure cancels everything.
@@ -310,7 +312,8 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 	})
 	stream, err := procClient.Start(bridgeCtx, startReq)
 	if err != nil {
-		l.Error().Err(err).Msg("terminal: boxd Start failed")
+		logRequestOutcome(ctx, "upstream_error")
+		l.Error().Msg("terminal: boxd Start failed")
 		_ = ws.Close(websocket.StatusInternalError, "failed to start shell")
 		return
 	}
@@ -319,12 +322,14 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 	// (needed for SendInput / Resize / Signal which all address the
 	// process by PID).
 	if !stream.Receive() {
-		l.Error().Err(stream.Err()).Msg("terminal: boxd stream empty on start")
+		logRequestOutcome(ctx, "upstream_error")
+		l.Error().Msg("terminal: boxd stream empty on start")
 		_ = ws.Close(websocket.StatusInternalError, "shell did not start")
 		return
 	}
 	startEvent := stream.Msg().GetStart()
 	if startEvent == nil {
+		logRequestOutcome(ctx, "upstream_error")
 		l.Error().Msg("terminal: first event was not StartEvent")
 		_ = ws.Close(websocket.StatusInternalError, "unexpected event")
 		return
@@ -394,7 +399,7 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 					if err := ws.Write(wctx, websocket.MessageBinary, pty); err != nil {
 						wcancel()
 						if !errors.Is(err, context.Canceled) {
-							l.Debug().Err(err).Msg("terminal: WS write failed")
+							l.Debug().Msg("terminal: WS write failed")
 						}
 						return
 					}
@@ -403,6 +408,7 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 				}
 			}
 			if e := msg.GetEnd(); e != nil {
+				logRequestOutcome(ctx, "process_exited")
 				// Shell exited — close the WS with a clean
 				// code so xterm.js can show "session ended".
 				l.Info().Int32("exit_code", e.GetExitCode()).Msg("terminal: shell exited")
@@ -411,7 +417,8 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 			}
 		}
 		if err := stream.Err(); err != nil && !errors.Is(err, context.Canceled) {
-			l.Warn().Err(err).Msg("terminal: boxd stream error")
+			logRequestOutcome(ctx, "upstream_error")
+			l.Warn().Msg("terminal: boxd stream error")
 		}
 	}()
 
@@ -444,7 +451,10 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 					Data: data,
 				}))
 				if err != nil {
-					l.Warn().Err(err).Msg("terminal: boxd SendInput failed")
+					if !errors.Is(err, context.Canceled) && connect.CodeOf(err) != connect.CodeCanceled {
+						logRequestOutcome(ctx, "upstream_error")
+					}
+					l.Warn().Msg("terminal: boxd SendInput failed")
 					return
 				}
 			case websocket.MessageText:
@@ -464,7 +474,7 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect.ProcessServiceClient, pid uint32, data []byte, l zerolog.Logger) {
 	var msg wsControlMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
-		l.Warn().Err(err).Msg("terminal: bad control JSON")
+		l.Warn().Msg("terminal: bad control JSON")
 		return
 	}
 
@@ -479,7 +489,7 @@ func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect
 			Size: &pb.TerminalSize{Cols: msg.Cols, Rows: msg.Rows},
 		}))
 		if err != nil {
-			l.Warn().Err(err).Msg("terminal: boxd Resize failed")
+			l.Warn().Msg("terminal: boxd Resize failed")
 		}
 
 	case "signal":
@@ -489,7 +499,7 @@ func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect
 		}
 		signum, ok := signalNameToNumber(msg.Name)
 		if !ok {
-			l.Warn().Str("name", msg.Name).Msg("terminal: unknown signal name")
+			l.Warn().Msg("terminal: unknown signal name")
 			return
 		}
 		_, err := client.Signal(ctx, connect.NewRequest(&pb.SignalRequest{
@@ -497,11 +507,11 @@ func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect
 			Signal: signum,
 		}))
 		if err != nil {
-			l.Warn().Err(err).Msg("terminal: boxd Signal failed")
+			l.Warn().Msg("terminal: boxd Signal failed")
 		}
 
 	default:
-		l.Debug().Str("type", msg.Type).Msg("terminal: unknown control type")
+		l.Debug().Msg("terminal: unknown control type")
 	}
 }
 
@@ -522,13 +532,13 @@ func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect
 // close is routine teardown at debug.
 func logWSReadEnd(l zerolog.Logger, err error, limitBytes int, bridge string) {
 	if errors.Is(err, websocket.ErrMessageTooBig) {
-		l.Warn().Err(err).Int("limit_bytes", limitBytes).
+		l.Warn().Int("limit_bytes", limitBytes).
 			Msg(bridge + ": client frame exceeded read limit")
 		return
 	}
 	closeErr := websocket.CloseStatus(err)
 	if closeErr != websocket.StatusNormalClosure && closeErr != websocket.StatusGoingAway {
-		l.Debug().Err(err).Msg(bridge + ": WS read ended")
+		l.Debug().Msg(bridge + ": WS read ended")
 	}
 }
 
