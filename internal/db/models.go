@@ -344,6 +344,51 @@ type BackupWalk struct {
 	StartedAt time.Time `json:"started_at"`
 }
 
+type BillingCommercialContract struct {
+	ID                          uuid.UUID          `json:"id"`
+	TeamID                      uuid.UUID          `json:"team_id"`
+	OfferKey                    string             `json:"offer_key"`
+	Status                      string             `json:"status"`
+	StartsAt                    time.Time          `json:"starts_at"`
+	EndsAt                      pgtype.Timestamptz `json:"ends_at"`
+	CustomerID                  string             `json:"customer_id"`
+	SubscriptionID              string             `json:"subscription_id"`
+	BasePriceID                 string             `json:"base_price_id"`
+	ChargeAmountCents           int64              `json:"charge_amount_cents"`
+	ChargeIntervalMonths        int32              `json:"charge_interval_months"`
+	Currency                    string             `json:"currency"`
+	EntitlementKind             string             `json:"entitlement_kind"`
+	EntitlementAmountCents      int64              `json:"entitlement_amount_cents"`
+	EntitlementCadence          string             `json:"entitlement_cadence"`
+	EntitlementAnchor           time.Time          `json:"entitlement_anchor"`
+	CollectionHasOverdueBalance *bool              `json:"collection_has_overdue_balance"`
+	CollectionCheckedAt         pgtype.Timestamptz `json:"collection_checked_at"`
+	CollectionValidUntil        pgtype.Timestamptz `json:"collection_valid_until"`
+	CollectionEvidence          []byte             `json:"collection_evidence"`
+	Revision                    int64              `json:"revision"`
+	CreatedAt                   time.Time          `json:"created_at"`
+}
+
+type BillingContractPayment struct {
+	ID                          uuid.UUID `json:"id"`
+	TeamID                      uuid.UUID `json:"team_id"`
+	ContractID                  uuid.UUID `json:"contract_id"`
+	InvoiceID                   string    `json:"invoice_id"`
+	PaymentReference            string    `json:"payment_reference"`
+	CustomerID                  string    `json:"customer_id"`
+	SubscriptionID              string    `json:"subscription_id"`
+	BasePriceID                 string    `json:"base_price_id"`
+	ServicePeriodStart          time.Time `json:"service_period_start"`
+	ServicePeriodEnd            time.Time `json:"service_period_end"`
+	BaseAmountPaidCents         int64     `json:"base_amount_paid_cents"`
+	InvoiceAmountPaidCents      int64     `json:"invoice_amount_paid_cents"`
+	InvoiceAmountRemainingCents int64     `json:"invoice_amount_remaining_cents"`
+	Currency                    string    `json:"currency"`
+	PaidAt                      time.Time `json:"paid_at"`
+	VerifiedAt                  time.Time `json:"verified_at"`
+	Evidence                    []byte    `json:"evidence"`
+}
+
 type BillingExportAllocation struct {
 	ID              uuid.UUID      `json:"id"`
 	TeamID          uuid.UUID      `json:"team_id"`
@@ -614,6 +659,28 @@ type BillingRollupTeamBackfillState struct {
 	TeamID        uuid.UUID `json:"team_id"`
 	NextHourStart time.Time `json:"next_hour_start"`
 	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type BillingUsageEntitlement struct {
+	ID                   uuid.UUID          `json:"id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	ContractID           uuid.UUID          `json:"contract_id"`
+	PaymentID            uuid.UUID          `json:"payment_id"`
+	Kind                 string             `json:"kind"`
+	PeriodStart          time.Time          `json:"period_start"`
+	PeriodEnd            time.Time          `json:"period_end"`
+	AmountCents          int64              `json:"amount_cents"`
+	Currency             string             `json:"currency"`
+	State                string             `json:"state"`
+	IdempotencyKey       string             `json:"idempotency_key"`
+	FirstAttemptAt       pgtype.Timestamptz `json:"first_attempt_at"`
+	RequestPayload       []byte             `json:"request_payload"`
+	ProviderInvoiceStart pgtype.Timestamptz `json:"provider_invoice_start"`
+	ProviderInvoiceEnd   pgtype.Timestamptz `json:"provider_invoice_end"`
+	StripeCreditGrantID  *string            `json:"stripe_credit_grant_id"`
+	IssuanceEvidence     []byte             `json:"issuance_evidence"`
+	IssuedAt             pgtype.Timestamptz `json:"issued_at"`
+	CreatedAt            time.Time          `json:"created_at"`
 }
 
 type BillingUsageExport struct {
