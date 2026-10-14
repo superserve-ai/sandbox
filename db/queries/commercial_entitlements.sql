@@ -57,11 +57,11 @@ RETURNING *;
 -- name: ClaimCurrentUsageEntitlement :one
 WITH contract AS MATERIALIZED (
     SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id)
-        AND b.id = sqlc.arg(contract_id) AND entitlement_cadence = 'monthly' FOR UPDATE
+        AND b.id = sqlc.arg(contract_id) FOR UPDATE
 )
 INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency)
-SELECT c.team_id, c.id, p.id, c.entitlement_kind, period.period_start, period.period_end, c.entitlement_amount_cents, c.currency
-FROM contract c CROSS JOIN LATERAL billing_entitlement_period(c.entitlement_anchor, clock_timestamp()) period
+SELECT c.team_id, c.id, p.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
+FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
 JOIN billing_contract_payment p ON p.contract_id = c.id
     AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
 WHERE billing_contract_eligible(c::billing_commercial_contract, period.period_start, period.period_end)
@@ -110,3 +110,44 @@ RETURNING *;
 -- name: ListUncertainUsageEntitlements :many
 SELECT * FROM billing_usage_entitlement WHERE state = 'uncertain' AND id > sqlc.arg(after_id)
 ORDER BY id LIMIT sqlc.arg(batch_size);
+
+-- name: CreateUpfrontCommercialContract :one
+INSERT INTO billing_commercial_contract (
+    id, team_id, offer_key, starts_at, ends_at, customer_id, subscription_id, base_price_id,
+    charge_kind, charge_amount_cents, charge_interval_months, entitlement_kind,
+    entitlement_amount_cents, entitlement_cadence, entitlement_anchor
+) VALUES (
+    sqlc.arg(contract_id), sqlc.arg(team_id), sqlc.arg(offer_key), sqlc.arg(starts_at), sqlc.arg(ends_at),
+    sqlc.arg(customer_id), sqlc.arg(subscription_id), sqlc.arg(base_price_id),
+    'upfront', sqlc.arg(charge_amount_cents), sqlc.arg(charge_interval_months),
+    sqlc.arg(entitlement_kind), sqlc.arg(entitlement_amount_cents), 'scheduled', sqlc.arg(entitlement_anchor)
+) RETURNING *;
+
+-- name: AddCommercialEntitlementPeriod :one
+INSERT INTO billing_contract_entitlement_schedule (team_id, contract_id, month_offset, amount_cents)
+VALUES (sqlc.arg(team_id), sqlc.arg(contract_id), sqlc.arg(month_offset), sqlc.arg(amount_cents))
+RETURNING *;
+
+-- name: ListCommercialEntitlementSchedule :many
+SELECT * FROM billing_contract_entitlement_schedule
+WHERE team_id = sqlc.arg(team_id) AND contract_id = sqlc.arg(contract_id) ORDER BY month_offset;
+
+-- name: AdoptUsageEntitlement :one
+WITH contract AS MATERIALIZED (
+    SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id)
+        AND b.id = sqlc.arg(contract_id) AND b.status = 'pending' FOR UPDATE
+)
+INSERT INTO billing_usage_entitlement (
+    team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency,
+    state, issuance_source, stripe_credit_grant_id, issuance_evidence, provider_created_at,
+    issued_at, adopted_at, adopted_available_balance_cents, provider_invoice_start, provider_invoice_end
+)
+SELECT c.team_id, c.id, p.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency,
+    'issued', 'adopted', sqlc.arg(grant_id), sqlc.arg(evidence), sqlc.arg(provider_created_at)::timestamptz,
+    sqlc.arg(provider_created_at)::timestamptz, clock_timestamp(), sqlc.arg(available_balance_cents)::bigint,
+    sqlc.arg(invoice_start)::timestamptz, sqlc.arg(invoice_end)::timestamptz
+FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
+JOIN billing_contract_payment p ON p.contract_id = c.id
+    AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
+ON CONFLICT (team_id, kind, period_start) DO NOTHING
+RETURNING *;

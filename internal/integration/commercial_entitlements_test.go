@@ -59,7 +59,7 @@ func commercialFixture(t *testing.T, annual bool) db.BillingCommercialContract {
 func commercialPayment(t *testing.T, c db.BillingCommercialContract) db.RecordCommercialBasePaymentParams {
 	return db.RecordCommercialBasePaymentParams{
 		TeamID: c.TeamID, ContractID: c.ID, InvoiceID: "in_" + uuid.NewString(), PaymentReference: "pay_" + uuid.NewString(),
-		CustomerID: c.CustomerID, SubscriptionID: c.SubscriptionID, BasePriceID: c.BasePriceID,
+		CustomerID: c.CustomerID, SubscriptionID: &c.SubscriptionID, BasePriceID: c.BasePriceID,
 		ServicePeriodStart: c.StartsAt, ServicePeriodEnd: c.StartsAt.UTC().AddDate(0, int(c.ChargeIntervalMonths), 0),
 		BaseAmountPaidCents: c.ChargeAmountCents, InvoiceAmountPaidCents: c.ChargeAmountCents,
 		Currency: "usd", PaidAt: c.StartsAt, VerifiedAt: commercialNow(t), Evidence: []byte(`{"verified_payment":"example"}`),
@@ -164,7 +164,7 @@ func TestIntegration_CommercialPaymentAuthority(t *testing.T) {
 		{"zero invoice", func(p *db.RecordCommercialBasePaymentParams) { p.BaseAmountPaidCents = 0; p.InvoiceAmountPaidCents = 0 }},
 		{"overage invoice", func(p *db.RecordCommercialBasePaymentParams) { p.BaseAmountPaidCents = 10000 }},
 		{"wrong customer", func(p *db.RecordCommercialBasePaymentParams) { p.CustomerID = "cus_other" }},
-		{"wrong subscription", func(p *db.RecordCommercialBasePaymentParams) { p.SubscriptionID = "sub_other" }},
+		{"wrong subscription", func(p *db.RecordCommercialBasePaymentParams) { v := "sub_other"; p.SubscriptionID = &v }},
 		{"wrong price", func(p *db.RecordCommercialBasePaymentParams) { p.BasePriceID = "price_cpu" }},
 		{"unpaid remainder", func(p *db.RecordCommercialBasePaymentParams) { p.InvoiceAmountRemainingCents = 1 }},
 		{"monthly coverage for annual", func(p *db.RecordCommercialBasePaymentParams) {
@@ -494,5 +494,149 @@ func TestIntegration_CommercialRechecksDeadlineAfterLock(t *testing.T) {
 	stored, err := testQueries.GetUsageEntitlement(t.Context(), db.GetUsageEntitlementParams{TeamID: c.TeamID, EntitlementID: e.ID})
 	if err != nil || stored.State != "pending" {
 		t.Fatalf("expired observation dispatched a request: %+v %v", stored, err)
+	}
+}
+
+// A standalone cash invoice must not be attributed to the continuing usage
+// subscription, and the lower allowance must start on the fourth anniversary.
+func TestIntegration_CommercialUpfrontScheduleAndAdoption(t *testing.T) {
+	team, err := testQueries.CreateTeam(t.Context(), "scheduled-"+uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := commercialNow(t)
+	anchor := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, -3, -7)
+	var termEnd time.Time
+	if err := testPool.QueryRow(t.Context(), `SELECT billing_anniversary_boundary($1,12)`, anchor).Scan(&termEnd); err != nil {
+		t.Fatal(err)
+	}
+	customer, subscription := "cus_"+uuid.NewString(), "sub_"+uuid.NewString()
+	correctionExec(t, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,$2,$3,$4)`, team.ID, customer, subscription, anchor)
+	c, err := testQueries.CreateUpfrontCommercialContract(t.Context(), db.CreateUpfrontCommercialContractParams{
+		ContractID: uuid.New(), TeamID: team.ID, OfferKey: "example_prepaid", StartsAt: anchor, EndsAt: commercialTime(termEnd),
+		CustomerID: customer, SubscriptionID: subscription, BasePriceID: "price_upfront", ChargeAmountCents: 10000000, ChargeIntervalMonths: 12,
+		EntitlementKind: "metered_usage", EntitlementAmountCents: 3000000, EntitlementAnchor: anchor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := commercialPayment(t, c)
+	p.ServicePeriodEnd = c.EndsAt.Time
+	p.Evidence = []byte(`{"parent":null,"verified_payment":"example"}`)
+	if _, err = testQueries.RecordCommercialBasePayment(t.Context(), p); err == nil {
+		t.Fatal("standalone receipt accepted with subscription parent")
+	}
+	p.SubscriptionID = nil
+	if _, err = testQueries.RecordCommercialBasePayment(t.Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	for n, i := range []int32{0, 1, 2, 9, 10, 11, 3, 4, 5, 6, 7, 8} {
+		if n == 11 {
+			if _, err = testQueries.ActivateCommercialContract(t.Context(), db.ActivateCommercialContractParams{TeamID: c.TeamID, ContractID: c.ID}); err == nil {
+				t.Fatal("activated incomplete schedule")
+			}
+		}
+		if n == 6 {
+			tx, err := testPool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(t.Context(), `UPDATE billing_commercial_contract SET ends_at=billing_anniversary_boundary(entitlement_anchor,6),revision=revision+1 WHERE id=$1`, c.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = testQueries.WithTx(tx).ActivateCommercialContract(t.Context(), db.ActivateCommercialContractParams{TeamID: c.TeamID, ContractID: c.ID, ExpectedRevision: 1}); err == nil {
+				t.Fatal("activated sparse schedule after term shortening")
+			}
+			tx.Rollback(t.Context())
+		}
+		amount := int64(100000)
+		if i < 3 {
+			amount = 3000000
+		}
+		if _, err = testQueries.AddCommercialEntitlementPeriod(t.Context(), db.AddCommercialEntitlementPeriodParams{TeamID: c.TeamID, ContractID: c.ID, MonthOffset: i, AmountCents: amount}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = testQueries.AddCommercialEntitlementPeriod(t.Context(), db.AddCommercialEntitlementPeriodParams{TeamID: c.TeamID, ContractID: c.ID, MonthOffset: 12, AmountCents: 100000}); err == nil {
+		t.Fatal("accepted thirteenth grant")
+	}
+	for i := 0; i < 13; i++ {
+		var amount int64
+		err = testPool.QueryRow(t.Context(), `SELECT amount_cents FROM billing_contract_entitlement((SELECT c FROM billing_commercial_contract c WHERE id=$1),billing_anniversary_boundary($2,$3))`, c.ID, anchor, i).Scan(&amount)
+		if i == 12 {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("offer continued past end: %v", err)
+			}
+			continue
+		}
+		want := int64(100000)
+		if i < 3 {
+			want = 3000000
+		}
+		if err != nil || amount != want {
+			t.Fatalf("month %d amount %d, want %d: %v", i+1, amount, want, err)
+		}
+	}
+	if _, err = testPool.Exec(t.Context(), `UPDATE billing_contract_entitlement_schedule SET amount_cents=3000000 WHERE contract_id=$1 AND month_offset=3`, c.ID); err == nil {
+		t.Fatal("rewrote historical schedule")
+	}
+	c = commercialObserve(t, c, true)
+	if _, err = testQueries.ClaimCurrentUsageEntitlement(t.Context(), db.ClaimCurrentUsageEntitlementParams{TeamID: c.TeamID, ContractID: c.ID}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("pending adoption exposed issuance: %v", err)
+	}
+	e := db.BillingUsageEntitlement{TeamID: c.TeamID, ContractID: c.ID}
+	if err = testPool.QueryRow(t.Context(), `SELECT period_start,period_end,amount_cents FROM billing_contract_entitlement((SELECT c FROM billing_commercial_contract c WHERE id=$1),clock_timestamp())`, c.ID).Scan(&e.PeriodStart, &e.PeriodEnd, &e.AmountCents); err != nil {
+		t.Fatal(err)
+	}
+	if e.AmountCents != 100000 {
+		t.Fatalf("fourth month received %d", e.AmountCents)
+	}
+	commercialMap(t, c, e)
+	grant := "credgr_" + uuid.NewString()
+	created := now.Add(-time.Hour).Truncate(time.Second)
+	balance := int64(43210)
+	evidence := map[string]any{
+		"id": grant, "customer": c.CustomerID, "created": created.Unix(), "category": "promotional",
+		"amount":       map[string]any{"type": "monetary", "monetary": map[string]any{"currency": "usd", "value": e.AmountCents}},
+		"effective_at": created.Unix(), "expires_at": e.PeriodEnd.Unix() + 1, "available_balance_cents": balance,
+		"applicability_config": map[string]any{"scope": map[string]any{"prices": []map[string]string{{"id": "price_cpu"}, {"id": "price_memory"}, {"id": "price_storage"}}}},
+		"metadata": map[string]string{"superserve_team_id": c.TeamID.String(), "superserve_contract_id": c.ID.String(), "superserve_offer": c.OfferKey, "superserve_contract_version": "1", "superserve_object_role": "monthly_usage_entitlement",
+			"superserve_entitlement": fmt.Sprintf("%s:usage:%d:%d", c.ID, e.PeriodStart.Unix(), e.PeriodEnd.Unix()), "superserve_period_start": fmt.Sprint(e.PeriodStart.Unix()), "superserve_period_end": fmt.Sprint(e.PeriodEnd.Unix())},
+	}
+	payload, _ := json.Marshal(evidence)
+	params := db.AdoptUsageEntitlementParams{TeamID: c.TeamID, ContractID: c.ID, GrantID: &grant, Evidence: payload, ProviderCreatedAt: created, AvailableBalanceCents: balance, InvoiceStart: e.PeriodStart, InvoiceEnd: e.PeriodEnd}
+	for _, field := range []string{"customer", "expires_at", "available_balance_cents", "metadata"} {
+		bad := map[string]any{}
+		for k, v := range evidence {
+			bad[k] = v
+		}
+		delete(bad, field)
+		params.Evidence, _ = json.Marshal(bad)
+		if _, err = testQueries.AdoptUsageEntitlement(t.Context(), params); err == nil {
+			t.Fatalf("adopted grant without %s", field)
+		}
+	}
+	params.Evidence = payload
+	adopted, err := testQueries.AdoptUsageEntitlement(t.Context(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted.IssuanceSource != "adopted" || adopted.FirstAttemptAt.Valid || len(adopted.RequestPayload) != 0 || !adopted.IssuedAt.Time.Equal(created) || *adopted.AdoptedAvailableBalanceCents != balance {
+		t.Fatalf("adoption lost original state: %+v", adopted)
+	}
+	if _, err = testQueries.AdoptUsageEntitlement(t.Context(), params); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("adoption retry changed grant: %v", err)
+	}
+	c, err = testQueries.ActivateCommercialContract(t.Context(), db.ActivateCommercialContractParams{TeamID: c.TeamID, ContractID: c.ID, ExpectedRevision: c.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c = commercialObserve(t, c, false)
+	e.ID = adopted.ID
+	if _, err = testQueries.ClaimCurrentUsageEntitlement(t.Context(), db.ClaimCurrentUsageEntitlementParams{TeamID: c.TeamID, ContractID: c.ID}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("adopted allowance duplicated: %v", err)
+	}
+	if _, err = testQueries.BeginUsageEntitlementIssuance(t.Context(), db.BeginUsageEntitlementIssuanceParams{TeamID: c.TeamID, ContractID: c.ID, EntitlementID: e.ID}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("adopted grant entered create path: %v", err)
 	}
 }

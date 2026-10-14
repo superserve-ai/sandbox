@@ -17,7 +17,7 @@ const activateCommercialContract = `-- name: ActivateCommercialContract :one
 UPDATE billing_commercial_contract SET status = 'active', revision = revision + 1
 WHERE team_id = $1 AND id = $2
     AND revision = $3 AND status = 'pending'
-RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
+RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_kind, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
 `
 
 type ActivateCommercialContractParams struct {
@@ -39,6 +39,7 @@ func (q *Queries) ActivateCommercialContract(ctx context.Context, arg ActivateCo
 		&i.CustomerID,
 		&i.SubscriptionID,
 		&i.BasePriceID,
+		&i.ChargeKind,
 		&i.ChargeAmountCents,
 		&i.ChargeIntervalMonths,
 		&i.Currency,
@@ -56,9 +57,111 @@ func (q *Queries) ActivateCommercialContract(ctx context.Context, arg ActivateCo
 	return i, err
 }
 
+const addCommercialEntitlementPeriod = `-- name: AddCommercialEntitlementPeriod :one
+INSERT INTO billing_contract_entitlement_schedule (team_id, contract_id, month_offset, amount_cents)
+VALUES ($1, $2, $3, $4)
+RETURNING team_id, contract_id, month_offset, amount_cents
+`
+
+type AddCommercialEntitlementPeriodParams struct {
+	TeamID      uuid.UUID `json:"team_id"`
+	ContractID  uuid.UUID `json:"contract_id"`
+	MonthOffset int32     `json:"month_offset"`
+	AmountCents int64     `json:"amount_cents"`
+}
+
+func (q *Queries) AddCommercialEntitlementPeriod(ctx context.Context, arg AddCommercialEntitlementPeriodParams) (BillingContractEntitlementSchedule, error) {
+	row := q.db.QueryRow(ctx, addCommercialEntitlementPeriod,
+		arg.TeamID,
+		arg.ContractID,
+		arg.MonthOffset,
+		arg.AmountCents,
+	)
+	var i BillingContractEntitlementSchedule
+	err := row.Scan(
+		&i.TeamID,
+		&i.ContractID,
+		&i.MonthOffset,
+		&i.AmountCents,
+	)
+	return i, err
+}
+
+const adoptUsageEntitlement = `-- name: AdoptUsageEntitlement :one
+WITH contract AS MATERIALIZED (
+    SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_kind, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $7
+        AND b.id = $8 AND b.status = 'pending' FOR UPDATE
+)
+INSERT INTO billing_usage_entitlement (
+    team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency,
+    state, issuance_source, stripe_credit_grant_id, issuance_evidence, provider_created_at,
+    issued_at, adopted_at, adopted_available_balance_cents, provider_invoice_start, provider_invoice_end
+)
+SELECT c.team_id, c.id, p.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency,
+    'issued', 'adopted', $1, $2, $3::timestamptz,
+    $3::timestamptz, clock_timestamp(), $4::bigint,
+    $5::timestamptz, $6::timestamptz
+FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
+JOIN billing_contract_payment p ON p.contract_id = c.id
+    AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
+ON CONFLICT (team_id, kind, period_start) DO NOTHING
+RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at
+`
+
+type AdoptUsageEntitlementParams struct {
+	GrantID               *string   `json:"grant_id"`
+	Evidence              []byte    `json:"evidence"`
+	ProviderCreatedAt     time.Time `json:"provider_created_at"`
+	AvailableBalanceCents int64     `json:"available_balance_cents"`
+	InvoiceStart          time.Time `json:"invoice_start"`
+	InvoiceEnd            time.Time `json:"invoice_end"`
+	TeamID                uuid.UUID `json:"team_id"`
+	ContractID            uuid.UUID `json:"contract_id"`
+}
+
+func (q *Queries) AdoptUsageEntitlement(ctx context.Context, arg AdoptUsageEntitlementParams) (BillingUsageEntitlement, error) {
+	row := q.db.QueryRow(ctx, adoptUsageEntitlement,
+		arg.GrantID,
+		arg.Evidence,
+		arg.ProviderCreatedAt,
+		arg.AvailableBalanceCents,
+		arg.InvoiceStart,
+		arg.InvoiceEnd,
+		arg.TeamID,
+		arg.ContractID,
+	)
+	var i BillingUsageEntitlement
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.ContractID,
+		&i.PaymentID,
+		&i.Kind,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.AmountCents,
+		&i.Currency,
+		&i.IssuanceSource,
+		&i.ProviderCreatedAt,
+		&i.AdoptedAt,
+		&i.AdoptedAvailableBalanceCents,
+		&i.State,
+		&i.IdempotencyKey,
+		&i.FirstAttemptAt,
+		&i.RequestPayload,
+		&i.ProviderInvoiceStart,
+		&i.ProviderInvoiceEnd,
+		&i.StripeCreditGrantID,
+		&i.IssuanceEvidence,
+		&i.IssuedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const beginUsageEntitlementIssuance = `-- name: BeginUsageEntitlementIssuance :one
 WITH contract AS MATERIALIZED (
-    SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $5
+    SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_kind, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $5
         AND b.id = $6 FOR UPDATE
 ), attempt AS MATERIALIZED (SELECT clock_timestamp() AS attempted_at FROM contract)
 UPDATE billing_usage_entitlement e SET state = 'uncertain', first_attempt_at = attempt.attempted_at,
@@ -73,7 +176,7 @@ UPDATE billing_usage_entitlement e SET state = 'uncertain', first_attempt_at = a
 FROM contract c CROSS JOIN attempt
 WHERE e.team_id = c.team_id AND e.contract_id = c.id AND e.id = $4 AND e.state = 'pending'
     AND billing_contract_eligible(c::billing_commercial_contract, e.period_start, e.period_end) AND e.period_start <= clock_timestamp() AND e.period_end > clock_timestamp()
-RETURNING e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at
+RETURNING e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at
 `
 
 type BeginUsageEntitlementIssuanceParams struct {
@@ -105,6 +208,10 @@ func (q *Queries) BeginUsageEntitlementIssuance(ctx context.Context, arg BeginUs
 		&i.PeriodEnd,
 		&i.AmountCents,
 		&i.Currency,
+		&i.IssuanceSource,
+		&i.ProviderCreatedAt,
+		&i.AdoptedAt,
+		&i.AdoptedAvailableBalanceCents,
 		&i.State,
 		&i.IdempotencyKey,
 		&i.FirstAttemptAt,
@@ -121,17 +228,17 @@ func (q *Queries) BeginUsageEntitlementIssuance(ctx context.Context, arg BeginUs
 
 const claimCurrentUsageEntitlement = `-- name: ClaimCurrentUsageEntitlement :one
 WITH contract AS MATERIALIZED (
-    SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $1
-        AND b.id = $2 AND entitlement_cadence = 'monthly' FOR UPDATE
+    SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_kind, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $1
+        AND b.id = $2 FOR UPDATE
 )
 INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency)
-SELECT c.team_id, c.id, p.id, c.entitlement_kind, period.period_start, period.period_end, c.entitlement_amount_cents, c.currency
-FROM contract c CROSS JOIN LATERAL billing_entitlement_period(c.entitlement_anchor, clock_timestamp()) period
+SELECT c.team_id, c.id, p.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
+FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
 JOIN billing_contract_payment p ON p.contract_id = c.id
     AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
 WHERE billing_contract_eligible(c::billing_commercial_contract, period.period_start, period.period_end)
 ON CONFLICT (team_id, kind, period_start) DO NOTHING
-RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at
+RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at
 `
 
 type ClaimCurrentUsageEntitlementParams struct {
@@ -152,6 +259,10 @@ func (q *Queries) ClaimCurrentUsageEntitlement(ctx context.Context, arg ClaimCur
 		&i.PeriodEnd,
 		&i.AmountCents,
 		&i.Currency,
+		&i.IssuanceSource,
+		&i.ProviderCreatedAt,
+		&i.AdoptedAt,
+		&i.AdoptedAvailableBalanceCents,
 		&i.State,
 		&i.IdempotencyKey,
 		&i.FirstAttemptAt,
@@ -170,7 +281,7 @@ const confirmUsageEntitlementIssued = `-- name: ConfirmUsageEntitlementIssued :o
 UPDATE billing_usage_entitlement SET state = 'issued',
     stripe_credit_grant_id = $1, issuance_evidence = $2, issued_at = clock_timestamp()
 WHERE team_id = $3 AND id = $4 AND state = 'uncertain'
-RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at
+RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at
 `
 
 type ConfirmUsageEntitlementIssuedParams struct {
@@ -198,6 +309,10 @@ func (q *Queries) ConfirmUsageEntitlementIssued(ctx context.Context, arg Confirm
 		&i.PeriodEnd,
 		&i.AmountCents,
 		&i.Currency,
+		&i.IssuanceSource,
+		&i.ProviderCreatedAt,
+		&i.AdoptedAt,
+		&i.AdoptedAvailableBalanceCents,
 		&i.State,
 		&i.IdempotencyKey,
 		&i.FirstAttemptAt,
@@ -222,7 +337,7 @@ INSERT INTO billing_commercial_contract (
     $5, $6, $7,
     $8, $9, $10,
     $11, $12, $13
-) RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
+) RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_kind, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
 `
 
 type CreateCommercialContractParams struct {
@@ -268,6 +383,81 @@ func (q *Queries) CreateCommercialContract(ctx context.Context, arg CreateCommer
 		&i.CustomerID,
 		&i.SubscriptionID,
 		&i.BasePriceID,
+		&i.ChargeKind,
+		&i.ChargeAmountCents,
+		&i.ChargeIntervalMonths,
+		&i.Currency,
+		&i.EntitlementKind,
+		&i.EntitlementAmountCents,
+		&i.EntitlementCadence,
+		&i.EntitlementAnchor,
+		&i.CollectionHasOverdueBalance,
+		&i.CollectionCheckedAt,
+		&i.CollectionValidUntil,
+		&i.CollectionEvidence,
+		&i.Revision,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createUpfrontCommercialContract = `-- name: CreateUpfrontCommercialContract :one
+INSERT INTO billing_commercial_contract (
+    id, team_id, offer_key, starts_at, ends_at, customer_id, subscription_id, base_price_id,
+    charge_kind, charge_amount_cents, charge_interval_months, entitlement_kind,
+    entitlement_amount_cents, entitlement_cadence, entitlement_anchor
+) VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8,
+    'upfront', $9, $10,
+    $11, $12, 'scheduled', $13
+) RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_kind, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
+`
+
+type CreateUpfrontCommercialContractParams struct {
+	ContractID             uuid.UUID          `json:"contract_id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	OfferKey               string             `json:"offer_key"`
+	StartsAt               time.Time          `json:"starts_at"`
+	EndsAt                 pgtype.Timestamptz `json:"ends_at"`
+	CustomerID             string             `json:"customer_id"`
+	SubscriptionID         string             `json:"subscription_id"`
+	BasePriceID            string             `json:"base_price_id"`
+	ChargeAmountCents      int64              `json:"charge_amount_cents"`
+	ChargeIntervalMonths   int32              `json:"charge_interval_months"`
+	EntitlementKind        string             `json:"entitlement_kind"`
+	EntitlementAmountCents int64              `json:"entitlement_amount_cents"`
+	EntitlementAnchor      time.Time          `json:"entitlement_anchor"`
+}
+
+func (q *Queries) CreateUpfrontCommercialContract(ctx context.Context, arg CreateUpfrontCommercialContractParams) (BillingCommercialContract, error) {
+	row := q.db.QueryRow(ctx, createUpfrontCommercialContract,
+		arg.ContractID,
+		arg.TeamID,
+		arg.OfferKey,
+		arg.StartsAt,
+		arg.EndsAt,
+		arg.CustomerID,
+		arg.SubscriptionID,
+		arg.BasePriceID,
+		arg.ChargeAmountCents,
+		arg.ChargeIntervalMonths,
+		arg.EntitlementKind,
+		arg.EntitlementAmountCents,
+		arg.EntitlementAnchor,
+	)
+	var i BillingCommercialContract
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.OfferKey,
+		&i.Status,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.CustomerID,
+		&i.SubscriptionID,
+		&i.BasePriceID,
+		&i.ChargeKind,
 		&i.ChargeAmountCents,
 		&i.ChargeIntervalMonths,
 		&i.Currency,
@@ -289,7 +479,7 @@ const endCommercialContract = `-- name: EndCommercialContract :one
 UPDATE billing_commercial_contract SET status = 'ended', revision = revision + 1
 WHERE team_id = $1 AND id = $2
     AND revision = $3 AND status <> 'ended'
-RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
+RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_kind, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
 `
 
 type EndCommercialContractParams struct {
@@ -311,6 +501,7 @@ func (q *Queries) EndCommercialContract(ctx context.Context, arg EndCommercialCo
 		&i.CustomerID,
 		&i.SubscriptionID,
 		&i.BasePriceID,
+		&i.ChargeKind,
 		&i.ChargeAmountCents,
 		&i.ChargeIntervalMonths,
 		&i.Currency,
@@ -365,7 +556,7 @@ func (q *Queries) GetCommercialBasePayment(ctx context.Context, arg GetCommercia
 }
 
 const getCommercialContract = `-- name: GetCommercialContract :one
-SELECT id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at FROM billing_commercial_contract WHERE team_id = $1 AND id = $2
+SELECT id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_kind, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at FROM billing_commercial_contract WHERE team_id = $1 AND id = $2
 `
 
 type GetCommercialContractParams struct {
@@ -386,6 +577,7 @@ func (q *Queries) GetCommercialContract(ctx context.Context, arg GetCommercialCo
 		&i.CustomerID,
 		&i.SubscriptionID,
 		&i.BasePriceID,
+		&i.ChargeKind,
 		&i.ChargeAmountCents,
 		&i.ChargeIntervalMonths,
 		&i.Currency,
@@ -404,7 +596,7 @@ func (q *Queries) GetCommercialContract(ctx context.Context, arg GetCommercialCo
 }
 
 const getCurrentCommercialContract = `-- name: GetCurrentCommercialContract :one
-SELECT id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at FROM billing_commercial_contract WHERE team_id = $1 AND status <> 'ended'
+SELECT id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_kind, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at FROM billing_commercial_contract WHERE team_id = $1 AND status <> 'ended'
 `
 
 func (q *Queries) GetCurrentCommercialContract(ctx context.Context, teamID uuid.UUID) (BillingCommercialContract, error) {
@@ -420,6 +612,7 @@ func (q *Queries) GetCurrentCommercialContract(ctx context.Context, teamID uuid.
 		&i.CustomerID,
 		&i.SubscriptionID,
 		&i.BasePriceID,
+		&i.ChargeKind,
 		&i.ChargeAmountCents,
 		&i.ChargeIntervalMonths,
 		&i.Currency,
@@ -438,7 +631,7 @@ func (q *Queries) GetCurrentCommercialContract(ctx context.Context, teamID uuid.
 }
 
 const getCurrentUsageEntitlement = `-- name: GetCurrentUsageEntitlement :one
-SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at FROM billing_usage_entitlement WHERE team_id = $1 AND kind = $2
+SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at FROM billing_usage_entitlement WHERE team_id = $1 AND kind = $2
     AND period_start <= clock_timestamp() AND period_end > clock_timestamp()
 `
 
@@ -460,6 +653,10 @@ func (q *Queries) GetCurrentUsageEntitlement(ctx context.Context, arg GetCurrent
 		&i.PeriodEnd,
 		&i.AmountCents,
 		&i.Currency,
+		&i.IssuanceSource,
+		&i.ProviderCreatedAt,
+		&i.AdoptedAt,
+		&i.AdoptedAvailableBalanceCents,
 		&i.State,
 		&i.IdempotencyKey,
 		&i.FirstAttemptAt,
@@ -475,7 +672,7 @@ func (q *Queries) GetCurrentUsageEntitlement(ctx context.Context, arg GetCurrent
 }
 
 const getReplayableUsageEntitlement = `-- name: GetReplayableUsageEntitlement :one
-SELECT e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at FROM billing_usage_entitlement e JOIN billing_commercial_contract c ON c.id = e.contract_id
+SELECT e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at FROM billing_usage_entitlement e JOIN billing_commercial_contract c ON c.id = e.contract_id
 WHERE e.team_id = $1 AND e.id = $2 AND e.state = 'uncertain'
     AND e.first_attempt_at > clock_timestamp() - interval '23 hours'
     AND e.period_start <= clock_timestamp() AND e.period_end > clock_timestamp()
@@ -500,6 +697,10 @@ func (q *Queries) GetReplayableUsageEntitlement(ctx context.Context, arg GetRepl
 		&i.PeriodEnd,
 		&i.AmountCents,
 		&i.Currency,
+		&i.IssuanceSource,
+		&i.ProviderCreatedAt,
+		&i.AdoptedAt,
+		&i.AdoptedAvailableBalanceCents,
 		&i.State,
 		&i.IdempotencyKey,
 		&i.FirstAttemptAt,
@@ -515,7 +716,7 @@ func (q *Queries) GetReplayableUsageEntitlement(ctx context.Context, arg GetRepl
 }
 
 const getUsageEntitlement = `-- name: GetUsageEntitlement :one
-SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at FROM billing_usage_entitlement WHERE team_id = $1 AND id = $2
+SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at FROM billing_usage_entitlement WHERE team_id = $1 AND id = $2
 `
 
 type GetUsageEntitlementParams struct {
@@ -536,6 +737,10 @@ func (q *Queries) GetUsageEntitlement(ctx context.Context, arg GetUsageEntitleme
 		&i.PeriodEnd,
 		&i.AmountCents,
 		&i.Currency,
+		&i.IssuanceSource,
+		&i.ProviderCreatedAt,
+		&i.AdoptedAt,
+		&i.AdoptedAvailableBalanceCents,
 		&i.State,
 		&i.IdempotencyKey,
 		&i.FirstAttemptAt,
@@ -550,8 +755,43 @@ func (q *Queries) GetUsageEntitlement(ctx context.Context, arg GetUsageEntitleme
 	return i, err
 }
 
+const listCommercialEntitlementSchedule = `-- name: ListCommercialEntitlementSchedule :many
+SELECT team_id, contract_id, month_offset, amount_cents FROM billing_contract_entitlement_schedule
+WHERE team_id = $1 AND contract_id = $2 ORDER BY month_offset
+`
+
+type ListCommercialEntitlementScheduleParams struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	ContractID uuid.UUID `json:"contract_id"`
+}
+
+func (q *Queries) ListCommercialEntitlementSchedule(ctx context.Context, arg ListCommercialEntitlementScheduleParams) ([]BillingContractEntitlementSchedule, error) {
+	rows, err := q.db.Query(ctx, listCommercialEntitlementSchedule, arg.TeamID, arg.ContractID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BillingContractEntitlementSchedule{}
+	for rows.Next() {
+		var i BillingContractEntitlementSchedule
+		if err := rows.Scan(
+			&i.TeamID,
+			&i.ContractID,
+			&i.MonthOffset,
+			&i.AmountCents,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUncertainUsageEntitlements = `-- name: ListUncertainUsageEntitlements :many
-SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at FROM billing_usage_entitlement WHERE state = 'uncertain' AND id > $1
+SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at FROM billing_usage_entitlement WHERE state = 'uncertain' AND id > $1
 ORDER BY id LIMIT $2
 `
 
@@ -579,6 +819,10 @@ func (q *Queries) ListUncertainUsageEntitlements(ctx context.Context, arg ListUn
 			&i.PeriodEnd,
 			&i.AmountCents,
 			&i.Currency,
+			&i.IssuanceSource,
+			&i.ProviderCreatedAt,
+			&i.AdoptedAt,
+			&i.AdoptedAvailableBalanceCents,
 			&i.State,
 			&i.IdempotencyKey,
 			&i.FirstAttemptAt,
@@ -607,7 +851,7 @@ UPDATE billing_commercial_contract SET
     collection_evidence = $4, revision = revision + 1
 WHERE team_id = $5 AND id = $6
     AND revision = $7 AND status <> 'ended'
-RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
+RETURNING id, team_id, offer_key, status, starts_at, ends_at, customer_id, subscription_id, base_price_id, charge_kind, charge_amount_cents, charge_interval_months, currency, entitlement_kind, entitlement_amount_cents, entitlement_cadence, entitlement_anchor, collection_has_overdue_balance, collection_checked_at, collection_valid_until, collection_evidence, revision, created_at
 `
 
 type ObserveCommercialCollectionParams struct {
@@ -641,6 +885,7 @@ func (q *Queries) ObserveCommercialCollection(ctx context.Context, arg ObserveCo
 		&i.CustomerID,
 		&i.SubscriptionID,
 		&i.BasePriceID,
+		&i.ChargeKind,
 		&i.ChargeAmountCents,
 		&i.ChargeIntervalMonths,
 		&i.Currency,
@@ -678,7 +923,7 @@ type RecordCommercialBasePaymentParams struct {
 	InvoiceID                   string    `json:"invoice_id"`
 	PaymentReference            string    `json:"payment_reference"`
 	CustomerID                  string    `json:"customer_id"`
-	SubscriptionID              string    `json:"subscription_id"`
+	SubscriptionID              *string   `json:"subscription_id"`
 	BasePriceID                 string    `json:"base_price_id"`
 	ServicePeriodStart          time.Time `json:"service_period_start"`
 	ServicePeriodEnd            time.Time `json:"service_period_end"`

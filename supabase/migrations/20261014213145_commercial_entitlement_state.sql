@@ -9,6 +9,7 @@ CREATE TABLE billing_commercial_contract (
     customer_id text NOT NULL CHECK (btrim(customer_id) <> ''),
     subscription_id text NOT NULL CHECK (btrim(subscription_id) <> ''),
     base_price_id text NOT NULL CHECK (btrim(base_price_id) <> ''),
+    charge_kind text NOT NULL DEFAULT 'subscription' CHECK (charge_kind IN ('subscription', 'upfront')),
     charge_amount_cents bigint NOT NULL CHECK (charge_amount_cents > 0),
     charge_interval_months integer NOT NULL CHECK (charge_interval_months > 0),
     currency text NOT NULL DEFAULT 'usd' CHECK (currency = 'usd'),
@@ -30,12 +31,22 @@ CREATE TABLE billing_commercial_contract (
             AND collection_valid_until <= collection_checked_at + interval '5 minutes'
             AND collection_evidence IS NOT NULL AND jsonb_typeof(collection_evidence) = 'object' AND collection_evidence <> '{}'::jsonb)),
     CHECK (offer_key NOT IN ('pro_monthly', 'pro_annual') OR
-        (entitlement_kind = 'metered_usage' AND entitlement_amount_cents = 100000 AND entitlement_cadence = 'monthly'
+        (charge_kind = 'subscription' AND entitlement_kind = 'metered_usage' AND entitlement_amount_cents = 100000 AND entitlement_cadence = 'monthly'
          AND charge_interval_months = CASE offer_key WHEN 'pro_monthly' THEN 1 ELSE 12 END
          AND charge_amount_cents = CASE offer_key WHEN 'pro_monthly' THEN 120000 ELSE 1200000 END))
 );
 CREATE UNIQUE INDEX billing_commercial_contract_current ON billing_commercial_contract(team_id) WHERE status <> 'ended';
 CREATE UNIQUE INDEX billing_commercial_subscription_current ON billing_commercial_contract(subscription_id) WHERE status <> 'ended';
+
+-- Explicit monthly amounts keep phased offers independent of the cash cadence.
+CREATE TABLE billing_contract_entitlement_schedule (
+    team_id uuid NOT NULL,
+    contract_id uuid NOT NULL,
+    month_offset integer NOT NULL CHECK (month_offset >= 0),
+    amount_cents bigint NOT NULL CHECK (amount_cents > 0),
+    PRIMARY KEY (contract_id, month_offset),
+    FOREIGN KEY (team_id, contract_id) REFERENCES billing_commercial_contract(team_id, id)
+);
 
 -- These are verified base-fee receipts, not arbitrary invoice-paid events.
 -- The payment handler must retrieve and validate provider payment evidence
@@ -47,7 +58,7 @@ CREATE TABLE billing_contract_payment (
     invoice_id text NOT NULL UNIQUE CHECK (btrim(invoice_id) <> ''),
     payment_reference text NOT NULL CHECK (btrim(payment_reference) <> ''),
     customer_id text NOT NULL,
-    subscription_id text NOT NULL,
+    subscription_id text,
     base_price_id text NOT NULL,
     service_period_start timestamptz NOT NULL CHECK (isfinite(service_period_start)),
     service_period_end timestamptz NOT NULL CHECK (isfinite(service_period_end) AND service_period_end > service_period_start),
@@ -73,6 +84,10 @@ CREATE TABLE billing_usage_entitlement (
     period_end timestamptz NOT NULL CHECK (isfinite(period_end) AND period_end > period_start),
     amount_cents bigint NOT NULL CHECK (amount_cents > 0),
     currency text NOT NULL CHECK (currency = 'usd'),
+    issuance_source text NOT NULL DEFAULT 'created' CHECK (issuance_source IN ('created', 'adopted')),
+    provider_created_at timestamptz,
+    adopted_at timestamptz,
+    adopted_available_balance_cents bigint CHECK (adopted_available_balance_cents >= 0 AND adopted_available_balance_cents <= amount_cents),
     state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'uncertain', 'issued')),
     idempotency_key text NOT NULL UNIQUE DEFAULT ('usage-entitlement-' || gen_random_uuid()::text),
     first_attempt_at timestamptz,
@@ -89,10 +104,15 @@ CREATE TABLE billing_usage_entitlement (
     CHECK (length(idempotency_key) BETWEEN 1 AND 255),
     CHECK ((state = 'pending' AND first_attempt_at IS NULL AND request_payload IS NULL
             AND provider_invoice_start IS NULL AND provider_invoice_end IS NULL)
-        OR (state IN ('uncertain', 'issued') AND first_attempt_at IS NOT NULL AND isfinite(first_attempt_at)
+        OR (issuance_source = 'created' AND state IN ('uncertain', 'issued') AND first_attempt_at IS NOT NULL AND isfinite(first_attempt_at)
             AND request_payload IS NOT NULL AND jsonb_typeof(request_payload) = 'object'
             AND provider_invoice_start IS NOT NULL AND isfinite(provider_invoice_start)
-            AND provider_invoice_end IS NOT NULL AND isfinite(provider_invoice_end) AND provider_invoice_end > provider_invoice_start)),
+            AND provider_invoice_end IS NOT NULL AND isfinite(provider_invoice_end) AND provider_invoice_end > provider_invoice_start)
+        OR (issuance_source = 'adopted' AND state = 'issued' AND first_attempt_at IS NULL AND request_payload IS NULL
+            AND provider_invoice_start IS NOT NULL AND provider_invoice_end > provider_invoice_start)),
+    CHECK ((issuance_source = 'created' AND provider_created_at IS NULL AND adopted_at IS NULL AND adopted_available_balance_cents IS NULL)
+        OR (issuance_source = 'adopted' AND state = 'issued' AND provider_created_at IS NOT NULL AND isfinite(provider_created_at)
+            AND adopted_at IS NOT NULL AND isfinite(adopted_at) AND adopted_available_balance_cents IS NOT NULL)),
     CHECK ((state <> 'issued' AND stripe_credit_grant_id IS NULL AND issuance_evidence IS NULL AND issued_at IS NULL)
         OR (state = 'issued' AND stripe_credit_grant_id IS NOT NULL AND issued_at IS NOT NULL
             AND issuance_evidence IS NOT NULL AND jsonb_typeof(issuance_evidence) = 'object' AND issuance_evidence <> '{}'::jsonb))
@@ -118,6 +138,7 @@ END;
 $$;
 
 CREATE FUNCTION guard_billing_commercial_contract() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE months integer;
 BEGIN
     IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'commercial contract history is immutable'; END IF;
     IF TG_OP = 'INSERT' THEN
@@ -125,13 +146,19 @@ BEGIN
             AND stripe_customer_id = NEW.customer_id AND stripe_subscription_id = NEW.subscription_id
             AND commercial_billing_anchor = NEW.entitlement_anchor FOR SHARE;
         IF NOT FOUND THEN RAISE EXCEPTION 'commercial contract billing association or anniversary differs'; END IF;
-        IF NEW.entitlement_cadence = 'monthly' AND NEW.starts_at IS DISTINCT FROM
+        IF NEW.starts_at IS DISTINCT FROM
             (SELECT period_start FROM billing_entitlement_period(NEW.entitlement_anchor, NEW.starts_at)) THEN
             RAISE EXCEPTION 'contract must start on its billing anniversary';
         END IF;
         IF EXISTS (SELECT 1 FROM billing_commercial_contract previous WHERE previous.subscription_id = NEW.subscription_id
             AND (previous.team_id, previous.customer_id) IS DISTINCT FROM (NEW.team_id, NEW.customer_id)) THEN
             RAISE EXCEPTION 'subscription history belongs to another billing account';
+        END IF;
+        IF NEW.charge_kind = 'upfront' AND (NEW.ends_at IS NULL OR NEW.ends_at IS DISTINCT FROM
+            billing_anniversary_boundary(NEW.entitlement_anchor, NEW.charge_interval_months +
+                (extract(year FROM NEW.starts_at AT TIME ZONE 'UTC')::integer - extract(year FROM NEW.entitlement_anchor AT TIME ZONE 'UTC')::integer) * 12
+                + extract(month FROM NEW.starts_at AT TIME ZONE 'UTC')::integer - extract(month FROM NEW.entitlement_anchor AT TIME ZONE 'UTC')::integer)) THEN
+            RAISE EXCEPTION 'upfront payment requires a bounded service term';
         END IF;
         IF NEW.status <> 'pending' OR NEW.revision <> 0 OR NEW.collection_checked_at IS NOT NULL THEN
             RAISE EXCEPTION 'commercial contracts must begin pending';
@@ -154,6 +181,14 @@ BEGIN
         IF OLD.ends_at IS NOT NULL AND (NEW.ends_at IS NULL OR NEW.ends_at > OLD.ends_at) THEN
             RAISE EXCEPTION 'contract end cannot be extended';
         END IF;
+        IF OLD.status = 'pending' AND NEW.status = 'active' AND NEW.entitlement_cadence = 'scheduled' THEN
+            months := (extract(year FROM NEW.ends_at AT TIME ZONE 'UTC')::integer - extract(year FROM NEW.starts_at AT TIME ZONE 'UTC')::integer) * 12
+                + extract(month FROM NEW.ends_at AT TIME ZONE 'UTC')::integer - extract(month FROM NEW.starts_at AT TIME ZONE 'UTC')::integer;
+            IF NEW.ends_at IS NULL OR months <= 0 OR (SELECT count(*) FROM billing_contract_entitlement_schedule WHERE contract_id = NEW.id) <> months
+                OR EXISTS (SELECT 1 FROM billing_contract_entitlement_schedule WHERE contract_id = NEW.id AND month_offset >= months) THEN
+                RAISE EXCEPTION 'scheduled contract requires every monthly amount before activation';
+            END IF;
+        END IF;
         IF OLD.status = 'pending' AND NEW.status = 'active' AND NOT EXISTS (
             SELECT 1 FROM billing_contract_payment p WHERE p.contract_id = NEW.id
                 AND p.service_period_start <= clock_timestamp() AND p.service_period_end > clock_timestamp()) THEN
@@ -166,14 +201,47 @@ $$;
 CREATE TRIGGER billing_commercial_contract_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_commercial_contract
     FOR EACH ROW EXECUTE FUNCTION guard_billing_commercial_contract();
 
+CREATE FUNCTION guard_billing_contract_schedule() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE c billing_commercial_contract; first_month integer;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'entitlement schedule is immutable'; END IF;
+    SELECT * INTO STRICT c FROM billing_commercial_contract WHERE team_id = NEW.team_id AND id = NEW.contract_id FOR UPDATE;
+    first_month := (extract(year FROM c.starts_at AT TIME ZONE 'UTC')::integer - extract(year FROM c.entitlement_anchor AT TIME ZONE 'UTC')::integer) * 12
+        + extract(month FROM c.starts_at AT TIME ZONE 'UTC')::integer - extract(month FROM c.entitlement_anchor AT TIME ZONE 'UTC')::integer;
+    IF c.status <> 'pending' OR c.entitlement_cadence <> 'scheduled' OR c.ends_at IS NULL
+        OR billing_anniversary_boundary(c.entitlement_anchor, first_month + NEW.month_offset + 1) > c.ends_at
+        OR c.ends_at IS DISTINCT FROM (SELECT period_start FROM billing_entitlement_period(c.entitlement_anchor, c.ends_at)) THEN
+        RAISE EXCEPTION 'schedule must be defined within the pending contract term';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER billing_contract_schedule_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_contract_entitlement_schedule
+    FOR EACH ROW EXECUTE FUNCTION guard_billing_contract_schedule();
+
+CREATE FUNCTION billing_contract_entitlement(c billing_commercial_contract, at_time timestamptz)
+RETURNS TABLE(period_start timestamptz, period_end timestamptz, amount_cents bigint) LANGUAGE sql STABLE AS $$
+    SELECT p.period_start, p.period_end, CASE c.entitlement_cadence WHEN 'monthly' THEN c.entitlement_amount_cents ELSE s.amount_cents END
+    FROM billing_entitlement_period(c.entitlement_anchor, at_time) p
+    LEFT JOIN billing_contract_entitlement_schedule s ON s.contract_id = c.id AND s.month_offset =
+        (extract(year FROM p.period_start AT TIME ZONE 'UTC')::integer - extract(year FROM c.starts_at AT TIME ZONE 'UTC')::integer) * 12
+        + extract(month FROM p.period_start AT TIME ZONE 'UTC')::integer - extract(month FROM c.starts_at AT TIME ZONE 'UTC')::integer
+    WHERE p.period_start >= c.starts_at AND (c.ends_at IS NULL OR p.period_end <= c.ends_at)
+        AND (c.entitlement_cadence = 'monthly' OR s.amount_cents IS NOT NULL);
+$$;
+
 CREATE FUNCTION guard_billing_contract_payment() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE c billing_commercial_contract; m integer; first_month integer;
 BEGIN
     IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'base payment evidence is immutable'; END IF;
     SELECT * INTO STRICT c FROM billing_commercial_contract WHERE team_id = NEW.team_id AND id = NEW.contract_id FOR SHARE;
     IF (NEW.customer_id, NEW.subscription_id, NEW.base_price_id, NEW.currency, NEW.base_amount_paid_cents)
-        IS DISTINCT FROM (c.customer_id, c.subscription_id, c.base_price_id, c.currency, c.charge_amount_cents) THEN
+        IS DISTINCT FROM (c.customer_id, CASE c.charge_kind WHEN 'subscription' THEN c.subscription_id ELSE NULL END, c.base_price_id, c.currency, c.charge_amount_cents) THEN
         RAISE EXCEPTION 'base payment does not match commercial terms';
+    END IF;
+    IF c.charge_kind = 'upfront' AND ((NEW.service_period_start, NEW.service_period_end) IS DISTINCT FROM (c.starts_at, c.ends_at)
+        OR NEW.evidence->'parent' IS DISTINCT FROM 'null'::jsonb) THEN
+        RAISE EXCEPTION 'upfront receipt requires standalone invoice and exact contract term';
     END IF;
     IF c.status = 'ended' OR NEW.service_period_start < c.starts_at OR NEW.paid_at > clock_timestamp()
         OR NEW.verified_at > clock_timestamp() THEN RAISE EXCEPTION 'invalid base payment period or verification time'; END IF;
@@ -207,31 +275,96 @@ RETURNS boolean LANGUAGE sql VOLATILE AS $$
             AND a.stripe_customer_id = c.customer_id AND a.stripe_subscription_id = c.subscription_id);
 $$;
 
+-- Adopt before activation, atomically reserving the period so workers cannot
+-- race an existing provider grant with a new create/replay path.
+-- The caller must retrieve the grant and its available balance before this write.
+CREATE FUNCTION billing_validate_entitlement_adoption(v billing_usage_entitlement) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE c billing_commercial_contract; evidence jsonb := v.issuance_evidence;
+BEGIN
+    SELECT * INTO STRICT c FROM billing_commercial_contract WHERE id = v.contract_id FOR UPDATE;
+    IF c.status <> 'pending'
+        OR NOT EXISTS (SELECT 1 FROM billing_contract_payment p WHERE p.id = v.payment_id AND p.contract_id = c.id
+            AND p.service_period_start <= v.period_start AND p.service_period_end >= v.period_end)
+        OR NOT EXISTS (SELECT 1 FROM team_billing_account a WHERE a.team_id = c.team_id
+            AND a.stripe_customer_id = c.customer_id AND a.stripe_subscription_id = c.subscription_id)
+        OR v.period_start > clock_timestamp() OR v.period_end <= clock_timestamp()
+        OR v.adopted_at > clock_timestamp() OR v.adopted_at < clock_timestamp() - interval '1 minute'
+        OR v.provider_created_at <> date_trunc('second', v.provider_created_at)
+        OR v.provider_created_at > v.adopted_at OR v.provider_created_at < c.starts_at
+        OR v.issued_at IS DISTINCT FROM v.provider_created_at
+        OR (evidence->>'created')::bigint IS DISTINCT FROM extract(epoch FROM v.provider_created_at)::bigint
+        OR evidence->>'id' IS DISTINCT FROM v.stripe_credit_grant_id
+        OR evidence->>'customer' IS DISTINCT FROM c.customer_id
+        OR evidence->>'category' IS DISTINCT FROM 'promotional'
+        OR evidence #>> '{amount,type}' IS DISTINCT FROM 'monetary'
+        OR evidence #>> '{amount,monetary,currency}' IS DISTINCT FROM v.currency
+        OR (evidence #>> '{amount,monetary,value}')::bigint IS DISTINCT FROM v.amount_cents
+        OR (evidence->>'available_balance_cents')::bigint IS DISTINCT FROM v.adopted_available_balance_cents
+        OR evidence #>> '{metadata,superserve_offer}' IS DISTINCT FROM c.offer_key
+        OR evidence #>> '{metadata,superserve_contract_version}' IS DISTINCT FROM '1'
+        OR evidence #>> '{metadata,superserve_object_role}' IS DISTINCT FROM 'monthly_usage_entitlement'
+        OR evidence #>> '{metadata,superserve_team_id}' IS DISTINCT FROM v.team_id::text
+        OR evidence #>> '{metadata,superserve_contract_id}' IS DISTINCT FROM v.contract_id::text
+        OR evidence #>> '{metadata,superserve_entitlement}' IS DISTINCT FROM
+            v.contract_id::text || ':usage:' || extract(epoch FROM v.period_start)::bigint::text || ':' || extract(epoch FROM v.period_end)::bigint::text
+        OR (evidence #>> '{metadata,superserve_period_start}')::bigint IS DISTINCT FROM extract(epoch FROM v.period_start)::bigint
+        OR (evidence #>> '{metadata,superserve_period_end}')::bigint IS DISTINCT FROM extract(epoch FROM v.period_end)::bigint
+        OR (evidence->>'effective_at')::bigint < extract(epoch FROM v.provider_invoice_start)::bigint + 1
+        OR (evidence->>'effective_at')::bigint < extract(epoch FROM v.provider_created_at)::bigint
+        OR (evidence->>'effective_at')::bigint > ceil(extract(epoch FROM v.adopted_at))::bigint
+        OR evidence->>'effective_at' IS NULL
+        OR (evidence->>'expires_at')::bigint IS DISTINCT FROM extract(epoch FROM v.provider_invoice_end)::bigint + 1
+        OR jsonb_typeof(evidence #> '{applicability_config,scope,prices}') IS DISTINCT FROM 'array'
+        OR jsonb_array_length(evidence #> '{applicability_config,scope,prices}') = 0
+        OR evidence #> '{applicability_config,scope,price_type}' IS NOT NULL THEN
+        RAISE EXCEPTION 'adopted grant does not match the entitlement';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM billing_invoice_calendar cal WHERE cal.team_id = v.team_id
+        AND cal.period_start = v.period_start AND cal.period_end = v.period_end
+        AND cal.customer_id = c.customer_id AND cal.subscription_id = c.subscription_id
+        AND cal.invoice_start = v.provider_invoice_start AND cal.invoice_end = v.provider_invoice_end)
+        OR v.provider_invoice_start <> date_trunc('second', v.provider_invoice_start)
+        OR v.provider_invoice_end <> date_trunc('second', v.provider_invoice_end)
+        OR v.provider_invoice_start >= v.period_end OR v.provider_invoice_end < v.period_end THEN
+        RAISE EXCEPTION 'adopted grant differs from the authoritative calendar';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(evidence #> '{applicability_config,scope,prices}') price
+        WHERE jsonb_typeof(price->'id') IS DISTINCT FROM 'string' OR btrim(price->>'id') = '' OR price->>'id' = c.base_price_id) THEN
+        RAISE EXCEPTION 'adopted grant price scope is invalid';
+    END IF;
+END;
+$$;
+
 CREATE FUNCTION guard_billing_usage_entitlement() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE c billing_commercial_contract; p billing_contract_payment; s timestamptz; e timestamptz;
+DECLARE c billing_commercial_contract; p billing_contract_payment; s timestamptz; e timestamptz; amount bigint;
 BEGIN
     IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'entitlement history is immutable'; END IF;
     IF TG_OP = 'INSERT' THEN
         SELECT * INTO STRICT c FROM billing_commercial_contract WHERE team_id = NEW.team_id AND id = NEW.contract_id FOR UPDATE;
         SELECT * INTO STRICT p FROM billing_contract_payment WHERE team_id = NEW.team_id AND contract_id = NEW.contract_id AND id = NEW.payment_id;
-        IF NEW.state <> 'pending' OR (NEW.kind, NEW.amount_cents, NEW.currency)
-            IS DISTINCT FROM (c.entitlement_kind, c.entitlement_amount_cents, c.currency)
-            OR NOT billing_contract_eligible(c, NEW.period_start, NEW.period_end)
+        SELECT period_start, period_end, amount_cents INTO s, e, amount FROM billing_contract_entitlement(c, clock_timestamp());
+        IF (NEW.kind, NEW.amount_cents, NEW.currency)
+            IS DISTINCT FROM (c.entitlement_kind, amount, c.currency)
             OR p.service_period_start > NEW.period_start OR p.service_period_end < NEW.period_end THEN
             RAISE EXCEPTION 'entitlement lacks eligible paid contract';
         END IF;
-        IF c.entitlement_cadence = 'monthly' THEN
-            SELECT period_start, period_end INTO s, e FROM billing_entitlement_period(c.entitlement_anchor, clock_timestamp());
-            IF s IS NULL OR (NEW.period_start, NEW.period_end) IS DISTINCT FROM (s, e) THEN
-                RAISE EXCEPTION 'only the current anniversary period can be claimed';
-            END IF;
+        IF s IS NULL OR (NEW.period_start, NEW.period_end) IS DISTINCT FROM (s, e) THEN
+            RAISE EXCEPTION 'only the current anniversary period can be claimed';
+        END IF;
+        IF NEW.issuance_source = 'adopted' AND NEW.state = 'issued' THEN
+            PERFORM billing_validate_entitlement_adoption(NEW);
+        ELSIF NEW.issuance_source <> 'created' OR NEW.state <> 'pending' OR NOT billing_contract_eligible(c, NEW.period_start, NEW.period_end) THEN
+            RAISE EXCEPTION 'entitlement lacks eligible paid contract';
         END IF;
     ELSE
-        IF (to_jsonb(NEW) - ARRAY['state','first_attempt_at','request_payload','provider_invoice_start','provider_invoice_end','stripe_credit_grant_id','issuance_evidence','issued_at'])
-            IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['state','first_attempt_at','request_payload','provider_invoice_start','provider_invoice_end','stripe_credit_grant_id','issuance_evidence','issued_at']) THEN
+        IF (to_jsonb(NEW) - ARRAY['state','first_attempt_at','request_payload','provider_invoice_start','provider_invoice_end','stripe_credit_grant_id','issuance_evidence','issued_at','issuance_source','provider_created_at','adopted_at','adopted_available_balance_cents'])
+            IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['state','first_attempt_at','request_payload','provider_invoice_start','provider_invoice_end','stripe_credit_grant_id','issuance_evidence','issued_at','issuance_source','provider_created_at','adopted_at','adopted_available_balance_cents']) THEN
             RAISE EXCEPTION 'entitlement terms and identity are immutable';
         END IF;
         IF OLD.state = 'issued' THEN RAISE EXCEPTION 'issued entitlement is immutable'; END IF;
+        IF NEW.issuance_source IS DISTINCT FROM OLD.issuance_source THEN
+            RAISE EXCEPTION 'adoption cannot replace an issuance intent';
+        END IF;
         IF OLD.state = 'uncertain' THEN
             IF NEW.state NOT IN ('uncertain','issued') OR
                 (NEW.first_attempt_at, NEW.request_payload, NEW.provider_invoice_start, NEW.provider_invoice_end)
@@ -298,7 +431,7 @@ CREATE TRIGGER billing_usage_entitlement_guard BEFORE INSERT OR UPDATE OR DELETE
 DO $$
 DECLARE t text; r text; f regprocedure;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['billing_commercial_contract','billing_contract_payment','billing_usage_entitlement'] LOOP
+    FOREACH t IN ARRAY ARRAY['billing_commercial_contract','billing_contract_entitlement_schedule','billing_contract_payment','billing_usage_entitlement'] LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('REVOKE ALL ON TABLE %I FROM PUBLIC', t);
         FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
@@ -313,7 +446,8 @@ BEGIN
     END LOOP;
     FOR f IN SELECT oid::regprocedure FROM pg_proc WHERE pronamespace = 'public'::regnamespace
         AND proname IN ('billing_anniversary_boundary','billing_entitlement_period','billing_contract_eligible',
-            'guard_billing_commercial_contract','guard_billing_contract_payment','guard_billing_usage_entitlement') LOOP
+            'guard_billing_commercial_contract','guard_billing_contract_payment','guard_billing_usage_entitlement',
+            'guard_billing_contract_schedule','billing_contract_entitlement','billing_validate_entitlement_adoption') LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', f);
         FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
