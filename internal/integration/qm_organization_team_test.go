@@ -101,6 +101,44 @@ func TestQMOrganizationTeam(t *testing.T) {
 	if n := teamCreationCount(t, pool, `SELECT count(*) FROM qm_organization_teams WHERE qm_org_id=$1`, org); n != 1 {
 		t.Fatal("duplicate binding")
 	}
+	t.Run("independent organizations and managed billing", func(t *testing.T) {
+		other := uuid.NewString()
+		w := call("POST", other, "qm-org:v1:"+other, token)
+		var second map[string]string
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &second) != nil || second["ss_team_id"] == id {
+			t.Fatal("independent organizations share a team", w.Code)
+		}
+		for _, team := range []string{id, second["ss_team_id"]} {
+			if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_signup_trial_provenance WHERE team_id=$1`, team); n != 0 {
+				t.Fatal("managed team entered human signup")
+			}
+			if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_credit_grant WHERE team_id=$1`, team); n != 0 {
+				t.Fatal("managed team received signup credits")
+			}
+			if n := teamCreationCount(t, pool, `SELECT count(*) WHERE team_sandbox_billing_eligible($1) AND feature_enabled('billing_metrics_write',$1) AND feature_enabled('billing_hourly_rollups',$1)`, team); n != 1 {
+				t.Fatal("managed team requires payment or lost metering")
+			}
+			// These guard older writers as well as the HTTP checkout route.
+			for _, statement := range []string{
+				`INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason) VALUES($1,5,5,'signup trial credit')`,
+				`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_example')`,
+				`INSERT INTO team_signup_trial_provenance(team_id) VALUES($1)`,
+			} {
+				tx, err := pool.Begin(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				localIdentityError(t, tx, "23514", statement, team)
+				tx.Rollback(context.Background())
+			}
+		}
+		// Normal human-created teams retain their existing signup gate.
+		ordinary := uuid.NewString()
+		rolloutExec(t, pool, `INSERT INTO team(id,name,home_region) VALUES($1,$2,'use')`, ordinary, "ordinary-"+ordinary)
+		if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_signup_trial_provenance WHERE team_id=$1`, ordinary); n != 1 {
+			t.Fatal("ordinary signup behavior changed")
+		}
+	})
 	t.Run("rollback leaves no team", func(t *testing.T) {
 		badOrg := uuid.NewString()
 		rolloutExec(t, pool, `CREATE FUNCTION reject_qm_binding() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test failure'; END $$`)
@@ -131,6 +169,7 @@ func TestQMOrganizationTeam(t *testing.T) {
 		}
 	})
 	t.Run("deletion cannot recreate or resurrect", func(t *testing.T) {
+		rolloutExec(t, pool, `DELETE FROM team_feature_flag WHERE team_id=$1`, id)
 		rolloutExec(t, pool, `DELETE FROM team WHERE id=$1`, id)
 		for _, method := range []string{"GET", "POST"} {
 			if w := call(method, org, key, token); w.Code != 410 {

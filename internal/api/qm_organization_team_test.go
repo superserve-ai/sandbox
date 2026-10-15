@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestQMTeamBodyDeadlinePrecedesAuthentication(t *testing.T) {
@@ -30,5 +33,26 @@ func TestQMTeamBodyDeadlinePrecedesAuthentication(t *testing.T) {
 		if !authenticated && (w.Code != 401 || body.reads != 0) {
 			t.Fatal("unauthenticated body was read")
 		}
+	}
+}
+
+type qmTeamErrorQuery struct{ err error }
+
+func (q qmTeamErrorQuery) QueryRow(context.Context, string, ...any) pgx.Row {
+	return qmTeamErrorRow{q.err}
+}
+
+type qmTeamErrorRow struct{ err error }
+
+func (r qmTeamErrorRow) Scan(...any) error { return r.err }
+func TestQMTeamAuthorityFailureIsNotConflictOrAbsence(t *testing.T) {
+	for _, failure := range []error{context.DeadlineExceeded, errors.New("synthetic database unavailable")} {
+		_, err := readQMTeam(context.Background(), qmTeamErrorQuery{failure}, qmTeamConfig{}, "org")
+		if !errors.Is(err, failure) || errors.Is(err, errQMTeamConflict) || errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal("transient failure misclassified", err)
+		}
+	}
+	if _, err := readQMTeam(context.Background(), qmTeamErrorQuery{pgx.ErrNoRows}, qmTeamConfig{}, "org"); !errors.Is(err, errQMTeamConflict) {
+		t.Fatal("missing authority must not authorize creation")
 	}
 }

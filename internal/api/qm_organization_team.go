@@ -111,24 +111,34 @@ func readQMTeam(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, cfg qmTeamConfig, org string) (qmTeamResult, error) {
 	var authority, regionIdentity string
-	if err := q.QueryRow(ctx, `SELECT authority_id::text,home_region FROM qm_team_service_authority WHERE namespace=$1`, cfg.namespace).Scan(&authority, &regionIdentity); err != nil || authority != cfg.authority || regionIdentity != cfg.region {
+	result := qmTeamResult{QMOrgID: org, Namespace: cfg.namespace}
+	var key, teamID, bindingAuthority, region, liveID *string
+	// One statement verifies the database identity and reads the mapping on the
+	// same connection, including when the pool routes different connections.
+	err := q.QueryRow(ctx, `SELECT a.authority_id::text,a.home_region,b.idempotency_key,b.team_id::text,b.authority_id::text,b.home_region,t.id::text
+ FROM qm_team_service_authority a
+ LEFT JOIN qm_organization_teams b ON b.namespace=a.namespace AND b.qm_org_id=$2
+ LEFT JOIN team t ON t.id=b.team_id AND t.home_region=b.home_region AND b.deleted_at IS NULL
+ WHERE a.namespace=$1`, cfg.namespace, org).Scan(&authority, &regionIdentity, &key, &teamID, &bindingAuthority, &region, &liveID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return qmTeamResult{}, errQMTeamConflict
 	}
-	result := qmTeamResult{QMOrgID: org, Namespace: cfg.namespace}
-	var liveID *string
-	var region string
-	err := q.QueryRow(ctx, `SELECT b.idempotency_key,b.team_id::text,b.authority_id::text,b.home_region,t.id::text
- FROM qm_organization_teams b LEFT JOIN team t ON t.id=b.team_id AND t.home_region=b.home_region AND b.deleted_at IS NULL
- WHERE b.namespace=$1 AND b.qm_org_id=$2`, cfg.namespace, org).Scan(&result.IdempotencyKey, &result.SSTeamID, &result.AuthorityID, &region, &liveID)
 	if err != nil {
 		return qmTeamResult{}, err
 	}
-	if result.AuthorityID != cfg.authority || region != cfg.region || result.IdempotencyKey != "qm-org:v1:"+org {
+	if authority != cfg.authority || regionIdentity != cfg.region {
+		return qmTeamResult{}, errQMTeamConflict
+	}
+	if key == nil {
+		return qmTeamResult{}, pgx.ErrNoRows
+	}
+	if teamID == nil || bindingAuthority == nil || region == nil || *bindingAuthority != cfg.authority || *region != cfg.region || *key != "qm-org:v1:"+org {
 		return qmTeamResult{}, errQMTeamConflict
 	}
 	if liveID == nil {
 		return qmTeamResult{}, errQMTeamGone
 	}
+	result.IdempotencyKey, result.SSTeamID, result.AuthorityID = *key, *teamID, *bindingAuthority
 	return result, nil
 }
 
@@ -146,11 +156,15 @@ func ensureQMTeam(ctx context.Context, pool *pgxpool.Pool, cfg qmTeamConfig, org
 		return result, err
 	}
 	id := uuid.NewString()
+	// Publish managed policy before team INSERT triggers run, in this transaction.
+	if _, err = tx.Exec(ctx, `INSERT INTO qm_organization_teams(namespace,qm_org_id,idempotency_key,authority_id,team_id,home_region) VALUES($1,$2,$3,$4,$5,$6)`, cfg.namespace, org, "qm-org:v1:"+org, cfg.authority, id, cfg.region); err != nil {
+		return qmTeamResult{}, err
+	}
 	// Names are not ownership evidence. A conflicting name aborts this transaction.
 	if _, err = tx.Exec(ctx, `INSERT INTO team(id,name,home_region) VALUES($1,$2,$3)`, id, "qm-"+cfg.namespace+"-"+org, cfg.region); err != nil {
 		return qmTeamResult{}, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO qm_organization_teams(namespace,qm_org_id,idempotency_key,authority_id,team_id,home_region) VALUES($1,$2,$3,$4,$5,$6)`, cfg.namespace, org, "qm-org:v1:"+org, cfg.authority, id, cfg.region); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_metrics_write',true),($1,'billing_hourly_rollups',true)`, id); err != nil {
 		return qmTeamResult{}, err
 	}
 	result, err = readQMTeam(ctx, tx, cfg, org)

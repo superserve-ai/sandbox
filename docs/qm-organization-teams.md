@@ -23,6 +23,27 @@ advisory lock. Team names do not authorize adoption. Deleting the team permanent
 tombstones its binding, including if someone later reinserts the same team UUID.
 Deleting or replacing a QM deployment must never call a team deletion endpoint.
 
+## Billing and runtime authority
+
+The immutable organization binding is also the protected managed-billing policy.
+It is inserted before the team in the same transaction, so human signup and
+checkout initialization never run for that team. Database guards reject signup
+credits and individual Stripe customer/subscription enrollment, including writes
+from older API versions. Sandbox billing eligibility recognizes the managed payer;
+normal abuse controls and machine authorization still apply.
+
+Compute/storage intervals and hourly usage stay attributed to the Superserve team.
+Provisioning explicitly enables metrics and hourly rollups. No billing-disabled
+flag or synthetic subscription is used. QM's customer charging remains a separate
+service concern.
+
+Machine principals are created under the verified backing team and retain their
+tenant, template and sandbox ownership restrictions. Only the scoped machine
+credential reaches a tenant runtime. Team creation and machine administration
+credentials remain in the control plane. Two-organization integration coverage uses
+real credential resolution, scoped sandbox creation, cross-team denial and the
+production usage-rollup query with a synthetic VM transport.
+
 ## Deployment
 
 Configure `QM_TEAM_SERVICE_TOKEN`, `QM_TEAM_NAMESPACE`, `QM_TEAM_AUTHORITY_ID`
