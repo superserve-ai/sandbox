@@ -71,8 +71,13 @@ func (h *Handlers) AdoptBillingExports(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	states, err := h.billingSubscriptionResourceStates(ctx, team, derefString(account.StripeSubscriptionID), storage)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
 	resources := map[[2]string]bool{}
-	for _, resource := range h.billingResourceStates(storage) {
+	for _, resource := range states {
 		if resource.Billable {
 			resources[[2]string{billingExportResourceType(resource.ResourceKey), resource.StripeEventName}] = true
 		}
@@ -343,8 +348,13 @@ func (h *Handlers) ApplyBillingCorrection(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	states, err := h.billingSubscriptionResourceStates(ctx, p.TeamID, derefString(account.StripeSubscriptionID), storage)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
 	eventName := ""
-	for _, state := range h.billingResourceStates(storage) {
+	for _, state := range states {
 		if billingExportResourceType(state.ResourceKey) == resource && (!needsAllocation || state.Billable) {
 			eventName = state.StripeEventName
 		}

@@ -96,6 +96,10 @@ func (h *Handlers) ensureInvoiceCalendar(ctx context.Context, p billing.ExportPe
 	if err != nil {
 		return p, err
 	}
+	sub, err = a.Base.stripSubscription(sub)
+	if err != nil {
+		return p, err
+	}
 	if sub.Customer != a.Customer {
 		return p, fmt.Errorf("invoice calendar customer changed")
 	}

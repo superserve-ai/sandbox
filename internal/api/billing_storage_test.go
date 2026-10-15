@@ -43,7 +43,7 @@ func TestStorageSubscriptionReadiness(t *testing.T) {
 		reconcile bool
 		failure   string
 	}{
-		{"preload", 0, true, ""}, {"already ready", 1, true, ""}, {"verify missing", 0, false, "has 0"},
+		{"annual Pro archived", 1, false, ""}, {"annual Pro archived missing storage", 0, true, "archived"}, {"annual Pro", 1, false, ""}, {"annual Pro wrong fee", 1, false, "licensed"}, {"annual Pro duplicate", 1, false, "duplicated"}, {"annual Pro missing", 1, false, "missing"}, {"preload", 0, true, ""}, {"already ready", 1, true, ""}, {"verify missing", 0, false, "has 0"},
 		{"duplicate", 2, true, "has 2"}, {"wrong price", 1, true, "conflicting"},
 		{"wrong customer", 1, false, "association"}, {"wrong meter", 1, false, "mapping"},
 		{"wrong rate", 1, false, "canonical"}, {"anchor changed", 0, true, "anchor changed"},
@@ -57,7 +57,7 @@ func TestStorageSubscriptionReadiness(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			items, posts, subReads := tc.initial, 0, 0
 			price := func(id string) map[string]any {
-				return map[string]any{"id": id, "product": "prod_storage", "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": "0.0108", "recurring": map[string]any{"usage_type": "metered", "meter": "mtr_storage", "interval": "month", "interval_count": 1}}
+				return map[string]any{"id": id, "product": "prod_storage", "active": !strings.Contains(tc.name, "archived"), "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": "0.0108", "recurring": map[string]any{"usage_type": "metered", "meter": "mtr_storage", "interval": "month", "interval_count": 1}}
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -85,7 +85,7 @@ func TestStorageSubscriptionReadiness(t *testing.T) {
 					if tc.name == "anchor changed" && subReads > 1 {
 						anchor++
 					}
-					out = map[string]any{"id": "sub_example", "customer": customer, "status": "active", "billing_cycle_anchor": anchor}
+					out = map[string]any{"id": "sub_example", "customer": customer, "status": "active", "billing_cycle_anchor": anchor, "billing_mode": map[string]any{"type": "flexible"}}
 				case "/v1/subscription_items":
 					if r.Method == http.MethodPost {
 						posts++
@@ -116,6 +116,17 @@ func TestStorageSubscriptionReadiness(t *testing.T) {
 							}
 							data = append(data, map[string]any{"id": fmt.Sprintf("si_%d", i), "price": price(id)})
 						}
+						if strings.HasPrefix(tc.name, "annual Pro") && tc.name != "annual Pro missing" {
+							amount := "1200000"
+							if tc.name == "annual Pro wrong fee" {
+								amount = "1"
+							}
+							base := map[string]any{"id": "si_base", "quantity": 1, "price": map[string]any{"id": "price_base", "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": amount, "recurring": map[string]any{"usage_type": "licensed", "interval": "year", "interval_count": 1}}}
+							data = append(data, base)
+							if tc.name == "annual Pro duplicate" {
+								data = append(data, base)
+							}
+						}
 						out = map[string]any{"data": data, "has_more": more}
 					}
 				case "/v1/billing/credit_grants":
@@ -145,6 +156,10 @@ func TestStorageSubscriptionReadiness(t *testing.T) {
 			defer server.Close()
 			client := &stripeHTTPClient{baseURL: server.URL, secretKey: "sk_test_example", apiVersion: "2025-06-30.basil", httpClient: server.Client()}
 			p := StripeStorageSubscriptionParams{SubscriptionID: "sub_example", CustomerID: "cus_example", PriceID: "price_storage", EventName: "storage_gib_hours", UnitAmountDecimal: "0.0108", Reconcile: tc.reconcile}
+			if strings.HasPrefix(tc.name, "annual Pro") {
+				p.Base = invoiceBase{Price: "price_base", Amount: 1200000, Months: 12}
+				p.PurchasedTerms = &StripeCheckoutResourceTerms{ResourceKey: "storage_gib", PriceID: "price_storage", EventName: "storage_gib_hours", MeterID: "mtr_storage", UnitAmountDecimal: "0.0108"}
+			}
 			err := client.EnsureStorageSubscription(context.Background(), p)
 			if tc.failure != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.failure) {

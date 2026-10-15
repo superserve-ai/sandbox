@@ -634,6 +634,27 @@ type BillingPeriodAnomaly struct {
 	ResolvedBy  pgtype.UUID        `json:"resolved_by"`
 }
 
+type BillingProClosedPurchase struct {
+	TeamID         uuid.UUID `json:"team_id"`
+	Generation     time.Time `json:"generation"`
+	SessionID      string    `json:"session_id"`
+	SubscriptionID string    `json:"subscription_id"`
+	Evidence       []byte    `json:"evidence"`
+}
+
+type BillingProInvoiceSeen struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	InvoiceID string    `json:"invoice_id"`
+	CheckedAt time.Time `json:"checked_at"`
+}
+
+type BillingProPaymentVerification struct {
+	InvoiceID      string    `json:"invoice_id"`
+	ReviewRequired bool      `json:"review_required"`
+	ObservedAt     time.Time `json:"observed_at"`
+	Evidence       []byte    `json:"evidence"`
+}
+
 type BillingRollupBackfillState struct {
 	Name          string    `json:"name"`
 	NextHourStart time.Time `json:"next_hour_start"`
@@ -667,6 +688,24 @@ type BillingRollupTeamBackfillState struct {
 	TeamID        uuid.UUID `json:"team_id"`
 	NextHourStart time.Time `json:"next_hour_start"`
 	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type BillingSignupChoice struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	OfferKey          *string            `json:"offer_key"`
+	State             string             `json:"state"`
+	Generation        pgtype.Timestamptz `json:"generation"`
+	ActorID           pgtype.UUID        `json:"actor_id"`
+	BasePriceID       *string            `json:"base_price_id"`
+	RequestPayload    []byte             `json:"request_payload"`
+	SessionID         *string            `json:"session_id"`
+	SubscriptionID    *string            `json:"subscription_id"`
+	NextCheckAt       time.Time          `json:"next_check_at"`
+	LastError         *string            `json:"last_error"`
+	InvoiceCursor     *string            `json:"invoice_cursor"`
+	PaidObservedAt    pgtype.Timestamptz `json:"paid_observed_at"`
+	PaidObservedUntil pgtype.Timestamptz `json:"paid_observed_until"`
+	Revision          int64              `json:"revision"`
 }
 
 type BillingUsageEntitlement struct {

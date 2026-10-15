@@ -101,6 +101,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/stripe/checkout-session", h.CreateStripeCheckoutSession)
 		api.POST("/stripe/checkout-session/publication-decision", PromotionAccountAuth(), h.CreateStripeCheckoutSession)
 		api.POST("/stripe/checkout-session/recover", h.RecoverStripeCheckoutSession)
+		api.POST("/stripe/plan-choice", h.CommitFreeSignupPlan)
+		api.POST("/stripe/pro-checkout/recover", h.RecoverProCheckout)
 		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
 
 		// RBAC Phase 2b customer-facing team management.

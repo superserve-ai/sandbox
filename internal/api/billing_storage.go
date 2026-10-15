@@ -15,12 +15,15 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 type StripeStorageSubscriptionParams struct {
+	PurchasedTerms                                                    *StripeCheckoutResourceTerms
 	SubscriptionID, CustomerID, PriceID, EventName, UnitAmountDecimal string
+	Base                                                              invoiceBase
 	Reconcile, AllowInactive                                          bool
 }
 
@@ -57,6 +60,9 @@ type storageSubscription struct {
 	Customer           string `json:"customer"`
 	Status             string `json:"status"`
 	BillingCycleAnchor int64  `json:"billing_cycle_anchor"`
+	BillingMode        struct {
+		Type string `json:"type"`
+	} `json:"billing_mode"`
 }
 
 func (c *stripeHTTPClient) EnsureStorageSubscription(ctx context.Context, p StripeStorageSubscriptionParams) error {
@@ -66,7 +72,13 @@ func (c *stripeHTTPClient) EnsureStorageSubscription(ctx context.Context, p Stri
 	}
 	amount, ok := new(big.Rat).SetString(price.UnitAmountDecimal)
 	expected, expectedOK := new(big.Rat).SetString(p.UnitAmountDecimal)
-	if price.ID != p.PriceID || price.Product == "" || !price.Active || price.Currency != "usd" || price.BillingScheme != "per_unit" || price.TransformQuantity != nil || !ok || !expectedOK || amount.Cmp(expected) != 0 || price.Recurring.UsageType != "metered" || price.Recurring.Meter == "" || price.Recurring.Interval != "month" || price.Recurring.IntervalCount != 1 {
+	if p.PurchasedTerms != nil {
+		frozenAmount, err := meterDecimal(p.PurchasedTerms.UnitAmountDecimal)
+		if err != nil || !ok || amount.Cmp(frozenAmount) != 0 || price.Recurring.Meter != p.PurchasedTerms.MeterID {
+			return fmt.Errorf("storage price differs from purchased resource terms")
+		}
+	}
+	if price.ID != p.PriceID || price.Product == "" || (!price.Active && p.PurchasedTerms == nil) || price.Currency != "usd" || price.BillingScheme != "per_unit" || price.TransformQuantity != nil || !ok || !expectedOK || amount.Cmp(expected) != 0 || price.Recurring.UsageType != "metered" || price.Recurring.Meter == "" || price.Recurring.Interval != "month" || price.Recurring.IntervalCount != 1 {
 		return fmt.Errorf("storage price %s must match the canonical USD/GiB-hour rate and monthly metered configuration", p.PriceID)
 	}
 	var meter struct {
@@ -99,17 +111,23 @@ func (c *stripeHTTPClient) EnsureStorageSubscription(ctx context.Context, p Stri
 		if err == nil && (sub.ID != p.SubscriptionID || sub.Customer != p.CustomerID || !p.AllowInactive && sub.Status != "active" && sub.Status != "trialing" && sub.Status != "past_due") {
 			err = fmt.Errorf("current subscription/customer association is not active; reconcile billing account first")
 		}
+		if err == nil && p.Base.Price != "" && sub.BillingMode.Type != "flexible" {
+			err = fmt.Errorf("Pro storage requires flexible billing")
+		}
 		return sub, err
 	}
 	before, err := readSubscription()
 	if err != nil {
 		return err
 	}
-	count, err := c.storageSubscriptionItems(ctx, p.SubscriptionID, price)
+	count, err := c.storageSubscriptionItems(ctx, p.SubscriptionID, price, p.Base)
 	if err != nil {
 		return err
 	}
 	if count == 0 && p.Reconcile {
+		if !price.Active {
+			return fmt.Errorf("archived storage price cannot be added to a subscription")
+		}
 		form := url.Values{"subscription": {p.SubscriptionID}, "price": {p.PriceID}, "proration_behavior": {"none"}}
 		// The account row lock serializes writers beyond Stripe's idempotency
 		// retention; a fresh item inventory also handles an accepted lost reply.
@@ -117,7 +135,7 @@ func (c *stripeHTTPClient) EnsureStorageSubscription(ctx context.Context, p Stri
 		if err = c.doForm(ctx, http.MethodPost, "/v1/subscription_items", form, nil, key); err != nil {
 			return err
 		}
-		count, err = c.storageSubscriptionItems(ctx, p.SubscriptionID, price)
+		count, err = c.storageSubscriptionItems(ctx, p.SubscriptionID, price, p.Base)
 		if err != nil {
 			return err
 		}
@@ -135,8 +153,8 @@ func (c *stripeHTTPClient) EnsureStorageSubscription(ctx context.Context, p Stri
 	return c.checkStorageCreditScopes(ctx, p.CustomerID, p.PriceID)
 }
 
-func (c *stripeHTTPClient) storageSubscriptionItems(ctx context.Context, subID string, wanted storagePrice) (int, error) {
-	count := 0
+func (c *stripeHTTPClient) storageSubscriptionItems(ctx context.Context, subID string, wanted storagePrice, base invoiceBase) (int, error) {
+	count, baseCount := 0, 0
 	after := ""
 	for page := 0; page < 10; page++ {
 		query := url.Values{"subscription": {subID}, "limit": {"100"}}
@@ -145,8 +163,9 @@ func (c *stripeHTTPClient) storageSubscriptionItems(ctx context.Context, subID s
 		}
 		var result struct {
 			Data []struct {
-				ID    string       `json:"id"`
-				Price storagePrice `json:"price"`
+				ID       string       `json:"id"`
+				Quantity int64        `json:"quantity"`
+				Price    storagePrice `json:"price"`
 			} `json:"data"`
 			HasMore bool `json:"has_more"`
 		}
@@ -154,6 +173,18 @@ func (c *stripeHTTPClient) storageSubscriptionItems(ctx context.Context, subID s
 			return 0, err
 		}
 		for _, item := range result.Data {
+			if base.Price != "" && item.Price.ID == base.Price {
+				interval := "month"
+				if base.Months == 12 {
+					interval = "year"
+				}
+				p := item.Price
+				if item.Quantity != 1 || p.Currency != "usd" || p.UnitAmountDecimal != fmt.Sprint(base.Amount) || p.Recurring.UsageType != "licensed" || p.Recurring.Interval != interval || p.Recurring.IntervalCount != 1 || p.TransformQuantity != nil || p.BillingScheme != "per_unit" {
+					return 0, fmt.Errorf("licensed subscription terms changed during storage validation")
+				}
+				baseCount++
+				continue
+			}
 			if item.Price.Recurring.Interval != wanted.Recurring.Interval || item.Price.Recurring.IntervalCount != wanted.Recurring.IntervalCount {
 				return 0, fmt.Errorf("subscription billing interval differs from storage price; operator review required")
 			}
@@ -164,6 +195,9 @@ func (c *stripeHTTPClient) storageSubscriptionItems(ctx context.Context, subID s
 			}
 		}
 		if !result.HasMore {
+			if base.Price != "" && baseCount != 1 {
+				return 0, fmt.Errorf("licensed base item is missing or duplicated")
+			}
 			return count, nil
 		}
 		if len(result.Data) == 0 || result.Data[len(result.Data)-1].ID == after {
@@ -235,12 +269,23 @@ func (h *Handlers) storageResource() (config.BillingResourceConfig, error) {
 	return config.BillingResourceConfig{}, fmt.Errorf("configure subscription_enabled storage_gib with its metered Stripe price and storage_gib_hours event")
 }
 
-func (h *Handlers) storageSubscriptionParams(ctx context.Context, q *db.Queries, account db.GetTeamBillingAccountRow, reconcile bool) (StripeStorageSubscriptionParams, error) {
-	r, err := h.storageResource()
+func (h *Handlers) storageSubscriptionParams(ctx context.Context, tx pgx.Tx, account db.GetTeamBillingAccountRow, reconcile bool, effectiveAt time.Time) (StripeStorageSubscriptionParams, error) {
+	states, err := h.billingSubscriptionResourceStates(ctx, account.TeamID, derefString(account.StripeSubscriptionID), true, tx)
 	if err != nil {
 		return StripeStorageSubscriptionParams{}, err
 	}
-	rates, err := q.ListActivePricingRatesForTeam(ctx, db.ListActivePricingRatesForTeamParams{TeamID: account.TeamID, EffectiveAt: h.nowUTC()})
+	var r config.BillingResourceConfig
+	var purchased *StripeCheckoutResourceTerms
+	for _, state := range states {
+		if state.ResourceKey == "storage_gib" {
+			r = state.BillingResourceConfig
+			purchased = state.PurchasedTerms
+		}
+	}
+	if !r.SubscriptionIncluded() || r.StripePriceID == "" || r.StripeEventName != "storage_gib_hours" {
+		return StripeStorageSubscriptionParams{}, fmt.Errorf("storage subscription mapping is unavailable")
+	}
+	rates, err := h.DB.WithTx(tx).ListActivePricingRatesForTeam(ctx, db.ListActivePricingRatesForTeamParams{TeamID: account.TeamID, EffectiveAt: effectiveAt})
 	if err != nil {
 		return StripeStorageSubscriptionParams{}, err
 	}
@@ -261,12 +306,21 @@ func (h *Handlers) storageSubscriptionParams(ctx context.Context, q *db.Queries,
 	if amount == "" {
 		return StripeStorageSubscriptionParams{}, fmt.Errorf("canonical storage pricing unavailable")
 	}
-	return StripeStorageSubscriptionParams{SubscriptionID: derefString(account.StripeSubscriptionID), CustomerID: derefString(account.StripeCustomerID), PriceID: r.StripePriceID, EventName: r.StripeEventName, UnitAmountDecimal: amount, Reconcile: reconcile}, nil
+	a := invoiceAccount{Customer: derefString(account.StripeCustomerID), Subscription: derefString(account.StripeSubscriptionID)}
+	if err := h.loadInvoiceBase(ctx, account.TeamID, &a, tx); err != nil {
+		return StripeStorageSubscriptionParams{}, err
+	}
+	return StripeStorageSubscriptionParams{PurchasedTerms: purchased, Base: a.Base, SubscriptionID: derefString(account.StripeSubscriptionID), CustomerID: derefString(account.StripeCustomerID), PriceID: r.StripePriceID, EventName: r.StripeEventName, UnitAmountDecimal: amount, Reconcile: reconcile}, nil
+}
+
+type storageReplayScope struct {
+	account invoiceAccount
+	period  billing.ExportPeriod
 }
 
 // Storage operations lock the current account association across provider I/O.
 // This is an operator/export path, never a sandbox lifecycle path.
-func (h *Handlers) withStorageSubscription(ctx context.Context, team uuid.UUID, reconcile, allowInactive bool, action func(pgx.Tx, StripeStorageSubscriptionParams) error) error {
+func (h *Handlers) withStorageSubscription(ctx context.Context, team uuid.UUID, reconcile, allowInactive bool, action func(pgx.Tx, StripeStorageSubscriptionParams) error, replay ...storageReplayScope) error {
 	if h.Pool == nil || h.DB == nil {
 		return fmt.Errorf("billing transactions are not configured")
 	}
@@ -294,7 +348,16 @@ func (h *Handlers) withStorageSubscription(ctx context.Context, team uuid.UUID, 
 	if account.StripeSubscriptionID == nil && account.TrialEndedAt.Valid {
 		return fmt.Errorf("paid team has no current subscription; reconcile billing account first")
 	}
-	request, err := h.storageSubscriptionParams(ctx, q, account, reconcile)
+	effectiveAt := h.nowUTC()
+	if len(replay) > 0 {
+		scope := replay[0]
+		if !allowInactive || reconcile || scope.account.ReplacementSubscription == "" || derefString(account.StripeCustomerID) != scope.account.ReplacementCustomer || derefString(account.StripeSubscriptionID) != scope.account.ReplacementSubscription {
+			return fmt.Errorf("historical storage association changed")
+		}
+		account.StripeCustomerID, account.StripeSubscriptionID = &scope.account.Customer, &scope.account.Subscription
+		effectiveAt = scope.period.End.Add(-time.Nanosecond)
+	}
+	request, err := h.storageSubscriptionParams(ctx, tx, account, reconcile, effectiveAt)
 	if err != nil {
 		return err
 	}
@@ -391,14 +454,28 @@ func (h *Handlers) ReconcileStorageBilling(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ready": true, "effective_at": at})
 }
 
-func (h *Handlers) reportBillingMeterEvent(ctx context.Context, team uuid.UUID, resource string, createdAt, measuredThrough time.Time, frozen bool, params StripeReportMeterEventParams) error {
+func (h *Handlers) reportBillingMeterEvent(ctx context.Context, team uuid.UUID, resource string, createdAt, measuredThrough time.Time, frozen bool, params StripeReportMeterEventParams, periods ...billing.ExportPeriod) error {
 	if resource != "storage" {
 		return h.Stripe.ReportMeterEvent(ctx, params)
+	}
+	var replay []storageReplayScope
+	if frozen && len(periods) > 0 {
+		period := periods[0]
+		if period.TeamID != team {
+			return &storageReadinessError{err: fmt.Errorf("storage period team differs")}
+		}
+		scope, _, err := h.invoiceAccountForPeriod(ctx, period)
+		if err != nil {
+			return &storageReadinessError{err: err}
+		}
+		if scope.ReplacementSubscription != "" {
+			replay = append(replay, storageReplayScope{account: scope, period: period})
+		}
 	}
 	calledProvider := false
 	err := h.withStorageSubscription(ctx, team, false, frozen, func(tx pgx.Tx, p StripeStorageSubscriptionParams) error {
 		if p.SubscriptionID == "" || p.CustomerID != params.CustomerID || p.EventName != params.EventName {
-			return fmt.Errorf("storage export does not match the current subscription/customer/meter; operator reconciliation required")
+			return fmt.Errorf("storage export does not match its subscription/customer/meter; operator reconciliation required")
 		}
 		var eligible bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_storage_billing_activation WHERE team_id=$1 AND effective_at<=$2::timestamptz AND effective_at<$3::timestamptz AND effective_at<=clock_timestamp())`, team, createdAt, measuredThrough).Scan(&eligible); err != nil {
@@ -409,7 +486,7 @@ func (h *Handlers) reportBillingMeterEvent(ctx context.Context, team uuid.UUID, 
 		}
 		calledProvider = true
 		return h.Stripe.ReportMeterEvent(ctx, params)
-	})
+	}, replay...)
 	if err != nil && !calledProvider {
 		return &storageReadinessError{err: err}
 	}

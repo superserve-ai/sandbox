@@ -780,6 +780,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	}
 	historical := scope.ReplacementSubscription != ""
 	if historical {
+		account.StripeSubscriptionID = &scope.Subscription
 		account.StripeCustomerID = &scope.Customer
 	}
 	var shadowHandoff bool
@@ -830,6 +831,10 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	if err != nil {
 		return result, err
 	}
+	states, err := h.billingSubscriptionResourceStates(ctx, p.TeamID, derefString(account.StripeSubscriptionID), storage)
+	if err != nil {
+		return result, err
+	}
 	if err = store.Enroll(ctx, p); err != nil {
 		return result, err
 	}
@@ -843,7 +848,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		if reconcileErr != nil {
 			return frozenResult, reconcileErr
 		}
-		if err = h.submitIncrementalEvents(ctx, p, 2*len(h.billingResourceStates(storage))); err != nil {
+		if err = h.submitIncrementalEvents(ctx, p, 2*len(states)); err != nil {
 			return frozenResult, err
 		}
 		// Keep the pre-delivery reconciliation as the safety gate for pending
@@ -909,7 +914,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 			return result, err
 		}
 	}
-	items, err := incrementalExportItems(usage, h.billingResourceStates(storage))
+	items, err := incrementalExportItems(usage, states)
 	if err != nil {
 		return result, err
 	}
@@ -972,7 +977,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	if err = h.submitIncrementalEvents(ctx, p, 2*len(items)); err != nil {
 		return result, err
 	}
-	reconciliationItems, err := h.incrementalReconciliationItems(ctx, p, usage, h.billingResourceStates(storage))
+	reconciliationItems, err := h.incrementalReconciliationItems(ctx, p, usage, states)
 	if err != nil {
 		return result, err
 	}
@@ -1136,7 +1141,7 @@ func (h *Handlers) submitIncrementalEvents(ctx context.Context, p billing.Export
 			return err
 		}
 		submitErr := h.reportBillingMeterEvent(submitCtx, p.TeamID, event.ResourceType, event.AllocationCreatedAt, event.MeasuredThrough, frozen, StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
-			EventName: event.EventName, CustomerID: event.CustomerID, Value: event.Quantity, Timestamp: event.Timestamp})
+			EventName: event.EventName, CustomerID: event.CustomerID, Value: event.Quantity, Timestamp: event.Timestamp}, p)
 		cancel()
 		var readinessErr *storageReadinessError
 		if errors.As(submitErr, &readinessErr) {
@@ -1170,6 +1175,7 @@ func (h *Handlers) reconcileIncrementalPeriod(ctx context.Context, p billing.Exp
 		return result, err
 	}
 	if scope.ReplacementSubscription != "" {
+		account.StripeSubscriptionID = &scope.Subscription
 		account.StripeCustomerID = &scope.Customer
 	}
 	reader, ok := h.Stripe.(stripeMeterSummaryReader)
@@ -1195,7 +1201,11 @@ func (h *Handlers) reconcileIncrementalPeriod(ctx context.Context, p billing.Exp
 	if err != nil {
 		return result, err
 	}
-	items, err := h.incrementalReconciliationItems(ctx, p, usage, h.billingResourceStates(storage))
+	states, err := h.billingSubscriptionResourceStates(ctx, p.TeamID, derefString(account.StripeSubscriptionID), storage)
+	if err != nil {
+		return result, err
+	}
+	items, err := h.incrementalReconciliationItems(ctx, p, usage, states)
 	if err != nil {
 		return result, err
 	}

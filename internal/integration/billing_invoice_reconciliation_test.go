@@ -30,7 +30,7 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 		loseResponse             bool
 		fault                    string
 	}{
-		{"up full", 106, 105, 1000, true, ""}, {"down full", 105, 106, 1000, true, ""},
+		{"frozen catalog", 106, 105, 1000, false, ""}, {"up full", 106, 105, 1000, true, ""}, {"down full", 105, 106, 1000, true, ""},
 		{"up partial", 106, 105, 100, false, ""}, {"down partial", 105, 106, 100, false, ""},
 		{"canceled frozen recovery", 106, 105, 1000, true, "canceled"},
 		{"replacement frozen recovery", 106, 105, 1000, true, "replacement"},
@@ -49,11 +49,13 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 				providerQuantity = "29.3055555556"
 			}
 			correctionExec(t, `UPDATE team_billing_usage SET vcpu_seconds=$2::numeric,memory_mib_seconds=0,storage_mib_seconds=0 WHERE team_id=$1`, p.TeamID, seconds)
-			if _, err := store.Reserve(t.Context(), p, "cpu", quantity, p.End, billing.ExportPayload{EventName: "example_cpu_hours", CustomerID: customer, Timestamp: p.End.Add(-time.Second).Unix()}); err != nil {
-				t.Fatal(err)
-			}
-			if tc.fault != "canceled" {
-				acceptIncrement(t, store, p)
+			if tc.name != "frozen catalog" {
+				if _, err := store.Reserve(t.Context(), p, "cpu", quantity, p.End, billing.ExportPayload{EventName: "example_cpu_hours", CustomerID: customer, Timestamp: p.End.Add(-time.Second).Unix()}); err != nil {
+					t.Fatal(err)
+				}
+				if tc.fault != "canceled" {
+					acceptIncrement(t, store, p)
+				}
 			}
 			correctionExec(t, `UPDATE team_billing_period SET status='exporting' WHERE team_id=$1`, p.TeamID)
 			correctionExec(t, `INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_round',$4)`, p.TeamID, customer, subscription, p.Start)
@@ -81,7 +83,7 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 			balance, adjustment := tc.credit, int64(0)
 			events, finalizations, releases, usageEvents := 0, 0, 0, 0
 			price := func(id, meter, amount string) map[string]any {
-				return map[string]any{"id": id, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": amount, "recurring": map[string]any{"usage_type": "metered", "interval": "month", "interval_count": 1, "meter": meter}}
+				return map[string]any{"id": id, "active": tc.name != "frozen catalog" || id == "price_round", "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": amount, "recurring": map[string]any{"usage_type": "metered", "interval": "month", "interval_count": 1, "meter": meter}}
 			}
 			line := func(id, pr, amount string, value int64) map[string]any {
 				if tc.fault == "offset" && status != "draft" {
@@ -159,10 +161,11 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 				case "/v1/billing/meters/mtr_storage/event_summaries":
 					out = map[string]any{"data": []any{}, "has_more": false}
 				case "/v1/billing/meters/mtr_cpu/event_summaries":
-					if offset > 0 && tc.fault == "" && (r.URL.Query().Get("start_time") != strconv.FormatInt(invoiceStart.Unix(), 10) || r.URL.Query().Get("end_time") != strconv.FormatInt(invoiceEnd.Unix(), 10)) {
+					localExportObservation := tc.name == "frozen catalog" && r.URL.Query().Get("start_time") == strconv.FormatInt(p.Start.Unix(), 10) && r.URL.Query().Get("end_time") == strconv.FormatInt(p.End.Unix(), 10)
+					if offset > 0 && tc.fault == "" && !localExportObservation && (r.URL.Query().Get("start_time") != strconv.FormatInt(invoiceStart.Unix(), 10) || r.URL.Query().Get("end_time") != strconv.FormatInt(invoiceEnd.Unix(), 10)) {
 						t.Errorf("provider usage queried outside mapped invoice: %s", r.URL)
 					}
-					if tc.fault == "canceled" && usageEvents == 0 {
+					if (tc.fault == "canceled" || tc.name == "frozen catalog") && usageEvents == 0 {
 						out = map[string]any{"data": []any{}, "has_more": false}
 						break
 					}
@@ -172,7 +175,7 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 				case "/v1/billing/meter_events":
 					if r.Form.Get("event_name") == "example_cpu_hours" {
 						usageEvents++
-						if tc.fault != "canceled" || r.Form.Get("payload[value]") != quantity {
+						if (tc.fault != "canceled" && tc.name != "frozen catalog") || r.Form.Get("payload[value]") != quantity {
 							t.Errorf("unexpected resource delivery %v", r.Form)
 						}
 						out = map[string]any{"identifier": r.Form.Get("identifier")}
@@ -238,6 +241,19 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 			}))
 			defer server.Close()
 			cfg := &config.Config{StripeSecretKey: "sk_test_example", StripeAPIBaseURL: server.URL, StripeAPIVersion: "2026-05-27.dahlia", BillingResources: []config.BillingResourceConfig{{ResourceKey: "vcpu", StripePriceID: "price_cpu", StripeEventName: "example_cpu_hours", Billable: true, CheckoutEnabled: true}, {ResourceKey: "storage_gib", StripePriceID: "price_storage", StripeEventName: "storage_gib_hours", Billable: false, CheckoutEnabled: true}}}
+			if tc.name == "frozen catalog" {
+				correctionExec(t, `UPDATE team_billing_account SET commercial_billing_anchor=$2 WHERE team_id=$1`, p.TeamID, p.Start)
+				payload, err := json.Marshal(api.StripeCreateCheckoutSessionParams{CustomerID: customer, ResourceTerms: []api.StripeCheckoutResourceTerms{
+					{ResourceKey: "vcpu", PriceID: "price_cpu", EventName: "example_cpu_hours", MeterID: "mtr_cpu", UnitAmountDecimal: "3.6"},
+					{ResourceKey: "storage_gib", PriceID: "price_storage", EventName: "storage_gib_hours", MeterID: "mtr_storage", UnitAmountDecimal: "0.0108"},
+				}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				correctionExec(t, `UPDATE billing_signup_choice SET offer_key='pro_monthly',state='committed',generation=now(),actor_id=team_id,base_price_id='price_base',subscription_id=$2,request_payload=$3 WHERE team_id=$1`, p.TeamID, subscription, payload)
+				cfg.BillingResources[0].StripePriceID, cfg.BillingResources[0].StripeEventName = "price_new_cpu", "new_cpu_event"
+				cfg.BillingResources[1].StripePriceID = "price_new_storage"
+			}
 			newHandler := func() *api.Handlers {
 				h := api.NewHandlers(&stubVMD{}, db.New(testPool), cfg)
 				h.Pool = testPool
@@ -275,6 +291,8 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 					if i == 0 && !worked {
 						t.Fatal("frozen canceled period not claimed")
 					}
+				} else if tc.name == "frozen catalog" {
+					err = newHandler().ExportInvoicePeriodForTest(t.Context(), p)
 				} else {
 					err = newHandler().ReconcileInvoiceForTest(t.Context(), p)
 				}
@@ -293,6 +311,9 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 					t.Fatal("invalid invoice bypassed close gate")
 				}
 				return
+			}
+			if tc.name == "frozen catalog" && usageEvents != 1 {
+				t.Fatalf("purchased meter received %d resource deliveries", usageEvents)
 			}
 			var savedState string
 			if err := testPool.QueryRow(t.Context(), `SELECT state FROM billing_invoice_close WHERE team_id=$1`, p.TeamID).Scan(&savedState); err != nil || savedState != "verified" {

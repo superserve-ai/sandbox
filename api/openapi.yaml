@@ -399,6 +399,7 @@ paths:
       operationId: createStripeCheckoutSession
       tags: [Billing]
       summary: Create a Stripe Checkout session
+      description: Pro offers are available only during uncommitted new-team onboarding. Checkout completion is followed by authoritative payment verification.
       security:
         - apiKey: []
       requestBody:
@@ -409,6 +410,11 @@ paths:
               type: object
               required: [success_url, cancel_url]
               properties:
+                offer:
+                  type: string
+                  enum: [free, pro_monthly, pro_annual]
+                  default: free
+                  description: Backend-owned offer key; price IDs are never accepted from the caller.
                 success_url:
                   type: string
                   format: uri
@@ -422,6 +428,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BillingSessionResponse"
+        "202":
+          description: Provider outcome is uncertain; use Pro recovery before another purchase or plan selection.
+        "409":
+          description: Plan already committed or a purchase is awaiting confirmation.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -520,6 +530,80 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+
+  /stripe/plan-choice:
+    post:
+      operationId: commitFreeSignupPlan
+      tags: [Billing]
+      summary: Commit Free onboarding
+      description: Requires billing:write. Commits Free access without requiring a payment method. A pending or committed Pro purchase returns 409 and retains its payment and benefits. Enterprise sales onboarding also uses this Free access decision.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [offer]
+              properties:
+                offer:
+                  type: string
+                  enum: [free]
+      responses:
+        "200":
+          description: Free plan committed
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: A Pro purchase is pending or committed
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /stripe/pro-checkout/recover:
+    post:
+      operationId: recoverProCheckout
+      tags: [Billing]
+      summary: Reconcile the original Pro purchase
+      description: Requires billing:write. Retrieves the original Checkout and verifies subscription and cash payment evidence. Restart closes an open unpaid session before allowing a new plan selection. Uncertain outcomes retain the billing fence; account access remains available.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                restart:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Authoritative recovery outcome
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [outcome]
+                properties:
+                  outcome:
+                    type: string
+                    enum: [active, retryable, payment_confirmation_pending, no_pending_pro_purchase]
+        "202":
+          description: Confirmation remains pending; retain the current plan and do not create a replacement purchase.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
 
   /stripe/checkout-session/recover:
     post:

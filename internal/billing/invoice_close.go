@@ -25,6 +25,9 @@ type InvoiceCloseResource struct {
 }
 
 type InvoiceClosePlan struct {
+	BaseCents           int64                  `json:"base_cents,omitempty"`
+	BasePeriodStart     int64                  `json:"base_period_start,omitempty"`
+	BasePeriodEnd       int64                  `json:"base_period_end,omitempty"`
 	InvoiceStart        int64                  `json:"invoice_start,omitempty"`
 	InvoiceEnd          int64                  `json:"invoice_end,omitempty"`
 	Customer            string                 `json:"customer"`

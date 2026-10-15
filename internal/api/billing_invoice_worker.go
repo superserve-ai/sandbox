@@ -32,6 +32,9 @@ func (h *Handlers) invoiceAccount(ctx context.Context, team uuid.UUID) (invoiceA
 	if err != nil {
 		return a, false, err
 	}
+	if err = h.loadInvoiceBase(ctx, team, &a); err != nil {
+		return a, true, err
+	}
 	if currentCustomer == nil || currentSubscription == nil || *currentCustomer != a.Customer || *currentSubscription != a.Subscription {
 		return a, true, errInvoiceAssociationChanged
 	}
@@ -179,7 +182,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 			conn.Conn().Close(cleanup)
 		}
 	}()
-	if _, err = client.ensureInvoiceSubscription(ctx, a, false, true); err != nil {
+	if a, err = client.ensureInvoiceSubscription(ctx, a, false, true); err != nil {
 		return err
 	}
 	// Older held periods have first claim on credits and must finish first.
@@ -266,7 +269,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		// immutable settlement again before acknowledging that same invoice.
 		alreadyReleased := final.AutoAdvance
 		final.AutoAdvance = false
-		if e = VerifyBillingInvoiceSettlement(final, plan.ExpectedCents, plan.CreditBeforeCents, remaining); e != nil {
+		if e = verifyInvoicePlanSettlement(final, plan, plan.CreditBeforeCents, remaining); e != nil {
 			return e
 		}
 		if alreadyReleased {
@@ -319,7 +322,14 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 				return fmt.Errorf("waiting for rounding event aggregation")
 			}
 		} else if plan.AdjustmentCents < 0 {
-			if err = client.applyInvoiceDiscount(ctx, invoiceID, -plan.AdjustmentCents, invoicePlanKey(invoiceID)); err != nil {
+			var products []string
+			if plan.BaseCents > 0 {
+				products, err = proRoundingProducts(inv, a.Base.Price)
+				if err != nil {
+					return err
+				}
+			}
+			if err = client.applyInvoiceDiscount(ctx, invoiceID, -plan.AdjustmentCents, invoicePlanKey(invoiceID), products...); err != nil {
 				return err
 			}
 		}
@@ -385,7 +395,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		if e = validateInvoiceDocument(final, invoicePeriod, a, plan); e != nil {
 			return e
 		}
-		if e = VerifyBillingInvoiceSettlement(final, plan.ExpectedCents, plan.CreditBeforeCents, remaining); e != nil {
+		if e = verifyInvoicePlanSettlement(final, plan, plan.CreditBeforeCents, remaining); e != nil {
 			return e
 		}
 		if e = h.validateInvoicePlan(ctx, p, a, plan, client); e != nil {
@@ -398,7 +408,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 			}
 		}
 		invoiceJSON, _ := json.Marshal(final)
-		evidence, _ := json.Marshal(billing.InvoiceCloseSettlement{CreditAppliedCents: applied, CreditRemainingCents: remaining, NetCents: final.Total, Invoice: invoiceJSON})
+		evidence, _ := json.Marshal(billing.InvoiceCloseSettlement{CreditAppliedCents: applied, CreditRemainingCents: remaining, NetCents: final.Total - plan.BaseCents, Invoice: invoiceJSON})
 		_, err = h.Pool.Exec(ctx, `UPDATE billing_invoice_close SET state='verified',verified_at=clock_timestamp(),finalized_evidence=$4,last_error=NULL,updated_at=clock_timestamp() WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End, evidence)
 		return err
 	}
@@ -411,7 +421,10 @@ func (h *Handlers) validateInvoicePlan(ctx context.Context, p billing.ExportPeri
 	if err != nil {
 		return err
 	}
-	if !ok || current != a {
+	// Termination is a provider observation, not part of the saved association.
+	observed := a
+	observed.Base.TerminatedAt = 0
+	if !ok || current != observed {
 		return fmt.Errorf("invoice account changed")
 	}
 	if _, err = client.ensureInvoiceSubscription(ctx, a, false, true); err != nil {
@@ -429,6 +442,10 @@ func (h *Handlers) validateInvoicePlan(ctx context.Context, p billing.ExportPeri
 		if !matches {
 			return fmt.Errorf("invoice calendar changed after planning")
 		}
+	}
+	sub, err = a.Base.stripSubscription(sub)
+	if err != nil {
+		return err
 	}
 	prices := map[string]string{a.Price: a.Meter}
 	for _, r := range plan.Resources {
@@ -497,7 +514,10 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if err != nil {
 		return plan, err
 	}
-	states := h.billingResourceStates(storage)
+	states, err := h.billingSubscriptionResourceStates(ctx, p.TeamID, a.Subscription, storage)
+	if err != nil {
+		return plan, err
+	}
 	items, err := incrementalExportItems(usage, states)
 	if err != nil {
 		return plan, err
@@ -525,10 +545,12 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	for _, item := range items {
 		priceID, resourceKey := "", ""
 		billable := false
+		var purchased *StripeCheckoutResourceTerms
 		for _, s := range states {
 			if billingExportResourceType(s.ResourceKey) == item.ResourceType {
 				priceID, resourceKey = s.StripePriceID, s.ResourceKey
 				billable = s.Billable
+				purchased = s.PurchasedTerms
 			}
 		}
 		if priceID == "" {
@@ -553,7 +575,13 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 			return plan, fmt.Errorf("invoice pricing unavailable")
 		}
 		expectedPrice := new(big.Rat).Mul(rate, big.NewRat(360000, 1))
-		if price.ID != priceID || !price.Active || price.Recurring.Interval != "month" || price.Recurring.IntervalCount != 1 || price.Currency != "usd" || price.BillingScheme != "per_unit" || price.TransformQuantity != nil || price.Recurring.UsageType != "metered" || providerPrice.Cmp(expectedPrice) != 0 {
+		if purchased != nil {
+			frozenAmount, err := meterDecimal(purchased.UnitAmountDecimal)
+			if err != nil || providerPrice.Cmp(frozenAmount) != 0 || price.Recurring.Meter != purchased.MeterID {
+				return plan, fmt.Errorf("invoice price differs from purchased resource terms")
+			}
+		}
+		if price.ID != priceID || (!price.Active && purchased == nil) || price.Recurring.Interval != "month" || price.Recurring.IntervalCount != 1 || price.Currency != "usd" || price.BillingScheme != "per_unit" || price.TransformQuantity != nil || price.Recurring.UsageType != "metered" || providerPrice.Cmp(expectedPrice) != 0 {
 			return plan, fmt.Errorf("invoice price differs from authoritative resource pricing")
 		}
 		unitUSD := new(big.Rat).Quo(providerPrice, big.NewRat(100, 1)).FloatString(14)
@@ -664,6 +692,10 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	}
 	if len(plan.Resources) == 0 || len(plan.Resources) > 3 {
 		return plan, fmt.Errorf("unsupported invoice resource set")
+	}
+	plan.BaseCents, plan.BasePeriodStart, plan.BasePeriodEnd, err = a.Base.expectedFee(invoicePeriod.End)
+	if err != nil {
+		return plan, err
 	}
 	if err = validateInvoiceDocument(inv, invoicePeriod, a, plan); err != nil {
 		return plan, err
@@ -780,8 +812,28 @@ func validateInvoiceDocument(inv StripeInvoiceAmounts, p billing.ExportPeriod, a
 		amounts[resource.PriceID] = resource.ProviderCents
 	}
 	start, end := meterObservationWindow(p.Start, p.End)
+	base := a.Base
+	// Saved positive fees retain their original sale even if cancellation follows.
+	if plan.BaseCents > 0 {
+		base.TerminatedAt = 0
+	}
+	baseCents, baseStart, baseEnd, err := base.expectedFee(p.End)
+	if err != nil || baseCents != plan.BaseCents || baseStart != plan.BasePeriodStart || baseEnd != plan.BasePeriodEnd {
+		return fmt.Errorf("licensed invoice plan differs from contract")
+	}
+	baseSeen := false
 	seen := map[string]bool{}
 	for _, line := range inv.Lines.Data {
+		if line.Pricing.PriceDetails != nil && a.Base.Price != "" && line.Pricing.PriceDetails.Price == a.Base.Price {
+			if baseSeen || baseCents == 0 {
+				return fmt.Errorf("unexpected or duplicate licensed invoice line")
+			}
+			if err := a.Base.validateLine(line, a.Subscription, baseStart, baseEnd); err != nil {
+				return err
+			}
+			baseSeen = true
+			continue
+		}
 		d, parent := line.Pricing.PriceDetails, line.Parent.SubscriptionItemDetails
 		if d == nil || parent == nil || parent.Proration || parent.Subscription != a.Subscription || line.Currency != "usd" || len(line.Discounts) != 0 {
 			return fmt.Errorf("invoice line does not match supported resource set")
@@ -802,6 +854,9 @@ func validateInvoiceDocument(inv StripeInvoiceAmounts, p billing.ExportPeriod, a
 		if line.Period.Start > latestStart || line.Period.End < end.Unix() {
 			return fmt.Errorf("invoice line does not cover usage window")
 		}
+	}
+	if (baseCents > 0) != baseSeen {
+		return fmt.Errorf("licensed invoice line is missing")
 	}
 	if len(seen) != len(allowed) {
 		return fmt.Errorf("invoice is missing resource or rounding lines")

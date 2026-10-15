@@ -13,6 +13,8 @@ import (
 var ErrStripeCheckoutSessionNotFound = errors.New("stripe checkout session was not found")
 
 type StripeRetrievedCheckoutSession struct {
+	SubscriptionID    string            `json:"subscription"`
+	PaymentStatus     string            `json:"payment_status"`
 	ID                string            `json:"id"`
 	URL               string            `json:"url"`
 	CustomerID        string            `json:"customer"`

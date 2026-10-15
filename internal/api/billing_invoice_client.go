@@ -57,6 +57,7 @@ type StripeInvoicePretaxCredit struct {
 }
 
 type StripeInvoiceAmountLine struct {
+	Quantity        int64             `json:"quantity"`
 	Discounts       []json.RawMessage `json:"discounts"`
 	ID              string            `json:"id"`
 	Amount          int64             `json:"amount"`

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -115,6 +116,9 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 	if err != nil {
 		return err
 	}
+	if err = h.loadInvoiceBase(ctx, team, &a, tx); err != nil {
+		return err
+	}
 	if !anchored {
 		return fmt.Errorf("commercial billing anchor is required before invoice enrollment")
 	}
@@ -152,12 +156,12 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		a.Price, a.Event, a.Meter = catalog.Price, catalog.Event, catalog.Meter
 	}
 	for _, resource := range h.billingResourceStates(true) {
-		if a.Price == resource.StripePriceID || a.Event == resource.StripeEventName {
+		if a.Base.Price == "" && (a.Price == resource.StripePriceID || a.Event == resource.StripeEventName) {
 			return fmt.Errorf("rounding price and event must be separate from resource usage")
 		}
 	}
 	if !enrolled || replacement {
-		if err = h.validateInvoiceEnrollment(ctx, team, a, client); err != nil {
+		if err = h.validateInvoiceEnrollment(ctx, team, a, client, tx); err != nil {
 			return err
 		}
 	}
@@ -170,7 +174,7 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 	var validate func(invoiceSubscription) error
 	if !enrolled || replacement {
 		validate = func(sub invoiceSubscription) error {
-			return h.validateInvoiceEnrollmentSubscription(ctx, team, a, client, sub)
+			return h.validateInvoiceEnrollmentSubscription(ctx, team, a, client, sub, tx)
 		}
 	}
 	a, err = client.ensureInvoiceSubscriptionValidated(ctx, a, !enrolled || replacement, false, validate)
@@ -288,27 +292,59 @@ func (h *Handlers) StartInvoiceEnrollmentService(ctx context.Context) {
 	}()
 }
 
-func (h *Handlers) validateInvoiceEnrollment(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient) error {
+func (h *Handlers) validateInvoiceEnrollment(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, reader db.DBTX) error {
 	sub, err := c.invoiceSubscription(ctx, a.Subscription)
 	if err != nil {
 		return err
 	}
-	return h.validateInvoiceEnrollmentSubscription(ctx, team, a, c, sub)
+	return h.validateInvoiceEnrollmentSubscription(ctx, team, a, c, sub, reader)
 }
 
-func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription) error {
+func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription, reader db.DBTX) error {
+	var stripErr error
+	sub, stripErr = a.Base.stripSubscription(sub)
+	if stripErr != nil {
+		return stripErr
+	}
+	if a.Base.Price != "" {
+		var payload []byte
+		if err := reader.QueryRow(ctx, `SELECT request_payload FROM billing_signup_choice WHERE team_id=$1 AND subscription_id=$2`, team, a.Subscription).Scan(&payload); err != nil {
+			return err
+		}
+		var params StripeCreateCheckoutSessionParams
+		if err := json.Unmarshal(payload, &params); err != nil {
+			return err
+		}
+		if params.CustomerID != a.Customer || params.BasePriceID != a.Base.Price {
+			return fmt.Errorf("frozen Pro enrollment association differs")
+		}
+		for _, term := range params.ResourceTerms {
+			if term.PriceID == a.Price || term.EventName == a.Event || (a.Meter != "" && term.MeterID == a.Meter) {
+				return fmt.Errorf("rounding configuration overlaps frozen resource terms")
+			}
+		}
+		if err := invoiceCalendarCompatible(a.Base.Anchor, sub, a.Price); err != nil {
+			return err
+		}
+		return validateFrozenProResources(sub, params.ResourceTerms, a.Price)
+	}
 	var anchor time.Time
-	if err := h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor); err != nil {
+	if err := reader.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor); err != nil {
 		return err
 	}
+	return h.validateInvoiceResourceSubscription(ctx, team, a, c, sub, anchor, reader)
+}
+
+func (h *Handlers) validateInvoiceResourceSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription, anchor time.Time, reader db.DBTX) error {
 	if err := invoiceCalendarCompatible(anchor, sub, a.Price); err != nil {
 		return err
 	}
-	storage, err := h.billingStorageBillingEnabledForWindow(ctx, team, time.Now())
+	queries := db.New(reader)
+	storage, err := queries.IsStorageBillingActivatedForWindow(ctx, db.IsStorageBillingActivatedForWindowParams{TeamID: team, PeriodEnd: time.Now()})
 	if err != nil {
 		return err
 	}
-	rates, err := h.DB.ListActivePricingRatesForTeam(ctx, db.ListActivePricingRatesForTeamParams{TeamID: team, EffectiveAt: time.Now()})
+	rates, err := queries.ListActivePricingRatesForTeam(ctx, db.ListActivePricingRatesForTeamParams{TeamID: team, EffectiveAt: time.Now()})
 	if err != nil {
 		return err
 	}

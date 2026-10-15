@@ -25,7 +25,15 @@ func (NoopBillingRecorder) RecordBillingBacklog(context.Context, string, int64, 
 func (NoopBillingRecorder) RecordBillingReconciliation(context.Context, string, float64, *float64, *float64) {
 }
 
+type ProBillingRecorder interface {
+	RecordProBillingBacklog(context.Context, string, int64, float64, int64, float64)
+}
+
 type billingMetrics struct {
+	proPaid        metric.Int64Gauge
+	proPaidAge     metric.Float64Gauge
+	proOverdue     metric.Int64Gauge
+	proOverdueAge  metric.Float64Gauge
 	operations     metric.Int64Counter
 	duration       metric.Float64Histogram
 	volume         metric.Int64Counter
@@ -71,6 +79,18 @@ func (r *OTelRecorder) initBilling(m metric.Meter) error {
 	if b.freshness, err = m.Float64Histogram("billing_previous_observation_age_seconds", metric.WithExplicitBucketBoundaries(60, 3600, 7200, 21600, 86400)); err != nil {
 		return err
 	}
+	if b.proPaid, err = m.Int64Gauge("billing_pro_paid_activation_pending", metric.WithDescription("Verified paid purchases awaiting local activation, capped at 1000 per offer")); err != nil {
+		return err
+	}
+	if b.proPaidAge, err = m.Float64Gauge("billing_pro_paid_activation_pending_age_seconds"); err != nil {
+		return err
+	}
+	if b.proOverdue, err = m.Int64Gauge("billing_pro_recovery_overdue", metric.WithDescription("Overdue pending recovery choices, capped at 1000 per offer")); err != nil {
+		return err
+	}
+	if b.proOverdueAge, err = m.Float64Gauge("billing_pro_recovery_overdue_age_seconds"); err != nil {
+		return err
+	}
 	r.billing = b
 	return nil
 }
@@ -80,7 +100,7 @@ func (r *OTelRecorder) RecordBillingWork(ctx context.Context, operation string, 
 		return
 	}
 	switch operation {
-	case "tick", "measurement", "submission", "reconciliation", "backlog_sample":
+	case "tick", "measurement", "submission", "reconciliation", "backlog_sample", "pro_payment", "pro_backlog_sample":
 	default:
 		operation = "unknown"
 	}
@@ -152,4 +172,18 @@ func (r *OTelRecorder) RecordBillingReconciliation(ctx context.Context, resource
 	if previousAge != nil {
 		r.billing.freshness.Record(ctx, math.Max(0, *previousAge), opt)
 	}
+}
+
+func (r *OTelRecorder) RecordProBillingBacklog(ctx context.Context, offer string, paid int64, paidAge float64, overdue int64, overdueAge float64) {
+	if r == nil || r.billing == nil {
+		return
+	}
+	if offer != "pro_monthly" && offer != "pro_annual" {
+		offer = "unknown"
+	}
+	opt := metric.WithAttributes(attribute.String("offer", offer))
+	r.billing.proPaid.Record(ctx, max(0, min(paid, 1000)), opt)
+	r.billing.proPaidAge.Record(ctx, math.Max(0, paidAge), opt)
+	r.billing.proOverdue.Record(ctx, max(0, min(overdue, 1000)), opt)
+	r.billing.proOverdueAge.Record(ctx, math.Max(0, overdueAge), opt)
 }

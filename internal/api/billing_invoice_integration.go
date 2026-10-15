@@ -34,3 +34,7 @@ func (h *Handlers) IncrementalBillingTickForTest(ctx context.Context) (bool, int
 func (h *Handlers) DiscoverIncrementalBillingWorkForTest(ctx context.Context) error {
 	return h.discoverIncrementalBillingWork(ctx)
 }
+
+func (h *Handlers) SubmitIncrementalEventsForTest(ctx context.Context, p billing.ExportPeriod) error {
+	return h.submitIncrementalEvents(ctx, p, 6)
+}

@@ -18,8 +18,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/billing"
+	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -203,7 +205,14 @@ func TestIntegration_BillingStorageActivationReadinessAndConcurrency(t *testing.
 	team, _, _, _ := seedBillingPeriodForStripe(t, true, true)
 	admin := seedPlatformAdminProfile(t)
 	stripe := &storageReadyStripe{fakeStripeClient: &fakeStripeClient{}, ready: map[string]bool{}}
-	r := newBillingRouter(t, stripe)
+	poolConfig := testPool.Config()
+	poolConfig.MaxConns = 4
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	r := newBillingRouterWithPool(t, stripe, pool)
 	path := "/internal/teams/" + team.String() + "/billing/storage"
 	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_storage_billing_enabled',true)`, team); err != nil {
 		t.Fatal(err)
@@ -1033,4 +1042,42 @@ func seedMeasuredZeroLegacyBaseline(t *testing.T, sandboxID uuid.UUID) {
 	storageExec(t, `UPDATE sandbox SET base_path=$2,delta_path=NULL WHERE id=$1`, sandboxID, path)
 	storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
 		SELECT template_id,$2,$2,0,0,repeat('0',64) FROM sandbox WHERE id=$1`, sandboxID, path)
+}
+
+func TestIntegration_StorageReplayUsesHistoricalSubscription(t *testing.T) {
+	store, p := seedIncrementalPeriod(t)
+	seedStorageActivation(t, p.TeamID, p.Start)
+	customer, oldSub, replacement := "cus_"+p.TeamID.String(), "sub_"+p.TeamID.String(), "sub_replacement_"+p.TeamID.String()
+	storageExec(t, `UPDATE team_billing_period SET status='exporting' WHERE team_id=$1`, p.TeamID)
+	storageExec(t, `INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_round',$4)`, p.TeamID, customer, oldSub, p.Start)
+	storageExec(t, `UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status='active',commercial_billing_anchor=now() WHERE team_id=$1`, p.TeamID, replacement)
+	payload, err := json.Marshal(api.StripeCreateCheckoutSessionParams{CustomerID: customer, ResourceTerms: []api.StripeCheckoutResourceTerms{{ResourceKey: "storage_gib", PriceID: "price_original_storage", EventName: "storage_gib_hours", MeterID: "mtr_original_storage", UnitAmountDecimal: "0.0108"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageExec(t, `UPDATE billing_signup_choice SET offer_key='pro_monthly',state='committed',generation=now(),actor_id=team_id,base_price_id='price_base',subscription_id=$2,request_payload=$3 WHERE team_id=$1`, p.TeamID, oldSub, payload)
+	event := reserveStorage(t, store, p, "1")
+	if event == nil {
+		t.Fatal("missing reservation")
+	}
+	stripe := &storageReadyStripe{fakeStripeClient: &fakeStripeClient{}, ready: map[string]bool{oldSub: true}}
+	poolConfig := testPool.Config()
+	poolConfig.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	h := api.NewHandlers(&stubVMD{}, db.New(pool), &config.Config{BillingResources: []config.BillingResourceConfig{{ResourceKey: "storage_gib", StripePriceID: "price_replacement_storage", StripeEventName: "replacement_storage_hours", CheckoutEnabled: true}}})
+	h.Pool, h.Stripe = pool, stripe
+	if err = h.SubmitIncrementalEventsForTest(t.Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	totals, err := store.Totals(t.Context(), p, "storage")
+	if err != nil || totals.Submitted != "1.000000000000" {
+		t.Fatalf("historical storage not submitted: %+v %v", totals, err)
+	}
+	if len(stripe.inspected) != 1 || stripe.inspected[0] != oldSub || len(stripe.reportCalls) != 1 || stripe.reportCalls[0].EventName != "storage_gib_hours" {
+		t.Fatalf("historical scope lost: inspected=%v calls=%+v", stripe.inspected, stripe.reportCalls)
+	}
 }

@@ -13,6 +13,14 @@ import (
 )
 
 type invoiceSubscription struct {
+	LatestInvoice     string            `json:"latest_invoice"`
+	EndedAt           int64             `json:"ended_at"`
+	StartDate         int64             `json:"start_date"`
+	CancelAtPeriodEnd bool              `json:"cancel_at_period_end"`
+	Metadata          map[string]string `json:"metadata"`
+	BillingMode       struct {
+		Type string `json:"type"`
+	} `json:"billing_mode"`
 	BillingCycleAnchor int64  `json:"billing_cycle_anchor"`
 	ID                 string `json:"id"`
 	Customer           string `json:"customer"`
@@ -28,16 +36,18 @@ type invoiceSubscription struct {
 	BillingThresholds any `json:"billing_thresholds"`
 	Items             struct {
 		Data []struct {
-			ID    string       `json:"id"`
-			Price storagePrice `json:"price"`
-			Start int64        `json:"current_period_start"`
-			End   int64        `json:"current_period_end"`
+			ID       string       `json:"id"`
+			Quantity int64        `json:"quantity"`
+			Price    storagePrice `json:"price"`
+			Start    int64        `json:"current_period_start"`
+			End      int64        `json:"current_period_end"`
 		} `json:"data"`
 		HasMore bool `json:"has_more"`
 	} `json:"items"`
 }
 
 type invoiceAccount struct {
+	Base                                         invoiceBase
 	Customer, Subscription, Price, Event, Meter  string
 	EnrolledAt                                   time.Time
 	ReplacementCustomer, ReplacementSubscription string
@@ -76,6 +86,12 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 	s, err := c.invoiceSubscription(ctx, a.Subscription)
 	if err != nil {
 		return a, err
+	}
+	if a.Base.Price != "" && s.Status == "canceled" {
+		if s.EndedAt <= 0 {
+			return a, fmt.Errorf("canceled Pro subscription has no termination timestamp")
+		}
+		a.Base.TerminatedAt = s.EndedAt
 	}
 	statusOK := s.Status == "active" || (!add && frozen && s.Status == "canceled")
 	if s.Customer != a.Customer || !statusOK || s.AutomaticTax.Enabled || len(s.Discounts) != 0 || s.BillingThresholds != nil {
@@ -341,7 +357,7 @@ func (c *stripeHTTPClient) invoiceCreditLedger(ctx context.Context, customer str
 	return total, nil
 }
 
-func (c *stripeHTTPClient) applyInvoiceDiscount(ctx context.Context, invoiceID string, cents int64, key string) error {
+func (c *stripeHTTPClient) applyInvoiceDiscount(ctx context.Context, invoiceID string, cents int64, key string, products ...string) error {
 	if cents <= 0 {
 		return fmt.Errorf("invalid invoice discount")
 	}
@@ -361,6 +377,9 @@ func (c *stripeHTTPClient) applyInvoiceDiscount(ctx context.Context, invoiceID s
 		ID        string `json:"id"`
 		AmountOff int64  `json:"amount_off"`
 		Currency  string `json:"currency"`
+		AppliesTo struct {
+			Products []string `json:"products"`
+		} `json:"applies_to"`
 	}
 	// A deterministic coupon ID makes creation recoverable after Stripe expires
 	// request idempotency. Never replace an existing coupon with another amount.
@@ -370,12 +389,27 @@ func (c *stripeHTTPClient) applyInvoiceDiscount(ctx context.Context, invoiceID s
 			return err
 		}
 		form := url.Values{"id": {couponID}, "amount_off": {strconv.FormatInt(cents, 10)}, "currency": {"usd"}, "duration": {"once"}, "name": {"Rounding adjustment"}}
+		for _, product := range products {
+			form.Add("applies_to[products][]", product)
+		}
 		if err = c.doForm(ctx, http.MethodPost, "/v1/coupons", form, &coupon, key+":coupon"); err != nil {
 			return err
 		}
 	}
 	if coupon.ID != couponID || coupon.AmountOff != cents || coupon.Currency != "usd" {
 		return fmt.Errorf("invoice rounding coupon differs from saved plan")
+	}
+	expected := map[string]bool{}
+	for _, product := range products {
+		expected[product] = true
+	}
+	if len(coupon.AppliesTo.Products) != len(expected) {
+		return fmt.Errorf("rounding coupon product scope changed")
+	}
+	for _, product := range coupon.AppliesTo.Products {
+		if !expected[product] {
+			return fmt.Errorf("rounding coupon includes an unexpected product")
+		}
 	}
 	if attached {
 		return nil

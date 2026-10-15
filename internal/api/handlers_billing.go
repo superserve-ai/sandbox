@@ -829,7 +829,8 @@ func (h *Handlers) requireBillingRead(c *gin.Context) (uuid.UUID, bool) {
 
 type billingResourceState struct {
 	config.BillingResourceConfig
-	Billable bool
+	Billable       bool
+	PurchasedTerms *StripeCheckoutResourceTerms
 }
 
 func (h *Handlers) billingConfiguredResources() []config.BillingResourceConfig {
