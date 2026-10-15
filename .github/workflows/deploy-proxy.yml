@@ -81,6 +81,7 @@ on:
       - 'internal/analytics/**'
       - 'internal/auth/**'
       - 'internal/preview/**'
+      - 'internal/requestlog/**'
       - 'internal/proxy/**'
       - 'internal/db/**'
       - 'internal/sentrylog/**'

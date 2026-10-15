@@ -165,6 +165,7 @@ func PromotionAccountAuth() gin.HandlerFunc {
 			return
 		}
 		c.Set("promotion_account", claims)
+		logHumanIdentity(c, actor.String())
 		c.Next()
 	}
 }

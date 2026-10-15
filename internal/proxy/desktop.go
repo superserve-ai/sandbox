@@ -125,5 +125,14 @@ func (h *Handler) serveDesktop(w http.ResponseWriter, r *http.Request, instanceI
 	}
 	h.captureDesktopUsage(instanceID, event, info)
 
-	h.newBoxdReverseProxy(r, instanceID, info, "desktop").ServeHTTP(w, r)
+	proxy := h.newBoxdReverseProxy(r, instanceID, info, "desktop")
+	if r.URL.Path == desktopStreamPath {
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			if resp.StatusCode < 400 {
+				logSessionStart(r.Context(), resp.StatusCode)
+			}
+			return nil
+		}
+	}
+	proxy.ServeHTTP(w, r)
 }

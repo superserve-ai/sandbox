@@ -171,6 +171,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 
 	token := extractTerminalToken(r)
 	if token == "" {
+		logSandboxAuth(r.Context(), "missing", "")
 		// The token check IS the auth phase for this request; stamp it so
 		// the common 401 path lands in the auth series too.
 		tAuthDone = time.Now()
@@ -181,7 +182,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
 	tAuthDone = time.Now()
 	if fail != nil {
-		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("exec/ws: auth failed")
+		h.log.Warn().Str("sandbox_id", logSandboxID(instanceID)).Int("status", fail.Status).Msg("exec/ws: auth failed")
 		fail.write(w)
 		return
 	}
@@ -199,9 +200,10 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	tEstablishStart = time.Now()
 	ws, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
-		h.log.Warn().Err(err).Msg("exec/ws: WS upgrade failed")
+		h.log.Warn().Msg("exec/ws: WS upgrade failed")
 		return
 	}
+	logSessionStart(r.Context(), http.StatusSwitchingProtocols)
 	tEstablished = time.Now()
 	emitConnectPhases()
 	ws.SetReadLimit(maxExecReadBytes)
@@ -217,7 +219,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 // bridgeExecWS pumps frames between the WebSocket and boxd until either side
 // closes. It owns the WS handle and closes it on the way out.
 func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClient boxdpbconnect.ProcessServiceClient, instanceID string) {
-	l := h.log.With().Str("sandbox_id", instanceID).Logger()
+	l := h.log.With().Str("sandbox_id", logSandboxID(instanceID)).Logger()
 
 	bridgeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -232,18 +234,21 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 		return
 	}
 	if typ != websocket.MessageText {
+		logRequestOutcome(ctx, "invalid_request")
 		_ = ws.Close(websocket.StatusUnsupportedData, "start message must be text JSON")
 		return
 	}
 	var start execWSStart
 	if err := json.Unmarshal(raw, &start); err != nil || start.Command == "" {
+		logRequestOutcome(ctx, "invalid_request")
 		_ = ws.Close(websocket.StatusPolicyViolation, "invalid start message (command required)")
 		return
 	}
 
 	stream, err := procClient.Start(bridgeCtx, connect.NewRequest(start.toStartRequest()))
 	if err != nil {
-		l.Error().Err(err).Msg("exec/ws: boxd Start failed")
+		logRequestOutcome(ctx, "upstream_error")
+		l.Error().Msg("exec/ws: boxd Start failed")
 		_ = ws.Close(websocket.StatusInternalError, "failed to start command")
 		return
 	}
@@ -252,7 +257,8 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	// SendInput / Signal.
 	if !stream.Receive() {
 		serr := stream.Err()
-		l.Error().Err(serr).Msg("exec/ws: stream empty on start")
+		logRequestOutcome(ctx, "upstream_error")
+		l.Error().Msg("exec/ws: stream empty on start")
 		if serr != nil {
 			msg, code := clientExecError(serr)
 			_ = writeExecEvent(bridgeCtx, ws, &execWSEvent{Error: msg, Code: code, Finished: true})
@@ -262,6 +268,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 	}
 	startEvent := stream.Msg().GetStart()
 	if startEvent == nil {
+		logRequestOutcome(ctx, "upstream_error")
 		l.Error().Msg("exec/ws: first event was not StartEvent")
 		_ = ws.Close(websocket.StatusInternalError, "unexpected event")
 		return
@@ -295,7 +302,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 				pingCancel()
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
-						l.Debug().Err(err).Msg("exec/ws: ping failed, tearing down")
+						l.Debug().Msg("exec/ws: ping failed, tearing down")
 					}
 					cancel()
 					return
@@ -320,7 +327,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 				if out := d.GetStdout(); len(out) > 0 {
 					if err := writeExecData(bridgeCtx, ws, execChStdout, out); err != nil {
 						if !errors.Is(err, context.Canceled) {
-							l.Debug().Err(err).Msg("exec/ws: WS write failed")
+							l.Debug().Msg("exec/ws: WS write failed")
 						}
 						return
 					}
@@ -328,7 +335,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 				if out := d.GetStderr(); len(out) > 0 {
 					if err := writeExecData(bridgeCtx, ws, execChStderr, out); err != nil {
 						if !errors.Is(err, context.Canceled) {
-							l.Debug().Err(err).Msg("exec/ws: WS write failed")
+							l.Debug().Msg("exec/ws: WS write failed")
 						}
 						return
 					}
@@ -336,10 +343,11 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 				continue
 			}
 			if e := msg.GetEnd(); e != nil {
+				logRequestOutcome(ctx, "process_exited")
 				code := e.GetExitCode()
 				if err := writeExecEvent(bridgeCtx, ws, &execWSEvent{ExitCode: &code, Finished: true}); err != nil {
 					if !errors.Is(err, context.Canceled) {
-						l.Debug().Err(err).Msg("exec/ws: WS write failed")
+						l.Debug().Msg("exec/ws: WS write failed")
 					}
 					return
 				}
@@ -348,7 +356,8 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 			}
 		}
 		if err := stream.Err(); err != nil && !errors.Is(err, context.Canceled) {
-			l.Warn().Err(err).Msg("exec/ws: boxd stream error")
+			logRequestOutcome(ctx, "upstream_error")
+			l.Warn().Msg("exec/ws: boxd stream error")
 			msg, code := clientExecError(err)
 			_ = writeExecEvent(bridgeCtx, ws, &execWSEvent{
 				Error:    msg,
@@ -387,7 +396,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 					Pid:  pid,
 					Data: data[1:],
 				})); err != nil {
-					l.Warn().Err(err).Msg("exec/ws: SendInput failed")
+					l.Warn().Msg("exec/ws: SendInput failed")
 				}
 			case websocket.MessageText:
 				h.handleExecControl(bridgeCtx, procClient, pid, data, l)
@@ -405,7 +414,7 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 func (h *Handler) handleExecControl(ctx context.Context, client boxdpbconnect.ProcessServiceClient, pid uint32, data []byte, l zerolog.Logger) {
 	var msg execWSControl
 	if err := json.Unmarshal(data, &msg); err != nil {
-		l.Warn().Err(err).Msg("exec/ws: bad control JSON")
+		l.Warn().Msg("exec/ws: bad control JSON")
 		return
 	}
 
@@ -415,24 +424,24 @@ func (h *Handler) handleExecControl(ctx context.Context, client boxdpbconnect.Pr
 			Pid: pid,
 			Eof: true,
 		})); err != nil {
-			l.Warn().Err(err).Msg("exec/ws: stdin_close failed")
+			l.Warn().Msg("exec/ws: stdin_close failed")
 		}
 
 	case "signal":
 		signum, ok := execSignalNameToNumber(msg.Name)
 		if !ok {
-			l.Warn().Str("name", msg.Name).Msg("exec/ws: unknown signal name")
+			l.Warn().Msg("exec/ws: unknown signal name")
 			return
 		}
 		if _, err := client.Signal(ctx, connect.NewRequest(&pb.SignalRequest{
 			Pid:    pid,
 			Signal: signum,
 		})); err != nil {
-			l.Warn().Err(err).Msg("exec/ws: Signal failed")
+			l.Warn().Msg("exec/ws: Signal failed")
 		}
 
 	default:
-		l.Debug().Str("type", msg.Type).Msg("exec/ws: unknown control type")
+		l.Debug().Msg("exec/ws: unknown control type")
 	}
 }
 

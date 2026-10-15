@@ -40,12 +40,14 @@ func (h *Handler) authorizeSandboxRequest(
 	}
 
 	if !auth.VerifyAccessToken(h.seedKey, requestSandboxID, token) {
+		logSandboxAuth(ctx, "invalid", "")
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusUnauthorized,
 			Message: "invalid access token",
 		}
 	}
 
+	logSandboxAuth(ctx, "authenticated", "")
 	info, err := h.resolver.Lookup(ctx, requestSandboxID)
 	if err != nil {
 		if errors.Is(err, ErrInstanceNotFound) {
@@ -61,6 +63,7 @@ func (h *Handler) authorizeSandboxRequest(
 			Code:    "sandbox_unavailable",
 		}
 	}
+	logSandboxAuth(ctx, "authenticated", info.TeamID)
 	if info.Status != "running" {
 		return InstanceInfo{}, &authzFailure{
 			Status:  http.StatusServiceUnavailable,
@@ -112,5 +115,9 @@ func (h *Handler) canRouteBoxdRequest(r *http.Request, sandboxID string) bool {
 	default:
 		return false
 	}
-	return h.seedKey != nil && auth.VerifyAccessToken(h.seedKey, sandboxID, token)
+	valid := h.seedKey != nil && auth.VerifyAccessToken(h.seedKey, sandboxID, token)
+	if valid {
+		logSandboxAuth(r.Context(), "authenticated", "")
+	}
+	return valid
 }

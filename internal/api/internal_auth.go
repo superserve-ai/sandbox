@@ -18,6 +18,7 @@ func InternalAuth() gin.HandlerFunc {
 	token := os.Getenv("INTERNAL_API_TOKEN")
 
 	return func(c *gin.Context) {
+		logSharedAuthAttempt(c, token != "")
 		if token == "" {
 			respondErrorMsg(c, "unauthorized", "internal API not configured", http.StatusUnauthorized)
 			c.Abort()
@@ -38,6 +39,7 @@ func InternalAuth() gin.HandlerFunc {
 			return
 		}
 
+		logServiceIdentity(c, "service")
 		c.Next()
 	}
 }
@@ -54,6 +56,8 @@ func PromotionProducerAuth(envName string) gin.HandlerFunc {
 		provided := strings.TrimPrefix(auth, "Bearer ")
 		otherToken := os.Getenv(other)
 		internalToken := os.Getenv("INTERNAL_API_TOKEN")
+		configured := token != "" && otherToken != "" && token != otherToken && token != internalToken && otherToken != internalToken
+		logSharedAuthAttempt(c, configured)
 		if token == "" || otherToken == "" || token == otherToken ||
 			((token == internalToken || otherToken == internalToken) && internalToken != "") ||
 			provided == auth || provided == "" ||
@@ -62,6 +66,7 @@ func PromotionProducerAuth(envName string) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		logServiceIdentity(c, "service")
 		c.Next()
 	}
 }
@@ -75,6 +80,9 @@ func InternalActorFromHeader() gin.HandlerFunc {
 		if raw != "" {
 			if id, err := uuid.Parse(raw); err == nil {
 				c.Set("actor_id", id)
+				if kind := logIdentity(c).ActorType; id != uuid.Nil && (kind == "service" || kind == "operator") {
+					logHumanIdentity(c, id.String())
+				}
 			}
 		}
 		c.Next()

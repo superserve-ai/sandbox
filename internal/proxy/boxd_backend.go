@@ -19,6 +19,7 @@ import (
 func (h *Handler) authorizeBoxdRequest(w http.ResponseWriter, r *http.Request, instanceID, logPrefix string) (InstanceInfo, bool) {
 	token := r.Header.Get(accessTokenHeader)
 	if token == "" {
+		logSandboxAuth(r.Context(), "missing", "")
 		http.Error(w, "missing X-Access-Token header", http.StatusUnauthorized)
 		return InstanceInfo{}, false
 	}
@@ -28,7 +29,7 @@ func (h *Handler) authorizeBoxdRequest(w http.ResponseWriter, r *http.Request, i
 
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
 	if fail != nil {
-		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg(logPrefix + ": auth failed")
+		h.log.Warn().Str("sandbox_id", logSandboxID(instanceID)).Int("status", fail.Status).Msg(logPrefix + ": auth failed")
 		fail.write(w)
 		return InstanceInfo{}, false
 	}
@@ -62,6 +63,7 @@ func boxdDirector(originalHost string, target *url.URL) func(*http.Request) {
 			"X-Forwarded-Proto",
 			"X-Real-Ip",
 			"Forwarded",
+			peerRequestIDHeader,
 		} {
 			req.Header.Del(hdr)
 		}
@@ -85,8 +87,9 @@ func (h *Handler) newBoxdReverseProxy(r *http.Request, instanceID string, info I
 				http.Error(rw, "request body too large", http.StatusRequestEntityTooLarge)
 				return
 			}
-			h.log.Error().Err(proxyErr).
-				Str("instance", instanceID).
+			logRequestOutcome(req.Context(), "transport_error")
+			h.log.Error().
+				Str("instance", logSandboxID(instanceID)).
 				Str("path", req.URL.Path).
 				Str("target", target.Host).
 				Msg(logPrefix + ": upstream error")

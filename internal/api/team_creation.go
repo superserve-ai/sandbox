@@ -380,12 +380,14 @@ func teamCreationError(c *gin.Context, code, message string, status int) {
 func TeamCreationInternalAuth() gin.HandlerFunc {
 	token := os.Getenv("INTERNAL_API_TOKEN")
 	return func(c *gin.Context) {
+		logSharedAuthAttempt(c, token != "")
 		provided := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		if token == "" || provided == "" || provided == c.GetHeader("Authorization") || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			teamCreationError(c, "invalid_assertion", "Authentication required", http.StatusUnauthorized)
 			c.Abort()
 			return
 		}
+		logServiceIdentity(c, "service")
 		c.Next()
 	}
 }
@@ -469,6 +471,7 @@ func (h *Handlers) createInternalTeam(c *gin.Context, now time.Time) {
 		return
 	}
 	c.Set("team_creation_request_id", input.RequestID)
+	logHumanIdentity(c, actor.String())
 	if h.Pool == nil {
 		teamCreationError(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)
 		return

@@ -36,6 +36,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
+	"github.com/superserve-ai/sandbox/internal/requestlog"
 	"github.com/superserve-ai/sandbox/internal/scheduler"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -59,10 +60,10 @@ var vmdKeepalive = keepalive.ClientParameters{Time: 30 * time.Second, Timeout: 1
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	multi := zerolog.MultiLevelWriter(
-		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
+		os.Stdout,
 		&sentrylog.Writer{},
 	)
-	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
+	log.Logger = zerolog.New(multi).Hook(requestlog.CloudSeverityHook{}).With().Timestamp().Caller().Logger()
 
 	if err := run(); err != nil {
 		log.Fatal().Err(err).Msg("controlplane exited with error")
