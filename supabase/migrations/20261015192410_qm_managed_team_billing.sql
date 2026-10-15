@@ -1,10 +1,12 @@
 -- Managed teams keep normal usage accounting. Their payer is the QM service,
 -- rather than an individual signup trial or Superserve subscription.
 CREATE FUNCTION qm_team_managed_billing(p_team_id uuid) RETURNS boolean
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public AS $$
- SELECT EXISTS(SELECT 1 FROM public.qm_organization_teams b
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,public AS $$
+BEGIN
+ RETURN EXISTS(SELECT 1 FROM public.qm_organization_teams b
  JOIN public.qm_team_service_authority a USING(namespace,authority_id,home_region)
  WHERE b.team_id=p_team_id AND b.deleted_at IS NULL);
+END
 $$;
 -- This read-only policy predicate reveals no organization or authority identity.
 GRANT EXECUTE ON FUNCTION qm_team_managed_billing(uuid) TO PUBLIC;

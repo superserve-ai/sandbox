@@ -44,6 +44,45 @@ credentials remain in the control plane. Two-organization integration coverage u
 real credential resolution, scoped sandbox creation, cross-team denial and the
 production usage-rollup query with a synthetic VM transport.
 
+## Provisioning signals and billing cost
+
+Authenticated, validated provisioning calls emit `qm_team_provisioning_attempt`
+and `qm_team_provisioning_outcome`. Both contain namespace, method and the stable
+SHA-256 `qm_org_ref` correlation value. Outcomes are `bound`, `absent`, `deleted`,
+`conflict` or `unavailable`, with duration and the team ID only when bound. Tokens,
+request bodies, raw errors and organization IDs are not logged by these events.
+Alert on organization correlations with attempts but no `bound` outcome over
+15 minutes. These events run on provisioning calls, not sandbox create/resume.
+
+The managed-billing predicate performs a unique `team_id` lookup and verifies the
+immutable authority. Its PL/pgSQL query plan is reused across calls. The existing
+eligibility read remains synchronous on a cache miss so the verdict comes from
+the same database snapshot; there is no new network round trip or separately
+maintained policy cache. Existing singleflight, 30-second eligible/3-second
+ineligible TTLs, bounded cache size and `billing_eligibility_ms` measurement remain.
+
+`BenchmarkQMManagedBilling` compares the prior eligibility body with the managed
+branch and executes the production active-team sweep. Local PostgreSQL 16 results
+with warm database pages, no application cache, and local container round trips:
+
+| Bindings | Ordinary eligibility, baseline / managed branch | Sweep, baseline / managed branch |
+| --- | --- | --- |
+| 1 | 0.330 / 0.358 ms | 3.59 / 5.44 ms |
+| 1,000 | 0.370 / 0.371 ms | 7.07 / 11.68 ms |
+| 100,000 | 0.370 / 0.390 ms | 7.93 / 10.94 ms |
+
+The sweep fixture has 500 ordinary teams, up to 500 managed teams and four active
+sandboxes per team. It deduplicates before eligibility evaluation. The unique
+lookup touched five shared buffers at 100,000 bindings; it did not scan the binding
+fleet. Reusing the predicate plan reduced that fixture's sweep from 35.63 to
+10.94 ms. The background sweep still scales with distinct active teams; its output
+limit does not cap candidates inspected. These measurements do not model cold
+database pages, network latency or a 100,000-active-team sweep.
+
+Reproduce with a disposable migrated database:
+`go test -tags integration ./internal/integration -run '^$' -bench '^BenchmarkQMManagedBilling$' -benchtime=1s -count=1 -v`.
+The benchmark rolls back its fixtures and emits `EXPLAIN (ANALYZE, BUFFERS)` plans.
+
 ## Deployment
 
 Configure `QM_TEAM_SERVICE_TOKEN`, `QM_TEAM_NAMESPACE`, `QM_TEAM_AUTHORITY_ID`

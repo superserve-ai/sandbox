@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog/log"
 )
 
 type qmTeamResult struct {
@@ -79,6 +82,14 @@ func qmOrganizationTeamHandler(pool *pgxpool.Pool, cfg qmTeamConfig) gin.Handler
 			c.AbortWithStatusJSON(400, gin.H{"error": "invalid_idempotency_key"})
 			return
 		}
+		started := time.Now()
+		orgRef := sha256.Sum256([]byte(cfg.namespace + ":" + org))
+		logger := log.With().Str("qm_org_ref", hex.EncodeToString(orgRef[:])).Str("namespace", cfg.namespace).Str("method", c.Request.Method).Logger()
+		logger.Info().Str("event", "qm_team_provisioning_attempt").Msg("organization team provisioning")
+		outcome, boundTeam := "unavailable", ""
+		defer func() {
+			logger.Info().Str("event", "qm_team_provisioning_outcome").Str("outcome", outcome).Str("ss_team_id", boundTeam).Int64("duration_ms", time.Since(started).Milliseconds()).Msg("organization team provisioning")
+		}()
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()
 		if pool == nil {
@@ -94,14 +105,18 @@ func qmOrganizationTeamHandler(pool *pgxpool.Pool, cfg qmTeamConfig) gin.Handler
 		}
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
+			outcome = "absent"
 			c.JSON(404, gin.H{"error": "organization_team_absent", "qm_org_id": org, "idempotency_key": key, "namespace": cfg.namespace, "authority_id": cfg.authority})
 		case errors.Is(err, errQMTeamGone):
+			outcome = "deleted"
 			c.JSON(410, gin.H{"error": "organization_team_deleted"})
 		case errors.Is(err, errQMTeamConflict):
+			outcome = "conflict"
 			c.JSON(409, gin.H{"error": "organization_team_conflict"})
 		case err != nil:
 			c.JSON(503, gin.H{"error": "team_service_unavailable"})
 		default:
+			outcome, boundTeam = "bound", result.SSTeamID
 			c.JSON(200, result)
 		}
 	}
