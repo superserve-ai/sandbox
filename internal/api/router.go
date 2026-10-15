@@ -121,6 +121,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.POST("/stripe/webhook", h.HandleStripeWebhook)
 	r.POST("/internal/teams", TeamCreationPrivacy(), TeamCreationInternalAuth(), h.CreateInternalTeam)
 	r.POST("/internal/qm/authorize", TeamCreationPrivacy(), h.QMAuthHandler())
+	r.POST("/internal/qm/organizations/:qm_org_id/team", TeamCreationPrivacy(), h.QMOrganizationTeamHandler())
+	r.GET("/internal/qm/organizations/:qm_org_id/team", TeamCreationPrivacy(), h.QMOrganizationTeamHandler())
 
 	promotionCapture := r.Group("/internal/promotion/signup")
 	promotionCapture.Use(PromotionProducerAuth("PROMOTION_CAPTURE_TOKEN"))
