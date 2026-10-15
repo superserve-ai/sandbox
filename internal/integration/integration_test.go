@@ -1271,6 +1271,8 @@ func newRouter(t *testing.T) *gin.Engine {
 
 func newRouterWithNow(t *testing.T, now func() time.Time) *gin.Engine {
 	t.Helper()
+	// The shared stub host has no heartbeat loop and can age out mid-suite.
+	setOwnerHeartbeat(t, testDefaultHostID, time.Now())
 	cfg := &config.Config{
 		Port:          "0",
 		VMDAddress:    "localhost:0",
@@ -2801,6 +2803,7 @@ func TestIntegration_PauseSandbox_AlreadyPaused(t *testing.T) {
 func TestIntegration_ResumeSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
+	setOwnerHeartbeat(t, testDefaultHostID, time.Now().Add(-3*time.Minute))
 	r := newRouter(t)
 
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"resume-box"}`)
