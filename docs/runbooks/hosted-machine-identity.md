@@ -199,7 +199,7 @@ re-enter after invalidation.
 ## Compatibility and activation gate
 
 The supported serving revision is `machine-identity-v1`: the schema migration
-`20261015175350_hosted_machine_identity.sql`, the API `CallerContext` resolver
+`20261015191924_hosted_machine_identity.sql`, the API `CallerContext` resolver
 and route gate, the `mcap.v1` verifier, and the proxy session registry must be
 deployed as one compatible set. A serving instance is **ready** only when its
 health/readiness check reports all four surfaces present, the authority lookup
@@ -244,7 +244,7 @@ not claim those measurements passed.
 ## Restoring the source after the coordinated-rollout revert
 
 PR #683 reverted PR #660 before its migration or deployments ran. The restored
-migration is `20261015175350_hosted_machine_identity.sql`, ordered after the
+migration is `20261015191924_hosted_machine_identity.sql`, ordered after the
 newer billing migrations with unchanged SQL. Before applying it, verify that
 no earlier hosted-machine migration was applied in the target environment;
 stop for reconciliation if its schema or migration history is already present.
