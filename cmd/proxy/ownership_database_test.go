@@ -165,7 +165,7 @@ func testRoutingDatabaseCredentialContract(t *testing.T, url, cleanupURL string)
 	cfg.Password = password
 	// ConnString retains the original URL; build the test DSN from explicit fields.
 	routingURL := fmt.Sprintf("host=%s port=%d dbname=%s user=sandbox_proxy_router password=%s sslmode=disable", cfg.Host, cfg.Port, name, password)
-	pool, err := newOwnershipPool(ctx, true, routingURL)
+	pool, err := newOwnershipPool(ctx, true, routingURL, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,14 +209,14 @@ func testRoutingDatabaseCredentialContract(t *testing.T, url, cleanupURL string)
 	if _, err := db.Exec(ctx, "GRANT UPDATE ON public.sandbox TO sandbox_proxy_router"); err != nil {
 		t.Fatal(err)
 	}
-	invalid, err := newOwnershipPool(ctx, true, routingURL)
+	invalid, err := newOwnershipPool(ctx, true, routingURL, 5*time.Second)
 	if invalid != nil {
 		invalid.Close()
 	}
 	if err == nil {
 		t.Fatal("startup accepted a routing credential with write access")
 	}
-	invalid, err = newOwnershipPool(ctx, true, url)
+	invalid, err = newOwnershipPool(ctx, true, url, 5*time.Second)
 	if invalid != nil {
 		invalid.Close()
 	}

@@ -1,11 +1,14 @@
 package api
 
+import "net/http"
+
 import (
 	"fmt"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/auth"
 )
 
 // customerTeamPermissionAllowed checks an active team-scoped permission without
@@ -71,6 +74,14 @@ func (h *Handlers) requireTeamPermissionFromContext(c *gin.Context, permission s
 // sandbox-specific helpers at call sites so a future sandboxes:* permission split
 // can be made centrally without touching every handler again.
 func (h *Handlers) requireTeamSandboxRead(c *gin.Context, teamID uuid.UUID) bool {
+	if operation, ok := machineOperationForRequest(c); ok {
+		if !h.requireMachineOperation(c, operation) || !h.requireMachineSandboxOwnerForRead(c, operation, teamID) {
+			return false
+		}
+		if _, machine := machineCallerFromContext(c); machine {
+			return true
+		}
+	}
 	if isConsoleImpersonation(c) && apiKeyHasScope(c, "platform:sandbox:read") {
 		return true
 	}
@@ -78,7 +89,46 @@ func (h *Handlers) requireTeamSandboxRead(c *gin.Context, teamID uuid.UUID) bool
 }
 
 func (h *Handlers) requireTeamSandboxWrite(c *gin.Context, teamID uuid.UUID) bool {
+	if operation, ok := machineOperationForRequest(c); ok {
+		if !h.requireMachineOperation(c, operation) {
+			return false
+		}
+		if _, machine := machineCallerFromContext(c); machine {
+			// Resume and pause check ownership in their claims and activate in
+			// its joined routing read; a separate read would duplicate that work.
+			if operation == auth.MachineOperationResume || operation == auth.MachineOperationActivate || operation == auth.MachineOperationPause {
+				return true
+			}
+			if raw := c.Param("sandbox_id"); raw != "" {
+				id, err := parsePublicSandboxID(raw)
+				if err != nil {
+					respondErrorMsg(c, "invalid_sandbox_id", "invalid sandbox id", http.StatusBadRequest)
+					return false
+				}
+				if !h.requireMachineSandboxOwner(c, id, teamID) {
+					return false
+				}
+			}
+			return true
+		}
+	}
 	return h.requireCustomerTeamPermission(c, teamID, "settings:write")
+}
+
+func (h *Handlers) requireMachineSandboxOwnerForRead(c *gin.Context, operation auth.MachineOperation, teamID uuid.UUID) bool {
+	_, machine := machineCallerFromContext(c)
+	if !machine || operation == auth.MachineOperationList || operation == auth.MachineOperationCreate {
+		return true
+	}
+	if raw := c.Param("sandbox_id"); raw != "" {
+		id, err := parsePublicSandboxID(raw)
+		if err != nil {
+			respondErrorMsg(c, "invalid_sandbox_id", "invalid sandbox id", http.StatusBadRequest)
+			return false
+		}
+		return h.requireMachineSandboxOwner(c, id, teamID)
+	}
+	return true
 }
 
 func (h *Handlers) requireTeamSettingsRead(c *gin.Context, teamID uuid.UUID) bool {

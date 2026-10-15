@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -60,11 +61,37 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		}()
 	}
 	return func(c *gin.Context) {
-		authStart := time.Now()
+		authStart, hasAuthStart := c.Get("auth_start")
+		if !hasAuthStart {
+			authStart = time.Now()
+			c.Set("auth_start", authStart)
+		}
+		startedAt, _ := authStart.(time.Time)
+		if startedAt.IsZero() {
+			startedAt = time.Now()
+			c.Set("auth_start", startedAt)
+		}
 		// Handlers base their phase-series totals on this so user-visible
 		// latency includes a slow auth cache miss (auth must never exceed
 		// its own request's total).
-		c.Set("auth_start", authStart)
+		// A verified hosted machine credential is a separate authority. Do not
+		// force it through human API-key/creator lookup or synthesize actor_id.
+		if _, machine := machineCallerFromContext(c); machine {
+			defer func() {
+				if _, owned := c.Get(phaseSeriesOwnedKey); owned {
+					return
+				}
+				op, ok := sandboxLifecycleOperation(c.Request.Method, c.FullPath())
+				if !ok {
+					return
+				}
+				RecordLatencyPhases(c.Request.Context(), op, "", map[string]time.Duration{"auth": time.Since(startedAt), "total": time.Since(startedAt)})
+			}()
+			c.Set("auth_ms", time.Since(startedAt).Milliseconds())
+			c.Set("auth_duration", time.Since(startedAt))
+			c.Next()
+			return
+		}
 		// A request aborted before its handler (auth failure, or a
 		// downstream middleware like the team rate limit) never runs the
 		// handler defer that emits the op's phase series, so those slow
@@ -78,7 +105,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 			if !ok {
 				return
 			}
-			phases := map[string]time.Duration{"total": time.Since(authStart)}
+			phases := map[string]time.Duration{"total": time.Since(startedAt)}
 			if v, ok := c.Get("auth_duration"); ok {
 				// Auth completed; the abort came later (e.g. rate limit).
 				if d, ok := v.(time.Duration); ok {
@@ -86,7 +113,7 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 				}
 			} else {
 				// Aborted inside auth itself.
-				phases["auth"] = time.Since(authStart)
+				phases["auth"] = time.Since(startedAt)
 			}
 			RecordLatencyPhases(c.Request.Context(), op, "", phases)
 		}()
@@ -141,8 +168,8 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 				}()
 			}
 			setAPIKeyContext(c, entry)
-			c.Set("auth_ms", time.Since(authStart).Milliseconds())
-			c.Set("auth_duration", time.Since(authStart))
+			c.Set("auth_ms", time.Since(startedAt).Milliseconds())
+			c.Set("auth_duration", time.Since(startedAt))
 			c.Next()
 			return
 		}
@@ -191,8 +218,8 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 		}
 
 		setAPIKeyContext(c, entry)
-		c.Set("auth_ms", time.Since(authStart).Milliseconds())
-		c.Set("auth_duration", time.Since(authStart))
+		c.Set("auth_ms", time.Since(startedAt).Milliseconds())
+		c.Set("auth_duration", time.Since(startedAt))
 		c.Next()
 	}
 }
@@ -204,6 +231,9 @@ func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
 	c.Set("api_key_id", entry.id)
 	c.Set("api_key_name", entry.name)
 	c.Set("api_key_scopes", entry.scopes)
+	if entry.expiresAt.Valid {
+		c.Set("api_key_expires_at", entry.expiresAt.Time)
+	}
 	c.Set("team_id", entry.teamID)
 	if entry.createdBy.Valid && entry.name != consoleImpersonationKeyName {
 		c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
@@ -225,7 +255,7 @@ func RequestLogger() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 
-		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" {
+		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" && !strings.HasPrefix(c.Request.URL.Path, "/internal/machine-identity") {
 			path = path + "?" + raw
 		}
 

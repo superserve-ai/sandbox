@@ -128,9 +128,11 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		return nil
 	}
 	inst, instErr := m.getInstance(vmID)
+	var prevOwnership *VMRecord
 	if instErr == nil {
 		inst.mu.RLock()
 		running := inst.Status == StatusRunning && !inst.Unverified
+		prevOwnership = explicitOwnershipRecord(inst)
 		inst.mu.RUnlock()
 		if running {
 			return nil, status.Errorf(codes.AlreadyExists, "vm %s is already running", vmID)
@@ -158,7 +160,9 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		inst.Unverified = true
 		inst.BackupGeneration = generation
 		inst.SourceSnapshotID = cfg.SavedSnapshotID
-		inst.TeamID, inst.OwnerID = teamID, ownerID
+		inst.TeamID = teamID
+		setOwnershipFromTrustedMarker(inst, ownerID)
+		restoreOwnershipFromRecord(inst, prevOwnership)
 		inst.PreviewAccess = previewAccess
 		inst.PreviewPorts = clonePreviewPorts(previewPorts)
 		inst.PreviewPolicyRevision = previewPolicyRevision

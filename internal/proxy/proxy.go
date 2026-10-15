@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/telemetry"
@@ -78,6 +79,24 @@ type Handler struct {
 	// sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
 	// Set via WithAuth; nil means data-plane endpoints are disabled.
 	seedKey []byte
+	// machineAuthority is the bounded-freshness durable revocation resolver.
+	// Machine capabilities fail closed when a proxy has not been configured
+	// with it; legacy tokens remain available only to ordinary sandboxes.
+	machineReadiness            machineReadinessState
+	sandboxOwnership            *CachedSandboxOwnership
+	machineAuthority            auth.RevocationAuthority
+	machineAuthoritySnapshotter interface {
+		LookupSnapshot(context.Context, uuid.UUID, uuid.UUID) (uint64, time.Time, error)
+	}
+	machineAuthorityInvalidator interface {
+		InvalidateCredential(uuid.UUID)
+		InvalidatePrincipal(uuid.UUID)
+	}
+	// sessions is the bounded active-stream registry. It is deliberately
+	// local to a serving instance; durable authority refresh/invalidation
+	// calls RevokeCredential/RevokePrincipal and the registered cancel funcs
+	// terminate transports without per-frame durable I/O.
+	sessions *auth.SessionRegistry
 
 	// terminal holds the dependencies specific to the /terminal WebSocket
 	// bridge (allowed browser origins for the Origin check). Nil means
@@ -152,6 +171,7 @@ func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handle
 		sandboxConns:       newConnLimiter(maxConnsPerSandbox),
 		ipConns:            newConnLimiter(maxConnsPerIP),
 		authenticatedConns: newConnLimiter(1024),
+		sessions:           auth.NewSessionRegistry(1024),
 		log:                log,
 	}
 	return h
@@ -193,8 +213,21 @@ func (h *Handler) FilesEnabled() bool {
 
 // ResolverReady verifies the configured resolver endpoint without touching a sandbox.
 func (h *Handler) ResolverReady(ctx context.Context) bool {
+	ordinary, _ := h.ResolverReadiness(ctx)
+	return ordinary
+}
+
+// ResolverReadiness returns reachability and machine protocol compatibility
+// from one observation; legacy resolvers cannot attest machine readiness.
+func (h *Handler) ResolverReadiness(ctx context.Context) (ordinary, machine bool) {
+	if resolver, ok := h.resolver.(interface {
+		ReadyWithMachineIdentity(context.Context) (bool, error)
+	}); ok {
+		compatible, err := resolver.ReadyWithMachineIdentity(ctx)
+		return err == nil, compatible && err == nil
+	}
 	resolver, ok := h.resolver.(interface{ Ready(context.Context) error })
-	return ok && resolver.Ready(ctx) == nil
+	return ok && resolver.Ready(ctx) == nil, false
 }
 
 // WithAnalytics enables data-plane usage events (exec/files).

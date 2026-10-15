@@ -1,0 +1,85 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/superserve-ai/sandbox/internal/db"
+)
+
+func TestMachineResumeClaimCarriesImmutableOwnership(t *testing.T) {
+	ctx := context.Background()
+	for _, machine := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "machine"}[machine], func(t *testing.T) {
+			teamID, _ := seedTeamAndKey(t)
+			sandboxID := seedPausedSandbox(t, teamID)
+			var principalID uuid.UUID
+			if machine {
+				principal := machineRepairPrincipal(t, testQueries, teamID)
+				principalID = principal.ID
+				if err := testQueries.CreateMachineSandboxOwner(ctx, sandboxID, principalID, teamID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			params := db.ClaimResumeParams{ID: sandboxID, TeamID: teamID, LockKey: sandboxID.String()}
+			other := machineRepairPrincipal(t, testQueries, teamID)
+			denied := params
+			denied.MachinePrincipalID = pgtype.UUID{Bytes: other.ID, Valid: true}
+			if _, err := testQueries.ClaimResume(ctx, denied); !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("foreign machine claimed sandbox: %v", err)
+			}
+			unchanged, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+			if err != nil || unchanged.Status != db.SandboxStatusPaused {
+				t.Fatalf("denied claim changed status: %s %v", unchanged.Status, err)
+			}
+			if machine {
+				params.MachinePrincipalID = pgtype.UUID{Bytes: principalID, Valid: true}
+			}
+			claim, err := testQueries.ClaimResume(ctx, params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claim.Sandbox.ID != sandboxID || claim.Sandbox.TeamID != teamID || claim.Sandbox.Status != db.SandboxStatusResuming || claim.MachineOwnershipPresent != machine {
+				t.Fatalf("claim identity mismatch: %+v", claim)
+			}
+			if machine {
+				if !claim.MachineOwnerPrincipalID.Valid || uuid.UUID(claim.MachineOwnerPrincipalID.Bytes) != principalID || !claim.MachineOwnerTeamID.Valid || uuid.UUID(claim.MachineOwnerTeamID.Bytes) != teamID {
+					t.Fatalf("claim lost immutable owner: %+v", claim)
+				}
+			} else if claim.MachineOwnerPrincipalID.Valid || claim.MachineOwnerTeamID.Valid {
+				t.Fatal("ordinary claim fabricated machine identity")
+			}
+			if _, err := testQueries.ClaimResume(ctx, params); !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("already claimed row was authorized again: %v", err)
+			}
+		})
+	}
+}
+
+func TestMachinePauseClaimRequiresOwningPrincipal(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := seedActiveSandbox(t, teamID, "machine-pause")
+	owner := machineRepairPrincipal(t, testQueries, teamID)
+	if err := testQueries.CreateMachineSandboxOwner(ctx, sandboxID, owner.ID, teamID); err != nil {
+		t.Fatal(err)
+	}
+	params := db.BeginPauseParams{ID: sandboxID, TeamID: teamID, PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, LeaseSeconds: 60}
+	other := machineRepairPrincipal(t, testQueries, teamID)
+	denied := params
+	denied.MachinePrincipalID = pgtype.UUID{Bytes: other.ID, Valid: true}
+	if _, err := testQueries.BeginPause(ctx, denied); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("foreign machine paused sandbox: %v", err)
+	}
+	params.MachinePrincipalID = pgtype.UUID{Bytes: owner.ID, Valid: true}
+	if row, err := testQueries.BeginPause(ctx, params); err != nil || row.Status != db.SandboxStatusPausing {
+		t.Fatalf("owner pause claim: %s %v", row.Status, err)
+	}
+}
