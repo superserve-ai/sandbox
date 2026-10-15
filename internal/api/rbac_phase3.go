@@ -94,9 +94,9 @@ func (h *Handlers) requireTeamSandboxWrite(c *gin.Context, teamID uuid.UUID) boo
 			return false
 		}
 		if _, machine := machineCallerFromContext(c); machine {
-			// Resume and pause check ownership in their claims and activate in
-			// its joined routing read; a separate read would duplicate that work.
-			if operation == auth.MachineOperationResume || operation == auth.MachineOperationActivate || operation == auth.MachineOperationPause {
+			// Resume and pause check ownership in their claims; activate and
+			// file listing use the joined routing read before any VM operation.
+			if operation == auth.MachineOperationResume || operation == auth.MachineOperationActivate || operation == auth.MachineOperationPause || operation == auth.MachineOperationFileList {
 				return true
 			}
 			if raw := c.Param("sandbox_id"); raw != "" {

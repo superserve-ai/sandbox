@@ -17,6 +17,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -244,5 +245,71 @@ func TestMachineActivateEnforcesOwnershipFromRoutingRead(t *testing.T) {
 		if !owned && (got != nil || w.Code != http.StatusForbidden) {
 			t.Fatalf("foreign activation status = %d", w.Code)
 		}
+	}
+}
+
+func TestMachineFileListEnforcesJoinedOwnership(t *testing.T) {
+	for _, scenario := range []string{"owned", "foreign_active", "foreign_paused", "missing_owner", "missing_sandbox"} {
+		t.Run(scenario, func(t *testing.T) {
+			team, sandbox, principal := uuid.New(), uuid.New(), uuid.New()
+			sb := db.Sandbox{ID: sandbox, TeamID: team, Status: db.SandboxStatusActive}
+			if scenario == "foreign_paused" {
+				sb.Status = db.SandboxStatusPaused
+			}
+			joinedReads := 0
+			mock := &boundaryOwnerDB{failure: errors.New("unexpected ownership pre-read"), mockDBTX: &mockDBTX{
+				queryRowFn: func(_ context.Context, query string, _ ...any) pgx.Row {
+					if strings.Contains(query, "'resuming'") {
+						t.Fatal("foreign file request attempted resume claim")
+					}
+					joinedReads++
+					if scenario == "missing_sandbox" {
+						return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
+					}
+					row := sandboxRow(sb)
+					scan := row.scanFn
+					row.scanFn = func(dest ...any) error {
+						if err := scan(dest...); err != nil {
+							return err
+						}
+						if len(dest) != 44 {
+							t.Fatalf("expected joined routing read, got %d columns", len(dest))
+						}
+						if scenario != "missing_owner" {
+							*dest[41].(*bool) = true
+							*dest[42].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
+							*dest[43].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
+						}
+						return nil
+					}
+					return row
+				},
+			}}
+			listCalls := 0
+			h := &Handlers{DB: db.New(mock), VMD: &stubVMD{listDirFn: func(context.Context, string, string) ([]vmdclient.DirEntry, error) {
+				listCalls++
+				return nil, nil
+			}}}
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, "/sandboxes/"+sandbox.String()+"/files", nil)
+			c.Params = gin.Params{{Key: "sandbox_id", Value: sandbox.String()}}
+			c.Set("team_id", team.String())
+			caller := machineRequestCaller(time.Now())
+			caller.TeamID, caller.PrincipalID = team, principal
+			if strings.HasPrefix(scenario, "foreign_") {
+				caller.PrincipalID = uuid.New()
+			}
+			caller.Permissions, caller.Policy = []auth.MachineOperation{auth.MachineOperationFileList}, auth.NewMachinePolicy(auth.MachineOperationFileList)
+			setMachineCaller(c, caller)
+			h.ListSandboxFiles(c)
+			wantStatus, wantCalls := http.StatusForbidden, 0
+			if scenario == "owned" {
+				wantStatus, wantCalls = http.StatusOK, 1
+			}
+			if w.Code != wantStatus || listCalls != wantCalls || joinedReads != 1 || mock.reads != 0 {
+				t.Fatalf("status=%d list calls=%d joined reads=%d owner pre-reads=%d", w.Code, listCalls, joinedReads, mock.reads)
+			}
+		})
 	}
 }
