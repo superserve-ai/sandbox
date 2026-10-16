@@ -30,7 +30,8 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
                      f"THEN CREATE ROLE {role}; END IF; END $$;")
         self.copy_migrations("20261002155219")
         self.push()
-        self.sql("CREATE SCHEMA auth; CREATE TABLE auth.users(id uuid PRIMARY KEY,created_at timestamptz);")
+        self.sql("CREATE SCHEMA auth; CREATE TABLE auth.users(id uuid PRIMARY KEY,created_at timestamptz,"
+                 "email text,email_confirmed_at timestamptz,deleted_at timestamptz);")
         aggregate = regional.verified_aggregate(cli_test.ROOT).decode()
         self.sql(aggregate + f"\nINSERT INTO supabase_migrations.schema_migrations(version,name,statements) "
                  f"VALUES('{regional.VERSION}','{regional.NAME}',ARRAY[$historical${aggregate}$historical$]);")
@@ -42,6 +43,9 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
 
     def apply(self, execute=True):
         return shared.apply(self.conn, "use4", self.revision, self.source, execute)
+
+    def apply_claims(self, execute=True):
+        return shared.apply(self.conn, "use4", self.revision, shared.claim_source(), execute, "claims")
 
     def regional_push(self, root=cli_test.ROOT):
         with patch.object(regional, "verify_connection_identity"), contextlib.redirect_stdout(io.StringIO()):
@@ -118,6 +122,103 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
         with self.assertRaisesRegex(shared.SharedMigrationError, "source_hash_mismatch"):
             shared.apply(self.conn, "use4", self.revision, self.source + "\n", True)
         self.assertFalse(shared.objects_present(self.conn))
+        self.assertFalse(shared.ledger_exists(self.conn))
+
+    def test_claims_require_authority_without_applying_it_implicitly(self):
+        self.assertEqual(self.apply_claims(False)["state"], "pending")
+        with self.assertRaisesRegex(shared.SharedMigrationError, "authority_migration_required"):
+            self.apply_claims()
+        self.assertFalse(shared.objects_present(self.conn))
+        self.assertFalse(shared.claim_objects_present(self.conn))
+        self.assertFalse(shared.ledger_exists(self.conn))
+
+    def test_claim_apply_retry_and_authority_inspection_preserve_both_receipts(self):
+        self.regional_push()
+        self.apply()
+        authority = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m WHERE version='{shared.VERSION}'")
+        before = self.history()
+        self.assertEqual(self.apply_claims()["state"], "applied")
+        original, executed = self.conn.execute(f"SELECT source_sql,applied_sql FROM {shared.LEDGER} WHERE version=%s",
+                                               (shared.CLAIM_VERSION,)).fetchone()
+        self.assertEqual(original, shared.claim_source())
+        self.assertEqual(executed, shared.claim_execution(original))
+        receipt = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        self.assertEqual(self.apply_claims()["state"], "applied")
+        self.assertEqual(self.apply_claims(False)["state"], "applied")
+        self.assertEqual(self.apply()["state"], "applied")
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version"), receipt)
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m WHERE version='{shared.VERSION}'"), authority)
+        self.assertEqual(self.history(), before)
+        self.regional_push()
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.apply_claims(False)["state"], "applied")
+        self.assertEqual(self.sql("SELECT count(*) FROM public.yc_claim"), "0")
+
+    def test_claim_failure_after_schema_creation_rolls_back_trigger_and_receipt(self):
+        self.apply()
+        receipt = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m")
+        with patch.object(shared, "claim_catalog", side_effect=shared.SharedMigrationError("injected_snapshot_failure")):
+            with self.assertRaisesRegex(shared.SharedMigrationError, "injected_snapshot_failure"):
+                self.apply_claims()
+        self.assertFalse(shared.claim_objects_present(self.conn))
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m"), receipt)
+        self.assertEqual(self.apply(False)["state"], "applied")
+
+    def test_claim_default_grants_and_lifecycle_trigger_are_restricted(self):
+        self.apply()
+        self.sql("ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public "
+                 "GRANT ALL ON TABLES TO anon,authenticated,service_role; "
+                 "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public "
+                 "GRANT ALL ON FUNCTIONS TO anon,authenticated,service_role,promotion_evidence_proxy;")
+        self.apply_claims()
+        shared.verify_claim_permissions(self.conn)
+        self.sql("INSERT INTO auth.users(id,email,created_at) VALUES(gen_random_uuid(),'before@example.test',now());"
+                 "UPDATE auth.users SET email='after@example.test';")
+        self.assertEqual(self.sql("SELECT count(*)>0 FROM public.yc_claim_identity_history"), "t")
+        self.assertEqual(self.apply_claims(False)["state"], "applied")
+
+    def test_claim_trigger_and_index_drift_refuse_retry(self):
+        self.apply()
+        self.apply_claims()
+        self.sql("ALTER TABLE auth.users DISABLE TRIGGER yc_claim_auth_lifecycle")
+        with self.assertRaisesRegex(shared.SharedMigrationError, "claim_auth_trigger_mismatch"):
+            self.apply_claims()
+        self.sql("ALTER TABLE auth.users ENABLE TRIGGER yc_claim_auth_lifecycle; DROP INDEX public.yc_claim_mail_due;")
+        with self.assertRaisesRegex(shared.SharedMigrationError, "shared_catalog_mismatch"):
+            self.apply_claims()
+
+    def test_claim_column_grants_refuse_inspection_and_retry(self):
+        self.apply()
+        self.apply_claims()
+        receipt = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        self.sql("GRANT SELECT (confirmation_token) ON public.yc_claim_mail TO service_role")
+        self.assertEqual(self.sql("SELECT has_table_privilege('service_role','public.yc_claim_mail','SELECT')"), "f")
+        for execute in (False, True):
+            with self.assertRaisesRegex(shared.SharedMigrationError, "claim_column_privileges_mismatch"):
+                self.apply_claims(execute)
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version"), receipt)
+
+    def test_unrecorded_claim_schema_is_not_adopted(self):
+        self.apply()
+        self.sql(shared.claim_source())
+        with self.assertRaisesRegex(shared.SharedMigrationError, "schema_without_shared_history"):
+            self.apply_claims()
+        self.assertEqual(self.sql(f"SELECT count(*) FROM {shared.LEDGER}"), "1")
+
+    def test_unknown_history_and_missing_claim_dependency_fail_closed(self):
+        self.apply()
+        self.apply_claims()
+        self.sql(f"UPDATE {shared.LEDGER} SET version='unknown' WHERE version='{shared.CLAIM_VERSION}'")
+        with self.assertRaisesRegex(shared.SharedMigrationError, "unknown_shared_history"):
+            self.apply()
+        self.sql(f"UPDATE {shared.LEDGER} SET version='{shared.CLAIM_VERSION}' WHERE version='unknown';"
+                 f"DELETE FROM {shared.LEDGER} WHERE version='{shared.VERSION}';")
+        with self.assertRaisesRegex(shared.SharedMigrationError, "claim_authority_history_missing"):
+            self.apply_claims()
+
+    def test_claim_source_changes_are_rejected_before_any_write(self):
+        with self.assertRaisesRegex(shared.SharedMigrationError, "source_hash_mismatch"):
+            shared.apply(self.conn, "use4", self.revision, shared.claim_source() + "\n", True, "claims")
         self.assertFalse(shared.ledger_exists(self.conn))
 
 

@@ -10,6 +10,8 @@ starts a subscription, or issues credits.
    to shared Auth with its existing `promotion_evidence_proxy` role. Do not apply
    it to regional databases. The role receives only the claim RPC, never tables.
    Use the separately approved shared-Auth executor and its history contract.
+   Inspect and apply the `authority` operation first, then separately inspect and
+   apply `claims` using the [shared migration workflow](../.github/workflows/SHARED-AUTH-MIGRATIONS.md).
    The regional runner does not apply new shared migrations; manually adding
    their versions to its Supabase ledger can block later regional deployments.
 2. Apply `supabase/migrations/20261016174554_yc_claim_team_intent.sql` to each

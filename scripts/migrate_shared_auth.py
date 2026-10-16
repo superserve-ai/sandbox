@@ -35,6 +35,17 @@ REVOKE ALL ON TABLE public.yc_company_activation_authority FROM service_role;
 GRANT SELECT,INSERT,UPDATE ON TABLE public.yc_company_activation_authority TO service_role;
 REVOKE ALL ON FUNCTION public.guard_yc_company_activation_authority() FROM service_role;
 """
+CLAIM_VERSION = "20261016174553"
+CLAIM_NAME = "yc_claim_authority"
+CLAIM_HASH = "fb950d14161c49f47dd6ea9d2094cdf35283165ba29d582807c942e85821cfa4"
+CLAIM_TABLES = tuple("public." + name for name in (
+    "yc_claim", "yc_claim_decision", "yc_claim_mail", "yc_claim_rate", "yc_claim_identity_history"))
+CLAIM_FUNCTIONS = ("public.yc_claim_view(public.yc_claim)", "public.yc_claim_rpc(text,jsonb)",
+                   "public.yc_claim_auth_lifecycle()", "public.yc_claim_preserve_evidence()")
+CLAIM_ACL_SQL = """
+REVOKE ALL ON FUNCTION public.yc_claim_auth_lifecycle(),public.yc_claim_preserve_evidence()
+FROM anon,authenticated,service_role,promotion_evidence_proxy;
+"""
 
 
 class SharedMigrationError(Exception):
@@ -52,6 +63,21 @@ def source(root=ROOT):
     return data.decode("utf-8")
 
 
+def claim_source(root=ROOT):
+    data = (root / "supabase/shared-auth-migrations" / f"{CLAIM_VERSION}_{CLAIM_NAME}.sql").read_bytes()
+    require(hashlib.sha256(data).hexdigest() == CLAIM_HASH, "source_hash_mismatch")
+    return data.decode("utf-8")
+
+
+def claim_execution(sql):
+    # Only this pinned source may have its outer wrapper removed. Executing its
+    # COMMIT inside our transaction would separate the schema from its receipt.
+    require(hashlib.sha256(sql.encode()).hexdigest() == CLAIM_HASH, "source_hash_mismatch")
+    prefix = "-- Shared Auth/control-plane database only, never a regional claim replica.\nBEGIN;\n"
+    require(sql.startswith(prefix) and sql.endswith("COMMIT;\n"), "claim_transaction_wrapper_mismatch")
+    return sql[len(prefix):-len("COMMIT;\n")] + CLAIM_ACL_SQL
+
+
 def ordinary_history(conn):
     return conn.execute("SELECT version,name,statements FROM supabase_migrations.schema_migrations ORDER BY version").fetchall()
 
@@ -67,7 +93,7 @@ def prerequisites(conn, target):
     require(conn.execute("SELECT count(*) FROM pg_roles WHERE rolname=ANY(%s)", (list(ROLES),)).fetchone()[0] == len(ROLES),
             "required_roles_missing")
     rows = ordinary_history(conn)
-    require(not any(row[0] == VERSION for row in rows), "shared_version_in_regional_history")
+    require(not any(row[0] in (VERSION, CLAIM_VERSION) for row in rows), "shared_version_in_regional_history")
     aggregate = [row for row in rows if row[0] == regional.VERSION]
     if target == "use4":
         require(len(aggregate) == 1 and aggregate[0][1] == regional.NAME
@@ -85,7 +111,7 @@ def objects_present(conn):
                         (TABLE, list(FUNCTIONS))).fetchone()[0]
 
 
-def catalog(conn):
+def catalog(conn, table=TABLE, functions=FUNCTIONS):
     """Record definitions and privileges, never customer rows or credentials."""
     return conn.execute("""
       SELECT jsonb_build_object(
@@ -104,7 +130,53 @@ def catalog(conn):
         'functions', (SELECT jsonb_agg(jsonb_build_array(p.oid::regprocedure::text,pg_get_functiondef(p.oid),
                      pg_get_userbyid(p.proowner),p.proacl) ORDER BY p.oid::regprocedure::text)
                      FROM pg_proc p WHERE p.oid=ANY(SELECT to_regprocedure(f) FROM unnest(%s::text[]) f)))
-    """, (TABLE, TABLE, TABLE, TABLE, TABLE, list(FUNCTIONS))).fetchone()[0]
+    """, (table, table, table, table, table, list(functions))).fetchone()[0]
+
+
+def claim_objects_present(conn):
+    # Resolve function names without resolving the composite claim type first:
+    # it does not exist before this migration.
+    return conn.execute("""SELECT
+        EXISTS(SELECT FROM unnest(%s::text[]) t WHERE to_regclass(t) IS NOT NULL)
+        OR EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                  WHERE n.nspname='public' AND p.proname=ANY(%s))
+        OR EXISTS(SELECT FROM pg_trigger WHERE tgrelid='auth.users'::regclass
+                  AND tgname='yc_claim_auth_lifecycle')""",
+        (list(CLAIM_TABLES), [f.split('.')[1].split('(')[0] for f in CLAIM_FUNCTIONS])).fetchone()[0]
+
+
+def claim_catalog(conn):
+    return {
+        "tables": {table: catalog(conn, table, CLAIM_FUNCTIONS if i == 0 else ())
+                   for i, table in enumerate(CLAIM_TABLES)},
+        "indexes": conn.execute("""SELECT jsonb_agg(pg_get_indexdef(i.indexrelid) ORDER BY c.relname)
+            FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+            WHERE i.indrelid=ANY(SELECT to_regclass(t) FROM unnest(%s::text[]) t)""",
+            (list(CLAIM_TABLES),)).fetchone()[0],
+        "auth_trigger": conn.execute("""SELECT jsonb_build_array(pg_get_triggerdef(oid),tgenabled)
+            FROM pg_trigger WHERE tgrelid='auth.users'::regclass AND tgname='yc_claim_auth_lifecycle'
+            AND NOT tgisinternal""").fetchone()[0],
+    }
+
+
+def verify_claim_permissions(conn):
+    for table in CLAIM_TABLES:
+        require(conn.execute("SELECT relkind='r' AND relrowsecurity AND relowner='postgres'::regrole "
+                             "FROM pg_class WHERE oid=%s::regclass", (table,)).fetchone()[0],
+                "claim_table_security_mismatch")
+        for role in ROLES:
+            require(not conn.execute("SELECT has_table_privilege(%s,%s,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')",
+                                     (role, table)).fetchone()[0], "claim_table_privileges_mismatch")
+            require(not conn.execute("SELECT has_any_column_privilege(%s,%s,'SELECT,INSERT,UPDATE,REFERENCES')",
+                                     (role, table)).fetchone()[0], "claim_column_privileges_mismatch")
+    for function in CLAIM_FUNCTIONS:
+        for role in ROLES:
+            allowed = conn.execute("SELECT has_function_privilege(%s,%s,'EXECUTE')", (role, function)).fetchone()[0]
+            require(allowed == (role == "promotion_evidence_proxy" and function == "public.yc_claim_rpc(text,jsonb)"),
+                    "claim_rpc_privileges_mismatch")
+    require(conn.execute("SELECT count(*)=1 FROM pg_trigger WHERE tgrelid='auth.users'::regclass "
+                         "AND tgname='yc_claim_auth_lifecycle' AND tgenabled='O' AND NOT tgisinternal").fetchone()[0],
+            "claim_auth_trigger_mismatch")
 
 
 def verify_permissions(conn):
@@ -143,36 +215,53 @@ def ledger_exists(conn):
     return True
 
 
-def inspect(conn, sql):
+def inspect(conn, sql, migration="authority"):
+    authority_sql = sql if migration == "authority" else source()
+    claim_sql = sql if migration == "claims" else claim_source()
+    definitions = {
+        VERSION: (NAME, authority_sql, authority_sql + ACL_SQL, SOURCE_HASH, objects_present, verify_permissions, catalog),
+        CLAIM_VERSION: (CLAIM_NAME, claim_sql, claim_execution(claim_sql), CLAIM_HASH,
+                        claim_objects_present, verify_claim_permissions, claim_catalog),
+    }
     if not ledger_exists(conn):
-        require(not objects_present(conn), "schema_without_shared_history")
+        require(not objects_present(conn) and not claim_objects_present(conn), "schema_without_shared_history")
         return "pending"
     rows = conn.execute(f"SELECT version,name,source_sql,applied_sql,source_sha256,catalog,revision FROM {LEDGER} ORDER BY version").fetchall()
-    require(len(rows) <= 1 and all(row[0] == VERSION for row in rows), "unknown_shared_history")
-    if not rows:
-        require(not objects_present(conn), "schema_without_shared_history")
-        return "pending"
-    version, name, stored_sql, applied_sql, stored_hash, stored_catalog, revision = rows[0]
-    require(name == NAME and stored_sql == sql and applied_sql == sql + ACL_SQL and stored_hash == SOURCE_HASH
-            and re.fullmatch(r"[a-f0-9]{40}", revision), "shared_history_mismatch")
-    require(objects_present(conn), "shared_schema_missing")
-    verify_permissions(conn)
-    require(catalog(conn) == stored_catalog, "shared_catalog_mismatch")
-    return "applied"
+    versions = {row[0] for row in rows}
+    require(len(versions) == len(rows) and versions <= definitions.keys(), "unknown_shared_history")
+    require(CLAIM_VERSION not in versions or VERSION in versions, "claim_authority_history_missing")
+    for version, name, stored_sql, applied_sql, stored_hash, stored_catalog, revision in rows:
+        expected_name, original, executed, expected_hash, present, permissions, snapshot = definitions[version]
+        require(name == expected_name and stored_sql == original and applied_sql == executed and stored_hash == expected_hash
+                and re.fullmatch(r"[a-f0-9]{40}", revision), "shared_history_mismatch")
+        require(present(conn), "shared_schema_missing")
+        permissions(conn)
+        require(snapshot(conn) == stored_catalog, "shared_catalog_mismatch")
+    for version, definition in definitions.items():
+        if version not in versions:
+            require(not definition[4](conn), "schema_without_shared_history")
+    selected = VERSION if migration == "authority" else CLAIM_VERSION
+    return "applied" if selected in versions else "pending"
 
 
-def apply(conn, target, revision, sql, execute=False):
+def apply(conn, target, revision, sql, execute=False, migration="authority"):
     require(target in ("staging", "use4"), "unsupported_auth_target")
     require(re.fullmatch(r"[a-f0-9]{40}", revision), "invalid_revision")
-    require(hashlib.sha256(sql.encode()).hexdigest() == SOURCE_HASH, "source_hash_mismatch")
+    require(migration in ("authority", "claims"), "unsupported_shared_migration")
+    version, name, expected_hash, executed_sql, permissions, snapshot = (
+        (VERSION, NAME, SOURCE_HASH, sql + ACL_SQL, verify_permissions, catalog) if migration == "authority" else
+        (CLAIM_VERSION, CLAIM_NAME, CLAIM_HASH, claim_execution(sql), verify_claim_permissions, claim_catalog))
+    require(hashlib.sha256(sql.encode()).hexdigest() == expected_hash, "source_hash_mismatch")
     with conn.transaction():
         if execute:
             require(conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (MUTEX,)).fetchone()[0], "shared_migration_busy")
         else:
             conn.execute("SET TRANSACTION READ ONLY")
         before = prerequisites(conn, target)
-        state = inspect(conn, sql)
+        state = inspect(conn, sql, migration)
         if execute and state == "pending":
+            if migration == "claims":
+                require(inspect(conn, source()) == "applied", "authority_migration_required")
             if not ledger_exists(conn):
                 conn.execute("""
                     CREATE SCHEMA shared_auth_migrations AUTHORIZATION postgres;
@@ -184,19 +273,20 @@ def apply(conn, target, revision, sql, execute=False):
                     ALTER TABLE shared_auth_migrations.schema_migrations ENABLE ROW LEVEL SECURITY;
                     REVOKE ALL ON shared_auth_migrations.schema_migrations FROM PUBLIC,anon,authenticated,service_role,promotion_evidence_proxy;
                 """)
-            conn.execute(sql + ACL_SQL)
-            verify_permissions(conn)
+            conn.execute(executed_sql)
+            permissions(conn)
             conn.execute(f"INSERT INTO {LEDGER}(version,name,source_sql,applied_sql,source_sha256,catalog,revision) VALUES(%s,%s,%s,%s,%s,%s,%s)",
-                         (VERSION, NAME, sql, sql + ACL_SQL, SOURCE_HASH, Jsonb(catalog(conn)), revision))
-            state = inspect(conn, sql)
+                         (version, name, sql, executed_sql, expected_hash, Jsonb(snapshot(conn)), revision))
+            state = inspect(conn, sql, migration)
         require(ordinary_history(conn) == before, "regional_history_changed")
-    return {"target": target, "version": VERSION, "state": state, "regional_history_unchanged": True}
+    return {"target": target, "version": version, "state": state, "regional_history_unchanged": True}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=("staging", "use4"))
     parser.add_argument("action", choices=("inspect", "apply"))
+    parser.add_argument("--migration", choices=("authority", "claims"), default="authority")
     parser.add_argument("--revision", required=True)
     parser.add_argument("--runtime-project", required=True,
                         help="Previously verified runtime authority project, not an inferred environment label")
@@ -207,7 +297,8 @@ def main():
                 "source_revision_mismatch")
         url = regional.migration_connection_url(os.environ.get("DATABASE_URL", ""), args.target)
         with psycopg.connect(url, autocommit=True, connect_timeout=10, options=OPTIONS, sslmode="require") as conn:
-            result = apply(conn, args.target, args.revision, source(), args.action == "apply")
+            sql = source() if args.migration == "authority" else claim_source()
+            result = apply(conn, args.target, args.revision, sql, args.action == "apply", args.migration)
         print(json.dumps(result, sort_keys=True))
     except Exception as error:
         # Driver errors may contain connection details or SQL parameters.
