@@ -132,6 +132,9 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 			return err
 		}
 		if !reconciled {
+			if !o.Start.Valid || sub.ID != o.Subscription || sub.StartDate != o.Start.Time.Unix() || sub.BillingCycleAnchor != sub.StartDate {
+				return errors.New("adopted subscription association or anniversary changed")
+			}
 			tx, err := h.Pool.Begin(ctx)
 			if err != nil {
 				return err

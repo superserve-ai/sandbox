@@ -423,6 +423,14 @@ func TestYCOperatorPreRolloutRenewalCalendarConflict(t *testing.T) {
 	runYCOperatorAdoption(t, false, "card", false, true, true, true, true)
 }
 
+func TestYCOperatorCalendarRejectsProviderAnchorDrift(t *testing.T) {
+	for _, renewal := range []bool{false, true} {
+		t.Run(map[bool]string{false: "active", true: "renewal"}[renewal], func(t *testing.T) {
+			runYCOperatorAdoption(t, false, "card", false, true, true, false, renewal, true)
+		})
+	}
+}
+
 func TestYCCalendarUsageBoundary(t *testing.T) {
 	f := newYCCalendarFixture(t, 0)
 	f.legacy(t)

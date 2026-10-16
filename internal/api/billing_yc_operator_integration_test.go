@@ -301,19 +301,36 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 		if conflict {
 			f.exec(t, `INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds) VALUES($1,$2,$3,12)`, team.ID, anchor.AddDate(0, 0, -13), anchor.AddDate(0, 0, 18))
 		}
+		anchorChanged := len(create) > 5 && create[5]
+		if anchorChanged {
+			sub.BillingCycleAnchor += 3600
+		}
 		var before []byte
 		if err = h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(w) FROM billing_contract_waiver w WHERE team_id=$1`, team.ID).Scan(&before); err != nil {
 			t.Fatal(err)
 		}
 		for range 2 {
 			err = h.reconcileYC(t.Context(), team.ID)
-			if (conflict && (err == nil || !strings.Contains(err.Error(), "yc_calendar_conflict"))) || (!conflict && err != nil) {
+			wantError := ""
+			if conflict {
+				wantError = "yc_calendar_conflict"
+			}
+			if anchorChanged {
+				wantError = "anniversary changed"
+			}
+			if (wantError != "" && (err == nil || !strings.Contains(err.Error(), wantError))) || (wantError == "" && err != nil) {
 				t.Fatal("pre-rollout active operation", err)
 			}
 		}
 		var preserved, reconciled bool
-		if err = h.Pool.QueryRow(t.Context(), `SELECT (SELECT to_jsonb(w)=$2::jsonb FROM billing_contract_waiver w WHERE team_id=$1),EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1)`, team.ID, before).Scan(&preserved, &reconciled); err != nil || !preserved || reconciled == conflict {
+		if err = h.Pool.QueryRow(t.Context(), `SELECT (SELECT to_jsonb(w)=$2::jsonb FROM billing_contract_waiver w WHERE team_id=$1),EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1)`, team.ID, before).Scan(&preserved, &reconciled); err != nil || !preserved || reconciled == (conflict || anchorChanged) {
 			t.Fatal("active recovery lost authority or completion evidence", err)
+		}
+		if anchorChanged {
+			var unchanged bool
+			if err = h.Pool.QueryRow(t.Context(), `SELECT count(*)=1 AND bool_and(period_start=$2 AND period_end=$3) FROM team_billing_period WHERE team_id=$1`, team.ID, anchor.AddDate(0, 0, -13), anchor.AddDate(0, 0, 18)).Scan(&unchanged); err != nil || !unchanged {
+				t.Fatal("provider drift changed calendar", err)
+			}
 		}
 		if writes != 0 {
 			t.Fatal("calendar recovery changed provider state")

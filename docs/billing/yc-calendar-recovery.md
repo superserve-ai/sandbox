@@ -46,7 +46,9 @@ Saved provider identities and earlier partial enrollment remain available for
 recovery. YC operations cannot independently enroll invoices until the
 transition has a receipt, and activation requires that receipt. Previously
 active operations and all operations entering annual renewal reconcile a missing
-receipt before continuing, without recreating contracts or provider state.
+receipt before continuing, without recreating contracts or provider state. They
+first verify that the provider subscription start and billing-cycle anchor still
+match the saved anniversary; drift leaves the periods and receipt unchanged.
 
 For an untouched open `[legacy_start, legacy_end)` crossing the anniversary, it
 changes only its end to the anniversary and creates the adjacent anniversary
