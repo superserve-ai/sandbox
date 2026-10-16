@@ -159,6 +159,72 @@ func (q *Queries) AdoptUsageEntitlement(ctx context.Context, arg AdoptUsageEntit
 	return i, err
 }
 
+const beginImmediateUsageEntitlementIssuance = `-- name: BeginImmediateUsageEntitlementIssuance :one
+WITH contract AS MATERIALIZED (
+    SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_kind, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $5
+        AND b.id = $6 FOR UPDATE
+), attempt AS MATERIALIZED (SELECT clock_timestamp() AS attempted_at FROM contract)
+UPDATE billing_usage_entitlement e SET state = 'uncertain', first_attempt_at = attempt.attempted_at,
+    provider_invoice_start = $1, provider_invoice_end = $2,
+    request_payload = jsonb_build_object(
+        'customer', c.customer_id, 'category', 'promotional',
+        'amount', jsonb_build_object('type','monetary','monetary',jsonb_build_object('currency',e.currency,'value',e.amount_cents)),
+        'priority', 50, 'expires_at', extract(epoch FROM $2::timestamptz)::bigint + 1,
+        'applicability_config', jsonb_build_object('scope',jsonb_build_object('prices',$3::jsonb)),
+        'metadata', jsonb_build_object('entitlement_id',e.id::text,'entitlement_start',extract(epoch FROM e.period_start)::bigint::text,'entitlement_end',extract(epoch FROM e.period_end)::bigint::text))
+FROM contract c CROSS JOIN attempt
+WHERE e.team_id = c.team_id AND e.contract_id = c.id AND e.id = $4 AND e.state = 'pending'
+    AND billing_contract_eligible(c::billing_commercial_contract, e.period_start, e.period_end) AND e.period_start <= clock_timestamp() AND e.period_end > clock_timestamp()
+RETURNING e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at
+`
+
+type BeginImmediateUsageEntitlementIssuanceParams struct {
+	InvoiceStart  pgtype.Timestamptz `json:"invoice_start"`
+	InvoiceEnd    pgtype.Timestamptz `json:"invoice_end"`
+	Prices        []byte             `json:"prices"`
+	EntitlementID uuid.UUID          `json:"entitlement_id"`
+	TeamID        uuid.UUID          `json:"team_id"`
+	ContractID    uuid.UUID          `json:"contract_id"`
+}
+
+func (q *Queries) BeginImmediateUsageEntitlementIssuance(ctx context.Context, arg BeginImmediateUsageEntitlementIssuanceParams) (BillingUsageEntitlement, error) {
+	row := q.db.QueryRow(ctx, beginImmediateUsageEntitlementIssuance,
+		arg.InvoiceStart,
+		arg.InvoiceEnd,
+		arg.Prices,
+		arg.EntitlementID,
+		arg.TeamID,
+		arg.ContractID,
+	)
+	var i BillingUsageEntitlement
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.ContractID,
+		&i.PaymentID,
+		&i.Kind,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.AmountCents,
+		&i.Currency,
+		&i.IssuanceSource,
+		&i.ProviderCreatedAt,
+		&i.AdoptedAt,
+		&i.AdoptedAvailableBalanceCents,
+		&i.State,
+		&i.IdempotencyKey,
+		&i.FirstAttemptAt,
+		&i.RequestPayload,
+		&i.ProviderInvoiceStart,
+		&i.ProviderInvoiceEnd,
+		&i.StripeCreditGrantID,
+		&i.IssuanceEvidence,
+		&i.IssuedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const beginUsageEntitlementIssuance = `-- name: BeginUsageEntitlementIssuance :one
 WITH contract AS MATERIALIZED (
     SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_kind, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $5
@@ -517,6 +583,20 @@ func (q *Queries) EndCommercialContract(ctx context.Context, arg EndCommercialCo
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const endLapsedCommercialContracts = `-- name: EndLapsedCommercialContracts :execrows
+UPDATE billing_commercial_contract SET status = 'ended', revision = revision + 1
+WHERE status <> 'ended' AND ends_at IS NOT NULL AND ends_at <= clock_timestamp()
+`
+
+// A fixed term ends at ends_at; nothing else transitions it, so this sweep does.
+func (q *Queries) EndLapsedCommercialContracts(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, endLapsedCommercialContracts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getCommercialBasePayment = `-- name: GetCommercialBasePayment :one

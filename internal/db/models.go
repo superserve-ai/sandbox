@@ -345,23 +345,24 @@ type BackupWalk struct {
 }
 
 type BillingCommercialContract struct {
-	ID                          uuid.UUID          `json:"id"`
-	TeamID                      uuid.UUID          `json:"team_id"`
-	OfferKey                    string             `json:"offer_key"`
-	Status                      string             `json:"status"`
-	StartsAt                    time.Time          `json:"starts_at"`
-	EndsAt                      pgtype.Timestamptz `json:"ends_at"`
-	CustomerID                  string             `json:"customer_id"`
-	SubscriptionID              string             `json:"subscription_id"`
-	BasePriceID                 string             `json:"base_price_id"`
-	ChargeKind                  string             `json:"charge_kind"`
-	ChargeAmountCents           int64              `json:"charge_amount_cents"`
-	ChargeIntervalMonths        int32              `json:"charge_interval_months"`
-	Currency                    string             `json:"currency"`
-	EntitlementKind             string             `json:"entitlement_kind"`
-	EntitlementAmountCents      int64              `json:"entitlement_amount_cents"`
-	EntitlementCadence          string             `json:"entitlement_cadence"`
-	EntitlementAnchor           time.Time          `json:"entitlement_anchor"`
+	ID                     uuid.UUID          `json:"id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	OfferKey               string             `json:"offer_key"`
+	Status                 string             `json:"status"`
+	StartsAt               time.Time          `json:"starts_at"`
+	EndsAt                 pgtype.Timestamptz `json:"ends_at"`
+	CustomerID             string             `json:"customer_id"`
+	SubscriptionID         string             `json:"subscription_id"`
+	BasePriceID            string             `json:"base_price_id"`
+	ChargeKind             string             `json:"charge_kind"`
+	ChargeAmountCents      int64              `json:"charge_amount_cents"`
+	ChargeIntervalMonths   int32              `json:"charge_interval_months"`
+	Currency               string             `json:"currency"`
+	EntitlementKind        string             `json:"entitlement_kind"`
+	EntitlementAmountCents int64              `json:"entitlement_amount_cents"`
+	EntitlementCadence     string             `json:"entitlement_cadence"`
+	EntitlementAnchor      time.Time          `json:"entitlement_anchor"`
+	// For Pro: any unpaid finalized invoice, regardless of due date; evidence must use finalized_invoice_gate_v1.
 	CollectionHasOverdueBalance *bool              `json:"collection_has_overdue_balance"`
 	CollectionCheckedAt         pgtype.Timestamptz `json:"collection_checked_at"`
 	CollectionValidUntil        pgtype.Timestamptz `json:"collection_valid_until"`
@@ -395,6 +396,37 @@ type BillingContractPayment struct {
 	PaidAt                      time.Time `json:"paid_at"`
 	VerifiedAt                  time.Time `json:"verified_at"`
 	Evidence                    []byte    `json:"evidence"`
+}
+
+type BillingEntitlementDebt struct {
+	ContractID  uuid.UUID `json:"contract_id"`
+	PeriodStart time.Time `json:"period_start"`
+	InvoiceID   string    `json:"invoice_id"`
+	ObservedAt  time.Time `json:"observed_at"`
+}
+
+type BillingEntitlementWithheld struct {
+	ContractID        uuid.UUID          `json:"contract_id"`
+	PeriodStart       time.Time          `json:"period_start"`
+	PeriodEnd         time.Time          `json:"period_end"`
+	ObservedAt        time.Time          `json:"observed_at"`
+	Evidence          []byte             `json:"evidence"`
+	PlatformFailureAt pgtype.Timestamptz `json:"platform_failure_at"`
+}
+
+type BillingEntitlementWork struct {
+	ContractID         uuid.UUID          `json:"contract_id"`
+	NextCheckAt        time.Time          `json:"next_check_at"`
+	LeaseToken         pgtype.UUID        `json:"lease_token"`
+	LeaseUntil         pgtype.Timestamptz `json:"lease_until"`
+	Failures           int32              `json:"failures"`
+	ProblemSince       pgtype.Timestamptz `json:"problem_since"`
+	AlertedAt          pgtype.Timestamptz `json:"alerted_at"`
+	LastError          *string            `json:"last_error"`
+	InventoryHead      *string            `json:"inventory_head"`
+	InventoryCursor    *string            `json:"inventory_cursor"`
+	InventoryNewHead   *string            `json:"inventory_new_head"`
+	InventoryCheckedAt pgtype.Timestamptz `json:"inventory_checked_at"`
 }
 
 type BillingExportAllocation struct {
@@ -585,6 +617,24 @@ type BillingInvoiceClose struct {
 	UpdatedAt         time.Time          `json:"updated_at"`
 }
 
+type BillingInvoiceCreditScan struct {
+	CustomerID    string `json:"customer_id"`
+	InvoiceEnd    int64  `json:"invoice_end"`
+	Cursor        string `json:"cursor"`
+	Credits       []byte `json:"credits"`
+	LedgerHead    string `json:"ledger_head"`
+	InventoryHead string `json:"inventory_head"`
+}
+
+type BillingInvoiceDiscovery struct {
+	CustomerID     string `json:"customer_id"`
+	SubscriptionID string `json:"subscription_id"`
+	PeriodStart    int64  `json:"period_start"`
+	PeriodEnd      int64  `json:"period_end"`
+	Cursor         string `json:"cursor"`
+	MatchID        string `json:"match_id"`
+}
+
 type BillingInvoiceEnrollment struct {
 	TeamID         uuid.UUID          `json:"team_id"`
 	CustomerID     string             `json:"customer_id"`
@@ -653,6 +703,16 @@ type BillingProPaymentVerification struct {
 	ReviewRequired bool      `json:"review_required"`
 	ObservedAt     time.Time `json:"observed_at"`
 	Evidence       []byte    `json:"evidence"`
+}
+
+type BillingProviderCredit struct {
+	CustomerID    string    `json:"customer_id"`
+	GrantID       string    `json:"grant_id"`
+	Evidence      []byte    `json:"evidence"`
+	EffectiveAt   int64     `json:"effective_at"`
+	ExpiresAt     int64     `json:"expires_at"`
+	EntitlementID *string   `json:"entitlement_id"`
+	ObservedAt    time.Time `json:"observed_at"`
 }
 
 type BillingRollupBackfillState struct {
@@ -931,6 +991,14 @@ type Permission struct {
 	Description *string   `json:"description"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type PlanLimit struct {
+	OfferKey             string `json:"offer_key"`
+	MaxSandboxes         int32  `json:"max_sandboxes"`
+	MaxTemplateVcpu      *int32 `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib *int32 `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib   *int32 `json:"max_template_disk_mib"`
 }
 
 type PricingPlan struct {
@@ -1523,6 +1591,7 @@ type Team struct {
 	MaxSnapshots           int32  `json:"max_snapshots"`
 	MaxSnapshotsPerSandbox int32  `json:"max_snapshots_per_sandbox"`
 	MaxSnapshotsInFlight   int32  `json:"max_snapshots_in_flight"`
+	LimitsCustomized       bool   `json:"limits_customized"`
 }
 
 type TeamActiveSandboxCount struct {

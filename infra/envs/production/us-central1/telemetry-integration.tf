@@ -1,5 +1,5 @@
 locals {
-  struct_roles = toset([
+  telemetry_integration_roles = toset([
     "roles/cloudasset.viewer",
     "roles/cloudsql.viewer",
     "roles/compute.viewer",
@@ -16,21 +16,22 @@ locals {
   ])
 }
 
-module "struct_iam" {
+module "telemetry_integration_iam" {
   source = "../../../modules/iam"
 
   project_id  = local.project_id
   environment = local.environment
   service_accounts = {
-    struct = {
-      account_id   = "struct"
-      display_name = "Struct"
+    telemetry_integration = {
+      account_id   = "telemetry-integration"
+      display_name = "Telemetry Integration"
+      description  = "External telemetry analysis and alert management."
     }
   }
   project_bindings = {
-    for role in local.struct_roles : role => {
+    for role in local.telemetry_integration_roles : role => {
       role    = role
-      members = ["serviceAccount:struct@${local.project_id}.iam.gserviceaccount.com"]
+      members = ["serviceAccount:telemetry-integration@${local.project_id}.iam.gserviceaccount.com"]
     }
   }
   labels = local.common_labels

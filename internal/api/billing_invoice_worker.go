@@ -203,7 +203,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		if e != nil {
 			return e
 		}
-		inv, e := client.billingCycleInvoice(ctx, a, invoicePeriod.Start.Unix(), invoicePeriod.End.Unix())
+		inv, e := h.billingCycleInvoice(ctx, a, invoicePeriod.Start.Unix(), invoicePeriod.End.Unix(), client)
 		if e != nil {
 			return e
 		}
@@ -261,7 +261,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		if e = validateInvoiceDocument(final, invoicePeriod, a, plan); e != nil {
 			return e
 		}
-		remaining, e := client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+		remaining, e := h.invoicePlanCredits(ctx, p, a, plan, &final, client)
 		if e != nil {
 			return e
 		}
@@ -338,7 +338,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		}
 	}
 	if state == "adjusted" {
-		credits, e := client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+		credits, e := h.invoicePlanCredits(ctx, p, a, plan, nil, client)
 		if e != nil {
 			return e
 		}
@@ -365,7 +365,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 			return e
 		}
 		if current.Status == "draft" {
-			credits, e := client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+			credits, e := h.invoicePlanCredits(ctx, p, a, plan, nil, client)
 			if e != nil {
 				return e
 			}
@@ -388,7 +388,7 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		if e != nil {
 			return e
 		}
-		remaining, e := client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+		remaining, e := h.invoicePlanCredits(ctx, p, a, plan, &final, client)
 		if e != nil {
 			return e
 		}
@@ -712,7 +712,11 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if plan.AdjustmentCents > int64(len(items)) || plan.AdjustmentCents < -int64(len(items)) {
 		return plan, fmt.Errorf("invoice difference exceeds supported rounding correction")
 	}
-	plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+	if a.Base.Price != "" {
+		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
+	} else {
+		plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+	}
 	return plan, err
 }
 

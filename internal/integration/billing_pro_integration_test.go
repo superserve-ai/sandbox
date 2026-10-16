@@ -593,7 +593,9 @@ func TestIntegration_ProCachedPaymentsAreRevalidated(t *testing.T) {
 			f.status, f.paid = "complete", true
 			f.mu.Unlock()
 			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
-			if _, err := testPool.Exec(t.Context(), `UPDATE billing_commercial_contract SET collection_has_overdue_balance=false,collection_checked_at=statement_timestamp(),collection_valid_until=statement_timestamp()+interval '5 minutes',collection_evidence='{"test":"collection"}',revision=revision+1 WHERE team_id=$1`, f.team); err != nil {
+			// New authorization requires a fresh observation of the saved receipt.
+			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
+			if _, err := testPool.Exec(t.Context(), `UPDATE billing_commercial_contract c SET collection_has_overdue_balance=false,collection_checked_at=statement_timestamp(),collection_valid_until=statement_timestamp()+interval '5 minutes',collection_evidence=jsonb_build_object('gate','finalized_invoice_gate_v1','period_start',p.service_period_start,'period_end',p.service_period_end),revision=revision+1 FROM billing_contract_payment p WHERE c.team_id=$1 AND p.contract_id=c.id`, f.team); err != nil {
 				t.Fatal(err)
 			}
 			eligible := func() bool {

@@ -1,0 +1,62 @@
+{
+  "name": "superserve/omnara",
+  "vcpu": 2,
+  "memory_mib": 4096,
+  "disk_mib": 8192,
+  "build_spec": {
+    "from": "ubuntu:24.04",
+    "steps": [
+      {
+        "env": {
+          "key": "LANG",
+          "value": "C.UTF-8"
+        }
+      },
+      {
+        "env": {
+          "key": "PIP_BREAK_SYSTEM_PACKAGES",
+          "value": "1"
+        }
+      },
+      {
+        "env": {
+          "key": "PLAYWRIGHT_BROWSERS_PATH",
+          "value": "/opt/ms-playwright"
+        }
+      },
+      {
+        "run": "printf '#!/bin/sh\\nexit 101\\n' >/usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git gh wget zip unzip xz-utils jq ripgrep sudo less procps openssh-client gnupg tzdata build-essential pkg-config make cmake ninja-build python3 python3-dev python3-pip python3-venv sqlite3 poppler-utils qpdf postgresql-16 postgresql-client-16 redis-server && rm -rf /var/lib/apt/lists/*"
+      },
+      {
+        "run": "echo 'dash dash/sh boolean false' | debconf-set-selections && ln -sf bash /bin/sh && [ \"$(readlink -f /bin/sh)\" = /usr/bin/bash ]"
+      },
+      {
+        "run": "pg_dropcluster --stop 16 main || true"
+      },
+      {
+        "run": "curl -fsSL https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz | tar -xJ -C /usr/local --strip-components=1 --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md' && npm install -g --no-fund --no-audit pnpm yarn && npm cache clean --force"
+      },
+      {
+        "run": "curl -fsSL https://go.dev/dl/go1.27.2.linux-amd64.tar.gz | tar -xz -C /usr/local && ln -s /usr/local/go/bin/go /usr/local/bin/go && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt"
+      },
+      {
+        "run": "curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64 -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq"
+      },
+      {
+        "run": "pip install --no-cache-dir uv numpy pandas matplotlib openpyxl python-docx python-pptx pypdf playwright"
+      },
+      {
+        "run": "playwright install --with-deps chromium-headless-shell && rm -rf /var/lib/apt/lists/*"
+      },
+      {
+        "run": "rm -f /usr/sbin/policy-rc.d && mkdir -p /workspace"
+      },
+      {
+        "workdir": "/workspace"
+      },
+      {
+        "run": "set -ex; [ \"$(readlink -f /bin/sh)\" = /usr/bin/bash ]; python3 --version; pip --version; uv --version; node --version; npm --version; pnpm --version; yarn --version; go version; gcc --version | head -1; cmake --version | head -1; ninja --version; git --version; gh --version | head -1; jq --version; yq --version; rg --version | head -1; sqlite3 --version; psql --version; pg_lsclusters; redis-server --version; pdftotext -v 2>&1 | head -1; qpdf --version | head -1; command -v setsid; python3 -c 'import numpy, pandas, matplotlib, openpyxl, docx, pptx, pypdf, playwright'; python3 -c 'from playwright.sync_api import sync_playwright\nwith sync_playwright() as p:\n    p.chromium.launch().close()'"
+      }
+    ]
+  }
+}

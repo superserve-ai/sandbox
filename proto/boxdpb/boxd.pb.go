@@ -26,6 +26,9 @@ type FrameFormat int32
 const (
 	FrameFormat_FRAME_FORMAT_UNSPECIFIED FrameFormat = 0 // Server picks the default (PNG).
 	FrameFormat_FRAME_FORMAT_PNG         FrameFormat = 1
+	// Lossy, fixed quality; several times smaller and faster to encode than
+	// PNG, for loops where a model reads the frame.
+	FrameFormat_FRAME_FORMAT_JPEG FrameFormat = 2
 )
 
 // Enum value maps for FrameFormat.
@@ -33,10 +36,12 @@ var (
 	FrameFormat_name = map[int32]string{
 		0: "FRAME_FORMAT_UNSPECIFIED",
 		1: "FRAME_FORMAT_PNG",
+		2: "FRAME_FORMAT_JPEG",
 	}
 	FrameFormat_value = map[string]int32{
 		"FRAME_FORMAT_UNSPECIFIED": 0,
 		"FRAME_FORMAT_PNG":         1,
+		"FRAME_FORMAT_JPEG":        2,
 	}
 )
 
@@ -2595,7 +2600,15 @@ type StepResponse struct {
 	CaptureError string `protobuf:"bytes,4,opt,name=capture_error,json=captureError,proto3" json:"capture_error,omitempty"`
 	// Whether the frame differs from the one before the batch. Only set when
 	// wait_for_change was requested and the display backend could compare.
-	Changed       bool `protobuf:"varint,5,opt,name=changed,proto3" json:"changed,omitempty"`
+	Changed bool `protobuf:"varint,5,opt,name=changed,proto3" json:"changed,omitempty"`
+	// Where the request's time went, in milliseconds: waiting for the input
+	// lock behind other requests, running the actions, the fixed settle, and
+	// the capture (which includes arming the change watch before the batch
+	// and any wait for a changed frame).
+	ActionsMs     uint32 `protobuf:"varint,6,opt,name=actions_ms,json=actionsMs,proto3" json:"actions_ms,omitempty"`
+	SettleMs      uint32 `protobuf:"varint,7,opt,name=settle_ms,json=settleMs,proto3" json:"settle_ms,omitempty"`
+	CaptureMs     uint32 `protobuf:"varint,8,opt,name=capture_ms,json=captureMs,proto3" json:"capture_ms,omitempty"`
+	QueueMs       uint32 `protobuf:"varint,9,opt,name=queue_ms,json=queueMs,proto3" json:"queue_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2663,6 +2676,34 @@ func (x *StepResponse) GetChanged() bool {
 		return x.Changed
 	}
 	return false
+}
+
+func (x *StepResponse) GetActionsMs() uint32 {
+	if x != nil {
+		return x.ActionsMs
+	}
+	return 0
+}
+
+func (x *StepResponse) GetSettleMs() uint32 {
+	if x != nil {
+		return x.SettleMs
+	}
+	return 0
+}
+
+func (x *StepResponse) GetCaptureMs() uint32 {
+	if x != nil {
+		return x.CaptureMs
+	}
+	return 0
+}
+
+func (x *StepResponse) GetQueueMs() uint32 {
+	if x != nil {
+		return x.QueueMs
+	}
+	return 0
 }
 
 // Named DesktopResizeRequest/Response (not ResizeRequest/Response) to avoid
@@ -2895,7 +2936,7 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\aactions\x18\x01 \x03(\v2\x1a.superserve.boxd.v1.ActionR\aactions\x127\n" +
 	"\x06format\x18\x02 \x01(\x0e2\x1f.superserve.boxd.v1.FrameFormatR\x06format\x12\x1b\n" +
 	"\tsettle_ms\x18\x03 \x01(\rR\bsettleMs\x12&\n" +
-	"\x0fwait_for_change\x18\x04 \x01(\bR\rwaitForChange\"\xd4\x01\n" +
+	"\x0fwait_for_change\x18\x04 \x01(\bR\rwaitForChange\"\xca\x02\n" +
 	"\fStepResponse\x12\x1a\n" +
 	"\bexecuted\x18\x01 \x01(\rR\bexecuted\x12!\n" +
 	"\faction_error\x18\x02 \x01(\tR\vactionError\x12F\n" +
@@ -2903,14 +2944,21 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"screenshot\x18\x03 \x01(\v2&.superserve.boxd.v1.ScreenshotResponseR\n" +
 	"screenshot\x12#\n" +
 	"\rcapture_error\x18\x04 \x01(\tR\fcaptureError\x12\x18\n" +
-	"\achanged\x18\x05 \x01(\bR\achanged\"D\n" +
+	"\achanged\x18\x05 \x01(\bR\achanged\x12\x1d\n" +
+	"\n" +
+	"actions_ms\x18\x06 \x01(\rR\tactionsMs\x12\x1b\n" +
+	"\tsettle_ms\x18\a \x01(\rR\bsettleMs\x12\x1d\n" +
+	"\n" +
+	"capture_ms\x18\b \x01(\rR\tcaptureMs\x12\x19\n" +
+	"\bqueue_ms\x18\t \x01(\rR\aqueueMs\"D\n" +
 	"\x14DesktopResizeRequest\x12\x14\n" +
 	"\x05width\x18\x01 \x01(\rR\x05width\x12\x16\n" +
 	"\x06height\x18\x02 \x01(\rR\x06height\"\x17\n" +
-	"\x15DesktopResizeResponse*A\n" +
+	"\x15DesktopResizeResponse*X\n" +
 	"\vFrameFormat\x12\x1c\n" +
 	"\x18FRAME_FORMAT_UNSPECIFIED\x10\x00\x12\x14\n" +
-	"\x10FRAME_FORMAT_PNG\x10\x01*}\n" +
+	"\x10FRAME_FORMAT_PNG\x10\x01\x12\x15\n" +
+	"\x11FRAME_FORMAT_JPEG\x10\x02*}\n" +
 	"\rPointerButton\x12\x1e\n" +
 	"\x1aPOINTER_BUTTON_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13POINTER_BUTTON_LEFT\x10\x01\x12\x18\n" +

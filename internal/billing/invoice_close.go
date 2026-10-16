@@ -24,7 +24,17 @@ type InvoiceCloseResource struct {
 	Snapshot         json.RawMessage `json:"snapshot"`
 }
 
+type InvoiceCreditGrant struct {
+	ID        string          `json:"id"`
+	Before    int64           `json:"before"`
+	ExpiresAt int64           `json:"expires_at"`
+	Evidence  json.RawMessage `json:"evidence"`
+}
+
 type InvoiceClosePlan struct {
+	CreditVersion       int                    `json:"credit_version,omitempty"`
+	CreditPrices        []string               `json:"credit_prices,omitempty"`
+	CreditGrants        []InvoiceCreditGrant   `json:"credit_grants,omitempty"`
 	BaseCents           int64                  `json:"base_cents,omitempty"`
 	BasePeriodStart     int64                  `json:"base_period_start,omitempty"`
 	BasePeriodEnd       int64                  `json:"base_period_end,omitempty"`

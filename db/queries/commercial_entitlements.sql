@@ -168,3 +168,26 @@ FROM contract c
 LEFT JOIN period ON period.contract_id = c.id
 LEFT JOIN billing_usage_entitlement e ON e.team_id = c.team_id AND e.contract_id = c.id
     AND e.kind = c.entitlement_kind AND e.period_start = period.period_start;
+
+-- name: BeginImmediateUsageEntitlementIssuance :one
+WITH contract AS MATERIALIZED (
+    SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id)
+        AND b.id = sqlc.arg(contract_id) FOR UPDATE
+), attempt AS MATERIALIZED (SELECT clock_timestamp() AS attempted_at FROM contract)
+UPDATE billing_usage_entitlement e SET state = 'uncertain', first_attempt_at = attempt.attempted_at,
+    provider_invoice_start = sqlc.arg(invoice_start), provider_invoice_end = sqlc.arg(invoice_end),
+    request_payload = jsonb_build_object(
+        'customer', c.customer_id, 'category', 'promotional',
+        'amount', jsonb_build_object('type','monetary','monetary',jsonb_build_object('currency',e.currency,'value',e.amount_cents)),
+        'priority', 50, 'expires_at', extract(epoch FROM sqlc.arg(invoice_end)::timestamptz)::bigint + 1,
+        'applicability_config', jsonb_build_object('scope',jsonb_build_object('prices',sqlc.arg(prices)::jsonb)),
+        'metadata', jsonb_build_object('entitlement_id',e.id::text,'entitlement_start',extract(epoch FROM e.period_start)::bigint::text,'entitlement_end',extract(epoch FROM e.period_end)::bigint::text))
+FROM contract c CROSS JOIN attempt
+WHERE e.team_id = c.team_id AND e.contract_id = c.id AND e.id = sqlc.arg(entitlement_id) AND e.state = 'pending'
+    AND billing_contract_eligible(c::billing_commercial_contract, e.period_start, e.period_end) AND e.period_start <= clock_timestamp() AND e.period_end > clock_timestamp()
+RETURNING e.*;
+
+-- name: EndLapsedCommercialContracts :execrows
+-- A fixed term ends at ends_at; nothing else transitions it, so this sweep does.
+UPDATE billing_commercial_contract SET status = 'ended', revision = revision + 1
+WHERE status <> 'ended' AND ends_at IS NOT NULL AND ends_at <= clock_timestamp();

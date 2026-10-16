@@ -83,9 +83,12 @@ func commercialActivate(t *testing.T, c db.BillingCommercialContract) db.Billing
 func commercialObserve(t *testing.T, c db.BillingCommercialContract, overdue bool) db.BillingCommercialContract {
 	t.Helper()
 	now := commercialNow(t)
+	start, end, _ := billing.AnniversaryPeriod(c.EntitlementAnchor, now)
+	evidence, _ := json.Marshal(map[string]any{"gate": "finalized_invoice_gate_v1", "period_start": start, "period_end": end})
+	correctionExec(t, `INSERT INTO billing_pro_payment_verification(invoice_id,review_required,evidence) SELECT invoice_id,false,'{"verified":true}' FROM billing_contract_payment WHERE contract_id=$1 ON CONFLICT(invoice_id) DO UPDATE SET observed_at=clock_timestamp()`, c.ID)
 	c, err := testQueries.ObserveCommercialCollection(t.Context(), db.ObserveCommercialCollectionParams{
 		TeamID: c.TeamID, ContractID: c.ID, ExpectedRevision: c.Revision, HasOverdueBalance: &overdue,
-		CheckedAt: commercialTime(now), ValidUntil: commercialTime(now.Add(4 * time.Minute)), Evidence: []byte(`{"open_invoices_checked":true}`),
+		CheckedAt: commercialTime(now), ValidUntil: commercialTime(now.Add(4 * time.Minute)), Evidence: evidence,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -638,5 +641,58 @@ func TestIntegration_CommercialUpfrontScheduleAndAdoption(t *testing.T) {
 	}
 	if _, err = testQueries.BeginUsageEntitlementIssuance(t.Context(), db.BeginUsageEntitlementIssuanceParams{TeamID: c.TeamID, ContractID: c.ID, EntitlementID: e.ID}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("adopted grant entered create path: %v", err)
+	}
+}
+
+func TestIntegration_CommercialImmediateIssuanceRecovery(t *testing.T) {
+	c := commercialObserve(t, commercialActivate(t, commercialFixture(t, false)), false)
+	e := commercialClaim(t, c)
+	commercialMap(t, c, e)
+	e, err := testQueries.BeginImmediateUsageEntitlementIssuance(t.Context(), db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: c.TeamID, ContractID: c.ID, EntitlementID: e.ID, InvoiceStart: commercialTime(e.PeriodStart), InvoiceEnd: commercialTime(e.PeriodEnd), Prices: []byte(`[{"id":"price_cpu"},{"id":"price_memory"},{"id":"price_storage"},{"id":"price_round"}]`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evidence map[string]any
+	if err = json.Unmarshal(e.RequestPayload, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := evidence["effective_at"]; ok {
+		t.Fatal("immediate grant froze a timestamp that can become backdated")
+	}
+	// A crash before dispatch retains the request; provider confirmation may be later.
+	replay, err := testQueries.GetReplayableUsageEntitlement(t.Context(), db.GetReplayableUsageEntitlementParams{TeamID: c.TeamID, EntitlementID: e.ID})
+	if err != nil || replay.IdempotencyKey != e.IdempotencyKey || string(replay.RequestPayload) != string(e.RequestPayload) {
+		t.Fatal("request identity changed", err)
+	}
+	grant := "credgr_" + uuid.NewString()
+	evidence["id"] = grant
+	evidence["effective_at"] = e.PeriodStart.Unix()
+	raw, _ := json.Marshal(evidence)
+	if _, err = testQueries.ConfirmUsageEntitlementIssued(t.Context(), db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant, Evidence: raw}); err == nil {
+		t.Fatal("accepted credit overlapping previous invoice")
+	}
+	evidence["effective_at"] = commercialNow(t).Unix()
+	evidence["priority"] = 0
+	raw, _ = json.Marshal(evidence)
+	if _, err = testQueries.ConfirmUsageEntitlementIssued(t.Context(), db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant, Evidence: raw}); err == nil {
+		t.Fatal("accepted wrong priority")
+	}
+	evidence["priority"] = 50
+	raw, _ = json.Marshal(evidence)
+	issued, err := testQueries.ConfirmUsageEntitlementIssued(t.Context(), db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant, Evidence: raw})
+	if err != nil || issued.State != "issued" {
+		t.Fatal("confirmation lost provider time", err)
+	}
+}
+func TestIntegration_CommercialLegacyDebtObservationCannotAuthorize(t *testing.T) {
+	c := commercialActivate(t, commercialFixture(t, false))
+	noDebt := false
+	now := commercialNow(t)
+	_, err := testQueries.ObserveCommercialCollection(t.Context(), db.ObserveCommercialCollectionParams{TeamID: c.TeamID, ContractID: c.ID, ExpectedRevision: c.Revision, HasOverdueBalance: &noDebt, CheckedAt: commercialTime(now), ValidUntil: commercialTime(now.Add(time.Minute)), Evidence: []byte(`{"overdue":false}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = testQueries.ClaimCurrentUsageEntitlement(t.Context(), db.ClaimCurrentUsageEntitlementParams{TeamID: c.TeamID, ContractID: c.ID}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatal("legacy overdue policy authorized Pro allowance", err)
 	}
 }

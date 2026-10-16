@@ -17,6 +17,12 @@ import (
 // preview has status=draft too; its upcoming_ ID does not identify an invoice
 // that can be held or finalized.
 type StripeInvoiceAmounts struct {
+	Created           int64 `json:"created"`
+	StatusTransitions struct {
+		PaidAt      int64 `json:"paid_at"`
+		FinalizedAt int64 `json:"finalized_at"`
+	} `json:"status_transitions"`
+	AmountRemaining *int64            `json:"amount_remaining"`
 	PeriodStart     int64             `json:"period_start"`
 	PeriodEnd       int64             `json:"period_end"`
 	Discounts       []invoiceDiscount `json:"discounts"`

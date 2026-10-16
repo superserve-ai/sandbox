@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"log"
@@ -131,8 +132,8 @@ func normalizeFrameConfig(cfg *pb.FrameConfig) (format pb.FrameFormat, interval 
 	if format == pb.FrameFormat_FRAME_FORMAT_UNSPECIFIED {
 		format = pb.FrameFormat_FRAME_FORMAT_PNG
 	}
-	if format != pb.FrameFormat_FRAME_FORMAT_PNG {
-		return 0, 0, fmt.Errorf("unsupported frame format %v: only PNG is supported", format)
+	if _, err := screenshotFormat(format); err != nil {
+		return 0, 0, err
 	}
 
 	fps := cfg.GetFps()
@@ -176,7 +177,7 @@ func (s *desktopService) Stream(ctx context.Context, req *connect.Request[pb.Fra
 	var lastFrameHash uint64
 	for {
 		frameStart := time.Now()
-		img, err := s.captureScreenshot(ctx, nil)
+		img, err := s.captureScreenshot(ctx, format, nil)
 		switch {
 		case ctx.Err() != nil:
 			// Best-effort; the client may already be gone.
@@ -256,13 +257,31 @@ func fnv64(b []byte) uint64 {
 
 // encodeFramePNG encodes a captured frame. BestSpeed: encode latency
 // matters more than size for transient frames.
-func encodeFramePNG(frame *image.RGBA) ([]byte, error) {
+// jpegQuality trades a little detail for frames a few times smaller than
+// PNG; text on a desktop stays legible to a model well above this.
+const jpegQuality = 80
+
+func encodeFrame(frame *image.RGBA, format pb.FrameFormat) ([]byte, error) {
 	var buf bytes.Buffer
-	enc := png.Encoder{CompressionLevel: png.BestSpeed}
-	if err := enc.Encode(&buf, frame); err != nil {
+	var err error
+	if format == pb.FrameFormat_FRAME_FORMAT_JPEG {
+		err = jpeg.Encode(&buf, frame, &jpeg.Options{Quality: jpegQuality})
+	} else {
+		enc := png.Encoder{CompressionLevel: png.BestSpeed}
+		err = enc.Encode(&buf, frame)
+	}
+	if err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// importFormat is the ImageMagick output spec for a frame format.
+func importFormat(format pb.FrameFormat) string {
+	if format == pb.FrameFormat_FRAME_FORMAT_JPEG {
+		return "jpeg:-"
+	}
+	return "png:-"
 }
 
 // Screenshot captures a single frame. It deliberately does not take the
@@ -286,19 +305,21 @@ func screenshotFormat(format pb.FrameFormat) (pb.FrameFormat, error) {
 	switch format {
 	case pb.FrameFormat_FRAME_FORMAT_UNSPECIFIED, pb.FrameFormat_FRAME_FORMAT_PNG:
 		return pb.FrameFormat_FRAME_FORMAT_PNG, nil
+	case pb.FrameFormat_FRAME_FORMAT_JPEG:
+		return pb.FrameFormat_FRAME_FORMAT_JPEG, nil
 	default:
-		return 0, fmt.Errorf("unsupported frame format %v: only PNG is supported", format)
+		return 0, fmt.Errorf("unsupported frame format %v: PNG and JPEG are supported", format)
 	}
 }
 
 // screenshotResponse captures one frame and reads its dimensions from the
 // PNG header. Shared by Screenshot and Step.
 func (s *desktopService) screenshotResponse(ctx context.Context, format pb.FrameFormat, watch *frameWatch) (*pb.ScreenshotResponse, error) {
-	img, err := s.captureScreenshot(ctx, watch)
+	img, err := s.captureScreenshot(ctx, format, watch)
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := png.DecodeConfig(bytes.NewReader(img))
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(img))
 	if err != nil {
 		return nil, fmt.Errorf("decode screenshot header: %w", err)
 	}
@@ -337,12 +358,12 @@ func (s *desktopService) armFrameWatch(ctx context.Context) *frameWatch {
 	return w
 }
 
-// captureScreenshot returns the current frame as PNG bytes: the persistent
-// X11 backend (in-process capture + encode, cursor composited) when
-// available, else ImageMagick's `import`. With watch, the X11 capture waits
-// for a changed frame first. Bound to a per-capture timeout derived from
-// ctx so one wedged capture can't stall the stream forever.
-func (s *desktopService) captureScreenshot(ctx context.Context, watch *frameWatch) ([]byte, error) {
+// captureScreenshot returns the current frame encoded as format: the
+// persistent X11 backend (in-process capture + encode, cursor composited)
+// when available, else ImageMagick's `import`. With watch, the X11 capture
+// waits for a changed frame first. Bound to a per-capture timeout derived
+// from ctx so one wedged capture can't stall the stream forever.
+func (s *desktopService) captureScreenshot(ctx context.Context, format pb.FrameFormat, watch *frameWatch) ([]byte, error) {
 	// One slot per capture on either backend: the X11 path also holds a
 	// full frame plus its PNG encoding in memory.
 	select {
@@ -367,7 +388,7 @@ func (s *desktopService) captureScreenshot(ctx context.Context, watch *frameWatc
 		if err != nil {
 			return err
 		}
-		encoded, err = encodeFramePNG(frame)
+		encoded, err = encodeFrame(frame, format)
 		return err
 	})
 	if attempted && err == nil {
@@ -379,7 +400,13 @@ func (s *desktopService) captureScreenshot(ctx context.Context, watch *frameWatc
 	if capCtx.Err() != nil {
 		return nil, capCtx.Err()
 	}
-	// A read is safe to redo through the shell path.
+	// A read is safe to redo through the shell path. The X11 failure is the
+	// one worth knowing about, so it is kept if the shell path fails too.
+	var x11Err error
+	if attempted {
+		x11Err = err
+		log.Printf("desktop: x11 capture failed, using the shell path: %v", err)
+	}
 	if watch != nil {
 		// The backend that armed the watch is gone; the shell path cannot
 		// compare, so it keeps the settle instead.
@@ -390,18 +417,18 @@ func (s *desktopService) captureScreenshot(ctx context.Context, watch *frameWatc
 		}
 	}
 
-	cmd, err := s.commandContext(capCtx, "import", "-window", "root", "png:-")
+	cmd, err := s.commandContext(capCtx, "import", "-window", "root", "-quality", strconv.Itoa(jpegQuality), importFormat(format))
 	if err != nil {
-		return nil, fmt.Errorf("resolve import: %w", err)
+		return nil, shellCaptureError(x11Err, fmt.Errorf("resolve import: %w", err))
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("import -window root: %w", err)
+		return nil, shellCaptureError(x11Err, fmt.Errorf("import -window root: %w", err))
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("import -window root: %w", err)
+		return nil, shellCaptureError(x11Err, fmt.Errorf("import -window root: %w", err))
 	}
 	// Read one byte past the cap at most, so an oversized frame is rejected
 	// without ever being buffered; killing import makes Wait return promptly.
@@ -410,17 +437,26 @@ func (s *desktopService) captureScreenshot(ctx context.Context, watch *frameWatc
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		if readErr != nil {
-			return nil, fmt.Errorf("import -window root: read: %w", readErr)
+			return nil, shellCaptureError(x11Err, fmt.Errorf("import -window root: read: %w", readErr))
 		}
-		return nil, fmt.Errorf("import -window root: screenshot exceeds %d bytes", maxScreenshotBytes)
+		return nil, shellCaptureError(x11Err, fmt.Errorf("import -window root: screenshot exceeds %d bytes", maxScreenshotBytes))
 	}
 	if err := cmd.Wait(); err != nil {
-		return nil, wrapExecErrOutput("import -window root", stderr.Bytes(), err)
+		return nil, shellCaptureError(x11Err, wrapExecErrOutput("import -window root", stderr.Bytes(), err))
 	}
 	if len(out) == 0 {
-		return nil, errors.New("import -window root: empty output")
+		return nil, shellCaptureError(x11Err, errors.New("import -window root: empty output"))
 	}
 	return out, nil
+}
+
+// shellCaptureError reports a shell-path capture failure together with the
+// X11 failure that sent the capture there, when there was one.
+func shellCaptureError(x11Err, shellErr error) error {
+	if x11Err == nil {
+		return shellErr
+	}
+	return fmt.Errorf("%w (after x11 capture failed: %v)", shellErr, x11Err)
 }
 
 // displayGeometry queries the virtual display's current resolution — via the
@@ -786,13 +822,16 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 
 	// The lock also covers the settle and the capture, so the frame shows
 	// the state this batch produced and nothing that arrived after it.
+	phase := time.Now()
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
+	resp := &pb.StepResponse{Executed: uint32(len(lowered)), QueueMs: millisSince(&phase)}
 	var watch *frameWatch
 	if req.Msg.GetWaitForChange() {
 		watch = s.armFrameWatch(ctx)
 	}
-	resp := &pb.StepResponse{Executed: uint32(len(lowered))}
+	// Arming reads and hashes a frame; it is capture work done early.
+	armMs := millisSince(&phase)
 	for i, run := range lowered {
 		if err := run(ctx); err != nil {
 			resp.Executed = uint32(i)
@@ -800,6 +839,7 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 			break
 		}
 	}
+	resp.ActionsMs = millisSince(&phase)
 	if watch != nil {
 		watch.deadline = time.Now().Add(settle)
 	} else if settle > 0 {
@@ -808,9 +848,11 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 		case <-ctx.Done():
 		}
 	}
+	resp.SettleMs = millisSince(&phase)
 	// Input already landed by now, so a capture failure is reported in the
 	// response rather than as an RPC error the caller might retry.
 	shot, err := s.screenshotResponse(ctx, format, watch)
+	resp.CaptureMs = armMs + millisSince(&phase)
 	if err != nil {
 		resp.CaptureError = err.Error()
 	} else {
@@ -818,6 +860,46 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 		resp.Changed = watch != nil && watch.changed
 	}
 	return connect.NewResponse(resp), nil
+}
+
+// millisSince returns the milliseconds since *from and moves *from to now,
+// so consecutive calls measure consecutive phases.
+func millisSince(from *time.Time) uint32 {
+	now := time.Now()
+	ms := now.Sub(*from).Milliseconds()
+	*from = now
+	return uint32(ms)
+}
+
+// resizeRepaintWait bounds how long Resize waits for clients to draw at the
+// new size. A display where nothing draws after the switch waits it out.
+const resizeRepaintWait = 2 * time.Second
+
+// markRepaint drops the repaint reports queued before a mode switch, so
+// awaitRepaint only credits drawing done after it. False when the display
+// backend cannot report repaints.
+func (s *desktopService) markRepaint(ctx context.Context) bool {
+	attempted, err := s.runX11(ctx, func(_ context.Context, b *x11Backend) error { return b.markRepaint() })
+	return attempted && err == nil
+}
+
+// awaitRepaint blocks until the display shows something drawn since the
+// switch, or until bound; without a display backend it returns at once. A
+// desktop that already redrew during the mode switch costs one read.
+func (s *desktopService) awaitRepaint(ctx context.Context, marked bool, bound time.Duration) {
+	// The reads get a little longer than the wait: a quiet display ends it
+	// with a plain false and keeps the connection, while a server that stops
+	// replying mid-read still releases the input lock soon after the bound.
+	deadline := time.Now().Add(bound)
+	ctx, cancel := context.WithDeadline(ctx, deadline.Add(time.Second))
+	defer cancel()
+	_, _ = s.runX11(ctx, func(ctx context.Context, b *x11Backend) error {
+		ok, err := b.awaitPainted(ctx, marked, deadline)
+		if err == nil && !ok {
+			log.Printf("desktop: display still blank %v after resize", bound)
+		}
+		return err
+	})
 }
 
 func abs32(v int32) int64 {
@@ -926,6 +1008,7 @@ func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.Des
 	if err != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("resolve xrandr: %w", err))
 	}
+	marked := s.markRepaint(resizeCtx)
 	if setModeOutput, setModeErr := setModeCmd.CombinedOutput(); setModeErr != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf(
 			"set desktop mode %s: %w (newmode: %s; addmode: %s)",
@@ -935,6 +1018,9 @@ func (s *desktopService) Resize(ctx context.Context, req *connect.Request[pb.Des
 			strings.TrimSpace(string(addModeOutput)),
 		))
 	}
+	// The switch leaves the display blank until clients repaint; a capture
+	// right after would show that, so wait until something is drawn, bounded.
+	s.awaitRepaint(resizeCtx, marked, resizeRepaintWait)
 	actualWidth, actualHeight, err := s.displayGeometry(resizeCtx)
 	if err != nil {
 		return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("verify resized display: %w", err))

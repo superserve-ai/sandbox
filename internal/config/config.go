@@ -19,6 +19,9 @@ import (
 
 // Config holds all configuration for the Superserve Sandbox control plane.
 type Config struct {
+	BillingUsageEntitlementsEnabled bool
+	BillingEntitlementWorkers       int
+
 	TemplateBuildRegion       string                       // TEMPLATE_BUILD_REGION matches the host registry region exactly
 	TemplateBackupBucket      string                       // BACKUP_BUCKET, cell-local durable template storage
 	ComputeRestrictionsFile   string                       // COMPUTE_RESTRICTIONS_FILE; empty disables config loading
@@ -130,9 +133,16 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	workers, err := strconv.Atoi(envOrDefault("BILLING_ENTITLEMENT_WORKERS", "8"))
+	if err != nil || workers < 2 || workers > 32 {
+		return nil, fmt.Errorf("BILLING_ENTITLEMENT_WORKERS must be between 2 and 32")
+	}
 	checkoutPriceIDs := checkoutPriceIDs()
 
 	cfg := &Config{
+		BillingUsageEntitlementsEnabled: boolEnv("BILLING_USAGE_ENTITLEMENTS_ENABLED", false),
+		BillingEntitlementWorkers:       workers,
+
 		TeamCreationRegion:            os.Getenv("TEAM_CREATION_REGION"),
 		TeamCreationKeys:              teamCreationKeys(os.Getenv("TEAM_CREATION_PUBLIC_KEYS")),
 		ComputeRestrictionsFile:       os.Getenv("COMPUTE_RESTRICTIONS_FILE"),

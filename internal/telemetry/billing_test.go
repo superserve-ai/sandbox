@@ -20,7 +20,7 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 	}
 	r.RecordBillingWork(ctx, "raw-secret", true, time.Second, 2)
 	r.RecordBillingLag(ctx, 3600)
-	for _, state := range []string{"pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted"} {
+	for _, state := range []string{"pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted", "entitlement_paid_missing", "entitlement_debt_unknown"} {
 		r.RecordBillingBacklog(ctx, state, 3, 90)
 	}
 	r.RecordBillingReconciliation(ctx, "raw-secret", 10, nil, nil)
@@ -46,7 +46,7 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 					}
 				}
 			case "billing_event_backlog_capped":
-				if points := m.Data.(metricdata.Gauge[int64]).DataPoints; len(points) != 6 {
+				if points := m.Data.(metricdata.Gauge[int64]).DataPoints; len(points) != 8 {
 					t.Fatalf("collapsed event states: %+v", points)
 				}
 			case "billing_reconciliation_total":

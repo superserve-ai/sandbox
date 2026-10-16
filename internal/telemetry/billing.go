@@ -100,7 +100,7 @@ func (r *OTelRecorder) RecordBillingWork(ctx context.Context, operation string, 
 		return
 	}
 	switch operation {
-	case "tick", "measurement", "submission", "reconciliation", "backlog_sample", "pro_payment", "pro_backlog_sample":
+	case "tick", "measurement", "submission", "reconciliation", "backlog_sample", "pro_payment", "pro_backlog_sample", "usage_entitlement", "usage_entitlement_backlog", "entitlement_coverage_sample":
 	default:
 		operation = "unknown"
 	}
@@ -126,7 +126,7 @@ func (r *OTelRecorder) RecordBillingBacklog(ctx context.Context, state string, c
 		return
 	}
 	switch state {
-	case "pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted":
+	case "pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted", "entitlement_due", "entitlement_paid_missing", "entitlement_debt_unknown":
 	default:
 		state = "unknown"
 	}

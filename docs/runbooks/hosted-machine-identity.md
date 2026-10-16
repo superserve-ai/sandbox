@@ -199,7 +199,7 @@ re-enter after invalidation.
 ## Compatibility and activation gate
 
 The supported serving revision is `machine-identity-v1`: the schema migration
-`20261015191924_hosted_machine_identity.sql`, the API `CallerContext` resolver
+`20261016150934_hosted_machine_identity.sql`, the API `CallerContext` resolver
 and route gate, the `mcap.v1` verifier, and the proxy session registry must be
 deployed as one compatible set. A serving instance is **ready** only when its
 health/readiness check reports all four surfaces present, the authority lookup
@@ -244,15 +244,19 @@ not claim those measurements passed.
 ## Restoring the source after the coordinated-rollout revert
 
 PR #683 reverted PR #660 before its migration or deployments ran. The restored
-migration is `20261015191924_hosted_machine_identity.sql`, ordered after the
+migration is `20261016150934_hosted_machine_identity.sql`, ordered after the
 newer billing migrations with unchanged SQL. Before applying it, verify that
 no earlier hosted-machine migration was applied in the target environment;
 stop for reconciliation if its schema or migration history is already present.
 
-Source integration and passing CI do not authorize deployment. Merge remains
-blocked until the rollout owner can prevent independent push deployments from
-racing the required VMD, proxy, then API sequence. Keep issuance disabled while
-installing the schema and deploying compatible components; validate readiness,
-ordinary-client compatibility, tenant isolation and revocation before enabling
-it. A dedicated backing team does not relax principal ownership checks inside
+Install the schema before deploying the API or a database-backed proxy: ordinary
+routing and ownership queries also use the new ownership table. For an initial
+rollout with no existing machine credentials or workloads, VMD, proxy and API
+upgrades may otherwise overlap while issuance remains disabled. VMD tolerates
+the absent machine schema, and the new proxy supports legacy VMD ownership
+records. Issuance disabled does not revoke existing credentials; verify the
+initial-rollout assumption before relying on mixed-version compatibility.
+Before enabling machine use, deploy compatible components everywhere and
+validate readiness, ordinary-client compatibility, tenant isolation and
+revocation. A dedicated backing team does not relax principal ownership checks inside
 that team. Team provisioning and billing policy remain separate integrations.

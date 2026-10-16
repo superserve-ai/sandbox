@@ -150,6 +150,7 @@ func (h *Handlers) sweepLoop(ctx context.Context, interval time.Duration, logger
 		sentrylog.RunSafe("interval-sweep", func() { h.sweepOrphanedIntervals(ctx, logger) })
 		sentrylog.RunSafe("revocation-cleanup", func() { h.cleanupExpiredRevocations(ctx, logger) })
 		sentrylog.RunSafe("snapshot-row-sweep", func() { h.sweepOrphanedSnapshotRows(ctx, logger) })
+		sentrylog.RunSafe("lapsed-contract-sweep", func() { h.endLapsedCommercialContracts(ctx, logger) })
 	}
 
 	// Immediately, so a restart after a crash cleans up without waiting a
@@ -163,6 +164,21 @@ func (h *Handlers) sweepLoop(ctx context.Context, interval time.Duration, logger
 		case <-ticker.C:
 			runSweeps()
 		}
+	}
+}
+
+// endLapsedCommercialContracts ends fixed-term contracts past ends_at, which
+// returns their teams to Free limits.
+func (h *Handlers) endLapsedCommercialContracts(ctx context.Context, logger zerolog.Logger) {
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	n, err := h.DB.EndLapsedCommercialContracts(qctx)
+	if err != nil {
+		logger.Error().Err(err).Msg("reaper: EndLapsedCommercialContracts failed")
+		return
+	}
+	if n > 0 {
+		logger.Info().Int64("ended", n).Msg("reaper: ended lapsed commercial contracts")
 	}
 }
 

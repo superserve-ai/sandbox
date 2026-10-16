@@ -49,7 +49,7 @@ func (c *stripeHTTPClient) verifyProInvoice(ctx context.Context, id string, o pr
 		if line.Pricing.PriceDetails == nil || line.Pricing.PriceDetails.Price != o.Price {
 			continue
 		}
-		if found || line.Parent.SubscriptionItemDetails == nil || line.Parent.SubscriptionItemDetails.Subscription != subscription || line.Parent.SubscriptionItemDetails.Proration || line.Amount != o.Amount || line.Currency != "usd" || line.Quantity != 1 || len(line.Discounts) != 0 || len(line.PretaxCredits) != 0 || line.Period.End <= line.Period.Start {
+		if found || line.Parent.SubscriptionItemDetails == nil || line.Parent.SubscriptionItemDetails.Subscription != subscription || line.Parent.SubscriptionItemDetails.Proration || line.Amount != o.Amount || line.Currency != "usd" || line.Quantity != 1 || baseLineHasCredits(line) || line.Period.End <= line.Period.Start {
 			return ev, false, &proPaymentReviewError{reason: "base invoice line differs from expected offer"}
 		}
 		found = true
