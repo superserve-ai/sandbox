@@ -1890,3 +1890,11 @@ type UserSignupTrialClaim struct {
 	TeamID    pgtype.UUID `json:"team_id"`
 	CreatedAt time.Time   `json:"created_at"`
 }
+
+type YcClaimTeamIntent struct {
+	TeamID     uuid.UUID          `json:"team_id"`
+	ClaimID    uuid.UUID          `json:"claim_id"`
+	UserID     uuid.UUID          `json:"user_id"`
+	CreatedAt  time.Time          `json:"created_at"`
+	ReleasedAt pgtype.Timestamptz `json:"released_at"`
+}

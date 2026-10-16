@@ -59,6 +59,7 @@ on:
       - 'internal/supervisor/**'
       - 'internal/telemetry/**'
       - 'internal/vmdclient/**'
+      - 'internal/ycclaims/**'
       - 'proto/**'
       - 'go.mod'
       - 'go.sum'
