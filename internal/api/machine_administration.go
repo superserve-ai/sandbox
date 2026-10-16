@@ -25,11 +25,13 @@ const machineAdministrationBodyLimit = 4096
 type machineAdministrationAuthority interface {
 	EnsurePrincipal(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, string) (auth.MachinePrincipal, error)
 	ReadPrincipal(context.Context, uuid.UUID) (auth.MachinePrincipal, error)
+	ReadCredential(context.Context, uuid.UUID, uuid.UUID) (auth.MachineCredential, error)
+	RevokeCredentialScoped(context.Context, uuid.UUID, uuid.UUID, int64) error
 	IssueCredentialFenced(context.Context, uuid.UUID, string, int64, uuid.UUID) (auth.MachineCredential, error)
 	RotateCredentialFenced(context.Context, uuid.UUID, uuid.UUID, string, int64, uuid.UUID) (auth.MachineCredential, error)
 	RestorePrincipalFenced(context.Context, uuid.UUID, string, int64, uuid.UUID) (auth.MachineCredential, error)
 	RevokeCredential(context.Context, uuid.UUID, string) error
-	DisablePrincipalFenced(context.Context, uuid.UUID, int64, uuid.UUID) error
+	DisablePrincipalCredentialFenced(context.Context, uuid.UUID, int64, uuid.UUID, *uuid.UUID) error
 }
 
 var _ machineAdministrationAuthority = (*DBMachineAuthority)(nil)
@@ -46,6 +48,30 @@ func (a *DBMachineAuthority) ReadPrincipal(ctx context.Context, id uuid.UUID) (a
 		return auth.MachinePrincipal{}, err
 	}
 	return machinePrincipalFromRow(row), nil
+}
+
+func (a *DBMachineAuthority) ReadCredential(ctx context.Context, principalID, credentialID uuid.UUID) (auth.MachineCredential, error) {
+	if !authorizedControlPlane(ctx) {
+		return auth.MachineCredential{}, auth.ErrMachineCapabilityDenied
+	}
+	if a == nil || a.Queries == nil {
+		return auth.MachineCredential{}, ErrMachineAuthorityUnavailable
+	}
+	row, err := a.Queries.ReadMachineCredential(ctx, principalID, credentialID)
+	if err != nil {
+		return auth.MachineCredential{}, err
+	}
+	return auth.MachineCredential{CredentialID: row.ID, PrincipalID: row.PrincipalID, LineageID: row.LineageID, State: auth.CredentialState(row.State), ExpiresAt: row.ExpiresAt, RevocationGeneration: uint64(row.RevocationGeneration)}, nil
+}
+
+func (a *DBMachineAuthority) RevokeCredentialScoped(ctx context.Context, principalID, credentialID uuid.UUID, expectedGeneration int64) error {
+	if !authorizedControlPlane(ctx) {
+		return auth.ErrMachineCapabilityDenied
+	}
+	if a == nil || a.Queries == nil {
+		return ErrMachineAuthorityUnavailable
+	}
+	return a.Queries.RevokeMachineCredentialScoped(ctx, principalID, credentialID, expectedGeneration)
 }
 
 // Bound socket reads even on rejected requests: net/http can drain an unread
@@ -229,6 +255,62 @@ type machineCredentialRequest struct {
 	ReplacementCredentialID uuid.UUID `json:"replacement_credential_id,omitempty"`
 }
 
+func machineCredentialResponse(credential auth.MachineCredential) gin.H {
+	return gin.H{"credential_id": credential.CredentialID, "principal_id": credential.PrincipalID, "lineage_id": credential.LineageID, "state": credential.State, "expires_at": credential.ExpiresAt, "revocation_generation": credential.RevocationGeneration}
+}
+
+func (h *Handlers) GetMachineCredential(c *gin.Context) {
+	a, ok := h.machineAdministrator(c)
+	if !ok {
+		return
+	}
+	principalID, ok := machineAdministrationID(c, "principal_id")
+	if !ok {
+		return
+	}
+	credentialID, ok := machineAdministrationID(c, "credential_id")
+	if !ok {
+		return
+	}
+	credential, err := a.ReadCredential(c.Request.Context(), principalID, credentialID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		respondErrorMsg(c, "not_found", "Machine credential not found.", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		machineAdministrationError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, machineCredentialResponse(credential))
+}
+
+func (h *Handlers) RevokeScopedMachineCredential(c *gin.Context) {
+	a, ok := h.machineAdministrator(c)
+	if !ok {
+		return
+	}
+	principalID, ok := machineAdministrationID(c, "principal_id")
+	if !ok {
+		return
+	}
+	var request struct {
+		CredentialID       uuid.UUID `json:"credential_id"`
+		ExpectedGeneration int64     `json:"expected_generation"`
+	}
+	if !decodeMachineAdministration(c, &request) {
+		return
+	}
+	if request.CredentialID == uuid.Nil || request.ExpectedGeneration <= 0 {
+		respondErrorMsg(c, "invalid_request", "A valid credential ID and positive credential generation are required.", http.StatusBadRequest)
+		return
+	}
+	if err := a.RevokeCredentialScoped(c.Request.Context(), principalID, request.CredentialID, request.ExpectedGeneration); err != nil {
+		machineAdministrationError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 func (h *Handlers) MutateMachineCredential(c *gin.Context) {
 	a, ok := h.machineAdministrator(c)
 	if !ok {
@@ -264,7 +346,7 @@ func (h *Handlers) MutateMachineCredential(c *gin.Context) {
 		machineAdministrationError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"credential_id": credential.CredentialID, "principal_id": credential.PrincipalID, "lineage_id": credential.LineageID, "state": credential.State, "expires_at": credential.ExpiresAt, "revocation_generation": credential.RevocationGeneration})
+	c.JSON(http.StatusOK, machineCredentialResponse(credential))
 }
 
 func (h *Handlers) RevokeMachineCredential(c *gin.Context) {
@@ -293,8 +375,9 @@ func (h *Handlers) DisableMachinePrincipal(c *gin.Context) {
 		return
 	}
 	var request struct {
-		OperationID        uuid.UUID `json:"operation_id"`
-		ExpectedGeneration int64     `json:"expected_generation"`
+		OperationID          uuid.UUID  `json:"operation_id"`
+		ExpectedGeneration   int64      `json:"expected_generation"`
+		ExpectedCredentialID *uuid.UUID `json:"expected_credential_id"`
 	}
 	if !decodeMachineAdministration(c, &request) {
 		return
@@ -303,7 +386,11 @@ func (h *Handlers) DisableMachinePrincipal(c *gin.Context) {
 		respondErrorMsg(c, "invalid_request", "A valid operation ID and positive expected generation are required.", http.StatusBadRequest)
 		return
 	}
-	if err := a.DisablePrincipalFenced(c.Request.Context(), id, request.ExpectedGeneration, request.OperationID); err != nil {
+	if request.ExpectedCredentialID != nil && *request.ExpectedCredentialID == uuid.Nil {
+		respondErrorMsg(c, "invalid_request", "A valid expected credential ID is required.", http.StatusBadRequest)
+		return
+	}
+	if err := a.DisablePrincipalCredentialFenced(c.Request.Context(), id, request.ExpectedGeneration, request.OperationID, request.ExpectedCredentialID); err != nil {
 		machineAdministrationError(c, err)
 		return
 	}

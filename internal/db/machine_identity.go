@@ -82,6 +82,7 @@ type LifecycleOptions struct {
 	ExpectedGeneration      *int64
 	OperationID             uuid.UUID
 	ReplacementCredentialID *uuid.UUID
+	ExpectedCredentialID    *uuid.UUID
 	// GeneratedExpiry excludes the server-generated expiry from caller input identity.
 	// Its first committed value is retained in the operation result on every retry.
 	GeneratedExpiry bool
@@ -221,6 +222,55 @@ func (q *Queries) machineCredentialByID(ctx context.Context, id uuid.UUID) (Mach
 	return scanMachineCredentialRow(q.db.QueryRow(ctx, `SELECT id,principal_id,lineage_id,state,expires_at,revocation_generation,permissions,audience,issued_at,revoked_at,secret_hash FROM machine_credential WHERE id=$1`, id))
 }
 
+type MachineCredentialMetadata struct {
+	ID                   uuid.UUID
+	PrincipalID          uuid.UUID
+	LineageID            uuid.UUID
+	State                string
+	ExpiresAt            time.Time
+	RevocationGeneration int64
+}
+
+// ReadMachineCredential includes revoked and expired records for reconciliation,
+// without selecting secret digests or treating this observation as authentication.
+func (q *Queries) ReadMachineCredential(ctx context.Context, principalID, credentialID uuid.UUID) (MachineCredentialMetadata, error) {
+	var row MachineCredentialMetadata
+	err := q.db.QueryRow(ctx, `SELECT id,principal_id,lineage_id,state,expires_at,revocation_generation FROM machine_credential WHERE id=$1 AND principal_id=$2`, credentialID, principalID).Scan(
+		&row.ID, &row.PrincipalID, &row.LineageID, &row.State, &row.ExpiresAt, &row.RevocationGeneration)
+	return row, err
+}
+
+// RevokeMachineCredentialScoped fences the immutable target, not the current
+// principal generation: cleanup of an old credential must survive restoration.
+func (q *Queries) RevokeMachineCredentialScoped(ctx context.Context, principalID, credentialID uuid.UUID, expectedGeneration int64) error {
+	if principalID == uuid.Nil || credentialID == uuid.Nil || expectedGeneration <= 0 {
+		return ErrMachineLifecycleConflict
+	}
+	tx, err := q.beginLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var lockedPrincipal uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT id FROM machine_principal WHERE id=$1 FOR UPDATE`, principalID).Scan(&lockedPrincipal); err != nil {
+		return err
+	}
+	var generation int64
+	var state string
+	if err := tx.QueryRow(ctx, `SELECT revocation_generation,state FROM machine_credential WHERE id=$1 AND principal_id=$2 FOR UPDATE`, credentialID, principalID).Scan(&generation, &state); err != nil {
+		return err
+	}
+	if generation != expectedGeneration {
+		return ErrMachineLifecycleConflict
+	}
+	if state == "active" {
+		if _, err := tx.Exec(ctx, `UPDATE machine_credential SET state='revoked',revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE id=$1`, credentialID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 // RotateMachineCredential requires explicit replacement and operation fences;
 // the principal generation is preserved while the old credential is revoked.
 func (q *Queries) RotateMachineCredential(ctx context.Context, principalID, lineageID uuid.UUID, expiresAt time.Time, permissions []string, audience string) (MachineCredentialRow, error) {
@@ -323,7 +373,14 @@ func (q *Queries) DisableMachinePrincipalFenced(ctx context.Context, id uuid.UUI
 	if err != nil {
 		return err
 	}
-	digest := lifecycleInputDigest("disable", id, uuid.Nil, nil, time.Time{}, nil, "", *fence.ExpectedGeneration, uuid.Nil, false)
+	expectedCredential := uuid.Nil
+	if fence.ExpectedCredentialID != nil {
+		expectedCredential = *fence.ExpectedCredentialID
+		if expectedCredential == uuid.Nil {
+			return ErrMachineLifecycleConflict
+		}
+	}
+	digest := lifecycleInputDigest("disable", id, uuid.Nil, nil, time.Time{}, nil, "", *fence.ExpectedGeneration, expectedCredential, false)
 	tx, err := q.beginLifecycle(ctx)
 	if err != nil {
 		return err
@@ -348,6 +405,14 @@ func (q *Queries) DisableMachinePrincipalFenced(ctx context.Context, id uuid.UUI
 	}
 	if status != "active" || generation != *fence.ExpectedGeneration {
 		return pgx.ErrNoRows
+	}
+	// Rotation preserves principal generation but revokes its predecessor.
+	// Check the observed credential under the same principal-first lock order.
+	if fence.ExpectedCredentialID != nil {
+		var credentialGeneration int64
+		if err := tx.QueryRow(ctx, `SELECT revocation_generation FROM machine_credential WHERE id=$1 AND principal_id=$2 AND state='active' AND revocation_generation=$3 FOR UPDATE`, expectedCredential, id, generation).Scan(&credentialGeneration); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO machine_lifecycle_operation(principal_id,operation_id,operation_kind,expected_generation,input_digest) VALUES($1,$2,'disable',$3,$4)`, id, fence.OperationID, *fence.ExpectedGeneration, digest); err != nil {
 		return err

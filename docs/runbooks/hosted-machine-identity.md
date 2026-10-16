@@ -124,11 +124,13 @@ All routes below are under `/internal/machine-identity`:
 | --- | --- |
 | `POST /principals` | JSON `team_id`, `hosted_tenant_id`, `approved_template_id`; returns the same fields as the read below. |
 | `GET /principals/{principal_id}` | Returns exactly `principal_id`, `team_id`, `hosted_tenant_id`, `status`, `generation`, and `approved_template_id` for lifecycle fencing. |
+| `GET /principals/{principal_id}/credentials/{credential_id}` | Returns the six credential metadata fields below, including revoked or expired records; missing or wrong-principal targets return 404. |
 | `POST /principals/{principal_id}/credentials/issue` | Fenced credential request; returns credential metadata. |
 | `POST /principals/{principal_id}/credentials/rotate` | Fenced credential request plus `replacement_credential_id`; replaces only that credential. |
 | `POST /principals/{principal_id}/credentials/restore` | Fenced credential request; restores the same principal within its recovery window. |
-| `POST /principals/{principal_id}/disable` | JSON `operation_id` and `expected_generation`; disables the principal and its credentials once for that fence; returns 204. |
+| `POST /principals/{principal_id}/disable` | JSON `operation_id`, `expected_generation`, and optional `expected_credential_id`; disables the principal and its credentials once for that fence; returns 204. |
 | `POST /credentials/{credential_id}/revoke` | Revokes that credential; returns 204. |
+| `POST /principals/{principal_id}/credentials/revoke` | JSON `credential_id`, `expected_generation`; revokes only that principal's matching credential generation, returning 204. Missing targets or binding/generation conflicts return 409. |
 
 A fenced credential request contains `operation_id` (a nonzero UUID),
 `expected_generation` (the positive generation just read), and
@@ -141,6 +143,35 @@ body, never in URLs or logs. Responses contain only `credential_id`,
 `principal_id`, `lineage_id`, `state`, `expires_at`, and
 `revocation_generation`; they never return credential material. The server
 supplies operation permissions, audiences, expiry, and lineage policy.
+
+For scoped revocation, `expected_generation` means the credential's stored
+`revocation_generation`, not the principal's current generation. Verify the
+principal's team/tenant binding with the principal read and the credential's
+principal/lineage binding with the credential read. The database checks the
+revoke target under the same principal lock used by rotation and restoration.
+An exact retry returns 204 without changing the original revocation timestamp,
+even after the principal has been restored; it cannot revoke a successor
+credential. No operation ID is needed for this monotonic, immutable-target
+mutation. After an uncertain response, repeat that same scoped request and read
+the target metadata; a 404 or 409 is not successful revocation evidence. Reads
+and scoped revocation remain available with issuance disabled. Metadata is an
+observation, not a credential validity check: stored `active` may be expired or
+belong to a disabled or newer-generation principal.
+
+Consumers disabling from an observed credential must send `expected_credential_id`.
+It must still be active and belong to that principal and generation when the
+transaction locks the principal, otherwise disable returns 409. This closes a
+rotation-after-read race even when rotation preserves the principal generation.
+The credential ID is part of the operation's immutable input: changing or omitting
+it on retry conflicts. An exact successful replay remains 204 after revocation or
+restore without disabling the restored generation. Omission retains legacy
+principal-wide behavior; a fenced disable also revokes active sibling credentials.
+
+Issue, rotation and restoration derive the result lineage from their operation
+ID. Rotation revokes the previous credential without changing its lineage, then
+creates a replacement with the new operation's lineage and the same principal
+generation. Restoration creates a fresh lineage and increments the principal
+generation. Replaying the same operation retains its original result lineage.
 
 JSON bodies are limited to 4 KiB and reject unknown fields or trailing values.
 Invalid request fields return 400; missing/wrong operator authentication returns

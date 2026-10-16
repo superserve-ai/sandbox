@@ -187,6 +187,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	{
 		machineAdministration.POST("/principals", h.EnsureMachinePrincipal)
 		machineAdministration.GET("/principals/:principal_id", h.GetMachinePrincipal)
+		machineAdministration.GET("/principals/:principal_id/credentials/:credential_id", h.GetMachineCredential)
+		machineAdministration.POST("/principals/:principal_id/credentials/revoke", h.RevokeScopedMachineCredential)
 		machineAdministration.POST("/principals/:principal_id/credentials/:action", h.MutateMachineCredential)
 		machineAdministration.POST("/principals/:principal_id/disable", h.DisableMachinePrincipal)
 		machineAdministration.POST("/credentials/:credential_id/revoke", h.RevokeMachineCredential)

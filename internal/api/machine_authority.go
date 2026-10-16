@@ -266,13 +266,18 @@ func (a *DBMachineAuthority) DisablePrincipal(ctx context.Context, principalID u
 }
 
 func (a *DBMachineAuthority) DisablePrincipalFenced(ctx context.Context, principalID uuid.UUID, expectedGeneration int64, operationID uuid.UUID) error {
+	return a.DisablePrincipalCredentialFenced(ctx, principalID, expectedGeneration, operationID, nil)
+}
+
+func (a *DBMachineAuthority) DisablePrincipalCredentialFenced(ctx context.Context, principalID uuid.UUID, expectedGeneration int64, operationID uuid.UUID, expectedCredentialID *uuid.UUID) error {
 	if !authorizedControlPlane(ctx) {
 		return auth.ErrMachineCapabilityDenied
 	}
 	if a == nil || a.Queries == nil {
 		return ErrMachineAuthorityUnavailable
 	}
-	return a.Queries.DisableMachinePrincipalFenced(ctx, principalID, db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID})
+	options := db.LifecycleOptions{ExpectedGeneration: &expectedGeneration, OperationID: operationID, ExpectedCredentialID: expectedCredentialID}
+	return a.Queries.DisableMachinePrincipalFenced(ctx, principalID, options)
 }
 
 func (a *DBMachineAuthority) RestorePrincipal(_ context.Context, _ uuid.UUID, _ string) (auth.MachineCredential, error) {
