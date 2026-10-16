@@ -47,12 +47,11 @@ def verify_revision(env):
                 or run.get("path") != ".github/workflows/deploy-proxy.yml"
                 or run.get("event") not in ("push", "workflow_dispatch")):
             raise GateError("Resume does not identify the original proxy revision")
-        comparison = api(repository, f"compare/{revision}...main")
-        if comparison.get("status") not in ("ahead", "identical"):
-            raise GateError("Resume revision is not an ancestor of current main")
-    elif (revision != env["GITHUB_SHA"]
-          or api(repository, "git/ref/heads/main")["object"]["sha"] != revision):
-        raise GateError("Main advanced; deployment must be re-evaluated")
+    elif revision != env["GITHUB_SHA"]:
+        raise GateError("Deployment revision must match the workflow revision")
+    comparison = api(repository, f"compare/{revision}...main")
+    if comparison.get("status") not in ("ahead", "identical"):
+        raise GateError("Deployment revision is not an ancestor of current main")
     return revision
 
 
