@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -361,7 +362,63 @@ func (c *stripeHTTPClient) ycPaymentMethod(ctx context.Context, customer string,
 		now := time.Now().UTC()
 		return method.Card.Year > now.Year() || (method.Card.Year == now.Year() && method.Card.Month >= int(now.Month())), nil
 	}
-	return false, errors.New("payment method requires operator verification; supported activation method is card")
+	if method.Type == "link" {
+		if types := sub.PaymentSettings.PaymentMethodTypes; len(types) > 0 && !slices.Contains(types, "link") {
+			return false, errors.New("payment_method_required: subscription payment settings do not allow the saved Link method")
+		}
+		return c.ycLinkSetup(ctx, cust, id, live)
+	}
+	return false, errors.New("payment_method_required: saved method is not supported for activation; choose a supported reusable method in billing")
+}
+
+// A portal-saved Link method has no card expiry. Verify the completed setup for
+// this exact method instead of inferring off-session reuse from attachment.
+func (c *stripeHTTPClient) ycLinkSetup(ctx context.Context, customer ycCustomer, method string, live bool) (bool, error) {
+	var setups struct {
+		Data []struct {
+			ID               string `json:"id"`
+			Customer         string `json:"customer"`
+			Account          string `json:"customer_account"`
+			PaymentMethod    string `json:"payment_method"`
+			Status           string `json:"status"`
+			Usage            string `json:"usage"`
+			Live             bool   `json:"livemode"`
+			Mandate          string `json:"mandate"`
+			SingleUseMandate string `json:"single_use_mandate"`
+			OnBehalfOf       string `json:"on_behalf_of"`
+		} `json:"data"`
+	}
+	// Filter by method so unrelated setup history cannot consume the refresh
+	// budget. One bounded page is enough to fail closed without a history scan.
+	query := url.Values{"payment_method": {method}, "limit": {"100"}}
+	if err := c.doForm(ctx, http.MethodGet, "/v1/setup_intents?"+query.Encode(), nil, &setups, ""); err != nil {
+		return false, err
+	}
+	for _, setup := range setups.Data {
+		if setup.ID == "" || setup.PaymentMethod != method || setup.Live != live ||
+			(setup.Customer != customer.ID && (customer.Account == "" || setup.Account != customer.Account)) ||
+			setup.Status != "succeeded" || setup.Usage != "off_session" || setup.SingleUseMandate != "" || setup.OnBehalfOf != "" {
+			continue
+		}
+		if setup.Mandate != "" {
+			var mandate struct {
+				ID            string `json:"id"`
+				PaymentMethod string `json:"payment_method"`
+				Status        string `json:"status"`
+				Type          string `json:"type"`
+				Live          bool   `json:"livemode"`
+				OnBehalfOf    string `json:"on_behalf_of"`
+			}
+			if err := c.doForm(ctx, http.MethodGet, "/v1/mandates/"+url.PathEscape(setup.Mandate), nil, &mandate, ""); err != nil {
+				return false, err
+			}
+			if mandate.ID != setup.Mandate || mandate.PaymentMethod != method || mandate.Live != live || mandate.Status != "active" || mandate.Type != "multi_use" || mandate.OnBehalfOf != "" {
+				return false, errors.New("payment_method_required: Link authorization is no longer reusable; update the payment method in billing")
+			}
+		}
+		return true, nil
+	}
+	return false, errors.New("payment_method_required: complete Link setup for future payments in billing")
 }
 func validateYCSubscription(sub invoiceSubscription, p StripeCreateCheckoutSessionParams, in ycApproval) error {
 	if sub.ID == "" || sub.Customer != in.Customer || sub.LiveMode != *in.Live || sub.Status != "active" || sub.CollectionMethod != "charge_automatically" || sub.Schedule != "" || sub.Items.HasMore || sub.StartDate <= 0 || sub.BillingCycleAnchor != sub.StartDate || sub.AutomaticTax.Enabled || sub.BillingThresholds != nil || sub.PendingUpdate != nil || len(sub.Discounts) != 0 {
