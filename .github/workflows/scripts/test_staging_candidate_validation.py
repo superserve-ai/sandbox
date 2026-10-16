@@ -207,8 +207,16 @@ class SourcesTests(unittest.TestCase):
                 gate.check_history(rows, expected)
 
 class TargetTests(unittest.TestCase):
+    def setUp(self):
+        projects = patch.dict(gate.migration.PROJECTS, staging='stagingprojectexample', use4='productionexampleone')
+        projects.start()
+        self.addCleanup(projects.stop)
+        account = patch.object(gate, 'STRIPE_ACCOUNT', 'acct_example')
+        account.start()
+        self.addCleanup(account.stop)
+
     def test_live_stripe_key_and_wrong_test_account_fail_before_any_mutation(self):
-        url = 'postgresql://postgres:example@db.rifhalqzxgskwajjgipj.supabase.co/postgres'
+        url = 'postgresql://postgres:example@db.stagingprojectexample.supabase.co/postgres'
         metadata = json.dumps({'name': 'projects/example/secrets/example/versions/1', 'state': 'ENABLED'})
         for key, account in [('sk_live_example', gate.STRIPE_ACCOUNT), ('sk_test_example', 'acct_other')]:
             with self.subTest(key=key), patch.object(gate, 'gcloud', return_value=metadata), \
@@ -266,8 +274,8 @@ class TargetTests(unittest.TestCase):
                 gate.service_state()
 
     def test_production_database_url_and_transaction_pooler_are_rejected(self):
-        for url in ['postgresql://postgres:example@db.xompkvadqplatcchfqjq.supabase.co/postgres',
-                    'postgresql://postgres.rifhalqzxgskwajjgipj:example@aws-0-us-east-1.pooler.supabase.com:6543/postgres']:
+        for url in ['postgresql://postgres:example@db.productionexampleone.supabase.co/postgres',
+                    'postgresql://postgres.stagingprojectexample:example@aws-0-us-east-1.pooler.supabase.com:6543/postgres']:
             with self.assertRaises(gate.migration.MigrationError):
                 gate.migration.verify_connection_identity(url, 'staging')
 
