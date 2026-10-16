@@ -337,7 +337,10 @@ func (s *desktopService) screenshotResponse(ctx context.Context, format pb.Frame
 type frameWatch struct {
 	baseline uint64
 	deadline time.Time
-	changed  bool
+	// quiet is how long the display must stay unrepainted after a changed
+	// frame before it is returned; 0 returns the first changed frame.
+	quiet   time.Duration
+	changed bool
 }
 
 // armFrameWatch snapshots the display for a later change comparison. nil
@@ -381,7 +384,7 @@ func (s *desktopService) captureScreenshot(ctx context.Context, format pb.FrameF
 		var frame *image.RGBA
 		var err error
 		if watch != nil {
-			frame, watch.changed, err = b.captureChanged(ctx, watch.baseline, watch.deadline)
+			frame, watch.changed, err = b.captureChanged(ctx, watch.baseline, watch.deadline, watch.quiet)
 		} else {
 			frame, err = b.Capture()
 		}
@@ -730,6 +733,24 @@ func (s *desktopService) Scroll(ctx context.Context, req *connect.Request[pb.Scr
 // worst-case input-lock hold time.
 const maxBatchActions = 64
 
+// pointerKeySettle separates a pointer action from a key action that follows
+// it in a batch. The server has delivered the click when the pointer action
+// returns, but the client still has to move its focus, and keys that arrive
+// first land in the old field. Keys sent straight after the click were
+// misrouted in a browser; keys a request round trip later never were.
+const pointerKeySettle = 80 * time.Millisecond
+
+// settleAfterPointer is the wait itself; tests replace it to see where it
+// is applied without timing requests.
+var settleAfterPointer = func(ctx context.Context) error {
+	select {
+	case <-time.After(pointerKeySettle):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // loweredAction is one fully validated batch step, ready to execute under
 // the input lock via whichever backend is available.
 type loweredAction func(ctx context.Context) error
@@ -745,6 +766,7 @@ func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, er
 		return nil, fmt.Errorf("too many actions: %d, max %d", len(actions), maxBatchActions)
 	}
 	lowered := make([]loweredAction, len(actions))
+	afterPointer := false
 	for i, action := range actions {
 		switch a := action.GetAction().(type) {
 		case *pb.Action_Pointer:
@@ -754,13 +776,29 @@ func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, er
 			}
 			ev := a.Pointer
 			lowered[i] = func(ctx context.Context) error { return s.execPointer(ctx, ev, args) }
+			switch ev.GetAction() {
+			case pb.PointerAction_POINTER_ACTION_UNSPECIFIED, pb.PointerAction_POINTER_ACTION_MOVE:
+				// A move (the default action) leaves focus where it is.
+			default:
+				afterPointer = true
+			}
 		case *pb.Action_Key:
 			args, err := keyArgs(a.Key)
 			if err != nil {
 				return nil, fmt.Errorf("action %d: %w", i, err)
 			}
 			ev := a.Key
-			lowered[i] = func(ctx context.Context) error { return s.execKey(ctx, ev, args) }
+			if afterPointer {
+				lowered[i] = func(ctx context.Context) error {
+					if err := settleAfterPointer(ctx); err != nil {
+						return err
+					}
+					return s.execKey(ctx, ev, args)
+				}
+			} else {
+				lowered[i] = func(ctx context.Context) error { return s.execKey(ctx, ev, args) }
+			}
+			afterPointer = false
 		case *pb.Action_Scroll:
 			cmds, err := scrollCommands(a.Scroll.GetDx(), a.Scroll.GetDy())
 			if err != nil {
@@ -768,6 +806,7 @@ func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, er
 			}
 			ev := a.Scroll
 			lowered[i] = func(ctx context.Context) error { return s.execScroll(ctx, ev, cmds) }
+			// A scroll leaves focus where it is, like a move.
 		default:
 			return nil, fmt.Errorf("action %d: one of pointer, key, or scroll is required", i)
 		}
@@ -815,6 +854,14 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 	if req.Msg.GetWaitForChange() && settle == 0 {
 		settle = defaultChangeWait
 	}
+	quiet := time.Duration(req.Msg.GetQuietMs()) * time.Millisecond
+	if quiet > 0 && !req.Msg.GetWaitForChange() {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("quiet_ms requires wait_for_change"))
+	}
+	if quiet > settle {
+		return nil, connect.NewError(connect.CodeInvalidArgument,
+			fmt.Errorf("quiet_ms %d exceeds settle_ms %d", req.Msg.GetQuietMs(), settle/time.Millisecond))
+	}
 	lowered, err := s.lowerActions(req.Msg.GetActions())
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
@@ -828,7 +875,9 @@ func (s *desktopService) Step(ctx context.Context, req *connect.Request[pb.StepR
 	resp := &pb.StepResponse{Executed: uint32(len(lowered)), QueueMs: millisSince(&phase)}
 	var watch *frameWatch
 	if req.Msg.GetWaitForChange() {
-		watch = s.armFrameWatch(ctx)
+		if watch = s.armFrameWatch(ctx); watch != nil {
+			watch.quiet = quiet
+		}
 	}
 	// Arming reads and hashes a frame; it is capture work done early.
 	armMs := millisSince(&phase)

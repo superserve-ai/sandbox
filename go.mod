@@ -25,6 +25,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/jackc/puddle/v2 v2.2.2
+	github.com/jezek/xgb v1.3.1
 	github.com/posthog/posthog-go v1.14.0
 	github.com/rs/zerolog v1.34.0
 	github.com/vishvananda/netlink v1.3.1
@@ -106,7 +107,6 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jezek/xgb v1.3.1 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect

@@ -1368,14 +1368,56 @@ func TestStep_WaitForChangeWithoutX11KeepsTheSettle(t *testing.T) {
 	}
 }
 
+// Keys that follow a click in one batch wait for the client to move its
+// focus; keys that do not follow a click, and clicks themselves, do not.
+func TestSendActions_KeysAfterAClickSettle(t *testing.T) {
+	stepFakeBins(t, "")
+	client := newDesktopTestServer(t)
+	settles := 0
+	orig := settleAfterPointer
+	settleAfterPointer = func(context.Context) error { settles++; return nil }
+	t.Cleanup(func() { settleAfterPointer = orig })
+	run := func(actions []*pb.Action) int {
+		t.Helper()
+		settles = 0
+		if _, err := client.SendActions(context.Background(), connect.NewRequest(&pb.ActionBatch{Actions: actions})); err != nil {
+			t.Fatalf("SendActions: %v", err)
+		}
+		return settles
+	}
+	click := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 10, Y: 20, Action: pb.PointerAction_POINTER_ACTION_CLICK}}}
+	move := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 11, Y: 21, Action: pb.PointerAction_POINTER_ACTION_MOVE}}}
+	defaultMove := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 12, Y: 22}}}
+	key := &pb.Action{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "hi"}}}}
+	scroll := &pb.Action{Action: &pb.Action_Scroll{Scroll: &pb.ScrollEvent{Dy: 3}}}
+	for _, tc := range []struct {
+		name    string
+		actions []*pb.Action
+		want    int
+	}{
+		{"click then key", []*pb.Action{click, key}, 1},
+		{"settle kept across a move", []*pb.Action{click, move, key}, 1},
+		{"settle kept across a scroll", []*pb.Action{click, scroll, key}, 1},
+		{"one settle per click, not per key", []*pb.Action{click, key, key, click, key}, 2},
+		{"keys before clicks", []*pb.Action{key, click, click}, 0},
+		{"moves leave focus where it is", []*pb.Action{defaultMove, key, move, key}, 0},
+	} {
+		if got := run(tc.actions); got != tc.want {
+			t.Errorf("%s: %d settles, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestStep_ValidationErrorNeverShellsOut(t *testing.T) {
 	// No fake tools on PATH: rejected requests must fail before any action.
 	client := newDesktopTestServer(t)
 	for name, req := range map[string]*pb.StepRequest{
-		"bad action":   {Actions: []*pb.Action{{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: -5, Y: 1}}}}},
-		"empty batch":  {},
-		"settle limit": {Actions: stepBatch(), SettleMs: uint32(maxStepSettle/time.Millisecond) + 1},
-		"bad format":   {Actions: stepBatch(), Format: pb.FrameFormat(99)},
+		"bad action":           {Actions: []*pb.Action{{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: -5, Y: 1}}}}},
+		"empty batch":          {},
+		"settle limit":         {Actions: stepBatch(), SettleMs: uint32(maxStepSettle/time.Millisecond) + 1},
+		"bad format":           {Actions: stepBatch(), Format: pb.FrameFormat(99)},
+		"quiet without change": {Actions: stepBatch(), QuietMs: 50},
+		"quiet over settle":    {Actions: stepBatch(), WaitForChange: true, SettleMs: 100, QuietMs: 200},
 	} {
 		_, err := client.Step(context.Background(), connect.NewRequest(req))
 		var ce *connect.Error

@@ -2522,6 +2522,13 @@ type StepRequest struct {
 	// changed frame proves the display repainted, not that the application
 	// finished; callers still need their own completion checks.
 	WaitForChange bool `protobuf:"varint,4,opt,name=wait_for_change,json=waitForChange,proto3" json:"wait_for_change,omitempty"`
+	// With wait_for_change: once a changed frame is seen, keep waiting while
+	// repaints keep arriving and return the frame after no repaint has been
+	// reported for quiet_ms, so a batch whose effects land in several paints
+	// (a focus ring, then the typed text) is captured once it has settled.
+	// Bounded by settle_ms; a display that never goes quiet returns at
+	// settle_ms. 0 returns the first changed frame. Requires wait_for_change.
+	QuietMs       uint32 `protobuf:"varint,5,opt,name=quiet_ms,json=quietMs,proto3" json:"quiet_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2582,6 +2589,13 @@ func (x *StepRequest) GetWaitForChange() bool {
 		return x.WaitForChange
 	}
 	return false
+}
+
+func (x *StepRequest) GetQuietMs() uint32 {
+	if x != nil {
+		return x.QuietMs
+	}
+	return 0
 }
 
 // StepResponse keeps a failed action and a failed capture apart from each
@@ -2931,12 +2945,13 @@ const file_proto_boxd_proto_rawDesc = "" +
 	"\vActionBatch\x124\n" +
 	"\aactions\x18\x01 \x03(\v2\x1a.superserve.boxd.v1.ActionR\aactions\"1\n" +
 	"\x13ActionBatchResponse\x12\x1a\n" +
-	"\bexecuted\x18\x01 \x01(\rR\bexecuted\"\xc1\x01\n" +
+	"\bexecuted\x18\x01 \x01(\rR\bexecuted\"\xdc\x01\n" +
 	"\vStepRequest\x124\n" +
 	"\aactions\x18\x01 \x03(\v2\x1a.superserve.boxd.v1.ActionR\aactions\x127\n" +
 	"\x06format\x18\x02 \x01(\x0e2\x1f.superserve.boxd.v1.FrameFormatR\x06format\x12\x1b\n" +
 	"\tsettle_ms\x18\x03 \x01(\rR\bsettleMs\x12&\n" +
-	"\x0fwait_for_change\x18\x04 \x01(\bR\rwaitForChange\"\xca\x02\n" +
+	"\x0fwait_for_change\x18\x04 \x01(\bR\rwaitForChange\x12\x19\n" +
+	"\bquiet_ms\x18\x05 \x01(\rR\aquietMs\"\xca\x02\n" +
 	"\fStepResponse\x12\x1a\n" +
 	"\bexecuted\x18\x01 \x01(\rR\bexecuted\x12!\n" +
 	"\faction_error\x18\x02 \x01(\tR\vactionError\x12F\n" +

@@ -244,6 +244,59 @@ func TestDesktopStepWaitForChange_RealXServer(t *testing.T) {
 	}
 }
 
+// With a quiet window, a Step follows the repaints a batch causes and returns
+// once the display has been still for that long, instead of on the first
+// changed frame.
+func TestDesktopStepQuiet_RealXServer(t *testing.T) {
+	for _, bin := range []string{"Xvnc", "xdotool", "xterm"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed", bin)
+		}
+	}
+	display := startXvnc(t, 640, 480)
+	t.Setenv("DISPLAY", display)
+	term := exec.Command("xterm", "-geometry", "80x24+0+0", "-e", "sh", "-c", "cat > /dev/null")
+	term.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := term.Start(); err != nil {
+		t.Fatalf("start xterm: %v", err)
+	}
+	t.Cleanup(func() { _ = term.Process.Kill(); _ = term.Wait() })
+	wait := exec.Command("xdotool", "search", "--sync", "--class", "xterm")
+	wait.Env = append(os.Environ(), "DISPLAY="+display)
+	if err := wait.Run(); err != nil {
+		t.Fatalf("xterm window did not appear: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	s := newDesktopService(&sandboxContext{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := s.SendPointer(ctx, connect.NewRequest(&pb.PointerEvent{X: 100, Y: 100, Action: pb.PointerAction_POINTER_ACTION_CLICK})); err != nil {
+		t.Fatalf("SendPointer: %v", err)
+	}
+	const quiet = 150 * time.Millisecond
+	start := time.Now()
+	resp, err := s.Step(ctx, connect.NewRequest(&pb.StepRequest{
+		Actions:       []*pb.Action{{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "quiet"}}}}},
+		SettleMs:      1500,
+		WaitForChange: true,
+		QuietMs:       uint32(quiet / time.Millisecond),
+	}))
+	if err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	elapsed := time.Since(start)
+	if !resp.Msg.GetChanged() || resp.Msg.GetCaptureError() != "" {
+		t.Fatalf("changed=%v capture_error=%q, want a changed frame", resp.Msg.GetChanged(), resp.Msg.GetCaptureError())
+	}
+	// The terminal paints each character; the frame comes back only after
+	// the last paint has had the quiet window to itself.
+	if elapsed < quiet || elapsed > 1200*time.Millisecond {
+		t.Errorf("returned after %v, want between the %v quiet window and well under the 1500ms bound", elapsed, quiet)
+	}
+	t.Logf("quiet frame after %v", elapsed)
+}
+
 // A repaint that lands after a snapshot's read but before its event drain
 // is the one DAMAGE will not report again (the region is already non-empty),
 // so a same-pixel repaint followed by a real one must not wait out the

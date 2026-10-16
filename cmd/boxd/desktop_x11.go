@@ -436,9 +436,11 @@ func (b *x11Backend) armChangeWatch() (uint64, error) {
 }
 
 // captureChanged waits until a repaint leaves the frame different from
-// baseline, or until deadline, and returns the frame as it is then.
-func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadline time.Time) (*image.RGBA, bool, error) {
-	frame, _, changed, err := b.captureChangedRaw(ctx, baseline, deadline)
+// baseline, or until deadline, and returns the frame as it is then. With
+// quiet, a changed frame is followed until no repaint has been reported for
+// that long, still bounded by deadline.
+func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadline time.Time, quiet time.Duration) (*image.RGBA, bool, error) {
+	frame, _, changed, err := b.captureChangedRaw(ctx, baseline, deadline, quiet)
 	if err != nil {
 		return nil, false, err
 	}
@@ -448,12 +450,12 @@ func (b *x11Backend) captureChanged(ctx context.Context, baseline uint64, deadli
 
 // captureChangedRaw is captureChanged before the cursor is drawn in, with
 // the frame's hash, for callers that go on comparing frames.
-func (b *x11Backend) captureChangedRaw(ctx context.Context, baseline uint64, deadline time.Time) (*image.RGBA, uint64, bool, error) {
-	return b.captureChangedWith(ctx, b.rawFrame, baseline, deadline)
+func (b *x11Backend) captureChangedRaw(ctx context.Context, baseline uint64, deadline time.Time, quiet time.Duration) (*image.RGBA, uint64, bool, error) {
+	return b.captureChangedWith(ctx, b.rawFrame, baseline, deadline, quiet)
 }
 
 // captureChangedWith is captureChangedRaw over any read of the root.
-func (b *x11Backend) captureChangedWith(ctx context.Context, read func() (*image.RGBA, uint16, error), baseline uint64, deadline time.Time) (*image.RGBA, uint64, bool, error) {
+func (b *x11Backend) captureChangedWith(ctx context.Context, read func() (*image.RGBA, uint16, error), baseline uint64, deadline time.Time, quiet time.Duration) (*image.RGBA, uint64, bool, error) {
 	for {
 		if _, err := b.awaitDamage(ctx, deadline); err != nil {
 			return nil, 0, false, err
@@ -462,14 +464,51 @@ func (b *x11Backend) captureChangedWith(ctx context.Context, read func() (*image
 		if err != nil {
 			return nil, 0, false, err
 		}
-		if hash != baseline || !time.Now().Before(deadline) {
-			return frame, hash, hash != baseline, nil
+		if hash != baseline {
+			if quiet > 0 {
+				return b.awaitQuiet(ctx, read, frame, hash, raced, baseline, deadline, quiet)
+			}
+			return frame, hash, true, nil
+		}
+		if !time.Now().Before(deadline) {
+			return frame, hash, false, nil
 		}
 		// Same pixels: an application repainted without visible change. A
 		// report that arrived after this read, or a raced one, means the
 		// region is non-empty again and nothing further will be reported,
 		// so it must stay pending.
 		b.damaged = b.damaged || raced
+	}
+}
+
+// awaitQuiet follows a changed frame through the repaints after it and
+// returns the frame once none has been reported for quiet, or the latest
+// one at deadline. A batch often lands in several paints (a focus ring,
+// then the typed text); the first of them is not the state the batch
+// produced. changed is judged on the frame returned: a change the later
+// paints undid is not one.
+func (b *x11Backend) awaitQuiet(ctx context.Context, read func() (*image.RGBA, uint16, error), frame *image.RGBA, hash uint64, raced bool, baseline uint64, deadline time.Time, quiet time.Duration) (*image.RGBA, uint64, bool, error) {
+	for {
+		b.damaged = b.damaged || raced
+		until := time.Now().Add(quiet)
+		if until.After(deadline) {
+			until = deadline
+		}
+		damaged, err := b.awaitDamage(ctx, until)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if !damaged {
+			return frame, hash, hash != baseline, nil
+		}
+		// A report pending at the deadline is still read, so the frame is
+		// the latest one and not the one before the last repaint.
+		if frame, hash, raced, err = b.snapshotWith(read); err != nil {
+			return nil, 0, false, err
+		}
+		if !time.Now().Before(deadline) {
+			return frame, hash, hash != baseline, nil
+		}
 	}
 }
 
@@ -561,7 +600,7 @@ func (b *x11Backend) awaitPainted(ctx context.Context, marked bool, deadline tim
 	if painted(frame) {
 		return true, nil
 	}
-	frame, _, changed, err := b.captureChangedWith(ctx, b.rawSample, maphash.Bytes(frameHashSeed, frame.Pix), deadline)
+	frame, _, changed, err := b.captureChangedWith(ctx, b.rawSample, maphash.Bytes(frameHashSeed, frame.Pix), deadline, 0)
 	if err != nil {
 		return false, err
 	}

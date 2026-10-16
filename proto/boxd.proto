@@ -350,6 +350,13 @@ message StepRequest {
   // changed frame proves the display repainted, not that the application
   // finished; callers still need their own completion checks.
   bool wait_for_change = 4;
+  // With wait_for_change: once a changed frame is seen, keep waiting while
+  // repaints keep arriving and return the frame after no repaint has been
+  // reported for quiet_ms, so a batch whose effects land in several paints
+  // (a focus ring, then the typed text) is captured once it has settled.
+  // Bounded by settle_ms; a display that never goes quiet returns at
+  // settle_ms. 0 returns the first changed frame. Requires wait_for_change.
+  uint32 quiet_ms = 5;
 }
 
 // StepResponse keeps a failed action and a failed capture apart from each
