@@ -9,6 +9,9 @@ starts a subscription, or issues credits.
 1. Apply `supabase/shared-auth-migrations/20261016174553_yc_claim_authority.sql`
    to shared Auth with its existing `promotion_evidence_proxy` role. Do not apply
    it to regional databases. The role receives only the claim RPC, never tables.
+   Use the separately approved shared-Auth executor and its history contract.
+   The regional runner does not apply new shared migrations; manually adding
+   their versions to its Supabase ledger can block later regional deployments.
 2. Apply `supabase/migrations/20261016174554_yc_claim_team_intent.sql` to each
    regional database before deploying claim-binding handlers. It fences plan
    selection and legacy checkout while a claim is being attached.
@@ -22,7 +25,7 @@ starts a subscription, or issues credits.
    separate random values of at least 32 bytes for `YC_CLAIM_CAPTURE_TOKEN` and
    `YC_CLAIM_CONSOLE_TOKEN`; neither may reuse internal/operator credentials.
    Populate the dedicated `YC_EMAIL_API_KEY` with a Resend sending credential.
-   Terraform defines secret containers/access, never secret values.
+   Terraform creates the dedicated empty containers independently of enablement. Populate their values before enabling claims; the enable flag controls runtime bindings and access, and disabling it preserves the containers. Terraform never manages secret values.
 5. Configure the website with `YC_CLAIM_API_URL` (HTTPS control-plane origin) and
    the capture credential. Configure Console with the console credential in every
    serving environment. Both are server-only. Enable the website only after mail

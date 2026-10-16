@@ -24,7 +24,7 @@ variable "yc_existing_exception_team_id" {
   description = "Exact approved team for the existing-account exception."
 }
 resource "google_secret_manager_secret" "yc_claim" {
-  for_each  = var.yc_claims_enabled ? toset(["capture-token", "console-token", "email-api-key"]) : toset([])
+  for_each  = toset(["capture-token", "console-token", "email-api-key"])
   project   = local.project_id
   secret_id = "yc-claim-${each.key}-${local.resource_suffix}"
   replication {
@@ -33,7 +33,7 @@ resource "google_secret_manager_secret" "yc_claim" {
   labels = local.common_labels
   lifecycle {
     precondition {
-      condition     = var.promotion_evidence_enabled && startswith(var.yc_claim_console_url, "https://") && var.yc_claim_email_from != ""
+      condition     = !var.yc_claims_enabled || (var.promotion_evidence_enabled && startswith(var.yc_claim_console_url, "https://") && var.yc_claim_email_from != "")
       error_message = "YC claims require shared Auth authority, HTTPS Console origin and a verified sender."
     }
   }
