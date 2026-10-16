@@ -9,13 +9,13 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -89,34 +89,6 @@ func (h *Handlers) EnrollInvoiceReconciliation(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "enrolled", "collection": "held"})
 }
 
-// Scheduled reconciliation is independent of webhook delivery and of the
-// hourly export lease. It never runs on sandbox lifecycle request paths.
-func (h *Handlers) StartInvoiceReconciliationService(ctx context.Context) {
-	if h.Pool == nil {
-		return
-	}
-	if _, ok := h.Stripe.(*stripeHTTPClient); !ok {
-		return
-	}
-	go func() {
-		ticker := time.NewTicker(time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			workCtx, cancel := context.WithTimeout(ctx, 50*time.Second)
-			_, err := h.invoiceReconciliationTick(workCtx)
-			if err != nil {
-				log.Warn().Err(err).Msg("invoice cent reconciliation held")
-			}
-			cancel()
-		}
-	}()
-}
-
 func (h *Handlers) invoiceReconciliationTick(ctx context.Context) (bool, error) {
 	var p billing.ExportPeriod
 	err := h.Pool.QueryRow(ctx, `SELECT p.team_id,p.period_start,p.period_end FROM team_billing_period p JOIN billing_invoice_account a USING(team_id) LEFT JOIN billing_invoice_close j USING(team_id,period_start,period_end)
@@ -137,7 +109,24 @@ func (h *Handlers) invoiceReconciliationTick(ctx context.Context) (bool, error) 
 
 func invoicePlanKey(invoiceID string) string { return "invoice-cent:" + invoiceID }
 
+func (h *Handlers) requireEarlierInvoicePeriodsReleased(ctx context.Context, p billing.ExportPeriod, enrolledAt time.Time) error {
+	var older bool
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p LEFT JOIN billing_invoice_close j USING(team_id,period_start,period_end) WHERE p.team_id=$1 AND p.period_end>$2 AND p.period_end<=$3 AND COALESCE(j.state,'')<>'released')`, p.TeamID, enrolledAt, p.Start).Scan(&older); err != nil {
+		return err
+	}
+	if older {
+		return fmt.Errorf("earlier invoice period remains held")
+	}
+	return nil
+}
+
 func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportPeriod) (resultErr error) {
+	if os.Getenv("BILLING_AUTOMATIC_CLOSE_DISABLED") == "true" {
+		return fmt.Errorf("automatic invoice closing is disabled")
+	}
+	ctx, cancel := context.WithTimeout(ctx, closeWorkTimeout)
+	defer cancel()
+
 	defer func() {
 		ack, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
@@ -162,36 +151,38 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 	if !ok {
 		return fmt.Errorf("invoice provider unavailable")
 	}
-	conn, err := h.Pool.Acquire(ctx)
+	// Transaction ownership pins the backend through transaction poolers and
+	// shares enrollment's lock key. A separate connection runs existing writes.
+	lockTx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = lockTx.Rollback(cleanup)
+	}()
 	var locked bool
-	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, "invoice:"+p.TeamID.String()).Scan(&locked); err != nil {
+	if err = lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+p.TeamID.String()).Scan(&locked); err != nil {
 		return err
 	}
 	if !locked {
 		return fmt.Errorf("invoice reconciliation already running")
 	}
-	defer func() {
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_, e := conn.Exec(cleanup, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, "invoice:"+p.TeamID.String())
-		if e != nil {
-			conn.Conn().Close(cleanup)
-		}
-	}()
+	// Enrollment could have changed while this attempt was acquiring ownership.
+	a, enrolled, err = h.invoiceAccountForPeriod(ctx, p)
+	if err != nil {
+		return err
+	}
+	if !enrolled || !a.EnrolledAt.Before(p.End) {
+		return nil
+	}
 	if a, err = client.ensureInvoiceSubscription(ctx, a, false, true); err != nil {
 		return err
 	}
 	// Older held periods have first claim on credits and must finish first.
-	var older bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account a USING(team_id) LEFT JOIN billing_invoice_close j USING(team_id,period_start,period_end) WHERE p.team_id=$1 AND p.period_end>$2 AND p.period_end<=$3 AND COALESCE(j.state,'')<>'released')`, p.TeamID, a.EnrolledAt, p.Start).Scan(&older); err != nil {
+	if err = h.requireEarlierInvoicePeriodsReleased(ctx, p, a.EnrolledAt); err != nil {
 		return err
-	}
-	if older {
-		return fmt.Errorf("earlier invoice period remains held")
 	}
 	var invoiceID, state string
 	var raw []byte
@@ -202,6 +193,9 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		invoicePeriod, e := h.ensureInvoiceCalendar(ctx, p, a, client)
 		if e != nil {
 			return e
+		}
+		if invoicePeriod.End.After(h.nowUTC()) {
+			return fmt.Errorf("waiting for the mapped provider cycle to end")
 		}
 		inv, e := h.billingCycleInvoice(ctx, a, invoicePeriod.Start.Unix(), invoicePeriod.End.Unix(), client)
 		if e != nil {
@@ -230,6 +224,9 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		return err
 	}
 	invoicePeriod := invoicePlanPeriod(p, plan)
+	if invoicePeriod.End.After(h.nowUTC()) {
+		return fmt.Errorf("waiting for the mapped provider cycle to end")
+	}
 	if plan.Customer != a.Customer || plan.Subscription != a.Subscription {
 		return fmt.Errorf("saved invoice scope differs")
 	}

@@ -167,7 +167,16 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 	}
 	// Fail before changing collection for unsupported credit configurations.
 	if !enrolled || replacement {
-		if _, err = client.invoiceCreditLedger(ctx, a.Customer, time.Now().Unix()); err != nil {
+		var ycContract, ycGrant string
+		ycErr := tx.QueryRow(ctx, `SELECT contract_id::text,COALESCE(request->>'existing_grant_id','') FROM billing_yc_operation WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3`, team, a.Customer, a.Subscription).Scan(&ycContract, &ycGrant)
+		if ycErr == nil {
+			err = client.ycGrantPreflight(ctx, a.Customer, ycContract, ycGrant)
+		} else if errors.Is(ycErr, pgx.ErrNoRows) {
+			_, err = client.invoiceCreditLedger(ctx, a.Customer, time.Now().Unix())
+		} else {
+			err = ycErr
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -308,7 +317,7 @@ func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, te
 	}
 	if a.Base.Price != "" {
 		var payload []byte
-		if err := reader.QueryRow(ctx, `SELECT request_payload FROM billing_signup_choice WHERE team_id=$1 AND subscription_id=$2`, team, a.Subscription).Scan(&payload); err != nil {
+		if err := reader.QueryRow(ctx, `SELECT request_payload FROM billing_signup_choice WHERE team_id=$1 AND subscription_id=$2 UNION ALL SELECT resource_terms || jsonb_build_object('CustomerID',customer_id) FROM billing_yc_operation WHERE team_id=$1 AND subscription_id=$2`, team, a.Subscription).Scan(&payload); err != nil {
 			return err
 		}
 		var params StripeCreateCheckoutSessionParams

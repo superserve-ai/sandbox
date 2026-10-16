@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
@@ -26,11 +27,30 @@ var ErrVMDPreviewProtocolUnsupported = errors.New("proxy: vmd does not attest pr
 
 // InstanceInfo holds the routing information for a sandbox instance.
 type InstanceInfo struct {
-	VMIP                     string
-	Status                   string
-	StartedAt                int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
-	TeamID                   string // owning team, for usage attribution
-	OwnerID                  string // creating user, for usage attribution; empty when unknown
+	VMIP      string
+	Status    string
+	StartedAt int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
+	TeamID    string // owning team, for usage attribution
+	OwnerID   string // creating user, for usage attribution; empty when unknown
+	// MachineOwned is set by a resolver that has loaded the durable owner
+	// record. Legacy sandbox-only tokens are rejected for such instances.
+	MachineOwned bool
+	// OwnershipState is an attested classification. Empty/unknown never
+	// becomes ordinary by inference; legacy callers must receive an explicit
+	// ordinary attestation from a capable producer.
+	OwnershipState auth.OwnershipState
+	// Only old HTTP responses omit the field. Preserve that distinction so a
+	// creator-backed legacy record can obtain durable proof without weakening
+	// an explicit unknown or malformed attestation.
+	legacyOwnershipState bool
+	// MachineOwnerPrincipalID is the durable owner attestation returned by
+	// the control plane/VMD for machine-owned sandboxes. It is required for
+	// machine capability authorization; an absent value fails closed.
+	MachineOwnerPrincipalID string
+	// MachineCaller carries the capability verifier's canonical identity to
+	// downstream attribution/transport code. It is absent for human/legacy
+	// requests and is never populated from headers or resource ownership.
+	MachineCaller            *auth.CallerContext
 	PreviewAccess            string
 	PreviewPorts             map[int]struct{}
 	PreviewPortAccess        map[int]string
@@ -103,24 +123,32 @@ type VMDResolver struct {
 	group singleflight.Group
 }
 
-// Ready verifies that the configured VMD endpoint is reachable. A 404 is
-// expected for the synthetic instance, but still proves the resolver path.
+// Ready verifies that the configured VMD endpoint is reachable.
 func (r *VMDResolver) Ready(ctx context.Context) error {
+	_, err := r.ReadyWithMachineIdentity(ctx)
+	return err
+}
+
+// ReadyWithMachineIdentity uses the same synthetic lookup for reachability and
+// version evidence. An old VMD's 404 remains ordinary-ready but cannot attest
+// that machine ownership metadata will be produced safely.
+func (r *VMDResolver) ReadyWithMachineIdentity(ctx context.Context) (bool, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, r.vmdAddr+"/instances/__healthcheck__", nil)
 	if err != nil {
-		return err
+		return false, err
 	}
+	req.Header.Set(auth.ProxyMachineIdentityHeader, auth.MachineIdentityRevision)
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("resolver probe returned %d", resp.StatusCode)
+		return false, fmt.Errorf("resolver probe returned %d", resp.StatusCode)
 	}
-	return nil
+	return resp.Header.Get(auth.VMDMachineIdentityHeader) == auth.MachineIdentityRevision, nil
 }
 
 // WithPreviewTokens declares that the owning proxy handler has a valid seed
@@ -190,11 +218,16 @@ func (r *VMDResolver) Invalidate(instanceID string) {
 
 // vmdResponse matches the JSON returned by VMD's local HTTP server.
 type vmdResponse struct {
-	VMIP                     string            `json:"vm_ip"`
-	Status                   string            `json:"status"`
-	StartedAt                int64             `json:"started_at"`
-	TeamID                   string            `json:"team_id"`
-	OwnerID                  string            `json:"owner_id"`
+	VMIP      string `json:"vm_ip"`
+	Status    string `json:"status"`
+	StartedAt int64  `json:"started_at"`
+	TeamID    string `json:"team_id"`
+	OwnerID   string `json:"owner_id"`
+	// MachineOwned is an explicit control-plane/VMD attestation. The proxy
+	// never infers machine ownership from OwnerID or caller-provided metadata.
+	MachineOwned             bool              `json:"machine_owned"`
+	MachineOwnerPrincipalID  string            `json:"machine_owner_principal_id"`
+	OwnershipState           json.RawMessage   `json:"ownership_state"`
 	PreviewAccess            string            `json:"preview_access"`
 	PreviewPorts             map[string]bool   `json:"preview_ports"`
 	PreviewPortAccess        map[string]string `json:"preview_port_access"`
@@ -207,6 +240,7 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 	if err != nil {
 		return InstanceInfo{}, fmt.Errorf("resolver: build request: %w", err)
 	}
+	req.Header.Set(auth.ProxyMachineIdentityHeader, auth.MachineIdentityRevision)
 	req.Header.Set(preview.ProxyProtocolHeader, preview.HostCapabilityPorts)
 	capabilities := preview.HostCapabilityPortAccess
 	if r.previewTokens {
@@ -239,9 +273,26 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 		return InstanceInfo{}, fmt.Errorf("resolver: decode response: %w", err)
 	}
 
+	var ownershipState auth.OwnershipState
+	legacyOwnershipState := len(raw.OwnershipState) == 0
+	if legacyOwnershipState {
+		ownershipState = auth.OwnershipUnknown
+	} else {
+		if err := json.Unmarshal(raw.OwnershipState, &ownershipState); err != nil {
+			return InstanceInfo{}, fmt.Errorf("resolver: invalid ownership attestation: %w", err)
+		}
+		switch ownershipState {
+		case auth.OwnershipUnknown, auth.OwnershipOrdinary, auth.OwnershipMachine:
+		default:
+			return InstanceInfo{}, errors.New("resolver: invalid ownership attestation")
+		}
+	}
 	info := InstanceInfo{
 		VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt,
-		TeamID: raw.TeamID, OwnerID: raw.OwnerID,
+		TeamID: raw.TeamID, OwnerID: raw.OwnerID, MachineOwned: raw.MachineOwned,
+		MachineOwnerPrincipalID:  raw.MachineOwnerPrincipalID,
+		OwnershipState:           ownershipState,
+		legacyOwnershipState:     legacyOwnershipState,
 		PreviewAccess:            raw.PreviewAccess,
 		PreviewPorts:             decodePreviewPorts(raw.PreviewPorts),
 		PreviewPortAccess:        decodePreviewPortAccess(raw.PreviewPorts, raw.PreviewPortAccess),

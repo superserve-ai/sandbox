@@ -129,13 +129,13 @@ func TestOwnershipPoolRespectsRoutingGate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	for _, url := range []string{"", "not a database URL"} {
-		pool, err := newOwnershipPool(ctx, false, url)
+		pool, err := newOwnershipPool(ctx, false, url, 5*time.Second)
 		if err != nil || pool != nil {
 			t.Fatalf("disabled routing initialized database: pool=%v err=%v", pool, err)
 		}
 	}
 	for _, url := range []string{"", "not a database URL", "postgres://localhost/example"} {
-		pool, err := newOwnershipPool(ctx, true, url)
+		pool, err := newOwnershipPool(ctx, true, url, 5*time.Second)
 		if pool != nil {
 			pool.Close()
 		}

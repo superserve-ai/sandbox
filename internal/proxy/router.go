@@ -129,6 +129,23 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "peer forwarding unavailable", http.StatusBadGateway)
 		return
 	}
+	if port == boxdPort {
+		local := h.local.(*Handler) // checked by canRouteBoxdRequest above
+		token := r.Header.Get(accessTokenHeader)
+		if r.URL.Path == terminalPath || r.URL.Path == execConnectPath {
+			token = extractTerminalToken(r)
+		}
+		// Destination cancellation alone cannot release an edge blocked in
+		// a client write. Bind edge authority as well; the bridge closes its
+		// hijacked client and peer transports when this context is canceled.
+		ctx, cleanup, ok := local.machineSessionContext(r.Context(), token)
+		if !ok {
+			(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
+			return
+		}
+		defer cleanup()
+		r = r.WithContext(ctx)
+	}
 	stream, err := h.peers.OpenStream(r.Context(), route.HostID, PeerEndpoint{Address: route.ProxyAddr, Generation: route.Generation})
 	if err != nil && hinted {
 		hinted = false

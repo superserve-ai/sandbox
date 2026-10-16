@@ -6,10 +6,10 @@ starts a subscription, or issues credits.
 
 ## Deployment
 
-1. Apply `supabase/shared-auth-migrations/20261016063228_yc_claim_authority.sql`
+1. Apply `supabase/shared-auth-migrations/20261016174553_yc_claim_authority.sql`
    to shared Auth with its existing `promotion_evidence_proxy` role. Do not apply
    it to regional databases. The role receives only the claim RPC, never tables.
-2. Apply `supabase/migrations/20261016070251_yc_claim_team_intent.sql` to each
+2. Apply `supabase/migrations/20261016174554_yc_claim_team_intent.sql` to each
    regional database before deploying claim-binding handlers. It fences plan
    selection and legacy checkout while a claim is being attached.
 3. Deploy the billing-owned company authority migration/RPCs before enabling team

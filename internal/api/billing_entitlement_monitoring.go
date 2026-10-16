@@ -72,14 +72,14 @@ func (h *Handlers) startEntitlementCoverageMonitoring(ctx context.Context) {
 
 func (h *Handlers) entitlementCoveragePage(ctx context.Context, after uuid.UUID, at time.Time, limit int) ([]entitlementCoverageSample, error) {
 	rows, err := h.Pool.Query(ctx, `WITH page AS MATERIALIZED (
- SELECT * FROM billing_commercial_contract WHERE status='active' AND offer_key IN ('pro_monthly','pro_annual') AND id>$1 ORDER BY id LIMIT $3
+ SELECT * FROM billing_commercial_contract WHERE status='active' AND offer_key IN ('pro_monthly','pro_annual','yc_2026') AND id>$1 ORDER BY id LIMIT $3
 )
 SELECT c.id,
  CASE WHEN c.starts_at<=p.period_start AND (c.ends_at IS NULL OR c.ends_at>=p.period_end)
-  AND pay.paid_at IS NOT NULL
+  AND COALESCE(pay.paid_at,waiver.approved_at) IS NOT NULL
   AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=c.id AND e.period_start=p.period_start AND e.state='issued')
   AND NOT COALESCE(w.observed_at>$2::timestamptz-interval '1 minute' AND w.evidence->>'unpaid_invoice'<>'',false)
- THEN greatest(0,extract(epoch FROM $2::timestamptz-greatest(p.period_start,pay.paid_at)))::double precision ELSE 0 END,
+ THEN greatest(0,extract(epoch FROM $2::timestamptz-greatest(p.period_start,COALESCE(pay.paid_at,waiver.approved_at))))::double precision ELSE 0 END,
  NOT COALESCE(c.collection_has_overdue_balance IS FALSE AND c.collection_valid_until>$2
   AND c.collection_evidence->>'gate'='finalized_invoice_gate_v1'
   AND (c.collection_evidence->>'period_start')::timestamptz=p.period_start
@@ -89,6 +89,7 @@ LEFT JOIN LATERAL (SELECT paid_at FROM billing_contract_payment pay WHERE pay.co
  AND pay.service_period_start<=p.period_start AND pay.service_period_end>=p.period_end
  AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=pay.invoice_id AND v.review_required)
  ORDER BY pay.service_period_start DESC LIMIT 1) pay ON true
+LEFT JOIN billing_yc_operation waiver ON waiver.contract_id=c.id AND waiver.revoked_at IS NULL AND waiver.state='active' AND waiver.payment_method_ready
 LEFT JOIN billing_entitlement_withheld w ON w.contract_id=c.id AND w.period_start=p.period_start
 ORDER BY c.id`, after, at, max(1, min(limit, 1000)))
 	if err != nil {

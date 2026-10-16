@@ -64,7 +64,7 @@ func entitlementGrantForm(raw []byte) (url.Values, error) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return nil, err
 	}
-	if g.Customer == "" || g.Category != "promotional" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != 100000 || g.ExpiresAt <= 0 || len(g.Applicability.Scope.Prices) != 4 || g.Metadata["entitlement_id"] == "" {
+	if g.Customer == "" || g.Category != "promotional" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value <= 0 || g.ExpiresAt <= 0 || len(g.Applicability.Scope.Prices) != 4 || g.Metadata["entitlement_id"] == "" {
 		return nil, errors.New("incomplete saved entitlement request")
 	}
 	v := url.Values{"customer": {g.Customer}, "category": {g.Category}, "amount[type]": {"monetary"}, "amount[monetary][currency]": {"usd"}, "amount[monetary][value]": {strconv.FormatInt(g.Amount.Monetary.Value, 10)}, "expires_at": {strconv.FormatInt(g.ExpiresAt, 10)}}

@@ -280,8 +280,11 @@ type VMRecord struct {
 	// not use it to mutate the VM's existing overlay.
 	DeltaDir string `json:"delta_dir,omitempty"`
 	// Persisted so usage attribution survives a vmd restart.
-	TeamID  string `json:"team_id,omitempty"`
-	OwnerID string `json:"owner_id,omitempty"`
+	TeamID                  string `json:"team_id,omitempty"`
+	OwnerID                 string `json:"owner_id,omitempty"`
+	MachineOwned            bool   `json:"machine_owned,omitempty"`
+	OrdinaryOwned           bool   `json:"ordinary_owned,omitempty"`
+	MachineOwnerPrincipalID string `json:"machine_owner_principal_id,omitempty"`
 	// PausedAt marks when a sandbox last entered the paused state. Zero on
 	// records written before the field existed; callers needing an ordering
 	// key fall back to CreatedAt.
@@ -1107,6 +1110,56 @@ func toRecord(inst *VMInstance) VMRecord {
 	return toRecordLocked(inst)
 }
 
+// setOwnershipFromTrustedMarker decodes ownership supplied by the control plane.
+// Reserved malformed markers stay unknown; they must never become creator IDs.
+func setOwnershipFromTrustedMarker(inst *VMInstance, ownerID string) {
+	inst.OwnerID, inst.MachineOwnerPrincipalID = "", ""
+	inst.MachineOwned, inst.OrdinaryOwned = false, false
+	if principal, reserved := strings.CutPrefix(ownerID, "machine:"); reserved {
+		inst.MachineOwned = true
+		if id, err := uuid.Parse(principal); err == nil && id != uuid.Nil {
+			inst.MachineOwnerPrincipalID = id.String()
+		}
+		return
+	}
+	if strings.HasPrefix(ownerID, "ordinary:") {
+		inst.OrdinaryOwned = ownerID == "ordinary:attested"
+		return
+	}
+	inst.OwnerID = ownerID
+}
+
+// explicitOwnershipRecord snapshots immutable attestation under inst.mu. A
+// same-ID retry cannot replace it with the transient requesting actor.
+func explicitOwnershipRecord(inst *VMInstance) *VMRecord {
+	if !inst.MachineOwned && !inst.OrdinaryOwned && inst.MachineOwnerPrincipalID == "" {
+		return nil
+	}
+	return &VMRecord{MachineOwned: inst.MachineOwned, OrdinaryOwned: inst.OrdinaryOwned,
+		MachineOwnerPrincipalID: inst.MachineOwnerPrincipalID, OwnerID: inst.OwnerID}
+}
+
+// restoreOwnershipFromRecord preserves explicit durable attestations and also
+// decodes the trusted marker in synthesized recordless-revival records.
+func restoreOwnershipFromRecord(inst *VMInstance, rec *VMRecord) {
+	if inst == nil || rec == nil {
+		return
+	}
+	setOwnershipFromTrustedMarker(inst, rec.OwnerID)
+	if rec.MachineOwned || rec.MachineOwnerPrincipalID != "" {
+		inst.OwnerID = ""
+		inst.MachineOwned = true
+		inst.MachineOwnerPrincipalID = rec.MachineOwnerPrincipalID
+		inst.OrdinaryOwned = rec.OrdinaryOwned
+		return
+	}
+	// A malformed reserved marker cannot be repaired by an ordinary flag.
+	if rec.OrdinaryOwned && !strings.HasPrefix(rec.OwnerID, "machine:") &&
+		(!strings.HasPrefix(rec.OwnerID, "ordinary:") || rec.OwnerID == "ordinary:attested") {
+		inst.OrdinaryOwned = true
+	}
+}
+
 // toRecordLocked snapshots an instance while its caller holds inst.mu. It is
 // used when a state write must be serialized with the in-memory mutation.
 func toRecordLocked(inst *VMInstance) VMRecord {
@@ -1153,6 +1206,9 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		DeltaDir:                   inst.Config.DeltaDir,
 		TeamID:                     inst.TeamID,
 		OwnerID:                    inst.OwnerID,
+		MachineOwned:               inst.MachineOwned,
+		OrdinaryOwned:              inst.OrdinaryOwned,
+		MachineOwnerPrincipalID:    inst.MachineOwnerPrincipalID,
 		PausedAt:                   inst.PausedAt,
 		Supervision:                inst.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts),
@@ -1218,7 +1274,7 @@ func previewPortsFromRecord(in map[int32]bool, access map[int32]string, tokenVer
 func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
-	return &VMInstance{
+	inst := &VMInstance{
 		ID:                      rec.ID,
 		PID:                     rec.PID,
 		SocketPath:              rec.SocketPath,
@@ -1263,6 +1319,9 @@ func toInstance(rec VMRecord) *VMInstance {
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,
 		OwnerID:                    rec.OwnerID,
+		MachineOwned:               rec.MachineOwned,
+		OrdinaryOwned:              rec.OrdinaryOwned,
+		MachineOwnerPrincipalID:    rec.MachineOwnerPrincipalID,
 		PausedAt:                   rec.PausedAt,
 		Supervision:                rec.Supervision,
 		PreviewAccess:              restrictivePreviewAccess(rec.PreviewAccess, ports),
@@ -1277,6 +1336,8 @@ func toInstance(rec VMRecord) *VMInstance {
 			DeltaDir:   rec.DeltaDir,
 		},
 	}
+	restoreOwnershipFromRecord(inst, &rec)
+	return inst
 }
 
 // PendingBackup is a durable marker that a pause still owes its backup

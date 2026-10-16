@@ -13,6 +13,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
@@ -105,14 +106,41 @@ type instanceResponse struct {
 	StartedAt                int64             `json:"started_at"` // Unix nanoseconds — proxy lifecycle key
 	TeamID                   string            `json:"team_id,omitempty"`
 	OwnerID                  string            `json:"owner_id,omitempty"`
+	MachineOwned             bool              `json:"machine_owned"`
+	MachineOwnerPrincipalID  string            `json:"machine_owner_principal_id,omitempty"`
+	OwnershipState           string            `json:"ownership_state,omitempty"`
 	PreviewAccess            string            `json:"preview_access,omitempty"`
 	PreviewPorts             map[string]bool   `json:"preview_ports,omitempty"`
 	PreviewPortAccess        map[string]string `json:"preview_port_access,omitempty"`
 	PreviewPortTokenVersions map[string]int64  `json:"preview_port_token_versions,omitempty"`
 }
 
+func ownershipState(machineOwned bool, principalID, ownerID string, ordinaryOwned ...bool) string {
+	ordinary := len(ordinaryOwned) > 0 && ordinaryOwned[0]
+	if machineOwned && ordinary {
+		return "unknown"
+	}
+	if machineOwned {
+		// A machine attestation without its principal is not ordinary
+		// ownership. Treat malformed or incomplete attestation as unknown so
+		// the proxy fails closed instead of falling back to a creator owner.
+		if principalID != "" {
+			return "machine"
+		}
+		return "unknown"
+	}
+	if principalID != "" {
+		return "unknown"
+	}
+	if ordinary || ownerID != "" {
+		return "ordinary"
+	}
+	return "unknown"
+}
+
 // handleInstance handles GET /instances/{instanceID}.
 func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set(auth.VMDMachineIdentityHeader, auth.MachineIdentityRevision)
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -126,6 +154,13 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 
 	info, ok := s.mgr.LookupInstance(instanceID)
 	if !ok {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
+	if (info.MachineOwned || info.MachineOwnerPrincipalID != "") &&
+		r.Header.Get(auth.ProxyMachineIdentityHeader) != auth.MachineIdentityRevision {
+		// An old proxy ignores ownership fields and would accept a legacy
+		// sandbox-only token. Withhold the route even for malformed owners.
 		http.Error(w, "instance not found", http.StatusNotFound)
 		return
 	}
@@ -169,6 +204,9 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		StartedAt:                info.CreatedAt.UnixNano(),
 		TeamID:                   info.TeamID,
 		OwnerID:                  info.OwnerID,
+		MachineOwned:             info.MachineOwned,
+		MachineOwnerPrincipalID:  info.MachineOwnerPrincipalID,
+		OwnershipState:           ownershipState(info.MachineOwned, info.MachineOwnerPrincipalID, info.OwnerID, info.OrdinaryOwned),
 		PreviewAccess:            info.PreviewAccess,
 		PreviewPorts:             previewPortsToJSON(info.PreviewPorts),
 		PreviewPortAccess:        previewPortAccessToJSON(info.PreviewPorts),

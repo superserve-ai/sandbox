@@ -50,7 +50,7 @@ func TestClaimTransactions(t *testing.T) {
 		}
 	}
 	exec(`CREATE SCHEMA auth; CREATE TABLE auth.users(id uuid PRIMARY KEY,email text,email_confirmed_at timestamptz,deleted_at timestamptz,created_at timestamptz NOT NULL DEFAULT now());`)
-	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "shared-auth-migrations", "20261016063228_yc_claim_authority.sql"))
+	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "shared-auth-migrations", "20261016174553_yc_claim_authority.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}

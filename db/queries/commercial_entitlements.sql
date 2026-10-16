@@ -59,11 +59,13 @@ WITH contract AS MATERIALIZED (
     SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id)
         AND b.id = sqlc.arg(contract_id) FOR UPDATE
 )
-INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency)
-SELECT c.team_id, c.id, p.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
+INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, waiver_id, kind, period_start, period_end, amount_cents, currency)
+SELECT c.team_id, c.id, p.id, w.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
 FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
-JOIN billing_contract_payment p ON p.contract_id = c.id
+LEFT JOIN billing_contract_payment p ON p.contract_id = c.id
     AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
+LEFT JOIN billing_contract_waiver w ON w.contract_id=c.id AND p.id IS NULL
+    AND billing_yc_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
 WHERE billing_contract_eligible(c::billing_commercial_contract, period.period_start, period.period_end)
 ON CONFLICT (team_id, kind, period_start) DO NOTHING
 RETURNING *;
@@ -138,17 +140,20 @@ WITH contract AS MATERIALIZED (
         AND b.id = sqlc.arg(contract_id) AND b.status = 'pending' FOR UPDATE
 )
 INSERT INTO billing_usage_entitlement (
-    team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency,
+    team_id, contract_id, payment_id, waiver_id, kind, period_start, period_end, amount_cents, currency,
     state, issuance_source, stripe_credit_grant_id, issuance_evidence, provider_created_at,
     issued_at, adopted_at, adopted_available_balance_cents, provider_invoice_start, provider_invoice_end
 )
-SELECT c.team_id, c.id, p.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency,
+SELECT c.team_id, c.id, p.id, w.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency,
     'issued', 'adopted', sqlc.arg(grant_id), sqlc.arg(evidence), sqlc.arg(provider_created_at)::timestamptz,
     sqlc.arg(provider_created_at)::timestamptz, clock_timestamp(), sqlc.arg(available_balance_cents)::bigint,
     sqlc.arg(invoice_start)::timestamptz, sqlc.arg(invoice_end)::timestamptz
 FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
-JOIN billing_contract_payment p ON p.contract_id = c.id
+LEFT JOIN billing_contract_payment p ON p.contract_id = c.id
     AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
+LEFT JOIN billing_contract_waiver w ON w.contract_id=c.id AND p.id IS NULL
+    AND billing_yc_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
+WHERE p.id IS NOT NULL OR w.id IS NOT NULL
 ON CONFLICT (team_id, kind, period_start) DO NOTHING
 RETURNING *;
 

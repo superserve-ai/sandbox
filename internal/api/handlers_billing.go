@@ -548,13 +548,27 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			!hasEstablishedSubscription && charges.CreditsRemainingUSD <= 0
 	}
 
+	yc, ycReady, ycState, ycErr := h.ycPaymentGate(c.Request.Context(), teamID)
+	if ycErr != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if yc {
+		checkoutAvailable = false
+		paymentSetupRequired = !ycReady
+		if !ycReady {
+			plan = billingSummaryPlan{Key: "yc_2026", Name: "YC Pro Annual", Status: "payment_method_required"}
+		} else if ycState != "active" && ycState != "renewed" {
+			plan.Status = ycState
+		}
+	}
 	setPrivateBillingCacheHeaders(c)
 	c.JSON(http.StatusOK, billingSummaryResponse{
 		Mode:                     mode,
 		BillingMode:              mode,
 		Permissions:              billingSummaryPermissions{CanView: true, CanManage: canManageBilling},
 		CheckoutAvailable:        checkoutAvailable,
-		PortalAvailable:          canManageBilling && mode == billingModeLive && h.Stripe != nil && hasEstablishedSubscription,
+		PortalAvailable:          canManageBilling && mode == billingModeLive && h.Stripe != nil && (hasEstablishedSubscription || (yc && account.StripeCustomerID != nil)),
 		PaymentSetupRequired:     paymentSetupRequired,
 		CurrentChargesUSD:        charges.CurrentChargesUSD,
 		CreditsAppliedUSD:        creditsApplied,
@@ -591,7 +605,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	})
 }
 
-var commercialPlanNames = map[string]string{"pro_monthly": "Pro Monthly", "pro_annual": "Pro Annual"}
+var commercialPlanNames = map[string]string{"pro_monthly": "Pro Monthly", "pro_annual": "Pro Annual", "yc_2026": "YC Pro Annual"}
 
 func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryPlan {
 	name, ok := commercialPlanNames[row.OfferKey]
@@ -599,6 +613,9 @@ func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryP
 		name = row.OfferKey
 	}
 	price := float64(row.ChargeAmountCents) / 100
+	if row.OfferKey == "yc_2026" {
+		price = 0
+	}
 	interval := row.ChargeIntervalMonths
 	starts := row.StartsAt
 	plan := billingSummaryPlan{

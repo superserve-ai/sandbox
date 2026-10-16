@@ -382,6 +382,7 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 // Reconciliation runs off the sandbox request path and recovers missed callbacks.
 func (h *Handlers) StartProPaymentReconciliation(ctx context.Context) {
 	h.startProBillingMonitoring(ctx)
+	h.startYCReconciliation(ctx)
 	if h.Pool == nil || h.Stripe == nil {
 		return
 	}

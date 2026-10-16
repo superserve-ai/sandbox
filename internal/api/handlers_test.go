@@ -38,6 +38,7 @@ import (
 
 type stubVMD struct {
 	restoreLimits vmdclient.ResourceLimits
+	restoreOwner  string
 	// restoreIgnoresRules is a vmd that predates rules on restore.
 	restoreIgnoresRules bool
 	destroyFn           func(ctx context.Context, id string, force bool) error
@@ -143,8 +144,9 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, s.resumeAttest, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, owner, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
 	s.restoreLimits = limits
+	s.restoreOwner = owner
 	protocol := preview.HostCapabilityPorts
 	if s.restorePreviewProtocol != nil {
 		protocol = *s.restorePreviewProtocol
@@ -333,6 +335,9 @@ func (b *mockBatch) Close() error {
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "owner_principal_id,team_id FROM sandbox_machine_owner WHERE") {
+		return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
+	}
 	if strings.Contains(sql, "-- name: SandboxSnapshotCaptureInFlight :one") {
 		return scalarBoolRow(m.captureInFlight)
 	}
@@ -1263,6 +1268,9 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 		*dest[47].(*[]int64) = versions
 		*dest[48].(**string) = nil
 		*dest[49].(*time.Time) = time.Now()
+		*dest[50].(*bool) = false
+		*dest[51].(*pgtype.UUID) = pgtype.UUID{}
+		*dest[52].(*pgtype.UUID) = pgtype.UUID{}
 		return nil
 	}}
 }
@@ -2335,6 +2343,30 @@ func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 	// plumbing breaks.
 	if body["preview_access"] != "legacy_public" {
 		t.Errorf("preview_access = %q, want legacy_public", body["preview_access"])
+	}
+}
+
+func TestActivateSandbox_UnclassifiedOwnershipFailsInsteadOfOmittingToken(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive, HostID: "owner"}
+	mock := &mockDBTX{queryRowFn: func(context.Context, string, ...any) pgx.Row {
+		row := sandboxRow(sb)
+		scan := row.scanFn
+		row.scanFn = func(dest ...any) error {
+			err := scan(dest...)
+			if len(dest) == 44 {
+				// Owner columns without the presence flag cannot be classified.
+				*dest[42].(*pgtype.UUID) = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+			}
+			return err
+		}
+		return row
+	}}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Config: routingHintTestConfig()}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
+	if w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "access_token") {
+		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
 	}
 }
 
