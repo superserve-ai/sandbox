@@ -158,6 +158,46 @@ func mustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 	}
 }
 
+func TestQMManagedTeamMigrationRefused(t *testing.T) {
+	ctx := context.Background()
+	for _, side := range []string{"source", "destination"} {
+		t.Run(side, func(t *testing.T) {
+			managed, other := srcPool, dstPool
+			if side == "destination" {
+				managed, other = dstPool, srcPool
+			}
+			authority, org, team := uuid.New(), uuid.New(), uuid.New()
+			name := "managed-" + team.String()
+			mustExec(t, managed, `INSERT INTO qm_team_service_authority(namespace,authority_id,home_region) VALUES('qm-migration-test',$1,'use')`, authority)
+			mustExec(t, managed, `INSERT INTO qm_organization_teams(namespace,qm_org_id,idempotency_key,authority_id,team_id,home_region)
+				VALUES('qm-migration-test',$1::uuid,'qm-org:v1:'||($1::uuid)::text,$2,$3,'use')`, org, authority, team)
+			mustExec(t, managed, `INSERT INTO team(id,name,home_region) VALUES($1,$2,'use')`, team, name)
+			if side == "destination" {
+				mustExec(t, other, `INSERT INTO team(id,name,home_region) VALUES($1,$2,'use')`, team, "ordinary-"+team.String())
+			}
+			for _, tombstoned := range []bool{false, true} {
+				if tombstoned {
+					mustExec(t, managed, `DELETE FROM team WHERE id=$1`, team)
+				}
+				before := scanString(t, other, `SELECT COALESCE(jsonb_agg(to_jsonb(t))::text,'[]') FROM team t WHERE id=$1`, team)
+				for _, phase := range []string{phasePlan, phaseCopy, phaseValidate, phaseDetach, phasePurge, phaseReleaseRollups} {
+					cfg := config{teamID: team, sourceURL: srcURL, destURL: dstURL, phase: phase, destHostID: destHostID, destRegion: destRegion, confirmTeamName: name}
+					if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), side+": QM organization backing teams cannot be migrated") {
+						t.Fatalf("%s tombstoned=%v: wanted managed-team refusal, got %v", phase, tombstoned, err)
+					}
+				}
+				if after := scanString(t, other, `SELECT COALESCE(jsonb_agg(to_jsonb(t))::text,'[]') FROM team t WHERE id=$1`, team); after != before {
+					t.Fatal("refused migration changed the other cell")
+				}
+				var deleted bool
+				if err := managed.QueryRow(ctx, `SELECT deleted_at IS NOT NULL FROM qm_organization_teams WHERE team_id=$1`, team).Scan(&deleted); err != nil || deleted != tombstoned {
+					t.Fatalf("binding changed: deleted=%v, error=%v", deleted, err)
+				}
+			}
+		})
+	}
+}
+
 func countScoped(t *testing.T, pool *pgxpool.Pool, spec tableSpec, teamID uuid.UUID) int64 {
 	t.Helper()
 	var n int64

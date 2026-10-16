@@ -74,6 +74,9 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("connect to source: %w", err)
 	}
 	defer src.Close()
+	if err := refuseQMManagedTeam(ctx, src, cfg.teamID); err != nil {
+		return fmt.Errorf("source: %w", err)
+	}
 
 	var dst *pgxpool.Pool
 	if cfg.destURL != "" {
@@ -82,7 +85,6 @@ func run(ctx context.Context, cfg config) error {
 			return fmt.Errorf("connect to dest: %w", err)
 		}
 		defer dst.Close()
-
 		// Fail fast if both DSNs land on the same database — string
 		// comparison can't catch pooler-vs-direct spellings of one DB, so
 		// compare live identity instead. With source == dest every later
@@ -105,6 +107,11 @@ func run(ctx context.Context, cfg config) error {
 	if cfg.phase == phaseCopy || cfg.phase == phaseDetach || cfg.phase == phasePurge {
 		if err := checkCanonicalMigrationPrivileges(ctx, dst); err != nil {
 			return err
+		}
+	}
+	if dst != nil {
+		if err := refuseQMManagedTeam(ctx, dst, cfg.teamID); err != nil {
+			return fmt.Errorf("destination: %w", err)
 		}
 	}
 	var teamName string
@@ -131,6 +138,23 @@ func run(ctx context.Context, cfg config) error {
 		return runReleaseRollups(ctx, src, dst, cfg)
 	}
 	return fmt.Errorf("unknown phase %q", cfg.phase)
+}
+
+func refuseQMManagedTeam(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID) error {
+	var installed, bound bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.qm_organization_teams') IS NOT NULL`).Scan(&installed); err != nil {
+		return fmt.Errorf("check organization binding schema: %w", err)
+	}
+	if !installed {
+		return nil
+	}
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.qm_organization_teams WHERE team_id=$1)`, teamID).Scan(&bound); err != nil {
+		return fmt.Errorf("check organization binding: %w", err)
+	}
+	if bound {
+		return errors.New("QM organization backing teams cannot be migrated between cells; their permanent binding and authority must remain together")
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

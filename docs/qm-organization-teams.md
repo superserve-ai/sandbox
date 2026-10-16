@@ -22,6 +22,8 @@ Team and binding creation share one database transaction and an organization
 advisory lock. Team names do not authorize adoption. Deleting the team permanently
 tombstones its binding, including if someone later reinserts the same team UUID.
 Deleting or replacing a QM deployment must never call a team deletion endpoint.
+The cell-migration tool refuses teams with organization bindings, including
+tombstones, because their permanent authority cannot be moved independently.
 
 ## Billing and runtime authority
 
