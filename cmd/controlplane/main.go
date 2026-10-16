@@ -240,6 +240,7 @@ func run() error {
 	if handlers.PromotionAuthPool != nil {
 		defer handlers.PromotionAuthPool.Close()
 	}
+	handlers.StartYCClaimMail(ctx)
 	handlers.Stripe = api.NewStripeBillingClient(cfg)
 
 	// Product-usage analytics — no-op when POSTHOG_KEY is unset.

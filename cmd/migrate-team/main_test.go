@@ -158,6 +158,46 @@ func mustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 	}
 }
 
+func TestQMManagedTeamMigrationRefused(t *testing.T) {
+	ctx := context.Background()
+	for _, side := range []string{"source", "destination"} {
+		t.Run(side, func(t *testing.T) {
+			managed, other := srcPool, dstPool
+			if side == "destination" {
+				managed, other = dstPool, srcPool
+			}
+			authority, org, team := uuid.New(), uuid.New(), uuid.New()
+			name := "managed-" + team.String()
+			mustExec(t, managed, `INSERT INTO qm_team_service_authority(namespace,authority_id,home_region) VALUES('qm-migration-test',$1,'use')`, authority)
+			mustExec(t, managed, `INSERT INTO qm_organization_teams(namespace,qm_org_id,idempotency_key,authority_id,team_id,home_region)
+				VALUES('qm-migration-test',$1::uuid,'qm-org:v1:'||($1::uuid)::text,$2,$3,'use')`, org, authority, team)
+			mustExec(t, managed, `INSERT INTO team(id,name,home_region) VALUES($1,$2,'use')`, team, name)
+			if side == "destination" {
+				mustExec(t, other, `INSERT INTO team(id,name,home_region) VALUES($1,$2,'use')`, team, "ordinary-"+team.String())
+			}
+			for _, tombstoned := range []bool{false, true} {
+				if tombstoned {
+					mustExec(t, managed, `DELETE FROM team WHERE id=$1`, team)
+				}
+				before := scanString(t, other, `SELECT COALESCE(jsonb_agg(to_jsonb(t))::text,'[]') FROM team t WHERE id=$1`, team)
+				for _, phase := range []string{phasePlan, phaseCopy, phaseValidate, phaseDetach, phasePurge, phaseReleaseRollups} {
+					cfg := config{teamID: team, sourceURL: srcURL, destURL: dstURL, phase: phase, destHostID: destHostID, destRegion: destRegion, confirmTeamName: name}
+					if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), side+": QM organization backing teams cannot be migrated") {
+						t.Fatalf("%s tombstoned=%v: wanted managed-team refusal, got %v", phase, tombstoned, err)
+					}
+				}
+				if after := scanString(t, other, `SELECT COALESCE(jsonb_agg(to_jsonb(t))::text,'[]') FROM team t WHERE id=$1`, team); after != before {
+					t.Fatal("refused migration changed the other cell")
+				}
+				var deleted bool
+				if err := managed.QueryRow(ctx, `SELECT deleted_at IS NOT NULL FROM qm_organization_teams WHERE team_id=$1`, team).Scan(&deleted); err != nil || deleted != tombstoned {
+					t.Fatalf("binding changed: deleted=%v, error=%v", deleted, err)
+				}
+			}
+		})
+	}
+}
+
 func countScoped(t *testing.T, pool *pgxpool.Pool, spec tableSpec, teamID uuid.UUID) int64 {
 	t.Helper()
 	var n int64
@@ -3040,5 +3080,65 @@ func TestStorageActivationMigrationValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestYCClaimHistoryBlocksMigration(t *testing.T) {
+	ctx := context.Background()
+	f := &fixture{team: uuid.New(), owner: uuid.New()}
+	mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, f.team, "yc-migration-"+f.team.String())
+	mustExec(t, srcPool, `INSERT INTO profile(id,email,provider,provider_id) VALUES($1,$2,'google',$3)`, f.owner, f.owner.String()+"@example.test", f.owner.String())
+	// The migration lock must permit reservation FK key-share locks. Reservation
+	// writers take the user advisory first; a team UPDATE lock creates inversion.
+	tx, err := srcPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = lockSourcePromotionMigration(ctx, tx, f.team); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := srcPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reservation.Exec(ctx, `SET LOCAL lock_timeout='1s'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reservation.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-user:' || $1::uuid::text)::bigint)`, f.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reservation.Exec(ctx, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_reserved_team_id) VALUES($1,$2)`, f.owner, f.team)
+	reservation.Rollback(ctx)
+	tx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("migration must allow reservation FK lock: %v", err)
+	}
+	_, err = srcPool.Exec(ctx, `INSERT INTO yc_claim_team_intent(team_id,claim_id,user_id) VALUES($1,$2,$3)`, f.team, uuid.New(), f.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, released := range []bool{false, true} {
+		if released {
+			_, err = srcPool.Exec(ctx, `UPDATE yc_claim_team_intent SET released_at=now() WHERE team_id=$1`, f.team)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, phase := range []string{phasePlan, phaseCopy, phaseValidate, phaseDetach, phasePurge, phaseReleaseRollups} {
+			if err := run(ctx, f.cfg(phase)); err == nil || !strings.Contains(err.Error(), "YC claim history") {
+				t.Fatalf("phase %s released=%v: %v", phase, released, err)
+			}
+		}
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = lockSourcePromotionMigration(ctx, tx, f.team)
+		tx.Rollback(ctx)
+		if err == nil || !strings.Contains(err.Error(), "YC claim history") {
+			t.Fatalf("locked recheck: %v", err)
+		}
 	}
 }

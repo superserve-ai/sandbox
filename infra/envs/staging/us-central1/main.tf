@@ -203,25 +203,29 @@ module "api" {
   service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
-    COMPUTE_RESTRICTIONS_SOURCE = "database"
-    API_PORT                    = "8080"
-    TEAM_CREATION_REGION        = "use"
-    TEAM_CREATION_PUBLIC_KEYS   = var.team_creation_public_keys
-    EDGE_PROXY_DOMAIN           = "staging-sandbox.superserve.ai"
-    OTEL_ENVIRONMENT            = local.environment
-    OTEL_EXPORTER_OTLP_ENDPOINT = local.staging_otlp_endpoint
-    OTEL_EXPORT_INTERVAL        = "15s"
-    OTEL_METRICS_ENABLED        = "true"
-    OTEL_SERVICE_NAME           = "sandbox-controlplane"
-    SUPABASE_URL                = var.supabase_url
-    TEMPLATE_BUILD_REGION       = local.region
-    BACKUP_BUCKET               = "superserve-artifact-backup-staging-usc1"
-    DEFAULT_HOST_ID             = var.build_host_id
-    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host_b.internal_ip)
-    STRIPE_API_BASE_URL         = "https://api.stripe.com"
-    STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
-    STRIPE_PRO_MONTHLY_PRICE_ID = "price_1UQiJZQ9Sm5V6nX8dRNQ5ob5"
-    STRIPE_PRO_ANNUAL_PRICE_ID  = "price_1UQiJjQ9Sm5V6nX8toQIgOzz"
+    YC_CONSOLE_URL                = var.yc_claim_console_url
+    YC_EMAIL_FROM                 = var.yc_claim_email_from
+    YC_EXISTING_EXCEPTION_USER_ID = var.yc_existing_exception_user_id
+    YC_EXISTING_EXCEPTION_TEAM_ID = var.yc_existing_exception_team_id
+    COMPUTE_RESTRICTIONS_SOURCE   = "database"
+    API_PORT                      = "8080"
+    TEAM_CREATION_REGION          = "use"
+    TEAM_CREATION_PUBLIC_KEYS     = var.team_creation_public_keys
+    EDGE_PROXY_DOMAIN             = "staging-sandbox.superserve.ai"
+    OTEL_ENVIRONMENT              = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT   = local.staging_otlp_endpoint
+    OTEL_EXPORT_INTERVAL          = "15s"
+    OTEL_METRICS_ENABLED          = "true"
+    OTEL_SERVICE_NAME             = "sandbox-controlplane"
+    SUPABASE_URL                  = var.supabase_url
+    TEMPLATE_BUILD_REGION         = local.region
+    BACKUP_BUCKET                 = "superserve-artifact-backup-staging-usc1"
+    DEFAULT_HOST_ID               = var.build_host_id
+    VMD_GRPC_ADDRESS              = format("%s:50051", module.sandbox_host_b.internal_ip)
+    STRIPE_API_BASE_URL           = "https://api.stripe.com"
+    STRIPE_CHECKOUT_PRICE_IDS     = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
+    STRIPE_PRO_MONTHLY_PRICE_ID   = "price_1UQiJZQ9Sm5V6nX8dRNQ5ob5"
+    STRIPE_PRO_ANNUAL_PRICE_ID    = "price_1UQiJjQ9Sm5V6nX8toQIgOzz"
     BILLING_RESOURCE_CONFIG = jsonencode([
       {
         resource_key         = "vcpu"
@@ -260,7 +264,7 @@ module "api" {
 
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
   }
-  secrets = merge(local.promotion_evidence_secrets, {
+  secrets = merge(local.promotion_evidence_secrets, local.yc_claim_secrets, {
     OPERATOR_API_TOKEN = {
       secret = google_secret_manager_secret.operator_api_token.secret_id
     }

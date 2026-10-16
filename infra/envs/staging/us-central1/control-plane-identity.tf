@@ -95,6 +95,7 @@ locals {
 
   controlplane_secret_ids = toset(concat(
     [for config in values(local.promotion_evidence_secrets) : config.secret],
+    [for config in values(local.yc_claim_secrets) : config.secret],
     [
       coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}"),
       coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}"),

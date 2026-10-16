@@ -74,6 +74,9 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("connect to source: %w", err)
 	}
 	defer src.Close()
+	if err := refuseQMManagedTeam(ctx, src, cfg.teamID); err != nil {
+		return fmt.Errorf("source: %w", err)
+	}
 
 	var dst *pgxpool.Pool
 	if cfg.destURL != "" {
@@ -82,7 +85,6 @@ func run(ctx context.Context, cfg config) error {
 			return fmt.Errorf("connect to dest: %w", err)
 		}
 		defer dst.Close()
-
 		// Fail fast if both DSNs land on the same database — string
 		// comparison can't catch pooler-vs-direct spellings of one DB, so
 		// compare live identity instead. With source == dest every later
@@ -107,6 +109,11 @@ func run(ctx context.Context, cfg config) error {
 			return err
 		}
 	}
+	if dst != nil {
+		if err := refuseQMManagedTeam(ctx, dst, cfg.teamID); err != nil {
+			return fmt.Errorf("destination: %w", err)
+		}
+	}
 	var teamName string
 	if err := src.QueryRow(ctx, `SELECT name FROM team WHERE id = $1`, cfg.teamID).Scan(&teamName); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -115,6 +122,10 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("look up team: %w", err)
 	}
 	log.Info().Str("phase", cfg.phase).Str("team", teamName).Str("team_id", cfg.teamID.String()).Msg("migrate-team")
+
+	if err := checkYCClaimMigration(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 
 	switch cfg.phase {
 	case phasePlan:
@@ -131,6 +142,23 @@ func run(ctx context.Context, cfg config) error {
 		return runReleaseRollups(ctx, src, dst, cfg)
 	}
 	return fmt.Errorf("unknown phase %q", cfg.phase)
+}
+
+func refuseQMManagedTeam(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID) error {
+	var installed, bound bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.qm_organization_teams') IS NOT NULL`).Scan(&installed); err != nil {
+		return fmt.Errorf("check organization binding schema: %w", err)
+	}
+	if !installed {
+		return nil
+	}
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.qm_organization_teams WHERE team_id=$1)`, teamID).Scan(&bound); err != nil {
+		return fmt.Errorf("check organization binding: %w", err)
+	}
+	if bound {
+		return errors.New("QM organization backing teams cannot be migrated between cells; their permanent binding and authority must remain together")
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2117,5 +2145,24 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	}
 
 	log.Info().Int64("deleted", total).Msg("purge: source rows removed (profiles, immutable publication authority, and append-only audit tables retained)")
+	return nil
+}
+
+// Shared company authority pins the home region. Even released intents retain
+// audit history, so these teams need a coordinated authority-transfer workflow.
+func checkYCClaimMigration(ctx context.Context, src querier, teamID uuid.UUID) error {
+	var present, claimed bool
+	if err := src.QueryRow(ctx, `SELECT to_regclass('public.yc_claim_team_intent') IS NOT NULL`).Scan(&present); err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	if err := src.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.yc_claim_team_intent WHERE team_id=$1)`, teamID).Scan(&claimed); err != nil {
+		return err
+	}
+	if claimed {
+		return fmt.Errorf("YC claim history blocks regional migration; coordinated shared company authority transfer is required")
+	}
 	return nil
 }
