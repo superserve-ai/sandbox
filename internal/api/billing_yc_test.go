@@ -174,3 +174,137 @@ func TestYCLeapDayAnniversary(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestYCLinkRequiresReusableSetupForEffectiveMethod(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(method, setup, mandate map[string]any, sub *invoiceSubscription)
+		ready  bool
+	}{
+		{"hosted-link", func(_, _, _ map[string]any, _ *invoiceSubscription) {}, true},
+		{"account-owner", func(m, s, _ map[string]any, _ *invoiceSubscription) {
+			delete(m, "customer")
+			delete(s, "customer")
+			m["customer_account"] = "acct_customer"
+			s["customer_account"] = "acct_customer"
+		}, true},
+		{"pending", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["status"] = "requires_action" }, false},
+		{"processing", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["status"] = "processing" }, false},
+		{"on-session-only", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["usage"] = "on_session" }, false},
+		{"other-method", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["payment_method"] = "pm_old" }, false},
+		{"other-owner", func(m, _, _ map[string]any, _ *invoiceSubscription) { m["customer"] = "cus_other" }, false},
+		{"other-setup-owner", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["customer"] = "cus_other" }, false},
+		{"other-mode", func(m, _, _ map[string]any, _ *invoiceSubscription) { m["livemode"] = true }, false},
+		{"other-setup-mode", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["livemode"] = true }, false},
+		{"other-merchant", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["on_behalf_of"] = "acct_other" }, false},
+		{"single-use", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["single_use_mandate"] = "mandate_once" }, false},
+		{"reusable-mandate", func(_, s, _ map[string]any, _ *invoiceSubscription) { s["mandate"] = "mandate_link" }, true},
+		{"revoked-mandate", func(_, s, m map[string]any, _ *invoiceSubscription) {
+			s["mandate"] = "mandate_link"
+			m["status"] = "inactive"
+		}, false},
+		{"foreign-mandate", func(_, s, m map[string]any, _ *invoiceSubscription) {
+			s["mandate"] = "mandate_link"
+			m["payment_method"] = "pm_old"
+		}, false},
+		{"subscription-excludes-link", func(_, _, _ map[string]any, s *invoiceSubscription) {
+			s.PaymentSettings.PaymentMethodTypes = []string{"card"}
+		}, false},
+		{"subscription-allows-link", func(_, _, _ map[string]any, s *invoiceSubscription) {
+			s.PaymentSettings.PaymentMethodTypes = []string{"card", "link"}
+		}, true},
+		{"unknown-family", func(m, _, _ map[string]any, _ *invoiceSubscription) { m["type"] = "future_method" }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			method := map[string]any{"id": "pm_link", "customer": "cus_pilot", "livemode": false, "type": "link", "link": map[string]any{}}
+			setup := map[string]any{"id": "seti_link", "customer": "cus_pilot", "livemode": false, "payment_method": "pm_link", "status": "succeeded", "usage": "off_session"}
+			mandate := map[string]any{"id": "mandate_link", "payment_method": "pm_link", "status": "active", "type": "multi_use", "livemode": false}
+			sub := invoiceSubscription{DefaultPaymentMethod: "pm_link"}
+			tc.mutate(method, setup, mandate, &sub)
+			requests := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				w.Header().Set("Content-Type", "application/json")
+				var out any
+				switch r.URL.Path {
+				case "/v1/customers/cus_pilot":
+					out = map[string]any{"id": "cus_pilot", "customer_account": "acct_customer", "invoice_settings": map[string]any{"default_payment_method": "pm_old"}}
+				case "/v1/payment_methods/pm_link":
+					out = method
+				case "/v1/setup_intents":
+					if r.URL.Query().Get("payment_method") != "pm_link" || r.URL.Query().Get("limit") != "100" {
+						t.Error("unbounded or unscoped setup lookup")
+					}
+					out = map[string]any{"data": []any{setup}}
+				case "/v1/mandates/mandate_link":
+					out = mandate
+				default:
+					t.Errorf("unexpected request %s", r.URL)
+					http.Error(w, "unexpected", 500)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(out)
+			}))
+			defer srv.Close()
+			client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+			ready, err := client.ycPaymentMethod(t.Context(), "cus_pilot", sub, false)
+			if ready != tc.ready || (tc.ready && err != nil) {
+				t.Fatalf("ready=%v want=%v err=%v", ready, tc.ready, err)
+			}
+			if requests > 4 {
+				t.Fatalf("unexpected provider fanout: %d", requests)
+			}
+		})
+	}
+}
+
+func TestYCLinkReplacementDoesNotReuseOldSetup(t *testing.T) {
+	current, status, unavailable, lookups := "pm_old", "succeeded", false, 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/customers/cus_pilot":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "cus_pilot", "invoice_settings": map[string]any{"default_payment_method": current}})
+		case "/v1/payment_methods/pm_old", "/v1/payment_methods/pm_new":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": current, "customer": "cus_pilot", "type": "link"})
+		case "/v1/setup_intents":
+			lookups++
+			if unavailable {
+				http.Error(w, "temporarily unavailable", 503)
+				return
+			}
+			// Even if a provider response includes stale evidence, it cannot
+			// authorize a different effective default or trigger a history scan.
+			_ = json.NewEncoder(w).Encode(map[string]any{"has_more": true, "data": []any{
+				map[string]any{"id": "seti_old", "customer": "cus_pilot", "payment_method": "pm_old", "status": "succeeded", "usage": "off_session"},
+				map[string]any{"id": "seti_new", "customer": "cus_pilot", "payment_method": "pm_new", "status": status, "usage": "off_session"},
+			}})
+		default:
+			t.Errorf("unexpected request %s", r.URL)
+			http.Error(w, "unexpected", 500)
+		}
+	}))
+	defer srv.Close()
+	c := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+	check := func(want bool) {
+		t.Helper()
+		before := lookups
+		got, err := c.ycPaymentMethod(t.Context(), "cus_pilot", invoiceSubscription{}, false)
+		if got != want {
+			t.Fatalf("ready=%v want=%v: %v", got, want, err)
+		}
+		if lookups-before > 1 {
+			t.Fatal("setup lookup paginated")
+		}
+	}
+	status = "requires_action"
+	check(true) // Pending replacement leaves the existing default usable.
+	current = "pm_new"
+	check(false) // A premature default change cannot borrow old readiness.
+	status = "succeeded"
+	check(true)
+	unavailable = true
+	check(false)
+	current = ""
+	check(false)
+}

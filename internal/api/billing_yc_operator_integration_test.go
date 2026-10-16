@@ -22,10 +22,19 @@ import (
 
 func TestYCOperatorAnnualOnlyAdoption(t *testing.T) {
 	for _, existing := range []bool{false, true} {
-		t.Run(fmt.Sprint("depleted-grant-", existing), func(t *testing.T) { runYCOperatorAdoption(t, existing) })
+		t.Run(fmt.Sprint("depleted-grant-", existing), func(t *testing.T) { runYCOperatorAdoption(t, existing, "card") })
 	}
 }
-func runYCOperatorAdoption(t *testing.T, existing bool) {
+func TestYCOperatorLinkAdoption(t *testing.T) { runYCOperatorAdoption(t, true, "link") }
+
+func TestYCOperatorLinkCreatesSubscriptionOnce(t *testing.T) {
+	runYCOperatorAdoption(t, false, "link", true)
+}
+
+func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, create ...bool) {
+	newSubscription := len(create) > 0 && create[0]
+	subscriptionCreated := !newSubscription
+	subscriptionWrites := 0
 	fixture := newEntitlementFixture(t, true, true)
 	h := fixture.h
 	team, err := h.DB.CreateTeam(t.Context(), "yc-operator-"+uuid.NewString())
@@ -99,6 +108,7 @@ func runYCOperatorAdoption(t *testing.T, existing bool) {
 		grant.Applicability.Scope.Prices[i].ID = "price_" + key
 	}
 	card := false
+	setupReady := false
 	methodOwner := "acct_customer"
 	writes := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -118,11 +128,36 @@ func runYCOperatorAdoption(t *testing.T, existing bool) {
 			}
 			output(map[string]any{"id": customer, "livemode": false, "customer_account": "acct_customer", "invoice_settings": map[string]any{"default_payment_method": pm}})
 		case r.URL.Path == "/v1/payment_methods/pm_card":
-			output(map[string]any{"id": "pm_card", "customer_account": methodOwner, "livemode": false, "type": "card", "card": map[string]any{"exp_month": 12, "exp_year": now.Year() + 2}})
+			method := map[string]any{"id": "pm_card", "customer_account": methodOwner, "livemode": false, "type": methodType}
+			if methodType == "card" {
+				method["card"] = map[string]any{"exp_month": 12, "exp_year": now.Year() + 2}
+			}
+			output(method)
+		case r.URL.Path == "/v1/setup_intents":
+			status := "requires_action"
+			if setupReady {
+				status = "succeeded"
+			}
+			output(map[string]any{"data": []any{map[string]any{"id": "seti_fixture", "customer_account": methodOwner, "livemode": false, "payment_method": "pm_card", "status": status, "usage": "off_session"}}})
 		case r.URL.Path == "/v1/invoices/in_first":
 			fmt.Fprintf(w, `{"id":"in_first","customer":%q,"status":"paid","currency":"usd","subtotal":1200000,"total":0,"amount_due":0,"amount_paid":0,"amount_remaining":0,"starting_balance":0,"ending_balance":0,"total_discount_amounts":[{"amount":1200000}],"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"amount":1200000,"currency":"usd","quantity":1,"period":{"start":%d,"end":%d},"pricing":{"price_details":{"price":%q}},"parent":{"subscription_item_details":{"subscription":%q}}}]}}`, customer, sub.ID, sub.StartDate, sub.Items.Data[0].End, p.BasePriceID, sub.ID)
+		case strings.HasPrefix(r.URL.Path, "/v1/coupons/"):
+			output(map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/v1/coupons/"), "duration": "once", "percent_off": 100, "applies_to": map[string]any{"products": []string{sub.Items.Data[0].Price.Product}}})
 		case r.URL.Path == "/v1/subscriptions":
-			output(map[string]any{"data": []invoiceSubscription{sub}})
+			if r.Method == http.MethodPost {
+				subscriptionWrites++
+				operation := r.Form.Get("metadata[yc_operation]")
+				if operation == "" || r.Header.Get("Idempotency-Key") != "yc-subscription:"+operation || r.Form.Get("collection_method") != "charge_automatically" {
+					t.Error("subscription creation lost durable authority")
+				}
+				subscriptionCreated = true
+				sub.Metadata = map[string]string{"yc_operation": operation}
+				output(sub)
+			} else if subscriptionCreated {
+				output(map[string]any{"data": []invoiceSubscription{sub}})
+			} else {
+				output(map[string]any{"data": []invoiceSubscription{}})
+			}
 		case r.URL.Path == "/v1/subscriptions/"+sub.ID:
 			if r.Method == http.MethodPost {
 				if r.Form.Has("metadata[yc_usage_attached]") {
@@ -189,6 +224,10 @@ func runYCOperatorAdoption(t *testing.T, existing bool) {
 	in.Customer = customer
 	in.Subscription = sub.ID
 	in.ExistingSubscriptionApproved = true
+	if newSubscription {
+		in.Subscription = ""
+		in.ExistingSubscriptionApproved = false
+	}
 	in.SignupEmail = "founder@example.com"
 	in.FounderEmail = in.SignupEmail
 	in.Evidence = "operator-fixture"
@@ -222,6 +261,15 @@ func runYCOperatorAdoption(t *testing.T, existing bool) {
 		t.Fatal("usage before card", err)
 	}
 	card = true
+	if methodType == "link" {
+		if err = h.reconcileYC(t.Context(), team.ID); err == nil {
+			t.Fatal("pending Link setup activated")
+		}
+		if eligible, err = h.DB.IsTeamSandboxBillingEligible(t.Context(), team.ID); err != nil || eligible {
+			t.Fatal("pending Link enabled usage", err)
+		}
+	}
+	setupReady = true
 	for i := 0; i < 3; i++ {
 		err = h.reconcileYC(t.Context(), team.ID)
 		if err == nil {
@@ -247,6 +295,9 @@ func runYCOperatorAdoption(t *testing.T, existing bool) {
 	}
 	if err = h.reconcileYC(t.Context(), team.ID); err != nil {
 		t.Fatal("repeat activation", err)
+	}
+	if newSubscription && subscriptionWrites != 1 {
+		t.Fatalf("created %d subscriptions", subscriptionWrites)
 	}
 	var receipts int
 	if err = h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_contract_payment WHERE contract_id=$1`, o.Contract).Scan(&receipts); err != nil || receipts != 0 {

@@ -136,3 +136,40 @@ activation and verify the actual payment gate and product access. Local claim te
 alone do not prove provider activation. This change does not execute that rollout.
 
 Teams with any YC claim intent, including released history, are blocked by migrate-team before cutover. Moving them requires a coordinated shared company authority transfer, which is outside this rollout. A migration already fenced in the source rejects new YC binds.
+
+## Link payment readiness
+
+Activation accepts cards under the existing expiry/ownership checks and Link with
+verified reusable setup. For Link, reconciliation reads at most 100 SetupIntents
+filtered to the effective payment method. It requires a successful `off_session`
+setup for the same customer or customer account and live/test mode, without a
+single-use mandate or another merchant's `on_behalf_of`. An attached mandate must
+still be active, reusable and bound to that method. Explicit subscription payment
+settings must allow Link. Missing evidence remains pending with a
+`payment_method_required` reason; saving a method never proves invoice payment.
+
+The subscription default still takes precedence over the customer default.
+Collect replacements through hosted setup before changing the effective default;
+a pending replacement cannot reuse the previous method's readiness. Reconciliation
+does not change defaults or fall back to a removed method. This increment does not
+add other payment families or change the portal's global settings. Roll out other
+families separately after verifying their currency, automatic collection and
+mandate requirements; a successful SetupIntent alone is not a universal
+capability check. See Stripe's [method support table](https://docs.stripe.com/payments/payment-methods/payment-method-support)
+and [Link setup guide](https://docs.stripe.com/payments/link/save-and-reuse).
+
+Before customer recovery, verify the deployed Stripe API version supports the
+[method-filtered SetupIntent lookup](https://docs.stripe.com/api/setup_intents/list),
+the runtime can read setup/mandate evidence, and portal/invoice/subscription
+settings agree. Deploy all reconciliation replicas before recovery so an older
+card-only worker cannot overwrite readiness. Complete one real hosted Link setup
+in staging/test mode, reconcile the existing approval, verify actual Console
+access and exactly one correctly scoped first-period grant, then retry once.
+Confirm effective worker issuance configuration and current refresh lag.
+
+Backend activation does not update `billing_signup_choice`. Console must recognize
+active YC billing through its authorized onboarding consumer before this release
+can be described as unblocking product access. Do not mark the customer Free or
+paid Pro to bypass plan selection. Hosted collection, deployed configuration and
+Console exit remain release checks; mocked-provider integration tests do not
+prove them.

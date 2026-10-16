@@ -18,6 +18,9 @@ type invoiceSubscription struct {
 	Schedule             string `json:"schedule"`
 	PendingUpdate        any    `json:"pending_update"`
 	DefaultPaymentMethod string `json:"default_payment_method"`
+	PaymentSettings      struct {
+		PaymentMethodTypes []string `json:"payment_method_types"`
+	} `json:"payment_settings"`
 
 	LatestInvoice     string            `json:"latest_invoice"`
 	EndedAt           int64             `json:"ended_at"`
