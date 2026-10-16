@@ -187,7 +187,11 @@ module "api" {
   cpu_idle = false
 
   env = {
-    PROMOTION_EVIDENCE_ENABLED = tostring(var.promotion_evidence_enabled)
+    YC_CONSOLE_URL                = var.yc_claim_console_url
+    YC_EMAIL_FROM                 = var.yc_claim_email_from
+    YC_EXISTING_EXCEPTION_USER_ID = var.yc_existing_exception_user_id
+    YC_EXISTING_EXCEPTION_TEAM_ID = var.yc_existing_exception_team_id
+    PROMOTION_EVIDENCE_ENABLED    = tostring(var.promotion_evidence_enabled)
 
     COMPUTE_RESTRICTIONS_FILE = "${local.controlplane_secret_volumes.compute-restrictions.mount_path}/${local.controlplane_secret_volumes.compute-restrictions.path}"
 

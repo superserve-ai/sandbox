@@ -80,7 +80,7 @@ locals {
     }
   } : {}
 
-  controlplane_secrets = merge(local.promotion_evidence_secrets, {
+  controlplane_secrets = merge(local.promotion_evidence_secrets, local.yc_claim_secrets, {
     DATABASE_URL = {
       secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
     }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -225,7 +226,7 @@ func RequestLogger() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 
-		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" {
+		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" && !strings.HasPrefix(c.Request.URL.Path, "/internal/yc/") {
 			path = path + "?" + raw
 		}
 

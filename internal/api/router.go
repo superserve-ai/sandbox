@@ -121,6 +121,13 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.POST("/stripe/webhook", h.HandleStripeWebhook)
 	r.POST("/internal/teams", TeamCreationPrivacy(), TeamCreationInternalAuth(), h.CreateInternalTeam)
 	r.POST("/internal/qm/authorize", TeamCreationPrivacy(), h.QMAuthHandler())
+	r.POST("/internal/yc/claims", TeamCreationPrivacy(), YCClaimAuth("YC_CLAIM_CAPTURE_TOKEN"), h.SubmitYCClaim)
+	ycConsole := r.Group("/internal/yc/account")
+	ycConsole.Use(TeamCreationPrivacy(), YCClaimAuth("YC_CLAIM_CONSOLE_TOKEN"))
+	ycConsole.POST("/confirm", h.ConfirmYCClaim)
+	ycConsole.POST("/claims", h.ListYCClaims)
+	ycConsole.POST("/bind", h.BindYCClaim)
+	ycConsole.POST("/status", h.YCClaimBillingStatus)
 
 	promotionCapture := r.Group("/internal/promotion/signup")
 	promotionCapture.Use(PromotionProducerAuth("PROMOTION_CAPTURE_TOKEN"))
@@ -147,6 +154,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	operator := r.Group("/internal")
 	operator.Use(OperatorAuth(), InternalActorFromHeader())
 	{
+		operator.GET("/yc/claims/:claim_id", TeamCreationPrivacy(), h.GetOperatorYCClaim)
+		operator.GET("/yc/claims", TeamCreationPrivacy(), h.PendingYCClaims)
+		operator.POST("/yc/claims/decision", TeamCreationPrivacy(), h.DecideYCClaim)
 		// Billing recovery requires a credential unavailable to VMD hosts.
 		operator.POST("/teams/:team_id/billing/storage", h.ReconcileStorageBilling)
 		operator.POST("/teams/:team_id/billing/invoice-reconciliation", h.EnrollInvoiceReconciliation)
