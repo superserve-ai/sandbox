@@ -77,6 +77,10 @@ WITH account AS (
 )
 SELECT CASE
     WHEN public.qm_team_managed_billing(p_team_id) THEN true
+    WHEN EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.team_id=p_team_id AND (NOT o.payment_method_ready OR o.payment_method_checked_at IS NULL OR o.payment_method_checked_at<now()-interval '5 minutes' OR o.state NOT IN ('active','renewed') OR (o.state='active' AND o.ends_at<=now()))) THEN false
+    WHEN EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.team_id=p_team_id AND o.state='renewed' AND NOT EXISTS(
+        SELECT 1 FROM billing_contract_payment p JOIN billing_pro_payment_verification v ON v.invoice_id=p.invoice_id
+        WHERE p.team_id=o.team_id AND p.contract_id=o.renewal_contract_id AND p.service_period_start<=now() AND p.service_period_end>now() AND NOT v.review_required)) THEN false
     WHEN lower(coalesce(account.stripe_subscription_status, '')) IN ('active','trialing','past_due') THEN true
     WHEN account.trial_ended_at IS NOT NULL THEN false
     WHEN denial.denied OR pending.pending THEN false
