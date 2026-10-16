@@ -45,12 +45,20 @@ func (h *Handlers) prepareEntitlementCredits(ctx context.Context, p billing.Expo
 	var contract uuid.UUID
 	var state, grantID string
 	var withheld bool
-	var platformFailure bool
-	err := h.Pool.QueryRow(ctx, `SELECT c.id,COALESCE(e.state,''),COALESCE(e.stripe_credit_grant_id,''),EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start=$2 AND w.period_end=$3),EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start=$2 AND w.platform_failure_at IS NOT NULL)
+	var platformFailure, adoptedEmpty bool
+	err := h.Pool.QueryRow(ctx, `SELECT c.id,COALESCE(e.state,''),COALESCE(e.stripe_credit_grant_id,''),COALESCE(e.issuance_source='adopted' AND e.adopted_available_balance_cents=0,false),EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start=$2 AND w.period_end=$3),EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start=$2 AND w.platform_failure_at IS NOT NULL)
  FROM billing_commercial_contract c LEFT JOIN billing_usage_entitlement e ON e.contract_id=c.id AND e.period_start=$2 AND e.period_end=$3
- WHERE c.team_id=$1 AND c.customer_id=$4 AND c.subscription_id=$5 AND c.starts_at<=$2 AND (c.ends_at IS NULL OR c.ends_at>=$3)`, p.TeamID, p.Start, p.End, a.Customer, a.Subscription).Scan(&contract, &state, &grantID, &withheld, &platformFailure)
+ WHERE c.team_id=$1 AND c.customer_id=$4 AND c.subscription_id=$5 AND c.starts_at<=$2 AND (c.ends_at IS NULL OR c.ends_at>=$3)`, p.TeamID, p.Start, p.End, a.Customer, a.Subscription).Scan(&contract, &state, &grantID, &adoptedEmpty, &withheld, &platformFailure)
 	if err != nil {
 		return err
+	}
+	var revoked bool
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation WHERE contract_id=$1 AND revoked_at<$2)`, contract, p.End).Scan(&revoked); err != nil {
+		return err
+	}
+	if revoked && state != "uncertain" && state != "issued" {
+		state = ""
+		withheld = true
 	}
 	if state != "issued" && (state != "" || !withheld) {
 		return errors.New("expected period allowance is unresolved; invoice collection requires recovery")
@@ -58,7 +66,7 @@ func (h *Handlers) prepareEntitlementCredits(ctx context.Context, p billing.Expo
 	if state == "" && platformFailure {
 		return errors.New("recorded platform issuance failure requires allowance remediation")
 	}
-	if state == "" && withheld {
+	if state == "" && withheld && !revoked {
 		if err = h.verifyEntitlementForfeiture(ctx, contract, p, a, client); err != nil {
 			return err
 		}
@@ -85,6 +93,22 @@ func (h *Handlers) prepareEntitlementCredits(ctx context.Context, p billing.Expo
 		if err != nil {
 			return err
 		}
+	}
+	if !found && adoptedEmpty {
+		// Zero balance was verified and recorded at operator adoption; there is no
+		// promised remaining credit to replace or silently charge for.
+		grant, e := client.retrieveEntitlementGrant(ctx, grantID)
+		if e != nil {
+			return e
+		}
+		if e = creditScope(grant, a.Customer, plan.InvoiceEnd, plan.CreditPrices); e != nil {
+			return e
+		}
+		balance, e := client.grantLedgerBalance(ctx, a.Customer, grantID)
+		if e != nil {
+			return e
+		}
+		found = balance == 0
 	}
 	if !found {
 		return errors.New("issued period allowance is absent from eligible credit inventory")

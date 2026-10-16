@@ -13,10 +13,17 @@ import (
 )
 
 type invoiceSubscription struct {
+	LiveMode             bool   `json:"livemode"`
+	CollectionMethod     string `json:"collection_method"`
+	Schedule             string `json:"schedule"`
+	PendingUpdate        any    `json:"pending_update"`
+	DefaultPaymentMethod string `json:"default_payment_method"`
+
 	LatestInvoice     string            `json:"latest_invoice"`
 	EndedAt           int64             `json:"ended_at"`
 	StartDate         int64             `json:"start_date"`
 	CancelAtPeriodEnd bool              `json:"cancel_at_period_end"`
+	CanceledAt        int64             `json:"canceled_at"`
 	CancelAt          int64             `json:"cancel_at"`
 	Metadata          map[string]string `json:"metadata"`
 	BillingMode       struct {

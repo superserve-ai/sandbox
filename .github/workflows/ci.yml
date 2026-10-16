@@ -194,7 +194,7 @@ jobs:
       - name: Run usage entitlement and invoice credit race contracts
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
-        run: go test -v -race -tags integration -count=1 -timeout 2m -run '^(TestEntitlement|TestInvoiceCredit|TestInvoiceDiscovery|TestEmptyCredit)' ./internal/api
+        run: go test -v -race -tags integration -count=1 -timeout 2m -run '^(TestYC|TestEntitlement|TestInvoiceCredit|TestInvoiceDiscovery|TestEmptyCredit)' ./internal/api
 
       - name: Run retained storage API race contracts
         env:
