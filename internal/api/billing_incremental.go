@@ -996,27 +996,31 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		if err := h.reconcileInvoicePeriod(ctx, p); err != nil {
 			return result, err
 		}
-		mapping, err := billing.RevalidateMeterCloseMapping(ctx, h.Pool, p, h.ResolveActiveBillingMeter)
-		if err != nil {
-			return result, err
-		}
-		tx, err := h.Pool.Begin(ctx)
-		if err != nil {
-			return result, err
-		}
-		defer tx.Rollback(ctx)
-		if err := mapping.Bind(ctx, tx); err != nil {
-			return result, err
-		}
-		if _, err = h.DB.WithTx(tx).MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End}); err != nil {
-			return result, err
-		}
-		if err := tx.Commit(ctx); err != nil {
+		if err := h.markBillingPeriodExported(ctx, p); err != nil {
 			return result, err
 		}
 		result.Status = "exported"
 	}
 	return result, nil
+}
+
+func (h *Handlers) markBillingPeriodExported(ctx context.Context, p billing.ExportPeriod) error {
+	mapping, err := billing.RevalidateMeterCloseMapping(ctx, h.Pool, p, h.ResolveActiveBillingMeter)
+	if err != nil {
+		return err
+	}
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := mapping.Bind(ctx, tx); err != nil {
+		return err
+	}
+	if _, err = h.DB.WithTx(tx).MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (h *Handlers) observeIncrementalResource(ctx context.Context, p billing.ExportPeriod, item incrementalExportItem, through time.Time, reader stripeMeterSummaryReader, customer string) (billing.ExportTotals, error) {

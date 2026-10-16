@@ -896,41 +896,13 @@ func (h *Handlers) ApproveTeamBillingPeriod(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), billing.StorageReportSettlementTimeout)
 	defer cancel()
-	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("begin billing period approval transaction failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := h.DB.WithTx(tx)
-	if err := prepareBillingStorageSnapshot(ctx, tx, teamID, periodEnd); err != nil {
-		respondBillingStorageSettlementError(c, err)
-		return
-	}
-	if _, _, err := h.upsertBillingSnapshotWithQueries(ctx, q, teamID, periodStart, periodEnd); err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("prepare billing period approval failed")
-		respondBillingStorageSettlementError(c, err)
-		return
-	}
-	period, err := q.ApproveTeamBillingPeriod(ctx, db.ApproveTeamBillingPeriodParams{
-		ApprovedBy:  pgtype.UUID{Bytes: actorID, Valid: true},
-		TeamID:      teamID,
-		PeriodStart: periodStart,
-		PeriodEnd:   periodEnd,
-	})
+	period, err := h.approveBillingPeriod(ctx, billing.ExportPeriod{TeamID: teamID, Start: periodStart, End: periodEnd}, actorID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			respondErrorMsg(c, "conflict", "billing period is not approvable", http.StatusConflict)
 			return
 		}
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("approve billing period failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit billing period approval transaction failed")
-		respondError(c, ErrInternal)
+		respondBillingStorageSettlementError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, billingPeriodResponseFromDB(period, account))

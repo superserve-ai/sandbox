@@ -684,6 +684,29 @@ type BillingPeriodAnomaly struct {
 	ResolvedBy  pgtype.UUID        `json:"resolved_by"`
 }
 
+type BillingPeriodCloseDiscovery struct {
+	Singleton  bool      `json:"singleton"`
+	AfterTeam  uuid.UUID `json:"after_team"`
+	AfterStart time.Time `json:"after_start"`
+	AfterEnd   time.Time `json:"after_end"`
+	NextRunAt  time.Time `json:"next_run_at"`
+}
+
+type BillingPeriodCloseWork struct {
+	TeamID         uuid.UUID          `json:"team_id"`
+	PeriodStart    time.Time          `json:"period_start"`
+	PeriodEnd      time.Time          `json:"period_end"`
+	NextAttemptAt  time.Time          `json:"next_attempt_at"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	LeaseUntil     pgtype.Timestamptz `json:"lease_until"`
+	Attempts       int64              `json:"attempts"`
+	LastAttemptAt  pgtype.Timestamptz `json:"last_attempt_at"`
+	LastProgressAt pgtype.Timestamptz `json:"last_progress_at"`
+	LastError      *string            `json:"last_error"`
+	Stage          string             `json:"stage"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
 type BillingProClosedPurchase struct {
 	TeamID         uuid.UUID `json:"team_id"`
 	Generation     time.Time `json:"generation"`
@@ -1650,6 +1673,7 @@ type TeamBillingPeriod struct {
 	GrossChargesUsd     pgtype.Numeric     `json:"gross_charges_usd"`
 	CreditsAppliedUsd   pgtype.Numeric     `json:"credits_applied_usd"`
 	NetInvoiceAmountUsd pgtype.Numeric     `json:"net_invoice_amount_usd"`
+	ApprovalSource      *string            `json:"approval_source"`
 }
 
 type TeamBillingUsage struct {

@@ -465,7 +465,7 @@ func run() error {
 	billing.StartBillingFinalizationService(ctx, dbPool, billingFinalizationConfig)
 	handlers.StartIncrementalBillingService(ctx)
 	handlers.StartInvoiceEnrollmentService(ctx)
-	handlers.StartInvoiceReconciliationService(ctx)
+	handlers.StartBillingPeriodCloseService(ctx)
 	handlers.StartStripeCheckoutAssociationMonitor(ctx)
 	handlers.StartProPaymentReconciliation(ctx)
 	handlers.StartUsageEntitlementService(ctx)

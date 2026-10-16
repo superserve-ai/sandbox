@@ -38,3 +38,14 @@ func (h *Handlers) DiscoverIncrementalBillingWorkForTest(ctx context.Context) er
 func (h *Handlers) SubmitIncrementalEventsForTest(ctx context.Context, p billing.ExportPeriod) error {
 	return h.submitIncrementalEvents(ctx, p, 6)
 }
+
+func (h *Handlers) BillingPeriodCloseTickForTest(ctx context.Context) (bool, error) {
+	return h.billingPeriodCloseTick(ctx)
+}
+func (h *Handlers) DiscoverBillingPeriodCloseForTest(ctx context.Context) error {
+	return h.discoverBillingPeriodCloseWork(ctx)
+}
+func (h *Handlers) ClaimBillingPeriodCloseForTest(ctx context.Context) (billing.ExportPeriod, error) {
+	c, err := h.claimBillingPeriodClose(ctx)
+	return c.ExportPeriod, err
+}

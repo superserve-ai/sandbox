@@ -439,7 +439,8 @@ RETURNING *;
 -- name: ApproveTeamBillingPeriod :one
 UPDATE team_billing_period
 SET status = 'approved',
-    approved_by = sqlc.arg(approved_by),
+    approval_source = CASE WHEN sqlc.narg(approved_by)::uuid IS NULL THEN 'system' ELSE 'human' END,
+    approved_by = sqlc.narg(approved_by),
     approved_at = now(),
     blocked_reason = NULL,
     blocked_at = NULL,
@@ -480,7 +481,9 @@ WITH exported_period AS (
             AND u.finalized_at IS NULL
       )
       AND storage_reports_complete_through(team_billing_period.team_id, team_billing_period.period_end)
-      AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
+      AND (feature_enabled('billing_export_enabled', team_billing_period.team_id)
+           OR (team_billing_period.status='exporting' AND billing_invoice_close_matches(
+               team_billing_period.team_id, team_billing_period.period_start, team_billing_period.period_end)))
     RETURNING *
 ),
 exported_usage AS (

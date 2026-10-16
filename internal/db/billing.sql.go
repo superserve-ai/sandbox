@@ -115,6 +115,7 @@ func (q *Queries) ApplyTeamCreditGrant(ctx context.Context, arg ApplyTeamCreditG
 const approveTeamBillingPeriod = `-- name: ApproveTeamBillingPeriod :one
 UPDATE team_billing_period
 SET status = 'approved',
+    approval_source = CASE WHEN $1::uuid IS NULL THEN 'system' ELSE 'human' END,
     approved_by = $1,
     approved_at = now(),
     blocked_reason = NULL,
@@ -134,7 +135,7 @@ WHERE team_billing_period.team_id = $2
         AND a.resolved_at IS NULL
         AND a.severity IN ('error', 'critical')
   )
-RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 `
 
 type ApproveTeamBillingPeriodParams struct {
@@ -168,6 +169,7 @@ func (q *Queries) ApproveTeamBillingPeriod(ctx context.Context, arg ApproveTeamB
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+		&i.ApprovalSource,
 	)
 	return i, err
 }
@@ -375,7 +377,7 @@ WHERE team_billing_period.team_id = $2
   AND team_billing_period.period_end = $4
   AND team_billing_period.status IN ('open', 'validating', 'blocked')
   AND team_billing_period.finalized_at IS NULL
-RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 `
 
 type BlockTeamBillingPeriodParams struct {
@@ -409,6 +411,7 @@ func (q *Queries) BlockTeamBillingPeriod(ctx context.Context, arg BlockTeamBilli
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+		&i.ApprovalSource,
 	)
 	return i, err
 }
@@ -862,7 +865,7 @@ func (q *Queries) FinishTeamBillingCheckoutForSubscription(ctx context.Context, 
 }
 
 const getActiveTeamBillingPeriod = `-- name: GetActiveTeamBillingPeriod :one
-SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 FROM team_billing_period
 WHERE team_id = $1
   AND finalized_at IS NULL
@@ -889,6 +892,7 @@ func (q *Queries) GetActiveTeamBillingPeriod(ctx context.Context, teamID uuid.UU
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+		&i.ApprovalSource,
 	)
 	return i, err
 }
@@ -1445,7 +1449,7 @@ func (q *Queries) GetTeamBillingCheckoutForRecovery(ctx context.Context, teamID 
 }
 
 const getTeamBillingPeriod = `-- name: GetTeamBillingPeriod :one
-SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 FROM team_billing_period
 WHERE team_id = $1
   AND period_start = $2
@@ -1477,12 +1481,13 @@ func (q *Queries) GetTeamBillingPeriod(ctx context.Context, arg GetTeamBillingPe
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+		&i.ApprovalSource,
 	)
 	return i, err
 }
 
 const getTeamBillingPeriodForUpdate = `-- name: GetTeamBillingPeriodForUpdate :one
-SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 FROM team_billing_period
 WHERE team_id = $1
   AND period_start = $2
@@ -1515,6 +1520,7 @@ func (q *Queries) GetTeamBillingPeriodForUpdate(ctx context.Context, arg GetTeam
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+		&i.ApprovalSource,
 	)
 	return i, err
 }
@@ -2221,13 +2227,13 @@ WITH exported_teams AS (
 ), candidates AS MATERIALIZED (
     -- Fence the expensive completeness check behind exported-team discovery.
     -- Earlier unfinalized periods must still participate in team ordering.
-    SELECT p.team_id, p.period_start, p.period_end, p.status, p.blocked_reason, p.blocked_at, p.approved_by, p.approved_at, p.exported_at, p.finalized_at, p.created_at, p.updated_at, p.gross_charges_usd, p.credits_applied_usd, p.net_invoice_amount_usd
+    SELECT p.team_id, p.period_start, p.period_end, p.status, p.blocked_reason, p.blocked_at, p.approved_by, p.approved_at, p.exported_at, p.finalized_at, p.created_at, p.updated_at, p.gross_charges_usd, p.credits_applied_usd, p.net_invoice_amount_usd, p.approval_source
     FROM team_billing_period p
     JOIN exported_teams e ON e.team_id = p.team_id
     WHERE p.finalized_at IS NULL AND p.period_end <= e.latest_exported_end
 ), ranked AS (
     SELECT
-        candidates.team_id, candidates.period_start, candidates.period_end, candidates.status, candidates.blocked_reason, candidates.blocked_at, candidates.approved_by, candidates.approved_at, candidates.exported_at, candidates.finalized_at, candidates.created_at, candidates.updated_at, candidates.gross_charges_usd, candidates.credits_applied_usd, candidates.net_invoice_amount_usd,
+        candidates.team_id, candidates.period_start, candidates.period_end, candidates.status, candidates.blocked_reason, candidates.blocked_at, candidates.approved_by, candidates.approved_at, candidates.exported_at, candidates.finalized_at, candidates.created_at, candidates.updated_at, candidates.gross_charges_usd, candidates.credits_applied_usd, candidates.net_invoice_amount_usd, candidates.approval_source,
         ROW_NUMBER() OVER (
             PARTITION BY team_id
             ORDER BY period_end ASC, period_start ASC
@@ -2235,7 +2241,7 @@ WITH exported_teams AS (
     FROM candidates
     WHERE storage_reports_complete_through(team_id, period_end)
 )
-SELECT ranked.team_id, ranked.period_start, ranked.period_end, ranked.status, ranked.blocked_reason, ranked.blocked_at, ranked.approved_by, ranked.approved_at, ranked.exported_at, ranked.finalized_at, ranked.created_at, ranked.updated_at, ranked.gross_charges_usd, ranked.credits_applied_usd, ranked.net_invoice_amount_usd, ranked.team_rank
+SELECT ranked.team_id, ranked.period_start, ranked.period_end, ranked.status, ranked.blocked_reason, ranked.blocked_at, ranked.approved_by, ranked.approved_at, ranked.exported_at, ranked.finalized_at, ranked.created_at, ranked.updated_at, ranked.gross_charges_usd, ranked.credits_applied_usd, ranked.net_invoice_amount_usd, ranked.approval_source, ranked.team_rank
 FROM ranked
 LEFT JOIN billing_finalization_attempt attempt ON attempt.team_id = ranked.team_id
 WHERE team_rank = 1
@@ -2260,6 +2266,7 @@ type ListExportedTeamBillingPeriodsRow struct {
 	GrossChargesUsd     pgtype.Numeric     `json:"gross_charges_usd"`
 	CreditsAppliedUsd   pgtype.Numeric     `json:"credits_applied_usd"`
 	NetInvoiceAmountUsd pgtype.Numeric     `json:"net_invoice_amount_usd"`
+	ApprovalSource      *string            `json:"approval_source"`
 	TeamRank            int64              `json:"team_rank"`
 }
 
@@ -2288,6 +2295,7 @@ func (q *Queries) ListExportedTeamBillingPeriods(ctx context.Context, batchSize 
 			&i.GrossChargesUsd,
 			&i.CreditsAppliedUsd,
 			&i.NetInvoiceAmountUsd,
+			&i.ApprovalSource,
 			&i.TeamRank,
 		); err != nil {
 			return nil, err
@@ -2377,7 +2385,7 @@ func (q *Queries) ListPricingRatesForPlanAt(ctx context.Context, arg ListPricing
 }
 
 const listTeamBillingPeriods = `-- name: ListTeamBillingPeriods :many
-SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 FROM team_billing_period
 WHERE team_id = $1
 ORDER BY period_start DESC
@@ -2414,6 +2422,7 @@ func (q *Queries) ListTeamBillingPeriods(ctx context.Context, arg ListTeamBillin
 			&i.GrossChargesUsd,
 			&i.CreditsAppliedUsd,
 			&i.NetInvoiceAmountUsd,
+			&i.ApprovalSource,
 		); err != nil {
 			return nil, err
 		}
@@ -3008,8 +3017,10 @@ WITH exported_period AS (
             AND u.finalized_at IS NULL
       )
       AND storage_reports_complete_through(team_billing_period.team_id, team_billing_period.period_end)
-      AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
-    RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+      AND (feature_enabled('billing_export_enabled', team_billing_period.team_id)
+           OR (team_billing_period.status='exporting' AND billing_invoice_close_matches(
+               team_billing_period.team_id, team_billing_period.period_start, team_billing_period.period_end)))
+    RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 ),
 exported_usage AS (
     UPDATE team_billing_usage u
@@ -3023,7 +3034,7 @@ exported_usage AS (
       AND u.finalized_at IS NULL
     RETURNING u.team_id
 )
-SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 FROM exported_period
 `
 
@@ -3049,6 +3060,7 @@ type MarkTeamBillingPeriodExportedRow struct {
 	GrossChargesUsd     pgtype.Numeric     `json:"gross_charges_usd"`
 	CreditsAppliedUsd   pgtype.Numeric     `json:"credits_applied_usd"`
 	NetInvoiceAmountUsd pgtype.Numeric     `json:"net_invoice_amount_usd"`
+	ApprovalSource      *string            `json:"approval_source"`
 }
 
 func (q *Queries) MarkTeamBillingPeriodExported(ctx context.Context, arg MarkTeamBillingPeriodExportedParams) (MarkTeamBillingPeriodExportedRow, error) {
@@ -3070,6 +3082,7 @@ func (q *Queries) MarkTeamBillingPeriodExported(ctx context.Context, arg MarkTea
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+		&i.ApprovalSource,
 	)
 	return i, err
 }
@@ -3086,7 +3099,7 @@ WITH exporting_period AS (
       AND team_billing_period.finalized_at IS NULL
       AND storage_reports_complete_through(team_billing_period.team_id, team_billing_period.period_end)
       AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
-    RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+    RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 ),
 exporting_usage AS (
     UPDATE team_billing_usage u
@@ -3099,7 +3112,7 @@ exporting_usage AS (
       AND u.finalized_at IS NULL
     RETURNING u.team_id
 )
-SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+SELECT team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 FROM exporting_period
 `
 
@@ -3125,6 +3138,7 @@ type MarkTeamBillingPeriodExportingRow struct {
 	GrossChargesUsd     pgtype.Numeric     `json:"gross_charges_usd"`
 	CreditsAppliedUsd   pgtype.Numeric     `json:"credits_applied_usd"`
 	NetInvoiceAmountUsd pgtype.Numeric     `json:"net_invoice_amount_usd"`
+	ApprovalSource      *string            `json:"approval_source"`
 }
 
 func (q *Queries) MarkTeamBillingPeriodExporting(ctx context.Context, arg MarkTeamBillingPeriodExportingParams) (MarkTeamBillingPeriodExportingRow, error) {
@@ -3146,6 +3160,7 @@ func (q *Queries) MarkTeamBillingPeriodExporting(ctx context.Context, arg MarkTe
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+		&i.ApprovalSource,
 	)
 	return i, err
 }
@@ -4075,7 +4090,7 @@ SET status = CASE
     END,
     updated_at = now()
 WHERE team_billing_period.finalized_at IS NULL
-RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd
+RETURNING team_id, period_start, period_end, status, blocked_reason, blocked_at, approved_by, approved_at, exported_at, finalized_at, created_at, updated_at, gross_charges_usd, credits_applied_usd, net_invoice_amount_usd, approval_source
 `
 
 type UpsertTeamBillingPeriodParams struct {
@@ -4109,6 +4124,7 @@ func (q *Queries) UpsertTeamBillingPeriod(ctx context.Context, arg UpsertTeamBil
 		&i.GrossChargesUsd,
 		&i.CreditsAppliedUsd,
 		&i.NetInvoiceAmountUsd,
+		&i.ApprovalSource,
 	)
 	return i, err
 }

@@ -100,7 +100,7 @@ func (r *OTelRecorder) RecordBillingWork(ctx context.Context, operation string, 
 		return
 	}
 	switch operation {
-	case "tick", "measurement", "submission", "reconciliation", "backlog_sample", "pro_payment", "pro_backlog_sample", "usage_entitlement", "usage_entitlement_backlog", "entitlement_coverage_sample":
+	case "period_close", "tick", "measurement", "submission", "reconciliation", "backlog_sample", "pro_payment", "pro_backlog_sample", "usage_entitlement", "usage_entitlement_backlog", "entitlement_coverage_sample":
 	default:
 		operation = "unknown"
 	}
