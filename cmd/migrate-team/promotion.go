@@ -15,6 +15,12 @@ import (
 // Read-committed snapshots must follow the locks: an in-flight reservation
 // otherwise remains invisible until after destination ownership is published.
 func lockSourcePromotionMigration(ctx context.Context, tx pgx.Tx, teamID uuid.UUID) error {
+	if _, err := tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, teamID); err != nil {
+		return fmt.Errorf("lock team for claim migration check: %w", err)
+	}
+	if err := checkYCClaimMigration(ctx, tx, teamID); err != nil {
+		return err
+	}
 	var expanded, canonical, provenance, claims bool
 	if err := tx.QueryRow(ctx, `SELECT
 		to_regclass('public.user_promotion_entitlement') IS NOT NULL,

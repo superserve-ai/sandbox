@@ -13,6 +13,10 @@ DO $$ DECLARE r text; BEGIN
  FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
    EXECUTE format('REVOKE ALL ON public.yc_claim_team_intent FROM %I',r);
+   IF r='service_role' THEN
+    GRANT SELECT,INSERT,UPDATE ON public.yc_claim_team_intent TO service_role;
+    CREATE POLICY yc_claim_intent_backend ON public.yc_claim_team_intent TO service_role USING(true) WITH CHECK(true);
+   END IF;
   END IF;
  END LOOP;
 END $$;

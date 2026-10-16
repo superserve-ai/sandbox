@@ -116,6 +116,10 @@ func run(ctx context.Context, cfg config) error {
 	}
 	log.Info().Str("phase", cfg.phase).Str("team", teamName).Str("team_id", cfg.teamID.String()).Msg("migrate-team")
 
+	if err := checkYCClaimMigration(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
+
 	switch cfg.phase {
 	case phasePlan:
 		return runPlan(ctx, src, cfg)
@@ -2117,5 +2121,24 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	}
 
 	log.Info().Int64("deleted", total).Msg("purge: source rows removed (profiles, immutable publication authority, and append-only audit tables retained)")
+	return nil
+}
+
+// Shared company authority pins the home region. Even released intents retain
+// audit history, so these teams need a coordinated authority-transfer workflow.
+func checkYCClaimMigration(ctx context.Context, src querier, teamID uuid.UUID) error {
+	var present, claimed bool
+	if err := src.QueryRow(ctx, `SELECT to_regclass('public.yc_claim_team_intent') IS NOT NULL`).Scan(&present); err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	if err := src.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.yc_claim_team_intent WHERE team_id=$1)`, teamID).Scan(&claimed); err != nil {
+		return err
+	}
+	if claimed {
+		return fmt.Errorf("YC claim history blocks regional migration; coordinated shared company authority transfer is required")
+	}
 	return nil
 }

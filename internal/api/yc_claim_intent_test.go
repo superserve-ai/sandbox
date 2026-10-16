@@ -49,9 +49,11 @@ func TestYCClaimAdmissionTransactions(t *testing.T) {
 	}
 	exec(`CREATE SCHEMA auth;CREATE TABLE auth.users(id uuid PRIMARY KEY,email text,email_confirmed_at timestamptz,deleted_at timestamptz,created_at timestamptz DEFAULT now());
  CREATE TABLE public.team(id uuid PRIMARY KEY,created_at timestamptz NOT NULL);
+ CREATE TABLE public.stripe_promotion_migration_fence(team_id uuid PRIMARY KEY);
  CREATE TABLE public.team_billing_account(team_id uuid PRIMARY KEY,stripe_customer_id text,stripe_subscription_id text,checkout_initializing_at timestamptz,stripe_activation_credit_reserved_at timestamptz,stripe_activation_credit_grant_id text);
  CREATE TABLE public.billing_signup_choice(team_id uuid PRIMARY KEY,state text,offer_key text);
  CREATE TABLE public.billing_commercial_contract(id uuid PRIMARY KEY,team_id uuid);`)
+	exec(`DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF; END $$;`)
 	for _, path := range []string{filepath.Join("..", "..", "supabase", "shared-auth-migrations", "20261016063228_yc_claim_authority.sql"), os.Getenv("YC_AUTHORITY_TEST_MIGRATION"), filepath.Join("..", "..", "supabase", "migrations", "20261016070251_yc_claim_team_intent.sql")} {
 		b, e := os.ReadFile(path)
 		if e != nil {
@@ -59,6 +61,15 @@ func TestYCClaimAdmissionTransactions(t *testing.T) {
 		}
 		exec(string(b))
 	}
+	// Exercise the runtime grants and RLS as a non-owner, not just postgres.
+	roleTx, e := pool.Begin(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = roleTx.Exec(ctx, `SET LOCAL ROLE service_role; SELECT * FROM public.yc_claim_team_intent; UPDATE public.yc_claim_team_intent SET released_at=now() WHERE false; INSERT INTO public.yc_claim_team_intent(team_id,claim_id,user_id) SELECT NULL,NULL,NULL WHERE false`); e != nil {
+		t.Fatal(e)
+	}
+	roleTx.Rollback(ctx)
 	h := &Handlers{Pool: pool, PromotionAuthPool: pool}
 	rpc := func(op string, p gin.H) map[string]any {
 		t.Helper()
@@ -90,6 +101,11 @@ func TestYCClaimAdmissionTransactions(t *testing.T) {
 		exec("INSERT INTO team VALUES($1,$2)", team, created)
 		exec("INSERT INTO billing_signup_choice VALUES($1,'selecting',NULL)", team)
 		return gin.H{"id": raw["id"], "user_id": user, "team_id": team, "home_region": "use", "token_hash": hash}
+	}
+	moving := create("moving@example.test", false)
+	exec("INSERT INTO stripe_promotion_migration_fence VALUES($1)", moving["team_id"])
+	if _, e := h.ycBindWithIntent(ctx, "bind", moving); e == nil || !strings.Contains(e.Error(), "migration") {
+		t.Fatalf("migration fence bypassed: %v", e)
 	}
 	p := create("fresh@example.test", false)
 	// A missing shared function models an unavailable billing rollout. Local

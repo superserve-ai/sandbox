@@ -3042,3 +3042,63 @@ func TestStorageActivationMigrationValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestYCClaimHistoryBlocksMigration(t *testing.T) {
+	ctx := context.Background()
+	f := &fixture{team: uuid.New(), owner: uuid.New()}
+	mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, f.team, "yc-migration-"+f.team.String())
+	mustExec(t, srcPool, `INSERT INTO profile(id,email,provider,provider_id) VALUES($1,$2,'google',$3)`, f.owner, f.owner.String()+"@example.test", f.owner.String())
+	// The migration lock must permit reservation FK key-share locks. Reservation
+	// writers take the user advisory first; a team UPDATE lock creates inversion.
+	tx, err := srcPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = lockSourcePromotionMigration(ctx, tx, f.team); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := srcPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reservation.Exec(ctx, `SET LOCAL lock_timeout='1s'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reservation.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-user:' || $1::uuid::text)::bigint)`, f.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reservation.Exec(ctx, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_reserved_team_id) VALUES($1,$2)`, f.owner, f.team)
+	reservation.Rollback(ctx)
+	tx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("migration must allow reservation FK lock: %v", err)
+	}
+	_, err = srcPool.Exec(ctx, `INSERT INTO yc_claim_team_intent(team_id,claim_id,user_id) VALUES($1,$2,$3)`, f.team, uuid.New(), f.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, released := range []bool{false, true} {
+		if released {
+			_, err = srcPool.Exec(ctx, `UPDATE yc_claim_team_intent SET released_at=now() WHERE team_id=$1`, f.team)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, phase := range []string{phasePlan, phaseCopy, phaseValidate, phaseDetach, phasePurge, phaseReleaseRollups} {
+			if err := run(ctx, f.cfg(phase)); err == nil || !strings.Contains(err.Error(), "YC claim history") {
+				t.Fatalf("phase %s released=%v: %v", phase, released, err)
+			}
+		}
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = lockSourcePromotionMigration(ctx, tx, f.team)
+		tx.Rollback(ctx)
+		if err == nil || !strings.Contains(err.Error(), "YC claim history") {
+			t.Fatalf("locked recheck: %v", err)
+		}
+	}
+}

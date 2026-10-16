@@ -131,3 +131,5 @@ company rejection across regions, email retry, billing outage/recovery, previous
 operator approval adoption, and revocation during dispatch. Complete the billing
 activation and verify the actual payment gate and product access. Local claim tests
 alone do not prove provider activation. This change does not execute that rollout.
+
+Teams with any YC claim intent, including released history, are blocked by migrate-team before cutover. Moving them requires a coordinated shared company authority transfer, which is outside this rollout. A migration already fenced in the source rejects new YC binds.

@@ -25,6 +25,13 @@ func (h *Handlers) ycBindWithIntent(ctx context.Context, op string, p gin.H) (js
 	if err = tx.QueryRow(ctx, "SELECT created_at FROM public.team WHERE id=$1 FOR UPDATE", team).Scan(&created); err != nil {
 		return nil, err
 	}
+	var migrating bool
+	if err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM public.stripe_promotion_migration_fence WHERE team_id=$1)", team).Scan(&migrating); err != nil {
+		return nil, err
+	}
+	if migrating {
+		return nil, errors.New("team migration requires operator review")
+	}
 	if _, err = tx.Exec(ctx, "INSERT INTO public.team_billing_account(team_id) VALUES($1) ON CONFLICT DO NOTHING", team); err != nil {
 		return nil, err
 	}

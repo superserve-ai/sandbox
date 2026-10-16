@@ -151,6 +151,7 @@ var migratedTables = []tableSpec{
 // alone. Printed by plan and copy so the decision is visible in the runbook
 // transcript.
 var skippedTables = []struct{ name, reason string }{
+	{"yc_claim_team_intent", "any claim history blocks migration pending coordinated shared authority transfer"},
 	{"proxy_audit", "append-only request audit; stays in the source cell"},
 	{"net_flow", "append-only egress-flow audit; stays in the source cell"},
 	{"audit_logs", "append-only RBAC audit (delete-blocked by trigger); stays in the source cell"},
