@@ -245,7 +245,7 @@ func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
 func RequestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		path := c.Request.URL.Path
+		path := requestDiagnosticPath(c)
 		raw := c.Request.URL.RawQuery
 
 		c.Next()
@@ -255,7 +255,7 @@ func RequestLogger() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 
-		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" && !strings.HasPrefix(c.Request.URL.Path, "/internal/machine-identity") {
+		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" && !strings.HasPrefix(c.Request.URL.Path, "/internal/machine-identity") && !strings.HasPrefix(path, "/internal/qm/organizations/") {
 			path = path + "?" + raw
 		}
 
@@ -277,6 +277,16 @@ func RequestLogger() gin.HandlerFunc {
 	}
 }
 
+func requestDiagnosticPath(c *gin.Context) string {
+	if strings.HasPrefix(c.Request.URL.Path, "/internal/qm/organizations/") {
+		if c.FullPath() == "/internal/qm/organizations/:qm_org_id/team" {
+			return c.FullPath()
+		}
+		return "/internal/qm/organizations/[redacted]"
+	}
+	return c.Request.URL.Path
+}
+
 // SecurityHeaders returns a Gin middleware that sets standard security headers
 // on all responses.
 func SecurityHeaders() gin.HandlerFunc {
@@ -296,7 +306,7 @@ func ErrorHandler() gin.HandlerFunc {
 			if r := recover(); r != nil {
 				zerolog.Ctx(c.Request.Context()).Error().
 					Interface("panic", r).
-					Str("path", c.Request.URL.Path).
+					Str("path", requestDiagnosticPath(c)).
 					Msg("panic recovered")
 
 				respondErrorMsg(c, "internal_error",

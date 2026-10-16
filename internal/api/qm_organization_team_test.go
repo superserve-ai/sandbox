@@ -1,15 +1,75 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
+
+func TestQMTeamRequestDiagnostics(t *testing.T) {
+	var output bytes.Buffer
+	previous := log.Logger
+	log.Logger = zerolog.New(&output)
+	t.Cleanup(func() { log.Logger = previous })
+	const org = "20000000-0000-4000-8000-000000000001"
+	const route = "/internal/qm/organizations/:qm_org_id/team"
+	for _, tc := range []struct {
+		method string
+		status int
+	}{
+		{http.MethodGet, 200}, {http.MethodPost, 200},
+		{http.MethodGet, 401}, {http.MethodPost, 401},
+		{http.MethodGet, 500}, {http.MethodPost, 500},
+		{http.MethodGet, 404},
+	} {
+		output.Reset()
+		r := gin.New()
+		r.Use(func(c *gin.Context) {
+			c.Request = c.Request.WithContext(log.Logger.WithContext(c.Request.Context()))
+		}, RequestLogger(), ErrorHandler())
+		r.Handle(tc.method, route, TeamCreationPrivacy(), func(c *gin.Context) {
+			if tc.status == 500 {
+				panic("idempotency-key-marker")
+			}
+			c.AbortWithStatus(tc.status)
+		})
+		path := "/internal/qm/organizations/" + org + "/team"
+		wantPath := route
+		if tc.status == 404 {
+			path += "/unknown"
+			wantPath = "/internal/qm/organizations/[redacted]"
+		}
+		req := httptest.NewRequest(tc.method, path+"?idempotency_key=idempotency-key-marker-"+org, nil)
+		response := httptest.NewRecorder()
+		r.ServeHTTP(response, req)
+		if response.Code != tc.status {
+			t.Fatalf("%s: status %d, want %d", tc.method, response.Code, tc.status)
+		}
+		if strings.Contains(output.String(), org) || strings.Contains(output.String(), "idempotency-key-marker") {
+			t.Fatal("request diagnostics exposed organization identity or idempotency key")
+		}
+		lines := bytes.Split(bytes.TrimSpace(output.Bytes()), []byte("\n"))
+		for _, line := range lines {
+			var event map[string]any
+			if err := json.Unmarshal(line, &event); err != nil {
+				t.Fatal(err)
+			}
+			if event["path"] != wantPath {
+				t.Fatalf("diagnostic path = %v, want %s", event["path"], wantPath)
+			}
+		}
+	}
+}
 
 func TestQMTeamBodyDeadlinePrecedesAuthentication(t *testing.T) {
 	cfg := qmTeamConfig{namespace: "qm-test", authority: "10000000-0000-4000-8000-000000000001", region: "use", token: strings.Repeat("t", 40)}
