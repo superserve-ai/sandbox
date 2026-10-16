@@ -1,0 +1,69 @@
+name: Apply shared Auth migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Inspect only, or apply the reviewed authority schema and private ledger'
+        required: true
+        type: choice
+        default: inspect
+        options: [inspect, apply]
+      target:
+        description: 'Verified authority database target (never inferred from the runtime secret name)'
+        required: true
+        type: choice
+        default: staging
+        options: [staging, use4]
+      runtime_project:
+        description: 'Project verified from the deployed runtime authority connection'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: database-migrations
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.revision.outputs.migration_revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify main revision and push CI
+        id: revision
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_REVISION: ${{ github.sha }}
+
+  shared-auth:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: ${{ inputs.target == 'use4' && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.revision }}
+          path: migration-source
+      - run: python3 -m pip install -r migration-source/scripts/migration-requirements.txt
+      - name: Run shared Auth action
+        run: |
+          python3 .github/workflows/scripts/deployment_migration_gate.py --verify-revision
+          python3 migration-source/scripts/migrate_shared_auth.py "$AUTH_TARGET" "$AUTH_ACTION" --revision "$MIGRATION_REVISION" --runtime-project "$RUNTIME_PROJECT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_REVISION: ${{ github.sha }}
+          MIGRATION_REVISION: ${{ needs.gate.outputs.revision }}
+          AUTH_TARGET: ${{ inputs.target }}
+          AUTH_ACTION: ${{ inputs.action }}
+          RUNTIME_PROJECT: ${{ inputs.runtime_project }}
+          DATABASE_URL: ${{ inputs.target == 'use4' && secrets.DATABASE_URL_PROD || secrets.DATABASE_URL_STAGING }}
