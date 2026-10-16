@@ -1,6 +1,7 @@
 """Regressions at the candidate release trust boundaries; no provider credentials."""
 
 import copy
+import importlib.util
 import io
 import json
 import os
@@ -33,6 +34,8 @@ class ProvenanceTests(unittest.TestCase):
             'git/ref/heads/main': {'object': {'sha': MAIN}},
             f'actions/workflows/ci.yml/runs?head_sha={MAIN}&event=push&per_page=100':
                 {'workflow_runs': [run(MAIN, 'push', '.github/workflows/ci.yml', 'main')]},
+            f'actions/workflows/staging-candidate-checks.yml/runs?head_sha={MAIN}&event=push&per_page=100':
+                {'workflow_runs': [run(MAIN, 'push', '.github/workflows/staging-candidate-checks.yml', 'main')]},
             'pulls/12': {'state': 'open', 'draft': False,
                          'base': {'ref': 'main', 'repo': {'full_name': gate.REPOSITORY}},
                          'head': {'ref': 'candidate', 'sha': HEAD, 'repo': {'full_name': gate.REPOSITORY}}},
@@ -96,6 +99,15 @@ class ProvenanceTests(unittest.TestCase):
         self.checks['statusCheckRollup'] = [{'status': 'IN_PROGRESS'}]
         with self.assertRaises(gate.GateError):
             self.verify()
+
+    def test_missing_or_failed_main_parser_check_blocks(self):
+        key = f'actions/workflows/staging-candidate-checks.yml/runs?head_sha={MAIN}&event=push&per_page=100'
+        for runs in [[], [run(MAIN, 'push', '.github/workflows/staging-candidate-checks.yml', 'main')]]:
+            if runs:
+                runs[0]['conclusion'] = 'failure'
+            self.responses[key]['workflow_runs'] = runs
+            with self.assertRaises(gate.GateError):
+                self.verify()
 
 
 class ReceiptTests(unittest.TestCase):
@@ -199,12 +211,44 @@ class SourcesTests(unittest.TestCase):
                 with self.assertRaisesRegex(gate.GateError, 'Main migration inputs changed'):
                     gate.verify_sources(manifest, candidate)
 
+
+@unittest.skipUnless(importlib.util.find_spec('pglast'), 'SQL parser runs in the required candidate source check')
+class SQLHistoryTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.migrations = self.root / 'supabase/migrations'
+        self.migrations.mkdir(parents=True)
+        (self.migrations / '1_first.sql').write_text('SELECT 1;')
+        (self.migrations / '2_second.sql').write_text('SELECT 2;')
+        self.rows = [['1', 'first', ['SELECT 1']], ['2', 'second', ['SELECT 2']]]
+
     def test_history_rejects_unrelated_missing_extra_and_renamed_entries(self):
-        expected = [['1', 'first'], ['2', 'second']]
-        gate.check_history([['1', 'first', ['SQL']], ['2', 'second', ['SQL']]], expected)
-        for rows in [[['1', 'first']], expected + [['3', 'extra']], [['1', 'first'], ['2', 'renamed']]]:
+        gate.check_history(self.rows, self.root)
+        for rows in [self.rows[:1], self.rows + [['3', 'extra', []]],
+                     [self.rows[0], ['2', 'renamed', ['SELECT 2']]]]:
             with self.subTest(rows=rows), self.assertRaises(gate.GateError):
-                gate.check_history(rows, expected)
+                gate.check_history(rows, self.root)
+
+    def test_correct_ledger_label_cannot_hide_changed_missing_or_reordered_sql(self):
+        for statements in [['SELECT 9'], [], None, ['SELECT 2; SELECT 1']]:
+            with self.subTest(statements=statements), self.assertRaises(gate.GateError):
+                gate.check_history([self.rows[0], ['2', 'second', statements]], self.root)
+
+    def test_parser_preserves_bodies_and_literals_but_ignores_comment_formatting(self):
+        sql = "CREATE FUNCTION example() RETURNS text LANGUAGE sql AS $$SELECT 'semi;colon'$$; SELECT '/*literal*/';"
+        (self.migrations / '2_second.sql').write_text(sql)
+        formatted = ["-- comment\n CREATE FUNCTION example() RETURNS text LANGUAGE sql AS $$SELECT 'semi;colon'$$;",
+                     "SELECT /* comment */ '/*literal*/';"]
+        gate.check_history([self.rows[0], ['2', 'second', formatted]], self.root)
+        with self.assertRaises(gate.GateError):
+            gate.check_history([self.rows[0], ['2', 'second', [sql.replace('semi;colon', 'different')]]], self.root)
+
+    def test_all_reviewed_migration_files_parse(self):
+        for path in (gate.ROOT / 'supabase/migrations').glob('*.sql'):
+            with self.subTest(path=path.name):
+                gate.sql_statements(path.read_text())
 
 class TargetTests(unittest.TestCase):
     def setUp(self):

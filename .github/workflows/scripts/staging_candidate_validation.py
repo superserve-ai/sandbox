@@ -93,6 +93,9 @@ def provenance(manifest, env):
     runs = api(REPOSITORY, f'actions/workflows/ci.yml/runs?head_sha={revision}&event=push&per_page=100')['workflow_runs']
     require(runs and successful_run(runs[0], revision, 'push', '.github/workflows/ci.yml', 'main'),
             'Successful exact-main push CI required')
+    runs = api(REPOSITORY, f'actions/workflows/staging-candidate-checks.yml/runs?head_sha={revision}&event=push&per_page=100')['workflow_runs']
+    require(runs and successful_run(runs[0], revision, 'push', '.github/workflows/staging-candidate-checks.yml', 'main'),
+            'Successful exact-main candidate source checks required')
     pr = api(REPOSITORY, f"pulls/{manifest['pull_request']}")
     require(pr['state'] == 'open' and not pr['draft'] and pr['base']['ref'] == 'main'
             and pr['base']['repo']['full_name'] == REPOSITORY
@@ -144,9 +147,27 @@ def expected_history(root):
     return rows
 
 
-def check_history(rows, expected):
-    require([[r[0], r[1]] for r in rows] == expected,
+def sql_statements(sql):
+    from pglast import parser
+    def without_positions(value):
+        if isinstance(value, list):
+            return [without_positions(v) for v in value]
+        if isinstance(value, dict):
+            return {k: without_positions(v) for k, v in value.items()
+                    if k not in ('location', 'stmt_len') and not k.endswith('_location')}
+        return value
+    return [without_positions(row['stmt']) for row in json.loads(parser.parse_sql_json(sql))['stmts']]
+
+
+def check_history(rows, root):
+    require([[r[0], r[1]] for r in rows] == expected_history(root),
             'Remote migration inventory differs; unrelated pending or changed history')
+    for version, name, statements in rows:
+        require(isinstance(statements, list) and all(isinstance(s, str) for s in statements),
+                'Stored migration statements are unavailable')
+        expected = sql_statements((root / 'supabase/migrations' / (version + '_' + name + '.sql')).read_text())
+        actual = [stmt for sql in statements for stmt in sql_statements(sql)]
+        require(actual == expected, 'Stored migration SQL differs from reviewed source')
 
 
 COHORT_SQL = """
@@ -172,7 +193,6 @@ def database_state(url, root, *, applied=False):
                 'Database execution settings unavailable')
         require(snapshot_reference_index.check(conn), 'Unrelated index preparation required')
         rows = [list(row) for row in conn.execute('SELECT version,name,statements FROM supabase_migrations.schema_migrations ORDER BY version')]
-        check_history(rows, expected_history(root))
         cohort = [list(row) for row in conn.execute(COHORT_SQL)]
         operations = [list(row) for row in conn.execute(
             "SELECT id::text,team_id::text,state,resource_terms,customer_id,subscription_id,"
@@ -180,6 +200,9 @@ def database_state(url, root, *, applied=False):
             "WHERE state<>'ended' ORDER BY id")]
         if applied:
             verify_wakeup_schema(conn, root)
+    # Parse outside the short read-only transaction; large migration histories
+    # must not consume its server-side transaction deadline doing local CPU work.
+    check_history(rows, root)
     # Only hashes and totals leave this process; no customer IDs in public artifacts.
     base_versions = {r[0] for r in expected_history(ROOT)}
     return {'history_hash': digest(rows), 'base_history_hash': digest([r for r in rows if r[0] in base_versions]),

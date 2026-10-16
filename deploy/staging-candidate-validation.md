@@ -9,6 +9,10 @@ A manifest in `deploy/staging-candidates` binds an open same-repository PR, exac
 head, baseline, successful PR CI run, exact-head approval and added migration
 hashes. The workflow and validator must first land on main and pass that exact
 revision's push CI. Changing the candidate requires a reviewed manifest update.
+The separate credentials-free candidate source check must also pass for that
+exact main revision. It installs the pinned PostgreSQL parser used to compare
+stored migration statement trees with the reviewed files, ignoring source
+positions and comments while preserving executable statements and literal bodies.
 Main's migration inputs must still match the baseline. A branch dispatch, fork,
 stale review, changed CI, unrelated pending migration, different remote history,
 or missing index preparation fails closed. No history repair is performed.
@@ -73,5 +77,10 @@ terms or subscriptions, and resetting anniversaries are not part of this workflo
 Run the existing workflow test discovery:
 
 ```sh
+python3 -m pip install -r deploy/staging-candidates/requirements.txt
 python3 -m unittest discover -s .github/workflows/scripts -p 'test_*.py'
 ```
+
+The dedicated candidate source workflow requires the parser and runs its history
+tests on every PR and main push. The general workflow-script suite can run without
+that optional local dependency; only parser tests are skipped in that case.
