@@ -85,6 +85,8 @@ func TestYCClaimStatusPaymentGate(t *testing.T) {
 		{"active", true, false, true, false, true, "requires_review"},
 		{"active", false, false, true, false, true, "requires_review"},
 		{"renewed", false, false, true, false, true, "requires_review"},
+		{"renewed", true, false, false, false, false, "renewed"},
+		{"active", true, false, false, false, false, "activation_pending"},
 		{"active", true, true, true, true, true, "requires_review"},
 		{"approved", false, false, false, false, false, "activation_pending"},
 	} {

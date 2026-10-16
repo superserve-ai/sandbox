@@ -115,6 +115,9 @@ func ycClaimDisplayStatus(state string, ready, revoked, failed, paymentRequired,
 		display = "awaiting_payment_method"
 	case state == "active" && ready && term:
 		display = "active"
+	// ends_at belongs to the original promotional year, not the paid renewal.
+	// Billing's renewed state verifies renewal receipts; Console links to billing
+	// for current plan details rather than claiming the promotional term is live.
 	case state == "renewed" && ready:
 		display = "renewed"
 	}
