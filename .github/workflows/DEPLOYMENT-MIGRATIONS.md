@@ -4,6 +4,10 @@ API, Proxy and Terraform deployments depend on `deployment-migrations.yml`
 through native GitHub Actions `needs`. Every invocation applies the complete
 migration bundle for its selected revision, including migrations inherited from
 earlier commits. There is no current-diff skip or search of migration run history.
+Main deployments stay pinned to their workflow commit when main advances while
+they are queued or waiting for CI; a newer commit alone does not invalidate them.
+The pinned commit must remain an ancestor of main; a ref rewrite that removes it
+blocks deployment.
 
 The prerequisite requires successful push CI for the migration revision, then
 runs staging followed by primary and west production when production is requested.
