@@ -4,6 +4,22 @@ This repository is open source. Everything committed here — code, comments,
 test fixtures, commit messages — and everything attached to it on GitHub —
 PR titles, PR descriptions, review comments — is public.
 
+## Cloud authentication and secrets
+
+This repository uses both AWS and GCP. These project-specific rules take
+precedence over the inherited AWS Guidance and Secret Safety rules:
+
+- Apply AWS skills and credential tools only to AWS operations. Require the
+  `aws-secrets-manager` skill and `asm-exec` only when accessing secrets stored
+  in AWS Secrets Manager; preserve the inherited restrictions for that access.
+- For GCP operations, use GCP authentication and secret tooling. Do not require
+  an AWS credential tool, AWS skill, or `asm-exec` for GCP credentials or secrets.
+- Use existing configured authentication for the relevant provider. Ask the user
+  for authentication help only when a required operation lacks usable access;
+  do not ask merely because the task mentions credentials or secrets, or because
+  an unrelated provider's tool is unavailable.
+- Keep secret values out of chat, logs, and committed files for both providers.
+
 ## Never reference internal context
 
 - **No customer names.** Do not name customers, their domains, or anything
