@@ -26,7 +26,7 @@ type ycCalendarFixture struct {
 	oldStart, oldEnd time.Time
 }
 
-func newYCCalendarFixture(t *testing.T, monthsAgo int) *ycCalendarFixture {
+func newYCCalendarFixture(t *testing.T, monthsAgo int, deferredAnniversary ...bool) *ycCalendarFixture {
 	t.Helper()
 	cfg, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
 	if err != nil || !strings.HasSuffix(cfg.ConnConfig.Database, "_test") {
@@ -59,11 +59,17 @@ func newYCCalendarFixture(t *testing.T, monthsAgo int) *ycCalendarFixture {
 	terms, _ := json.Marshal(params)
 	f := &ycCalendarFixture{h: h, sub: sub, token: uuid.New(), oldStart: anchor.AddDate(0, 0, -13), oldEnd: anchor.AddDate(0, 0, 18)}
 	f.exec(t, `INSERT INTO team_billing_account(team_id,stripe_customer_id,commercial_billing_anchor) VALUES($1,$2,$3)`, team.ID, sub.Customer, f.oldStart)
-	f.exec(t, `INSERT INTO billing_yc_operation(team_id,approved_by,evidence_reference,request,resource_terms,customer_id,subscription_id,starts_at,ends_at,state,payment_method_ready,payment_method_checked_at) VALUES($1,'synthetic-operator','synthetic-review',jsonb_build_object('company_identity',$1::uuid::text),$2,$3,$4,$5,$6,'provider_pending',true,clock_timestamp())`, team.ID, terms, sub.Customer, sub.ID, anchor, ycAnnualEnd(anchor))
+	var savedStart, savedEnd any = anchor, ycAnnualEnd(anchor)
+	if len(deferredAnniversary) > 0 && deferredAnniversary[0] {
+		savedStart, savedEnd = nil, nil
+	}
+	f.exec(t, `INSERT INTO billing_yc_operation(team_id,approved_by,evidence_reference,request,resource_terms,customer_id,subscription_id,starts_at,ends_at,state,payment_method_ready,payment_method_checked_at) VALUES($1,'synthetic-operator','synthetic-review',jsonb_build_object('company_identity',$1::uuid::text),$2,$3,$4,$5,$6,'provider_pending',true,clock_timestamp())`, team.ID, terms, sub.Customer, sub.ID, savedStart, savedEnd)
 	f.o, err = h.ycOperation(t.Context(), team.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.o.Start = pgtype.Timestamptz{Time: anchor, Valid: true}
+	f.o.End = pgtype.Timestamptz{Time: ycAnnualEnd(anchor), Valid: true}
 	if _, err = h.DB.ClaimStripeWebhookProcessingLease(t.Context(), db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: sub.Customer, Token: f.token}); err != nil {
 		t.Fatal(err)
 	}
@@ -223,6 +229,104 @@ func TestYCCalendarConflictsPreserveAuthority(t *testing.T) {
 			var same bool
 			if err = f.h.Pool.QueryRow(t.Context(), `SELECT (SELECT to_jsonb(p)=$2::jsonb FROM team_billing_period p WHERE team_id=$1) AND NOT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1) AND NOT EXISTS(SELECT 1 FROM billing_yc_operation WHERE team_id=$1 AND state='active')`, f.o.Team, before).Scan(&same); err != nil || !same {
 				t.Fatal("conflict changed authority", err)
+			}
+		})
+	}
+}
+
+func TestYCCalendarAdjacentPeriodsDoNotHideLegacyAuthority(t *testing.T) {
+	for _, kind := range []string{"usage", "export", "ledger", "future-usage"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newYCCalendarFixture(t, 0, true)
+			// An earlier correction may have changed the period keys without
+			// reconciling records that have no period foreign key.
+			f.exec(t, `INSERT INTO team_billing_period(team_id,period_start,period_end) VALUES($1,$2,$3),($1,$3,$4)`, f.o.Team, f.oldStart, f.o.Start.Time, f.o.Start.Time.UTC().AddDate(0, 1, 0))
+			if kind == "future-usage" {
+				f.oldStart = f.oldStart.AddDate(0, 1, 0)
+				f.oldEnd = f.oldEnd.AddDate(0, 1, 0)
+			}
+			// Seed the saved record before provider anniversary persistence, as
+			// an older worker could have done before this migration was present.
+			args := []any{f.o.Team, f.oldStart, f.oldEnd}
+			table := ""
+			switch kind {
+			case "usage", "future-usage":
+				table = "team_billing_usage"
+				f.exec(t, `INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds) VALUES($1,$2,$3,12)`, args...)
+			case "export":
+				table = "billing_usage_export"
+				f.exec(t, `INSERT INTO billing_usage_export(team_id,period_start,period_end,resource_type,stripe_meter_event_identifier,stripe_event_name,value,status) VALUES($1,$2,$3,'cpu',$1::uuid::text,'cpu',12,'pending')`, args...)
+			case "ledger":
+				table = "team_credit_ledger"
+				f.exec(t, `INSERT INTO team_credit_ledger(team_id,billing_period_start,billing_period_end,amount_usd,reason) VALUES($1,$2,$3,-1,'synthetic settlement')`, args...)
+			}
+			f.exec(t, `UPDATE billing_yc_operation SET starts_at=$2,ends_at=$3 WHERE team_id=$1`, f.o.Team, f.o.Start.Time, f.o.End.Time)
+			var before []byte
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(r) FROM `+table+` r WHERE team_id=$1`, f.o.Team).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				if err := f.persist(t.Context()); err == nil || !strings.Contains(err.Error(), "yc_calendar_conflict") {
+					t.Fatal("straddling authority accepted", err)
+				}
+			}
+			var preserved bool
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT (SELECT to_jsonb(r)=$2::jsonb FROM `+table+` r WHERE team_id=$1) AND NOT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1)`, f.o.Team, before).Scan(&preserved); err != nil || !preserved {
+				t.Fatal("conflict changed authority", err)
+			}
+		})
+	}
+}
+
+func TestYCCalendarMissingPeriodWriterRace(t *testing.T) {
+	for _, writerFirst := range []bool{true, false} {
+		t.Run(map[bool]string{true: "before-anniversary-saved", false: "transition-first"}[writerFirst], func(t *testing.T) {
+			f := newYCCalendarFixture(t, 0, writerFirst)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			tx, err := f.h.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			usage := `INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds) VALUES($1,$2,$3,12)`
+			// A future old-calendar key has no parent or overlapping period to lock.
+			s, e := f.oldStart.AddDate(0, 2, 0), f.oldEnd.AddDate(0, 2, 0)
+			if writerFirst {
+				if _, err = tx.Exec(ctx, usage, f.o.Team, s, e); err != nil {
+					t.Fatal(err)
+				}
+				f.exec(t, `UPDATE billing_yc_operation SET starts_at=$2,ends_at=$3 WHERE team_id=$1`, f.o.Team, f.o.Start.Time, f.o.End.Time)
+				result := make(chan error, 1)
+				go func() { result <- f.persist(ctx) }()
+				select {
+				case err = <-result:
+					t.Fatal("missing-parent writer was not fenced", err)
+				case <-time.After(50 * time.Millisecond):
+				}
+				if err = tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err = <-result; err == nil || !strings.Contains(err.Error(), "yc_calendar_conflict") {
+					t.Fatal("concurrent authority accepted", err)
+				}
+			} else {
+				if _, err = tx.Exec(ctx, `SELECT reconcile_yc_billing_calendar($1,$2)`, f.o.Team, f.o.ID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = f.h.Pool.Exec(ctx, usage, f.o.Team, s, e); err == nil || !strings.Contains(err.Error(), "55P03") {
+					t.Fatal("missing-parent writer bypassed account fence", err)
+				}
+				if err = tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = f.h.Pool.Exec(ctx, usage, f.o.Team, s, e); err == nil || !strings.Contains(err.Error(), "yc_calendar_conflict") {
+					t.Fatal("stale retry accepted", err)
+				}
+			}
+			var count int
+			if err = f.h.Pool.QueryRow(ctx, `SELECT count(*) FROM team_billing_usage WHERE team_id=$1`, f.o.Team).Scan(&count); err != nil || count != map[bool]int{true: 1, false: 0}[writerFirst] {
+				t.Fatal("lost or stale authority", count, err)
 			}
 		})
 	}

@@ -64,18 +64,26 @@ BEGIN
         PERFORM 1 FROM team_billing_period p WHERE p.team_id=owner_team
             AND tstzrange(p.period_start,p.period_end,'[)') && tstzrange(s,e,'[)')
             ORDER BY p.period_start,p.period_end FOR UPDATE;
-        has_period := FOUND;
     ELSIF TG_TABLE_NAME <> 'team_billing_period' THEN
         PERFORM 1 FROM team_billing_period p WHERE p.team_id=owner_team
             AND tstzrange(p.period_start,p.period_end,'[)') && tstzrange(s,e,'[)')
             ORDER BY p.period_start,p.period_end FOR KEY SHARE;
-        has_period := FOUND;
+    END IF;
+    IF TG_TABLE_NAME <> 'team_billing_period' THEN
+        SELECT EXISTS(SELECT 1 FROM team_billing_period p WHERE p.team_id=owner_team
+            AND p.period_start=s AND p.period_end=e) INTO has_period;
+        IF NOT has_period THEN
+            -- Missing-parent writers also fence a not-yet-saved anniversary.
+            -- They may already own period/contract locks, so never wait in
+            -- the inverse order against account-first reconciliation.
+            PERFORM 1 FROM team_billing_account WHERE team_id=owner_team FOR SHARE NOWAIT;
+        END IF;
     END IF;
     SELECT anniversary INTO boundary FROM billing_yc_calendar_transition WHERE team_id=owner_team;
     IF boundary IS NULL AND NOT has_period THEN
         SELECT starts_at INTO boundary FROM billing_yc_operation WHERE team_id=owner_team;
     END IF;
-    IF TG_TABLE_NAME = 'team_billing_period' AND s >= boundary AND NOT EXISTS (
+    IF s >= boundary AND NOT EXISTS (
         SELECT 1 FROM billing_entitlement_period(boundary,s) b WHERE b.period_start=s AND b.period_end=e) THEN
         RAISE EXCEPTION 'yc_calendar_conflict: team %, period [%, %) does not match anniversary %; follow docs/billing/yc-calendar-recovery.md', owner_team,s,e,boundary;
     END IF;
@@ -125,23 +133,32 @@ BEGIN
         END IF;
     END IF;
     PERFORM 1 FROM billing_commercial_contract WHERE team_id=p_team ORDER BY id FOR UPDATE;
+    -- Include historical prefixes: non-FK writers may overlap them without
+    -- using an exact period key. Audit only after every such writer drains.
+    PERFORM 1 FROM team_billing_period WHERE team_id=p_team
+        ORDER BY period_start,period_end FOR UPDATE;
     -- A delayed retry materializes every elapsed month from the original
     -- anniversary, rather than leaving a gap before the current month.
     WHILE billing_anniversary_boundary(boundary,n+1) <= clock_timestamp() LOOP
         n := n+1;
     END LOOP;
-    -- Legacy writers could have saved period-keyed data without a parent row.
-    -- It still carries authority and must not be hidden by a new calendar.
+    -- Legacy non-FK records retain authority even if a previous correction
+    -- already made the period rows adjacent or materialized the new calendar.
     FOR orphan IN
         SELECT 'usage summary' kind,period_start s,period_end e FROM team_billing_usage WHERE team_id=p_team
         UNION ALL SELECT 'cumulative export',period_start,period_end FROM billing_usage_export WHERE team_id=p_team
         UNION ALL SELECT 'credit settlement',billing_period_start,billing_period_end FROM team_credit_ledger WHERE team_id=p_team AND billing_period_start IS NOT NULL
         UNION ALL SELECT 'usage entitlement',period_start,period_end FROM billing_usage_entitlement WHERE team_id=p_team
+        UNION ALL SELECT 'entitlement withholding',u.period_start,u.period_end FROM billing_entitlement_withheld u
+            JOIN billing_commercial_contract c ON c.id=u.contract_id WHERE c.team_id=p_team
+        UNION ALL SELECT 'entitlement debt',u.period_start,b.period_end FROM billing_entitlement_debt u
+            JOIN billing_commercial_contract c ON c.id=u.contract_id
+            CROSS JOIN LATERAL billing_entitlement_period(c.entitlement_anchor,u.period_start) b WHERE c.team_id=p_team
     LOOP
-        IF orphan.s < boundary AND orphan.e > boundary AND NOT EXISTS (
-            SELECT 1 FROM team_billing_period WHERE team_id=p_team
-            AND tstzrange(period_start,period_end,'[)') && tstzrange(orphan.s,orphan.e,'[)')) THEN
-            RAISE EXCEPTION 'yc_calendar_conflict: team %, period [%, %), anniversary %: orphan %; follow docs/billing/yc-calendar-recovery.md',
+        IF orphan.e > boundary AND NOT EXISTS (
+            SELECT 1 FROM billing_entitlement_period(boundary,orphan.s) b
+            WHERE b.period_start=orphan.s AND b.period_end=orphan.e) THEN
+            RAISE EXCEPTION 'yc_calendar_conflict: team %, period [%, %), anniversary %: incompatible %; follow docs/billing/yc-calendar-recovery.md',
                 p_team,orphan.s,orphan.e,boundary,orphan.kind;
         END IF;
     END LOOP;

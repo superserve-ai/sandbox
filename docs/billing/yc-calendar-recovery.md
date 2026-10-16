@@ -39,7 +39,7 @@ trigger production deployment; this procedure does not authorize that action.
 ## What reconciliation does
 
 The transaction takes the existing webhook processing lease, the team invoice
-advisory lock, the billing-account lock, existing contract locks, and overlapping period locks
+advisory lock, the billing-account lock, existing contract locks, and period locks
 in that order. It reconciles periods **before** saving the local subscription association,
 commercial anchor, contract, or waiver. A conflict rolls back that transaction.
 Saved provider identities and earlier partial enrollment remain available for
@@ -114,8 +114,12 @@ entitlement) are explicitly fenced; withholding/debt writers share the contract
 lock. Other accounting paths are protected by direct or transitive period foreign
 keys. Provider invoice-discovery/credit-inventory cursors are keyed to provider
 windows, not local period authority; they are retained without changing their
-keys or evidence. A legacy orphan record that straddles the
-anniversary also requires review.
+keys or evidence. Non-FK records with incompatible periods crossing or following
+the anniversary require review even when the period rows are already adjacent.
+Writers without an exact parent period share the account lock; they fail with a
+retryable lock conflict if reconciliation already holds it, rather than waiting
+in the reverse lock order. Retry reloads the committed anniversary and rejects
+incompatible keys.
 
 The owning billing operator and accounting reviewer must record the following
 before an operator-assisted correction:
