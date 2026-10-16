@@ -43,8 +43,10 @@ advisory lock, the billing-account lock, existing contract locks, and period loc
 in that order. It reconciles periods **before** saving the local subscription association,
 commercial anchor, contract, or waiver. A conflict rolls back that transaction.
 Saved provider identities and earlier partial enrollment remain available for
-recovery. Pending YC operations cannot independently enroll invoices until the
-transition has a receipt, and activation requires that receipt.
+recovery. YC operations cannot independently enroll invoices until the
+transition has a receipt, and activation requires that receipt. Previously
+active operations and all operations entering annual renewal reconcile a missing
+receipt before continuing, without recreating contracts or provider state.
 
 For an untouched open `[legacy_start, legacy_end)` crossing the anniversary, it
 changes only its end to the anniversary and creates the adjacent anniversary
@@ -74,7 +76,7 @@ straddling the anniversary.
 1. Verify the operation's team home region and provider merchant/test mode. Read
    `GET /internal/teams/:team_id/billing/yc/status`. Capture the operation ID,
    subscription/customer IDs, original annual start/end, first invoice, contract,
-   waiver, credit schedule, enrollment state, and `last_error` in restricted
+   waiver, credit schedule, enrollment state, transition receipt, and `last_error` in restricted
    operator evidence. Keep real identifiers out of public PRs and logs.
 2. Confirm the migration and worker revision in that team's regional database.
    Do not clear `enrolling`, the provider attempt, or the saved subscription.
@@ -147,7 +149,9 @@ before an operator-assisted correction:
 5. Attach the recovery approval, executing actor, revision, timestamps, complete
    before/after evidence, and subsequent reconciliation/grant results to the
    restricted incident record. Never edit the transition receipt to certify a
-   correction it did not perform.
+   correction it did not perform. For an operation marked active by an older
+   worker, the saved state alone is not transition evidence: require its receipt
+   and a successful reconciliation response before declaring recovery complete.
 
 ## Staging acceptance
 

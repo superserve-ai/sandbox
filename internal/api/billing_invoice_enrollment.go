@@ -118,7 +118,7 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 	}
 	var calendarPending bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation o
-        WHERE o.team_id=$1 AND o.state IN ('approved','provider_pending','enrolling')
+        WHERE o.team_id=$1 AND o.state IN ('approved','provider_pending','enrolling','active','renewal_pending','renewed')
         AND NOT EXISTS(SELECT 1 FROM billing_yc_calendar_transition r WHERE r.operation_id=o.id))`, team).Scan(&calendarPending); err != nil {
 		return err
 	}

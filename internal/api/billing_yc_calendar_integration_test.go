@@ -411,6 +411,18 @@ func TestYCOperatorLegacyCalendarActivation(t *testing.T) {
 	runYCOperatorAdoption(t, false, "card", false, true)
 }
 
+func TestYCOperatorPreRolloutActiveCalendar(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		t.Run(map[bool]string{false: "untouched", true: "accounting-conflict"}[conflict], func(t *testing.T) {
+			runYCOperatorAdoption(t, false, "card", false, true, true, conflict)
+		})
+	}
+}
+
+func TestYCOperatorPreRolloutRenewalCalendarConflict(t *testing.T) {
+	runYCOperatorAdoption(t, false, "card", false, true, true, true, true)
+}
+
 func TestYCCalendarUsageBoundary(t *testing.T) {
 	f := newYCCalendarFixture(t, 0)
 	f.legacy(t)
@@ -441,13 +453,18 @@ func TestYCCalendarUsageBoundary(t *testing.T) {
 }
 
 func TestYCCalendarBlocksPrematureEnrollment(t *testing.T) {
-	f := newYCCalendarFixture(t, 0)
-	f.legacy(t)
-	f.savePartial(t)
-	f.exec(t, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.o.Team)
-	f.h.Stripe = &stripeHTTPClient{}
-	if err := f.h.enrollInvoiceAccount(t.Context(), f.o.Team, nil); err == nil || !strings.Contains(err.Error(), "YC calendar reconciliation") {
-		t.Fatal("enrolled before period reconciliation", err)
+	for _, state := range []string{"enrolling", "active", "renewal_pending", "renewed"} {
+		t.Run(state, func(t *testing.T) {
+			f := newYCCalendarFixture(t, 0)
+			f.legacy(t)
+			f.savePartial(t)
+			f.exec(t, `UPDATE billing_yc_operation SET state=$2 WHERE team_id=$1`, f.o.Team, state)
+			f.exec(t, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.o.Team)
+			f.h.Stripe = &stripeHTTPClient{}
+			if err := f.h.enrollInvoiceAccount(t.Context(), f.o.Team, nil); err == nil || !strings.Contains(err.Error(), "YC calendar reconciliation") {
+				t.Fatal("enrolled before period reconciliation", err)
+			}
+		})
 	}
 }
 

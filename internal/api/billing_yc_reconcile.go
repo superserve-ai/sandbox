@@ -125,7 +125,27 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 	if o.State == "ended" {
 		return nil
 	}
-	if o.End.Valid && !time.Now().Before(o.End.Time) {
+	renewalDue := o.End.Valid && !time.Now().Before(o.End.Time)
+	if o.State == "active" || o.State == "renewed" || o.State == "renewal_pending" || renewalDue {
+		var reconciled bool
+		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE operation_id=$1 AND team_id=$2 AND anniversary=$3)`, o.ID, team, o.Start.Time).Scan(&reconciled); err != nil {
+			return err
+		}
+		if !reconciled {
+			tx, err := h.Pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx)
+			if err = h.lockAndReconcileYCCalendar(ctx, tx, o, token); err != nil {
+				return err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	if renewalDue {
 		return h.reconcileYCRenewal(ctx, o, sub, client, token)
 	}
 	if o.Subscription == "" {
@@ -411,23 +431,14 @@ func (h *Handlers) ensureYCResources(ctx context.Context, o ycOperation, sub inv
 	}
 	return updated, validateFrozenProResources(resources, o.Params.ResourceTerms, rounding)
 }
-func (h *Handlers) persistYCContract(ctx context.Context, o ycOperation, sub invoiceSubscription, token uuid.UUID) error {
-	start, end, err := proMeteredPeriod(sub, proOffer{Key: "pro_annual", Price: o.Params.BasePriceID, Amount: 1200000, Months: 12})
-	if err != nil {
-		return err
-	}
-	tx, err := h.Pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
+func (h *Handlers) lockAndReconcileYCCalendar(ctx context.Context, tx pgx.Tx, o ycOperation, token uuid.UUID) error {
 	q := h.DB.WithTx(tx)
-	if _, err = q.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: o.Customer, Token: token}); err != nil {
+	if _, err := q.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: o.Customer, Token: token}); err != nil {
 		return err
 	}
 	// Match invoice enrollment's advisory-before-account order. The webhook
 	// lease still fences subscription association changes and stale retries.
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+o.Team.String()); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+o.Team.String()); err != nil {
 		return err
 	}
 	a, err := q.LockTeamBillingAccount(ctx, o.Team)
@@ -438,6 +449,21 @@ func (h *Handlers) persistYCContract(ctx context.Context, o ycOperation, sub inv
 		return errors.New("billing binding changed during adoption")
 	}
 	if _, err = tx.Exec(ctx, `SELECT reconcile_yc_billing_calendar($1,$2)`, o.Team, o.ID); err != nil {
+		return err
+	}
+	return nil
+}
+func (h *Handlers) persistYCContract(ctx context.Context, o ycOperation, sub invoiceSubscription, token uuid.UUID) error {
+	start, end, err := proMeteredPeriod(sub, proOffer{Key: "pro_annual", Price: o.Params.BasePriceID, Amount: 1200000, Months: 12})
+	if err != nil {
+		return err
+	}
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err = h.lockAndReconcileYCCalendar(ctx, tx, o, token); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `UPDATE billing_yc_operation SET state=CASE WHEN state='active' THEN state ELSE 'enrolling' END WHERE team_id=$1`, o.Team)

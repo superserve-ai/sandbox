@@ -50,6 +50,10 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 	}
 	now := time.Now().UTC()
 	anchor := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	renewalPending := len(create) > 4 && create[4]
+	if renewalPending {
+		anchor = anchor.AddDate(-1, -1, 0)
+	}
 	legacy := len(create) > 1 && create[1]
 	if legacy {
 		if _, err = h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end) VALUES($1,$2,$3)`, team.ID, anchor.AddDate(0, 0, -13), anchor.AddDate(0, 0, 18)); err != nil {
@@ -276,6 +280,46 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 		}
 	}
 	setupReady = true
+	if len(create) > 2 && create[2] {
+		// Model an older worker's completed operation before transition receipts
+		// existed, retaining its contract, waiver, enrollment and anniversary.
+		if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_yc_operation SET starts_at=$2,ends_at=$3 WHERE team_id=$1`, team.ID, anchor, ycAnnualEnd(anchor)); err != nil {
+			t.Fatal(err)
+		}
+		o, err := h.ycOperation(t.Context(), team.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := &ycCalendarFixture{h: h, o: o}
+		f.savePartial(t)
+		state := "active"
+		if renewalPending {
+			state = "renewal_pending"
+		}
+		f.exec(t, `UPDATE billing_yc_operation SET state=$2 WHERE team_id=$1`, team.ID, state)
+		conflict := len(create) > 3 && create[3]
+		if conflict {
+			f.exec(t, `INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds) VALUES($1,$2,$3,12)`, team.ID, anchor.AddDate(0, 0, -13), anchor.AddDate(0, 0, 18))
+		}
+		var before []byte
+		if err = h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(w) FROM billing_contract_waiver w WHERE team_id=$1`, team.ID).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			err = h.reconcileYC(t.Context(), team.ID)
+			if (conflict && (err == nil || !strings.Contains(err.Error(), "yc_calendar_conflict"))) || (!conflict && err != nil) {
+				t.Fatal("pre-rollout active operation", err)
+			}
+		}
+		var preserved, reconciled bool
+		if err = h.Pool.QueryRow(t.Context(), `SELECT (SELECT to_jsonb(w)=$2::jsonb FROM billing_contract_waiver w WHERE team_id=$1),EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1)`, team.ID, before).Scan(&preserved, &reconciled); err != nil || !preserved || reconciled == conflict {
+			t.Fatal("active recovery lost authority or completion evidence", err)
+		}
+		if writes != 0 {
+			t.Fatal("calendar recovery changed provider state")
+		}
+		return
+	}
 	for i := 0; i < 3; i++ {
 		err = h.reconcileYC(t.Context(), team.ID)
 		if err == nil {
