@@ -17,6 +17,26 @@ Main's migration inputs must still match the baseline. A branch dispatch, fork,
 stale review, changed CI, unrelated pending migration, different remote history,
 or missing index preparation fails closed. No history repair is performed.
 
+The credit-recovery manifest additionally pins a staging historical baseline to
+its exact candidate revision and migration hashes. Five previously applied SQL
+variants match earlier repository revisions: template alias constraint handling,
+a preview-access migration whose version was also used for template limits,
+dashboard-role creation race handling, superseded trial eligibility, and snapshot
+DDL lock handling. `yc-credit-history.json` records their historical sources,
+exact ordered statement and syntax-tree hashes, and current source hashes.
+Only those exact variants are accepted; all other history remains strict.
+
+The validator also requires the relevant current template constraints, legacy
+preview columns, role/grants, snapshot index/foreign key, and billing/snapshot
+function and trigger definitions. Later migrations already supply the current
+effects, so replaying the old SQL is neither necessary nor permitted. Catalog
+evidence is read in one bounded read-only query; parsing happens after the
+transaction. Policy and catalog hashes enter the approved receipt and are checked
+again before apply. After apply, only the reviewed enqueue-function transition is
+accepted and every preexisting history row must remain unchanged. A changed
+candidate, baseline source, variant or catalog requires fresh review; this policy
+does not authorize production exceptions or database repair.
+
 ## Preflight
 
 Dispatch **Staging candidate validation** on main with the reviewed manifest name
@@ -77,10 +97,13 @@ terms or subscriptions, and resetting anniversaries are not part of this workflo
 Run the existing workflow test discovery:
 
 ```sh
-python3 -m pip install -r deploy/staging-candidates/requirements.txt
+python3 -m pip install -r deploy/staging-candidates/requirements.txt -r scripts/migration-requirements.txt
 python3 -m unittest discover -s .github/workflows/scripts -p 'test_*.py'
 ```
 
-The dedicated candidate source workflow requires the parser and runs its history
-tests on every PR and main push. The general workflow-script suite can run without
-that optional local dependency; only parser tests are skipped in that case.
+The dedicated candidate source workflow requires the parser and tests the catalog
+query against disposable PostgreSQL on every PR and main push. Local catalog-query
+testing requires `STAGING_CATALOG_DATABASE_URL` pointing to a fresh disposable
+`staging_catalog_test` database on `127.0.0.1`; never use staging credentials.
+Without that URL the catalog-query test is skipped locally. Parser tests also
+skip when the optional local parser dependency is absent.

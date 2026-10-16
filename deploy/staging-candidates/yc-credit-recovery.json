@@ -11,5 +11,6 @@
     "supabase/migrations/20261017000100_entitlement_activation_wakeup.sql": "9f34863d4ace7c82fe0c0658b8ec04544890250b8c9b7c01434b6bc265a7218d"
   },
   "cohort": "commercial-allowances-v1",
-  "verification": "entitlement-wakeup-v1"
+  "verification": "entitlement-wakeup-v1",
+  "historical_baseline": "yc-credit-history"
 }

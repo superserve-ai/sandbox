@@ -13,6 +13,20 @@ jobs:
   source:
     name: Candidate source checks
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: staging_catalog_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,8 +34,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python3 -m pip install -r deploy/staging-candidates/requirements.txt
+      - run: python3 -m pip install -r deploy/staging-candidates/requirements.txt -r scripts/migration-requirements.txt
       - name: Test validator including real PostgreSQL parser
+        env:
+          STAGING_CATALOG_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/staging_catalog_test
         run: |
           python3 -c 'import pglast'
           python3 -m unittest discover -s .github/workflows/scripts -p 'test_staging_candidate_validation.py'

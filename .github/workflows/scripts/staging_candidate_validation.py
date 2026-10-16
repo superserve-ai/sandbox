@@ -17,6 +17,7 @@ import zipfile
 
 from deployment_migration_gate import MIGRATION_INPUTS
 from migration_gate import GateError, api
+import staging_history_baseline as historical
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -147,6 +148,20 @@ def expected_history(root):
     return rows
 
 
+def load_historical_baseline(manifest):
+    require(manifest.get('historical_baseline') == 'yc-credit-history',
+            'Explicit reviewed historical baseline required')
+    policy = json.loads((ROOT / 'deploy/staging-candidates/yc-credit-history.json').read_text())
+    require(policy['schema'] == 1 and policy['target'] == 'staging'
+            and policy['candidate_revision'] == manifest['revision']
+            and policy['candidate_migrations'] == manifest['migrations'],
+            'Historical baseline is not approved for this target or candidate')
+    require(set(policy['variants']) == {'20260429000001', '20260710000001', '20260730000002',
+                                       '20260818000001', '20260924000001'},
+            'Historical baseline version scope changed')
+    return policy
+
+
 def sql_statements(sql):
     from pglast import parser
     def without_positions(value):
@@ -159,15 +174,24 @@ def sql_statements(sql):
     return [without_positions(row['stmt']) for row in json.loads(parser.parse_sql_json(sql))['stmts']]
 
 
-def check_history(rows, root):
-    require([[r[0], r[1]] for r in rows] == expected_history(root),
+def check_history(rows, root, policy=None):
+    expected_rows = expected_history(root)
+    require([r[0] for r in rows] == [r[0] for r in expected_rows],
             'Remote migration inventory differs; unrelated pending or changed history')
-    for version, name, statements in rows:
+    for (version, name, statements), (_, source_name) in zip(rows, expected_rows):
         require(isinstance(statements, list) and all(isinstance(s, str) for s in statements),
                 'Stored migration statements are unavailable')
-        expected = sql_statements((root / 'supabase/migrations' / (version + '_' + name + '.sql')).read_text())
+        path = 'supabase/migrations/' + version + '_' + source_name + '.sql'
+        expected = sql_statements((root / path).read_text())
         actual = [stmt for sql in statements for stmt in sql_statements(sql)]
-        require(actual == expected, 'Stored migration SQL differs from reviewed source')
+        variant = policy['variants'].get(version) if policy else None
+        if variant:
+            require(variant['source'] == path and file_hash(root / path) == variant['source_sha256']
+                    and digest(expected) == variant['source_ast_sha256'], 'Historical baseline source changed')
+            require(name == variant['observed_name'] and digest(statements) == variant['statements_sha256']
+                    and digest(actual) == variant['ast_sha256'], 'Unapproved historical migration variant')
+        else:
+            require(name == source_name and actual == expected, 'Stored migration SQL differs from reviewed source')
 
 
 COHORT_SQL = """
@@ -182,7 +206,7 @@ WHERE c.status='active' AND c.offer_key IN ('pro_monthly','pro_annual','yc_2026'
 """
 
 
-def database_state(url, root, *, applied=False):
+def database_state(url, root, *, applied=False, policy=None):
     import psycopg
     import snapshot_reference_index
     bounded = migration.bounded_url(migration.migration_connection_url(url, 'staging'))
@@ -198,17 +222,20 @@ def database_state(url, root, *, applied=False):
             "SELECT id::text,team_id::text,state,resource_terms,customer_id,subscription_id,"
             "starts_at::text,ends_at::text,revoked_at::text,cancel_pending FROM billing_yc_operation "
             "WHERE state<>'ended' ORDER BY id")]
+        catalog = historical.catalog_state(conn, policy) if policy else None
         if applied:
             verify_wakeup_schema(conn, root)
     # Parse outside the short read-only transaction; large migration histories
     # must not consume its server-side transaction deadline doing local CPU work.
-    check_history(rows, root)
+    check_history(rows, root, policy)
+    catalog_hash = historical.check_catalog(catalog, policy, root, applied=applied) if policy else None
     # Only hashes and totals leave this process; no customer IDs in public artifacts.
     base_versions = {r[0] for r in expected_history(ROOT)}
     return {'history_hash': digest(rows), 'base_history_hash': digest([r for r in rows if r[0] in base_versions]),
             'cohort_hash': digest(cohort), 'yc_operations_hash': digest(operations), 'yc_operations': len(operations),
             'active_contracts': len(cohort), 'missing_current_grant': sum(not r[8] for r in cohort),
-            'unresolved_entitlements': sum(r[9] for r in cohort)}
+            'unresolved_entitlements': sum(r[9] for r in cohort),
+            'historical_baseline_hash': digest(policy) if policy else None, 'catalog_hash': catalog_hash}
 
 
 def verify_wakeup_schema(conn, root):
@@ -349,6 +376,7 @@ def main():
     try:
         env = os.environ
         manifest = load_manifest(env.get('CANDIDATE', ''))
+        policy = load_historical_baseline(manifest)
         provenance(manifest, env)
         require(env.get('GITHUB_RUN_ATTEMPT') == '1', 'Use a fresh dispatch, not a rerun')
         mode = env.get('VALIDATION_MODE')
@@ -365,7 +393,7 @@ def main():
         image_hash = file_hash(image_archive)
         before = service_state()
         url, versions = staging_credentials()
-        state = database_state(url, ROOT)
+        state = database_state(url, ROOT, policy=policy)
         receipt = {'schema': 1, 'mode': 'preflight', 'run_id': env['GITHUB_RUN_ID'],
                    'main_revision': env['GITHUB_SHA'], 'manifest_hash': digest(manifest),
                    'candidate_revision': manifest['revision'], 'image_archive_hash': image_hash,
@@ -392,12 +420,12 @@ def main():
                 require(current == approved, 'Staging state or approved input changed; repeat preflight')
                 image_digest = publish_image(image_archive, manifest)
                 provenance(manifest, env)
-                require(database_state(url, ROOT) == state, 'Database changed during preflight')
+                require(database_state(url, ROOT, policy=policy) == state, 'Database changed during preflight')
                 require(service_state()['spec'] == before['spec'], 'Staging service changed during preflight')
                 # The existing runner owns SQL execution and its advisory lock. Workers
                 # remain live: approval includes concurrent normal staging processing.
                 migration.migrate('staging', 'push', url, root=root)
-                after = database_state(url, root, applied=True)
+                after = database_state(url, root, applied=True, policy=policy)
                 require(after['base_history_hash'] == state['history_hash'], 'Existing migration history changed during apply')
                 result = deploy(image_digest, before, versions)
                 with open(env['GITHUB_STEP_SUMMARY'], 'a') as summary:

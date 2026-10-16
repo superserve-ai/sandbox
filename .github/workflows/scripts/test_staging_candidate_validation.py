@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
+from urllib.parse import urlsplit
 
 import staging_candidate_validation as gate
 
@@ -249,6 +251,177 @@ class SQLHistoryTests(unittest.TestCase):
         for path in (gate.ROOT / 'supabase/migrations').glob('*.sql'):
             with self.subTest(path=path.name):
                 gate.sql_statements(path.read_text())
+
+    def historical_policy(self):
+        path = 'supabase/migrations/2_second.sql'
+        statements = ['SELECT 3', 'SELECT 4']
+        return {'variants': {'2': {
+            'source': path, 'source_sha256': gate.file_hash(self.root / path),
+            'source_ast_sha256': gate.digest(gate.sql_statements('SELECT 2;')),
+            'observed_name': 'historical', 'statements_sha256': gate.digest(statements),
+            'ast_sha256': gate.digest(gate.sql_statements(';'.join(statements)))}}}
+
+    def test_only_exact_reviewed_historical_variant_is_accepted(self):
+        policy = self.historical_policy()
+        rows = [self.rows[0], ['2', 'historical', ['SELECT 3', 'SELECT 4']]]
+        gate.check_history(rows, self.root, policy)
+        for replacement in [['SELECT 4', 'SELECT 3'], ['SELECT 3', 'SELECT 5'], ['SELECT 3; SELECT 4']]:
+            with self.subTest(replacement=replacement), self.assertRaises(gate.GateError):
+                gate.check_history([rows[0], ['2', 'historical', replacement]], self.root, policy)
+        for changed in [self.rows, [['1', 'first', ['SELECT 9']], rows[1]], rows[:1],
+                        rows + [['3', 'extra', ['SELECT 5']]]]:
+            with self.subTest(changed=changed), self.assertRaises(gate.GateError):
+                gate.check_history(changed, self.root, policy)
+        (self.migrations / '2_second.sql').write_text('SELECT 5;')
+        with self.assertRaisesRegex(gate.GateError, 'baseline source changed'):
+            gate.check_history(rows, self.root, policy)
+
+
+class HistoricalCatalogTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        (self.root / 'before.sql').write_text('reviewed before')
+        (self.root / 'after.sql').write_text('reviewed after')
+        spec = {'source': 'before.sql', 'source_sha256': gate.file_hash(self.root / 'before.sql'),
+                'arguments': '', 'body_sha256': gate.digest('original'), 'language': 'sql', 'security_definer': False, 'volatility': 'v', 'result': 'text', 'configuration': None}
+        updated = dict(spec, source='after.sql', source_sha256=gate.file_hash(self.root / 'after.sql'),
+                       body_sha256=gate.digest('updated'))
+        self.policy = {'catalog': {'checks': [['required', True]]},
+                       'functions': {'example': spec}, 'applied_functions': {'example': updated}}
+        self.catalog = {'checks': [['required', True]], 'functions': [['example', '', 'original', 'sql', False, 'v', 'text', None]]}
+
+    def test_catalog_drift_and_function_substitution_fail_closed(self):
+        gate.historical.check_catalog(self.catalog, self.policy, self.root)
+        for key, value in [('checks', []), ('checks', [['required', False]]), ('functions', []),
+                           ('functions', [['example', '', 'changed', 'sql', False, 'v', 'text', None]]),
+                           ('functions', [['example', '', 'original', 'sql', True, 'v', 'text', None]])]:
+            with self.subTest(value=value), self.assertRaises(gate.GateError):
+                gate.historical.check_catalog(dict(self.catalog, **{key: value}), self.policy, self.root)
+        (self.root / 'before.sql').write_text('changed source')
+        with self.assertRaises(gate.GateError):
+            gate.historical.check_catalog(self.catalog, self.policy, self.root)
+
+    def test_applied_phase_requires_only_reviewed_function_transition(self):
+        after = dict(self.catalog, functions=[['example', '', 'updated', 'sql', False, 'v', 'text', None]])
+        gate.historical.check_catalog(after, self.policy, self.root, applied=True)
+        with self.assertRaises(gate.GateError):
+            gate.historical.check_catalog(after, self.policy, self.root)
+        with self.assertRaises(gate.GateError):
+            gate.historical.check_catalog(self.catalog, self.policy, self.root, applied=True)
+
+    def test_policy_cannot_follow_another_candidate_or_target(self):
+        manifest = json.loads((gate.ROOT / 'deploy/staging-candidates/yc-credit-recovery.json').read_text())
+        policy = gate.load_historical_baseline(manifest)
+        for changed in [dict(manifest, revision='c' * 40), dict(manifest, migrations={}),
+                        dict(manifest, historical_baseline='unreviewed')]:
+            with self.subTest(changed=changed), self.assertRaises(gate.GateError):
+                gate.load_historical_baseline(changed)
+        with patch.object(Path, 'read_text', return_value=json.dumps(dict(policy, target='production'))), \
+             self.assertRaises(gate.GateError):
+            gate.load_historical_baseline(manifest)
+
+
+class ApplyHistoryTests(unittest.TestCase):
+    def invoke(self, *, approved_change=None, preapply_change=None, after_change=None):
+        state = {'history_hash': 'original-history', 'catalog_hash': 'original-catalog',
+                 'historical_baseline_hash': 'reviewed-policy'}
+        manifest = {'revision': HEAD}
+        runtime = {'spec': {'synthetic': True}}
+        approved = {'schema': 1, 'mode': 'preflight', 'run_id': '123', 'main_revision': MAIN,
+                    'manifest_hash': gate.digest(manifest), 'candidate_revision': HEAD, 'image_archive_hash': 'image',
+                    'target': {'project': gate.PROJECT, 'region': gate.REGION, 'service': gate.SERVICE,
+                               'database': gate.migration.PROJECTS['staging'], 'stripe': gate.STRIPE_ACCOUNT},
+                    'runtime_hash': gate.digest(runtime['spec']), 'secret_versions': {},
+                    'database': dict(state, **(approved_change or {}))}
+        after = dict(state, base_history_hash=state['history_hash'])
+        after.update(after_change or {})
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, dict(ENV, GITHUB_RUN_ID='124', GITHUB_RUN_ATTEMPT='1', VALIDATION_MODE='apply',
+                                         GITHUB_STEP_SUMMARY=str(Path(directory) / 'summary'))), \
+             patch.object(sys, 'argv', ['validator', 'apply']), \
+             patch.object(gate, 'load_manifest', return_value=manifest), \
+             patch.object(gate, 'load_historical_baseline', return_value={'synthetic': True}), \
+             patch.object(gate, 'provenance'), patch.object(gate, 'verify_sources'), patch.object(gate, 'compose'), \
+             patch.object(gate, 'fetch_receipt', return_value=approved), \
+             patch.object(gate, 'file_hash', return_value='image'), \
+             patch.object(gate, 'service_state', return_value=runtime), \
+             patch.object(gate, 'staging_credentials', return_value=('synthetic', {})), \
+             patch.object(gate, 'database_state', side_effect=[state, dict(state, **(preapply_change or {})), after]), \
+             patch.object(gate.migration, 'migrate') as migrate, \
+             patch.object(gate, 'publish_image', return_value='image'), \
+             patch.object(gate, 'deploy', return_value={'revision': 'synthetic', 'image_digest': 'image'}) as deploy:
+            result = gate.main()
+        return result, [call.args[1] for call in migrate.call_args_list], deploy.called
+
+    def test_receipt_and_preapply_bind_catalog_and_policy(self):
+        for change in [{'catalog_hash': 'drift'}, {'historical_baseline_hash': 'different-policy'}]:
+            for point in ['approved_change', 'preapply_change']:
+                with self.subTest(point=point, change=change):
+                    status, actions, deployed = self.invoke(**{point: change})
+                    self.assertEqual(status, 1)
+                    self.assertNotIn('push', actions)
+                    self.assertFalse(deployed)
+
+    def test_postapply_history_change_prevents_deployment(self):
+        status, actions, deployed = self.invoke(after_change={'base_history_hash': 'rewritten-history'})
+        self.assertEqual(status, 1)
+        self.assertIn('push', actions)
+        self.assertFalse(deployed)
+        self.assertEqual(self.invoke(), (0, ['preflight', 'list', 'dry-run', 'push'], True))
+
+
+@unittest.skipUnless(os.environ.get('STAGING_CATALOG_DATABASE_URL'), 'Disposable catalog database runs in candidate source check')
+class CatalogQueryTests(unittest.TestCase):
+    def test_catalog_query_collects_real_postgres_rows_without_writes(self):
+        import psycopg
+        url = os.environ['STAGING_CATALOG_DATABASE_URL']
+        parsed = urlsplit(url)
+        self.assertEqual(parsed.hostname, '127.0.0.1')
+        self.assertEqual(parsed.path, '/staging_catalog_test')
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute("""
+CREATE TABLE template(team_id uuid,name text NOT NULL,deleted_at timestamptz,vcpu int,
+ CONSTRAINT template_vcpu_range CHECK(vcpu BETWEEN 1 AND 32));
+CREATE UNIQUE INDEX template_name_unique_per_team_active ON template(team_id,name) WHERE deleted_at IS NULL;
+CREATE TABLE sandbox_snapshot(id uuid,team_id uuid,PRIMARY KEY(id,team_id));
+CREATE TABLE sandbox(id uuid,team_id uuid,source_snapshot_id uuid,
+ preview_access text NOT NULL DEFAULT 'public',preview_token_version integer NOT NULL DEFAULT 1,
+ CONSTRAINT sandbox_preview_access_valid CHECK(preview_access IN ('public','private')),
+ CONSTRAINT sandbox_source_snapshot_fk FOREIGN KEY(source_snapshot_id,team_id) REFERENCES sandbox_snapshot(id,team_id));
+CREATE INDEX sandbox_by_source_snapshot ON sandbox(source_snapshot_id) WHERE source_snapshot_id IS NOT NULL;
+CREATE TABLE sandbox_preview_policy(id uuid);
+CREATE TABLE sandbox_published_port(id uuid);
+ALTER TABLE sandbox_preview_policy ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sandbox_published_port ENABLE ROW LEVEL SECURITY;
+CREATE SCHEMA analytics;
+CREATE VIEW analytics.synthetic AS SELECT 1 AS value;
+CREATE ROLE grafana_readonly LOGIN;
+GRANT USAGE ON SCHEMA analytics TO grafana_readonly;
+GRANT SELECT ON analytics.synthetic TO grafana_readonly;
+CREATE FUNCTION example() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+CREATE TRIGGER example BEFORE INSERT ON sandbox FOR EACH ROW EXECUTE FUNCTION example();
+""")
+        with psycopg.connect(url) as conn:
+            conn.execute('SET TRANSACTION READ ONLY')
+            catalog = gate.historical.catalog_state(conn, {'functions': {'example': {}}})
+            self.assertEqual(conn.execute('SHOW transaction_read_only').fetchone()[0], 'on')
+        self.assertEqual(catalog['functions'], [['example', '', ' BEGIN RETURN NEW; END ', 'plpgsql', False, 'v', 'trigger', None]])
+        self.assertEqual(catalog['triggers'], [['sandbox', 'example', 'O', 'example', 'CREATE TRIGGER example BEFORE INSERT ON public.sandbox FOR EACH ROW EXECUTE FUNCTION example()']])
+        self.assertEqual(catalog['analytics_grants'], [True, True])
+        self.assertEqual(catalog['grafana_role'], [['grafana_readonly', True, False, False, False, False, False]])
+        self.assertEqual(catalog['columns'], [['name', 'text', True], ['source_snapshot_id', 'uuid', False]])
+        self.assertEqual(catalog['legacy_columns'], [['preview_access', 'text', True, "'public'::text"],
+                                                     ['preview_token_version', 'integer', True, '1']])
+        self.assertEqual(catalog['preview_tables'], [['sandbox_preview_policy', True, False],
+                                                     ['sandbox_published_port', True, False]])
+        self.assertEqual([r[:3] for r in catalog['constraints']],
+                         [['sandbox', 'sandbox_preview_access_valid', True], ['template', 'template_vcpu_range', True]])
+        self.assertEqual(catalog['source_snapshot_fk'], [['sandbox_source_snapshot_fk', True,
+                         'FOREIGN KEY (source_snapshot_id, team_id) REFERENCES sandbox_snapshot(id, team_id)']])
+        self.assertEqual([r[:4] for r in catalog['indexes']],
+                         [['sandbox_by_source_snapshot', True, True, False], ['template_name_unique_per_team_active', True, True, True]])
 
 class TargetTests(unittest.TestCase):
     def setUp(self):
