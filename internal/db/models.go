@@ -1202,6 +1202,23 @@ type ProxyAudit struct {
 	ErrorCode      *string     `json:"error_code"`
 }
 
+type QmOrganizationTeam struct {
+	Namespace      string             `json:"namespace"`
+	QmOrgID        uuid.UUID          `json:"qm_org_id"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	AuthorityID    uuid.UUID          `json:"authority_id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	HomeRegion     string             `json:"home_region"`
+	CreatedAt      time.Time          `json:"created_at"`
+	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type QmTeamServiceAuthority struct {
+	Namespace   string    `json:"namespace"`
+	AuthorityID uuid.UUID `json:"authority_id"`
+	HomeRegion  string    `json:"home_region"`
+}
+
 type QuotaAlertState struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	QuotaType string    `json:"quota_type"`

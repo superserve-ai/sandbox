@@ -1598,6 +1598,17 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 	if !h.requireCustomerTeamPermission(c, teamID, "billing:write") {
 		return
 	}
+	if h.Pool != nil {
+		var managed bool
+		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT qm_team_managed_billing($1)`, teamID).Scan(&managed); err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if managed {
+			respondErrorMsg(c, "forbidden", "This team's billing is managed by QM", http.StatusForbidden)
+			return
+		}
+	}
 	actorID, err := customerActorID(c)
 	if err != nil {
 		return
