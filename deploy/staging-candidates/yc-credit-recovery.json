@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "repository": "superserve-ai/sandbox",
+  "pull_request": 707,
+  "branch": "aw/yc-credit-scope-recovery",
+  "revision": "e669ff51ddf7e5bfc49c9eb74d4ba7f3349f898c",
+  "baseline": "61443f7d4857411ada88a982599ab403c2413423",
+  "ci_run": 38971475243,
+  "approval_review": 5554159051,
+  "migrations": {
+    "supabase/migrations/20261017000100_entitlement_activation_wakeup.sql": "9f34863d4ace7c82fe0c0658b8ec04544890250b8c9b7c01434b6bc265a7218d"
+  },
+  "cohort": "commercial-allowances-v1",
+  "verification": "entitlement-wakeup-v1"
+}
