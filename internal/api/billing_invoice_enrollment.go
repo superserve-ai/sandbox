@@ -116,6 +116,15 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 	if err != nil {
 		return err
 	}
+	var calendarPending bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation o
+        WHERE o.team_id=$1 AND o.state IN ('approved','provider_pending','enrolling')
+        AND NOT EXISTS(SELECT 1 FROM billing_yc_calendar_transition r WHERE r.operation_id=o.id))`, team).Scan(&calendarPending); err != nil {
+		return err
+	}
+	if calendarPending {
+		return fmt.Errorf("YC calendar reconciliation is required before invoice enrollment; retry YC activation and follow docs/billing/yc-calendar-recovery.md on conflict")
+	}
 	if err = h.loadInvoiceBase(ctx, team, &a, tx); err != nil {
 		return err
 	}

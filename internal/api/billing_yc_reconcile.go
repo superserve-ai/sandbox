@@ -256,6 +256,13 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 			}
 		}
 	}
+	var reconciled bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE operation_id=$1 AND team_id=$2 AND anniversary=$3)`, o.ID, team, o.Start.Time).Scan(&reconciled); err != nil {
+		return err
+	}
+	if !reconciled {
+		return errors.New("YC billing calendar reconciliation is required before activation")
+	}
 	if err = q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: team, StripeGrantID: ""}); err != nil {
 		return err
 	}
@@ -418,12 +425,20 @@ func (h *Handlers) persistYCContract(ctx context.Context, o ycOperation, sub inv
 	if _, err = q.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: o.Customer, Token: token}); err != nil {
 		return err
 	}
+	// Match invoice enrollment's advisory-before-account order. The webhook
+	// lease still fences subscription association changes and stale retries.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+o.Team.String()); err != nil {
+		return err
+	}
 	a, err := q.LockTeamBillingAccount(ctx, o.Team)
 	if err != nil {
 		return err
 	}
 	if derefString(a.StripeCustomerID) != o.Customer || (a.StripeSubscriptionID != nil && *a.StripeSubscriptionID != o.Subscription) {
 		return errors.New("billing binding changed during adoption")
+	}
+	if _, err = tx.Exec(ctx, `SELECT reconcile_yc_billing_calendar($1,$2)`, o.Team, o.ID); err != nil {
+		return err
 	}
 	_, err = tx.Exec(ctx, `UPDATE billing_yc_operation SET state=CASE WHEN state='active' THEN state ELSE 'enrolling' END WHERE team_id=$1`, o.Team)
 	if err != nil {

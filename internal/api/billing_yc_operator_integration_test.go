@@ -50,6 +50,12 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 	}
 	now := time.Now().UTC()
 	anchor := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	legacy := len(create) > 1 && create[1]
+	if legacy {
+		if _, err = h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end) VALUES($1,$2,$3)`, team.ID, anchor.AddDate(0, 0, -13), anchor.AddDate(0, 0, 18)); err != nil {
+			t.Fatal(err)
+		}
+	}
 	sub, p, in := ycTestSubscription()
 	sub.ID = "sub_" + team.ID.String()
 	sub.Customer = customer
@@ -285,6 +291,12 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 	}
 	if o.State != "active" || o.Subscription != sub.ID || !o.Start.Time.Equal(anchor) || !o.End.Time.Equal(ycAnnualEnd(anchor)) {
 		t.Fatal("activation reset identity or term", o.State)
+	}
+	if legacy {
+		var retained bool
+		if err = h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open') AND EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1)`, team.ID, anchor.AddDate(0, 0, -13), anchor).Scan(&retained); err != nil || !retained {
+			t.Fatal("legacy interval not retained", err)
+		}
 	}
 	eligible, err = h.DB.IsTeamSandboxBillingEligible(t.Context(), team.ID)
 	if err != nil || !eligible {
