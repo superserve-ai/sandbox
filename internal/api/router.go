@@ -159,6 +159,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	operator.Use(OperatorAuth(), InternalActorFromHeader())
 	{
 		// Billing recovery requires a credential unavailable to VMD hosts.
+		operator.POST("/teams/:team_id/billing/yc/preflight", h.YCPreflight)
+		operator.POST("/teams/:team_id/billing/yc/approve", h.YCApprove)
+		operator.POST("/teams/:team_id/billing/yc/activate", h.YCActivate)
+		operator.POST("/teams/:team_id/billing/yc/reconcile", h.YCActivate)
+		operator.GET("/teams/:team_id/billing/yc/status", h.YCStatus)
+		operator.POST("/teams/:team_id/billing/yc/revoke", h.YCRevoke)
 		operator.POST("/teams/:team_id/billing/storage", h.ReconcileStorageBilling)
 		operator.POST("/teams/:team_id/billing/invoice-reconciliation", h.EnrollInvoiceReconciliation)
 		operator.POST("/teams/:team_id/billing/periods/:period_id/adopt-exports", h.AdoptBillingExports)

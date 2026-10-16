@@ -347,6 +347,17 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 	if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 		return false, err
 	}
+	var yc bool
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation WHERE customer_id=$1)`, obj.Customer).Scan(&yc); err != nil {
+		return false, err
+	}
+	if yc {
+		if _, err := h.Pool.Exec(ctx, `UPDATE billing_yc_operation SET next_check_at=clock_timestamp() WHERE customer_id=$1`, obj.Customer); err != nil {
+			return true, err
+		}
+		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
+		return true, err
+	}
 	var closed bool
 	subscription := obj.Subscription
 	if strings.HasPrefix(event.Type, "customer.subscription.") {

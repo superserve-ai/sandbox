@@ -1919,7 +1919,12 @@ func (h *Handlers) CreateStripeCustomerPortalSession(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "team has no Stripe customer mapping", http.StatusConflict)
 		return
 	}
-	if !billingAccountHasEstablishedSubscription(account) {
+	yc, _, _, ycErr := h.ycPaymentGate(c.Request.Context(), teamID)
+	if ycErr != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if !billingAccountHasEstablishedSubscription(account) && !yc {
 		respondErrorMsg(c, "conflict", "team does not have an active Stripe subscription", http.StatusConflict)
 		return
 	}
