@@ -80,8 +80,12 @@ straddling the anniversary.
 1. Verify the operation's team home region and provider merchant/test mode. Read
    `GET /internal/teams/:team_id/billing/yc/status`. Capture the operation ID,
    subscription/customer IDs, original annual start/end, first invoice, contract,
-   waiver, credit schedule, enrollment state, transition receipt, and `last_error` in restricted
-   operator evidence. Keep real identifiers out of public PRs and logs.
+   and `last_error` in restricted operator evidence. This endpoint does not return
+   the calendar receipt, waiver, credit schedule, or enrollment state. Obtain those
+   through authorized read access to the team's regional billing database:
+   `billing_yc_calendar_transition`, `billing_contract_waiver`,
+   `billing_contract_entitlement_schedule`, and `billing_invoice_enrollment`.
+   Keep real identifiers out of public PRs and logs.
 2. Confirm the migration and worker revision in that team's regional database.
    Do not clear `enrolling`, the provider attempt, or the saved subscription.
 3. Call `POST /internal/teams/:team_id/billing/yc/reconcile` with the existing
@@ -89,7 +93,8 @@ straddling the anniversary.
    same path. A saved anchor/contract/enrollment needs no rollback first. The
    transition rechecks the real periods transactionally; no manual shortening is
    needed for an untouched open period.
-4. On success inspect the immutable transition receipt and the period list.
+4. On success inspect the immutable transition receipt and period list using
+   the regional queries below.
    Check exactly adjacent coverage, the same original subscription/anniversary,
    the same waiver and schedule, and completed activation. Separately verify the
    current grant's issuance/adoption and scope; `active` alone is not evidence
@@ -97,6 +102,22 @@ straddling the anniversary.
 5. On `yc_calendar_conflict`, keep the operation pending and follow the review
    below. The message contains the team, affected interval, anniversary, and
    dependency category. Retrying does not remove or modify that authority.
+
+Use these parameterized read-only queries with `$1` bound to the verified team
+UUID and `$2` to the operation UUID returned by the status endpoint. Run them
+before and after reconciliation using the approved regional billing read role;
+retain the results in restricted operator evidence. No receipt row means there
+is no recorded transition for that operation; an API `active` state alone does
+not establish completion.
+
+```sql
+SELECT * FROM billing_yc_calendar_transition
+WHERE team_id = $1 AND operation_id = $2;
+
+SELECT * FROM team_billing_period
+WHERE team_id = $1
+ORDER BY period_start, period_end;
+```
 
 ## Review procedure for accounting conflicts
 
