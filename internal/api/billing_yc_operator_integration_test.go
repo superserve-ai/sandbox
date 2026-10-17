@@ -37,7 +37,23 @@ func TestYCOperatorLinkCreatesSubscriptionOnce(t *testing.T) {
 	runYCOperatorAdoption(t, false, "link", true)
 }
 
+func TestYCOperatorCalendarRecoveryWithoutPaymentReadiness(t *testing.T) {
+	for _, renewal := range []bool{false, true} {
+		for _, failure := range []string{"missing", "unavailable"} {
+			for _, conflict := range []bool{false, true} {
+				t.Run(fmt.Sprintf("renewal-%t/%s/conflict-%t", renewal, failure, conflict), func(t *testing.T) {
+					runYCOperatorAdoptionWithPaymentFailure(t, false, "card", failure, false, true, true, conflict, renewal)
+				})
+			}
+		}
+	}
+}
+
 func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, create ...bool) {
+	runYCOperatorAdoptionWithPaymentFailure(t, existing, methodType, "", create...)
+}
+
+func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, methodType, paymentFailure string, create ...bool) {
 	computeOnly := len(create) > 1 && create[1]
 	newSubscription := len(create) > 0 && create[0]
 	subscriptionCreated := !newSubscription
@@ -130,6 +146,7 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 		grant.Applicability.Scope.Prices[i].ID = "price_" + key
 	}
 	card := false
+	methodUnavailable := false
 	setupReady := false
 	methodOwner := "acct_customer"
 	writes := 0
@@ -152,6 +169,10 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 			}
 			output(map[string]any{"id": customer, "livemode": false, "customer_account": "acct_customer", "invoice_settings": map[string]any{"default_payment_method": pm}})
 		case r.URL.Path == "/v1/payment_methods/pm_card":
+			if methodUnavailable {
+				http.Error(w, "payment lookup unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			method := map[string]any{"id": "pm_card", "customer_account": methodOwner, "livemode": false, "type": methodType}
 			if methodType == "card" {
 				method["card"] = map[string]any{"exp_month": 12, "exp_year": now.Year() + 2}
@@ -339,6 +360,8 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 		if anchorChanged {
 			sub.BillingCycleAnchor += 3600
 		}
+		card = paymentFailure != "missing"
+		methodUnavailable = paymentFailure == "unavailable"
 		var before []byte
 		if err = h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(w) FROM billing_contract_waiver w WHERE team_id=$1`, team.ID).Scan(&before); err != nil {
 			t.Fatal(err)
@@ -346,6 +369,11 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 		for range 2 {
 			err = h.reconcileYC(t.Context(), team.ID)
 			wantError := ""
+			if paymentFailure == "missing" {
+				wantError = "payment_method_required"
+			} else if paymentFailure == "unavailable" {
+				wantError = "payment lookup unavailable"
+			}
 			if conflict {
 				wantError = "yc_calendar_conflict"
 			}
@@ -364,6 +392,20 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 			var unchanged bool
 			if err = h.Pool.QueryRow(t.Context(), `SELECT count(*)=1 AND bool_and(period_start=$2 AND period_end=$3) FROM team_billing_period WHERE team_id=$1`, team.ID, anchor.AddDate(0, 0, -13), anchor.AddDate(0, 0, 18)).Scan(&unchanged); err != nil || !unchanged {
 				t.Fatal("provider drift changed calendar", err)
+			}
+		}
+		if paymentFailure != "" {
+			eligible, err = h.DB.IsTeamSandboxBillingEligible(t.Context(), team.ID)
+			if err != nil || eligible {
+				t.Fatal("calendar recovery bypassed payment readiness", err)
+			}
+			var retained bool
+			end := anchor
+			if conflict {
+				end = anchor.AddDate(0, 0, 18)
+			}
+			if err = h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open')`, team.ID, anchor.AddDate(0, 0, -13), end).Scan(&retained); err != nil || !retained {
+				t.Fatal("payment failure lost historical interval", err)
 			}
 		}
 		if writes != 0 {

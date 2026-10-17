@@ -49,6 +49,8 @@ active operations and all operations entering annual renewal reconcile a missing
 receipt before continuing, without recreating contracts or provider state. They
 first verify that the provider subscription start and billing-cycle anchor still
 match the saved anniversary; drift leaves the periods and receipt unchanged.
+This recovery runs even when a missing payment method or payment-method lookup
+failure blocks subsequent billing; payment readiness still gates usage and renewal.
 
 For an untouched open `[legacy_start, legacy_end)` crossing the anniversary, it
 changes only its end to the anniversary and creates the adjacent anniversary

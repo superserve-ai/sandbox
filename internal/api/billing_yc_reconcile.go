@@ -116,17 +116,9 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 	if _, err = h.Pool.Exec(ctx, `UPDATE billing_yc_operation SET payment_method_ready=$2,payment_method_checked_at=clock_timestamp() WHERE team_id=$1`, team, ready); err != nil {
 		return err
 	}
-	if methodErr != nil {
-		return methodErr
-	}
-	if !ready {
-		return errors.New("payment_method_required: resource usage remains blocked")
-	}
-	if o.State == "ended" {
-		return nil
-	}
 	renewalDue := o.End.Valid && !time.Now().Before(o.End.Time)
-	if o.State == "active" || o.State == "renewed" || o.State == "renewal_pending" || renewalDue {
+	// Repair adopted accounting authority even when payment readiness blocks billing.
+	if o.State != "ended" && (o.State == "active" || o.State == "renewed" || o.State == "renewal_pending" || renewalDue) {
 		var reconciled bool
 		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE operation_id=$1 AND team_id=$2 AND anniversary=$3)`, o.ID, team, o.Start.Time).Scan(&reconciled); err != nil {
 			return err
@@ -147,6 +139,15 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 				return err
 			}
 		}
+	}
+	if methodErr != nil {
+		return methodErr
+	}
+	if !ready {
+		return errors.New("payment_method_required: resource usage remains blocked")
+	}
+	if o.State == "ended" {
+		return nil
 	}
 	if renewalDue {
 		return h.reconcileYCRenewal(ctx, o, sub, client, token)
