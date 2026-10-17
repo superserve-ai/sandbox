@@ -872,6 +872,18 @@ type BillingUsageExport struct {
 	StripeIdempotencyKey       *string            `json:"stripe_idempotency_key"`
 }
 
+type BillingYcCalendarTransition struct {
+	OperationID       uuid.UUID          `json:"operation_id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	Anniversary       time.Time          `json:"anniversary"`
+	PreviousAnchor    pgtype.Timestamptz `json:"previous_anchor"`
+	PreviousAccount   []byte             `json:"previous_account"`
+	ShortenedPeriods  []byte             `json:"shortened_periods"`
+	ApprovedBy        string             `json:"approved_by"`
+	EvidenceReference string             `json:"evidence_reference"`
+	CommittedAt       time.Time          `json:"committed_at"`
+}
+
 type BillingYcOperation struct {
 	TeamID                 uuid.UUID          `json:"team_id"`
 	ID                     uuid.UUID          `json:"id"`

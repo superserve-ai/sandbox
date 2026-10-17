@@ -96,6 +96,39 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 			return err
 		}
 	}
+	ready, err := client.ycPaymentMethod(ctx, o.Customer, sub, *o.Request.Live)
+	methodErr := err
+	if methodErr != nil {
+		ready = false
+	}
+	if _, err = h.Pool.Exec(ctx, `UPDATE billing_yc_operation SET payment_method_ready=$2,payment_method_checked_at=clock_timestamp() WHERE team_id=$1`, team, ready); err != nil {
+		return err
+	}
+	renewalDue := o.End.Valid && !time.Now().Before(o.End.Time)
+	// The verified anniversary can be saved before contract adoption commits.
+	// Reconcile that durable calendar independently of later billing checks.
+	if o.Subscription != "" && o.Start.Valid {
+		var reconciled bool
+		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE operation_id=$1 AND team_id=$2 AND anniversary=$3)`, o.ID, team, o.Start.Time).Scan(&reconciled); err != nil {
+			return err
+		}
+		if !reconciled {
+			if !o.Start.Valid || sub.ID != o.Subscription || sub.StartDate != o.Start.Time.Unix() || sub.BillingCycleAnchor != sub.StartDate {
+				return errors.New("adopted subscription association or anniversary changed")
+			}
+			tx, err := h.Pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx)
+			if err = h.lockAndReconcileYCCalendar(ctx, tx, o, token); err != nil {
+				return err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	if sub.LatestInvoice != "" {
 		var latest StripeInvoiceAmounts
 		if err = client.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(sub.LatestInvoice), nil, &latest, ""); err != nil {
@@ -108,14 +141,6 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 			return err
 		}
 	}
-	ready, err := client.ycPaymentMethod(ctx, o.Customer, sub, *o.Request.Live)
-	methodErr := err
-	if methodErr != nil {
-		ready = false
-	}
-	if _, err = h.Pool.Exec(ctx, `UPDATE billing_yc_operation SET payment_method_ready=$2,payment_method_checked_at=clock_timestamp() WHERE team_id=$1`, team, ready); err != nil {
-		return err
-	}
 	if methodErr != nil {
 		return methodErr
 	}
@@ -125,7 +150,7 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 	if o.State == "ended" {
 		return nil
 	}
-	if o.End.Valid && !time.Now().Before(o.End.Time) {
+	if renewalDue {
 		return h.reconcileYCRenewal(ctx, o, sub, client, token)
 	}
 	if o.Subscription == "" {
@@ -255,6 +280,13 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 				return err
 			}
 		}
+	}
+	var reconciled bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE operation_id=$1 AND team_id=$2 AND anniversary=$3)`, o.ID, team, o.Start.Time).Scan(&reconciled); err != nil {
+		return err
+	}
+	if !reconciled {
+		return errors.New("YC billing calendar reconciliation is required before activation")
 	}
 	if err = q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: team, StripeGrantID: ""}); err != nil {
 		return err
@@ -409,6 +441,28 @@ func (h *Handlers) ensureYCResources(ctx context.Context, o ycOperation, sub inv
 	}
 	return updated, validateFrozenProResources(resources, o.Params.ResourceTerms, rounding)
 }
+func (h *Handlers) lockAndReconcileYCCalendar(ctx context.Context, tx pgx.Tx, o ycOperation, token uuid.UUID) error {
+	q := h.DB.WithTx(tx)
+	if _, err := q.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: o.Customer, Token: token}); err != nil {
+		return err
+	}
+	// Match invoice enrollment's advisory-before-account order. The webhook
+	// lease still fences subscription association changes and stale retries.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+o.Team.String()); err != nil {
+		return err
+	}
+	a, err := q.LockTeamBillingAccount(ctx, o.Team)
+	if err != nil {
+		return err
+	}
+	if derefString(a.StripeCustomerID) != o.Customer || (a.StripeSubscriptionID != nil && *a.StripeSubscriptionID != o.Subscription) || (o.State == "ended" && derefString(a.StripeSubscriptionID) != o.Subscription) {
+		return errors.New("billing binding changed during adoption")
+	}
+	if _, err = tx.Exec(ctx, `SELECT reconcile_yc_billing_calendar($1,$2)`, o.Team, o.ID); err != nil {
+		return err
+	}
+	return nil
+}
 func (h *Handlers) persistYCContract(ctx context.Context, o ycOperation, sub invoiceSubscription, token uuid.UUID) error {
 	start, end, err := proMeteredPeriod(sub, proOffer{Key: "pro_annual", Price: o.Params.BasePriceID, Amount: 1200000, Months: 12})
 	if err != nil {
@@ -419,16 +473,8 @@ func (h *Handlers) persistYCContract(ctx context.Context, o ycOperation, sub inv
 		return err
 	}
 	defer tx.Rollback(ctx)
-	q := h.DB.WithTx(tx)
-	if _, err = q.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: o.Customer, Token: token}); err != nil {
+	if err = h.lockAndReconcileYCCalendar(ctx, tx, o, token); err != nil {
 		return err
-	}
-	a, err := q.LockTeamBillingAccount(ctx, o.Team)
-	if err != nil {
-		return err
-	}
-	if derefString(a.StripeCustomerID) != o.Customer || (a.StripeSubscriptionID != nil && *a.StripeSubscriptionID != o.Subscription) {
-		return errors.New("billing binding changed during adoption")
 	}
 	_, err = tx.Exec(ctx, `UPDATE billing_yc_operation SET state=CASE WHEN state='active' THEN state ELSE 'enrolling' END WHERE team_id=$1`, o.Team)
 	if err != nil {
