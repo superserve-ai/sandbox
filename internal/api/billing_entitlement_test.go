@@ -24,12 +24,12 @@ func TestEntitlementRequestRetainsImmediateActivation(t *testing.T) {
 	_ = json.Unmarshal(raw, &fields)
 	delete(fields, "effective_at")
 	raw, _ = json.Marshal(fields)
-	first, err := entitlementGrantForm(raw)
+	first, err := entitlementGrantForm(raw, []map[string]string{{"id": "cpu"}, {"id": "memory"}, {"id": "storage"}, {"id": "round"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(time.Millisecond)
-	replay, err := entitlementGrantForm(raw)
+	replay, err := entitlementGrantForm(raw, []map[string]string{{"id": "cpu"}, {"id": "memory"}, {"id": "storage"}, {"id": "round"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +75,17 @@ func TestEntitlementDebtChecksEveryFinalizedUnpaidStatus(t *testing.T) {
 	}
 }
 func TestInvoiceCreditTransactionsRejectFalseAttribution(t *testing.T) {
-	for _, bad := range []string{"", "wrong invoice", "wrong grant", "wrong line", "wrong scope", "changed ledger", "earlier credit skipped"} {
+	for _, bad := range []string{"", "compute only", "wrong invoice", "wrong grant", "wrong line", "wrong scope", "changed ledger", "earlier credit skipped"} {
 		t.Run(bad, func(t *testing.T) {
 			g := testEntitlementGrant()
+			if bad == "compute only" {
+				g.Applicability.Scope.Prices = g.Applicability.Scope.Prices[:3]
+			}
 			raw, _ := json.Marshal(g)
 			plan := billing.InvoiceClosePlan{CreditVersion: 1, Customer: g.Customer, ExpectedCents: 135000, InvoiceEnd: 200, CreditBeforeCents: 100000, CreditPrices: []string{"cpu", "memory", "round", "storage"}, CreditGrants: []billing.InvoiceCreditGrant{{ID: g.ID, Before: 100000, ExpiresAt: 201, Evidence: raw}}}
+			if bad == "compute only" {
+				plan.CreditPrices = plan.CreditPrices[:3]
+			}
 			var inv StripeInvoiceAmounts
 			_ = json.Unmarshal([]byte(`{"id":"in_example","customer":"cus_example","status":"open","total_pretax_credit_amounts":[{"type":"credit_balance_transaction","amount":100000,"credit_balance_transaction":"cbtxn_one"}],"lines":{"data":[{"id":"il_cpu","pricing":{"price_details":{"price":"cpu"}},"pretax_credit_amounts":[{"type":"credit_balance_transaction","amount":100000,"credit_balance_transaction":"cbtxn_one"}]}]}}`), &inv)
 			if bad == "wrong scope" {
@@ -133,7 +139,7 @@ func TestInvoiceCreditTransactionsRejectFalseAttribution(t *testing.T) {
 			defer srv.Close()
 			client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
 			remaining, err := client.verifyInvoiceCreditTransactions(t.Context(), inv, plan)
-			if bad == "" {
+			if bad == "" || bad == "compute only" {
 				if err != nil || remaining != 0 {
 					t.Fatalf("valid credit rejected: %d %v", remaining, err)
 				}

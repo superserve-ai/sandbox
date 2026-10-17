@@ -2,7 +2,7 @@
 
 An operator approval reserves a company globally, then records immutable commercial terms in its team's home region. Approval alone does not permit usage. The worker verifies an effective, customer-owned default card before activating billing. It preserves the subscription's original activation anniversary, including when card completion is delayed.
 
-The annual list price remains $12,000. A separate bounded waiver covers the first year's base fee; no payment receipt is fabricated. Monthly allowances are $30,000 for periods 1–3 and $1,000 for periods 4–12. They expire without rollover. CPU, memory, storage and rounding retain full usage exports and their existing invoice reconciliation. Overages remain payable.
+The annual list price remains $12,000. A separate bounded waiver covers the first year's base fee; no payment receipt is fabricated. Monthly allowances are $30,000 for periods 1–3 and $1,000 for periods 4–12. They expire without rollover. Credits cover the approved CPU and memory prices plus invoice rounding. Approved storage terms are also covered when present; storage billing remains subject to its separate prospective activation gate. Overages remain payable.
 
 ## Rollout
 
@@ -48,7 +48,7 @@ For a new signup omit the customer and subscription values (or use empty strings
 
 Preflight rejects customer/region/account/mode conflicts, concurrent checkout or promotion state, incompatible annual/resource terms, additional subscriptions and unbound live grants. It verifies a genuine zero-dollar discounted annual invoice for an existing subscription. Approval must remain separate from card collection. A mapped YC customer can use an exact-customer portal session before subscription activation; the summary exposes `payment_method_required`. A new operation may need one reconciliation pass to create its customer before this portal is available.
 
-Annual-only adoption adds monthly metered resources with no proration and no reset of the annual anchor. Existing owned grants are discovered and adopted through the shared entitlement machinery rather than topped up. An existing grant may be selected with `existing_grant_id`; preflight verifies its exact customer, current period, full amount and four-price scope and saves its evidence. A depleted grant is adopted without a top-up. If it expires before activation completes, that evidence remains historical and the new period can proceed. An unexpected grant stops adoption for operator reconciliation. Do not delete it or create another grant to bypass this check.
+Annual-only adoption adds monthly metered resources with no proration and no reset of the annual anchor. Existing owned grants are discovered and adopted through the shared entitlement machinery rather than topped up. An existing grant may be selected with `existing_grant_id`; preflight verifies its exact customer, current period, full amount and exact approved resource-price scope plus rounding and saves its evidence. A depleted grant is adopted without a top-up. If it expires before activation completes, that evidence remains historical and the new period can proceed. An unexpected grant stops adoption for operator reconciliation. Do not delete it or create another grant to bypass this check.
 
 Term-end cancellation is normalized to the original absolute annual boundary so monthly usage items cannot shorten the covered year. Access and eligible monthly grants continue within that term while billing remains current. Revocation preserves already-issued credit until expiry, then usage is payable without new YC allowances. At year end, a continuing subscription must supply a freshly verified paid annual receipt before the separate normal Pro Annual contract becomes active. Stripe owns collection; the transition never creates a second subscription or a duplicate charge.
 
@@ -59,3 +59,62 @@ Inspect `last_error` and the `yc_reconciliation` work metric. For provider timeo
 Before live activation, reproduce the annual-only existing customer with a discounted $0 first invoice and no card in staging. Confirm approval succeeds while an actual product create/resume remains blocked. Complete card setup, reconcile, then verify the same subscription/annual anniversary, Pro limits, one correctly scoped grant and successful product usage. Confirm measured usage exports and an overage invoice reconcile. Also validate Accounts v2-backed customer compatibility through its mapped `cus_` representation and the effective payment-method override; never impersonate the customer account as the merchant.
 
 Local tests cover waiver-backed monthly boundaries, no-card gating, grant timeout recovery, revocation and shared-auth RPC permissions. These tests do not replace deployed staging product-action and provider-invoice validation.
+
+## Compatible credit recovery rollout
+
+Apply `supabase/migrations/20261017000100_entitlement_activation_wakeup.sql` to
+**each regional billing database**, starting with staging, before deploying the
+API/workers. It does not belong in shared Auth. The migration only changes work
+scheduling: activation wakes delayed work, preserving leases; a generation guard
+prevents a stale worker acknowledgement from losing the wake. A one-time wake
+also covers already-active, unexpired contracts lacking their current issued
+allowance. Financial guards and approval history are unchanged.
+
+Keep invoice export and usage-entitlement workers enabled. Preserve each team's
+storage activation state. CPU/memory-only approvals need no storage price added
+to their frozen terms or subscriptions. New approvals verify canonical resource
+identities, unique prices/meters/events, currency, provider mode and rates.
+Invoice enrollment continues provisioning a missing rounding catalog. If storage
+is already activated, approval and issuance require approved storage coverage.
+Adding storage to current configuration cannot amend an existing subscription's
+frozen terms; normal storage activation rejects missing approved mappings.
+
+For an existing **approved** operation, resolve its normal payment-method and
+invoice-enrollment prerequisites, then use the existing `POST reconcile` (or
+`POST activate`). For an existing **active** operation, let the entitlement worker
+reconcile after deployment; the migration brings delayed work forward. No repair
+endpoint, reapproval, subscription replacement, anniversary reset or direct work
+row edit is needed. The existing `POST reconcile` drives YC activation, not a
+synchronous credit issuance promise.
+
+Before and after recovery, retain private evidence of operation/contract IDs,
+customer/subscription, frozen terms, first invoice, waiver and annual boundaries.
+Use `GET status` to distinguish `state: active` from `credit_issued: true` and
+inspect `credit_state`, `credit_error` and `credit_next_check_at`. Verify the
+current entitlement is `issued`, its amount matches the scheduled month, its
+scope is exactly the approved resources plus rounding (never the annual base
+price), and its grant expires at the mapped invoice boundary plus one second.
+Retry and verify the same entitlement/grant. Uncertain attempts retain their
+saved request, timestamps and idempotency key; discovery precedes replay within
+the existing 23-hour recovery window. Conflicting grants, stale uncertainty or
+provider ownership discrepancies require investigation, not payload rewrites.
+
+Pre-merge tests use a disposable PostgreSQL database and synthetic Stripe HTTP
+fixtures. They cover three-price issuance/adoption, full scheduled amounts,
+response loss and concurrent replay, invoice credit attribution, local validation
+rollback, disabled/enabled storage boundaries, and activation/deployment wakes
+with active leases. They are not actual Stripe staging acceptance.
+
+Staging acceptance must use an existing CPU/memory-only approval with storage
+disabled, activate it, verify one actual Stripe test-mode $30,000 grant and one
+issued entitlement, retry without duplication, and consume credits through the
+invoice reconciliation harness. Verify application access separately through the
+console; an active contract does not establish frontend routing or credit readiness.
+Record the deployed revision and regional migration evidence separately from the
+local test results. Do not apply this procedure to production without its separate
+operational coordination.
+
+Separate follow-ups remain for coupon product-restriction expansion during
+coupon retrieval and for billing-anchor changes colliding with an older open
+billing period. This recovery patch does not claim to validate the entire fresh
+signup path or resolve the separately owned console routing dependency.

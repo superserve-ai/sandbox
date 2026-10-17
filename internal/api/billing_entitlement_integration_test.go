@@ -44,6 +44,10 @@ type entitlementFixture struct {
 
 func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 	t.Helper()
+	resources := []string{"cpu", "memory", "storage"}
+	if len(annual) > 3 && annual[3] {
+		resources = resources[:2]
+	}
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		t.Fatal("DATABASE_URL must name a migrated disposable test database")
@@ -97,8 +101,8 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 		ycID, ycContract = uuid.New(), uuid.New()
 		offer = "yc_2026"
 		fixtureTerms := []StripeCheckoutResourceTerms{}
-		for _, r := range []string{"cpu", "memory", "storage"} {
-			fixtureTerms = append(fixtureTerms, StripeCheckoutResourceTerms{ResourceKey: r, PriceID: "price_" + r, UnitAmountDecimal: "1", MeterID: "mtr_price_" + r, EventName: r})
+		for _, r := range resources {
+			fixtureTerms = append(fixtureTerms, StripeCheckoutResourceTerms{ResourceKey: map[string]string{"cpu": "vcpu", "memory": "memory_gib", "storage": "storage_gib"}[r], PriceID: "price_" + r, UnitAmountDecimal: "1", MeterID: "mtr_price_" + r, EventName: r})
 		}
 		fixturePayload, _ := json.Marshal(StripeCreateCheckoutSessionParams{ResourceTerms: fixtureTerms})
 		request, _ := json.Marshal(ycApproval{CompanyIdentity: "https://www.ycombinator.com/companies/fixture-" + team.ID.String(), Region: "test", Live: new(bool)})
@@ -110,11 +114,16 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 		exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'yc_2026',$3,$4,$5,$6,'price_base',1200000,12,'metered_usage',100000,'scheduled',$3)`, ycContract, team.ID, anchor, coverageEnd, customer, subscription)
 		exec(`INSERT INTO billing_contract_entitlement_schedule(team_id,contract_id,month_offset,amount_cents) SELECT $1,$2,m,CASE WHEN m<3 THEN 3000000 ELSE 100000 END FROM generate_series(0,11) m`, team.ID, ycContract)
 		exec(`INSERT INTO billing_contract_waiver(id,team_id,contract_id,offer_key,offer_version,customer_id,subscription_id,starts_at,ends_at,collectible_base_cents) VALUES($1,$2,$3,'yc_2026',1,$4,$5,$6,$7,0)`, ycID, team.ID, ycContract, customer, subscription, anchor, coverageEnd)
-		c, err = h.DB.ActivateCommercialContract(t.Context(), db.ActivateCommercialContractParams{TeamID: team.ID, ContractID: ycContract, ExpectedRevision: 0})
+		if len(annual) > 2 && annual[2] {
+			c, err = h.DB.GetCommercialContract(t.Context(), db.GetCommercialContractParams{TeamID: team.ID, ContractID: ycContract})
+			exec(`INSERT INTO billing_entitlement_work(contract_id) VALUES($1)`, ycContract)
+		} else {
+			c, err = h.DB.ActivateCommercialContract(t.Context(), db.ActivateCommercialContractParams{TeamID: team.ID, ContractID: ycContract, ExpectedRevision: 0})
+			exec(`UPDATE billing_yc_operation SET state='active' WHERE id=$1`, ycID)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		exec(`UPDATE billing_yc_operation SET state='active' WHERE id=$1`, ycID)
 	} else {
 		c, err = h.DB.CreateCommercialContract(t.Context(), db.CreateCommercialContractParams{TeamID: team.ID, OfferKey: offer, StartsAt: anchor, CustomerID: customer, SubscriptionID: subscription, BasePriceID: "price_base", ChargeAmountCents: amount, ChargeIntervalMonths: months, EntitlementKind: "metered_usage", EntitlementAmountCents: 100000, EntitlementCadence: "monthly", EntitlementAnchor: anchor})
 		if err != nil {
@@ -135,9 +144,9 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 	price := func(id, usage string) map[string]any {
 		return map[string]any{"id": id, "active": true, "currency": "usd", "unit_amount_decimal": "1", "billing_scheme": "per_unit", "recurring": map[string]any{"usage_type": usage, "interval": "month", "interval_count": 1, "meter": "mtr_" + id}}
 	}
-	for _, r := range []string{"cpu", "memory", "storage"} {
+	for _, r := range resources {
 		id := "price_" + r
-		terms = append(terms, StripeCheckoutResourceTerms{ResourceKey: r, PriceID: id, UnitAmountDecimal: "1", MeterID: "mtr_" + id, EventName: r})
+		terms = append(terms, StripeCheckoutResourceTerms{ResourceKey: map[string]string{"cpu": "vcpu", "memory": "memory_gib", "storage": "storage_gib"}[r], PriceID: id, UnitAmountDecimal: "1", MeterID: "mtr_" + id, EventName: r})
 		items = append(items, map[string]any{"id": "si_" + r, "price": price(id, "metered"), "current_period_start": start.Unix(), "current_period_end": end.Unix()})
 	}
 	items = append(items, map[string]any{"id": "si_round", "price": price("price_round", "metered"), "current_period_start": start.Unix(), "current_period_end": end.Unix()})
@@ -223,6 +232,7 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 			g.EffectiveAt = g.Created
 			g.ExpiresAt = end.Unix() + 1
 			g.Metadata = map[string]string{"entitlement_id": r.Form.Get("metadata[entitlement_id]")}
+			g.Applicability.Scope.Prices = g.Applicability.Scope.Prices[:len(resources)+1]
 			for i := range g.Applicability.Scope.Prices {
 				g.Applicability.Scope.Prices[i].ID = r.Form.Get(fmt.Sprintf("applicability_config[scope][prices][%d][id]", i))
 			}

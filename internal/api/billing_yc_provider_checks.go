@@ -141,6 +141,9 @@ func (c *stripeHTTPClient) validateYCExistingGrant(ctx context.Context, sub invo
 	if prices.HasMore || len(prices.Data) != 1 {
 		return g, errors.New("existing grant requires a unique rounding price")
 	}
+	if err = validateEntitlementResourceTerms(p.ResourceTerms, prices.Data[0].ID, invoiceRoundingEvent, prices.Data[0].Recurring.Meter, false); err != nil {
+		return g, err
+	}
 	scope := []string{prices.Data[0].ID}
 	for _, t := range p.ResourceTerms {
 		scope = append(scope, t.PriceID)
@@ -148,7 +151,7 @@ func (c *stripeHTTPClient) validateYCExistingGrant(ctx context.Context, sub invo
 	if err = creditScope(g, sub.Customer, end.Unix(), scope); err != nil {
 		return g, err
 	}
-	if g.Category != "promotional" || g.Amount.Monetary.Value != amount || g.EffectiveAt < start.Unix()+1 || g.EffectiveAt > time.Now().Unix() || g.Created < sub.StartDate || g.Created > g.EffectiveAt || g.ExpiresAt != end.Unix()+1 || g.Applicability.Scope.PriceType != "" || len(g.Applicability.Scope.Prices) != 4 {
+	if g.Category != "promotional" || g.Amount.Monetary.Value != amount || g.EffectiveAt < start.Unix()+1 || g.EffectiveAt > time.Now().Unix() || g.Created < sub.StartDate || g.Created > g.EffectiveAt || g.ExpiresAt != end.Unix()+1 || g.Applicability.Scope.PriceType != "" || len(g.Applicability.Scope.Prices) != len(scope) {
 		return g, errors.New("existing grant does not match the current full YC allowance")
 	}
 	balance, err := c.grantLedgerBalance(ctx, sub.Customer, id)

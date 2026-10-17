@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,11 @@ func TestYCOperatorAnnualOnlyAdoption(t *testing.T) {
 		t.Run(fmt.Sprint("depleted-grant-", existing), func(t *testing.T) { runYCOperatorAdoption(t, existing, "card") })
 	}
 }
+func TestYCOperatorComputeOnlyCredits(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprint(existing), func(t *testing.T) { runYCOperatorAdoption(t, existing, "card", false, true) })
+	}
+}
 func TestYCOperatorLinkAdoption(t *testing.T) { runYCOperatorAdoption(t, true, "link") }
 
 func TestYCOperatorLinkCreatesSubscriptionOnce(t *testing.T) {
@@ -32,6 +38,7 @@ func TestYCOperatorLinkCreatesSubscriptionOnce(t *testing.T) {
 }
 
 func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, create ...bool) {
+	computeOnly := len(create) > 1 && create[1]
 	newSubscription := len(create) > 0 && create[0]
 	subscriptionCreated := !newSubscription
 	subscriptionWrites := 0
@@ -66,7 +73,11 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"vcpu", "memory_gib", "storage_gib"} {
+	keys := []string{"vcpu", "memory_gib", "storage_gib"}
+	if computeOnly {
+		keys = keys[:2]
+	}
+	for _, key := range keys {
 		id := "price_" + key
 		h.Config.BillingResources = append(h.Config.BillingResources, config.BillingResourceConfig{ResourceKey: key, UsageUnit: "second", StripePriceID: id, StripeEventName: key, Tracked: true, Billable: true, CheckoutEnabled: true})
 		amount := ""
@@ -83,14 +94,14 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 		if amount == "" {
 			t.Fatal("missing rate", key)
 		}
-		price := storagePrice{ID: id, Active: true, Currency: "usd", BillingScheme: "per_unit", UnitAmountDecimal: amount}
+		price := storagePrice{ID: id, Product: "prod_" + key, Active: true, Currency: "usd", BillingScheme: "per_unit", UnitAmountDecimal: amount}
 		price.Recurring.UsageType = "metered"
 		price.Recurring.Interval = "month"
 		price.Recurring.IntervalCount = 1
 		price.Recurring.Meter = "mtr_" + key
 		prices[id] = price
 	}
-	rounding := storagePrice{ID: "price_round", Active: true, Currency: "usd", BillingScheme: "per_unit", UnitAmountDecimal: "1"}
+	rounding := storagePrice{ID: "price_round", Product: invoiceRoundingProduct, Active: true, Currency: "usd", BillingScheme: "per_unit", UnitAmountDecimal: "1"}
 	rounding.Recurring.UsageType = "metered"
 	rounding.Recurring.Interval = "month"
 	rounding.Recurring.IntervalCount = 1
@@ -104,13 +115,16 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 	grant.EffectiveAt = grant.Created
 	grant.ExpiresAt = anchor.AddDate(0, 1, 0).Unix() + 1
 	grant.Metadata = nil
-	for i, key := range []string{"vcpu", "memory_gib", "storage_gib", "round"} {
+	grant.Applicability.Scope.Prices = grant.Applicability.Scope.Prices[:len(keys)+1]
+	for i, key := range append(append([]string{}, keys...), "round") {
 		grant.Applicability.Scope.Prices[i].ID = "price_" + key
 	}
 	card := false
 	setupReady := false
 	methodOwner := "acct_customer"
 	writes := 0
+	grantWrites := 0
+	issued := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		output := func(v any) { _ = json.NewEncoder(w).Encode(v) }
@@ -171,6 +185,9 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 					sub.Metadata["yc_usage_attached"] = r.Form.Get("metadata[yc_usage_attached]")
 					for i := 0; i < 3; i++ {
 						id := r.Form.Get(fmt.Sprintf("items[%d][price]", i))
+						if id == "" {
+							break
+						}
 						sub.Items.Data = append(sub.Items.Data, invoiceSubscriptionItem{ID: "si_" + id, Price: prices[id], Start: anchor.Unix(), End: anchor.AddDate(0, 1, 0).Unix()})
 					}
 					if r.Form.Get("proration_behavior") != "none" {
@@ -204,8 +221,21 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 			}
 			output(map[string]any{"data": meters})
 		case r.URL.Path == "/v1/billing/credit_grants":
+			if r.Method == http.MethodPost {
+				grantWrites++
+				grant.Metadata = map[string]string{"entitlement_id": r.Form.Get("metadata[entitlement_id]")}
+				grant.Amount.Monetary.Value, _ = strconv.ParseInt(r.Form.Get("amount[monetary][value]"), 10, 64)
+				grant.Created = time.Now().Unix()
+				grant.EffectiveAt = grant.Created
+				for i := range grant.Applicability.Scope.Prices {
+					grant.Applicability.Scope.Prices[i].ID = r.Form.Get(fmt.Sprintf("applicability_config[scope][prices][%d][id]", i))
+				}
+				issued = true
+				http.Error(w, "lost response", 503)
+				return
+			}
 			grants := []entitlementGrant{}
-			if existing {
+			if existing || issued {
 				grants = append(grants, grant)
 			}
 			output(map[string]any{"data": grants})
@@ -294,7 +324,7 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 	if err != nil || !eligible {
 		t.Fatal("usage after card", err)
 	}
-	if len(sub.Items.Data) != 5 {
+	if len(sub.Items.Data) != len(keys)+2 {
 		t.Fatalf("duplicated or missing resources: %d", len(sub.Items.Data))
 	}
 	if err = h.reconcileYC(t.Context(), team.ID); err != nil {
@@ -302,6 +332,33 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 	}
 	if newSubscription && subscriptionWrites != 1 {
 		t.Fatalf("created %d subscriptions", subscriptionWrites)
+	}
+	if !existing {
+		before, _ := json.Marshal(o)
+		if _, err = h.reconcileUsageEntitlement(t.Context(), o.Contract); err == nil {
+			t.Fatal("expected lost response")
+		}
+		for i := 0; i < 2; i++ {
+			if _, err = h.reconcileUsageEntitlement(t.Context(), o.Contract); err != nil {
+				t.Fatal(err)
+			}
+		}
+		e, eerr := h.DB.GetCurrentUsageEntitlement(t.Context(), db.GetCurrentUsageEntitlementParams{TeamID: team.ID, Kind: "metered_usage"})
+		if eerr != nil || e.State != "issued" || grantWrites != 1 || grant.Amount.Monetary.Value != 3000000 {
+			t.Fatal("full grant recovery", e.State, grantWrites, eerr)
+		}
+		after, _ := h.ycOperation(t.Context(), team.ID)
+		afterRaw, _ := json.Marshal(after)
+		if !bytes.Equal(before, afterRaw) {
+			t.Fatal("issuance rewrote frozen operation")
+		}
+		scope := []string{"price_round"}
+		for _, key := range keys {
+			scope = append(scope, "price_"+key)
+		}
+		if err = creditScope(grant, customer, anchor.AddDate(0, 1, 0).Unix(), scope); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var receipts int
 	if err = h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_contract_payment WHERE contract_id=$1`, o.Contract).Scan(&receipts); err != nil || receipts != 0 {
@@ -317,7 +374,7 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 			t.Fatal(eerr)
 		}
 		plan := billing.InvoiceClosePlan{InvoiceEnd: anchor.AddDate(0, 1, 0).Unix()}
-		for _, key := range []string{"vcpu", "memory_gib", "storage_gib"} {
+		for _, key := range keys {
 			plan.Resources = append(plan.Resources, billing.InvoiceCloseResource{PriceID: "price_" + key})
 		}
 		if eerr = h.prepareEntitlementCredits(t.Context(), billing.ExportPeriod{TeamID: team.ID, Start: anchor, End: anchor.AddDate(0, 1, 0)}, account, "in_overage", &plan, h.Stripe.(*stripeHTTPClient)); eerr != nil {

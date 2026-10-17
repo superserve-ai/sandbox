@@ -440,6 +440,8 @@ type BillingEntitlementWork struct {
 	InventoryCursor    *string            `json:"inventory_cursor"`
 	InventoryNewHead   *string            `json:"inventory_new_head"`
 	InventoryCheckedAt pgtype.Timestamptz `json:"inventory_checked_at"`
+	WakeGeneration     int64              `json:"wake_generation"`
+	LeaseGeneration    int64              `json:"lease_generation"`
 }
 
 type BillingExportAllocation struct {
