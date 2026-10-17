@@ -104,6 +104,28 @@ class DrainTests(unittest.TestCase):
         with self.assertRaisesRegex(drain.common.GateError, 'not verifiably retired'):
             self.runner.barrier()
 
+    def test_missing_or_invalid_generations_cannot_prove_retirement(self):
+        for generation in (None, '', '0', 'unknown'):
+            with self.subTest(generation=generation):
+                provider = Provider()
+                revision = provider.revisions[0]
+                revision.pop('generation', None)
+                revision.pop('observedGeneration', None)
+                if generation is not None:
+                    revision.update(generation=generation, observedGeneration=generation)
+                runner = drain.Drain(drain.inventory(provider.request), IMAGE, '123',
+                                     versions={k: '9' for k in drain.common.SECRETS},
+                                     get=provider.request, sleep=lambda _: None)
+                runner.pause()
+                with self.assertRaisesRegex(drain.common.GateError, 'not verifiably retired'):
+                    runner.barrier()
+
+    def test_missing_service_generations_do_not_prove_readiness(self):
+        self.provider.service.pop('generation')
+        self.provider.service.pop('observedGeneration')
+        with self.assertRaisesRegex(drain.common.GateError, 'reconciling'):
+            drain.inventory(self.provider.request)
+
     def test_missing_revision_is_not_assumed_deleted(self):
         self.runner.pause()
         self.provider.revisions.pop(0)

@@ -14,6 +14,12 @@ PARENT = f'projects/{common.PROJECT}/locations/{common.REGION}'
 API = 'https://run.googleapis.com/v2/'
 
 
+def current_generation(resource):
+    generation = resource.get('generation')
+    return (isinstance(generation, str) and re.fullmatch(r'[1-9][0-9]*', generation) is not None
+            and resource.get('observedGeneration') == generation)
+
+
 def request(path, body=None, mask=None):
     require(path.startswith(PARENT + '/'), 'Cloud Run target outside staging region')
     token = common.command(['gcloud', 'auth', 'print-access-token'])
@@ -49,7 +55,7 @@ def inventory(get=request):
     require(all(r['name'].startswith(SERVICE + '/revisions/') and r.get('uid') for r in revisions),
             'Revision identity mismatch')
     require(service.get('name') == SERVICE and service.get('uid') and service.get('etag'), 'Service identity unavailable')
-    require(not service.get('reconciling') and service.get('observedGeneration') == service.get('generation'),
+    require(not service.get('reconciling') and current_generation(service),
             'Service is reconciling')
     require(service.get('terminalCondition', {}).get('state') == 'CONDITION_SUCCEEDED', 'Service is not ready')
     require(len(service['template']['containers']) == 1, 'Only one-container service is supported')
@@ -69,7 +75,7 @@ def configuration(state):
 
 def retired(revision):
     return (not revision.get('reconciling')
-            and revision.get('observedGeneration') == revision.get('generation')
+            and current_generation(revision)
             and any(c.get('revisionReason') == 'RETIRED' and c.get('state') == 'CONDITION_FAILED'
                     for c in revision.get('conditions', [])))
 
@@ -128,7 +134,7 @@ class Drain:
         for _ in range(60):
             service = self.get(SERVICE)
             if not service.get('reconciling'):
-                require(service.get('observedGeneration') == service.get('generation')
+                require(current_generation(service)
                         and service.get('generation') == self.expected_generation
                         and service.get('terminalCondition', {}).get('state') == 'CONDITION_SUCCEEDED',
                         'Cloud Run update did not succeed; stop and inspect recovery instructions')
