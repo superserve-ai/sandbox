@@ -43,7 +43,10 @@ advisory lock, the billing-account lock, existing contract locks, and period loc
 in that order. It reconciles periods **before** saving the local subscription association,
 commercial anchor, contract, or waiver. A conflict rolls back that transaction.
 Saved provider identities and earlier partial enrollment remain available for
-recovery. YC operations cannot independently enroll invoices until the
+recovery. A saved anniversary is sufficient to reconcile the calendar even when
+the worker stopped in `provider_pending` before contract adoption. That repair
+does not create the contract, waiver, or provider resources; activation continues
+only after its remaining checks pass. YC operations cannot independently enroll invoices until the
 transition has a receipt, and activation requires that receipt. Previously
 active operations and all operations entering annual renewal reconcile a missing
 receipt before continuing, without recreating contracts or provider state. They

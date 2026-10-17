@@ -38,7 +38,7 @@ func TestYCOperatorLinkCreatesSubscriptionOnce(t *testing.T) {
 }
 
 func TestYCOperatorCalendarRecoveryBeforeBillingChecks(t *testing.T) {
-	for _, state := range []string{"enrolling", "active", "renewed", "renewal_pending", "ended"} {
+	for _, state := range []string{"provider_pending", "enrolling", "active", "renewed", "renewal_pending", "ended"} {
 		renewal := state == "renewed" || state == "renewal_pending" || state == "ended"
 		for _, failure := range []string{"missing", "unavailable", "invoice-unavailable"} {
 			for _, conflict := range []bool{false, true} {
@@ -360,7 +360,9 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 			t.Fatal(err)
 		}
 		f := &ycCalendarFixture{h: h, o: o}
-		f.savePartial(t)
+		if recoveryState != "provider_pending" {
+			f.savePartial(t)
+		}
 		state := "active"
 		if renewalPending {
 			state = "renewal_pending"
@@ -384,7 +386,7 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 		methodUnavailable = recoveryFailure == "unavailable"
 		invoiceUnavailable = recoveryFailure == "invoice-unavailable"
 		var before []byte
-		if err = h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(w) FROM billing_contract_waiver w WHERE team_id=$1`, team.ID).Scan(&before); err != nil {
+		if err = h.Pool.QueryRow(t.Context(), `SELECT COALESCE((SELECT to_jsonb(w) FROM billing_contract_waiver w WHERE team_id=$1),'null'::jsonb)`, team.ID).Scan(&before); err != nil {
 			t.Fatal(err)
 		}
 		for range 2 {
@@ -408,7 +410,7 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 			}
 		}
 		var preserved, reconciled bool
-		if err = h.Pool.QueryRow(t.Context(), `SELECT (SELECT to_jsonb(w)=$2::jsonb FROM billing_contract_waiver w WHERE team_id=$1),EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1)`, team.ID, before).Scan(&preserved, &reconciled); err != nil || !preserved || reconciled == (conflict || anchorChanged) {
+		if err = h.Pool.QueryRow(t.Context(), `SELECT COALESCE((SELECT to_jsonb(w) FROM billing_contract_waiver w WHERE team_id=$1),'null'::jsonb)=$2::jsonb,EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1)`, team.ID, before).Scan(&preserved, &reconciled); err != nil || !preserved || reconciled == (conflict || anchorChanged) {
 			t.Fatal("active recovery lost authority or completion evidence", err)
 		}
 		if anchorChanged {
@@ -431,6 +433,12 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 			}
 			if err = h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open')`, team.ID, anchor.AddDate(0, 0, -13), end).Scan(&retained); err != nil || !retained {
 				t.Fatal("readiness failure lost historical interval", err)
+			}
+		}
+		if state == "provider_pending" {
+			var unadopted bool
+			if err = h.Pool.QueryRow(t.Context(), `SELECT o.state='provider_pending' AND a.stripe_subscription_id IS NULL AND a.commercial_billing_anchor IS NULL AND NOT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE id=o.contract_id) FROM billing_yc_operation o JOIN team_billing_account a USING(team_id) WHERE o.team_id=$1`, team.ID).Scan(&unadopted); err != nil || !unadopted {
+				t.Fatal("calendar recovery prematurely adopted contract", err)
 			}
 		}
 		if state == "ended" {

@@ -105,9 +105,9 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 		return err
 	}
 	renewalDue := o.End.Valid && !time.Now().Before(o.End.Time)
-	// Repair adopted accounting authority even when payment readiness blocks billing.
-	endedAdoption := o.State == "ended" && o.Subscription != "" && o.Start.Valid
-	if endedAdoption || (o.State != "ended" && (o.State == "enrolling" || o.State == "active" || o.State == "renewed" || o.State == "renewal_pending" || renewalDue)) {
+	// The verified anniversary can be saved before contract adoption commits.
+	// Reconcile that durable calendar independently of later billing checks.
+	if o.Subscription != "" && o.Start.Valid {
 		var reconciled bool
 		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE operation_id=$1 AND team_id=$2 AND anniversary=$3)`, o.ID, team, o.Start.Time).Scan(&reconciled); err != nil {
 			return err
