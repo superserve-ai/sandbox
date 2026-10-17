@@ -7,7 +7,7 @@ subscription, waiver, or grant to work around the overlap.
 
 ## Deployment order and destination
 
-Apply `20261017000200_yc_billing_calendar_transition.sql` to **regional billing
+Apply `20261017012100_yc_billing_calendar_transition.sql` to **regional billing
 PostgreSQL databases**, starting with staging. With the repository migration
 runner these destinations are `staging`, then, only under a separately authorized
 production rollout, `use4` and `usw2`. This is not a shared Auth migration. It
