@@ -31,6 +31,7 @@ type reconciliationDB struct {
 	publication                 bool
 	finalized                   bool
 	finalizeCalls               int
+	allocationVerified          bool
 	acceptCalls                 int
 	firstStarted                *time.Time
 	transitions                 []string
@@ -98,6 +99,7 @@ func (m *reconciliationDB) QueryRow(_ context.Context, sql string, args ...inter
 		return reconciliationRow{values: []any{true}}
 	case strings.Contains(sql, "SELECT finalize_template_build"):
 		m.finalizeCalls++
+		m.allocationVerified = args[6].(bool)
 		m.finalized = true
 		return reconciliationRow{values: []any{true}}
 	case strings.Contains(sql, "SELECT template_id,team_id FROM template_build"):
@@ -350,7 +352,7 @@ func TestReconcileExecutionRecordsDurableManifestBeforeHostRetry(t *testing.T) {
 }
 
 func readyBuildStatus() vmdclient.BuildStatusResult {
-	return vmdclient.BuildStatusResult{Status: "ready", AllocatedBytesSupported: true,
+	return vmdclient.BuildStatusResult{Status: "ready", AllocatedBytesSupported: true, AllocationsVerified: true,
 		RootfsPath: "/snapshots/example/rootfs.ext4", SnapshotPath: "/snapshots/example/snapshot",
 		MemFilePath: "/snapshots/example/mem", SizeBytes: 4096, RootfsAllocatedBytes: 2048,
 		ResolvedDigest: "sha256:example"}
@@ -576,5 +578,20 @@ func TestAPublicationSurvivesAnUnreachableProducer(t *testing.T) {
 	}
 	if m.acceptCalls != 1 {
 		t.Fatalf("acceptance required a live producer: acceptCalls=%d", m.acceptCalls)
+	}
+}
+
+func TestFinalizationPreservesAllocationCapabilityAcrossHostVersions(t *testing.T) {
+	for _, verified := range []bool{false, true} {
+		s, m, v := newReconciliationFixture()
+		v.result = readyBuildStatus()
+		v.result.RootfsAllocatedBytes = 0
+		v.result.AllocationsVerified = verified
+		if err := s.reconcileExecution(context.Background(), m.buildID); err != nil {
+			t.Fatal(err)
+		}
+		if m.finalizeCalls != 1 || m.allocationVerified != verified {
+			t.Fatalf("finalizer changed producer evidence: calls=%d verified=%v want=%v", m.finalizeCalls, m.allocationVerified, verified)
+		}
 	}
 }

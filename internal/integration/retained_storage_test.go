@@ -190,6 +190,9 @@ func TestRetainedStorageTemplateDeltaCutoverParity(t *testing.T) {
 			exec(`UPDATE sandbox SET created_at=$2,template_id=$3,base_path=NULL,delta_path='/example/template/delta.ext4' WHERE id=$1`, f.sandboxID, start, template)
 			exec(`INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
  VALUES($1,'delta.ext4','/example/template/delta.ext4',1048576,1048576,$2)`, template, strings.Repeat("0", 64))
+			exec(`SET LOCAL session_replication_role=replica`)
+			exec(`UPDATE artifact_manifest SET allocation_eligible_at=$2 WHERE template_id=$1`, template, start)
+			exec(`SET LOCAL session_replication_role=origin`)
 			if tc.legacyAfter {
 				// A different owner reports the shared template delta while this
 				// legacy reference remains open on the same or another host.
@@ -1443,6 +1446,9 @@ func TestRetainedStorageTemplateRebuildKeepsPersistedBaselineGeneration(t *testi
  VALUES($1,$2,'example-template','ready','{}'::jsonb,$3,$4,$5,1,1024,1024)`, templateID, team, newRootfsPath, newSnapshotPath, "/example/templates/base/build-b/mem.snap")
 	exec(`INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
  VALUES($1,'rootfs.ext4',$2,1048576,1048576,$3),($1,'rootfs.ext4',$4,1048576,1048576,$3)`, templateID, oldRootfsPath, strings.Repeat("0", 64), newRootfsPath)
+	exec(`SET LOCAL session_replication_role=replica`)
+	exec(`UPDATE artifact_manifest SET allocation_eligible_at=$2 WHERE template_id=$1`, templateID, start)
+	exec(`SET LOCAL session_replication_role=origin`)
 	exec(`UPDATE sandbox SET created_at=$2,template_id=$3,snapshot_path=$4,base_path=NULL,delta_path=NULL WHERE id=$1`, f.sandboxID, start, templateID, oldSnapshotPath)
 	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,template_id,snapshot_path)
  VALUES($1,$2,'example-rollback-generation','paused',$3,1,1024,2,$4,$5,$6)`, rollbackOwner, team, f.hostID, start.Add(10*time.Second), templateID, newSnapshotPath)

@@ -28,6 +28,8 @@ func TestIntegration_BillingMissingLegacyStorage(t *testing.T) {
 		{"missing history before activation", true, 2 * time.Hour, false, http.StatusOK},
 		{"missing billable measurements", true, 0, false, http.StatusServiceUnavailable},
 		{"measured zero", false, -1, true, http.StatusOK},
+		{"placeholder without activation", true, -1, false, http.StatusOK},
+		{"placeholder with activation", true, 0, false, http.StatusServiceUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			team, key, _ := seedTeamAndKeyWithRole(t, "viewer")
@@ -57,9 +59,12 @@ func TestIntegration_BillingMissingLegacyStorage(t *testing.T) {
 				VALUES($1,$2,'default',0,$3,$4,'deleted')`, sandbox, team, start, start.Add(time.Hour))
 			storageExec(t, `INSERT INTO sandbox_compute_billing_interval(sandbox_id,team_id,vcpu_count,memory_mib,started_at,ended_at,end_reason)
 				VALUES($1,$2,1,1024,$3,$4,'paused')`, sandbox, team, start, start.Add(time.Hour))
-			if tc.measuredZero {
+			if tc.measuredZero || strings.Contains(tc.name, "placeholder") {
 				storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
 					SELECT id,'base.ext4',rootfs_path,0,0,repeat('0',64) FROM template WHERE id=$1`, template)
+			}
+			if tc.measuredZero {
+				seedHistoricalTemplateEvidence(t, template, "/templates/"+template.String()+"/base.ext4", start)
 			}
 			storageCharge := 0.0
 			if tc.activation > 0 {

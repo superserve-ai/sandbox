@@ -406,6 +406,7 @@ func (s *BuildSupervisor) pollOne(ctx context.Context, row db.TemplateBuild) {
 			RootfsAllocatedBytes: rootfsAllocated,
 			BaseAllocatedBytes:   baseAllocated,
 			DeltaAllocatedBytes:  deltaAllocated,
+			AllocationsVerified:  res.AllocationsVerified,
 		})
 		cancel()
 		if errors.Is(err, pgx.ErrNoRows) {

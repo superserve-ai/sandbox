@@ -318,10 +318,12 @@ WHERE template.id = build_done.template_id
 RETURNING template.*
 ), artifacts AS (
 INSERT INTO artifact_manifest (
-    template_id, file_name, path, size_bytes, allocated_bytes, sha256
+    template_id, file_name, path, size_bytes, allocated_bytes, sha256,
+    allocation_measured_at, allocation_build_id
 )
 SELECT DISTINCT ON (a.path) updated.id, a.file_name, a.path, a.size_bytes, a.allocated_bytes,
-       repeat('0', 64)
+       repeat('0', 64),
+       CASE WHEN sqlc.arg('allocations_verified')::boolean AND a.allocated_bytes>=0 THEN clock_timestamp() END,$1
 FROM updated
 CROSS JOIN LATERAL (
     VALUES
@@ -334,7 +336,10 @@ ORDER BY a.path, (a.file_name = 'rootfs.ext4') DESC
 ON CONFLICT (template_id, path) WHERE template_id IS NOT NULL DO UPDATE
 SET path = EXCLUDED.path,
     size_bytes = EXCLUDED.size_bytes,
-    allocated_bytes = EXCLUDED.allocated_bytes
+    allocated_bytes = EXCLUDED.allocated_bytes,
+    allocation_measured_at = EXCLUDED.allocation_measured_at,
+    allocation_build_id = EXCLUDED.allocation_build_id,
+    allocation_attempt_id = NULL
 RETURNING 1
 )
 SELECT * FROM updated;

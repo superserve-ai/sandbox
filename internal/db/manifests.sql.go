@@ -21,7 +21,7 @@ func (q *Queries) DeleteSnapshotManifest(ctx context.Context, snapshotID pgtype.
 }
 
 const listSnapshotManifest = `-- name: ListSnapshotManifest :many
-SELECT id, snapshot_id, template_id, file_name, path, size_bytes, sha256, base_path, guest_kernel, vmd_version, created_at, allocated_bytes FROM artifact_manifest
+SELECT id, snapshot_id, template_id, file_name, path, size_bytes, sha256, base_path, guest_kernel, vmd_version, created_at, allocated_bytes, allocation_measured_at, allocation_eligible_at, allocation_build_id, allocation_attempt_id FROM artifact_manifest
 WHERE snapshot_id = $1
 ORDER BY file_name
 `
@@ -48,6 +48,10 @@ func (q *Queries) ListSnapshotManifest(ctx context.Context, snapshotID pgtype.UU
 			&i.VmdVersion,
 			&i.CreatedAt,
 			&i.AllocatedBytes,
+			&i.AllocationMeasuredAt,
+			&i.AllocationEligibleAt,
+			&i.AllocationBuildID,
+			&i.AllocationAttemptID,
 		); err != nil {
 			return nil, err
 		}
