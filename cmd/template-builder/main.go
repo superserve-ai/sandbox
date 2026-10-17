@@ -60,6 +60,7 @@ func main() {
 	launcherNS := flag.String("launcher-ns", "", "path to vmd's pruned launcher mount-namespace pin; empty selects the legacy `ip netns exec` launch")
 	netlinkOps := flag.Bool("netlink-slot-ops", false, "build this VM's network slot over netlink instead of forking iproute2")
 	freezeWorkload := flag.Bool("freeze-workload", false, "freeze the guest's workload for the snapshot when it proves it corrects its clock, and mark the image")
+	punchZeroHoles := flag.Bool("punch-zero-holes", false, "punch the snapshot memory's all-zero blocks into holes so restores can leave them to the kernel")
 	timeout := flag.Duration("timeout", 15*time.Minute, "build timeout")
 	flag.Parse()
 
@@ -101,6 +102,7 @@ func main() {
 		launcherNS:     *launcherNS,
 		netlinkOps:     *netlinkOps,
 		freezeWorkload: *freezeWorkload,
+		punchZeroHoles: *punchZeroHoles,
 	})
 	if err != nil {
 		// Emit a user-visible error (stable code + user-friendly message)
@@ -200,6 +202,8 @@ type buildConfig struct {
 	// the supervisor that forks this build, from its own switch: a frozen
 	// image is only safe under one that can wake it.
 	freezeWorkload bool
+	// punchZeroHoles turns the snapshot memory's all-zero blocks into holes.
+	punchZeroHoles bool
 }
 
 func runBuild(ctx context.Context, cfg buildConfig) error {
@@ -384,6 +388,16 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		return fmt.Errorf("snapshot: %w", err)
 	}
 	emitInternal("system", "snapshot captured")
+
+	// Before the fsync and metadata below, so a published template is already
+	// sparse. Contents are unchanged: a hole reads as the zeros it replaced.
+	if cfg.punchZeroHoles {
+		punched, err := vm.PunchZeroBlocks(memPath)
+		if err != nil {
+			return fmt.Errorf("punch zero holes: %w", err)
+		}
+		emitInternal("system", "punched %d zero bytes of memory into holes", punched)
+	}
 
 	// The manifest tells a supervisor this image's workload is frozen, that its
 	// guest corrects its clock, and which token the wake must present.

@@ -821,6 +821,9 @@ func main() {
 	// Off by default: a frozen template is only safe under a supervisor that
 	// wakes it, so this follows the binary, never precedes it.
 	templateFreezeWorkload := envOrDefault("VMD_TEMPLATE_FREEZE_WORKLOAD", "false") == "true"
+	// Off by default: on, template builds punch all-zero memory into holes and
+	// restores leave it to the kernel once the binary advertises skip-zero-holes.
+	skipZeroHoles := envOrDefault("VMD_SKIP_ZERO_HOLES", "false") == "true"
 	// Pause-side wait for the guest to stop its workload before a frozen-clock
 	// snapshot; only paid when the restore would freeze the clock.
 	savedSnapshotConcurrency := 0
@@ -1013,6 +1016,7 @@ func main() {
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
 		TemplateFreezeWorkload:              templateFreezeWorkload,
+		SkipZeroHolesEnabled:                skipZeroHoles,
 		GuestFreezeBudget:                   guestFreezeBudget,
 		SavedSnapshotConcurrency:            savedSnapshotConcurrency,
 		RequirePresenceSidecar:              requirePresenceSidecar,

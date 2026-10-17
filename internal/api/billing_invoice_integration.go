@@ -49,3 +49,9 @@ func (h *Handlers) ClaimBillingPeriodCloseForTest(ctx context.Context) (billing.
 	c, err := h.claimBillingPeriodClose(ctx)
 	return c.ExportPeriod, err
 }
+
+func (h *Handlers) InvoiceCollectionTickForTest(ctx context.Context) (bool, error) {
+	return h.invoiceCollectionTick(ctx)
+}
+
+func InvoiceCollectionHashForTest(inv StripeInvoiceAmounts) string { return invoiceSettlementHash(inv) }

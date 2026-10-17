@@ -338,13 +338,18 @@ func (h *Handlers) createYCSubscription(ctx context.Context, o ycOperation, c *s
 				Products []string `json:"products"`
 			} `json:"applies_to"`
 		}
-		err := c.doForm(ctx, http.MethodGet, "/v1/coupons/"+coupon, nil, &existing, "")
+		couponPath := "/v1/coupons/" + coupon + "?" + url.Values{"expand[]": {"applies_to"}}.Encode()
+		err := c.doForm(ctx, http.MethodGet, couponPath, nil, &existing, "")
 		if err != nil {
-			if !strings.HasPrefix(err.Error(), "stripe GET /v1/coupons/"+coupon+" returned 404:") {
+			if !strings.HasPrefix(err.Error(), "stripe GET "+couponPath+" returned 404:") {
 				return sub, err
 			}
 			form := url.Values{"id": {coupon}, "duration": {"once"}, "percent_off": {"100"}, "applies_to[products][0]": {price.Product}}
-			if err = c.doForm(ctx, http.MethodPost, "/v1/coupons", form, &existing, coupon); err != nil {
+			if err = c.doForm(ctx, http.MethodPost, "/v1/coupons", form, nil, coupon); err != nil {
+				return sub, err
+			}
+			// Read restriction evidence explicitly without changing the replayable creation payload.
+			if err = c.doForm(ctx, http.MethodGet, couponPath, nil, &existing, ""); err != nil {
 				return sub, err
 			}
 		}

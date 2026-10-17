@@ -79,6 +79,9 @@ func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Lo
 			"firecracker lacks the dirty-tracking session; guarded pauses stay off")
 		track(first, caps, eagerOverlayCap, &m.eagerOverlayCapable, false,
 			"firecracker eager-overlay capability changed", "")
+		track(first, caps, skipZeroHolesCap, &m.skipZeroHolesCapable, m.cfg.SkipZeroHolesEnabled,
+			"firecracker skip-zero-holes capability changed",
+			"firecracker lacks skip-zero-holes; restores register all memory")
 	}
 	go func() {
 		probe(true)

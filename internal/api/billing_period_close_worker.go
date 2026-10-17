@@ -70,6 +70,7 @@ func (h *Handlers) StartBillingPeriodCloseService(ctx context.Context) {
 	if _, ok := h.Stripe.(*stripeHTTPClient); !ok {
 		return
 	}
+	h.startBillingInvoiceCollectionService(ctx)
 	go func() {
 		timer := time.NewTimer(time.Duration(1+rand.IntN(10)) * time.Second)
 		defer timer.Stop()

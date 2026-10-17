@@ -325,8 +325,12 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	}
 	prices = append(prices, map[string]string{"id": a.Price})
 	sort.Slice(prices, func(i, j int) bool { return prices[i]["id"] < prices[j]["id"] })
-	if len(prices) != 4 {
-		return next, errors.New("entitlement requires CPU, memory, storage and rounding scope")
+	storage, err := h.billingStorageBillingEnabledForWindow(ctx, team, end)
+	if err != nil {
+		return next, err
+	}
+	if err = validateEntitlementResourceTerms(terms, a.Price, a.Event, a.Meter, storage); err != nil {
+		return next, err
 	}
 	p := billing.ExportPeriod{TeamID: team, Start: start, End: end}
 	if _, err = h.DB.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{TeamID: team, PeriodStart: start, PeriodEnd: end, Status: "open"}); err != nil {
@@ -396,7 +400,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	}
 	if e.State == "pending" {
 		raw, _ := json.Marshal(prices)
-		e, err = h.DB.BeginImmediateUsageEntitlementIssuance(ctx, db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: team, ContractID: id, EntitlementID: e.ID, InvoiceStart: pgtype.Timestamptz{Time: mapped.Start, Valid: true}, InvoiceEnd: pgtype.Timestamptz{Time: mapped.End, Valid: true}, Prices: raw})
+		e, err = h.beginValidatedUsageEntitlementIssuance(ctx, db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: team, ContractID: id, EntitlementID: e.ID, InvoiceStart: pgtype.Timestamptz{Time: mapped.Start, Valid: true}, InvoiceEnd: pgtype.Timestamptz{Time: mapped.End, Valid: true}, Prices: raw}, prices)
 		if err != nil {
 			return next, err
 		}
@@ -424,7 +428,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err = client.rejectCompetingCreditInvoice(ctx, c.CustomerID, "", e.ProviderInvoiceEnd.Time.Unix()); err != nil {
 		return next, err
 	}
-	form, err := entitlementGrantForm(e.RequestPayload)
+	form, err := entitlementGrantForm(e.RequestPayload, prices)
 	if err != nil {
 		return next, err
 	}
@@ -504,4 +508,21 @@ func (h *Handlers) discoverUsageEntitlement(ctx context.Context, c db.BillingCom
 	raw, _ := json.Marshal(grant)
 	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
 	return err
+}
+
+// Commit issuance intent only after the exact database-generated request is valid.
+func (h *Handlers) beginValidatedUsageEntitlementIssuance(ctx context.Context, params db.BeginImmediateUsageEntitlementIssuanceParams, prices []map[string]string) (db.BillingUsageEntitlement, error) {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return db.BillingUsageEntitlement{}, err
+	}
+	defer tx.Rollback(ctx)
+	e, err := h.DB.WithTx(tx).BeginImmediateUsageEntitlementIssuance(ctx, params)
+	if err != nil {
+		return e, err
+	}
+	if _, err = entitlementGrantForm(e.RequestPayload, prices); err != nil {
+		return e, err
+	}
+	return e, tx.Commit(ctx)
 }

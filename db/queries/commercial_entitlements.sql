@@ -168,7 +168,8 @@ WITH contract AS MATERIALIZED (
     FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) AS p(period_start, period_end, amount_cents)
 )
 SELECT c.offer_key, c.status, c.starts_at, c.ends_at, c.charge_amount_cents, c.charge_interval_months,
-    period.period_start, period.period_end, period.amount_cents AS period_amount_cents, e.state AS entitlement_state
+    period.period_start, period.period_end, period.amount_cents AS period_amount_cents, e.state AS entitlement_state,
+    e.stripe_credit_grant_id AS entitlement_grant_id
 FROM contract c
 LEFT JOIN period ON period.contract_id = c.id
 LEFT JOIN billing_usage_entitlement e ON e.team_id = c.team_id AND e.contract_id = c.id

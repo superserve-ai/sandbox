@@ -410,6 +410,11 @@ type ManagerConfig struct {
 	// false; the switch to turn on first, and the one to turn off first.
 	TemplateFreezeWorkload bool
 
+	// SkipZeroHolesEnabled has template builds punch all-zero memory into holes
+	// and UFFD restores ask Firecracker to leave every page that is zero in all
+	// layers to the kernel instead of copying it. Default false.
+	SkipZeroHolesEnabled bool
+
 	// RequirePresenceSidecar controls refusing a layered UFFD restore whose
 	// overlay has no .presence side-car next to it. Without the side-car,
 	// Firecracker falls back to inferring page presence from the overlay's
@@ -823,6 +828,8 @@ type Manager struct {
 	dirtyTrackingSessionCapable atomic.Bool
 	// eagerOverlayCapable is the same probe for mem_backend.eager_overlay.
 	eagerOverlayCapable atomic.Bool
+	// skipZeroHolesCapable is the same probe for mem_backend.skip_zero_holes.
+	skipZeroHolesCapable atomic.Bool
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -2957,10 +2964,12 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 	}
 	armed, used, rerr := m.restoreWithSessionFallback(sessionID, func(sid string) (bool, error) {
 		return m.restoreWithClockFallback(clockPolicy, beforeLegacy, func(clock *bool) error {
-			return RestoreSnapshotUffdInternalWithOverrides(
-				socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
-				m.cfg.HandlerDeathAbortEnabled, false, sid, clock,
-			)
+			return m.restoreWithSkipZeroHolesFallback(m.skipZeroHolesEnabled(), func(skip bool) error {
+				return RestoreSnapshotUffdInternalWithOverrides(
+					socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+					m.cfg.HandlerDeathAbortEnabled, false, skip, sid, clock,
+				)
+			})
 		})
 	})
 	return trackDirty, armed, used, rerr
@@ -4187,10 +4196,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				armed, restoreClockFrozen, attemptErr = m.restoreWithSessionFallback(trackingSessionID, func(sid string) (bool, error) {
 					return m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
 						used, err := m.restoreWithEagerOverlayFallback(eager, func(eager bool) error {
-							return RestoreSnapshotUffdInternalWithOverrides(
-								socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
-								m.cfg.HandlerDeathAbortEnabled, eager, sid, clock,
-							)
+							return m.restoreWithSkipZeroHolesFallback(m.skipZeroHolesEnabled(), func(skip bool) error {
+								return RestoreSnapshotUffdInternalWithOverrides(
+									socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+									m.cfg.HandlerDeathAbortEnabled, eager, skip, sid, clock,
+								)
+							})
 						})
 						// A refused field fell back without it: measure the
 						// restore as the one that actually ran.

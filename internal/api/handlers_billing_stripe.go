@@ -78,6 +78,10 @@ type stripeCreditBalanceReader interface {
 	GetCustomerCreditBalance(context.Context, string) (StripeCreditBalance, error)
 }
 
+type stripeGrantBalanceReader interface {
+	GetCreditGrantLedgerBalance(ctx context.Context, customerID, grantID string) (float64, error)
+}
+
 type stripeEventRetriever interface {
 	RetrieveEvent(ctx context.Context, eventID string) (json.RawMessage, error)
 }
@@ -452,6 +456,13 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 	return StripeCreditBalance{AvailableUSD: float64(cents) / 100, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: false}, nil
 }
 
+// The ledger balance, not available_balance: draft-invoice reservations already
+// reduce the latter, and the summary subtracts current-period usage itself.
+func (c *stripeHTTPClient) GetCreditGrantLedgerBalance(ctx context.Context, customerID, grantID string) (float64, error) {
+	cents, err := c.grantLedgerBalance(ctx, customerID, grantID)
+	return float64(cents) / 100, err
+}
+
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {
 	form := url.Values{}
 	form.Set("mode", "subscription")
@@ -544,7 +555,7 @@ func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form
 	if err != nil {
 		return err
 	}
-	if method == http.MethodPost && (path == "/v1/checkout/sessions" || path == "/v1/billing/credit_grants") {
+	if method == http.MethodPost && (path == "/v1/checkout/sessions" || path == "/v1/billing/credit_grants" || (strings.HasPrefix(path, "/v1/invoices/") && strings.HasSuffix(path, "/pay"))) {
 		// Account for retries durably at the application boundary. A transparent
 		// transport replay could mask an accepted first request with a later 4xx.
 		req.GetBody = nil
@@ -2725,7 +2736,7 @@ func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q 
 			}
 		}
 		return err
-	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
+	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized", "invoice.updated", "invoice.payment_action_required":
 		var obj stripeInvoiceObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err
@@ -2771,7 +2782,7 @@ func (h *Handlers) resolveStripeWebhookRouting(ctx context.Context, event *strip
 			return stripeWebhookRoutingDecisionInvalid, err
 		}
 		return stripeWebhookRoutingDecisionOwned, nil
-	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
+	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized", "invoice.updated", "invoice.payment_action_required":
 		var obj stripeInvoiceObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return stripeWebhookRoutingDecisionInvalid, err
@@ -3540,10 +3551,18 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 			}
 		}
 		return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
-	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
+	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized", "invoice.updated", "invoice.payment_action_required":
 		var obj stripeInvoiceObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err
+		}
+		// Events are wakeups, never payment authority. Polling covers missing or
+		// reordered events and events racing a leased reconciliation attempt.
+		if _, err := tx.Exec(ctx, `UPDATE billing_invoice_collection SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE invoice_id=$1 AND customer_id=$2 AND state NOT IN ('paid','void')`, obj.ID, obj.Customer); err != nil {
+			return err
+		}
+		if event.Type == "invoice.updated" || event.Type == "invoice.payment_action_required" {
+			return nil
 		}
 		account, err := q.GetTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
 		if err != nil {

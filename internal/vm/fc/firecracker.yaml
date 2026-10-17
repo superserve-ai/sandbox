@@ -1472,6 +1472,14 @@ definitions:
           them. Only meaningful for a layered UffdInternal restore (base_path set);
           ignored otherwise. Support is advertised by the eager-overlay capability
           in `firecracker --version`.
+      skip_zero_holes:
+        type: boolean
+        default: false
+        description: When true, pages absent from the overlay and a hole in the
+          file backing them (base_path when set, else backend_path) are left to the
+          kernel to zero-fill instead of being served by the UFFD handler. Only
+          meaningful when backend_type is UffdInternal; ignored otherwise. Support
+          is advertised by the skip-zero-holes capability in `firecracker --version`.
       record_to:
         type: string
         description: Optional path the in-process UFFD handler writes each served

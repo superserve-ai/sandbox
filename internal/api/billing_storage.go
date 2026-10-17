@@ -40,6 +40,7 @@ func (e *storageReadinessError) Error() string { return e.err.Error() }
 func (e *storageReadinessError) Unwrap() error { return e.err }
 
 type storagePrice struct {
+	LiveMode          bool   `json:"livemode"`
 	ID                string `json:"id"`
 	Product           string `json:"product"`
 	Currency          string `json:"currency"`

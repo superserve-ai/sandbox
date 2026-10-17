@@ -54,6 +54,8 @@ type fakeStripeClient struct {
 	creditGrantExternalCalls  int
 	creditBalance             api.StripeCreditBalance
 	creditBalanceErr          error
+	grantBalanceUSD           float64
+	grantBalanceErr           error
 	reportErr                 error
 	reportErrAt               int
 	checkoutErr               error
@@ -73,6 +75,12 @@ func (f *fakeStripeClient) GetCustomerCreditBalance(_ context.Context, _ string)
 		return api.StripeCreditBalance{}, f.creditBalanceErr
 	}
 	return f.creditBalance, nil
+}
+
+func (f *fakeStripeClient) GetCreditGrantLedgerBalance(_ context.Context, _, _ string) (float64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.grantBalanceUSD, f.grantBalanceErr
 }
 
 type thinEventStripeClient struct {

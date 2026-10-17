@@ -185,6 +185,9 @@ func (m *Manager) templateBuildArgs(req BuildTemplateRequest, buildVMID string, 
 	if m.cfg.TemplateFreezeWorkload {
 		args = append(args, "--freeze-workload")
 	}
+	if m.cfg.SkipZeroHolesEnabled {
+		args = append(args, "--punch-zero-holes")
+	}
 	return args
 }
 

@@ -193,7 +193,7 @@ func TestEagerOverlaySerializesOnlyWhenOn(t *testing.T) {
 	for _, eager := range []bool{true, false} {
 		if err := RestoreSnapshotUffdInternalWithOverrides(
 			fc.socketPath, "/tmp/snap", "/tmp/mem.diff", "/tmp/base", "", "", "eth0", "tap0", "",
-			false, false, eager, "", nil,
+			false, false, eager, false, "", nil,
 		); err != nil {
 			t.Fatal(err)
 		}

@@ -140,3 +140,36 @@ func TestIntegration_GetBillingSummaryCommercialPlan(t *testing.T) {
 		})
 	}
 }
+
+// Plan credit grants are price-scoped, so the metered-scope balance alone
+// reports them as zero.
+func TestIntegration_GetBillingSummaryCountsIssuedPlanCredit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		grantErr  error
+		status    string
+		remaining any
+	}{
+		{name: "grant balance counted", status: "available", remaining: float64(1000)},
+		{name: "grant balance unreadable", grantErr: errors.New("grant unavailable"), status: "unavailable", remaining: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := commercialObserve(t, commercialActivate(t, commercialFixture(t, true)), false)
+			commercialIssue(t, c)
+			correctionExec(t, `UPDATE team_billing_account SET stripe_subscription_status='active' WHERE team_id=$1`, c.TeamID)
+			stripe := &fakeStripeClient{
+				creditBalance:   api.StripeCreditBalance{AvailableUSD: 0, ObservedAt: time.Now().UTC()},
+				grantBalanceUSD: 1000,
+				grantBalanceErr: tc.grantErr,
+			}
+			w := do(newBillingRouter(t, stripe), "GET", "/billing/summary", seedKeyForExistingTeamWithRole(t, c.TeamID, "viewer"), "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			body := mustJSON(t, w)
+			if body["credit_status"] != tc.status || body["stripe_remaining_credit_usd"] != tc.remaining {
+				t.Fatalf("credit_status=%v stripe_remaining_credit_usd=%v", body["credit_status"], body["stripe_remaining_credit_usd"])
+			}
+		})
+	}
+}

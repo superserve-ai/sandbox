@@ -440,6 +440,8 @@ type BillingEntitlementWork struct {
 	InventoryCursor    *string            `json:"inventory_cursor"`
 	InventoryNewHead   *string            `json:"inventory_new_head"`
 	InventoryCheckedAt pgtype.Timestamptz `json:"inventory_checked_at"`
+	WakeGeneration     int64              `json:"wake_generation"`
+	LeaseGeneration    int64              `json:"lease_generation"`
 }
 
 type BillingExportAllocation struct {
@@ -628,6 +630,27 @@ type BillingInvoiceClose struct {
 	FinalizedEvidence []byte             `json:"finalized_evidence"`
 	LastError         *string            `json:"last_error"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
+type BillingInvoiceCollection struct {
+	InvoiceID         string             `json:"invoice_id"`
+	CustomerID        string             `json:"customer_id"`
+	SubscriptionID    string             `json:"subscription_id"`
+	Livemode          bool               `json:"livemode"`
+	SettlementHash    string             `json:"settlement_hash"`
+	IdempotencyKey    string             `json:"idempotency_key"`
+	PaymentAuthorized bool               `json:"payment_authorized"`
+	State             string             `json:"state"`
+	FirstAttemptAt    pgtype.Timestamptz `json:"first_attempt_at"`
+	NextAttemptAt     time.Time          `json:"next_attempt_at"`
+	LeaseToken        pgtype.UUID        `json:"lease_token"`
+	LeaseUntil        pgtype.Timestamptz `json:"lease_until"`
+	LastError         *string            `json:"last_error"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
+type BillingInvoiceCollectionScheduler struct {
+	ID bool `json:"id"`
 }
 
 type BillingInvoiceCreditScan struct {

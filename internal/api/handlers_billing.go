@@ -280,6 +280,9 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		trialBalance  db.GetTeamTrialBalanceRow
 		trialRunway   db.GetTeamTrialRunwayRow
 		plan          billingSummaryPlan
+		// The current period's issued plan credit, which the metered-scope
+		// balance read below does not count.
+		planGrantID string
 	)
 	g, ctx := errgroup.WithContext(c.Request.Context())
 	hasEstablishedSubscription := billingAccountHasEstablishedSubscription(account)
@@ -326,6 +329,9 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			return fmt.Errorf("get current commercial plan: %w", err)
 		}
 		plan = billingPlanFromContract(row)
+		if row.EntitlementState != nil && *row.EntitlementState == "issued" && row.EntitlementGrantID != nil {
+			planGrantID = *row.EntitlementGrantID
+		}
 		return nil
 	})
 
@@ -498,6 +504,14 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		// the Stripe dependency is unavailable.
 		if reader, ok := h.Stripe.(stripeCreditBalanceReader); ok && account.StripeCustomerID != nil {
 			cb, e := reader.GetCustomerCreditBalance(c.Request.Context(), *account.StripeCustomerID)
+			// Plan credits are scoped to specific usage prices, so the
+			// metered-scope summary leaves them out; add the period's grant.
+			if grants, ok := h.Stripe.(stripeGrantBalanceReader); e == nil && ok && planGrantID != "" {
+				var grantUSD float64
+				if grantUSD, e = grants.GetCreditGrantLedgerBalance(c.Request.Context(), *account.StripeCustomerID, planGrantID); e == nil {
+					cb.AvailableUSD += grantUSD
+				}
+			}
 			if e == nil {
 				v := cb.AvailableUSD
 				stripeBalance = &v

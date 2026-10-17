@@ -34,7 +34,7 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 		{"up partial", 106, 105, 100, false, ""}, {"down partial", 105, 106, 100, false, ""},
 		{"canceled frozen recovery", 106, 105, 1000, true, "canceled"},
 		{"replacement frozen recovery", 106, 105, 1000, true, "replacement"},
-		{"offsetting resource errors", 106, 105, 1000, false, "offset"}, {"wrong remaining credits", 106, 105, 1000, false, "credit"}, {"late adjustment ignored", 106, 105, 1000, false, "late"}, {"no credit", 106, 105, 0, false, ""}, {"no adjustment", 105, 105, 1000, false, ""},
+		{"offsetting resource errors", 106, 105, 1000, false, "offset"}, {"wrong remaining credits", 106, 105, 1000, false, "credit"}, {"late adjustment ignored", 106, 105, 1000, false, "late"}, {"no credit", 106, 105, 0, false, ""}, {"payment reply lost", 106, 105, 0, true, ""}, {"no adjustment", 105, 105, 1000, false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store, p := seedIncrementalPeriod(t)
@@ -125,7 +125,15 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 				if net > 0 && net < 50 {
 					due, ending = 0, net
 				}
-				return map[string]any{"id": invoiceID, "customer": customer, "currency": "usd", "billing_reason": "subscription_cycle", "period_start": invoiceStart.Unix(), "period_end": invoiceEnd.Unix(), "status": status, "auto_advance": auto, "subtotal": subtotal, "total": net, "amount_due": due, "starting_balance": 0, "ending_balance": ending, "discounts": discounts, "total_discount_amounts": discountAmounts, "total_pretax_credit_amounts": credits, "parent": map[string]any{"subscription_details": map[string]any{"subscription": subscription}}, "lines": map[string]any{"data": []any{line("il_cpu", "price_cpu", "3.6", tc.provider), line("il_round", "price_round", "1", adjustment), line("il_storage", "price_storage", "0.0108", 0)}, "has_more": false}}
+				remaining := due
+				shownStatus := status
+				if status != "draft" && due == 0 {
+					shownStatus = "paid"
+				}
+				if shownStatus == "paid" {
+					remaining = 0
+				}
+				return map[string]any{"collection_method": "charge_automatically", "amount_remaining": remaining, "id": invoiceID, "customer": customer, "currency": "usd", "billing_reason": "subscription_cycle", "period_start": invoiceStart.Unix(), "period_end": invoiceEnd.Unix(), "status": shownStatus, "auto_advance": auto, "subtotal": subtotal, "total": net, "amount_due": due, "starting_balance": 0, "ending_balance": ending, "discounts": discounts, "total_discount_amounts": discountAmounts, "total_pretax_credit_amounts": credits, "parent": map[string]any{"subscription_details": map[string]any{"subscription": subscription}}, "lines": map[string]any{"data": []any{line("il_cpu", "price_cpu", "3.6", tc.provider), line("il_round", "price_round", "1", adjustment), line("il_storage", "price_storage", "0.0108", 0)}, "has_more": false}}
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_ = r.ParseForm()
@@ -151,7 +159,7 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 						out.(map[string]any)["pause_collection"] = map[string]any{"behavior": "keep_as_draft"}
 					}
 				case "/v1/subscriptions/" + subscription:
-					out = map[string]any{"id": subscription, "customer": customer, "billing_cycle_anchor": invoiceStart.Unix(), "status": subscriptionStatus, "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": []any{map[string]any{"id": "si_cpu", "current_period_start": invoiceStart.Unix(), "current_period_end": invoiceEnd.Unix(), "price": price("price_cpu", "mtr_cpu", "3.6")}, map[string]any{"id": "si_round", "price": price("price_round", "mtr_round", "1")}, map[string]any{"id": "si_storage", "current_period_start": invoiceStart.Unix(), "current_period_end": invoiceEnd.Unix(), "price": price("price_storage", "mtr_storage", "0.0108")}}}}
+					out = map[string]any{"collection_method": "charge_automatically", "id": subscription, "customer": customer, "billing_cycle_anchor": invoiceStart.Unix(), "status": subscriptionStatus, "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": []any{map[string]any{"id": "si_cpu", "current_period_start": invoiceStart.Unix(), "current_period_end": invoiceEnd.Unix(), "price": price("price_cpu", "mtr_cpu", "3.6")}, map[string]any{"id": "si_round", "price": price("price_round", "mtr_round", "1")}, map[string]any{"id": "si_storage", "current_period_start": invoiceStart.Unix(), "current_period_end": invoiceEnd.Unix(), "price": price("price_storage", "mtr_storage", "0.0108")}}}}
 				case "/v1/billing/meters":
 					data := []any{}
 					for _, m := range []struct{ id, event string }{{"mtr_cpu", "example_cpu_hours"}, {"mtr_round", "round"}, {"mtr_storage", "storage_gib_hours"}} {
@@ -202,18 +210,24 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 					out = map[string]any{"id": "rounding_" + invoiceID, "amount_off": 1, "currency": "usd"}
 				case "/v1/invoices/" + invoiceID:
 					if r.Method == http.MethodPost {
-						if r.Form.Get("auto_advance") == "true" {
-							auto = true
-							releases++
-							if tc.loseResponse && releases == 1 {
-								http.Error(w, `{"error":{"message":"release response lost"}}`, 500)
-								return
-							}
-						} else if r.Form.Get("discounts[0][coupon]") == "rounding_"+invoiceID {
+						if r.Form.Get("discounts[0][coupon]") == "rounding_"+invoiceID {
 							coupon = true
 						} else {
 							t.Errorf("unexpected invoice write %v", r.Form)
 						}
+					}
+					out = invoice()
+				case "/v1/invoice_payments":
+					out = map[string]any{"data": []any{}, "has_more": false}
+				case "/v1/invoices/" + invoiceID + "/pay":
+					if r.Form.Get("off_session") != "true" || r.Header.Get("Idempotency-Key") != "billing-invoice-pay:v1:"+invoiceID {
+						t.Error("payment has no stable off-session intent")
+					}
+					releases++
+					status = "paid"
+					if tc.loseResponse && releases == 1 {
+						http.Error(w, `{"error":{"message":"payment response lost"}}`, 500)
+						return
 					}
 					out = invoice()
 				case "/v1/invoices/" + invoiceID + "/finalize":
@@ -374,14 +388,31 @@ func testInvoiceCentRecoveryAndCredits(t *testing.T, offset time.Duration) {
 			if err = release(); err != nil && !(tc.loseResponse && strings.Contains(err.Error(), "500")) {
 				t.Fatal(err)
 			}
-			if err = release(); err != nil {
+			if err = newHandler().ReconcileInvoiceForTest(t.Context(), p); err != nil {
 				t.Fatal(err)
 			}
 			wantEvents := 0
 			if tc.target > tc.provider {
 				wantEvents = 1
 			}
-			if events != wantEvents || finalizations != 1 || releases != 1 {
+			for i := 0; i < 2; i++ {
+				correctionExec(t, `UPDATE billing_invoice_collection SET next_attempt_at=now() WHERE invoice_id=$1`, invoiceID)
+				if _, e := newHandler().InvoiceCollectionTickForTest(t.Context()); e != nil {
+					t.Fatal(e)
+				}
+			}
+			var collectionState string
+			if e := testPool.QueryRow(t.Context(), `SELECT state FROM billing_invoice_collection WHERE invoice_id=$1`, invoiceID).Scan(&collectionState); e != nil || collectionState != "paid" {
+				t.Fatalf("collection state %s: %v", collectionState, e)
+			}
+			wantPayments := 0
+			if invoice()["amount_due"].(int64) > 0 {
+				wantPayments = 1
+			}
+			if auto {
+				t.Fatal("subscription invoice automatic collection enabled")
+			}
+			if events != wantEvents || finalizations != 1 || releases != wantPayments {
 				t.Fatalf("duplicate provider writes: events=%d finalize=%d release=%d", events, finalizations, releases)
 			}
 			if offset > 0 && tc.name == "up full" {

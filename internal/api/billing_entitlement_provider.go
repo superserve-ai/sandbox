@@ -55,7 +55,7 @@ func (c *stripeHTTPClient) retrieveEntitlementGrant(ctx context.Context, id stri
 
 // The form is derived exclusively from the saved request, including omission of
 // effective_at. Replays never substitute a new timestamp or idempotency key.
-func entitlementGrantForm(raw []byte) (url.Values, error) {
+func entitlementGrantForm(raw []byte, expected []map[string]string) (url.Values, error) {
 	var g entitlementGrant
 	if err := json.Unmarshal(raw, &g); err != nil {
 		return nil, err
@@ -64,8 +64,21 @@ func entitlementGrantForm(raw []byte) (url.Values, error) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return nil, err
 	}
-	if g.Customer == "" || g.Category != "promotional" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value <= 0 || g.ExpiresAt <= 0 || len(g.Applicability.Scope.Prices) != 4 || g.Metadata["entitlement_id"] == "" {
+	if g.Customer == "" || g.Category != "promotional" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value <= 0 || g.ExpiresAt <= 0 || (len(expected) < 3 || len(expected) > 4 || len(g.Applicability.Scope.Prices) != len(expected) || g.Applicability.Scope.PriceType != "") || g.Metadata["entitlement_id"] == "" {
 		return nil, errors.New("incomplete saved entitlement request")
+	}
+	scope := map[string]bool{}
+	for _, p := range expected {
+		if p["id"] == "" || scope[p["id"]] {
+			return nil, errors.New("invalid approved credit price scope")
+		}
+		scope[p["id"]] = true
+	}
+	for _, p := range g.Applicability.Scope.Prices {
+		if !scope[p.ID] {
+			return nil, errors.New("saved entitlement scope differs from approved resource and rounding prices")
+		}
+		delete(scope, p.ID)
 	}
 	v := url.Values{"customer": {g.Customer}, "category": {g.Category}, "amount[type]": {"monetary"}, "amount[monetary][currency]": {"usd"}, "amount[monetary][value]": {strconv.FormatInt(g.Amount.Monetary.Value, 10)}, "expires_at": {strconv.FormatInt(g.ExpiresAt, 10)}}
 	if _, ok := fields["priority"]; ok {

@@ -75,7 +75,11 @@ func (h *Handlers) YCStatus(c *gin.Context) {
 		return
 	}
 	var raw []byte
-	err := h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object('operation_id',id,'contract_id',contract_id,'renewal_contract_id',renewal_contract_id,'company_identity',request->>'company_identity','first_invoice_id',first_invoice_id,'state',state,'customer_id',customer_id,'subscription_id',subscription_id,'starts_at',starts_at,'ends_at',ends_at,'payment_method_ready',payment_method_ready,'revoked_at',revoked_at,'last_error',last_error,'next_check_at',next_check_at) FROM billing_yc_operation WHERE team_id=$1`, team).Scan(&raw)
+	err := h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object('operation_id',id,'contract_id',contract_id,'renewal_contract_id',renewal_contract_id,'company_identity',request->>'company_identity','first_invoice_id',first_invoice_id,'state',state,'customer_id',customer_id,'subscription_id',subscription_id,'starts_at',starts_at,'ends_at',ends_at,'payment_method_ready',payment_method_ready,'revoked_at',revoked_at,'last_error',last_error,'next_check_at',next_check_at,
+ 'credit_issued',EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=o.contract_id AND e.state='issued' AND e.period_start<=clock_timestamp() AND e.period_end>clock_timestamp()),
+ 'credit_state',COALESCE((SELECT e.state FROM billing_usage_entitlement e WHERE e.contract_id=o.contract_id AND e.period_start<=clock_timestamp() AND e.period_end>clock_timestamp()),'missing'),
+ 'credit_error',(SELECT CASE WHEN last_error LIKE 'credit_scope_incomplete:%' THEN 'credit_scope_incomplete: frozen terms do not cover billable resources' WHEN last_error IS NOT NULL THEN 'credit_issuance_failed: inspect entitlement work and provider evidence' END FROM billing_entitlement_work w WHERE w.contract_id=o.contract_id),
+ 'credit_next_check_at',(SELECT next_check_at FROM billing_entitlement_work w WHERE w.contract_id=o.contract_id)) FROM billing_yc_operation o WHERE team_id=$1`, team).Scan(&raw)
 	if err != nil {
 		respondErrorMsg(c, "not_found", "YC operation not found", 404)
 		return
@@ -253,12 +257,25 @@ func (h *Handlers) ycPreflight(ctx context.Context, team uuid.UUID, in ycApprova
 	if !enabled {
 		return params, sub, errors.New("invoice export must be enabled")
 	}
-	prices, err := billingCheckoutPriceIDs(h.billingResourceStates(true))
+	storage, err := h.billingStorageBillingEnabled(ctx, team)
+	if err != nil {
+		return params, sub, err
+	}
+	prices, err := ycResourcePriceIDs(h.billingResourceStates(storage), storage)
 	if err != nil {
 		return params, sub, err
 	}
 	terms, err := h.freezeProResourceTerms(ctx, team, prices, client)
 	if err != nil {
+		return params, sub, err
+	}
+	if err = validateEntitlementResourceTerms(terms, "", "", "", storage); err != nil {
+		return params, sub, err
+	}
+	if err = client.validateYCResourcePrices(ctx, terms, *in.Live); err != nil {
+		return params, sub, err
+	}
+	if err = client.ycRoundingPreflight(ctx, terms, *in.Live); err != nil {
 		return params, sub, err
 	}
 	params = StripeCreateCheckoutSessionParams{BasePriceID: offer.Price, CustomerID: in.Customer, Flexible: true, DeferredResourcePriceIDs: prices, ResourceTerms: terms}

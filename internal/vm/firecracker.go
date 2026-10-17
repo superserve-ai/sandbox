@@ -667,7 +667,7 @@ func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, ta
 // suppressed on the Firecracker side regardless of accessLogPath.
 func RestoreSnapshotUffdInternalWithOverrides(
 	socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, ifaceID, tapDevice, blockDeltaDir string,
-	trackDirty, abortOnHandlerDeath, eagerOverlay bool,
+	trackDirty, abortOnHandlerDeath, eagerOverlay, skipZeroHoles bool,
 	trackingSessionID string,
 	clockRealtime *bool,
 ) error {
@@ -690,6 +690,7 @@ func RestoreSnapshotUffdInternalWithOverrides(
 				RecordTo:            recordToPath,
 				AbortOnHandlerDeath: omitFalse(abortOnHandlerDeath),
 				EagerOverlay:        omitFalse(eagerOverlay),
+				SkipZeroHoles:       omitFalse(skipZeroHoles),
 			},
 			// Arms dirty-page tracking so the next pause can write an incremental
 			// (Diff) snapshot instead of a Full one. The session id (guarded

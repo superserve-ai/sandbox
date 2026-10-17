@@ -391,17 +391,3 @@ func (c *stripeHTTPClient) applyInvoiceDiscount(ctx context.Context, invoiceID s
 	}
 	return c.doForm(ctx, http.MethodPost, "/v1/invoices/"+url.PathEscape(invoiceID), url.Values{"discounts[0][coupon]": {couponID}}, nil, key+":discount")
 }
-
-func (c *stripeHTTPClient) releaseBillingInvoice(ctx context.Context, id string) error {
-	invoice, err := c.RetrieveBillingInvoice(ctx, id)
-	if err != nil {
-		return err
-	}
-	if invoice.Status == "paid" {
-		return nil
-	}
-	if invoice.Status != "open" {
-		return fmt.Errorf("verified invoice is not open for collection")
-	}
-	return c.doForm(ctx, http.MethodPost, "/v1/invoices/"+url.PathEscape(id), url.Values{"auto_advance": {"true"}}, nil, "")
-}

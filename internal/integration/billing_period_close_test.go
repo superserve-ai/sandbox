@@ -70,7 +70,7 @@ func TestIntegration_AutomaticBillingClose(t *testing.T) {
 				}(), "currency": "usd", "period": map[string]any{"start": invoiceStart.Unix(), "end": invoiceEnd.Unix()}, "pricing": map[string]any{"unit_amount_decimal": amount, "price_details": map[string]any{"price": pr}}, "parent": map[string]any{"subscription_item_details": map[string]any{"subscription": sub, "subscription_item": "si_" + pr, "proration": false}}}
 			}
 			invoice := func() map[string]any {
-				return map[string]any{"id": invoiceID, "customer": customer, "currency": "usd", "billing_reason": "subscription_cycle", "period_start": invoiceStart.Unix(), "period_end": invoiceEnd.Unix(), "status": status, "auto_advance": auto, "subtotal": charge, "total": charge, "amount_due": 0, "starting_balance": 0, "ending_balance": charge, "parent": map[string]any{"subscription_details": map[string]any{"subscription": sub}}, "lines": map[string]any{"data": []any{line("price_cpu", "3.6"), line("price_round", "1")}, "has_more": false}}
+				return map[string]any{"id": invoiceID, "customer": customer, "currency": "usd", "billing_reason": "subscription_cycle", "period_start": invoiceStart.Unix(), "period_end": invoiceEnd.Unix(), "status": status, "auto_advance": auto, "subtotal": charge, "total": charge, "amount_due": 0, "amount_remaining": 0, "starting_balance": 0, "ending_balance": charge, "parent": map[string]any{"subscription_details": map[string]any{"subscription": sub}}, "lines": map[string]any{"data": []any{line("price_cpu", "3.6"), line("price_round", "1")}, "has_more": false}}
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_ = r.ParseForm()
@@ -130,8 +130,12 @@ func TestIntegration_AutomaticBillingClose(t *testing.T) {
 					if r.Form.Get("auto_advance") != "false" {
 						t.Error("early collection")
 					}
-					status = "open"
+					status = "paid"
 					finalizations++
+					if mode == "response_loss" && finalizations == 1 {
+						http.Error(w, "lost finalization response", 500)
+						return
+					}
 					out = invoice()
 				default:
 					t.Errorf("unexpected request %s %s", r.Method, r.URL)
@@ -280,7 +284,11 @@ func TestIntegration_AutomaticBillingClose(t *testing.T) {
 			if nonzero && usageEvents != 1 {
 				t.Fatalf("usage delivered %d times", usageEvents)
 			}
-			if finalizations != 1 || releases != 1 {
+			var collected bool
+			if err := testPool.QueryRow(t.Context(), `SELECT state='paid' AND first_attempt_at IS NULL FROM billing_invoice_collection WHERE invoice_id=$1`, invoiceID).Scan(&collected); err != nil || !collected {
+				t.Fatalf("zero-due collection handoff: %v %v", collected, err)
+			}
+			if finalizations != 1 || releases != 0 {
 				t.Fatalf("provider writes finalize=%d release=%d", finalizations, releases)
 			}
 			if worked, err := newHandler().BillingPeriodCloseTickForTest(t.Context()); worked || err != nil {

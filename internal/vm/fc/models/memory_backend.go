@@ -43,6 +43,9 @@ type MemoryBackend struct {
 
 	// Optional path the in-process UFFD handler writes each served page offset to (template-build mode). Only meaningful when backend_type is UffdInternal; ignored otherwise. When present, prefetch is suppressed.
 	RecordTo string `json:"record_to,omitempty"`
+
+	// When true, pages absent from the overlay and a hole in the file backing them (base_path when set, else backend_path) are left to the kernel to zero-fill instead of being served by the UFFD handler. Only meaningful when backend_type is UffdInternal; ignored otherwise. Support is advertised by the skip-zero-holes capability in `firecracker --version`.
+	SkipZeroHoles *bool `json:"skip_zero_holes,omitempty"`
 }
 
 // Validate validates this memory backend

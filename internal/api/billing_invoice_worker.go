@@ -269,13 +269,9 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		if e = verifyInvoicePlanSettlement(final, plan, plan.CreditBeforeCents, remaining); e != nil {
 			return e
 		}
-		if alreadyReleased {
-			return advance("released")
-		}
-		if err = client.releaseBillingInvoice(ctx, invoiceID); err != nil {
-			return err
-		}
-		return advance("released")
+		// Enqueue and release accounting atomically. The subscription remains held;
+		// collection continues independently if payment needs customer action.
+		return h.enqueueInvoiceCollection(ctx, p, final, !alreadyReleased)
 	}
 	inv, err := client.RetrieveBillingInvoice(ctx, invoiceID)
 	if err != nil {
