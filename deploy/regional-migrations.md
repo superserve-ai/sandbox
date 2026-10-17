@@ -58,22 +58,30 @@ substitute for the gates.
 ## Snapshot reference index
 
 The ordinary `push` action prebuilds `idx_sandbox_snapshot_id` concurrently
-before the CLI applies its migration. It uses the migration mutex, the existing
-250ms lock timeout, and the 60s command deadline. Only the concurrent build may
-run for up to 30s, shortened when necessary to leave 6s in the command budget.
-That statement temporarily disables its session's 2s transaction timer so it
-can span multiple build phases; the statement timeout bounds the whole build.
-The session restores the short timers afterward and closes on any failure.
-Ordinary migration transactions retain their 2s limit. Preflight, list, and
-dry-run remain read-only. A fresh database builds the index in its normal SQL
-migration. The index includes soft-deleted sandboxes because snapshot deletion
-must clear their foreign-key references too.
+before the CLI applies its migration. It uses the migration mutex and the 60s
+command deadline. Only the concurrent build may run for up to 30s, shortened
+when necessary to leave 6s in the command budget. That statement temporarily
+disables its session's 2s transaction timer so it can span multiple build
+phases, and raises its 250ms lock timeout to the same bound as the build: a
+concurrent build does not block ordinary writes, but it does take the table's
+lock and wait behind transactions already holding it, which a live cell always
+has. The statement timeout bounds the whole build. The session restores the
+short timers afterward and closes on any failure. Ordinary migration
+transactions retain their 2s limit. Preflight, list, and dry-run remain
+read-only. A fresh database builds the index in its normal SQL migration. The
+index includes soft-deleted sandboxes because snapshot deletion must clear
+their foreign-key references too.
 
 Both preparation and migration verify the exact index definition and validity.
-An interrupted build can leave an invalid index; stop and review that index's
-recovery before retrying. The runner does not drop it, increase timeouts, or mark
-the migration applied. If preparation succeeds but the subsequent CLI run fails,
-the next approved run reuses the valid index and records the normal migration.
+An interrupted build can leave behind an invalid index carrying this exact
+definition; preparation drops that one concurrently and rebuilds it, because
+PostgreSQL never uses an invalid index and it holds no state, and because
+refusing instead would stand every later migration on that cell — and the API
+and proxy deployments behind it — down until an operator intervened. An index
+of any other definition still fails closed: stop and review its recovery before
+retrying, and do not mark the migration applied. If preparation succeeds but
+the subsequent CLI run fails, the next approved run reuses the valid index and
+records the normal migration.
 Merging a migration-only change triggers the API deployment's migration
 prerequisite: successful push CI at the exact revision, then staging, East, and
 West through their environment gates. The standalone CD Migrate workflow also
