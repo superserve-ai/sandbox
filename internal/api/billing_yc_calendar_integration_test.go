@@ -461,7 +461,7 @@ func TestYCCalendarUsageBoundary(t *testing.T) {
 }
 
 func TestYCCalendarBlocksPrematureEnrollment(t *testing.T) {
-	for _, state := range []string{"enrolling", "active", "renewal_pending", "renewed"} {
+	for _, state := range []string{"enrolling", "active", "renewal_pending", "renewed", "ended"} {
 		t.Run(state, func(t *testing.T) {
 			f := newYCCalendarFixture(t, 0)
 			f.legacy(t)
@@ -536,5 +536,45 @@ func TestYCCalendarFencesFutureStaleWriter(t *testing.T) {
 	}
 	if err = <-result; err == nil || !strings.Contains(err.Error(), "yc_calendar_conflict") {
 		t.Fatal("stale future authority accepted", err)
+	}
+}
+
+func TestYCEndedCalendarRequiresOriginalBinding(t *testing.T) {
+	for _, replacement := range []string{"", "sub_replacement"} {
+		t.Run(replacement, func(t *testing.T) {
+			f := newYCCalendarFixture(t, 0)
+			f.legacy(t)
+			f.savePartial(t)
+			f.o.State = "ended"
+			f.exec(t, `UPDATE billing_yc_operation SET state='ended' WHERE team_id=$1`, f.o.Team)
+			f.exec(t, `UPDATE team_billing_account SET stripe_subscription_id=NULLIF($2,'') WHERE team_id=$1`, f.o.Team, replacement)
+			tx, err := f.h.Pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(t.Context())
+			if err = f.h.lockAndReconcileYCCalendar(t.Context(), tx, f.o, f.token); err == nil || !strings.Contains(err.Error(), "binding changed") {
+				t.Fatal("ended recovery accepted missing or replacement binding", err)
+			}
+			var unchanged bool
+			if err = tx.QueryRow(t.Context(), `SELECT NOT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE team_id=$1) AND EXISTS(SELECT 1 FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`, f.o.Team, f.oldStart, f.oldEnd).Scan(&unchanged); err != nil || !unchanged {
+				t.Fatal("ended recovery changed another billing association", err)
+			}
+		})
+	}
+}
+
+func TestYCEndedCalendarDoesNotBlockReplacementEnrollment(t *testing.T) {
+	f := newYCCalendarFixture(t, 0)
+	f.legacy(t)
+	f.savePartial(t)
+	f.exec(t, `UPDATE billing_yc_operation SET state='ended' WHERE team_id=$1`, f.o.Team)
+	f.exec(t, `UPDATE team_billing_account SET stripe_subscription_id='sub_replacement' WHERE team_id=$1`, f.o.Team)
+	f.exec(t, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.o.Team)
+	f.h.Stripe = &stripeHTTPClient{}
+	// Reach the existing configuration check without provider calls. An old
+	// ended operation must not intercept the replacement account's enrollment.
+	if err := f.h.enrollInvoiceAccount(t.Context(), f.o.Team, &invoiceAccount{Price: "different"}); err == nil || !strings.Contains(err.Error(), "existing rounding configuration differs") {
+		t.Fatal("ended calendar blocked replacement enrollment", err)
 	}
 }

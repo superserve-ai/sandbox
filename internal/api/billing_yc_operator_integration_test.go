@@ -38,8 +38,8 @@ func TestYCOperatorLinkCreatesSubscriptionOnce(t *testing.T) {
 }
 
 func TestYCOperatorCalendarRecoveryBeforeBillingChecks(t *testing.T) {
-	for _, state := range []string{"enrolling", "active", "renewed", "renewal_pending"} {
-		renewal := state == "renewed" || state == "renewal_pending"
+	for _, state := range []string{"enrolling", "active", "renewed", "renewal_pending", "ended"} {
+		renewal := state == "renewed" || state == "renewal_pending" || state == "ended"
 		for _, failure := range []string{"missing", "unavailable", "invoice-unavailable"} {
 			for _, conflict := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/%s/conflict-%t", state, failure, conflict), func(t *testing.T) {
@@ -47,6 +47,14 @@ func TestYCOperatorCalendarRecoveryBeforeBillingChecks(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestYCOperatorEndedCalendarRecovery(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		t.Run(fmt.Sprint(conflict), func(t *testing.T) {
+			runYCOperatorAdoptionWithRecoveryFailure(t, false, "card", "", "ended", false, true, true, conflict, true)
+		})
 	}
 }
 
@@ -361,6 +369,9 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 			state = recoveryState
 		}
 		f.exec(t, `UPDATE billing_yc_operation SET state=$2 WHERE team_id=$1`, team.ID, state)
+		if state == "ended" {
+			sub.Status = "canceled"
+		}
 		conflict := len(create) > 3 && create[3]
 		if conflict {
 			f.exec(t, `INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds) VALUES($1,$2,$3,12)`, team.ID, anchor.AddDate(0, 0, -13), anchor.AddDate(0, 0, 18))
@@ -420,6 +431,12 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 			}
 			if err = h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open')`, team.ID, anchor.AddDate(0, 0, -13), end).Scan(&retained); err != nil || !retained {
 				t.Fatal("readiness failure lost historical interval", err)
+			}
+		}
+		if state == "ended" {
+			current, err := h.ycOperation(t.Context(), team.ID)
+			if err != nil || current.State != "ended" || current.Subscription != sub.ID || sub.Status != "canceled" {
+				t.Fatal("calendar recovery reactivated ended subscription", err)
 			}
 		}
 		if writes != 0 {

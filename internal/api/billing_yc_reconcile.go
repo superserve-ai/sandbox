@@ -106,7 +106,8 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 	}
 	renewalDue := o.End.Valid && !time.Now().Before(o.End.Time)
 	// Repair adopted accounting authority even when payment readiness blocks billing.
-	if o.State != "ended" && (o.State == "enrolling" || o.State == "active" || o.State == "renewed" || o.State == "renewal_pending" || renewalDue) {
+	endedAdoption := o.State == "ended" && o.Subscription != "" && o.Start.Valid
+	if endedAdoption || (o.State != "ended" && (o.State == "enrolling" || o.State == "active" || o.State == "renewed" || o.State == "renewal_pending" || renewalDue)) {
 		var reconciled bool
 		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE operation_id=$1 AND team_id=$2 AND anniversary=$3)`, o.ID, team, o.Start.Time).Scan(&reconciled); err != nil {
 			return err
@@ -454,7 +455,7 @@ func (h *Handlers) lockAndReconcileYCCalendar(ctx context.Context, tx pgx.Tx, o 
 	if err != nil {
 		return err
 	}
-	if derefString(a.StripeCustomerID) != o.Customer || (a.StripeSubscriptionID != nil && *a.StripeSubscriptionID != o.Subscription) {
+	if derefString(a.StripeCustomerID) != o.Customer || (a.StripeSubscriptionID != nil && *a.StripeSubscriptionID != o.Subscription) || (o.State == "ended" && derefString(a.StripeSubscriptionID) != o.Subscription) {
 		return errors.New("billing binding changed during adoption")
 	}
 	if _, err = tx.Exec(ctx, `SELECT reconcile_yc_billing_calendar($1,$2)`, o.Team, o.ID); err != nil {

@@ -94,7 +94,12 @@ straddling the anniversary.
    operator credential and `X-Actor-User-Id`. The background reconciler uses the
    same path. A saved anchor/contract/enrollment needs no rollback first. The
    transition rechecks the real periods transactionally; no manual shortening is
-   needed for an untouched open period.
+   needed for an untouched open period. Previously adopted `ended` operations
+   require this explicit call because the background scheduler excludes them.
+   Recovery requires the original customer/subscription to remain the current
+   account binding and retains `ended`; it does not renew or reactivate service.
+   If that binding has been cleared or replaced, preserve the historical authority
+   and use the reviewed accounting-conflict procedure instead.
 4. On success inspect the immutable transition receipt and period list using
    the regional queries below.
    Check exactly adjacent coverage, the same original subscription/anniversary,
