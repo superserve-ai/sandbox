@@ -546,6 +546,9 @@ func TestYCEndedCalendarRequiresOriginalBinding(t *testing.T) {
 			f.legacy(t)
 			f.savePartial(t)
 			f.o.State = "ended"
+			if replacement != "" {
+				replacement += uuid.NewString()
+			}
 			f.exec(t, `UPDATE billing_yc_operation SET state='ended' WHERE team_id=$1`, f.o.Team)
 			f.exec(t, `UPDATE team_billing_account SET stripe_subscription_id=NULLIF($2,'') WHERE team_id=$1`, f.o.Team, replacement)
 			tx, err := f.h.Pool.Begin(t.Context())
@@ -569,7 +572,7 @@ func TestYCEndedCalendarDoesNotBlockReplacementEnrollment(t *testing.T) {
 	f.legacy(t)
 	f.savePartial(t)
 	f.exec(t, `UPDATE billing_yc_operation SET state='ended' WHERE team_id=$1`, f.o.Team)
-	f.exec(t, `UPDATE team_billing_account SET stripe_subscription_id='sub_replacement' WHERE team_id=$1`, f.o.Team)
+	f.exec(t, `UPDATE team_billing_account SET stripe_subscription_id=$2 WHERE team_id=$1`, f.o.Team, "sub_replacement_"+uuid.NewString())
 	f.exec(t, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.o.Team)
 	f.h.Stripe = &stripeHTTPClient{}
 	// Reach the existing configuration check without provider calls. An old
