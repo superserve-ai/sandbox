@@ -1,0 +1,279 @@
+{
+  "schema": 1,
+  "target": "staging",
+  "candidate_revision": "345734adf5aa6fed71d2351dd53d17e1a876bce3",
+  "candidate_migrations": {
+    "supabase/migrations/20261017012100_yc_billing_calendar_transition.sql": "1c8afc6feabcc6e392482c4f746acf7e02ac7b18fbbf35e3b048264947497675"
+  },
+  "variants": {
+    "20260429000001": {
+      "source": "supabase/migrations/20260429000001_template_alias_to_name.sql",
+      "source_sha256": "b25138ca86d21902e4c1f0eeca7c9b7046f4b126c5b7c9aad779b26c49020360",
+      "source_ast_sha256": "1d3c018f35d98afc38b5c682fad5f2735daadd389e16984892d592a8213fa1dc",
+      "observed_name": "template_alias_to_name",
+      "statements_sha256": "a3384e3d5e5a547b278bc3bb32f3fa2276fa77c95cd2281d1ceff1204b4a10cd",
+      "ast_sha256": "a89b4a2b7bc4fbdc5782d2a37edde2758793bef0ba2f44b2997cbd22a78d4cbb",
+      "historical_source": {
+        "commit": "d5b62a7196a829893c173593e66f00b06e9974a0",
+        "path": "supabase/migrations/20260429000001_template_alias_to_name.sql"
+      }
+    },
+    "20260710000001": {
+      "source": "supabase/migrations/20260710000001_raise_template_size_limits.sql",
+      "source_sha256": "b6b903867e444739324bb4b67a1cf047b0048f0713695ad2f9e3178b5f36f085",
+      "source_ast_sha256": "38c3dd6438578eafa79c891d9cf053ad7ac9e5bb9b372769b0268eaf11a7c1b4",
+      "observed_name": "sandbox_preview_access",
+      "statements_sha256": "bb2f31156c623b633cd5a40ae26e4c64e95af40c4e5dd41170eb79de8f12452a",
+      "ast_sha256": "f9053e81b2210726bb7c822c27ce1d1a9311b8f31717646009389c84489019a7",
+      "historical_source": {
+        "commit": "bf15e71483abde1e6f10b15d8c72ce9b976a9e51",
+        "path": "supabase/migrations/20260710000001_sandbox_preview_access.sql"
+      }
+    },
+    "20260730000002": {
+      "source": "supabase/migrations/20260730000002_grafana_readonly_role.sql",
+      "source_sha256": "10cb7a7949b18bccb9d6f31e9f14b78604fa0321026256044703342ca0b404f1",
+      "source_ast_sha256": "1ab6bc9e75d0884cedc595ffa6e5af96fd3c3e1959309d603c89a2a29f08e316",
+      "observed_name": "grafana_readonly_role",
+      "statements_sha256": "60639dac493fdf803b40951511d6e9e08030a8c01f9dd7f89a99e757ab8252c0",
+      "ast_sha256": "8c2933642316238dc6cf1e00476db341362135818c71760dd4549b282ab180c3",
+      "historical_source": {
+        "commit": "6aa0c8c39c940e715ee0b461ef62a6b6477884b2",
+        "path": "supabase/migrations/20260730000002_grafana_readonly_role.sql"
+      }
+    },
+    "20260818000001": {
+      "source": "supabase/migrations/20260818000001_billing_trial_eligibility.sql",
+      "source_sha256": "da762dc5fb8fb628e527f1ec933260e2d5d7de086a9682d7040d94643869f928",
+      "source_ast_sha256": "7f81ceadf8268b0db3b038992fb68b68e51e29f9fb268bb7b7bffbcc71bc86d7",
+      "observed_name": "billing_trial_eligibility",
+      "statements_sha256": "be6250fe43281c55ef88cc571ae2ddae77d8f5828ba8a554852d716f69458306",
+      "ast_sha256": "956f395b5711bfe059186573edde55ac85690a2b70ad8e8251c60a6391eaeeef",
+      "historical_source": {
+        "commit": "6c364cb05b962299e6e1adad0d4ce88677813308",
+        "path": "supabase/migrations/20260818000001_billing_trial_eligibility.sql"
+      }
+    },
+    "20260924000001": {
+      "source": "supabase/migrations/20260924000001_sandbox_snapshot.sql",
+      "source_sha256": "4c832e2b51bfb88f5a738c96ec134e57dfdd89b15b9d361f4740b87578e128f4",
+      "source_ast_sha256": "f8030d7f6d644eb6b66088d2d2ce07fca14e979223651f7865d3c2ec5fb61001",
+      "observed_name": "sandbox_snapshot",
+      "statements_sha256": "113005498a8ba1facfe9d0040286134e1cee79e84d578fec7e9fc2f9826cdc8d",
+      "ast_sha256": "7991924dbdc837f3d872445231f40a7d2a66a75a1f964ecacd51a3709fb24025",
+      "historical_source": {
+        "commit": "842086bfac33ddfd0d5dabce0704055a91f35db5",
+        "path": "supabase/migrations/20260924000001_sandbox_snapshot.sql"
+      }
+    }
+  },
+  "catalog": {
+    "constraints": [
+      [
+        "sandbox",
+        "sandbox_preview_access_valid",
+        true,
+        "CHECK ((preview_access = ANY (ARRAY['public'::text, 'private'::text])))"
+      ],
+      [
+        "sandbox",
+        "sandbox_preview_token_version_valid",
+        true,
+        "CHECK ((preview_token_version >= 1))"
+      ],
+      [
+        "template",
+        "template_disk_range",
+        true,
+        "CHECK (((disk_mib >= 1024) AND (disk_mib <= 131072)))"
+      ],
+      [
+        "template",
+        "template_memory_range",
+        true,
+        "CHECK (((memory_mib >= 256) AND (memory_mib <= 131072)))"
+      ],
+      [
+        "template",
+        "template_vcpu_range",
+        true,
+        "CHECK (((vcpu >= 1) AND (vcpu <= 32)))"
+      ]
+    ],
+    "legacy_columns": [
+      [
+        "preview_access",
+        "text",
+        true,
+        "'public'::text"
+      ],
+      [
+        "preview_token_version",
+        "integer",
+        true,
+        "1"
+      ]
+    ],
+    "preview_tables": [
+      [
+        "sandbox_preview_policy",
+        true,
+        false
+      ],
+      [
+        "sandbox_published_port",
+        true,
+        false
+      ]
+    ],
+    "indexes": [
+      [
+        "sandbox_by_source_snapshot",
+        true,
+        true,
+        false,
+        "CREATE INDEX sandbox_by_source_snapshot ON public.sandbox USING btree (source_snapshot_id) WHERE (source_snapshot_id IS NOT NULL)"
+      ],
+      [
+        "template_name_unique_per_team_active",
+        true,
+        true,
+        true,
+        "CREATE UNIQUE INDEX template_name_unique_per_team_active ON public.template USING btree (team_id, name) WHERE (deleted_at IS NULL)"
+      ]
+    ],
+    "source_snapshot_fk": [
+      [
+        "sandbox_source_snapshot_fk",
+        true,
+        "FOREIGN KEY (source_snapshot_id, team_id) REFERENCES sandbox_snapshot(id, team_id)"
+      ]
+    ],
+    "columns": [
+      [
+        "name",
+        "text",
+        true
+      ],
+      [
+        "source_snapshot_id",
+        "uuid",
+        false
+      ]
+    ],
+    "grafana_role": [
+      [
+        "grafana_readonly",
+        true,
+        false,
+        false,
+        false,
+        false,
+        false
+      ]
+    ],
+    "analytics_grants": [
+      true,
+      true
+    ],
+    "triggers": [
+      [
+        "billing_commercial_contract",
+        "billing_entitlement_enqueue",
+        "O",
+        "enqueue_billing_entitlement",
+        "CREATE TRIGGER billing_entitlement_enqueue AFTER INSERT OR UPDATE OF status ON public.billing_commercial_contract FOR EACH ROW EXECUTE FUNCTION enqueue_billing_entitlement()"
+      ],
+      [
+        "sandbox_snapshot",
+        "trg_sandbox_snapshot_no_revive",
+        "O",
+        "sandbox_snapshot_no_revive",
+        "CREATE TRIGGER trg_sandbox_snapshot_no_revive BEFORE UPDATE ON public.sandbox_snapshot FOR EACH ROW EXECUTE FUNCTION sandbox_snapshot_no_revive()"
+      ],
+      [
+        "sandbox_snapshot",
+        "trg_sandbox_snapshot_quota",
+        "O",
+        "sandbox_snapshot_quota_on_insert",
+        "CREATE TRIGGER trg_sandbox_snapshot_quota BEFORE INSERT ON public.sandbox_snapshot FOR EACH ROW EXECUTE FUNCTION sandbox_snapshot_quota_on_insert()"
+      ],
+      [
+        "team",
+        "team_signup_trial_credit",
+        "O",
+        "grant_signup_trial_credit",
+        "CREATE TRIGGER team_signup_trial_credit AFTER INSERT ON public.team FOR EACH ROW EXECUTE FUNCTION grant_signup_trial_credit()"
+      ]
+    ]
+  },
+  "functions": {
+    "enqueue_billing_entitlement": {
+      "source": "supabase/migrations/20261017000100_entitlement_activation_wakeup.sql",
+      "source_sha256": "9f34863d4ace7c82fe0c0658b8ec04544890250b8c9b7c01434b6bc265a7218d",
+      "arguments": "",
+      "body_sha256": "6bf5104cb55b23a8764cadab018006457cafc72c9540723982b3e2ed816433ed",
+      "language": "plpgsql",
+      "security_definer": false,
+      "volatility": "v",
+      "result": "trigger",
+      "configuration": null
+    },
+    "grant_signup_trial_credit": {
+      "source": "supabase/migrations/20261016171308_qm_managed_team_billing.sql",
+      "source_sha256": "40cec7e36c8f535c0b50d786da432aaebbb4348cc0174ae78966bce461339833",
+      "arguments": "",
+      "body_sha256": "74ec4e11df11f570ecf5d813a2725b7dd03a311ed216e0a2c285bfb40587632e",
+      "language": "plpgsql",
+      "security_definer": false,
+      "volatility": "v",
+      "result": "trigger",
+      "configuration": null
+    },
+    "refresh_team_trial_eligibility": {
+      "source": "supabase/migrations/20261003010019_fail_closed_trial_eligibility.sql",
+      "source_sha256": "fdb2d65015ce4426eb9ee6bf4dff8bffed4b85587dd8936d16b7d952fbd7b3ed",
+      "arguments": "p_team_id uuid",
+      "body_sha256": "d795577c181ed2b205613098b545dcdd7cc3476165596d0be0090e363bfe287f",
+      "language": "sql",
+      "security_definer": false,
+      "volatility": "s",
+      "result": "boolean",
+      "configuration": null
+    },
+    "sandbox_snapshot_no_revive": {
+      "source": "supabase/migrations/20260924000001_sandbox_snapshot.sql",
+      "source_sha256": "4c832e2b51bfb88f5a738c96ec134e57dfdd89b15b9d361f4740b87578e128f4",
+      "arguments": "",
+      "body_sha256": "629e6e7182d368e2f73cc11a04c7c1851ccea9dc642193c05f91ce9db5a1156d",
+      "language": "plpgsql",
+      "security_definer": false,
+      "volatility": "v",
+      "result": "trigger",
+      "configuration": null
+    },
+    "sandbox_snapshot_quota_on_insert": {
+      "source": "supabase/migrations/20260925000004_sandbox_snapshot_sweep.sql",
+      "source_sha256": "e19fb0c4ed29cd736d8e0a57f36886394c0a24efde7c57d64a51f1d0b0b42eff",
+      "arguments": "",
+      "body_sha256": "f045be4cf1429af3a603984ca8e4c896c4c5f921cb538c9c474df8381ac9acbf",
+      "language": "plpgsql",
+      "security_definer": false,
+      "volatility": "v",
+      "result": "trigger",
+      "configuration": null
+    },
+    "team_sandbox_billing_eligible": {
+      "source": "supabase/migrations/20261016171308_qm_managed_team_billing.sql",
+      "source_sha256": "40cec7e36c8f535c0b50d786da432aaebbb4348cc0174ae78966bce461339833",
+      "arguments": "p_team_id uuid",
+      "body_sha256": "7420399c988e0b7db82c8c17401737784ce7839246b35381d2c8566f369998aa",
+      "language": "sql",
+      "security_definer": false,
+      "volatility": "s",
+      "result": "boolean",
+      "configuration": null
+    }
+  },
+  "applied_functions": {}
+}

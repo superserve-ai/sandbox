@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "repository": "superserve-ai/sandbox",
+  "pull_request": 711,
+  "branch": "aw/yc-billing-calendar-transition",
+  "revision": "345734adf5aa6fed71d2351dd53d17e1a876bce3",
+  "baseline": "6febbaa48ebefb0c302d64f0e9958e36036e900f",
+  "ci_run": 39061634904,
+  "approval_review": 5559653209,
+  "migrations": {
+    "supabase/migrations/20261017012100_yc_billing_calendar_transition.sql": "1c8afc6feabcc6e392482c4f746acf7e02ac7b18fbbf35e3b048264947497675"
+  }
+}
