@@ -37,12 +37,13 @@ func TestYCOperatorLinkCreatesSubscriptionOnce(t *testing.T) {
 	runYCOperatorAdoption(t, false, "link", true)
 }
 
-func TestYCOperatorCalendarRecoveryWithoutPaymentReadiness(t *testing.T) {
-	for _, renewal := range []bool{false, true} {
-		for _, failure := range []string{"missing", "unavailable"} {
+func TestYCOperatorCalendarRecoveryBeforeBillingChecks(t *testing.T) {
+	for _, state := range []string{"enrolling", "active", "renewed", "renewal_pending"} {
+		renewal := state == "renewed" || state == "renewal_pending"
+		for _, failure := range []string{"missing", "unavailable", "invoice-unavailable"} {
 			for _, conflict := range []bool{false, true} {
-				t.Run(fmt.Sprintf("renewal-%t/%s/conflict-%t", renewal, failure, conflict), func(t *testing.T) {
-					runYCOperatorAdoptionWithPaymentFailure(t, false, "card", failure, false, true, true, conflict, renewal)
+				t.Run(fmt.Sprintf("%s/%s/conflict-%t", state, failure, conflict), func(t *testing.T) {
+					runYCOperatorAdoptionWithRecoveryFailure(t, false, "card", failure, state, false, true, true, conflict, renewal)
 				})
 			}
 		}
@@ -50,10 +51,10 @@ func TestYCOperatorCalendarRecoveryWithoutPaymentReadiness(t *testing.T) {
 }
 
 func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, create ...bool) {
-	runYCOperatorAdoptionWithPaymentFailure(t, existing, methodType, "", create...)
+	runYCOperatorAdoptionWithRecoveryFailure(t, existing, methodType, "", "", create...)
 }
 
-func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, methodType, paymentFailure string, create ...bool) {
+func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, methodType, recoveryFailure, recoveryState string, create ...bool) {
 	computeOnly := len(create) > 1 && create[1]
 	newSubscription := len(create) > 0 && create[0]
 	subscriptionCreated := !newSubscription
@@ -147,6 +148,7 @@ func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, method
 	}
 	card := false
 	methodUnavailable := false
+	invoiceUnavailable := false
 	setupReady := false
 	methodOwner := "acct_customer"
 	writes := 0
@@ -185,6 +187,10 @@ func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, method
 			}
 			output(map[string]any{"data": []any{map[string]any{"id": "seti_fixture", "customer_account": methodOwner, "livemode": false, "payment_method": "pm_card", "status": status, "usage": "off_session"}}})
 		case r.URL.Path == "/v1/invoices/in_first":
+			if invoiceUnavailable {
+				http.Error(w, "invoice lookup unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			fmt.Fprintf(w, `{"id":"in_first","customer":%q,"status":"paid","currency":"usd","subtotal":1200000,"total":0,"amount_due":0,"amount_paid":0,"amount_remaining":0,"starting_balance":0,"ending_balance":0,"total_discount_amounts":[{"amount":1200000}],"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"amount":1200000,"currency":"usd","quantity":1,"period":{"start":%d,"end":%d},"pricing":{"price_details":{"price":%q}},"parent":{"subscription_item_details":{"subscription":%q}}}]}}`, customer, sub.ID, sub.StartDate, sub.Items.Data[0].End, p.BasePriceID, sub.ID)
 		case strings.HasPrefix(r.URL.Path, "/v1/coupons/"):
 			coupon := map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/v1/coupons/"), "duration": "once", "percent_off": 100}
@@ -351,6 +357,9 @@ func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, method
 		if renewalPending {
 			state = "renewal_pending"
 		}
+		if recoveryState != "" {
+			state = recoveryState
+		}
 		f.exec(t, `UPDATE billing_yc_operation SET state=$2 WHERE team_id=$1`, team.ID, state)
 		conflict := len(create) > 3 && create[3]
 		if conflict {
@@ -360,8 +369,9 @@ func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, method
 		if anchorChanged {
 			sub.BillingCycleAnchor += 3600
 		}
-		card = paymentFailure != "missing"
-		methodUnavailable = paymentFailure == "unavailable"
+		card = recoveryFailure != "missing"
+		methodUnavailable = recoveryFailure == "unavailable"
+		invoiceUnavailable = recoveryFailure == "invoice-unavailable"
 		var before []byte
 		if err = h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(w) FROM billing_contract_waiver w WHERE team_id=$1`, team.ID).Scan(&before); err != nil {
 			t.Fatal(err)
@@ -369,10 +379,12 @@ func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, method
 		for range 2 {
 			err = h.reconcileYC(t.Context(), team.ID)
 			wantError := ""
-			if paymentFailure == "missing" {
+			if recoveryFailure == "missing" {
 				wantError = "payment_method_required"
-			} else if paymentFailure == "unavailable" {
+			} else if recoveryFailure == "unavailable" {
 				wantError = "payment lookup unavailable"
+			} else if recoveryFailure == "invoice-unavailable" {
+				wantError = "invoice lookup unavailable"
 			}
 			if conflict {
 				wantError = "yc_calendar_conflict"
@@ -394,10 +406,12 @@ func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, method
 				t.Fatal("provider drift changed calendar", err)
 			}
 		}
-		if paymentFailure != "" {
-			eligible, err = h.DB.IsTeamSandboxBillingEligible(t.Context(), team.ID)
-			if err != nil || eligible {
-				t.Fatal("calendar recovery bypassed payment readiness", err)
+		if recoveryFailure != "" {
+			if recoveryFailure != "invoice-unavailable" {
+				eligible, err = h.DB.IsTeamSandboxBillingEligible(t.Context(), team.ID)
+				if err != nil || eligible {
+					t.Fatal("calendar recovery bypassed payment readiness", err)
+				}
 			}
 			var retained bool
 			end := anchor
@@ -405,7 +419,7 @@ func runYCOperatorAdoptionWithPaymentFailure(t *testing.T, existing bool, method
 				end = anchor.AddDate(0, 0, 18)
 			}
 			if err = h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open')`, team.ID, anchor.AddDate(0, 0, -13), end).Scan(&retained); err != nil || !retained {
-				t.Fatal("payment failure lost historical interval", err)
+				t.Fatal("readiness failure lost historical interval", err)
 			}
 		}
 		if writes != 0 {

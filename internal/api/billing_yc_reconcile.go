@@ -96,18 +96,6 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 			return err
 		}
 	}
-	if sub.LatestInvoice != "" {
-		var latest StripeInvoiceAmounts
-		if err = client.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(sub.LatestInvoice), nil, &latest, ""); err != nil {
-			return err
-		}
-		if latest.ID != sub.LatestInvoice || latest.Customer != o.Customer || latest.Parent.SubscriptionDetails == nil || latest.Parent.SubscriptionDetails.Subscription != sub.ID || latest.Status == "" {
-			return errors.New("latest invoice association differs")
-		}
-		if _, err = h.Pool.Exec(ctx, `UPDATE team_billing_account SET stripe_invoice_status=$3 WHERE team_id=$1 AND stripe_customer_id=$2`, team, o.Customer, latest.Status); err != nil {
-			return err
-		}
-	}
 	ready, err := client.ycPaymentMethod(ctx, o.Customer, sub, *o.Request.Live)
 	methodErr := err
 	if methodErr != nil {
@@ -118,7 +106,7 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 	}
 	renewalDue := o.End.Valid && !time.Now().Before(o.End.Time)
 	// Repair adopted accounting authority even when payment readiness blocks billing.
-	if o.State != "ended" && (o.State == "active" || o.State == "renewed" || o.State == "renewal_pending" || renewalDue) {
+	if o.State != "ended" && (o.State == "enrolling" || o.State == "active" || o.State == "renewed" || o.State == "renewal_pending" || renewalDue) {
 		var reconciled bool
 		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_calendar_transition WHERE operation_id=$1 AND team_id=$2 AND anniversary=$3)`, o.ID, team, o.Start.Time).Scan(&reconciled); err != nil {
 			return err
@@ -138,6 +126,18 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 			if err = tx.Commit(ctx); err != nil {
 				return err
 			}
+		}
+	}
+	if sub.LatestInvoice != "" {
+		var latest StripeInvoiceAmounts
+		if err = client.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(sub.LatestInvoice), nil, &latest, ""); err != nil {
+			return err
+		}
+		if latest.ID != sub.LatestInvoice || latest.Customer != o.Customer || latest.Parent.SubscriptionDetails == nil || latest.Parent.SubscriptionDetails.Subscription != sub.ID || latest.Status == "" {
+			return errors.New("latest invoice association differs")
+		}
+		if _, err = h.Pool.Exec(ctx, `UPDATE team_billing_account SET stripe_invoice_status=$3 WHERE team_id=$1 AND stripe_customer_id=$2`, team, o.Customer, latest.Status); err != nil {
+			return err
 		}
 	}
 	if methodErr != nil {
