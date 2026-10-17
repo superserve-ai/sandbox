@@ -50,3 +50,20 @@ class PushCIGateTests(unittest.TestCase):
                        SimpleNamespace(returncode=0, stdout="not JSON")):
             self.assertFalse(GATE.wait_for_ci("example/repo", "a" * 40, "push",
                                              run=Mock(return_value=result), sleep=Mock()))
+
+    def test_transient_lookup_failure_does_not_decide(self):
+        good = dict(head_sha="a" * 40, event="push", status="completed", conclusion="success")
+        ok = SimpleNamespace(returncode=0, stdout=json.dumps({"workflow_runs": [good]}))
+        pending = SimpleNamespace(returncode=0, stdout=json.dumps({"workflow_runs": [
+            dict(good, status="in_progress", conclusion=None)]}))
+        bad = SimpleNamespace(returncode=1, stdout="")
+        run = Mock(side_effect=[bad, pending, bad, bad, ok])
+        self.assertTrue(GATE.wait_for_ci("example/repo", "a" * 40, "push",
+                                        attempts=6, interval=0, tolerance=3,
+                                        run=run, sleep=Mock()))
+        self.assertEqual(run.call_count, 5)
+        run = Mock(return_value=bad)
+        self.assertFalse(GATE.wait_for_ci("example/repo", "a" * 40, "push",
+                                         attempts=60, interval=0, tolerance=3,
+                                         run=run, sleep=Mock()))
+        self.assertEqual(run.call_count, 3)
