@@ -2,9 +2,12 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -21,9 +24,60 @@ func (h *Handlers) ycAuthorityPreflight(ctx context.Context, team uuid.UUID, in 
 	if conflict {
 		return errors.New("company eligibility is already bound or revoked")
 	}
-	return nil
+	if in.ClaimID != "" {
+		_, err = h.ycClaimApproval(ctx, team, in)
+	}
+	return err
+}
+
+// A bound claim carries its audited existing-account exception into billing.
+// Adopt that authority without rewriting evidence or opening general plan choice.
+func (h *Handlers) ycClaimApproval(ctx context.Context, team uuid.UUID, in ycApproval) (uuid.UUID, error) {
+	id, err := uuid.Parse(in.ClaimID)
+	if err != nil {
+		return uuid.Nil, errors.New("invalid YC claim identity")
+	}
+	var user uuid.UUID
+	err = h.Pool.QueryRow(ctx, `SELECT user_id FROM public.yc_claim_team_intent WHERE team_id=$1 AND claim_id=$2 AND released_at IS NULL`, team, id).Scan(&user)
+	if err != nil {
+		return uuid.Nil, errors.New("active YC claim intent unavailable")
+	}
+	raw, err := h.ycClaimRPC(ctx, "account-get", gin.H{"id": id, "user_id": user})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	var claim struct {
+		ID           uuid.UUID `json:"id"`
+		User         uuid.UUID `json:"claimed_user_id"`
+		Team         uuid.UUID `json:"team_id"`
+		Approval     uuid.UUID `json:"approval_id"`
+		State        string    `json:"state"`
+		Company      string    `json:"company_identity"`
+		Region       string    `json:"home_region"`
+		SignupEmail  string    `json:"submitted_email"`
+		FounderEmail string    `json:"founder_email"`
+	}
+	if err = json.Unmarshal(raw, &claim); err != nil {
+		return uuid.Nil, err
+	}
+	if claim.ID != id || claim.User != user || claim.Team != team || claim.Approval == uuid.Nil || claim.State != "bound" || claim.Company != in.CompanyIdentity || claim.Region != in.Region ||
+		!strings.EqualFold(claim.SignupEmail, strings.TrimSpace(in.SignupEmail)) || !strings.EqualFold(claim.FounderEmail, strings.TrimSpace(in.FounderEmail)) {
+		return uuid.Nil, errors.New("YC claim differs from billing approval")
+	}
+	var valid bool
+	err = h.PromotionAuthPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.read_yc_activation_authority($1,$2) WHERE approval_id=$3 AND company_identity=$1 AND team_id=$2 AND home_region=$4 AND offer_key='yc_2026' AND offer_version=1 AND revoked_at IS NULL)`, in.CompanyIdentity, team, claim.Approval, in.Region).Scan(&valid)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if !valid {
+		return uuid.Nil, errors.New("YC claim activation authority is unavailable")
+	}
+	return claim.Approval, nil
 }
 func (h *Handlers) reserveYCAuthority(ctx context.Context, team, actor uuid.UUID, in ycApproval) (uuid.UUID, error) {
+	if in.ClaimID != "" {
+		return h.ycClaimApproval(ctx, team, in)
+	}
 	var id uuid.UUID
 	err := h.PromotionAuthPool.QueryRow(ctx, `SELECT approval_id FROM public.reserve_yc_activation_authority($1,$2,$3,$4,'operator',$5,NULL)`, in.CompanyIdentity, team, in.Region, actor, in.Evidence).Scan(&id)
 	return id, err

@@ -187,6 +187,14 @@ func (h *Handlers) ycApprove(c *gin.Context, apply bool) {
 	c.JSON(200, gin.H{"approved": apply, "customer_id": input.Customer, "subscription_id": input.Subscription, "starts_at": start, "ends_at": end, "new_subscription_anchor": "subscription activation", "usage_requires_payment_method": true})
 }
 func (h *Handlers) ycLocalPreflight(ctx context.Context, q db.DBTX, team uuid.UUID, in ycApproval) error {
+	var claimID *uuid.UUID
+	if in.ClaimID != "" {
+		id, err := uuid.Parse(in.ClaimID)
+		if err != nil {
+			return errors.New("invalid YC claim identity")
+		}
+		claimID = &id
+	}
 	var region string
 	var conflicts bool
 	err := q.QueryRow(ctx, `SELECT home_region FROM team WHERE id=$1`, team).Scan(&region)
@@ -200,7 +208,8 @@ func (h *Handlers) ycLocalPreflight(ctx context.Context, q db.DBTX, team uuid.UU
  (COALESCE(stripe_customer_id,'')<>$2 OR (stripe_subscription_id IS NOT NULL AND stripe_subscription_id<>$3) OR checkout_initializing_at IS NOT NULL OR stripe_activation_credit_reserved_at IS NOT NULL OR stripe_activation_credit_grant_id IS NOT NULL))
  OR EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND id NOT IN(SELECT contract_id FROM billing_yc_operation WHERE team_id=$1))
  OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND state<>'selecting')
- OR (NOT $4 AND NOT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND state='selecting'))`, team, in.Customer, in.Subscription, in.ExistingSubscriptionApproved).Scan(&conflicts)
+ OR (NOT $4 AND NOT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND state='selecting')
+ AND NOT EXISTS(SELECT 1 FROM yc_claim_team_intent WHERE team_id=$1 AND claim_id=$5 AND released_at IS NULL))`, team, in.Customer, in.Subscription, in.ExistingSubscriptionApproved, claimID).Scan(&conflicts)
 	if err != nil {
 		return err
 	}

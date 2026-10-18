@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/config"
 )
 
 func TestYCClaimAdmissionTransactions(t *testing.T) {
@@ -198,4 +199,86 @@ func TestYCClaimAdmissionTransactions(t *testing.T) {
 	}
 	exec("UPDATE billing_signup_choice SET state='committed',offer_key='free' WHERE team_id=$1", race["team_id"])
 
+	t.Run("approved existing account billing handoff", func(t *testing.T) {
+		exec("ALTER TABLE team ADD COLUMN home_region text NOT NULL DEFAULT 'use'; CREATE TABLE billing_yc_operation(team_id uuid,contract_id uuid)")
+		h.Config = &config.Config{TeamCreationRegion: "use"}
+		input := create("existing-billing@example.test", true)
+		team := input["team_id"].(uuid.UUID)
+		exec("DELETE FROM billing_signup_choice WHERE team_id=$1", team)
+		input["actor_id"], input["reason"], input["evidence_reference"] = uuid.New(), "approved existing account", "synthetic-review"
+		input["existing_customer_exception"] = true
+		raw, err := h.ycBindWithIntent(ctx, "approve", input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var claim struct {
+			Approval uuid.UUID `json:"approval_id"`
+		}
+		if err = json.Unmarshal(raw, &claim); err != nil || claim.Approval == uuid.Nil {
+			t.Fatalf("missing approval: %s %v", raw, err)
+		}
+		approval := ycApproval{ClaimID: input["id"].(string), CompanyIdentity: "https://www.ycombinator.com/companies/existing-billing", Region: "use", SignupEmail: "existing-billing@example.test", FounderEmail: "existing-billing@example.test"}
+		check := func(in ycApproval) error {
+			if e := h.ycLocalPreflight(ctx, pool, team, in); e != nil {
+				return e
+			}
+			return h.ycAuthorityPreflight(ctx, team, in)
+		}
+		if err = check(approval); err != nil {
+			t.Fatal("approved account rejected", err)
+		}
+		for _, change := range []struct {
+			name string
+			edit func(*ycApproval)
+		}{
+			{"missing claim", func(p *ycApproval) { p.ClaimID = "" }},
+			{"other claim", func(p *ycApproval) { p.ClaimID = uuid.NewString() }},
+			{"invalid claim", func(p *ycApproval) { p.ClaimID = "invalid" }},
+			{"other company", func(p *ycApproval) { p.CompanyIdentity = "https://www.ycombinator.com/companies/other" }},
+			{"other region", func(p *ycApproval) { p.Region = "usw" }},
+			{"other account", func(p *ycApproval) { p.SignupEmail = "other@example.test" }},
+			{"other founder", func(p *ycApproval) { p.FounderEmail = "other@example.test" }},
+		} {
+			t.Run(change.name, func(t *testing.T) {
+				changed := approval
+				change.edit(&changed)
+				if check(changed) == nil {
+					t.Fatal("invalid claim accepted")
+				}
+			})
+		}
+		for i := 0; i < 2; i++ {
+			id, e := h.reserveYCAuthority(ctx, team, uuid.New(), approval)
+			if e != nil || id != claim.Approval {
+				t.Fatal("approval replay changed authority", id, e)
+			}
+		}
+		var count int
+		if e := pool.QueryRow(ctx, "SELECT count(*) FROM yc_claim_decision WHERE claim_id=$1 AND decision='operator'", approval.ClaimID).Scan(&count); e != nil || count != 1 {
+			t.Fatal("approval evidence changed", count, e)
+		}
+		exec("UPDATE team_billing_account SET stripe_customer_id='cus_other' WHERE team_id=$1", team)
+		if check(approval) == nil {
+			t.Fatal("conflicting provider binding accepted")
+		}
+		exec("UPDATE team_billing_account SET stripe_customer_id=NULL WHERE team_id=$1", team)
+		exec("UPDATE yc_claim_team_intent SET user_id=$2 WHERE team_id=$1", team, uuid.New())
+		if check(approval) == nil {
+			t.Fatal("different intent user accepted")
+		}
+		exec("UPDATE yc_claim_team_intent SET user_id=$2 WHERE team_id=$1", team, input["user_id"])
+		exec("UPDATE auth.users SET email_confirmed_at=NULL WHERE id=$1", input["user_id"])
+		if check(approval) == nil {
+			t.Fatal("unverified account accepted")
+		}
+		exec("UPDATE auth.users SET email_confirmed_at=now() WHERE id=$1", input["user_id"])
+		exec("SELECT revoke_yc_activation_authority($1,$2,$3)", claim.Approval, team, uuid.New())
+		if check(approval) == nil {
+			t.Fatal("revoked authority accepted")
+		}
+		exec("UPDATE yc_claim_team_intent SET released_at=now() WHERE team_id=$1", team)
+		if e := h.ycLocalPreflight(ctx, pool, team, approval); e == nil {
+			t.Fatal("released intent accepted")
+		}
+	})
 }
