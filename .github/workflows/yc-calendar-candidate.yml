@@ -1,0 +1,154 @@
+name: YC calendar candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Preflight is read-only; apply migrates and deploys staging
+        required: true
+        type: choice
+        options: [preflight, apply]
+      preflight_run_id:
+        description: Successful preflight run on this exact main revision (apply only)
+        type: string
+      approved_receipt_sha256:
+        description: Reviewed receipt hash from that preflight summary (apply only)
+        type: string
+      accept_staging_outage_and_cohort:
+        description: Approve staging API outage and financial effects for the inventoried cohort (apply only)
+        type: boolean
+        default: false
+      confirm_executor_inventory:
+        description: Confirm the reviewed inventory covers every old YC/enrollment executor and maintenance window
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: control-plane-deploy
+  queue: max
+  cancel-in-progress: false
+
+env:
+  VALIDATION_MODE: ${{ inputs.mode }}
+  PREFLIGHT_RUN_ID: ${{ inputs.preflight_run_id }}
+  APPROVED_RECEIPT_SHA256: ${{ inputs.approved_receipt_sha256 }}
+  ACCEPT_STAGING_OUTAGE_AND_COHORT: ${{ inputs.accept_staging_outage_and_cohort && 'true' || 'false' }}
+  CONFIRM_EXECUTOR_INVENTORY: ${{ inputs.confirm_executor_inventory && 'true' || 'false' }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      candidate_revision: ${{ steps.gate.outputs.candidate_revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: gate
+        run: python3 .github/workflows/scripts/yc_calendar_candidate.py gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    name: Build candidate
+    needs: gate
+    if: inputs.mode == 'preflight'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.candidate_revision }}
+          persist-credentials: false
+      - name: Build without cloud credentials
+        env:
+          CANDIDATE_REVISION: ${{ needs.gate.outputs.candidate_revision }}
+        run: |
+          docker build --platform linux/amd64 -t "controlplane:$CANDIDATE_REVISION" .
+          docker run --rm --network none --entrypoint /bin/sh "controlplane:$CANDIDATE_REVISION" -c 'set -eu; /bin/sleep infinity & p=$!; /bin/sleep 1; kill -0 "$p"; kill "$p"; wait "$p" || test "$?" = 143'
+          docker save "controlplane:$CANDIDATE_REVISION" > /tmp/controlplane.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-image
+          path: /tmp/controlplane.tar
+          retention-days: 7
+          if-no-files-found: error
+
+  staging:
+    name: Calendar staging
+    needs: [gate, build]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && (needs.build.result == 'success' || (inputs.mode == 'apply' && needs.build.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: database-migrations
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      checks: read
+      statuses: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reverify before obtaining cloud credentials
+        run: python3 .github/workflows/scripts/yc_calendar_candidate.py gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.candidate_revision }}
+          path: candidate-source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-image
+          path: image
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.mode == 'apply' && inputs.preflight_run_id || github.run_id }}
+      - uses: supabase/setup-cli@v1
+        with:
+          version: '2.119.0'
+      - run: python3 -m pip install -r scripts/migration-requirements.txt
+      - run: python3 -m pip install -r deploy/staging-candidates/requirements.txt
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Run calendar staging validation
+        run: python3 .github/workflows/scripts/yc_calendar_candidate.py "$VALIDATION_MODE"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode == 'preflight'
+        with:
+          name: yc-calendar-preflight
+          path: calendar-receipt/receipt.json
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.mode == 'apply'
+        with:
+          name: yc-calendar-audit
+          path: calendar-audit/journal.jsonl
+          retention-days: 30
+          if-no-files-found: ignore

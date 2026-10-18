@@ -115,6 +115,10 @@ func main() {
 	if err := os.Chmod(defaultHome, 0o755); err != nil {
 		log.Fatalf("chmod defaultHome %s: %v", defaultHome, err)
 	}
+	// Not fatal: a guest without the links is degraded, not unusable.
+	if err := ensureStandardStreamLinks("/dev"); err != nil {
+		log.Printf("init: standard stream links: %v", err)
+	}
 
 	mux := http.NewServeMux()
 

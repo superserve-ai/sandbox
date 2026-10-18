@@ -40,7 +40,7 @@ class ControlPlaneIdentityPlanTests(unittest.TestCase):
         self.assertEqual(participants, {
             "control-plane-identity-rollout.yml", "deploy-api.yml", "terraform-cd.yml",
             "terraform-rollout-staging.yml", "terraform-rollout-production.yml",
-            "staging-candidate-validation.yml",
+            "staging-candidate-validation.yml", "yc-calendar-candidate.yml",
         })
         # GitHub's native max queue retains both pending CD/API runs behind
         # an active rollout; every participant must opt out of the single slot.
