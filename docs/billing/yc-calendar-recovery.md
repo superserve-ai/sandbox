@@ -14,25 +14,40 @@ production rollout, `use4` and `usw2`. This is not a shared Auth migration. It
 creates regional transition evidence and guards on regional accounting tables;
 it does not change global company approval authority.
 
-1. Pause new YC approvals and drain old YC reconciliation workers before the
-   regional migration/API rollout. Preserve invoice holds and existing export
-   and entitlement gates. Other billing writers may remain online: period locks,
-   foreign keys, and the added non-FK writer fences serialize their accounting
-   records with the transition.
-2. Apply the migration, then deploy the API and billing workers containing this
-   change. Do not run these binaries against a database without the migration.
-   Do not resume an older YC worker after a transition has committed.
+1. Use the normal migration-first deployment workflow. Its prerequisite waits
+   for push CI and applies the regional migrations to staging, then `use4` and
+   `usw2` when production is authorized, before deploying the API to staging and
+   then production. Preserve environment approvals, invoice holds, and existing
+   export and entitlement gates. Do not run the new binaries before migration.
+2. Verify the deployed revision, serving traffic, health, and billing errors.
+   Starting the new workers automatically reconciles due YC operations,
+   including saved partial activations and active operations missing a receipt.
+   Confirm successful reconciliation and its receipt before declaring activation
+   complete; unresolved accounting conflicts require the recovery procedure below.
 3. Include the approved-resource credit-scope recovery from PR #707 before
    accepting CPU/memory-only credit issuance. Integrate the coupon evidence fix
    independently; its subscription creation identities and idempotency keys
    remain unchanged by this transition.
-4. Validate the staging scenario below, then resume approvals for that deployment.
+4. Validate the staging scenario below using assigned synthetic fixtures. Do not
+   create production fixtures or manually convert customer accounts as a rollout
+   check. Retry clearly transient deployment failures; otherwise stop and notify
+   the release owner. Do not automatically repair billing state or roll back.
    Retain the migration and its audit rows if application rollout is paused.
+
+The migration itself does not change period boundaries, anchors, or provider
+resources. Older APIs can use the additive schema, but they do not enforce the
+new reconciliation receipt before enrollment or activation. After reconciliation,
+the database rejects stale calendar writes; normal readers already use the saved
+commercial anniversary. Full-service shutdown and a permanent old-binary fence
+are not prerequisites. Period locks, foreign keys, and non-FK writer fences
+serialize accounting records with each transition. These guards also add locking
+to shared billing tables; accounts without a YC operation are not converted.
 
 The existing branch-staging deployment gate refuses migration inputs different
 from main. Use a reviewed revision through that gate after the migrations are
 available there, or the owning deployment workflow's explicitly approved staging
-procedure. Do not bypass the gate, execute branch SQL through shared Auth, or
+procedure. The disabled experimental calendar-drain workflow is not required.
+Do not bypass the gate, execute branch SQL through shared Auth, or
 interpret passing local fixtures as deployed acceptance. A push/merge to main can
 trigger production deployment; this procedure does not authorize that action.
 
