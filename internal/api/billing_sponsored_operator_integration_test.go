@@ -23,7 +23,7 @@ import (
 )
 
 func TestSponsoredOperatorOnboardingAndRetry(t *testing.T) {
-	for _, scenario := range []string{"new", "existing_anniversary", "revoke_creation", "catalog_rotation", "checkout_race", "revoke_canceled"} {
+	for _, scenario := range []string{"new", "existing_anniversary", "revoke_creation", "catalog_rotation", "checkout_race", "revoke_canceled", "historical_terms"} {
 		t.Run(scenario, func(t *testing.T) { sponsoredOperatorScenario(t, scenario) })
 	}
 }
@@ -204,6 +204,10 @@ func sponsoredOperatorScenario(t *testing.T, scenario string) {
 	defer srv.Close()
 	h.Stripe = &stripeHTTPClient{baseURL: srv.URL, httpClient: srv.Client(), apiVersion: "2026-07-29.dahlia"}
 	request := sponsoredRequest{Key: "onboarding", Schedule: []sponsoredPhase{{3, 3000000}, {9, 100000}}, Start: "now", Reason: "pilot", Reference: "approval"}
+	if scenario == "historical_terms" {
+		prior, _ := json.Marshal(StripeCreateCheckoutSessionParams{ResourceTerms: []StripeCheckoutResourceTerms{{ResourceKey: "vcpu", PriceID: "price_obsolete", MeterID: "mtr_obsolete", EventName: "obsolete", UnitAmountDecimal: "1"}}})
+		exec(`INSERT INTO billing_sponsored_operation(team_id,idempotency_key,request,resource_terms,approved_by,approved_at,reason,reference,customer_id,subscription_id,state,revoked_at,revoked_by) VALUES($1,'old','{}',$2,$3,clock_timestamp()-interval '1 day','fixture','fixture',$4,$5,'revoked',clock_timestamp(),$3)`, team, prior, uuid.New(), customer, sub.ID)
+	}
 	actor := uuid.New()
 	call := func(apply bool, r sponsoredRequest) *httptest.ResponseRecorder {
 		raw, _ := json.Marshal(r)
@@ -231,14 +235,14 @@ func sponsoredOperatorScenario(t *testing.T, scenario string) {
 		t.Fatal("preflight", w.Code, w.Body.String())
 	}
 	var rows int
-	if err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_sponsored_operation WHERE team_id=$1`, team).Scan(&rows); err != nil || rows != 0 || writes != 0 {
+	if err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_sponsored_operation WHERE team_id=$1 AND idempotency_key='onboarding'`, team).Scan(&rows); err != nil || rows != 0 || writes != 0 {
 		t.Fatal("preflight wrote state", rows, writes, err)
 	}
 	if w := call(true, request); w.Code != 200 {
 		t.Fatal("apply", w.Code, w.Body.String())
 	}
 	var id uuid.UUID
-	if err = h.Pool.QueryRow(ctx, `SELECT id FROM billing_sponsored_operation WHERE team_id=$1`, team).Scan(&id); err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT id FROM billing_sponsored_operation WHERE team_id=$1 AND idempotency_key='onboarding'`, team).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	if w := call(true, request); w.Code != 200 {
@@ -300,6 +304,21 @@ func sponsoredOperatorScenario(t *testing.T, scenario string) {
 		}
 		if e = h.validateInvoiceEnrollmentSubscription(ctx, team, a, h.Stripe.(*stripeHTTPClient), sub, h.Pool); e != nil {
 			t.Fatal("rotated catalog broke existing collection", e)
+		}
+	}
+	if scenario == "historical_terms" {
+		states, e := h.billingSubscriptionResourceStates(ctx, team, sub.ID, false)
+		if e != nil || len(states) != 3 {
+			t.Fatal("stale resource authority", states, e)
+		}
+		scope, e := h.fundingCreditResourcePrices(ctx, team, customer)
+		if e != nil {
+			t.Fatal("stale credit authority", scope, e)
+		}
+		for _, price := range scope {
+			if price == "price_obsolete" {
+				t.Fatal("historical price selected")
+			}
 		}
 	}
 	if scenario == "revoke_canceled" {

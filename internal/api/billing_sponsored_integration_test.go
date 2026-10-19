@@ -4,11 +4,13 @@ package api
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -154,5 +156,70 @@ func TestSponsoredCanceledPendingDoesNotPoisonInvoice(t *testing.T) {
 	var poisoned bool
 	if err = f.h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_entitlement_withheld WHERE contract_id=$1 AND platform_failure_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_entitlement_work WHERE contract_id=$1 AND alerted_at IS NOT NULL)`, f.c.ID).Scan(&poisoned); err != nil || poisoned || f.grants.Load() != 0 {
 		t.Fatal("canceled grant poisoned closing invoice", poisoned, err)
+	}
+}
+
+func TestSponsoredExpirationReleasesContract(t *testing.T) {
+	h, team := fundingTransitionFixture(t)
+	h.Config = &config.Config{TeamCreationRegion: "use"}
+	ctx := t.Context()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, e := h.Pool.Exec(ctx, q, args...); e != nil {
+			t.Fatal(e)
+		}
+	}
+	op, contract := uuid.New(), uuid.New()
+	customer, sub := "cus_"+team.String(), "sub_"+team.String()
+	now := time.Now().UTC()
+	start := time.Date(now.Year()-2, now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(1, 0, 0)
+	exec(`UPDATE team SET home_region='use' WHERE id=$1`, team)
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,$2,$3,$4)`, team, customer, sub, start)
+	exec(`INSERT INTO billing_sponsored_operation(id,team_id,contract_id,idempotency_key,request,resource_terms,approved_by,reason,reference,customer_id,subscription_id,anchor,starts_at,ends_at) VALUES($1,$2,$3,'past','{}','{}',$4,'fixture','fixture',$5,$6,$7,$7,$8)`, op, team, contract, uuid.New(), customer, sub, start, end)
+	exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_kind,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'sponsored_usage',$3,$4,$5,$6,'','sponsored_entitlement',0,1,'metered_usage',100,'scheduled',$3)`, contract, team, start, end, customer, sub)
+	exec(`INSERT INTO billing_contract_entitlement_schedule(team_id,contract_id,month_offset,amount_cents) SELECT $1,$2,m,100 FROM generate_series(0,11) m`, team, contract)
+	exec(`UPDATE billing_commercial_contract SET status='active',revision=revision+1 WHERE id=$1`, contract)
+	exec(`UPDATE billing_sponsored_operation SET state='active' WHERE id=$1`, op)
+	if e := h.reconcileSponsored(ctx, op); e != nil {
+		t.Fatal(e)
+	}
+	var closed bool
+	if e := h.Pool.QueryRow(ctx, `SELECT c.status='ended' AND o.state='expired' AND c.ends_at=$2 AND o.ends_at=$2 FROM billing_commercial_contract c JOIN billing_sponsored_operation o ON o.contract_id=c.id WHERE c.id=$1`, contract, end).Scan(&closed); e != nil || !closed {
+		t.Fatal("expiry did not retain history and release authority", closed, e)
+	}
+	if e := h.sponsoredLocalPreflight(ctx, h.Pool, team); e != nil {
+		t.Fatal("expired sponsorship blocks successor", e)
+	}
+}
+
+func TestSponsoredSuccessorCannotRewriteIssuedCreditScope(t *testing.T) {
+	f := newEntitlementFixture(t, false, false, false, false, true)
+	ctx := t.Context()
+	if _, err := f.h.reconcileUsageEntitlement(ctx, f.c.ID); err != nil {
+		t.Fatal(err)
+	}
+	var prior uuid.UUID
+	if err := f.h.Pool.QueryRow(ctx, `SELECT id FROM billing_sponsored_operation WHERE contract_id=$1`, f.c.ID).Scan(&prior); err != nil {
+		t.Fatal(err)
+	}
+	f.h.Config.TeamCreationRegion = "use"
+	if _, err := f.h.Pool.Exec(ctx, `UPDATE team SET home_region='use' WHERE id=$1`, f.c.TeamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.h.Pool.Exec(ctx, `UPDATE billing_sponsored_operation SET revoked_at=clock_timestamp(),revoked_by=$2,state='revoking' WHERE id=$1`, prior, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.reconcileSponsored(ctx, prior); err != nil {
+		t.Fatal(err)
+	}
+	// The issued grant still covers a period whose invoice has not closed.
+	var outstanding bool
+	if err := f.h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE contract_id=$1 AND state='issued' AND NOT EXISTS(SELECT 1 FROM billing_invoice_close i WHERE i.team_id=e.team_id AND i.period_start=e.period_start AND i.period_end=e.period_end AND i.state='released'))`, f.c.ID).Scan(&outstanding); err != nil || !outstanding {
+		t.Fatal("missing historical obligation", outstanding, err)
+	}
+	_, err := f.h.Pool.Exec(ctx, `INSERT INTO billing_sponsored_operation(team_id,idempotency_key,request,resource_terms,approved_by,reason,reference,customer_id,subscription_id) SELECT team_id,'replacement','{}',jsonb_set(resource_terms,'{ResourceTerms,0,PriceID}','"price_changed"'),approved_by,'fixture','fixture',customer_id,subscription_id FROM billing_sponsored_operation WHERE id=$1`, prior)
+	if err == nil || !strings.Contains(err.Error(), "resource terms conflict with historical sponsorship") {
+		t.Fatal("successor reinterpreted predecessor credit/invoice", err)
 	}
 }

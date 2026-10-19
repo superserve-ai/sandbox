@@ -356,7 +356,7 @@ func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, te
 		return err
 	}
 	var frozen []byte
-	err := reader.QueryRow(ctx, `SELECT resource_terms FROM billing_sponsored_operation WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 ORDER BY approved_at DESC LIMIT 1`, team, a.Customer, a.Subscription).Scan(&frozen)
+	err := reader.QueryRow(ctx, `SELECT resource_terms FROM billing_sponsored_operation WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 ORDER BY approved_at DESC,id DESC LIMIT 1`, team, a.Customer, a.Subscription).Scan(&frozen)
 	if err == nil {
 		var params StripeCreateCheckoutSessionParams
 		if err = json.Unmarshal(frozen, &params); err != nil {

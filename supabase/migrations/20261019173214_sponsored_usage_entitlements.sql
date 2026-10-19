@@ -27,6 +27,7 @@ CREATE TABLE billing_sponsored_operation (
 );
 CREATE UNIQUE INDEX sponsored_current ON billing_sponsored_operation(team_id) WHERE state NOT IN ('revoked','expired');
 CREATE INDEX sponsored_due ON billing_sponsored_operation(next_check_at,id) WHERE state NOT IN ('revoked','expired');
+CREATE INDEX sponsored_awaiting_activation ON billing_sponsored_operation(approved_at) WHERE state='approved';
 ALTER TABLE billing_sponsored_operation ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON billing_sponsored_operation FROM PUBLIC;
 ALTER TABLE billing_usage_entitlement ADD COLUMN sponsorship_id uuid;
@@ -78,6 +79,9 @@ BEGIN
  t:=NEW.team_id;
  PERFORM 1 FROM team_billing_account WHERE team_id=t FOR UPDATE;
  IF TG_TABLE_NAME='billing_sponsored_operation' THEN
+  IF EXISTS(SELECT 1 FROM billing_sponsored_operation o JOIN billing_commercial_contract c ON c.id=o.contract_id
+   WHERE o.team_id=t AND o.subscription_id=NEW.subscription_id AND o.resource_terms<>NEW.resource_terms) THEN
+   RAISE EXCEPTION 'subscription resource terms conflict with historical sponsorship'; END IF;
   IF EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=t AND status<>'ended')
    OR EXISTS(SELECT 1 FROM billing_yc_operation WHERE team_id=t AND NOT billing_yc_released(t))
    OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=t AND offer_key IN ('pro_monthly','pro_annual') AND state<>'selecting')

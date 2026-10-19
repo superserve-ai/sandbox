@@ -46,7 +46,10 @@ Unpaid finalized debt, overlapping commercial or sponsored authority, YC
 approval, and pending paid checkout block approval or issuance. Existing usage
 subscriptions must match the approved resource terms and anniversary. An existing
 anniversary without an aligned subscription is rejected before provider creation;
-reconcile that billing setup separately rather than resetting its anniversary. Ordinary
+reconcile that billing setup separately rather than resetting its anniversary.
+Successive sponsorships on a retained subscription must preserve the original
+resource terms so historical usage and closing invoices keep their authority.
+A price/meter migration requires separate billing recovery. Ordinary
 customer and host credentials cannot approve or revoke sponsorship.
 
 ## Access and exhaustion
@@ -77,7 +80,9 @@ It respects the existing observation-capacity budget (initially four teams); it
 fails atomically if that budget is full. Follow [funding rollout validation](funding-access.md)
 before expanding that budget. No production activation is implied by this change.
 
-Inspect operation `last_error`, existing entitlement work/coverage metrics,
+Inspect operation `last_error`, `sponsorship_activation` backlog count/oldest age
+(including unclaimed approvals), `sponsorship_reconciliation` work metrics, and
+existing entitlement work/coverage metrics,
 funding freshness, and invoice work. Provider creation and grants use stable
 idempotency keys and durable attempt timestamps. Unknown creation or issuance
 beyond the 23-hour replay window requires operator recovery; never substitute a

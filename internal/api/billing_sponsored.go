@@ -167,6 +167,15 @@ func (h *Handlers) sponsoredApply(c *gin.Context, apply bool) {
 		conflicts = append(conflicts, err.Error())
 	}
 	params := StripeCreateCheckoutSessionParams{ResourceTerms: terms}
+	frozen, _ := json.Marshal(params)
+	var historicalConflict bool
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_operation o JOIN billing_commercial_contract c ON c.id=o.contract_id WHERE o.team_id=$1 AND o.subscription_id=$2 AND o.resource_terms<>$3::jsonb)`, team, subscription, frozen).Scan(&historicalConflict); err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if historicalConflict {
+		conflicts = append(conflicts, "resource terms differ from historical sponsorship on this subscription; explicit billing migration required")
+	}
 	if subscription != "" {
 		sub, e := client.invoiceSubscription(ctx, subscription)
 		var rounding string

@@ -20,6 +20,13 @@ func (h *Handlers) startSponsoredReconciliation(ctx context.Context) {
 	go func() {
 		for ctx.Err() == nil {
 			tick, cancel := context.WithTimeout(ctx, 50*time.Second)
+			var pending int64
+			var age float64
+			if e := h.Pool.QueryRow(tick, `SELECT count(*),COALESCE(extract(epoch FROM clock_timestamp()-min(approved_at)),0)::double precision FROM billing_sponsored_operation WHERE state='approved'`).Scan(&pending, &age); e != nil {
+				log.Warn().Err(e).Msg("sponsorship activation backlog observation failed")
+			} else {
+				currentBillingRecorder().RecordBillingBacklog(tick, "sponsorship_activation", pending, age)
+			}
 			token := uuid.New()
 			rows, err := h.Pool.Query(tick, `WITH due AS (SELECT id FROM billing_sponsored_operation WHERE state NOT IN ('revoked','expired') AND next_check_at<=clock_timestamp() AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_check_at,id FOR UPDATE SKIP LOCKED LIMIT 4) UPDATE billing_sponsored_operation o SET lease_token=$1,lease_until=clock_timestamp()+interval '1 minute',next_check_at=clock_timestamp()+interval '1 minute' FROM due WHERE o.id=due.id RETURNING o.id`, token)
 			var ids []uuid.UUID
@@ -40,8 +47,10 @@ func (h *Handlers) startSponsoredReconciliation(ctx context.Context) {
 				log.Warn().Err(err).Msg("sponsorship scheduler failed")
 			}
 			runYCReconciliationBatch(tick, ids, func(work context.Context, id uuid.UUID) {
+				started := time.Now()
 				err := h.reconcileSponsored(work, id)
 				var message *string
+				currentBillingRecorder().RecordBillingWork(work, "sponsorship_reconciliation", err != nil, time.Since(started), 1)
 				if err != nil {
 					s := err.Error()
 					message = &s
@@ -140,7 +149,18 @@ func (h *Handlers) reconcileSponsored(ctx context.Context, id uuid.UUID) error {
 	}
 	if o.State == "active" {
 		if o.End.Valid && !o.End.Time.After(time.Now()) {
-			_, err = h.Pool.Exec(ctx, `UPDATE billing_sponsored_operation SET state='expired' WHERE id=$1`, id)
+			tx, e := h.Pool.Begin(ctx)
+			if e != nil {
+				return e
+			}
+			defer tx.Rollback(ctx)
+			if _, e = tx.Exec(ctx, `UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1 AND status<>'ended' AND ends_at<=clock_timestamp()`, o.Contract); e != nil {
+				return e
+			}
+			if _, e = tx.Exec(ctx, `UPDATE billing_sponsored_operation SET state='expired' WHERE id=$1`, id); e != nil {
+				return e
+			}
+			err = tx.Commit(ctx)
 		}
 		return err
 	}
