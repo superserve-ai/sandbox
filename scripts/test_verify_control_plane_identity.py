@@ -177,7 +177,6 @@ class KmsOwnershipTests(unittest.TestCase):
     def test_deployments_only_verify_terraform_owned_grants(self):
         root = Path(__file__).resolve().parents[1]
         for path in (
-            "scripts/verify-control-plane-kms.sh",
             "scripts/verify-control-plane-identity.py",
             ".github/workflows/control-plane-identity-rollout.yml",
             ".github/workflows/deploy-api.yml",
@@ -188,9 +187,6 @@ class KmsOwnershipTests(unittest.TestCase):
                 self.assertNotIn("KMS_POLICY_OWNER_SERVICE_ACCOUNT", source)
                 self.assertNotIn("--kms-owner", source)
                 self.assertNotIn("gcloud kms keys add-iam-policy-binding", source)
-        source = (root / "scripts/verify-control-plane-kms.sh").read_text()
-        self.assertIn("gcloud kms encrypt", source)
-        self.assertIn("gcloud kms decrypt", source)
 
 
 class RuntimeAccessRolloutTests(unittest.TestCase):

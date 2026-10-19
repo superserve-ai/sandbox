@@ -31,11 +31,10 @@ grant while it drains, and the dedicated production VMD identities keep their
 existing create/read grants. No new host grant or host impersonation grant is
 part of this migration.
 
-The regular production API deployment workflows update Cloud Run with
-`--no-traffic`, then run `scripts/verify-control-plane-kms.sh`. That check
-verifies access to every production runtime secret and performs an
-encrypt/decrypt round trip as the runtime identity before the workflow routes
-the revision. It does not change IAM policy.
+The regular production API deployment workflows validate the configured
+service identity, update Cloud Run with `--no-traffic`, and route the revision
+with traffic and health verification. KMS and secret-access probes belong to
+the explicit staged identity rollout; they do not run on every API deployment.
 
 Automatic Terraform CD runs a plan-time identity guard for all three serving
 cells and refuses any control-plane service-account transition before apply.
