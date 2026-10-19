@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type apply for infrastructure changes, or smoke for smoke-only validation'
+        description: 'Type apply for changes, plan for claim-access planning, or smoke for validation'
         required: true
         type: string
       privateca_bootstrap:
@@ -37,9 +37,74 @@ on:
         default: none
         options: [none, hold, cutover, rollback, release, abort, expedite-abort]
 
+      yc_claim_access:
+        description: 'Plan or apply only the two staging YC API secret grants'
+        type: choice
+        default: none
+        options: [none, plan, apply]
+      yc_claim_source_sha:
+        description: 'Exact reviewed source SHA for claim-access plan or apply'
+        type: string
+        default: ''
+      yc_claim_plan_run_id:
+        description: 'Successful plan run ID; required only for claim-access apply'
+        type: string
+        default: ''
+      yc_claim_plan_sha256:
+        description: 'Reviewed saved-plan SHA256; required only for claim-access apply'
+        type: string
+        default: ''
+
 jobs:
+  yc-claim-access:
+    if: ${{ inputs.yc_claim_access == 'plan' || inputs.yc_claim_access == 'apply' }}
+    name: Staging YC claim credential access
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      YC_CLAIM_ACCESS: ${{ inputs.yc_claim_access }}
+      YC_CLAIM_SOURCE_SHA: ${{ inputs.yc_claim_source_sha }}
+      YC_CLAIM_PLAN_RUN_ID: ${{ inputs.yc_claim_plan_run_id }}
+      YC_CLAIM_PLAN_SHA256: ${{ inputs.yc_claim_plan_sha256 }}
+      CONFIRM: ${{ inputs.confirm }}
+      PRIVATECA_BOOTSTRAP: ${{ inputs.privateca_bootstrap }}
+      SMOKE_ONLY: ${{ inputs.smoke_only }}
+      PROXY_PREPARE: ${{ inputs.proxy_prepare }}
+      PROXY_RUNTIME_IAM: ${{ inputs.proxy_runtime_iam }}
+      PROXY_MIGRATION: ${{ inputs.proxy_migration }}
+      DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Check exclusive mode and reviewed source
+        run: python3 scripts/yc_claim_access.py check
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.16.6'
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Save reviewed claim access plan
+        if: ${{ inputs.yc_claim_access == 'plan' }}
+        run: python3 scripts/yc_claim_access.py plan
+      - name: Apply reviewed claim access plan
+        if: ${{ inputs.yc_claim_access == 'apply' }}
+        run: python3 scripts/yc_claim_access.py apply
+
   smoke:
-    if: ${{ inputs.smoke_only }}
+    if: ${{ inputs.yc_claim_access == 'none' && inputs.smoke_only }}
     name: Validate staging without infrastructure changes
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -72,7 +137,7 @@ jobs:
         run: scripts/smoke-test-region.sh staging us-central1
 
   privateca-bootstrap:
-    if: ${{ inputs.privateca_bootstrap && !inputs.smoke_only }}
+    if: ${{ inputs.yc_claim_access == 'none' && inputs.privateca_bootstrap && !inputs.smoke_only }}
     name: Bootstrap staging Private CA read access
     runs-on: ubuntu-latest
     environment: staging
@@ -127,7 +192,7 @@ jobs:
           terraform apply -input=false -lock-timeout=5m tfplan
 
   proxy-prepare:
-    if: ${{ inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
+    if: ${{ inputs.yc_claim_access == 'none' && inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
     name: Prepare staging proxy infrastructure
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -237,7 +302,7 @@ jobs:
           echo 'Staging proxy resources prepared; frontend references are unchanged.' >> "$GITHUB_STEP_SUMMARY"
 
   proxy-runtime-iam:
-    if: ${{ inputs.proxy_runtime_iam && !inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
+    if: ${{ inputs.yc_claim_access == 'none' && inputs.proxy_runtime_iam && !inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
     name: Apply staging runtime endpoint exception
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -281,7 +346,7 @@ jobs:
           echo 'Staging runtime may read/attach/detach endpoints in all project NEGs; production unchanged.' >> "$GITHUB_STEP_SUMMARY"
 
   proxy-migration:
-    if: ${{ inputs.proxy_migration != 'none' && !inputs.proxy_runtime_iam && !inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
+    if: ${{ inputs.yc_claim_access == 'none' && inputs.proxy_migration != 'none' && !inputs.proxy_runtime_iam && !inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
     name: Migrate staging proxy frontends
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.proxy_migration == 'abort' && 90 || 20 }}
@@ -317,7 +382,7 @@ jobs:
         run: python3 scripts/staging_proxy_migration.py "$PROXY_MIGRATION"
 
   staging:
-    if: ${{ !inputs.privateca_bootstrap && !inputs.smoke_only && !inputs.proxy_prepare && !inputs.proxy_runtime_iam && inputs.proxy_migration == 'none' }}
+    if: ${{ inputs.yc_claim_access == 'none' && !inputs.privateca_bootstrap && !inputs.smoke_only && !inputs.proxy_prepare && !inputs.proxy_runtime_iam && inputs.proxy_migration == 'none' }}
     name: Apply staging us-central1
     runs-on: ubuntu-latest
     environment: staging

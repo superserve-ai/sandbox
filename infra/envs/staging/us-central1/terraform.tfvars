@@ -1,4 +1,5 @@
-promotion_evidence_enabled = true
+promotion_evidence_enabled  = true
+yc_claim_api_access_enabled = true
 
 project_id                            = "rayai-dev"
 environment                           = "staging"

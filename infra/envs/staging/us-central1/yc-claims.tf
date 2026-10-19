@@ -3,6 +3,12 @@ variable "yc_claims_enabled" {
   default     = false
   description = "Enable YC claim credentials only after shared migrations, mail and Console are ready. Requires promotion_evidence_enabled."
 }
+variable "yc_claim_api_access_enabled" {
+  type        = bool
+  default     = false
+  nullable    = false
+  description = "Grant staging runtime access to capture and Console credentials before enabling YC claims or mail."
+}
 variable "yc_claim_console_url" {
   type        = string
   default     = ""

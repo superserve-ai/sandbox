@@ -53,24 +53,25 @@ class DeployTargetTests(unittest.TestCase):
     def test_staging_smoke_selection_excludes_infrastructure_jobs(self):
         workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
         jobs = {}
-        for name in ('smoke', 'privateca-bootstrap', 'proxy-prepare', 'proxy-runtime-iam', 'proxy-migration', 'staging'):
+        for name in ('yc-claim-access', 'smoke', 'privateca-bootstrap', 'proxy-prepare', 'proxy-runtime-iam', 'proxy-migration', 'staging'):
             job = re.split(r'^  [a-z][a-z-]*:\n', workflow.split(f'  {name}:\n', 1)[1],
                            maxsplit=1, flags=re.M)[0]
             jobs[name] = job
-        for smoke, bootstrap, proxy, runtime, migration in itertools.product((False, True), (False, True), (False, True), (False, True), ('none', 'hold', 'cutover', 'rollback', 'release', 'abort')):
-            with self.subTest(smoke=smoke, bootstrap=bootstrap, proxy=proxy, runtime=runtime):
+        for smoke, bootstrap, proxy, runtime, migration, claim in itertools.product((False, True), (False, True), (False, True), (False, True), ('none', 'hold', 'cutover', 'rollback', 'release', 'abort'), ('none', 'plan', 'apply')):
+            with self.subTest(smoke=smoke, bootstrap=bootstrap, proxy=proxy, runtime=runtime, claim=claim):
                 selected = []
                 for name, job in jobs.items():
                     guard = re.search(r'^    if: \$\{\{ (.+) \}\}$', job, re.M)[1]
-                    guard = guard.replace('&&', 'and').replace('!=', '<>').replace('!', 'not ').replace('<>', '!=')
+                    guard = guard.replace('&&', 'and').replace('||', 'or').replace('!=', '<>').replace('!', 'not ').replace('<>', '!=')
                     if eval(guard, {'__builtins__': {}},
                             {'inputs': SimpleNamespace(smoke_only=smoke,
                                                        privateca_bootstrap=bootstrap,
                                                        proxy_prepare=proxy,
                                                        proxy_runtime_iam=runtime,
-                                                       proxy_migration=migration)}):
+                                                       proxy_migration=migration,
+                                                       yc_claim_access=claim)}):
                         selected.append(name)
-                expected = ('smoke' if smoke else 'privateca-bootstrap' if bootstrap
+                expected = ('yc-claim-access' if claim != 'none' else 'smoke' if smoke else 'privateca-bootstrap' if bootstrap
                             else 'proxy-prepare' if proxy else 'proxy-runtime-iam' if runtime else 'proxy-migration' if migration != 'none' else 'staging')
                 self.assertEqual(selected, [expected])
         self.assertIn('environment: staging', jobs['smoke'])

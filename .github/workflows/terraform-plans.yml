@@ -157,6 +157,7 @@ jobs:
 
           cd "${{ matrix.dir }}"
 
+          terraform version -json | jq -er '.terraform_version | select(type == "string") | select(test("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$")) | "Terraform version: \(.)"'
           terraform init -input=false
           terraform validate
 
