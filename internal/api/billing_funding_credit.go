@@ -92,6 +92,7 @@ func (h *Handlers) fundingCreditResourcePrices(ctx context.Context, team uuid.UU
  FROM team_billing_account a WHERE a.team_id=$1 AND a.stripe_customer_id=$2
 ), evidence AS (
  SELECT c.request_payload payload,1 priority FROM billing_signup_choice c,identity i WHERE c.team_id=$1 AND c.subscription_id=i.subscription AND c.offer_key IN ('pro_monthly','pro_annual')
+ UNION ALL SELECT o.resource_terms,2 FROM billing_sponsored_operation o,identity i WHERE o.team_id=$1 AND o.customer_id=$2 AND o.subscription_id=i.subscription
  UNION ALL SELECT o.resource_terms,2 FROM billing_yc_operation o,identity i WHERE o.team_id=$1 AND o.customer_id=$2 AND o.subscription_id=i.subscription
  UNION ALL SELECT r.previous_choice->'request_payload',3 FROM billing_plan_release r,identity i WHERE r.team_id=$1 AND r.customer_id=$2 AND r.subscription_id=i.subscription
 )

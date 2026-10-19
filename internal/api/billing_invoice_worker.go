@@ -705,7 +705,11 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if plan.AdjustmentCents > int64(len(items)) || plan.AdjustmentCents < -int64(len(items)) {
 		return plan, fmt.Errorf("invoice difference exceeds supported rounding correction")
 	}
-	if a.Base.Price != "" {
+	var sponsored bool
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND charge_kind='sponsored_entitlement' AND starts_at<=$4 AND ends_at>=$5)`, p.TeamID, a.Customer, a.Subscription, p.Start, p.End).Scan(&sponsored); err != nil {
+		return plan, err
+	}
+	if a.Base.Price != "" || sponsored {
 		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
 	} else {
 		var released bool

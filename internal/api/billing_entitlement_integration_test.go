@@ -43,6 +43,9 @@ type entitlementFixture struct {
 }
 
 func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
+	return newEntitlementFixtureAt(t, time.Time{}, annual...)
+}
+func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitlementFixture {
 	t.Helper()
 	resources := []string{"cpu", "memory", "storage"}
 	if len(annual) > 3 && annual[3] {
@@ -75,6 +78,9 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 	}
 	now = now.UTC()
 	start := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if !at.IsZero() {
+		start, _, _ = billing.AnniversaryPeriod(at, now)
+	}
 	_, end, _ := billing.AnniversaryPeriod(start, now)
 	anchor, coverageEnd, amount, months, offer, interval := start, end, int64(120000), int32(1), "pro_monthly", "month"
 	if len(annual) > 0 && annual[0] {
@@ -94,6 +100,7 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 	}
 	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,$2,$3,$4)`, team.ID, customer, subscription, anchor)
 	yc := len(annual) > 1 && annual[1]
+	sponsored := len(annual) > 4 && annual[4]
 	var ycID, ycContract uuid.UUID
 	if yc {
 		ensureYCTestAuthority(t, pool)
@@ -110,7 +117,23 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 		exec(`INSERT INTO public.yc_company_activation_authority(company_identity,approval_id,team_id,home_region,approved_by,evidence_reference) VALUES($1,$2,$3,'test',$4,'fixture')`, "https://www.ycombinator.com/companies/fixture-"+team.ID.String(), ycID, team.ID, uuid.New())
 	}
 	var c db.BillingCommercialContract
-	if yc {
+	if sponsored {
+		contract, operation := uuid.New(), uuid.New()
+		fixtureTerms := []StripeCheckoutResourceTerms{}
+		for _, r := range resources {
+			fixtureTerms = append(fixtureTerms, StripeCheckoutResourceTerms{ResourceKey: map[string]string{"cpu": "vcpu", "memory": "memory_gib", "storage": "storage_gib"}[r], PriceID: "price_" + r, UnitAmountDecimal: "1", MeterID: "mtr_price_" + r, EventName: r})
+		}
+		payload, _ := json.Marshal(StripeCreateCheckoutSessionParams{ResourceTerms: fixtureTerms})
+		coverageEnd = anchor.AddDate(1, 0, 0)
+		exec(`INSERT INTO billing_sponsored_operation(id,team_id,contract_id,idempotency_key,request,resource_terms,approved_by,reason,reference,customer_id,subscription_id,anchor,starts_at,ends_at) VALUES($1,$2,$3,'fixture','{}',$4,$5,'fixture','fixture',$6,$7,$8,$8,$9)`, operation, team.ID, contract, payload, uuid.New(), customer, subscription, anchor, coverageEnd)
+		exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_kind,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'sponsored_usage',$3,$4,$5,$6,'','sponsored_entitlement',0,1,'metered_usage',3000000,'scheduled',$3)`, contract, team.ID, anchor, coverageEnd, customer, subscription)
+		exec(`INSERT INTO billing_contract_entitlement_schedule(team_id,contract_id,month_offset,amount_cents) SELECT $1,$2,m,CASE WHEN m<3 THEN 3000000 ELSE 100000 END FROM generate_series(0,11) m`, team.ID, contract)
+		c, err = h.DB.ActivateCommercialContract(t.Context(), db.ActivateCommercialContractParams{TeamID: team.ID, ContractID: contract})
+		if err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE billing_sponsored_operation SET state='active' WHERE id=$1`, operation)
+	} else if yc {
 		exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'yc_2026',$3,$4,$5,$6,'price_base',1200000,12,'metered_usage',100000,'scheduled',$3)`, ycContract, team.ID, anchor, coverageEnd, customer, subscription)
 		exec(`INSERT INTO billing_contract_entitlement_schedule(team_id,contract_id,month_offset,amount_cents) SELECT $1,$2,m,CASE WHEN m<3 THEN 3000000 ELSE 100000 END FROM generate_series(0,11) m`, team.ID, ycContract)
 		exec(`INSERT INTO billing_contract_waiver(id,team_id,contract_id,offer_key,offer_version,customer_id,subscription_id,starts_at,ends_at,collectible_base_cents) VALUES($1,$2,$3,'yc_2026',1,$4,$5,$6,$7,0)`, ycID, team.ID, ycContract, customer, subscription, anchor, coverageEnd)
@@ -141,6 +164,9 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 	}
 	terms := []StripeCheckoutResourceTerms{}
 	items := []any{map[string]any{"id": "si_base", "quantity": 1, "price": map[string]any{"id": "price_base", "currency": "usd", "unit_amount_decimal": fmt.Sprint(amount), "billing_scheme": "per_unit", "recurring": map[string]any{"usage_type": "licensed", "interval": interval, "interval_count": 1}}}}
+	if sponsored {
+		items = nil
+	}
 	price := func(id, usage string) map[string]any {
 		return map[string]any{"id": id, "active": true, "currency": "usd", "unit_amount_decimal": "1", "billing_scheme": "per_unit", "recurring": map[string]any{"usage_type": usage, "interval": "month", "interval_count": 1, "meter": "mtr_" + id}}
 	}
@@ -151,7 +177,7 @@ func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
 	}
 	items = append(items, map[string]any{"id": "si_round", "price": price("price_round", "metered"), "current_period_start": start.Unix(), "current_period_end": end.Unix()})
 	payload, _ := json.Marshal(StripeCreateCheckoutSessionParams{ResourceTerms: terms})
-	if !yc {
+	if !yc && !sponsored {
 		exec(`UPDATE billing_signup_choice SET offer_key=$6,state='committed',generation=$2,actor_id=$3,base_price_id='price_base',request_payload=$4,subscription_id=$5 WHERE team_id=$1`, team.ID, start, uuid.New(), payload, subscription, offer)
 	}
 	exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_price_round',$4)`, team.ID, customer, subscription, start)

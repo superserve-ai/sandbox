@@ -59,13 +59,15 @@ WITH contract AS MATERIALIZED (
     SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id)
         AND b.id = sqlc.arg(contract_id) FOR UPDATE
 )
-INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, waiver_id, kind, period_start, period_end, amount_cents, currency)
-SELECT c.team_id, c.id, p.id, w.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
+INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, waiver_id, sponsorship_id, kind, period_start, period_end, amount_cents, currency)
+SELECT c.team_id, c.id, p.id, w.id, sp.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
 FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
 LEFT JOIN billing_contract_payment p ON p.contract_id = c.id
     AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
 LEFT JOIN billing_contract_waiver w ON w.contract_id=c.id AND p.id IS NULL
     AND billing_yc_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
+LEFT JOIN billing_sponsored_operation sp ON sp.contract_id=c.id AND p.id IS NULL AND w.id IS NULL
+    AND billing_sponsored_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
 WHERE billing_contract_eligible(c::billing_commercial_contract, period.period_start, period.period_end)
 ON CONFLICT (team_id, kind, period_start) DO NOTHING
 RETURNING *;
@@ -161,6 +163,7 @@ RETURNING *;
 WITH contract AS MATERIALIZED (
     -- Nothing ends a fixed-term contract at its boundary, so a lapsed term counts as ended here.
     SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id) AND b.status <> 'ended'
+        AND b.charge_kind <> 'sponsored_entitlement'
         AND (b.ends_at IS NULL OR b.ends_at > clock_timestamp())
 ), period AS MATERIALIZED (
     SELECT c.id AS contract_id, p.period_start::timestamptz AS period_start,

@@ -33,6 +33,7 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	}
 	workers := 8
 	h.startEntitlementCoverageMonitoring(ctx)
+	h.startSponsoredReconciliation(ctx)
 	if h.Config != nil && h.Config.BillingEntitlementWorkers >= 2 {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)
 	}
@@ -135,7 +136,7 @@ func (h *Handlers) processEntitlementJob(ctx context.Context, j entitlementJob) 
  failures=CASE WHEN $4::text IS NULL THEN 0 ELSE least(failures+1,10000) END,
  problem_since=CASE WHEN $4::text IS NULL THEN NULL ELSE COALESCE(problem_since,clock_timestamp()) END,
  last_error=$4,
- alerted_at=CASE WHEN (($4::text IS NOT NULL AND COALESCE(problem_since,clock_timestamp())<clock_timestamp()-interval '5 minutes') OR EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=$1 AND e.state<>'issued' AND (e.state='uncertain' OR NOT EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL)) AND (e.first_attempt_at<clock_timestamp()-interval '5 minutes' OR e.period_end<clock_timestamp()+interval '15 minutes'))) AND (alerted_at IS NULL OR alerted_at<clock_timestamp()-interval '1 hour') THEN clock_timestamp() ELSE alerted_at END
+ alerted_at=CASE WHEN (($4::text IS NOT NULL AND COALESCE(problem_since,clock_timestamp())<clock_timestamp()-interval '5 minutes') OR EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=$1 AND e.state<>'issued' AND (e.state='uncertain' OR NOT (EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL))) AND (e.first_attempt_at<clock_timestamp()-interval '5 minutes' OR e.period_end<clock_timestamp()+interval '15 minutes'))) AND (alerted_at IS NULL OR alerted_at<clock_timestamp()-interval '1 hour') THEN clock_timestamp() ELSE alerted_at END
  FROM previous WHERE contract_id=previous.old_contract_id AND lease_token=$2 RETURNING alerted_at) SELECT finished.alerted_at IS DISTINCT FROM previous.old_alerted_at FROM finished CROSS JOIN previous`, j.Contract, j.Token, next, message).Scan(&alert)
 	if alert {
 		_, incidentErr := h.Pool.Exec(ack, `INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence,platform_failure_at)
@@ -199,6 +200,18 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 				return next, e
 			}
 		}
+		if c.ChargeKind == "sponsored_entitlement" {
+			var revoked bool
+			if err = h.Pool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM billing_sponsored_operation WHERE contract_id=$1`, c.ID).Scan(&revoked); err != nil {
+				return next, err
+			}
+			if revoked {
+				if e.State == "uncertain" {
+					return next, h.finishSponsoredAttempt(ctx, c, e, client)
+				}
+				return time.Now().Add(time.Hour), nil
+			}
+		}
 		if e.State == "pending" && c.OfferKey == "yc_2026" {
 			var revoked bool
 			if err = h.Pool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM billing_yc_operation WHERE contract_id=$1`, c.ID).Scan(&revoked); err != nil {
@@ -217,6 +230,15 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	}
 	if c.Status != "active" || (c.EndsAt.Valid && !c.EndsAt.Time.After(time.Now())) {
 		return time.Now().Add(24 * time.Hour), nil
+	}
+	if c.ChargeKind == "sponsored_entitlement" {
+		var revoked bool
+		if err = h.Pool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM billing_sponsored_operation WHERE contract_id=$1`, c.ID).Scan(&revoked); err != nil {
+			return next, err
+		}
+		if revoked {
+			return time.Now().Add(time.Hour), nil
+		}
 	}
 	start, end, ok := billing.AnniversaryPeriod(c.EntitlementAnchor, time.Now())
 	if !ok {
@@ -252,7 +274,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_contract_payment p WHERE contract_id=$1 AND service_period_start<=$2 AND service_period_end>=$3 AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required))`, id, start, end).Scan(&paid); err != nil {
 		return next, err
 	}
-	if !paid && c.OfferKey != "yc_2026" {
+	if !paid && c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
 		if _, err = h.reconcileProCheckout(ctx, team, false); err != nil {
 			return next, err
 		}
@@ -343,7 +365,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if time.Now().Unix() <= mapped.Start.Unix() {
 		return mapped.Start.Add(2 * time.Second), nil
 	}
-	if c.OfferKey != "yc_2026" {
+	if c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
 		// Refresh the exact covering receipt through the existing payment verifier.
 		var paymentInvoice string
 		if err = h.Pool.QueryRow(ctx, `SELECT invoice_id FROM billing_contract_payment WHERE contract_id=$1 AND service_period_start<=$2 AND service_period_end>=$3 ORDER BY service_period_start DESC,invoice_id LIMIT 1`, id, start, end).Scan(&paymentInvoice); err != nil {
@@ -425,23 +447,27 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err = tx.Commit(ctx); err != nil {
 		return next, err
 	}
-	if err = client.rejectCompetingCreditInvoice(ctx, c.CustomerID, "", e.ProviderInvoiceEnd.Time.Unix()); err != nil {
-		return next, err
+	return end.Add(time.Second), h.dispatchUsageEntitlement(ctx, c, e, client, prices)
+}
+
+func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCommercialContract, e db.BillingUsageEntitlement, client *stripeHTTPClient, prices []map[string]string) error {
+	if err := client.rejectCompetingCreditInvoice(ctx, c.CustomerID, "", e.ProviderInvoiceEnd.Time.Unix()); err != nil {
+		return err
 	}
 	form, err := entitlementGrantForm(e.RequestPayload, prices)
 	if err != nil {
-		return next, err
+		return err
 	}
 	var grant entitlementGrant
 	if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey); err != nil {
-		return next, err
+		return err
 	}
 	if grant.VoidedAt != 0 {
-		return next, errors.New("created grant was voided; operator recovery required")
+		return errors.New("created grant was voided; operator recovery required")
 	}
 	raw, _ := json.Marshal(grant)
-	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: team, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
-	return end.Add(time.Second), err
+	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
+	return err
 }
 
 func (h *Handlers) entitlementClosingInvoice(ctx context.Context, c db.BillingCommercialContract, start time.Time, client *stripeHTTPClient) error {

@@ -877,6 +877,35 @@ type BillingSignupChoice struct {
 	Revision          int64              `json:"revision"`
 }
 
+type BillingSponsoredOperation struct {
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	ContractID        uuid.UUID          `json:"contract_id"`
+	IdempotencyKey    string             `json:"idempotency_key"`
+	Request           []byte             `json:"request"`
+	ResourceTerms     []byte             `json:"resource_terms"`
+	ApprovedBy        uuid.UUID          `json:"approved_by"`
+	ApprovedAt        time.Time          `json:"approved_at"`
+	Reason            string             `json:"reason"`
+	Reference         string             `json:"reference"`
+	CustomerID        *string            `json:"customer_id"`
+	SubscriptionID    *string            `json:"subscription_id"`
+	CustomerName      string             `json:"customer_name"`
+	CustomerAttemptAt pgtype.Timestamptz `json:"customer_attempt_at"`
+	ProviderAttemptAt pgtype.Timestamptz `json:"provider_attempt_at"`
+	ResolvedStart     time.Time          `json:"resolved_start"`
+	Anchor            pgtype.Timestamptz `json:"anchor"`
+	StartsAt          pgtype.Timestamptz `json:"starts_at"`
+	EndsAt            pgtype.Timestamptz `json:"ends_at"`
+	State             string             `json:"state"`
+	RevokedAt         pgtype.Timestamptz `json:"revoked_at"`
+	RevokedBy         pgtype.UUID        `json:"revoked_by"`
+	NextCheckAt       time.Time          `json:"next_check_at"`
+	LeaseToken        pgtype.UUID        `json:"lease_token"`
+	LeaseUntil        pgtype.Timestamptz `json:"lease_until"`
+	LastError         *string            `json:"last_error"`
+}
+
 type BillingUsageEntitlement struct {
 	ID                           uuid.UUID          `json:"id"`
 	TeamID                       uuid.UUID          `json:"team_id"`
@@ -902,6 +931,7 @@ type BillingUsageEntitlement struct {
 	IssuedAt                     pgtype.Timestamptz `json:"issued_at"`
 	CreatedAt                    time.Time          `json:"created_at"`
 	WaiverID                     pgtype.UUID        `json:"waiver_id"`
+	SponsorshipID                pgtype.UUID        `json:"sponsorship_id"`
 }
 
 type BillingUsageExport struct {

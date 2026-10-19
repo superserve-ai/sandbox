@@ -355,6 +355,29 @@ func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, te
 	if err := reader.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor); err != nil {
 		return err
 	}
+	var frozen []byte
+	err := reader.QueryRow(ctx, `SELECT resource_terms FROM billing_sponsored_operation WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 ORDER BY approved_at DESC LIMIT 1`, team, a.Customer, a.Subscription).Scan(&frozen)
+	if err == nil {
+		var params StripeCreateCheckoutSessionParams
+		if err = json.Unmarshal(frozen, &params); err != nil {
+			return err
+		}
+		if err = validateEntitlementResourceTerms(params.ResourceTerms, "", "", "", false); err != nil {
+			return err
+		}
+		for _, term := range params.ResourceTerms {
+			if term.PriceID == a.Price || term.EventName == a.Event || a.Meter != "" && term.MeterID == a.Meter {
+				return errors.New("rounding configuration overlaps frozen sponsored resources")
+			}
+		}
+		if err = invoiceCalendarCompatible(anchor, sub, a.Price); err != nil {
+			return err
+		}
+		return validateFrozenProResources(sub, params.ResourceTerms, a.Price)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
 	return h.validateInvoiceResourceSubscription(ctx, team, a, c, sub, anchor, reader)
 }
 
