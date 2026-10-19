@@ -46,7 +46,7 @@ to shared billing tables; accounts without a YC operation are not converted.
 The existing branch-staging deployment gate refuses migration inputs different
 from main. Use a reviewed revision through that gate after the migrations are
 available there, or the owning deployment workflow's explicitly approved staging
-procedure. The disabled experimental calendar-drain workflow is not required.
+procedure.
 Do not bypass the gate, execute branch SQL through shared Auth, or
 interpret passing local fixtures as deployed acceptance. A push/merge to main can
 trigger production deployment; this procedure does not authorize that action.
