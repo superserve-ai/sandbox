@@ -1,3 +1,4 @@
+import fnmatch
 import importlib.util
 import os
 from pathlib import Path
@@ -110,12 +111,36 @@ class AlertRolloutGateTests(unittest.TestCase):
         self.assertNotIn('group: otel-collector-production', terraform)
         def push_paths(source):
             paths = source.split('    paths:', 1)[1].split('jobs:', 1)[0]
-            return {line.strip() for line in paths.splitlines() if line.strip().startswith('- ')}
+            return {line.strip()[2:].strip("'\"") for line in paths.splitlines() if line.strip().startswith('- ')}
 
         self.assertEqual(push_paths(workflow), push_paths(terraform),
                          'Every superseding Terraform push must also start a replacement collector rollout')
-        self.assertIn("- 'infra/**'", push_paths(workflow))
-        self.assertIn("- '.github/workflows/terraform-cd.yml'", push_paths(workflow))
+        patterns = push_paths(workflow)
+        def triggered(paths):
+            return any(fnmatch.fnmatchcase(path, pattern) for path in paths for pattern in patterns)
+
+        orchestration = ['.github/workflows/terraform-cd.yml',
+                         '.github/workflows/deploy-otel-collector.yml']
+        for paths in ([orchestration[0]], [orchestration[1]], orchestration):
+            with self.subTest(paths=paths):
+                self.assertFalse(triggered(paths), 'Orchestration edits must not apply drift or strand collectors')
+        runtime_inputs = [
+            'infra/envs/staging/us-central1/main.tf',
+            'deploy/otel/collector.yaml',
+            'deploy/superserve-otel-collector.service',
+            '.github/workflows/scripts/deploy-otel-collector.py',
+            '.github/workflows/scripts/wait-for-otel-alerts.py',
+            '.github/workflows/scripts/select-deploy-target.sh',
+            '.github/workflows/scripts/wait_credentials_key_iam.py',
+            '.github/workflows/scripts/wait_host_logging_iam.py',
+        ]
+        for path in runtime_inputs:
+            for paths in ([path], orchestration + [path]):
+                with self.subTest(paths=paths):
+                    self.assertTrue(triggered(paths), 'Runtime changes must start both same-revision workflows')
+        api_path = '.github/workflows/deploy-api.yml'
+        self.assertFalse(triggered(orchestration + [api_path]))
+        self.assertIn(api_path, push_paths((SCRIPT.parents[1] / 'deploy-api.yml').read_text()))
 
 
 if __name__ == '__main__':

@@ -36,6 +36,14 @@ service identity, update Cloud Run with `--no-traffic`, and route the revision
 with traffic and health verification. KMS and secret-access probes belong to
 the explicit staged identity rollout; they do not run on every API deployment.
 
+Terraform CD and collector rollouts share push triggers for infrastructure,
+collector configuration and deployment scripts, and IAM prerequisite scripts.
+Edits only to `terraform-cd.yml` or `deploy-otel-collector.yml` do not
+automatically apply infrastructure or redeploy collectors. Deployment behavior
+changes in those workflows therefore wait for a matching runtime-input change;
+CI still validates workflow edits. API workflow edits retain their own automatic
+deployment path, including migration prerequisites and health verification.
+
 Automatic Terraform CD runs a plan-time identity guard for all three serving
 cells and refuses any control-plane service-account transition before apply.
 Use the staged identity rollout for that transition; ordinary image and
