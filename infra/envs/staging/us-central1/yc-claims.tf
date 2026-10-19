@@ -3,6 +3,27 @@ variable "yc_claims_enabled" {
   default     = false
   description = "Enable YC claim credentials only after shared migrations, mail and Console are ready. Requires promotion_evidence_enabled."
 }
+variable "yc_claim_api_enabled" {
+  type        = bool
+  default     = false
+  nullable    = false
+  description = "Enable capture and Console credentials without starting confirmation email delivery."
+}
+variable "yc_claim_api_access_enabled" {
+  type        = bool
+  default     = false
+  nullable    = false
+  description = "Retain runtime access to capture and Console credentials independently of their attachment."
+}
+variable "yc_claim_api_secret_versions" {
+  type = object({
+    capture = string
+    console = string
+  })
+  default     = { capture = "latest", console = "latest" }
+  nullable    = false
+  description = "Published versions of the capture and Console credentials."
+}
 variable "yc_claim_console_url" {
   type        = string
   default     = ""
@@ -33,15 +54,26 @@ resource "google_secret_manager_secret" "yc_claim" {
   labels = local.common_labels
   lifecycle {
     precondition {
+      condition     = !(var.yc_claims_enabled || var.yc_claim_api_enabled) || (var.promotion_evidence_enabled && can(regex("^https://[^/?#@]+/?$", var.yc_claim_console_url)))
+      error_message = "YC claim APIs require shared Auth authority and an HTTPS Console origin."
+    }
+    precondition {
       condition     = !var.yc_claims_enabled || (var.promotion_evidence_enabled && startswith(var.yc_claim_console_url, "https://") && var.yc_claim_email_from != "")
       error_message = "YC claims require shared Auth authority, HTTPS Console origin and a verified sender."
     }
   }
 }
 locals {
-  yc_claim_secrets = var.yc_claims_enabled ? {
-    YC_CLAIM_CAPTURE_TOKEN = { secret = google_secret_manager_secret.yc_claim["capture-token"].secret_id }
-    YC_CLAIM_CONSOLE_TOKEN = { secret = google_secret_manager_secret.yc_claim["console-token"].secret_id }
-    YC_EMAIL_API_KEY       = { secret = google_secret_manager_secret.yc_claim["email-api-key"].secret_id }
-  } : {}
+  yc_claim_secrets = merge(var.yc_claims_enabled || var.yc_claim_api_enabled ? {
+    YC_CLAIM_CAPTURE_TOKEN = {
+      secret  = google_secret_manager_secret.yc_claim["capture-token"].secret_id
+      version = var.yc_claim_api_secret_versions.capture
+    }
+    YC_CLAIM_CONSOLE_TOKEN = {
+      secret  = google_secret_manager_secret.yc_claim["console-token"].secret_id
+      version = var.yc_claim_api_secret_versions.console
+    }
+    } : {}, var.yc_claims_enabled ? {
+    YC_EMAIL_API_KEY = { secret = google_secret_manager_secret.yc_claim["email-api-key"].secret_id }
+  } : {})
 }
