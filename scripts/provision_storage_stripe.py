@@ -52,13 +52,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Stripe:
-    def __init__(self, key, live, account, apply=False):
+    def __init__(self, key, live, account, apply=False, api_version=API_VERSION, scope="storage-catalog-v1"):
         prefix = "live" if live else "test"
         if not re.fullmatch(r"[sr]k_" + prefix + r"_[A-Za-z0-9]+", key):
             raise ProvisionError("Credential does not match the requested environment")
         if not re.fullmatch(r"acct_[A-Za-z0-9]+", account):
             raise ProvisionError("Expected account must be a Stripe account ID")
         self.key, self.live, self.account, self.apply = key, live, account, apply
+        self.api_version, self.scope = api_version, scope
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def request(self, method, path, params=None):
@@ -68,13 +69,13 @@ class Stripe:
             raise ProvisionError("Writes require --apply and a catalog endpoint")
         params = params or {}
         encoded = urllib.parse.urlencode(params).encode()
-        headers = {"Authorization": "Bearer " + self.key, "Stripe-Version": API_VERSION}
+        headers = {"Authorization": "Bearer " + self.key, "Stripe-Version": self.api_version}
         url = "https://api.stripe.com" + path
         if method == "GET":
             url += "?" + encoded.decode()
         else:
-            fingerprint = json.dumps([self.account, API_VERSION, path, params], sort_keys=True)
-            headers["Idempotency-Key"] = "storage-catalog-v1-" + hashlib.sha256(fingerprint.encode()).hexdigest()
+            fingerprint = json.dumps([self.account, self.api_version, path, params], sort_keys=True)
+            headers["Idempotency-Key"] = self.scope + "-" + hashlib.sha256(fingerprint.encode()).hexdigest()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         req = urllib.request.Request(url, data=encoded if method == "POST" else None, headers=headers, method=method)
         try:
@@ -138,6 +139,25 @@ def require(actual, expected, label):
             raise ProvisionError(f"Existing {label} conflicts at {key}; no replacement will be created")
 
 
+def require_price(price, label, product_id, tax_behavior, unit_amount_decimal, recurring):
+    require(price, {"active": True, "currency": "usd", "billing_scheme": "per_unit",
+                    "type": "recurring", "product": product_id, "transform_quantity": None,
+                    "custom_unit_amount": None, "tax_behavior": tax_behavior}, label)
+    currencies = price.get("currency_options")
+    if not isinstance(currencies, dict) or not currencies:
+        raise ProvisionError(f"{label} currency options were not expanded; no writes attempted")
+    if set(currencies) != {"usd"}:
+        raise ProvisionError(f"{label} has additional currency options; reconcile them manually")
+    require(price.get("recurring") or {}, {"interval_count": 1, "trial_period_days": None, **recurring},
+            f"{label} recurring settings")
+    try:
+        equal = Decimal(str(price.get("unit_amount_decimal"))) == Decimal(unit_amount_decimal)
+    except InvalidOperation:
+        equal = False
+    if not equal:
+        raise ProvisionError(f"Existing {label} has a different rate; no replacement will be created")
+
+
 def inspect(stripe, spec):
     # Finish all reads and conflict checks before creating any object.
     meters, products, prices = [stripe.inventory(kind) for kind in PATHS]
@@ -163,22 +183,8 @@ def inspect(stripe, spec):
     if price:
         if not meter or not product:
             raise ProvisionError("Storage price exists without a matching meter and product")
-        require(price, {"active": True, "currency": "usd", "billing_scheme": "per_unit",
-                        "type": "recurring", "product": product["id"], "transform_quantity": None,
-                        "custom_unit_amount": None, "tax_behavior": spec["tax_behavior"]}, "price")
-        currencies = price.get("currency_options")
-        if not isinstance(currencies, dict) or not currencies:
-            raise ProvisionError("Storage price currency options were not expanded; no writes attempted")
-        if set(currencies) != {"usd"}:
-            raise ProvisionError("Storage price has additional currency options; reconcile them manually")
-        require(price.get("recurring") or {}, {"meter": meter["id"], "interval": "month",
-                "interval_count": 1, "usage_type": "metered", "trial_period_days": None}, "price recurring settings")
-        try:
-            equal = Decimal(str(price.get("unit_amount_decimal"))) == Decimal(spec["unit_amount_decimal"])
-        except InvalidOperation:
-            equal = False
-        if not equal:
-            raise ProvisionError("Existing storage price has a different rate; no replacement will be created")
+        require_price(price, "Storage price", product["id"], spec["tax_behavior"], spec["unit_amount_decimal"],
+                      {"meter": meter["id"], "interval": "month", "usage_type": "metered"})
     return {"meter": meter, "product": product, "price": price}
 
 

@@ -167,10 +167,29 @@ to open those CLI sessions; the sandbox holds nothing but devbox test data.
 Webhook signing secrets come from `stripe listen` on each box and are not
 stored in GitHub.
 
-The sandbox then needs the billing catalog the API expects (usage meters and
-prices, and the Pro prices); record the resulting IDs in the
-`DEVBOX_CONFIG_STRIPE_*` and `DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG`
-variables above.
+Then create the billing catalog the API expects: a meter, product and monthly
+metered price for vCPU, memory and storage at the rates seeded in the
+database, and a separate Pro product with the $1,200 monthly and $12,000
+annual licensed prices. From the repository root, with Python 3.10 or later
+and `acct_XXXXXXXX` replaced by the sandbox's account ID:
+
+```sh
+read -rs STRIPE_SECRET_KEY && export STRIPE_SECRET_KEY
+python3 scripts/provision_devbox_stripe.py --expected-account acct_XXXXXXXX
+python3 scripts/provision_devbox_stripe.py --expected-account acct_XXXXXXXX --apply
+unset STRIPE_SECRET_KEY
+```
+
+The first run is a read-only preview of what is missing. `--apply` creates
+only missing objects, verifies the whole catalog and prints the
+`github_environment_variables` to store in the `devbox` environment. Reruns
+reuse existing objects and print the same values; the script refuses live
+keys, a key for another account, and existing objects whose shape or rate
+differs, and never archives or replaces anything. The API itself creates
+customers, the invoice rounding price, coupons and credit grants at runtime.
+
+Finally, open the sandbox's customer portal settings once and save them, so
+the API can create portal sessions in test mode.
 
 ### Cost
 

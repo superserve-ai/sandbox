@@ -9,12 +9,22 @@ on:
       - 'deploy/devbox/**'
       - '.github/workflows/scripts/devbox*'
       - '.github/workflows/devbox-checks.yml'
+      - 'scripts/provision_devbox_stripe.py'
+      - 'scripts/test_provision_devbox_stripe.py'
+      - 'scripts/provision_storage_stripe.py'
+      - 'supabase/migrations/**'
+      - 'internal/api/billing_pro_checkout.go'
   push:
     branches: [main]
     paths:
       - 'deploy/devbox/**'
       - '.github/workflows/scripts/devbox*'
       - '.github/workflows/devbox-checks.yml'
+      - 'scripts/provision_devbox_stripe.py'
+      - 'scripts/test_provision_devbox_stripe.py'
+      - 'scripts/provision_storage_stripe.py'
+      - 'supabase/migrations/**'
+      - 'internal/api/billing_pro_checkout.go'
 
 permissions:
   contents: read
@@ -35,3 +45,6 @@ jobs:
 
       - name: Run profile tests
         run: python3 -m unittest discover -s deploy/devbox -p 'test_*.py'
+
+      - name: Run Stripe catalog bootstrap tests
+        run: python3 -m unittest discover -s scripts -p 'test_provision_devbox_stripe.py'
