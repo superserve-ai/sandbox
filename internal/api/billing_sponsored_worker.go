@@ -149,18 +149,8 @@ func (h *Handlers) reconcileSponsored(ctx context.Context, id uuid.UUID) error {
 	}
 	if o.State == "active" {
 		if o.End.Valid && !o.End.Time.After(time.Now()) {
-			tx, e := h.Pool.Begin(ctx)
-			if e != nil {
-				return e
-			}
-			defer tx.Rollback(ctx)
-			if _, e = tx.Exec(ctx, `UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1 AND status<>'ended' AND ends_at<=clock_timestamp()`, o.Contract); e != nil {
-				return e
-			}
-			if _, e = tx.Exec(ctx, `UPDATE billing_sponsored_operation SET state='expired' WHERE id=$1`, id); e != nil {
-				return e
-			}
-			err = tx.Commit(ctx)
+			err = h.expireSponsorship(ctx, o)
+
 		}
 		return err
 	}
@@ -211,6 +201,24 @@ func (h *Handlers) reconcileSponsored(ctx context.Context, id uuid.UUID) error {
 	}
 	return h.activateSponsorship(ctx, o, token)
 }
+
+// The database clock decides both halves of expiration, including when an API
+// host reaches the boundary first or the general reaper already ended it.
+func (h *Handlers) expireSponsorship(ctx context.Context, o sponsoredOperation) error {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1 AND status<>'ended' AND ends_at<=clock_timestamp()`, o.Contract); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE billing_sponsored_operation SET state='expired' WHERE id=$1 AND state='active' AND ends_at<=clock_timestamp() AND EXISTS(SELECT 1 FROM billing_commercial_contract WHERE id=$2 AND status='ended')`, o.ID, o.Contract); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (h *Handlers) ensureSponsoredCustomer(ctx context.Context, o *sponsoredOperation) error {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {

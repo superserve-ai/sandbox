@@ -223,3 +223,23 @@ func TestSponsoredSuccessorCannotRewriteIssuedCreditScope(t *testing.T) {
 		t.Fatal("successor reinterpreted predecessor credit/invoice", err)
 	}
 }
+
+func TestSponsoredExpirationWaitsForDatabaseBoundary(t *testing.T) {
+	f := newEntitlementFixture(t, false, false, false, false, true)
+	var id uuid.UUID
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT id FROM billing_sponsored_operation WHERE contract_id=$1`, f.c.ID).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	o, err := f.h.sponsoredOperation(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the expiration path as an ahead-of-database API clock would.
+	if err = f.h.expireSponsorship(t.Context(), o); err != nil {
+		t.Fatal(err)
+	}
+	var active bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT o.state='active' AND c.status='active' FROM billing_sponsored_operation o JOIN billing_commercial_contract c ON c.id=o.contract_id WHERE o.id=$1`, id).Scan(&active); err != nil || !active {
+		t.Fatal("premature terminal transition", active, err)
+	}
+}
