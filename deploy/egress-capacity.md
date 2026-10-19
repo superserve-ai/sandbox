@@ -45,17 +45,13 @@ Staging execution and evidence collection belong to the rollout owner; they are
 required before production activation, not before development completion or PR
 merge. No new automated staging load runner is required.
 
-The deployment workflow reads the three GitHub environment variables
-`VMD_EGRESS_MAX_CONNECTIONS`, `VMD_EGRESS_ENFORCE`, and
-`VMD_EGRESS_ROLLOUT_APPROVAL` in staging and each production cell. An unset
-workflow enforcement variable explicitly writes `false`; an omitted maximum
-preserves the host setting (or the binary default on a fresh host). When invoking
-the deployment script directly, omitted maximum/enforcement settings preserve
-existing host values. Preflight examines those effective values without sourcing
-the host environment file. The workflow supplies the actual `DEPLOY_CELL` for
-each step. Direct staging invocations must set `DEPLOY_CELL=staging` to use the
-staging activation exemption; any other or omitted cell requires release/limit
-approval when enabling enforcement. Telemetry metadata does not select this gate.
+The deployment workflow reads `VMD_EGRESS_MAX_CONNECTIONS` and
+`VMD_EGRESS_ENFORCE` in staging and each production cell. An unset workflow
+enforcement variable explicitly writes `false`; an omitted maximum preserves
+the host setting (or the binary default on a fresh host). When invoking the
+deployment script directly, omitted maximum/enforcement settings preserve
+existing host values. Preflight validates those effective values without sourcing
+the host environment file.
 Inherited scalar settings may have surrounding
 whitespace or simple quotes. Invalid inherited scalar values require explicit
 deployment settings. Multiline/escaped host environment syntax must be normalized
@@ -81,19 +77,14 @@ otherwise alter an unrelated multiline value. Preflight fails before host mutati
    this is not a zero-downtime deployment.
 5. Record and review the full release SHA, effective connection limit, host
    capacity, traffic mix, measured impact, restart time and rollback settings.
-   Set the production environment's `VMD_EGRESS_ROLLOUT_APPROVAL` to
-   `<full-release-SHA>:<effective-limit>` and explicitly set
-   `VMD_EGRESS_ENFORCE=true`. This operator-controlled value records that review;
-   the script checks the binding, not the truth of the evidence. A successful
-   staging boot alone is insufficient. Missing/mismatched approval fails before
-   uploading or modifying the host, even if enforcement was already enabled.
+   Set `VMD_EGRESS_ENFORCE=true` to enable enforcement.
 6. Roll out incrementally by the existing scoped host/cell selectors and observe
    rejection rates and neighboring workloads. A subsequent release or changed
-   limit needs updated staging evidence/approval. Production is not activated by
+   limit should be assessed against the observed workload. Production is not activated by
    merging with the default configuration.
 
 To stop enforcement, explicitly set `VMD_EGRESS_ENFORCE=false` and deploy through
-the normal scoped path; disabling does not need activation approval. This requires
+the normal scoped path. This requires
 a VMD restart and removes aggregate protection. Preserve the per-sandbox/security
 controls. A binary rollback follows existing compatibility guards and has the
 same outbound interruption; connection accounting has no state migration.

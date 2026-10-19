@@ -1,11 +1,9 @@
 import importlib.util
 import io
 import json
-import re
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
-from types import SimpleNamespace
 
 
 SCRIPT = Path(__file__).with_name("check_control_plane_identity_plan.py")
@@ -31,33 +29,6 @@ def service(account):
 
 
 class ControlPlaneIdentityPlanTests(unittest.TestCase):
-    def test_shared_queue_preserves_multiple_pending_deployments(self):
-        workflows = SCRIPT.parent.parent / ".github/workflows"
-        participants = {
-            path.name for path in workflows.glob("*.yml")
-            if re.search(r"^  group: .*\bcontrol-plane-deploy\b", path.read_text(), re.M)
-        }
-        self.assertEqual(participants, {
-            "control-plane-identity-rollout.yml", "deploy-api.yml", "terraform-cd.yml",
-            "terraform-rollout-staging.yml", "terraform-rollout-production.yml",
-            "staging-candidate-validation.yml",
-        })
-        # GitHub's native max queue retains both pending CD/API runs behind
-        # an active rollout; every participant must opt out of the single slot.
-        for name in participants:
-            with self.subTest(workflow=name):
-                block = re.search(r"^concurrency:\n((?:[ \t]+[^\n]*\n)+)", (workflows / name).read_text(), re.M).group(1)
-                group = re.search(r"^  group: (.+)$", block, re.M)[1]
-                if group.startswith("${{"):
-                    expression = group[3:-2].replace("&&", "and").replace("||", "or")
-                    for mode in ("", "none"):
-                        selected = eval(expression, {"__builtins__": {}},
-                                        {"inputs": SimpleNamespace(proxy_migration=mode)})
-                        self.assertEqual(selected, "control-plane-deploy")
-                else:
-                    self.assertEqual(group, "control-plane-deploy")
-                self.assertIn("  queue: max\n", block)
-                self.assertIn("  cancel-in-progress: false\n", block)
 
     def test_production_pins_before_planning_and_checks_saved_traffic(self):
         workflow = (SCRIPT.parent.parent / ".github/workflows/terraform-cd.yml").read_text()

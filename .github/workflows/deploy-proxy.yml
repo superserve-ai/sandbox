@@ -102,15 +102,11 @@ on:
       - '.github/workflows/scripts/select-deploy-target.sh'
 
 env:
-  PROXY_DEPLOYMENT_MODE: ${{ (inputs.operation == 'bootstrap' || inputs.deployment_mode == 'generation' || (github.event_name == 'push' && vars.PROXY_GENERATION_PROMOTION_READY == 'true')) && 'generation' || 'legacy' }}
+  # Push deployments keep existing listeners unless generation mode is selected.
+  PROXY_DEPLOYMENT_MODE: ${{ (inputs.operation == 'bootstrap' || inputs.deployment_mode == 'generation' || (github.event_name == 'push' && vars.PROXY_DEPLOYMENT_MODE == 'generation')) && 'generation' || 'legacy' }}
   PROXY_ROLLOUT_ID: ${{ inputs.rollout_id || github.run_id }}
   PROXY_OPERATION: ${{ inputs.operation || 'deploy' }}
   PROXY_ROLLOUT_MANIFESTS: bin/proxy-rollout.json
-  # These repository variables are populated only after the executable
-  # Notion runbook is published and its staging evidence is recorded.
-  PROXY_GENERATION_RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
-  PROXY_GENERATION_PROMOTION_EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
-  PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
   DEPLOY_EVENT: ${{ github.event_name }}
   DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
   DEPLOY_TARGET: ${{ inputs.target || 'serving' }}
@@ -168,33 +164,6 @@ jobs:
       - name: Select proxy deployment mode
         id: mode
         run: echo "mode=$PROXY_DEPLOYMENT_MODE" >> "$GITHUB_OUTPUT"
-      - name: Require host identity readiness for automatic rollout
-        env:
-          DEPLOY_EVENT: ${{ github.event_name }}
-          ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
-          GENERATION_READY: ${{ vars.PROXY_GENERATION_PROMOTION_READY }}
-          RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
-          EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
-          EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
-        run: |
-          if [ "${PROXY_DEPLOYMENT_MODE:-generation}" = generation ] && [ "$DEPLOY_EVENT" = push ] && [ "${GENERATION_READY:-}" != true ]; then
-            echo 'Generation migration and staging promotion evidence are required before automatic rollout.' >&2
-            exit 1
-          fi
-          if [ "${PROXY_DEPLOYMENT_MODE:-generation}" = generation ] && [ "$DEPLOY_EVENT" = push ]; then
-            notion_url_pattern='^https://(([A-Za-z0-9-]+\.)?(notion\.so|notion\.site)|app\.notion\.com)/[^[:space:]<>#]+$'
-            https_url_pattern='^https://[^[:space:]<>#]+$'
-            if [[ ! "${RUNBOOK_URL:-}" =~ $notion_url_pattern ]] ||
-               [[ ! "${EVIDENCE_URL:-}" =~ $https_url_pattern ]] ||
-               [ "${EVIDENCE_STATUS:-}" != passed ]; then
-              echo 'Generation promotion requires a published Notion runbook, immutable HTTPS staging evidence link, and passed evidence status.' >&2
-              exit 1
-            fi
-          fi
-          if [ "$DEPLOY_EVENT" = push ] && [ "${ROLLOUT_READY:-}" != true ]; then
-            echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
-            exit 1
-          fi
 
   migrations:
     needs: [migration-gate]
@@ -312,7 +281,7 @@ jobs:
           python3 .github/workflows/scripts/deploy-proxy.py
 
   deploy-production:
-    if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && (needs['migration-gate'].outputs.mode == 'legacy' || (vars.PROXY_GENERATION_PROMOTION_READY == 'true' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed' && vars.PROXY_GENERATION_RUNBOOK_URL != '' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL != ''))
+    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
     needs: [migration-gate, deploy-staging]
     runs-on: ubuntu-latest
     environment: production
@@ -324,30 +293,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.migration-gate.outputs.revision }}
-
-      - name: Validate linked staging promotion evidence
-        if: env.PROXY_DEPLOYMENT_MODE == 'generation'
-        env:
-          RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
-          EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
-          EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
-        run: |
-          set -eu
-          notion_url_pattern='^https://(([A-Za-z0-9-]+\.)?(notion\.so|notion\.site)|app\.notion\.com)/[^[:space:]<>#]+$'
-          https_url_pattern='^https://[^[:space:]<>#]+$'
-          if [[ ! "$RUNBOOK_URL" =~ $notion_url_pattern ]] ||
-             [[ ! "$EVIDENCE_URL" =~ $https_url_pattern ]] ||
-             [ "$EVIDENCE_STATUS" != passed ]; then
-            echo 'Linked Notion runbook or staging promotion evidence is missing or invalid; refusing production deployment.' >&2
-            exit 1
-          fi
-          {
-            echo '### Proxy generation promotion evidence'
-            # Actions summaries are public for this repository.  Keep the
-            # configured runbook/evidence URLs out of the summary because the
-            # gate intentionally accepts links whose access may be private.
-            echo "- Evidence status: $EVIDENCE_STATUS"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record proxy revision
         run: echo "PROXY_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"

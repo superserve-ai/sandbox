@@ -34,16 +34,11 @@ Routine applies can resume once both resources are no-ops. Perform this
 migration with an operator-applied saved plan after the checks below; a merge
 or generic rollout confirmation does not authorize Host 2 maintenance.
 
-For a future migration, set the repository variable
-`HOST_IDENTITY_ROLLOUT_READY=false` to pause automatic VMD and proxy deployments,
-and wait for in-flight deployments to finish. Use manual dispatch for the
-coordinated runtime rollout. Set it to `true` only after the
-operator-applied plans succeed and Host 2 instance/identity changes are no-ops
-in both cells and the [host identity rollout](host-generation-rollout.md)
-prerequisites are complete for all automatic VMD deployment targets. Retain
-`true` after rollout: automatic VMD deployments require that exact value;
-removing or unsetting the variable blocks them. An unset variable permits
-automatic proxy deployments only.
+For a future migration, coordinate a pause in automatic VMD and proxy deployments
+and wait for in-flight deployments to finish before host maintenance. Resume
+automatic deployments after the operator-applied plans succeed and the
+[host identity rollout](host-generation-rollout.md) prerequisites are complete
+for all deployment targets.
 
 Keep the GitHub Actions variable `HOST2_PEER_IDENTITY_READY_STAGING` unset
 until staging Host 2 completes migration and bootstrap verification; keep

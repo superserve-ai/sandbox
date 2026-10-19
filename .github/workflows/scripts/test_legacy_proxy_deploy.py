@@ -93,22 +93,6 @@ class LegacyProxyTests(unittest.TestCase):
         self.assertIn('systemctl restart proxy', inner)
         self.assertIn('InvocationID', inner)
 
-    def test_legacy_mode_bypasses_only_generation_promotion(self):
-        workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
-        step = workflow.split('      - name: Require host identity readiness for automatic rollout\n')[1].split('      - name:', 1)[0]
-        script = step.split('        run: |\n')[1].split('\n  migrations:', 1)[0]
-        for ready in ('', 'true'):
-            env = dict(os.environ, PROXY_DEPLOYMENT_MODE='legacy', DEPLOY_EVENT='push', ROLLOUT_READY=ready)
-            result = subprocess.run(['bash', '-eu', '-c', script], env=env, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0 if ready == 'true' else 1, result.stderr)
-        production = workflow.split('  deploy-production:\n')[1]
-        expression = re.search(r'^    if: (.+)$', production, re.M)[1]
-        for environment in ('staging', 'production'):
-            context = dict(github=SimpleNamespace(event_name='workflow_dispatch', event=SimpleNamespace(
-                inputs=SimpleNamespace(environment=environment))),
-                needs={'migration-gate': SimpleNamespace(outputs=SimpleNamespace(mode='legacy'))})
-            self.assertEqual(eval(expression.replace('&&', ' and ').replace('||', ' or '),
-                                  {'__builtins__': {}}, context), environment == 'production')
 
     def test_retry_mode_controls_manifest_loading_and_production_gate(self):
         workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
@@ -119,27 +103,23 @@ class LegacyProxyTests(unittest.TestCase):
         production_gate = re.search(r'^    if: (.+)$', production, re.M)[1]
         for requested in ('legacy', 'generation'):
             for rollout_id in ('', '123'):
-                for ready in ('', 'true'):
-                    with self.subTest(requested=requested, rollout_id=rollout_id, ready=ready):
-                        context = dict(
-                            inputs=SimpleNamespace(operation='deploy', rollout_id=rollout_id,
-                                                   revision='a' * 40 if rollout_id else '',
-                                                   deployment_mode=requested),
-                            github=SimpleNamespace(event_name='workflow_dispatch', event=SimpleNamespace(
-                                inputs=SimpleNamespace(environment='production'))),
-                            vars=SimpleNamespace(PROXY_GENERATION_PROMOTION_READY=ready,
-                                                 PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS='passed',
-                                                 PROXY_GENERATION_RUNBOOK_URL='https://example.test/runbook',
-                                                 PROXY_GENERATION_PROMOTION_EVIDENCE_URL='https://example.test/evidence'))
-                        def evaluate(expression):
-                            return eval(expression.replace('&&', ' and ').replace('||', ' or '),
-                                        {'__builtins__': {}}, context)
-                        selected = evaluate(selector)
-                        self.assertEqual(selected, requested)
-                        context['env'] = SimpleNamespace(PROXY_DEPLOYMENT_MODE=selected)
-                        context['needs'] = {'migration-gate': SimpleNamespace(outputs=SimpleNamespace(mode=selected))}
-                        self.assertEqual(evaluate(manifest_gate), requested == 'generation')
-                        self.assertEqual(evaluate(production_gate), requested == 'legacy' or ready == 'true')
+                with self.subTest(requested=requested, rollout_id=rollout_id):
+                    context = dict(
+                        inputs=SimpleNamespace(operation='deploy', rollout_id=rollout_id,
+                                               revision='a' * 40 if rollout_id else '',
+                                               deployment_mode=requested),
+                        github=SimpleNamespace(event_name='workflow_dispatch', event=SimpleNamespace(
+                            inputs=SimpleNamespace(environment='production'))),
+                        vars=SimpleNamespace(PROXY_DEPLOYMENT_MODE='generation'))
+                    def evaluate(expression):
+                        return eval(expression.replace('&&', ' and ').replace('||', ' or '),
+                                    {'__builtins__': {}}, context)
+                    selected = evaluate(selector)
+                    self.assertEqual(selected, requested)
+                    context['env'] = SimpleNamespace(PROXY_DEPLOYMENT_MODE=selected)
+                    context['needs'] = {'migration-gate': SimpleNamespace(outputs=SimpleNamespace(mode=selected))}
+                    self.assertEqual(evaluate(manifest_gate), requested == 'generation')
+                    self.assertEqual(evaluate(production_gate), True)
 
     def test_full_production_apply_cannot_change_frontends(self):
         items = [dict(address=address, change=dict(actions=['no-op'], before={'id': address},

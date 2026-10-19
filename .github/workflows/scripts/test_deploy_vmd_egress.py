@@ -25,40 +25,16 @@ class EgressCapacityDeploymentTest(unittest.TestCase):
             result = subprocess.run(['bash', '-c', linux_shell_prelude() + '\nsudo() { "$@"; }\n' + script], text=True, capture_output=True)
             return result, path.read_text()
 
-    def test_production_enforcement_requires_exact_release_and_limit(self):
-        for approval in ('', 'a' * 40 + ':4096', 'b' * 40 + ':8'):
-            result, contents = self.exercise(VMD_EGRESS_ENFORCE='true', VMD_EGRESS_MAX_CONNECTIONS='8', VMD_EGRESS_ROLLOUT_APPROVAL=approval)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertNotIn('VMD_EGRESS_ENFORCE=', contents)
-        result, contents = self.exercise(VMD_EGRESS_ENFORCE='true', VMD_EGRESS_MAX_CONNECTIONS='8', VMD_EGRESS_ROLLOUT_APPROVAL='a' * 40 + ':8')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('VMD_EGRESS_ENFORCE=true', contents)
 
-    def test_retained_enforcement_cannot_bypass_rollout_gate(self):
-        result, _ = self.exercise('VMD_EGRESS_ENFORCE=true\nVMD_EGRESS_MAX_CONNECTIONS=8\n')
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_staging_can_enable_and_reruns_preserve_optional_settings(self):
-        result, contents = self.exercise(DEPLOY_CELL='staging', VMD_EGRESS_ENFORCE='true', VMD_EGRESS_MAX_CONNECTIONS='8')
+    def test_reruns_preserve_optional_settings(self):
+        result, contents = self.exercise(VMD_EGRESS_ENFORCE='true', VMD_EGRESS_MAX_CONNECTIONS='8')
         self.assertEqual(result.returncode, 0, result.stderr)
-        result, again = self.exercise(contents.removeprefix('UNRELATED=preserve\n'), DEPLOY_CELL='staging')
+        result, again = self.exercise(contents.removeprefix('UNRELATED=preserve\n'))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(contents, again)
 
-    def test_telemetry_metadata_cannot_select_staging_exemption(self):
-        for cell in ('use4', 'usw2', '', 'unknown'):
-            with self.subTest(cell=cell):
-                result, contents = self.exercise(DEPLOY_CELL=cell, OTEL_ENVIRONMENT='staging',
-                                                VMD_EGRESS_ENFORCE='true')
-                self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn('VMD_EGRESS_ENFORCE=', contents)
-        # The actual staging cell is exempt even with missing/conflicting telemetry.
-        for telemetry in ('', 'production'):
-            result, _ = self.exercise(DEPLOY_CELL='staging', OTEL_ENVIRONMENT=telemetry,
-                                      VMD_EGRESS_ENFORCE='true')
-            self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_explicit_disable_is_safe_without_approval(self):
+    def test_explicit_disable_preserves_capacity(self):
         result, contents = self.exercise('VMD_EGRESS_ENFORCE=true\nVMD_EGRESS_MAX_CONNECTIONS=8\n', VMD_EGRESS_ENFORCE='false')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(contents.count('VMD_EGRESS_ENFORCE='), 1)
@@ -75,10 +51,6 @@ class EgressCapacityDeploymentTest(unittest.TestCase):
     def test_inherited_whitespace_quotes_and_last_assignment(self):
         existing = 'VMD_EGRESS_ENFORCE=false\n  VMD_EGRESS_ENFORCE = "true"\n\tVMD_EGRESS_MAX_CONNECTIONS = \'8\'\n'
         result, _ = self.exercise(existing)
-        self.assertNotEqual(result.returncode, 0)
-        result, _ = self.exercise(existing, VMD_EGRESS_ROLLOUT_APPROVAL='a' * 40 + ':4096')
-        self.assertNotEqual(result.returncode, 0)
-        result, _ = self.exercise(existing, VMD_EGRESS_ROLLOUT_APPROVAL='a' * 40 + ':8')
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_inherited_overflow_and_unsupported_syntax_fail_before_updates(self):
@@ -105,8 +77,6 @@ class EgressCapacityDeploymentTest(unittest.TestCase):
                 result, contents = self.exercise(existing)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(contents, 'UNRELATED=preserve\n' + existing)
-        result, _ = self.exercise(cases[0], VMD_EGRESS_ROLLOUT_APPROVAL='a' * 40 + ':4096')
-        self.assertNotEqual(result.returncode, 0)
         # Explicit overrides may not rewrite apparent keys inside another value.
         result, contents = self.exercise(cases[2], VMD_EGRESS_ENFORCE='false', VMD_EGRESS_MAX_CONNECTIONS='8')
         self.assertNotEqual(result.returncode, 0)

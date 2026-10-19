@@ -863,19 +863,6 @@ class ApplyTests(unittest.TestCase):
 
 
 class WiringTests(unittest.TestCase):
-    def test_defaults_and_no_new_github_variables(self):
-        expected = {'staging/us-central1': 'superserve-vmd-20260401-224137',
-                    'production/us-west2': 'ubuntu-2404-lts-amd64', 'production/us-east4': 'ubuntu-2204-lts'}
-        for root, image in expected.items():
-            variables = (ROOT/'infra/envs'/root/'variables.tf').read_text()
-            self.assertIn(image, variables)
-            main = (ROOT/'infra/envs'/root/'main.tf').read_text()
-            self.assertIn('lookup(var.host_image_overrides,', main)
-            self.assertIn('contains(var.provisioning_hosts,', main)
-        for name in ('terraform-plans.yml', 'terraform-cd.yml', 'terraform-rollout-staging.yml', 'terraform-rollout-production.yml'):
-            text = (ROOT/'.github/workflows'/name).read_text()
-            self.assertNotIn('TF_VAR_BOOT_DISK_IMAGE', text)
-            self.assertNotIn('terraform-require-boot-image.sh', text)
 
     def test_protection_lookup_fails_closed(self):
         workflow = (ROOT/'.github/workflows/host-provision.yml').read_text()

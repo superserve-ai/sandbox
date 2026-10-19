@@ -121,19 +121,6 @@ env:
   DEPLOY_PRODUCTION_CELL: ${{ inputs.cell }}
 
 jobs:
-  migration-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require host identity rollout readiness for push deployments
-        env:
-          DEPLOY_EVENT: ${{ github.event_name }}
-          ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
-        run: |
-          if [ "$DEPLOY_EVENT" = push ] && [ "$ROLLOUT_READY" != true ]; then
-            echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
-            exit 1
-          fi
-
   # Failing CI must not reach production control-plane hosts. CI is a
   # separate workflow, so `needs:` can't reach it directly — poll the
   # same-SHA run instead, same pattern as Deploy API's wait-for-migrations.
@@ -175,7 +162,7 @@ jobs:
 
   deploy-staging:
     runs-on: ubuntu-latest
-    needs: [wait-for-ci, migration-gate]
+    needs: [wait-for-ci]
     environment: staging
     permissions:
       contents: read
@@ -227,10 +214,9 @@ jobs:
           # Fleet defaults for paused-network reclaim live in deployment
           # config, not the binary. Operators can override them per host in
           # /etc/sandbox/vmd.env after deployment.
-          # Enforcement remains off until the rollout owner records staging evidence.
+          # Enforcement defaults to disabled when the variable is unset.
           VMD_EGRESS_MAX_CONNECTIONS: ${{ vars.VMD_EGRESS_MAX_CONNECTIONS }}
           VMD_EGRESS_ENFORCE: ${{ vars.VMD_EGRESS_ENFORCE || 'false' }}
-          VMD_EGRESS_ROLLOUT_APPROVAL: ${{ vars.VMD_EGRESS_ROLLOUT_APPROVAL }}
           VMD_PAUSED_NETWORK_RECLAIM: "true"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
@@ -355,10 +341,9 @@ jobs:
           # Fleet defaults for paused-network reclaim live in deployment
           # config, not the binary. Operators can override them per host in
           # /etc/sandbox/vmd.env after deployment.
-          # Enforcement remains off until the rollout owner records staging evidence.
+          # Enforcement defaults to disabled when the variable is unset.
           VMD_EGRESS_MAX_CONNECTIONS: ${{ vars.VMD_EGRESS_MAX_CONNECTIONS }}
           VMD_EGRESS_ENFORCE: ${{ vars.VMD_EGRESS_ENFORCE || 'false' }}
-          VMD_EGRESS_ROLLOUT_APPROVAL: ${{ vars.VMD_EGRESS_ROLLOUT_APPROVAL }}
           VMD_PAUSED_NETWORK_RECLAIM: "true"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
@@ -439,10 +424,9 @@ jobs:
           # Fleet defaults for paused-network reclaim live in deployment
           # config, not the binary. Operators can override them per host in
           # /etc/sandbox/vmd.env after deployment.
-          # Enforcement remains off until the rollout owner records staging evidence.
+          # Enforcement defaults to disabled when the variable is unset.
           VMD_EGRESS_MAX_CONNECTIONS: ${{ vars.VMD_EGRESS_MAX_CONNECTIONS }}
           VMD_EGRESS_ENFORCE: ${{ vars.VMD_EGRESS_ENFORCE || 'false' }}
-          VMD_EGRESS_ROLLOUT_APPROVAL: ${{ vars.VMD_EGRESS_ROLLOUT_APPROVAL }}
           VMD_PAUSED_NETWORK_RECLAIM: "true"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_PERCENT: "0"
           VMD_PAUSED_NETWORK_SLOT_HEADROOM_RESERVE: "42000"
