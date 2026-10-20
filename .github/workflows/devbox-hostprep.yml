@@ -1,8 +1,9 @@
 name: Devbox Hostprep Seed
 
 # Copies the guest kernel and base rootfs from a staging host into the devbox
-# hostprep bucket. The staging host is only read; the kernel must match its
-# pinned digest, and the rootfs must not change while it is copied.
+# hostprep bucket, reading the host only. The kernel must match its pinned
+# digest; the rootfs carries the boxd injected by the host's last deploy,
+# which a box's own VMD install replaces.
 on:
   workflow_dispatch:
     inputs:
@@ -25,13 +26,17 @@ jobs:
     name: Seed hostprep artifacts
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     environment: staging
     env:
       HOST: ${{ inputs.host }}
       BUCKET: gs://rayai-dev-devbox-hostprep/hostprep
       KERNEL_SHA256: 3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -49,18 +54,37 @@ jobs:
             gcloud compute ssh "$HOST" --project=rayai-dev --zone=us-central1-a \
               --tunnel-through-iap --quiet --command="set -eu; $1" -- -T
           }
-          before=$(ssh_host 'sudo sha256sum /var/lib/sandbox/rootfs/base.ext4' | cut -d' ' -f1)
-          ssh_host 'sudo cat /var/lib/sandbox/kernel/vmlinux-4.14-fuse' > "$work/vmlinux-4.14-fuse"
-          ssh_host 'sudo cat /var/lib/sandbox/rootfs/base.ext4' > "$work/base.ext4"
-          echo "$KERNEL_SHA256  $work/vmlinux-4.14-fuse" | sha256sum -c -
-          rootfs=$(sha256sum "$work/base.ext4" | cut -d' ' -f1)
-          [ "$rootfs" = "$before" ] || { echo "::error::base.ext4 changed during the copy; rerun"; exit 1; }
+          # deploy/devbox/hostprep_reader.py streams each file in one read on
+          # the host, hashes exactly those bytes and reports whether the open
+          # file was written meanwhile; a rename over the path is harmless.
+          reader=$(base64 -w0 deploy/devbox/hostprep_reader.py)
+          fetch() {
+            local attempt read_line
+            for attempt in 1 2 3; do
+              if ssh_host "echo $reader | base64 -d | sudo python3 -I - $1" > "$work/$2" 2> "$work/$2.log"; then
+                read_line=$(grep -o 'READ sha256=[0-9a-f]\{64\} size=[0-9]* stable=[01]' "$work/$2.log" | tail -1 || true)
+                if [ "$read_line" = "READ sha256=$(sha256sum "$work/$2" | cut -d' ' -f1) size=$(stat -c %s "$work/$2") stable=1" ]; then
+                  sha256sum "$work/$2" | cut -d' ' -f1
+                  return 0
+                fi
+                echo "::warning::$2 attempt $attempt: host reported '${read_line:-nothing}', received $(stat -c %s "$work/$2") bytes with sha256 $(sha256sum "$work/$2" | cut -d' ' -f1)" >&2
+              else
+                cat "$work/$2.log" >&2
+                echo "::warning::$2 attempt $attempt: copy failed" >&2
+              fi
+            done
+            echo "::error::Could not copy a consistent $2 after 3 attempts" >&2
+            return 1
+          }
+          kernel=$(fetch /var/lib/sandbox/kernel/vmlinux-4.14-fuse vmlinux-4.14-fuse)
+          [ "$kernel" = "$KERNEL_SHA256" ] || { echo "::error::vmlinux-4.14-fuse on $HOST has sha256 $kernel, not the pinned $KERNEL_SHA256"; exit 1; }
+          rootfs=$(fetch /var/lib/sandbox/rootfs/base.ext4 base.ext4)
           gcloud storage cp "$work/vmlinux-4.14-fuse" "$work/base.ext4" "$BUCKET/"
           {
             echo "## Devbox hostprep seeded from $HOST"
             echo
             echo "- vmlinux-4.14-fuse: \`$KERNEL_SHA256\`"
-            echo "- base.ext4: \`$rootfs\`"
+            echo "- base.ext4: \`$rootfs\` (includes the boxd injected by the host's last deploy)"
             echo
             echo "If base.ext4 differs from DEVBOX_ROOTFS_DIGEST in deploy/devbox/runtime-pins.env, update that pin."
           } >> "$GITHUB_STEP_SUMMARY"
