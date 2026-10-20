@@ -229,6 +229,7 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	history[0].Lines.Data[0].Pricing.PriceDetails.Price = p.ID
 	previewBytes, _ := json.Marshal(history[0])
 	_ = json.Unmarshal(previewBytes, &providerPreview)
+	providerPreview.ID = "upcoming_in_fixture"
 	providerPreview.Lines.Data[0].Pricing.PriceDetails.Price = "price_previous_annual"
 	mu.Unlock()
 	for _, previewItem := range []string{item.ID, "si_previous_annual"} {
