@@ -28,13 +28,13 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	if h.Pool == nil {
 		return
 	}
+	h.startSponsoredAnnualReconciliation(ctx)
 	if _, ok := h.Stripe.(*stripeHTTPClient); !ok {
 		return
 	}
 	workers := 8
 	h.startEntitlementCoverageMonitoring(ctx)
 	h.startSponsoredReconciliation(ctx)
-	h.startSponsoredAnnualReconciliation(ctx)
 	if h.Config != nil && h.Config.BillingEntitlementWorkers >= 2 {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)
 	}

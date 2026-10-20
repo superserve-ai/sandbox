@@ -4,6 +4,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -404,14 +405,28 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 		t.Fatal("renewal before original boundary")
 	}
 	time.Sleep(time.Until(end.Add(20 * time.Millisecond)))
-	// Expiry must revoke the waived default benefits before any provider access.
-	if err = h.reconcileSponsoredAnnual(ctx, team); err == nil {
-		t.Fatal("missing provider unexpectedly accepted")
+	// Exercise service startup: a missing provider must not disable local expiry.
+	if h.Stripe != nil {
+		t.Fatal("fixture unexpectedly has a provider")
 	}
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	defer stopWorker()
+	h.StartUsageEntitlementService(workerCtx)
 	var limits int
-	if err = h.Pool.QueryRow(ctx, `SELECT max_sandboxes FROM team WHERE id=$1`, team).Scan(&limits); err != nil || limits == 1000 {
-		t.Fatal("waived benefits survived provider failure", limits, err)
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		var finished bool
+		if err = h.Pool.QueryRow(ctx, `SELECT t.max_sandboxes,a.state='renewal_pending' AND a.lease_token IS NULL AND a.last_error IS NOT NULL FROM team t JOIN billing_sponsored_annual_authority a ON a.team_id=t.id WHERE t.id=$1 AND a.id=$2`, team, o.ID).Scan(&limits, &finished); err != nil {
+			t.Fatal(err)
+		}
+		if limits != 1000 && finished {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waived benefits survived service startup without provider", limits, finished)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	stopWorker()
 	for range 2 {
 		if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err != nil {
 			t.Fatal("unpaid renewal/replay", err)
