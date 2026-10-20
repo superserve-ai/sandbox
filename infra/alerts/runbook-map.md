@@ -4,12 +4,17 @@ Alerts use the repository Actions variable `RUNBOOK_BASE_URL`, matching Cloud ID
 
 Workflows pass the shared variable as `TF_VAR_alert_runbook_base_url` for these alerts and `TF_VAR_cloud_ids_runbook_base_url` for Cloud IDS. Local Terraform runs use the corresponding inputs. Trailing slashes are normalized before appending a page ID. No full-URL map is required.
 
+Billing policies use the repository procedure in `docs/pro-billing.md#entitlement-alert-response`, referenced by the `billing_entitlement` key below. It requires no private runbook URL.
+
 | Policy and variant | Runbook key | Family | Component | Failure family | Operation |
 | --- | --- | --- | --- | --- | --- |
 | `sandbox_lifecycle_latency[create]` | `lifecycle_latency` | `sandbox_lifecycle` | `api` | `latency` | `create` |
 | `sandbox_lifecycle_latency[resume]` | `lifecycle_latency` | `sandbox_lifecycle` | `api` | `latency` | `resume` |
 | `sandbox_lifecycle_latency[pause]` | `lifecycle_latency` | `sandbox_lifecycle` | `api` | `latency` | `pause` |
 | `sandbox_lifecycle_latency[delete]` | `lifecycle_latency` | `sandbox_lifecycle` | `api` | `latency` | `delete` |
+| `entitlement_metric[each]` | `billing_entitlement` | `billing` | `api` | `missing_entitlement`, `unknown_eligibility`, `observation_failure`, or `missing_telemetry` | — |
+| `entitlement_recovery` | `billing_entitlement` | `billing` | `api` | `manual_recovery` | — |
+| `billing_preserved[each]` | `billing_entitlement` | `billing` | `api` | `billing_backlog` | — |
 | `sandbox_failed` | `lifecycle_failure` | `sandbox_lifecycle` | `api` | `lifecycle_failure` | — |
 | `backup[upload_failures]` | `backup_pipeline` | `backup` | `vmd` | `backup_upload_failure` | — |
 | `backup[backlog_age]` | `backup_pipeline` | `backup` | `vmd` | `backup_backlog` | — |

@@ -223,3 +223,92 @@ issuance. If a plan cannot drain, keep collection held and deploy a forward fix;
 do not delete frozen plans, grants, or requests to make an older binary proceed.
 The database deliberately rejects older Pro overdue observations as new credit
 authority. Existing issued grants and legacy invoice plans remain readable.
+
+## Entitlement alert response
+
+The billing alert policies are owned by Terraform. Production has one policy
+set in `infra/envs/production/us-central1`, covering API cells in `us-east4`
+and `us-west2`. This root uses the production state bucket's
+`production/us-central1` prefix and default workspace; it is the state owner,
+not a restriction on monitored regions. Staging has its own policy set and
+notification channel in `infra/envs/staging/us-central1`. The normal Terraform
+CD workflow applies staging and production after merge. Do not apply a PR plan.
+
+The metric resource's `location` comes from the receiving collector, currently
+`us-east4-c` and `us-west2-a` in production and `us-central1-a` in staging.
+It is not the Cloud Run region. Queries restrict the project and
+`sandbox-controlplane` job and take the maximum of replicated backlog gauges.
+Customer and contract identifiers stay in diagnostic logs, never metric or
+incident labels.
+
+| Signal | Timing and meaning | Response |
+| --- | --- | --- |
+| Paid missing | Critical on any nonzero count, evaluated every minute, with no extra sustained delay after the application's 15-minute threshold | Identify affected current entitlements; check eligibility and frozen request evidence. |
+| Debt unknown | Warning on any nonzero count; a subset of paid missing | Restore fresh debt observation. Unknown debt does not prove nonpayment or authorize a grant. |
+| Sampler errors | Critical on any coverage/backlog error increase over five minutes | Check database and worker errors; the policy clears after errors leave the window. |
+| Sampler stopped | Critical after no counter progress for five minutes plus a one-minute hold, separately per cell and sampler | Inspect API/collector health and export delays. Absent or frozen counters are not healthy zeroes. |
+| Operator recovery | Critical on the first matching ERROR; one incident for all customers, replicas and cells | Inspect all matching logs, pending grants and collection holds. |
+
+The independent backlog sampler runs even with issuance disabled. Coverage
+sampler liveness is configured with each cell's `coverage_checks_enabled`.
+The production configuration arms East for its coordinated activation and
+leaves West disarmed until its separate issuance rollout. Deploy the East
+monitoring with that activation sequence, before an enabled revision starts
+background workers; traffic cutover is not the activation boundary. Verify
+recent coverage-counter progress afterward. A never-seen sampler can alert after the first minute of evaluation; the
+five-minute lookback does not provide a startup grace period. Coordinate
+activation promptly after arming monitoring. Previously observed counters
+can alert after their last progress ages out of the lookback plus the
+one-minute hold.
+Disarm coverage liveness when deliberately disabling issuance. Staging
+coverage liveness remains a separate follow-up. This monitoring input never
+changes issuance itself. The three metric failure policies and recovery log policy
+remain enabled before rollout. Error series need not exist before their first
+failure: validate selectors using descriptors and staging/fixture evidence,
+then verify live observations after enablement. Normal issuance still targets
+one minute; escalation thresholds are not the normal service target.
+
+The recovery selector covers the API's current console `ERR` lines in
+`textPayload` as well as structured JSON `ERROR` entries, scoped to the expected
+Cloud Run services and regions. The recovery policy extracts no labels, so 100
+customer events within five minutes produce one incident and one initial notification. Subsequent matching
+events can notify again no sooner than five minutes later; there is no initial
+five-minute delay, including near-expiry events. Cloud Monitoring limits direct
+log policies to 20 notifications per day. Treat a notification as a prompt to
+inspect *all* affected contracts; it is not a queue of individual customers.
+The paid-missing and debt-unknown policies overlap deliberately and remain
+separately identifiable. A log incident auto-closes after 24 hours of silence;
+metric predicates clear on healthy samples. Neither notification closure nor
+missing telemetry proves billing recovery.
+
+Before declaring a billing incident resolved, verify the intended current
+period has its confirmed grant and correct provider evidence, or record the
+explicit manual remediation for a missed period. Inspect
+`billing_entitlement_work`, `billing_usage_entitlement`, and
+`billing_entitlement_withheld` as described above. Retain the frozen request
+identity after a potentially successful write; reconcile the original grant
+instead of issuing a replacement. Keep invoice collection held until the
+expected allowance and invoice settlement are correct. Never automatically
+extend an expired grant or roll it into a new period.
+
+### Policy adoption and rollout evidence
+
+The production root imports existing billing policies by ID. Review the plan:
+existing overdue-work, payment activation, recovery-choice and reconciliation
+predicates and routing must remain intact; the paid-missing policy is adopted
+with its extra five-minute delay removed. There must be no policy replacement
+or deletion. Preserve the existing billing notification route rather than
+substituting the general infrastructure channel. Staging uses its own channel.
+
+Before adoption, stop external management of these policy IDs and
+confirm it will not recreate or overwrite them. Removing external-management
+labels in Terraform alone does not prove the external controller has stopped.
+Do not remove broad telemetry IAM permissions to solve this local ownership
+handoff. Unrelated unmanaged policies belong to their owning rollout.
+
+After the approved Terraform deployment, record policy IDs, enabled states,
+selectors, cell scope, channel IDs and the no-replacement plan. Verify missing,
+failing and recovered predicate behavior using fixtures or non-notifying
+queries. Notification receipt tests and synthetic deliveries are unnecessary.
+Hand the evidence to the issuance rollout owner; an approved PR alone does not
+satisfy deployment, and this policy change does not enable issuance.
