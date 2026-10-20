@@ -23,7 +23,7 @@ import (
 )
 
 func TestSponsoredOperatorOnboardingAndRetry(t *testing.T) {
-	for _, scenario := range []string{"new", "existing_anniversary", "revoke_creation", "catalog_rotation", "checkout_race", "revoke_canceled", "historical_terms"} {
+	for _, scenario := range []string{"new", "existing_anniversary", "revoke_creation", "catalog_rotation", "checkout_race", "revoke_canceled", "historical_terms", "capacity_existing", "capacity_new", "capacity_race"} {
 		t.Run(scenario, func(t *testing.T) { sponsoredOperatorScenario(t, scenario) })
 	}
 }
@@ -209,16 +209,137 @@ func sponsoredOperatorScenario(t *testing.T, scenario string) {
 		exec(`INSERT INTO billing_sponsored_operation(team_id,idempotency_key,request,resource_terms,approved_by,approved_at,reason,reference,customer_id,subscription_id,state,revoked_at,revoked_by) VALUES($1,'old','{}',$2,$3,clock_timestamp()-interval '1 day','fixture','fixture',$4,$5,'revoked',clock_timestamp(),$3)`, team, prior, uuid.New(), customer, sub.ID)
 	}
 	actor := uuid.New()
-	call := func(apply bool, r sponsoredRequest) *httptest.ResponseRecorder {
+	callForTeam := func(target uuid.UUID, apply bool, r sponsoredRequest) *httptest.ResponseRecorder {
 		raw, _ := json.Marshal(r)
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(raw))
 		c.Request.Header.Set("Content-Type", "application/json")
-		c.Params = gin.Params{{Key: "team_id", Value: team.String()}}
+		c.Params = gin.Params{{Key: "team_id", Value: target.String()}}
 		c.Set("actor_id", actor)
 		h.sponsoredApply(c, apply)
 		return w
+	}
+	call := func(apply bool, r sponsoredRequest) *httptest.ResponseRecorder {
+		return callForTeam(team, apply, r)
+	}
+	if strings.HasPrefix(scenario, "capacity_") {
+		exec(`UPDATE billing_funding_policy SET max_observed_teams=4 WHERE singleton`)
+		var occupants []uuid.UUID
+		t.Cleanup(func() {
+			_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false,enforce=false WHERE team_id=ANY($1::uuid[])`, occupants)
+		})
+		if scenario == "capacity_existing" {
+			exec(`UPDATE billing_funding_account SET observe=true WHERE team_id=$1`, team)
+			occupants = append(occupants, team)
+		}
+		seats := 4
+		if scenario == "capacity_race" {
+			seats = 3
+		}
+		for len(occupants) < seats {
+			_, id := fundingTransitionFixture(t)
+			occupants = append(occupants, id)
+			exec(`UPDATE billing_funding_account SET observe=true WHERE team_id=$1`, id)
+		}
+		preflight := func(target uuid.UUID, wantAvailable, wantObserved bool) {
+			t.Helper()
+			w := callForTeam(target, false, request)
+			var result struct {
+				Eligible  bool     `json:"eligible"`
+				Conflicts []string `json:"conflicts"`
+				Capacity  struct {
+					Max       int  `json:"max_observed_teams"`
+					Count     int  `json:"observed_teams"`
+					Observed  bool `json:"target_already_observed"`
+					Available bool `json:"available"`
+				} `json:"funding_capacity"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || w.Code != 200 {
+				t.Fatalf("capacity preflight: %d %s %v", w.Code, w.Body.String(), err)
+			}
+			if result.Eligible != wantAvailable || result.Capacity.Available != wantAvailable || result.Capacity.Observed != wantObserved || result.Capacity.Max != 4 || result.Capacity.Count != seats {
+				t.Fatalf("unexpected capacity preview: %+v", result)
+			}
+			if !wantAvailable && !strings.Contains(strings.Join(result.Conflicts, " "), "cohort is at capacity") {
+				t.Fatal("missing capacity conflict", result)
+			}
+			var operations int
+			if err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_sponsored_operation WHERE team_id=$1`, target).Scan(&operations); err != nil || operations != 0 || writes != 0 {
+				t.Fatal("preflight mutated state", operations, writes, err)
+			}
+		}
+		preflight(team, scenario != "capacity_new", scenario == "capacity_existing")
+		if scenario == "capacity_new" {
+			w := call(true, request)
+			var operations, contracts, accounts int
+			var observed bool
+			err := h.Pool.QueryRow(ctx, `SELECT
+              (SELECT count(*) FROM billing_sponsored_operation WHERE team_id=$1),
+              (SELECT count(*) FROM billing_commercial_contract WHERE team_id=$1),
+              (SELECT count(*) FROM team_billing_account WHERE team_id=$1),
+              (SELECT observe FROM billing_funding_account WHERE team_id=$1)`, team).Scan(&operations, &contracts, &accounts, &observed)
+			if w.Code != 409 || err != nil || operations != 0 || contracts != 0 || accounts != 0 || observed || writes != 0 {
+				t.Fatal("capacity rejection was not atomic", w.Code, w.Body.String(), operations, contracts, accounts, observed, writes, err)
+			}
+			return
+		}
+		if scenario == "capacity_race" {
+			_, other := fundingTransitionFixture(t)
+			exec(`UPDATE team SET home_region='use' WHERE id=$1`, other)
+			// Cover both missing and existing unobserved funding rows.
+			exec(`DELETE FROM billing_funding_account WHERE team_id=$1`, other)
+			preflight(other, true, false)
+			occupants = append(occupants, team, other)
+			lock, err := h.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Rollback(context.Background())
+			if _, err = lock.Exec(ctx, `SELECT singleton FROM billing_funding_policy WHERE singleton FOR UPDATE`); err != nil {
+				t.Fatal(err)
+			}
+			results := make(chan *httptest.ResponseRecorder, 2)
+			for _, target := range []uuid.UUID{team, other} {
+				go func() { results <- callForTeam(target, true, request) }()
+			}
+			// Both approvals must reach enrollment before releasing the last slot.
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				var waiting int
+				err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()
+                  AND cardinality(pg_blocking_pids(pid))>0 AND query LIKE 'UPDATE billing_funding_account SET observe=true%'`).Scan(&waiting)
+				if err != nil || time.Now().After(deadline) {
+					t.Fatalf("enrollments did not contend for capacity: waiting=%d error=%v", waiting, err)
+				}
+				if waiting == 2 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err = lock.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			codes := map[int]int{}
+			for range 2 {
+				w := <-results
+				codes[w.Code]++
+				if w.Code != 200 && (w.Code != 409 || !strings.Contains(w.Body.String(), "capacity budget")) {
+					t.Fatal("unexpected race result", w.Code, w.Body.String())
+				}
+			}
+			var count, operations, contracts int
+			var optedIn bool
+			err = h.Pool.QueryRow(ctx, `SELECT
+              (SELECT count(*) FROM billing_funding_account WHERE observe),
+              (SELECT count(*) FROM billing_sponsored_operation WHERE team_id=ANY($1::uuid[])),
+              (SELECT count(*) FROM billing_commercial_contract WHERE team_id=ANY($1::uuid[])),
+              (SELECT bool_and(f.observe AND f.enforce) FROM billing_sponsored_operation o JOIN billing_funding_account f USING(team_id) WHERE o.team_id=ANY($1::uuid[]))`, []uuid.UUID{team, other}).Scan(&count, &operations, &contracts, &optedIn)
+			if err != nil || codes[200] != 1 || codes[409] != 1 || count != 4 || operations != 1 || contracts != 0 || !optedIn || writes != 0 {
+				t.Fatal("last slot was not exclusive/atomic", codes, count, operations, contracts, optedIn, writes, err)
+			}
+			return
+		}
 	}
 	if scenario == "existing_anniversary" {
 		exec(`INSERT INTO team_billing_account(team_id,commercial_billing_anchor) VALUES($1,$2) ON CONFLICT(team_id) DO UPDATE SET commercial_billing_anchor=$2`, team, anchor.Add(-time.Hour))

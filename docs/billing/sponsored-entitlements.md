@@ -12,7 +12,10 @@ UUID in the team's home billing region. These endpoints are under
 `/internal/teams/:team_id/billing/sponsored-entitlements`:
 
 - `POST /preflight` returns identity and member emails, current billing state,
-  conflicts, frozen resource scope, and monthly schedule. It makes no writes.
+  conflicts, frozen resource scope, monthly schedule, and `funding_capacity`
+  (budget, observed count, whether the target is already observed, and availability).
+  It makes no writes and reserves no capacity; apply can lose the last slot to
+  another enrollment after preflight.
 - `POST` persists approval and starts background onboarding. Send exactly the
   same body and idempotency key to retry. Changed terms with the same key fail.
 - `GET /:operation_id` returns immutable approval, provider identities, calendar,
@@ -76,8 +79,9 @@ release gates, including their alert prerequisites. Approval does not enable the
 global grant gate. Do not roll back to older binaries after admitting sponsors.
 
 Approval opts only the selected team into funding observation and enforcement.
-It respects the existing observation-capacity budget (initially four teams); it
-fails atomically if that budget is full. Follow [funding rollout validation](funding-access.md)
+It respects the existing observation-capacity budget (initially four teams); a
+new observer fails atomically if that budget is full. Already-observed teams
+need no additional slot. Follow [funding rollout validation](funding-access.md)
 before expanding that budget. No production activation is implied by this change.
 
 Inspect operation `last_error`, `sponsorship_activation` backlog count/oldest age

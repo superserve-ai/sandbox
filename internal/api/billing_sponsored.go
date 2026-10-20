@@ -213,6 +213,24 @@ func (h *Handlers) sponsoredApply(c *gin.Context, apply bool) {
 		cursor = e
 	}
 	if !apply {
+		var capacity struct {
+			MaxObservedTeams      int64 `json:"max_observed_teams"`
+			ObservedTeams         int64 `json:"observed_teams"`
+			TargetAlreadyObserved bool  `json:"target_already_observed"`
+			Available             bool  `json:"available"`
+		}
+		err = h.Pool.QueryRow(ctx, `SELECT max_observed_teams,
+          (SELECT count(*) FROM billing_funding_account WHERE observe),
+          COALESCE((SELECT observe FROM billing_funding_account WHERE team_id=$1),false)
+          FROM billing_funding_policy WHERE singleton`, team).Scan(&capacity.MaxObservedTeams, &capacity.ObservedTeams, &capacity.TargetAlreadyObserved)
+		if err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		capacity.Available = capacity.TargetAlreadyObserved || capacity.ObservedTeams < capacity.MaxObservedTeams
+		if !capacity.Available {
+			conflicts = append(conflicts, "funding observation cohort is at capacity")
+		}
 		var snapshot []byte
 		err = h.Pool.QueryRow(ctx, `SELECT jsonb_build_object(
           'contracts',COALESCE((SELECT jsonb_agg(to_jsonb(c)) FROM billing_commercial_contract c WHERE team_id=$1),'[]'::jsonb),
@@ -231,7 +249,7 @@ func (h *Handlers) sponsoredApply(c *gin.Context, apply bool) {
 			respondError(c, ErrInternal)
 			return
 		}
-		c.JSON(200, gin.H{"identity": json.RawMessage(identity), "customer_id": customer, "subscription_id": subscription, "effective_plan": plan, "current_billing": json.RawMessage(snapshot), "first_period_start": start, "first_period_end": end, "schedule": periods, "resource_scope": terms, "conflicts": conflicts, "eligible": len(conflicts) == 0, "exhaustion": "add a usable payment method to continue; existing billing enforcement pauses resources with observation and suspension lag; retained storage may continue accruing charges", "new_account_anchor": "provider subscription anniversary is confirmed during onboarding"})
+		c.JSON(200, gin.H{"identity": json.RawMessage(identity), "customer_id": customer, "subscription_id": subscription, "effective_plan": plan, "current_billing": json.RawMessage(snapshot), "funding_capacity": capacity, "first_period_start": start, "first_period_end": end, "schedule": periods, "resource_scope": terms, "conflicts": conflicts, "eligible": len(conflicts) == 0, "exhaustion": "add a usable payment method to continue; existing billing enforcement pauses resources with observation and suspension lag; retained storage may continue accruing charges", "new_account_anchor": "provider subscription anniversary is confirmed during onboarding"})
 		return
 	}
 	if len(conflicts) > 0 {
@@ -277,7 +295,12 @@ func (h *Handlers) sponsoredApply(c *gin.Context, apply bool) {
 		err = tx.QueryRow(ctx, `INSERT INTO billing_sponsored_operation(team_id,idempotency_key,request,resource_terms,approved_by,reason,reference,customer_id,subscription_id,customer_name) VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),NULLIF($9,''),(SELECT name FROM team WHERE id=$1)) RETURNING id`, team, input.Key, request, rawTerms, actor, input.Reason, input.Reference, customer, subscription).Scan(&existing)
 	}
 	if err == nil {
-		_, err = tx.Exec(ctx, `INSERT INTO billing_funding_account(team_id,observe,enforce) VALUES($1,true,true) ON CONFLICT(team_id) DO UPDATE SET observe=true,enforce=true`, team)
+		// BEFORE INSERT runs before conflict resolution: inserting observe=true
+		// would charge an existing cohort member for another slot at capacity.
+		_, err = tx.Exec(ctx, `INSERT INTO billing_funding_account(team_id) VALUES($1) ON CONFLICT(team_id) DO NOTHING`, team)
+	}
+	if err == nil {
+		_, err = tx.Exec(ctx, `UPDATE billing_funding_account SET observe=true,enforce=true WHERE team_id=$1`, team)
 	}
 	if err == nil {
 		err = tx.Commit(ctx)
