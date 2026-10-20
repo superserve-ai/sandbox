@@ -56,14 +56,14 @@ func (h *Handlers) reconcileSponsoredAnnualRenewal(ctx context.Context, o sponso
 	if _, err = tx.Exec(ctx, `INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'pro_annual',$3,$4,$5,$6,1200000,12,'metered_usage',100000,'monthly',$7) ON CONFLICT(id) DO NOTHING`, o.Renewal, o.Team, o.End, o.Customer, o.Subscription, o.Price, o.Start); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET state=CASE WHEN state='renewed' THEN state ELSE 'renewal_pending' END WHERE team_id=$1`, o.Team); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET state=CASE WHEN state='renewed' THEN state ELSE 'renewal_pending' END WHERE id=$1`, o.ID); err != nil {
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
 	var cursor string
-	if err = h.Pool.QueryRow(ctx, `SELECT COALESCE(invoice_cursor,'') FROM billing_sponsored_annual_authority WHERE team_id=$1`, o.Team).Scan(&cursor); err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT COALESCE(invoice_cursor,'') FROM billing_sponsored_annual_authority WHERE id=$1`, o.ID).Scan(&cursor); err != nil {
 		return err
 	}
 	ids, next, err := client.proInvoices(ctx, o.Customer, o.Subscription, cursor)
@@ -212,13 +212,16 @@ func (h *Handlers) reconcileSponsoredAnnualRenewal(ctx context.Context, o sponso
 		}
 		state = "ended"
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET state=$2,invoice_cursor=NULLIF($3,''),last_error=NULL,next_check_at=clock_timestamp()+interval '30 seconds' WHERE team_id=$1`, o.Team, state, next); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET state=$2,invoice_cursor=NULLIF($3,''),last_error=NULL,next_check_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, o.ID, state, next); err != nil {
+		return err
+	}
+	// Verification survives bounded pagination; it does not authorize cash coverage.
+	if _, err = tx.Exec(ctx, `INSERT INTO billing_pro_invoice_seen(team_id,invoice_id) SELECT $1,unnest($2::text[]) ON CONFLICT DO NOTHING`, o.Team, verifiedIDs); err != nil {
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
-
 	return recoveryErr
 }
 

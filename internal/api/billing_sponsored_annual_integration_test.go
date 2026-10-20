@@ -285,17 +285,32 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 	op, contract := uuid.New(), uuid.New()
 	exec(`UPDATE team SET home_region='use' WHERE id=$1`, team)
 	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,$2,$3,$4)`, team, customer, subscription, start)
-	exec(`INSERT INTO billing_sponsored_operation(id,team_id,contract_id,idempotency_key,request,resource_terms,approved_by,reason,reference,customer_id,subscription_id,anchor,starts_at,ends_at) VALUES($1,$2,$3,'fixture','{}','{}',$4,'fixture','fixture',$5,$6,$7,$7,$8)`, op, team, contract, uuid.New(), customer, subscription, start, end)
-	exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_kind,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'sponsored_usage',$3,$4,$5,$6,'','sponsored_entitlement',0,1,'metered_usage',3000000,'scheduled',$3)`, contract, team, start, end, customer, subscription)
-	exec(`INSERT INTO billing_contract_entitlement_schedule(team_id,contract_id,month_offset,amount_cents) SELECT $1,$2,m,CASE WHEN m<3 THEN 3000000 ELSE 100000 END FROM generate_series(0,11) m`, team, contract)
-	if _, err := h.DB.ActivateCommercialContract(ctx, db.ActivateCommercialContractParams{TeamID: team, ContractID: contract}); err != nil {
-		t.Fatal(err)
-	}
-	exec(`UPDATE billing_sponsored_operation SET state='active' WHERE id=$1`, op)
 	historicalID := "in_waiver_" + team.String()
 	historical := StripeInvoiceAmounts{ID: historicalID, Customer: customer, Status: "paid"}
 	historyRaw, _ := json.Marshal(map[string]any{"waiver_inventory": []StripeInvoiceAmounts{historical}})
-	exec(`INSERT INTO billing_sponsored_annual_authority(team_id,sponsorship_id,contract_id,idempotency_key,request,approved_by,customer_id,subscription_id,item_id,base_price_id,base_product_id,live_mode,home_region,starts_at,waiver_ends_at,provider_evidence) VALUES($1,$2,$3,'annual','{}',$4,$5,$6,'si_annual_'||$1::uuid::text,'price_annual','prod_annual',false,'use',$7,$8,$9)`, team, op, contract, uuid.New(), customer, subscription, start, end, historyRaw)
+	seed := func(op, contract uuid.UUID, subscription, key string, evidence []byte) {
+		exec(`INSERT INTO billing_sponsored_operation(id,team_id,contract_id,idempotency_key,request,resource_terms,approved_by,reason,reference,customer_id,subscription_id,anchor,starts_at,ends_at) VALUES($1,$2,$3,$9,'{}','{}',$4,'fixture','fixture',$5,$6,$7,$7,$8)`, op, team, contract, uuid.New(), customer, subscription, start, end, key)
+		exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_kind,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'sponsored_usage',$3,$4,$5,$6,'','sponsored_entitlement',0,1,'metered_usage',3000000,'scheduled',$3)`, contract, team, start, end, customer, subscription)
+		exec(`INSERT INTO billing_contract_entitlement_schedule(team_id,contract_id,month_offset,amount_cents) SELECT $1,$2,m,CASE WHEN m<3 THEN 3000000 ELSE 100000 END FROM generate_series(0,11) m`, team, contract)
+		if _, err := h.DB.ActivateCommercialContract(ctx, db.ActivateCommercialContractParams{TeamID: team, ContractID: contract}); err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE billing_sponsored_operation SET state='active' WHERE id=$1`, op)
+		exec(`INSERT INTO billing_sponsored_annual_authority(team_id,sponsorship_id,contract_id,idempotency_key,request,approved_by,customer_id,subscription_id,item_id,base_price_id,base_product_id,live_mode,home_region,starts_at,waiver_ends_at,provider_evidence) VALUES($1,$2,$3,$10,'{}',$4,$5,$6,'si_annual_'||$6::text,'price_annual','prod_annual',false,'use',$7,$8,$9)`, team, op, contract, uuid.New(), customer, subscription, start, end, evidence, key)
+	}
+	oldSub := subscription + "_old"
+	exec(`UPDATE team_billing_account SET stripe_subscription_id=$2 WHERE team_id=$1`, team, oldSub)
+	oldOp, oldContract := uuid.New(), uuid.New()
+	seed(oldOp, oldContract, oldSub, "old", []byte(`{}`))
+	exec(`UPDATE billing_sponsored_annual_authority SET state='ended',invoice_cursor='in_old_cursor' WHERE team_id=$1`, team)
+	var oldBefore, oldAfter []byte
+	if err := h.Pool.QueryRow(ctx, `SELECT to_jsonb(a) FROM billing_sponsored_annual_authority a WHERE team_id=$1`, team).Scan(&oldBefore); err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1`, oldContract)
+	exec(`UPDATE billing_sponsored_operation SET state='revoked',revoked_at=clock_timestamp(),revoked_by=$2 WHERE id=$1`, oldOp, uuid.New())
+	exec(`UPDATE team_billing_account SET stripe_subscription_id=$2 WHERE team_id=$1`, team, subscription)
+	seed(op, contract, subscription, "annual", historyRaw)
 	o, err := h.sponsoredAnnualAuthority(ctx, team, h.Pool)
 	if err != nil {
 		t.Fatal(err)
@@ -308,6 +323,15 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 	sub.BillingMode.Type = "flexible"
 	sub.Items.Data = append(sub.Items.Data, invoiceSubscriptionItem{ID: o.Item, Quantity: 1, Price: p, Start: end.Unix(), End: annualBoundary(start, 24).Unix()})
 	invoiceID := "in_renewal_" + team.String()
+	monthly := map[string]StripeInvoiceAmounts{}
+	var monthlyIDs []string
+	for n := range 23 {
+		id := fmt.Sprintf("in_month_%02d_%s", n, team)
+		var inv StripeInvoiceAmounts
+		_ = json.Unmarshal([]byte(fmt.Sprintf(`{"id":%q,"customer":%q,"status":"paid","parent":{"subscription_details":{"subscription":%q}}}`, id, customer, subscription)), &inv)
+		monthly[id] = inv
+		monthlyIDs = append(monthlyIDs, id)
+	}
 	var paid, refunded, prorated atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -316,11 +340,29 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/invoices":
+			all := []map[string]any{}
 			if paid.Load() {
-				fmt.Fprintf(w, `{"data":[{"id":%q,"status":"paid","amount_paid":1200000},{"id":%q,"status":"paid","amount_paid":0}]}`, invoiceID, historicalID)
-			} else {
-				fmt.Fprintf(w, `{"data":[{"id":%q,"status":"paid","amount_paid":0}]}`, historicalID)
+				all = append(all, map[string]any{"id": invoiceID, "status": "paid", "amount_paid": 1200000})
 			}
+			for _, id := range monthlyIDs {
+				all = append(all, map[string]any{"id": id, "status": "paid", "amount_paid": 0})
+			}
+			all = append(all, map[string]any{"id": historicalID, "status": "paid", "amount_paid": 0})
+			offset := 0
+			if cursor := r.URL.Query().Get("starting_after"); cursor != "" {
+				for n, x := range all {
+					if x["id"] == cursor {
+						offset = n + 1
+						break
+					}
+				}
+			}
+			limit := len(all)
+			if r.URL.Query().Get("limit") == "10" {
+				limit = 10
+			}
+			stop := min(len(all), offset+limit)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": all[offset:stop], "has_more": stop < len(all)})
 		case "/v1/invoices/" + historicalID:
 			_ = json.NewEncoder(w).Encode(historical)
 		case "/v1/invoices/" + invoiceID:
@@ -343,6 +385,10 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 				return 0
 			}())
 		default:
+			if inv, ok := monthly[strings.TrimPrefix(r.URL.Path, "/v1/invoices/")]; ok {
+				_ = json.NewEncoder(w).Encode(inv)
+				return
+			}
 			t.Errorf("unexpected renewal request %s", r.URL.Path)
 			http.Error(w, "unexpected", 500)
 		}
@@ -373,7 +419,7 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 	}
 	var contracts, payments, grants int
 	var state string
-	if err = h.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended'),(SELECT count(*) FROM billing_contract_payment WHERE team_id=$1),(SELECT count(*) FROM billing_usage_entitlement WHERE team_id=$1),state FROM billing_sponsored_annual_authority WHERE team_id=$1`, team).Scan(&contracts, &payments, &grants, &state); err != nil || contracts != 1 || payments != 0 || grants != 0 || state != "renewal_pending" {
+	if err = h.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended'),(SELECT count(*) FROM billing_contract_payment WHERE team_id=$1),(SELECT count(*) FROM billing_usage_entitlement WHERE team_id=$1),state FROM billing_sponsored_annual_authority WHERE team_id=$1 AND id=$2`, team, o.ID).Scan(&contracts, &payments, &grants, &state); err != nil || contracts != 1 || payments != 0 || grants != 0 || state != "renewal_pending" {
 		t.Fatal("unpaid renewal created cash/credit or duplicates", contracts, payments, grants, state, err)
 	}
 	c, err := h.DB.GetCommercialContract(ctx, db.GetCommercialContractParams{TeamID: team, ContractID: o.Renewal})
@@ -403,7 +449,7 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 			t.Fatal("paid renewal/replay", err)
 		}
 	}
-	if err = h.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1),state FROM billing_sponsored_annual_authority WHERE team_id=$1`, team).Scan(&payments, &state); err != nil || payments != 1 || state != "renewed" {
+	if err = h.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1),state FROM billing_sponsored_annual_authority WHERE team_id=$1 AND id=$2`, team, o.ID).Scan(&payments, &state); err != nil || payments != 1 || state != "renewed" {
 		t.Fatal("paid renewal not singular/active", payments, state, err)
 	}
 	c, err = h.DB.GetCommercialContract(ctx, db.GetCommercialContractParams{TeamID: team, ContractID: o.Renewal})
@@ -418,6 +464,18 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 	c, err = h.DB.GetCommercialContract(ctx, db.GetCommercialContractParams{TeamID: team, ContractID: o.Renewal})
 	if err != nil || c.Status != "active" {
 		t.Fatal("cancellation forfeited paid term", c.Status, err)
+	}
+	for range 3 {
+		if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err != nil {
+			t.Fatal("multi-page terminal recovery", err)
+		}
+	}
+	closed, err := h.proInvoicesClosed(ctx, client, team, customer, subscription, nil)
+	if err != nil || !closed {
+		t.Fatal("verified intermediate invoice pages were forgotten", closed, err)
+	}
+	if err = h.Pool.QueryRow(ctx, `SELECT to_jsonb(a) FROM billing_sponsored_annual_authority a WHERE team_id=$1 AND state='ended'`, team).Scan(&oldAfter); err != nil || !bytes.Equal(oldBefore, oldAfter) {
+		t.Fatal("renewal touched ended authority history", err)
 	}
 	refunded.Store(true)
 	if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err == nil {
