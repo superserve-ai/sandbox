@@ -109,7 +109,7 @@ jobs:
             kernel=$(fetch /var/lib/sandbox/kernel/vmlinux-4.14-fuse vmlinux-4.14-fuse)
             rootfs=$(fetch /var/lib/sandbox/rootfs/base.ext4 base.ext4)
           fi
-          [ "$kernel" = "$KERNEL_SHA256" ] || { echo "::error::vmlinux-4.14-fuse does not match its pinned digest"; exit 1; }
+          [ "$kernel" = "$KERNEL_SHA256" ] || { echo "::error::vmlinux-4.14-fuse from $origin has sha256 $kernel, not the pinned $KERNEL_SHA256"; exit 1; }
           gcloud storage cp "$work/vmlinux-4.14-fuse" "$work/base.ext4" "$BUCKET/"
           {
             echo "## Devbox hostprep seeded from $origin"
