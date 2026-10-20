@@ -90,14 +90,15 @@ storage rights, only the staging Terraform identity can write it, through the
 Devbox Hostprep Seed workflow.
 
 Dispatch Devbox Hostprep Seed (`.github/workflows/devbox-hostprep.yml`) from
-`main` once. It copies the guest kernel and the pristine base rootfs from
-staging's non-secret host artifacts in
-`gs://superserve-artifact-backup-staging-usc1/hostprep/`, using the staging
-Terraform identity; the kernel must match the SHA-256 recorded in the
+`main` once. It copies the guest kernel and base rootfs from staging's
+non-secret host artifacts in
+`gs://superserve-artifact-backup-staging-usc1/hostprep/`, which hosts are
+prepared from before CD injects boxd, using the staging Terraform identity; the kernel must match the SHA-256 recorded in the
 [Host 2 identity runbook](../host2-identity-runbook.md), or the job stops.
 The rootfs on a running staging host is not pristine: every VMD deploy that
-changes boxd rewrites it with the new boxd. Only if the staging objects are
-unavailable does the job fall back to reading staging Host 1 over IAP SSH.
+changes boxd rewrites it with the new boxd. Only if the staging objects do
+not exist does the job fall back to reading staging Host 1 over IAP SSH; any
+other error listing them, such as missing read access, stops the job.
 That copy then includes the host's injected boxd, which a box's own VMD
 install replaces anyway. The fallback reads each file once on the host,
 hashing exactly the bytes it sends, and accepts the copy only if the open file

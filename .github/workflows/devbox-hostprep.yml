@@ -1,14 +1,15 @@
 name: Devbox Hostprep Seed
 
-# Copies the guest kernel and pristine base rootfs from staging's hostprep
-# artifacts into the devbox hostprep bucket. Only if those objects are
-# unavailable does it read them from a staging host, whose rootfs carries the
-# boxd injected by its last deploy. The kernel must match its pinned digest.
+# Copies the guest kernel and base rootfs from staging's hostprep artifacts,
+# which hosts are prepared from before CD injects boxd, into the devbox
+# hostprep bucket. Only if those objects do not exist does it read them from a
+# staging host, whose rootfs carries the boxd injected by its last deploy. The
+# kernel must match its pinned digest.
 on:
   workflow_dispatch:
     inputs:
       host:
-        description: 'Staging host to read from if the staging hostprep objects are unavailable'
+        description: 'Staging host to read from if the staging hostprep objects do not exist'
         required: true
         default: superserve-vmd-staging
         type: string
@@ -89,14 +90,21 @@ jobs:
             echo "::error::Could not copy a consistent $2 after 3 attempts" >&2
             return 1
           }
-          if gcloud storage ls "$SOURCE/vmlinux-4.14-fuse" "$SOURCE/base.ext4" > /dev/null 2> "$work/ls.log"; then
+          listed=0
+          gcloud storage ls "$SOURCE/vmlinux-4.14-fuse" "$SOURCE/base.ext4" > /dev/null 2> "$work/ls.log" || listed=$?
+          if [ "$listed" -ne 0 ] && ! grep -q 'matched no objects' "$work/ls.log"; then
+            cat "$work/ls.log" >&2
+            echo "::error::Could not list $SOURCE; the staging identity needs read access to it" >&2
+            exit 1
+          fi
+          if [ "$listed" -eq 0 ]; then
             origin="$SOURCE"
             gcloud storage cp "$SOURCE/vmlinux-4.14-fuse" "$SOURCE/base.ext4" "$work/"
             kernel=$(sha256sum "$work/vmlinux-4.14-fuse" | cut -d' ' -f1)
             rootfs=$(sha256sum "$work/base.ext4" | cut -d' ' -f1)
           else
             cat "$work/ls.log" >&2
-            echo "::warning::Staging hostprep objects unavailable; reading from $HOST, whose rootfs includes its injected boxd" >&2
+            echo "::warning::$SOURCE lacks the hostprep objects; reading from $HOST, whose rootfs includes its injected boxd" >&2
             origin="$HOST (rootfs includes the boxd injected by its last deploy)"
             kernel=$(fetch /var/lib/sandbox/kernel/vmlinux-4.14-fuse vmlinux-4.14-fuse)
             rootfs=$(fetch /var/lib/sandbox/rootfs/base.ext4 base.ext4)
