@@ -61,6 +61,38 @@ timing override alone need not undo the provider’s previously billed-through
 state. Verify the full original-boundary renewal amount and service period in
 staging before approving a provider normalization procedure.
 
+## Activation-promotion coordination
+
+The activation reservation boundary suppresses the generic $95 grant when a
+current sponsorship owns the account. An exact historical customer/subscription
+association keeps that suppression after expiry or revocation. Ordinary Free/PAYG
+reservations retain their identity, device, replay-window and ownership checks.
+A reservation that has not reached Stripe is released with a durable sponsored
+denial; attempted reservations remain fenced for reconciliation. Annual preflight
+is observational and blocks unresolved reservations and incomplete recovery.
+
+For an existing conflict, an operator may POST to
+`/internal/teams/:team_id/billing/sponsored-entitlements/:operation_id/recover-promotion`
+using operator authentication and `X-Actor-User-Id`. Supply `idempotency_key`,
+`merchant_account`, `live_mode`, `customer_id`, `subscription_id`, the original
+`activation_user_id` and `reservation_event_id`, plus `reason` and `reference`.
+Include `grant_id` when known. A missing durable grant ID requires unique provider
+identity discovery tied to an attempted reservation; absence is not proof that
+an ambiguous request failed.
+
+The recovery records immutable approval and before/after evidence in
+`billing_sponsored_promotion_recovery`. Both available and ledger balances must
+be exactly 9,500 cents before voiding; invoice-applied, unknown, mismatched,
+reserved or consumed credits remain blocked. Recovery never expires credits or
+clears redemption history. Retry the identical request to reconcile a lost void
+response. `completed_at` confirms local completion; a pending row requires the
+same recovery request before annual adoption can proceed. Re-run annual preflight
+after completion and retain its strict inventory checks.
+
+Deploy the migration before the compatible API writers. Existing conflicts are
+recovered only through an explicit operator request; rollout does not backfill
+or mutate provider grants automatically.
+
 ## Verification and recovery
 
 Verify the operation is active, the billing summary identifies Pro Annual with

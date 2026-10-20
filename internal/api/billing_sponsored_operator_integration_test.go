@@ -23,7 +23,7 @@ import (
 )
 
 func TestSponsoredOperatorOnboardingAndRetry(t *testing.T) {
-	for _, scenario := range []string{"new", "existing_anniversary", "revoke_creation", "catalog_rotation", "checkout_race", "revoke_canceled", "historical_terms", "capacity_existing", "capacity_new", "capacity_race", "annual_adoption"} {
+	for _, scenario := range []string{"new", "existing_anniversary", "revoke_creation", "catalog_rotation", "checkout_race", "revoke_canceled", "historical_terms", "capacity_existing", "capacity_new", "capacity_race", "annual_adoption", "annual_recovery"} {
 		t.Run(scenario, func(t *testing.T) { sponsoredOperatorScenario(t, scenario) })
 	}
 }
@@ -352,6 +352,20 @@ func sponsoredOperatorScenario(t *testing.T, scenario string) {
 		}
 		return
 	}
+	if scenario == "annual_recovery" {
+		activationActor := uuid.New()
+		event := "evt_" + team.String()
+		exec(`INSERT INTO profile(id,email) VALUES($1,$2)`, activationActor, activationActor.String()+"@example.com")
+		exec(`INSERT INTO team_billing_account(team_id) VALUES($1) ON CONFLICT DO NOTHING`, team)
+		exec(`INSERT INTO stripe_webhook_event(event_id,event_type,payload) VALUES($1,'customer.subscription.created','{}')`, event)
+		var reservation string
+		if e := h.Pool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, team, activationActor, event).Scan(&reservation); e != nil || reservation != "acquired" {
+			t.Fatal("historical activation", reservation, e)
+		}
+		if e := h.DB.FinalizeStripePromotion(ctx, db.FinalizeStripePromotionParams{TeamID: team, UserID: activationActor, StripeGrantID: "cred_" + team.String()}); e != nil {
+			t.Fatal(e)
+		}
+	}
 	if w := call(false, request); w.Code != 200 {
 		t.Fatal("preflight", w.Code, w.Body.String())
 	}
@@ -464,8 +478,8 @@ func sponsoredOperatorScenario(t *testing.T, scenario string) {
 	if customerWrites != expectedCustomers || subWrites != 1 || grantWrites != 1 {
 		t.Fatal("duplicate/missing external writes", customerWrites, subWrites, grantWrites)
 	}
-	if scenario == "annual_adoption" {
-		testSponsoredAnnualAdoption(t, h, team, o, sub, *grant)
+	if scenario == "annual_adoption" || scenario == "annual_recovery" {
+		testSponsoredAnnualAdoption(t, h, team, o, sub, *grant, scenario == "annual_recovery")
 		return
 	}
 	var choice string

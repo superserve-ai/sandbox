@@ -181,13 +181,13 @@ func (h *Handlers) annualPreflight(ctx context.Context, team uuid.UUID, r sponso
 		return o, nil, "", errors.New("annual adoption requires the original three large and nine standard allowances")
 	}
 	var pending bool
-	if err = reader.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_usage_entitlement WHERE contract_id=$1 AND state<>'issued') OR EXISTS(SELECT 1 FROM billing_invoice_close WHERE team_id=$2 AND state NOT IN ('verified','released'))`, o.Contract, team).Scan(&pending); err != nil {
+	if err = reader.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_usage_entitlement WHERE contract_id=$1 AND state<>'issued') OR EXISTS(SELECT 1 FROM billing_invoice_close WHERE team_id=$2 AND state NOT IN ('verified','released')) OR EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$2 AND stripe_activation_credit_reserved_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_sponsored_promotion_recovery WHERE team_id=$2 AND completed_at IS NULL)`, o.Contract, team).Scan(&pending); err != nil {
 		return o, nil, "", err
 	}
 	// Existing close plans freeze the fee authority. Supporting their adoption needs
 	// a separate historical-plan reconciliation rather than silently changing it.
 	if pending {
-		return o, nil, "", errors.New("in-flight entitlements or unfinished invoice close plans require explicit reconciliation before adoption")
+		return o, nil, "", errors.New("in-flight entitlements, activation promotions, or unfinished invoice close plans require explicit reconciliation before adoption")
 	}
 	if err = client.ycMerchant(ctx, ycApproval{Merchant: r.Merchant}); err != nil {
 		return o, nil, "", err

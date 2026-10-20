@@ -20,7 +20,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, sponsor sponsoredOperation, sub invoiceSubscription, grant entitlementGrant) {
+func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, sponsor sponsoredOperation, sub invoiceSubscription, grant entitlementGrant, recoverActivation bool) {
 	t.Helper()
 	ctx := t.Context()
 	var mu sync.Mutex
@@ -32,6 +32,9 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	sub.Items.Data = append(sub.Items.Data, item)
 	// This is an observed remaining balance, not a fresh grant or reset balance.
 	remaining := int64(2876543)
+	var activationGrant = activationRevocationGrant(team)
+	activationGrant.ID, activationGrant.Customer = "cred_"+team.String(), sub.Customer
+	recoveryVoids := 0
 	writes := 0
 	debt := false
 	var history []StripeInvoiceAmounts
@@ -41,7 +44,7 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 		defer mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		out := func(v any) { _ = json.NewEncoder(w).Encode(v) }
-		if r.Method != http.MethodGet && r.URL.Path != "/v1/invoices/create_preview" {
+		if r.Method != http.MethodGet && r.URL.Path != "/v1/invoices/create_preview" && r.URL.Path != "/v1/billing/credit_grants/"+activationGrant.ID+"/void" {
 			writes++
 			t.Errorf("adoption wrote provider %s", r.URL.Path)
 		}
@@ -63,8 +66,23 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 		case "/v1/invoiceitems":
 			out(map[string]any{"data": []any{}})
 		case "/v1/billing/credit_grants":
-			out(map[string]any{"data": []entitlementGrant{grant}})
+			grants := []any{grant}
+			if recoverActivation {
+				grants = append(grants, activationGrant)
+			}
+			out(map[string]any{"data": grants})
+		case "/v1/billing/credit_grants/" + activationGrant.ID:
+			out(activationGrant)
+		case "/v1/billing/credit_grants/" + activationGrant.ID + "/void":
+			recoveryVoids++
+			stamp := time.Now().Unix()
+			activationGrant.VoidedAt = &stamp
+			out(activationGrant)
 		case "/v1/billing/credit_balance_summary":
+			if r.URL.Query().Get("filter[credit_grant]") == activationGrant.ID {
+				out(map[string]any{"customer": sub.Customer, "balances": []any{map[string]any{"available_balance": map[string]any{"monetary": map[string]any{"currency": "usd", "value": 9500}}, "ledger_balance": map[string]any{"monetary": map[string]any{"currency": "usd", "value": 9500}}}}})
+				return
+			}
 			out(map[string]any{"balances": []any{map[string]any{"ledger_balance": map[string]any{"monetary": map[string]any{"currency": "usd", "value": remaining}}}}})
 		case "/v1/invoices/create_preview":
 			out(providerPreview)
@@ -103,6 +121,34 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	before, err := h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: "metered_usage"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if recoverActivation {
+		if w := call(false, r); w.Code != 409 || !strings.Contains(w.Body.String(), "unrecognized unexpired credit") {
+			t.Fatal("existing activation conflict not observed", w.Code, w.Body.String())
+		}
+		if recoveryVoids != 0 {
+			t.Fatal("preflight mutated activation grant")
+		}
+		a, e := h.DB.GetTeamBillingAccount(ctx, team)
+		if e != nil {
+			t.Fatal(e)
+		}
+		recovery := sponsoredPromotionRequest{Key: "recover", Merchant: r.Merchant, Live: r.Live, Customer: r.Customer, Subscription: r.Subscription, User: uuid.UUID(a.StripeActivationUserID.Bytes), Event: *a.StripeActivationCreditReservationEventID, Grant: activationGrant.ID, Reason: "unused activation correction", Reference: "fixture"}
+		if e = h.recoverSponsoredPromotion(ctx, team, sponsor.ID, uuid.New(), recovery); e != nil {
+			t.Fatal(e)
+		}
+		if e = h.recoverSponsoredPromotion(ctx, team, sponsor.ID, uuid.New(), recovery); e != nil || recoveryVoids != 1 {
+			t.Fatal("recovery replay", recoveryVoids, e)
+		}
+	} else {
+		actor := uuid.New()
+		if _, e := h.Pool.Exec(ctx, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com"); e != nil {
+			t.Fatal(e)
+		}
+		var decision string
+		if e := h.Pool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,'evt_fresh',$3,NULL,false)`, team, actor, sub.ID).Scan(&decision); e != nil || decision != "sponsored" {
+			t.Fatal("fresh signup promotion not suppressed", decision, e)
+		}
 	}
 	mu.Lock()
 	sub.BillingSchedules = json.RawMessage(`[{"bill_until":{"timestamp":123}}]`)

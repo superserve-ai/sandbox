@@ -17,6 +17,7 @@ type StripeCreditRequest func(context.Context, string, string, url.Values, any, 
 
 type StripeActivationGrant struct {
 	ID       string `json:"id"`
+	LiveMode bool   `json:"livemode"`
 	Customer string `json:"customer"`
 	Category string `json:"category"`
 	Amount   struct {

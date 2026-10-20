@@ -182,6 +182,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.POST("/teams/:team_id/billing/sponsored-entitlements", h.SponsoredApply)
 		operator.GET("/teams/:team_id/billing/sponsored-entitlements/:operation_id", h.SponsoredStatus)
 		operator.POST("/teams/:team_id/billing/sponsored-entitlements/:operation_id/revoke", h.SponsoredRevoke)
+		operator.POST("/teams/:team_id/billing/sponsored-entitlements/:operation_id/recover-promotion", h.SponsoredPromotionRecovery)
 		operator.POST("/teams/:team_id/billing/yc/preflight", h.YCPreflight)
 		operator.POST("/teams/:team_id/billing/yc/approve", h.YCApprove)
 		operator.POST("/teams/:team_id/billing/yc/activate", h.YCActivate)
