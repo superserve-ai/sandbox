@@ -333,6 +333,39 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	if err = h.validateInvoiceEnrollmentSubscription(ctx, team, account, h.Stripe.(*stripeHTTPClient), sub, h.Pool); err != nil {
 		t.Fatal("mixed calendar rejected", err)
 	}
+	invoiceID := "in_history_" + team.String()
+	if _, err = h.Pool.Exec(ctx, `INSERT INTO billing_invoice_collection(invoice_id,customer_id,subscription_id,livemode,settlement_hash,idempotency_key,payment_authorized) VALUES($1,$2,$3,false,'fixture',$1,false)`, invoiceID, sub.Customer, sub.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{"open", "paid"} {
+		eventType := "invoice.payment_failed"
+		if status == "paid" {
+			eventType = "invoice.paid"
+		}
+		object, _ := json.Marshal(map[string]any{"id": invoiceID, "customer": sub.Customer, "status": status, "parent": map[string]any{"subscription_details": map[string]any{"subscription": sub.ID}}})
+		event := stripeEventEnvelope{ID: "evt_" + uuid.NewString(), Type: eventType, Data: stripeEventEnvelopeData{Object: object}}
+		payload, _ := json.Marshal(event)
+		if _, err = h.Pool.Exec(ctx, `INSERT INTO stripe_webhook_event(event_id,event_type,payload) VALUES($1,$2,$3)`, event.ID, event.Type, payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = h.Pool.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET next_check_at=clock_timestamp()+interval '1 hour' WHERE team_id=$1`, team); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = h.Pool.Exec(ctx, `UPDATE billing_invoice_collection SET next_attempt_at=clock_timestamp()+interval '1 hour' WHERE invoice_id=$1`, invoiceID); err != nil {
+			t.Fatal(err)
+		}
+		if err = h.processRecordedStripeWebhook(ctx, event); err != nil {
+			t.Fatal("annual invoice webhook", err)
+		}
+		var projected string
+		var annualDue, collectionDue, processed, pending bool
+		if err = h.Pool.QueryRow(ctx, `SELECT b.stripe_invoice_status,a.next_check_at<=clock_timestamp(),c.next_attempt_at<=clock_timestamp(),e.processed_at IS NOT NULL,c.state='pending' AND a.state='active' FROM team_billing_account b JOIN billing_sponsored_annual_authority a USING(team_id) JOIN billing_invoice_collection c ON c.invoice_id=$2 JOIN stripe_webhook_event e ON e.event_id=$3 WHERE b.team_id=$1`, team, invoiceID, event.ID).Scan(&projected, &annualDue, &collectionDue, &processed, &pending); err != nil {
+			t.Fatal(err)
+		}
+		if projected != status || !annualDue || !collectionDue || !processed || !pending {
+			t.Fatalf("annual invoice event lost generic handling or supplied payment authority: %s %v %v %v %v", projected, annualDue, collectionDue, processed, pending)
+		}
+	}
 	if _, err = h.Pool.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET item_id='si_replacement' WHERE team_id=$1`, team); err == nil {
 		t.Fatal("immutable binding rewritten")
 	}

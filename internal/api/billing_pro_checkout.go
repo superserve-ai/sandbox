@@ -340,6 +340,11 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 		if _, err := h.Pool.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET next_check_at=clock_timestamp() WHERE customer_id=$1 AND subscription_id=$2 AND state<>'ended'`, obj.Customer, subscription); err != nil {
 			return true, err
 		}
+		if strings.HasPrefix(event.Type, "invoice.") {
+			// Invoice projection and collection wakeups still belong to the
+			// generic handler; only verified reconciliation can activate renewal.
+			return false, nil
+		}
 		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
 		return true, err
 	}
