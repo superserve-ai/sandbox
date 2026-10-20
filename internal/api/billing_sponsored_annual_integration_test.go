@@ -247,6 +247,7 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 	sub := invoiceSubscription{ID: subscription, Customer: customer, Status: "active"}
 	sub.BillingMode.Type = "flexible"
 	sub.Items.Data = append(sub.Items.Data, invoiceSubscriptionItem{ID: o.Item, Quantity: 1, Price: p, Start: end.Unix(), End: annualBoundary(start, 24).Unix()})
+	invoiceID := "in_renewal_" + team.String()
 	var paid atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -256,16 +257,16 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/invoices":
 			if paid.Load() {
-				fmt.Fprint(w, `{"data":[{"id":"in_renewal"}]}`)
+				fmt.Fprintf(w, `{"data":[{"id":%q}]}`, invoiceID)
 			} else {
 				fmt.Fprint(w, `{"data":[]}`)
 			}
-		case "/v1/invoices/in_renewal":
-			fmt.Fprintf(w, `{"id":"in_renewal","customer":%q,"status":"paid","currency":"usd","total":1200000,"amount_due":1200000,"starting_balance":0,"ending_balance":0,"amount_paid":1200000,"amount_remaining":0,"status_transitions":{"paid_at":%d},"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"quantity":1,"amount":1200000,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"unit_amount_decimal":"1200000","price_details":{"price":"price_annual","product":"prod_annual"}},"parent":{"subscription_item_details":{"subscription":%q,"subscription_item":%q}}}]}}`, customer, end.Unix(), subscription, end.Unix(), annualBoundary(start, 24).Unix(), subscription, o.Item)
+		case "/v1/invoices/" + invoiceID:
+			fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","currency":"usd","total":1200000,"amount_due":1200000,"starting_balance":0,"ending_balance":0,"amount_paid":1200000,"amount_remaining":0,"status_transitions":{"paid_at":%d},"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"quantity":1,"amount":1200000,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"unit_amount_decimal":"1200000","price_details":{"price":"price_annual","product":"prod_annual"}},"parent":{"subscription_item_details":{"subscription":%q,"subscription_item":%q}}}]}}`, invoiceID, customer, end.Unix(), subscription, end.Unix(), annualBoundary(start, 24).Unix(), subscription, o.Item)
 		case "/v1/credit_notes":
 			fmt.Fprint(w, `{"data":[]}`)
 		case "/v1/invoice_payments":
-			fmt.Fprint(w, `{"data":[{"id":"inpay_fixture","invoice":"in_renewal","status":"paid","currency":"usd","amount_paid":1200000,"payment":{"type":"payment_intent","payment_intent":"pi_fixture"}}]}`)
+			fmt.Fprintf(w, `{"data":[{"id":"inpay_fixture","invoice":%q,"status":"paid","currency":"usd","amount_paid":1200000,"payment":{"type":"payment_intent","payment_intent":"pi_fixture"}}]}`, invoiceID)
 		case "/v1/payment_intents/pi_fixture":
 			fmt.Fprintf(w, `{"id":"pi_fixture","status":"succeeded","customer":%q,"currency":"usd","amount_received":1200000,"latest_charge":"ch_fixture"}`, customer)
 		case "/v1/charges/ch_fixture":
@@ -301,7 +302,7 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 		t.Fatal("successor terms differ", c, err)
 	}
 	paid.Store(true)
-	sub.LatestInvoice = "in_renewal"
+	sub.LatestInvoice = invoiceID
 	for range 2 {
 		if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err != nil {
 			t.Fatal("paid renewal/replay", err)
