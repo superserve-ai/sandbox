@@ -934,6 +934,26 @@ type BillingSponsoredOperation struct {
 	LastError         *string            `json:"last_error"`
 }
 
+type BillingSponsoredPromotionRecovery struct {
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	SponsorshipID  uuid.UUID          `json:"sponsorship_id"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	Request        []byte             `json:"request"`
+	ApprovedBy     uuid.UUID          `json:"approved_by"`
+	ApprovedAt     time.Time          `json:"approved_at"`
+	Reason         string             `json:"reason"`
+	Reference      string             `json:"reference"`
+	CustomerID     string             `json:"customer_id"`
+	SubscriptionID string             `json:"subscription_id"`
+	UserID         uuid.UUID          `json:"user_id"`
+	EventID        string             `json:"event_id"`
+	GrantID        *string            `json:"grant_id"`
+	BeforeEvidence []byte             `json:"before_evidence"`
+	AfterEvidence  []byte             `json:"after_evidence"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
 type BillingUsageEntitlement struct {
 	ID                           uuid.UUID          `json:"id"`
 	TeamID                       uuid.UUID          `json:"team_id"`
