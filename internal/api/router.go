@@ -171,6 +171,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.GET("/yc/claims", TeamCreationPrivacy(), h.PendingYCClaims)
 		operator.POST("/yc/claims/decision", TeamCreationPrivacy(), h.DecideYCClaim)
 		// Billing recovery requires a credential unavailable to VMD hosts.
+		operator.POST("/teams/:team_id/billing/sponsored-annual/preflight", h.SponsoredAnnualPreflight)
+		operator.POST("/teams/:team_id/billing/sponsored-annual", h.SponsoredAnnualApply)
+		operator.GET("/teams/:team_id/billing/sponsored-annual/:operation_id", h.SponsoredAnnualStatus)
 		operator.POST("/teams/:team_id/billing/sponsored-entitlements/preflight", h.SponsoredPreflight)
 		operator.POST("/teams/:team_id/billing/sponsored-entitlements", h.SponsoredApply)
 		operator.GET("/teams/:team_id/billing/sponsored-entitlements/:operation_id", h.SponsoredStatus)

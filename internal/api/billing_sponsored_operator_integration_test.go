@@ -23,7 +23,7 @@ import (
 )
 
 func TestSponsoredOperatorOnboardingAndRetry(t *testing.T) {
-	for _, scenario := range []string{"new", "existing_anniversary", "revoke_creation", "catalog_rotation", "checkout_race", "revoke_canceled", "historical_terms", "capacity_existing", "capacity_new", "capacity_race"} {
+	for _, scenario := range []string{"new", "existing_anniversary", "revoke_creation", "catalog_rotation", "checkout_race", "revoke_canceled", "historical_terms", "capacity_existing", "capacity_new", "capacity_race", "annual_adoption"} {
 		t.Run(scenario, func(t *testing.T) { sponsoredOperatorScenario(t, scenario) })
 	}
 }
@@ -463,6 +463,10 @@ func sponsoredOperatorScenario(t *testing.T, scenario string) {
 	}
 	if customerWrites != expectedCustomers || subWrites != 1 || grantWrites != 1 {
 		t.Fatal("duplicate/missing external writes", customerWrites, subWrites, grantWrites)
+	}
+	if scenario == "annual_adoption" {
+		testSponsoredAnnualAdoption(t, h, team, o, sub, *grant)
+		return
 	}
 	var choice string
 	if err = h.Pool.QueryRow(ctx, `SELECT state FROM billing_signup_choice WHERE team_id=$1`, team).Scan(&choice); err != nil || choice != "selecting" {

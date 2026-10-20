@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
@@ -13,11 +14,14 @@ import (
 )
 
 type invoiceSubscription struct {
-	LiveMode             bool   `json:"livemode"`
-	CollectionMethod     string `json:"collection_method"`
-	Schedule             string `json:"schedule"`
-	PendingUpdate        any    `json:"pending_update"`
-	DefaultPaymentMethod string `json:"default_payment_method"`
+	LiveMode             bool            `json:"livemode"`
+	CollectionMethod     string          `json:"collection_method"`
+	Schedule             string          `json:"schedule"`
+	BillingSchedules     json.RawMessage `json:"billing_schedules"`
+	TrialStart           int64           `json:"trial_start"`
+	TrialEnd             int64           `json:"trial_end"`
+	PendingUpdate        any             `json:"pending_update"`
+	DefaultPaymentMethod string          `json:"default_payment_method"`
 	PaymentSettings      struct {
 		PaymentMethodTypes []string `json:"payment_method_types"`
 	} `json:"payment_settings"`

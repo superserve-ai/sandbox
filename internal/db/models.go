@@ -877,6 +877,34 @@ type BillingSignupChoice struct {
 	Revision          int64              `json:"revision"`
 }
 
+type BillingSponsoredAnnualAuthority struct {
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	SponsorshipID     uuid.UUID          `json:"sponsorship_id"`
+	ContractID        uuid.UUID          `json:"contract_id"`
+	RenewalContractID uuid.UUID          `json:"renewal_contract_id"`
+	IdempotencyKey    string             `json:"idempotency_key"`
+	Request           []byte             `json:"request"`
+	ApprovedBy        uuid.UUID          `json:"approved_by"`
+	ApprovedAt        time.Time          `json:"approved_at"`
+	CustomerID        string             `json:"customer_id"`
+	SubscriptionID    string             `json:"subscription_id"`
+	ItemID            string             `json:"item_id"`
+	BasePriceID       string             `json:"base_price_id"`
+	BaseProductID     string             `json:"base_product_id"`
+	LiveMode          bool               `json:"live_mode"`
+	HomeRegion        string             `json:"home_region"`
+	StartsAt          time.Time          `json:"starts_at"`
+	WaiverEndsAt      time.Time          `json:"waiver_ends_at"`
+	ProviderEvidence  []byte             `json:"provider_evidence"`
+	State             string             `json:"state"`
+	InvoiceCursor     *string            `json:"invoice_cursor"`
+	NextCheckAt       time.Time          `json:"next_check_at"`
+	LastError         *string            `json:"last_error"`
+	LeaseToken        pgtype.UUID        `json:"lease_token"`
+	LeaseUntil        pgtype.Timestamptz `json:"lease_until"`
+}
+
 type BillingSponsoredOperation struct {
 	ID                uuid.UUID          `json:"id"`
 	TeamID            uuid.UUID          `json:"team_id"`

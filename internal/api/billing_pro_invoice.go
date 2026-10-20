@@ -15,6 +15,10 @@ import (
 )
 
 type invoiceBase struct {
+	Product      string
+	Live         bool
+	Item         string
+	WaiverEnd    int64
 	Price        string
 	Amount       int64
 	Months       int32
@@ -29,13 +33,21 @@ func (h *Handlers) loadInvoiceBase(ctx context.Context, team uuid.UUID, a *invoi
 	}
 	err := reader.QueryRow(ctx, `SELECT base_price_id,charge_amount_cents,charge_interval_months,entitlement_anchor FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND offer_key IN ('pro_monthly','pro_annual','yc_2026') ORDER BY created_at DESC LIMIT 1`, team, a.Customer, a.Subscription).Scan(&a.Base.Price, &a.Base.Amount, &a.Base.Months, &a.Base.Anchor)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
+		err = nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return h.loadSponsoredAnnualBase(ctx, team, a, reader)
 }
 func (b invoiceBase) stripSubscription(sub invoiceSubscription) (invoiceSubscription, error) {
 	if b.Price == "" {
 		return sub, nil
+	}
+	if b.Item != "" {
+		if err := validateSponsoredAnnualTiming(sub); err != nil {
+			return sub, err
+		}
 	}
 	// Copy before filtering; callers may retain the original provider evidence.
 	items := sub.Items.Data[:0:0]
@@ -49,8 +61,15 @@ func (b invoiceBase) stripSubscription(sub invoiceSubscription) (invoiceSubscrip
 		if b.Months == 12 {
 			interval = "year"
 		}
-		if found || sub.BillingMode.Type != "flexible" || item.Quantity != 1 || item.Price.Currency != "usd" || item.Price.UnitAmountDecimal != fmt.Sprint(b.Amount) || item.Price.Recurring.UsageType != "licensed" || item.Price.Recurring.Interval != interval || item.Price.Recurring.IntervalCount != 1 || item.Price.TransformQuantity != nil || item.Price.BillingScheme != "per_unit" {
+		if (b.Item != "" && item.ID != b.Item) || found || sub.BillingMode.Type != "flexible" || item.Quantity != 1 || item.Price.Currency != "usd" || item.Price.UnitAmountDecimal != fmt.Sprint(b.Amount) || item.Price.Recurring.UsageType != "licensed" || item.Price.Recurring.Interval != interval || item.Price.Recurring.IntervalCount != 1 || item.Price.TransformQuantity != nil || item.Price.BillingScheme != "per_unit" {
 			return sub, errors.New("licensed subscription terms changed")
+		}
+		if b.Item != "" {
+			start := time.Unix(item.Start, 0).UTC()
+			months := (start.Year()-b.Anchor.UTC().Year())*12 + int(start.Month()-b.Anchor.UTC().Month())
+			if item.Price.Product != b.Product || item.Price.LiveMode != b.Live || sub.LiveMode != b.Live || months < 0 || months%12 != 0 || item.Start != annualBoundary(b.Anchor, months).Unix() || item.End != annualBoundary(b.Anchor, months+12).Unix() {
+				return sub, errors.New("adopted annual item period or product changed")
+			}
 		}
 		found = true
 	}
@@ -70,6 +89,9 @@ func (b invoiceBase) expectedFee(boundary time.Time) (int64, int64, int64, error
 	if !ok || !start.Equal(boundary) || b.Months <= 0 {
 		return 0, 0, 0, errors.New("base invoice boundary is not a contract anniversary")
 	}
+	if b.WaiverEnd > 0 && boundary.Unix() < b.WaiverEnd {
+		return 0, 0, 0, nil
+	}
 	months := (boundary.UTC().Year()-b.Anchor.UTC().Year())*12 + int(boundary.UTC().Month()-b.Anchor.UTC().Month())
 	if months%int(b.Months) != 0 {
 		return 0, 0, 0, nil
@@ -86,7 +108,7 @@ func (b invoiceBase) expectedFee(boundary time.Time) (int64, int64, int64, error
 }
 func (b invoiceBase) validateLine(line StripeInvoiceAmountLine, subscription string, start, end int64) error {
 	parent := line.Parent.SubscriptionItemDetails
-	if parent == nil || parent.Subscription != subscription || parent.Proration || line.Currency != "usd" || line.Amount != b.Amount || line.Quantity != 1 || line.Pricing.UnitAmountDecimal != fmt.Sprint(b.Amount) || baseLineHasCredits(line) || line.Period.Start != start || line.Period.End != end {
+	if parent == nil || (b.Item != "" && parent.SubscriptionItem != b.Item) || parent.Subscription != subscription || parent.Proration || line.Currency != "usd" || line.Amount != b.Amount || line.Quantity != 1 || line.Pricing.UnitAmountDecimal != fmt.Sprint(b.Amount) || baseLineHasCredits(line) || line.Period.Start != start || line.Period.End != end {
 		return errors.New("licensed invoice line differs from contract")
 	}
 	return nil

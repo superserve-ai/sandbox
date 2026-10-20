@@ -60,6 +60,13 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 	if derefString(locked.StripeCustomerID) != derefString(account.StripeCustomerID) {
 		return errFundingPlanTransition
 	}
+	var annual bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE team_id=$1 AND state<>'ended')`, team).Scan(&annual); err != nil {
+		return err
+	}
+	if annual {
+		return errFundingPlanTransition
+	}
 	var choiceJSON, accountJSON, ycJSON []byte
 	var offer, choiceSubscription *string
 	var choiceState string

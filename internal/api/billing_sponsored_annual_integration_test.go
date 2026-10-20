@@ -1,0 +1,318 @@
+//go:build integration
+
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/superserve-ai/sandbox/internal/db"
+)
+
+func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, sponsor sponsoredOperation, sub invoiceSubscription, grant entitlementGrant) {
+	t.Helper()
+	ctx := t.Context()
+	var mu sync.Mutex
+	p := storagePrice{ID: "price_annual", Product: "prod_annual", Active: true, Currency: "usd", BillingScheme: "per_unit", UnitAmountDecimal: "1200000"}
+	p.Recurring.UsageType = "licensed"
+	p.Recurring.Interval = "year"
+	p.Recurring.IntervalCount = 1
+	item := invoiceSubscriptionItem{ID: "si_annual_" + team.String(), Quantity: 1, Price: p, Start: sponsor.Anchor.Time.Unix(), End: sponsor.End.Time.Unix()}
+	sub.Items.Data = append(sub.Items.Data, item)
+	// This is an observed remaining balance, not a fresh grant or reset balance.
+	remaining := int64(2876543)
+	writes := 0
+	debt := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		out := func(v any) { _ = json.NewEncoder(w).Encode(v) }
+		if r.Method != http.MethodGet && r.URL.Path != "/v1/invoices/create_preview" {
+			writes++
+			t.Errorf("adoption wrote provider %s", r.URL.Path)
+		}
+		switch r.URL.Path {
+		case "/v1/account":
+			out(map[string]any{"id": "acct_fixture"})
+		case "/v1/subscriptions/" + sub.ID:
+			out(sub)
+		case "/v1/invoices":
+			if debt && r.URL.Query().Get("status") == "open" {
+				out(map[string]any{"data": []any{map[string]any{"id": "in_debt", "customer": sub.Customer, "status": "open"}}})
+				return
+			}
+			out(map[string]any{"data": []any{}})
+		case "/v1/invoiceitems":
+			out(map[string]any{"data": []any{}})
+		case "/v1/billing/credit_grants":
+			out(map[string]any{"data": []entitlementGrant{grant}})
+		case "/v1/billing/credit_balance_summary":
+			out(map[string]any{"balances": []any{map[string]any{"ledger_balance": map[string]any{"monetary": map[string]any{"currency": "usd", "value": remaining}}}}})
+		case "/v1/invoices/create_preview":
+			out(StripeInvoiceAmounts{ID: "upcoming_in_fixture", Customer: sub.Customer})
+		default:
+			t.Errorf("unexpected annual provider request %s", r.URL.String())
+			http.Error(w, "unexpected", 500)
+		}
+	}))
+	defer server.Close()
+	h.Stripe = &stripeHTTPClient{baseURL: server.URL, httpClient: server.Client(), apiVersion: "2026-07-29.dahlia"}
+	live := false
+	r := sponsoredAnnualRequest{Merchant: "acct_fixture", Key: "annual", Sponsorship: sponsor.ID, Customer: sub.Customer, Subscription: sub.ID, Item: item.ID, Price: p.ID, Live: &live, Reason: "approved annual waiver", Reference: "fixture"}
+	call := func(apply bool, r sponsoredAnnualRequest) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(r)
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(raw))
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Params = gin.Params{{Key: "team_id", Value: team.String()}}
+		c.Set("actor_id", uuid.New())
+		h.sponsoredAnnualApply(c, apply)
+		return w
+	}
+	historyStart := sponsor.Anchor.Time.AddDate(0, -2, 0)
+	historyEnd := sponsor.Anchor.Time.AddDate(0, -1, 0)
+	if _, err := h.DB.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{TeamID: team, PeriodStart: historyStart, PeriodEnd: historyEnd, Status: "open"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state,verified_at,finalized_evidence) VALUES($1,$2,$3,$4,'{"expected_cents":12345,"credit_before_cents":3000000}','verified',clock_timestamp(),'{"credit_applied_cents":12345,"credit_remaining_cents":2987655}')`, team, historyStart, historyEnd, "in_history_"+team.String()); err != nil {
+		t.Fatal(err)
+	}
+	var historyBefore, historyAfter []byte
+	if err := h.Pool.QueryRow(ctx, `SELECT to_jsonb(c) FROM billing_invoice_close c WHERE team_id=$1`, team).Scan(&historyBefore); err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: "metered_usage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	sub.BillingSchedules = json.RawMessage(`[{"bill_until":{"timestamp":123}}]`)
+	mu.Unlock()
+	if w := call(false, r); w.Code != 409 || !strings.Contains(w.Body.String(), "billing_schedules") {
+		t.Fatal("unknown override accepted", w.Code, w.Body.String())
+	}
+	mu.Lock()
+	sub.BillingSchedules = nil
+	debt = true
+	mu.Unlock()
+	if w := call(false, r); w.Code != 409 {
+		t.Fatal("debt accepted", w.Body.String())
+	}
+	mu.Lock()
+	debt = false
+	mu.Unlock()
+	w := call(false, r)
+	if w.Code != 200 {
+		t.Fatal("preflight", w.Code, w.Body.String())
+	}
+	var preview struct {
+		Fingerprint string `json:"preflight_fingerprint"`
+	}
+	if err = json.Unmarshal(w.Body.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	r.Fingerprint = preview.Fingerprint
+	var count int
+	if err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_sponsored_annual_authority WHERE team_id=$1`, team).Scan(&count); err != nil || count != 0 {
+		t.Fatal("preflight wrote authority", count, err)
+	}
+	mu.Lock()
+	sub.Metadata["changed"] = "yes"
+	mu.Unlock()
+	if w = call(true, r); w.Code != 409 {
+		t.Fatal("drift accepted", w.Body.String())
+	}
+	mu.Lock()
+	delete(sub.Metadata, "changed")
+	remaining -= 123
+	mu.Unlock()
+	if w = call(true, r); w.Code != 200 {
+		t.Fatal("adopt", w.Code, w.Body.String())
+	}
+	if w = call(true, r); w.Code != 200 {
+		t.Fatal("replay", w.Code, w.Body.String())
+	}
+	changed := r
+	changed.Reason = "changed"
+	if w = call(true, changed); w.Code != 409 {
+		t.Fatal("changed request accepted")
+	}
+	after, err := h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: "metered_usage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := json.Marshal(before)
+	b, _ := json.Marshal(after)
+	if !bytes.Equal(a, b) {
+		t.Fatal("adoption rewrote issued credit history")
+	}
+	if err := h.Pool.QueryRow(ctx, `SELECT to_jsonb(c) FROM billing_invoice_close c WHERE team_id=$1`, team).Scan(&historyAfter); err != nil || !bytes.Equal(historyBefore, historyAfter) {
+		t.Fatal("adoption changed completed invoice history", err)
+	}
+	var limits int
+	if err = h.Pool.QueryRow(ctx, `SELECT max_sandboxes FROM team WHERE id=$1`, team).Scan(&limits); err != nil || limits != 1000 {
+		t.Fatal("Pro limits missing", limits, err)
+	}
+	plan, err := h.DB.GetCurrentCommercialPlan(ctx, team)
+	if err != nil || plan.OfferKey != "pro_annual" || plan.ChargeAmountCents != 0 || plan.PeriodAmountCents == nil || *plan.PeriodAmountCents != 3000000 {
+		t.Fatal("wrong composed plan", plan, err)
+	}
+	display := billingPlanFromContract(plan)
+	if !display.BaseFeeWaived || display.RenewalPriceUSD == nil || *display.RenewalPriceUSD != 12000 {
+		t.Fatal("waiver or renewal omitted", display)
+	}
+	account, enrolled, err := h.invoiceAccount(ctx, team)
+	if err != nil || !enrolled || account.Base.Item != item.ID {
+		t.Fatal("base not recognized", account, err)
+	}
+	if err = h.validateInvoiceEnrollmentSubscription(ctx, team, account, h.Stripe.(*stripeHTTPClient), sub, h.Pool); err != nil {
+		t.Fatal("mixed calendar rejected", err)
+	}
+	if _, err = h.Pool.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET item_id='si_replacement' WHERE team_id=$1`, team); err == nil {
+		t.Fatal("immutable binding rewritten")
+	}
+	if err = h.commitFreeFundingPlan(ctx, team, uuid.New()); err == nil {
+		t.Fatal("active annual authority released")
+	}
+	if _, err = h.Pool.Exec(ctx, `UPDATE team_billing_account SET checkout_initializing_at=clock_timestamp() WHERE team_id=$1`, team); err == nil {
+		t.Fatal("checkout bypassed annual fence")
+	}
+	if err = h.reconcileSponsoredAnnual(ctx, team); err != nil {
+		t.Fatal("active reconciliation", err)
+	}
+	if writes != 0 || remaining != 2876420 {
+		t.Fatal("provider or balance was mutated", writes, remaining)
+	}
+	// A user-set limit remains authoritative when the adopted benefit ends.
+	if _, err = h.Pool.Exec(ctx, `UPDATE team SET max_sandboxes=777 WHERE id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	sub.Status = "canceled"
+	sub.EndedAt = time.Now().Unix()
+	mu.Unlock()
+	if err = h.reconcileSponsoredAnnual(ctx, team); err != nil {
+		t.Fatal("cancellation reconciliation", err)
+	}
+	if err = h.Pool.QueryRow(ctx, `SELECT max_sandboxes FROM team WHERE id=$1`, team).Scan(&limits); err != nil || limits != 777 {
+		t.Fatal("custom limits overwritten", limits, err)
+	}
+}
+
+// A real database-clock boundary proves the original sponsor expires before the
+// successor is inserted, without disabling history guards or rewriting dates.
+func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
+	h, team := fundingTransitionFixture(t)
+	ctx := t.Context()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := h.Pool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	end := time.Now().UTC().Truncate(time.Second).Add(3 * time.Second)
+	start := end.AddDate(-1, 0, 0)
+	customer, subscription := "cus_"+team.String(), "sub_"+team.String()
+	op, contract := uuid.New(), uuid.New()
+	exec(`UPDATE team SET home_region='use' WHERE id=$1`, team)
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,$2,$3,$4)`, team, customer, subscription, start)
+	exec(`INSERT INTO billing_sponsored_operation(id,team_id,contract_id,idempotency_key,request,resource_terms,approved_by,reason,reference,customer_id,subscription_id,anchor,starts_at,ends_at) VALUES($1,$2,$3,'fixture','{}','{}',$4,'fixture','fixture',$5,$6,$7,$7,$8)`, op, team, contract, uuid.New(), customer, subscription, start, end)
+	exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_kind,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'sponsored_usage',$3,$4,$5,$6,'','sponsored_entitlement',0,1,'metered_usage',3000000,'scheduled',$3)`, contract, team, start, end, customer, subscription)
+	exec(`INSERT INTO billing_contract_entitlement_schedule(team_id,contract_id,month_offset,amount_cents) SELECT $1,$2,m,CASE WHEN m<3 THEN 3000000 ELSE 100000 END FROM generate_series(0,11) m`, team, contract)
+	if _, err := h.DB.ActivateCommercialContract(ctx, db.ActivateCommercialContractParams{TeamID: team, ContractID: contract}); err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE billing_sponsored_operation SET state='active' WHERE id=$1`, op)
+	exec(`INSERT INTO billing_sponsored_annual_authority(team_id,sponsorship_id,contract_id,idempotency_key,request,approved_by,customer_id,subscription_id,item_id,base_price_id,base_product_id,live_mode,home_region,starts_at,waiver_ends_at,provider_evidence) VALUES($1,$2,$3,'annual','{}',$4,$5,$6,'si_annual_'||$1::uuid::text,'price_annual','prod_annual',false,'use',$7,$8,'{}')`, team, op, contract, uuid.New(), customer, subscription, start, end)
+	o, err := h.sponsoredAnnualAuthority(ctx, team, h.Pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := storagePrice{ID: o.Price, Product: o.Product, Currency: "usd", BillingScheme: "per_unit", UnitAmountDecimal: "1200000"}
+	p.Recurring.UsageType = "licensed"
+	p.Recurring.Interval = "year"
+	p.Recurring.IntervalCount = 1
+	sub := invoiceSubscription{ID: subscription, Customer: customer, Status: "active"}
+	sub.BillingMode.Type = "flexible"
+	sub.Items.Data = append(sub.Items.Data, invoiceSubscriptionItem{ID: o.Item, Quantity: 1, Price: p, Start: end.Unix(), End: annualBoundary(start, 24).Unix()})
+	var paid atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("renewal attempted financial write %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/invoices":
+			if paid.Load() {
+				fmt.Fprint(w, `{"data":[{"id":"in_renewal"}]}`)
+			} else {
+				fmt.Fprint(w, `{"data":[]}`)
+			}
+		case "/v1/invoices/in_renewal":
+			fmt.Fprintf(w, `{"id":"in_renewal","customer":%q,"status":"paid","currency":"usd","total":1200000,"amount_due":1200000,"starting_balance":0,"ending_balance":0,"amount_paid":1200000,"amount_remaining":0,"status_transitions":{"paid_at":%d},"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"quantity":1,"amount":1200000,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"unit_amount_decimal":"1200000","price_details":{"price":"price_annual","product":"prod_annual"}},"parent":{"subscription_item_details":{"subscription":%q,"subscription_item":%q}}}]}}`, customer, end.Unix(), subscription, end.Unix(), annualBoundary(start, 24).Unix(), subscription, o.Item)
+		case "/v1/credit_notes":
+			fmt.Fprint(w, `{"data":[]}`)
+		case "/v1/invoice_payments":
+			fmt.Fprint(w, `{"data":[{"id":"inpay_fixture","invoice":"in_renewal","status":"paid","currency":"usd","amount_paid":1200000,"payment":{"type":"payment_intent","payment_intent":"pi_fixture"}}]}`)
+		case "/v1/payment_intents/pi_fixture":
+			fmt.Fprintf(w, `{"id":"pi_fixture","status":"succeeded","customer":%q,"currency":"usd","amount_received":1200000,"latest_charge":"ch_fixture"}`, customer)
+		case "/v1/charges/ch_fixture":
+			fmt.Fprintf(w, `{"id":"ch_fixture","customer":%q,"payment_intent":"pi_fixture","currency":"usd","paid":true,"captured":true,"amount_captured":1200000,"amount_refunded":0,"disputed":false}`, customer)
+		default:
+			t.Errorf("unexpected renewal request %s", r.URL.Path)
+			http.Error(w, "unexpected", 500)
+		}
+	}))
+	defer server.Close()
+	client := &stripeHTTPClient{baseURL: server.URL, httpClient: server.Client(), apiVersion: "2026-07-29.dahlia"}
+	token := uuid.New()
+	if _, err = h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: customer, Token: token}); err != nil {
+		t.Fatal(err)
+	}
+	defer h.DB.ReleaseStripeWebhookProcessingLease(ctx, db.ReleaseStripeWebhookProcessingLeaseParams{CustomerID: customer, Token: token})
+	if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err == nil {
+		t.Fatal("renewal before original boundary")
+	}
+	time.Sleep(time.Until(end.Add(20 * time.Millisecond)))
+	for range 2 {
+		if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err != nil {
+			t.Fatal("unpaid renewal/replay", err)
+		}
+	}
+	var contracts, payments, grants int
+	var state string
+	if err = h.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended'),(SELECT count(*) FROM billing_contract_payment WHERE team_id=$1),(SELECT count(*) FROM billing_usage_entitlement WHERE team_id=$1),state FROM billing_sponsored_annual_authority WHERE team_id=$1`, team).Scan(&contracts, &payments, &grants, &state); err != nil || contracts != 1 || payments != 0 || grants != 0 || state != "renewal_pending" {
+		t.Fatal("unpaid renewal created cash/credit or duplicates", contracts, payments, grants, state, err)
+	}
+	c, err := h.DB.GetCommercialContract(ctx, db.GetCommercialContractParams{TeamID: team, ContractID: o.Renewal})
+	if err != nil || c.Status != "pending" || !c.StartsAt.Equal(end) || !c.EntitlementAnchor.Equal(start) || c.EntitlementAmountCents != 100000 {
+		t.Fatal("successor terms differ", c, err)
+	}
+	paid.Store(true)
+	sub.LatestInvoice = "in_renewal"
+	for range 2 {
+		if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err != nil {
+			t.Fatal("paid renewal/replay", err)
+		}
+	}
+	if err = h.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1),state FROM billing_sponsored_annual_authority WHERE team_id=$1`, team).Scan(&payments, &state); err != nil || payments != 1 || state != "renewed" {
+		t.Fatal("paid renewal not singular/active", payments, state, err)
+	}
+	c, err = h.DB.GetCommercialContract(ctx, db.GetCommercialContractParams{TeamID: team, ContractID: o.Renewal})
+	if err != nil || c.Status != "active" {
+		t.Fatal("verified annual payment did not activate", c.Status, err)
+	}
+
+}

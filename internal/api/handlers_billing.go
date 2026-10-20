@@ -128,6 +128,8 @@ type billingSummaryResponse struct {
 // billingSummaryPlan is the team's commercial plan, separate from PricingTier,
 // which is the usage rate card every plan shares.
 type billingSummaryPlan struct {
+	BaseFeeWaived         bool                         `json:"base_fee_waived,omitempty"`
+	RenewalPriceUSD       *float64                     `json:"renewal_price_usd,omitempty"`
 	Key                   string                       `json:"key"`
 	Name                  string                       `json:"name"`
 	Status                string                       `json:"status"`
@@ -635,6 +637,11 @@ func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryP
 	plan := billingSummaryPlan{
 		Key: row.OfferKey, Name: name, Status: row.Status,
 		PriceUSD: &price, BillingIntervalMonths: &interval, StartsAt: &starts,
+	}
+	if row.OfferKey == "pro_annual" && row.ChargeAmountCents == 0 {
+		plan.BaseFeeWaived = true
+		renewal := 12000.0
+		plan.RenewalPriceUSD = &renewal
 	}
 	if row.EndsAt.Valid {
 		plan.EndsAt = &row.EndsAt.Time
