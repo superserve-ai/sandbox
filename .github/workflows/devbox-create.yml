@@ -1,0 +1,115 @@
+# Create a disposable devbox from selected sandbox and UI branches.
+#
+# Runs only from main. The runner resolves branches to SHAs and provisions
+# with the devbox environment's credentials; the selected revisions are
+# checked out and built on the box, never on the runner. See
+# deploy/devbox/README.md.
+
+name: Devbox Create
+
+on:
+  workflow_dispatch:
+    inputs:
+      ui_branch:
+        description: 'superserve (console) branch'
+        required: true
+        default: main
+        type: string
+      sandbox_branch:
+        description: 'sandbox branch'
+        required: true
+        default: main
+        type: string
+      name:
+        description: 'Devbox name (blank generates <owner>-dev-<hex>)'
+        required: false
+        default: ''
+        type: string
+      lifetime_hours:
+        description: 'Lifetime in hours (1-168); the box is deleted afterwards'
+        required: true
+        default: '24'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.prepare.outputs.name }}
+      owner: ${{ steps.prepare.outputs.owner }}
+      lifetime_hours: ${{ steps.prepare.outputs.lifetime_hours }}
+      sandbox_branch: ${{ steps.prepare.outputs.sandbox_branch }}
+      sandbox_sha: ${{ steps.prepare.outputs.sandbox_sha }}
+      ui_branch: ${{ steps.prepare.outputs.ui_branch }}
+      ui_sha: ${{ steps.prepare.outputs.ui_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs and resolve branches
+        id: prepare
+        env:
+          INPUT_NAME: ${{ inputs.name }}
+          INPUT_LIFETIME_HOURS: ${{ inputs.lifetime_hours }}
+          INPUT_SANDBOX_BRANCH: ${{ inputs.sandbox_branch }}
+          INPUT_UI_BRANCH: ${{ inputs.ui_branch }}
+        run: python3 .github/workflows/scripts/devbox_workflow.py prepare-create
+
+  create:
+    needs: prepare
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: devbox
+    timeout-minutes: 180
+    # Shared with Devbox Deploy and Devbox Destroy so operations on one box
+    # never overlap. Queued runs are kept rather than replaced, and a running
+    # create is never cancelled for another run.
+    concurrency:
+      group: devbox-${{ needs.prepare.outputs.name }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.DEVBOX_GCP_WORKLOAD_IDENTITY }}
+          service_account: ${{ vars.DEVBOX_GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create devbox
+        env:
+          DEVBOX_ATTEMPT_FILE: ${{ runner.temp }}/devbox-attempt.json
+          NAME: ${{ needs.prepare.outputs.name }}
+          OWNER: ${{ needs.prepare.outputs.owner }}
+          LIFETIME_HOURS: ${{ needs.prepare.outputs.lifetime_hours }}
+          SANDBOX_BRANCH: ${{ needs.prepare.outputs.sandbox_branch }}
+          SANDBOX_SHA: ${{ needs.prepare.outputs.sandbox_sha }}
+          UI_BRANCH: ${{ needs.prepare.outputs.ui_branch }}
+          UI_SHA: ${{ needs.prepare.outputs.ui_sha }}
+          DEVBOX_SECRET_STRIPE_SECRET_KEY: ${{ secrets.DEVBOX_SECRET_STRIPE_SECRET_KEY }}
+          DEVBOX_SECRET_RECAPTCHA_API_KEY: ${{ secrets.DEVBOX_SECRET_RECAPTCHA_API_KEY }}
+          DEVBOX_CONFIG_STRIPE_API_VERSION: ${{ vars.DEVBOX_CONFIG_STRIPE_API_VERSION }}
+          DEVBOX_CONFIG_STRIPE_CHECKOUT_PRICE_IDS: ${{ vars.DEVBOX_CONFIG_STRIPE_CHECKOUT_PRICE_IDS }}
+          DEVBOX_CONFIG_STRIPE_PRO_MONTHLY_PRICE_ID: ${{ vars.DEVBOX_CONFIG_STRIPE_PRO_MONTHLY_PRICE_ID }}
+          DEVBOX_CONFIG_STRIPE_PRO_ANNUAL_PRICE_ID: ${{ vars.DEVBOX_CONFIG_STRIPE_PRO_ANNUAL_PRICE_ID }}
+          DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG: ${{ vars.DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG }}
+          DEVBOX_CONFIG_RECAPTCHA_SITE_KEY: ${{ vars.DEVBOX_CONFIG_RECAPTCHA_SITE_KEY }}
+          DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID: ${{ vars.DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID }}
+        run: python3 .github/workflows/scripts/devbox_workflow.py create
+
+      - name: Mark an interrupted create failed
+        if: failure() || cancelled()
+        env:
+          DEVBOX_ATTEMPT_FILE: ${{ runner.temp }}/devbox-attempt.json
+        run: python3 .github/workflows/scripts/devbox_workflow.py finish-create

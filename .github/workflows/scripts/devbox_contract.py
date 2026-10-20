@@ -41,7 +41,8 @@ FORBIDDEN_LABELS = ("sandbox_role", "sandbox_status", "environment", "region", "
 
 STATES = ("creating", "ready", "failed", "deploying", "destroying")
 RESOURCE_TYPES = ("instance", "disk", "bucket")
-MIGRATION_RESULTS = ("applied", "none", "failed")
+MIGRATION_RESULTS = ("applied", "none", "failed", "unknown")
+UNKNOWN_SHA = "unknown"
 DEPLOY_RESULTS = ("succeeded", "failed")
 
 REPOSITORIES = ("sandbox", "ui")
@@ -284,7 +285,12 @@ def validate_manifest(manifest):
         for value in manifest[field].values():
             if not isinstance(value, dict):
                 raise ContractError(f"Manifest {field} entry {value!r} is malformed")
-            revision(value.get("branch"), value.get("sha"))
+            if field == "components" and value.get("sha") == UNKNOWN_SHA:
+                revision(value.get("branch"), "0" * 40)
+            else:
+                revision(value.get("branch"), value.get("sha"))
+            if field == "revisions" and value.get("unconfirmed", True) is not True:
+                raise ContractError(f"Manifest revisions entry {value!r} has a malformed unconfirmed flag")
     return manifest
 
 
@@ -313,13 +319,15 @@ def component_scripts(components):
 
 
 def record_deploy(manifest, *, at, actor, components, revisions, migrations, result,
-                  checked_out=None, deployed=None):
-    """Append a deploy and move only what actually changed on the box.
+                  checked_out=None, deployed=None, unconfirmed=(), in_flight=None):
+    """Append a deploy and move only what is confirmed to have changed.
 
     `revisions` is what the deploy targeted. `checked_out` lists the
-    repositories whose checkout moved and `deployed` the components whose
-    install finished. A succeeded deploy moved everything it targeted; a
-    failed one must say what it moved.
+    repositories confirmed at the target and `deployed` the components whose
+    install finished. A failed deploy must also say which targeted
+    repositories it could not confirm either way (`unconfirmed`, kept at their
+    previous revision and flagged) and which component's install was running
+    when it stopped (`in_flight`, recorded with an unknown SHA).
     """
     if migrations not in MIGRATION_RESULTS:
         raise ContractError(f"Unknown migration result {migrations!r}")
@@ -335,7 +343,15 @@ def record_deploy(manifest, *, at, actor, components, revisions, migrations, res
     if not checked_out <= repositories or not deployed <= set(components) \
             or any(COMPONENT_REPOSITORIES[component] not in checked_out for component in deployed):
         raise ContractError("Deployed components must be a targeted subset built from checked-out repositories")
-    if result == "succeeded" and (checked_out != repositories or deployed != set(components)):
+    unconfirmed = set(unconfirmed)
+    if unconfirmed & checked_out or not unconfirmed <= repositories:
+        raise ContractError("Unconfirmed repositories must be targeted and not confirmed checked out")
+    if in_flight is not None and (in_flight not in components or in_flight in deployed
+                                  or COMPONENT_REPOSITORIES[in_flight] not in checked_out):
+        raise ContractError(f"In-flight component {in_flight!r} must be targeted, not deployed, "
+                            "and built from a checked-out repository")
+    if result == "succeeded" and (checked_out != repositories or deployed != set(components)
+                                  or unconfirmed or in_flight is not None):
         raise ContractError("A succeeded deploy must have checked out and deployed everything it targeted")
     updated = copy.deepcopy(manifest)
     target = {key: revision(value["branch"], value["sha"]) for key, value in revisions.items()}
@@ -349,9 +365,14 @@ def record_deploy(manifest, *, at, actor, components, revisions, migrations, res
         "result": result,
     })
     updated["revisions"].update({key: target[key] for key in checked_out})
+    for key in unconfirmed:
+        updated["revisions"][key] = {**updated["revisions"][key], "unconfirmed": True}
     for component in components:
         if component in deployed:
             updated["components"][component] = dict(target[COMPONENT_REPOSITORIES[component]])
+    if in_flight is not None:
+        updated["components"][in_flight] = {"branch": target[COMPONENT_REPOSITORIES[in_flight]]["branch"],
+                                            "sha": UNKNOWN_SHA}
     updated["state"] = "ready" if result == "succeeded" else "failed"
     return validate_manifest(updated)
 
