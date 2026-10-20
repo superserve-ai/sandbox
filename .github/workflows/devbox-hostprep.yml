@@ -36,6 +36,8 @@ jobs:
       KERNEL_SHA256: 3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2

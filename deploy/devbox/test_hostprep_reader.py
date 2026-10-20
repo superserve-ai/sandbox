@@ -17,6 +17,14 @@ class StreamTest(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.path = Path(self.dir.name) / "base.ext4"
         self.path.write_bytes(ORIGINAL)
+        # Filesystem timestamps move in coarse ticks; backdate the file and wait
+        # for a later tick so any change made during the read is visible.
+        os.utime(self.path, ns=(0, 0))
+        scratch = Path(self.dir.name) / "tick"
+        while True:
+            scratch.write_bytes(b"")
+            if scratch.stat().st_ctime_ns > self.path.stat().st_ctime_ns:
+                break
 
     def tearDown(self):
         self.dir.cleanup()
@@ -58,13 +66,11 @@ class StreamTest(unittest.TestCase):
         self.assertFalse(self.read(write)[1])
 
     def test_in_place_write_that_restores_mtime_is_unstable(self):
-        mtime_ns = self.path.stat().st_mtime_ns
-
         def write():
             with open(self.path, "r+b") as target:
                 target.seek(len(ORIGINAL) - 1)
                 target.write(b"\0" if ORIGINAL[-1:] != b"\0" else b"\1")
-            os.utime(self.path, ns=(mtime_ns, mtime_ns))
+            os.utime(self.path, ns=(0, 0))
 
         self.assertFalse(self.read(write)[1])
 
