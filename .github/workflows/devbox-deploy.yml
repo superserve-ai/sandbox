@@ -3,7 +3,7 @@
 # Re-runs the same box install scripts the create workflow uses, in contract
 # order, so the upgrade exercised is the real one. Database migrations are
 # applied forward by install-api.sh. Runs only from main; the selected
-# revisions are built on the box. See deploy/devbox/README.md.
+# revisions are built on the box. See the Set up and operate a sandbox devbox runbook.
 
 name: Devbox Deploy
 
