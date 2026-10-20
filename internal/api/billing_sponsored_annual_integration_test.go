@@ -35,6 +35,7 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	writes := 0
 	debt := false
 	var history []StripeInvoiceAmounts
+	providerPreview := StripeInvoiceAmounts{ID: "upcoming_in_fixture", Customer: sub.Customer}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -66,7 +67,7 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 		case "/v1/billing/credit_balance_summary":
 			out(map[string]any{"balances": []any{map[string]any{"ledger_balance": map[string]any{"monetary": map[string]any{"currency": "usd", "value": remaining}}}}})
 		case "/v1/invoices/create_preview":
-			out(StripeInvoiceAmounts{ID: "upcoming_in_fixture", Customer: sub.Customer})
+			out(providerPreview)
 		default:
 			t.Errorf("unexpected annual provider request %s", r.URL.String())
 			http.Error(w, "unexpected", 500)
@@ -195,7 +196,53 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	mu.Lock()
 	history[0].Status = "paid"
 	history[0].Lines.Data[0].Amount = 0
+	history[0].Lines.Data[0].Parent.SubscriptionItemDetails.SubscriptionItem = "si_previous_annual"
+	history[0].Lines.Data[0].Period.End = sponsor.End.Time.Unix() + 86400
+	mu.Unlock()
+	for _, historicalPrice := range []string{"price_previous_annual", ""} {
+		mu.Lock()
+		history[0].Lines.Data[0].Pricing.PriceDetails.Price = historicalPrice
+		mu.Unlock()
+		for _, apply := range []bool{false, true} {
+			if w := call(apply, r); w.Code != 409 || !strings.Contains(w.Body.String(), "unrecognized historical invoice price") {
+				t.Fatalf("replaced annual item history accepted (%q, apply=%v): %d %s", historicalPrice, apply, w.Code, w.Body.String())
+			}
+		}
+	}
+	// Recognized resource usage and rounding history remain adoptable.
+	for _, usageItem := range sub.Items.Data {
+		if usageItem.ID == item.ID {
+			continue
+		}
+		mu.Lock()
+		history[0].Lines.Data[0].Pricing.PriceDetails.Price = usageItem.Price.ID
+		history[0].Lines.Data[0].Amount = 123
+		mu.Unlock()
+		if w := call(false, r); w.Code != 200 {
+			t.Fatalf("recognized usage history rejected (%s): %d %s", usageItem.Price.ID, w.Code, w.Body.String())
+		}
+	}
+	mu.Lock()
+	history[0].Lines.Data[0].Parent.SubscriptionItemDetails.SubscriptionItem = item.ID
+	history[0].Lines.Data[0].Period.End = 0
+	history[0].Lines.Data[0].Amount = 0
 	history[0].Lines.Data[0].Pricing.PriceDetails.Price = p.ID
+	previewBytes, _ := json.Marshal(history[0])
+	_ = json.Unmarshal(previewBytes, &providerPreview)
+	providerPreview.Lines.Data[0].Pricing.PriceDetails.Price = "price_previous_annual"
+	mu.Unlock()
+	for _, previewItem := range []string{item.ID, "si_previous_annual"} {
+		mu.Lock()
+		providerPreview.Lines.Data[0].Parent.SubscriptionItemDetails.SubscriptionItem = previewItem
+		mu.Unlock()
+		for _, apply := range []bool{false, true} {
+			if w := call(apply, r); w.Code != 409 || !strings.Contains(w.Body.String(), "first-year preview includes") {
+				t.Fatalf("old annual price preview accepted (%s, apply=%v): %d %s", previewItem, apply, w.Code, w.Body.String())
+			}
+		}
+	}
+	mu.Lock()
+	providerPreview = StripeInvoiceAmounts{ID: "upcoming_in_fixture", Customer: sub.Customer}
 	mu.Unlock()
 	validItems := append([]invoiceSubscriptionItem(nil), sub.Items.Data...)
 	for _, invalid := range []string{"missing", "duplicate", "licensed", "amount", "meter"} {

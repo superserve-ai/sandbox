@@ -218,7 +218,7 @@ func (h *Handlers) annualPreflight(ctx context.Context, team uuid.UUID, r sponso
 	if err != nil {
 		return o, nil, "", err
 	}
-	inventory, err := client.annualWaiverInventory(ctx, o)
+	inventory, err := client.annualWaiverInventory(ctx, o, rounding)
 	if err != nil {
 		return o, nil, "", err
 	}
@@ -243,7 +243,16 @@ func (h *Handlers) annualPreflight(ctx context.Context, team uuid.UUID, r sponso
 	return o, evidence, hex.EncodeToString(hash[:]), nil
 }
 
-func (c *stripeHTTPClient) annualWaiverInventory(ctx context.Context, o sponsoredAnnualAuthority) (json.RawMessage, error) {
+func (c *stripeHTTPClient) annualWaiverInventory(ctx context.Context, o sponsoredAnnualAuthority, rounding string) (json.RawMessage, error) {
+	usagePrices := map[string]bool{}
+	if rounding != "" {
+		usagePrices[rounding] = true
+	}
+	for _, term := range o.Params.ResourceTerms {
+		if term.PriceID != "" {
+			usagePrices[term.PriceID] = true
+		}
+	}
 	var page struct {
 		Data    []StripeInvoiceAmounts `json:"data"`
 		HasMore bool                   `json:"has_more"`
@@ -274,6 +283,10 @@ func (c *stripeHTTPClient) annualWaiverInventory(ctx context.Context, o sponsore
 				if line.Period.End > o.End.Unix() {
 					return nil, errors.New("historical annual line extends into paid renewal; provider billed-through reconciliation required")
 				}
+			} else if inv.Status != "void" && (line.Pricing.PriceDetails == nil || !usagePrices[line.Pricing.PriceDetails.Price]) {
+				// A replaced annual item and price must not disappear from the
+				// waiver check merely because neither matches the current item.
+				return nil, errors.New("unrecognized historical invoice price; explicit financial reconciliation required")
 			}
 		}
 	}
@@ -297,6 +310,9 @@ func (c *stripeHTTPClient) annualWaiverInventory(ctx context.Context, o sponsore
 	for _, line := range preview.Lines.Data {
 		if (line.Parent.SubscriptionItemDetails != nil && line.Parent.SubscriptionItemDetails.SubscriptionItem == o.Item) || (line.Pricing.PriceDetails != nil && line.Pricing.PriceDetails.Price == o.Price) {
 			return nil, errors.New("first-year preview includes an annual fee")
+		}
+		if line.Pricing.PriceDetails == nil || !usagePrices[line.Pricing.PriceDetails.Price] {
+			return nil, errors.New("first-year preview includes an unrecognized price")
 		}
 	}
 	// Preview usage amounts change as the team runs; do not turn them into terms.
