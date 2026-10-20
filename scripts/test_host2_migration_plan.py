@@ -79,7 +79,7 @@ class Host2MigrationPlanTest(unittest.TestCase):
                     result = self.run_guard([change(address, actions)])
                     self.assertEqual(result.returncode, 1)
                     self.assertIn(address, result.stderr)
-                    self.assertIn("host2-identity-runbook.md", result.stderr)
+                    self.assertIn("Host and control-plane identity preparation runbook", result.stderr)
 
     def test_allows_routine_apply_after_migration(self):
         result = self.run_guard([

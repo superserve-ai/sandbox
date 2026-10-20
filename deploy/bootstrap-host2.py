@@ -140,7 +140,7 @@ sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'host endpoint h
 test "$invocation" = "$(sudo systemctl show -p InvocationID --value superserve-vmd.service)"
 ''')
         print('Host 2 identity, TLS, mounts, services and current-invocation endpoint heartbeat verified.')
-        print('Admission remains gated on the directory, capabilities, artifacts and agent evidence in deploy/host2-identity-runbook.md.')
+        print('Admission remains gated on the directory, capabilities, artifacts and agent evidence in the Host and control-plane identity preparation runbook.')
         return
     # Require the existing cold standby baseline. Never synthesize a partial
     # secret configuration or reformat storage containing an unknown filesystem.

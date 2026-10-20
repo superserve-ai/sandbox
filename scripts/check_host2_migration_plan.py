@@ -44,7 +44,7 @@ def main():
 
     if blocked:
         print("Host maintenance requires an operator-applied plan after the "
-              "prechecks in deploy/host2-identity-runbook.md:", file=sys.stderr)
+              "prechecks in the Host and control-plane identity preparation runbook:", file=sys.stderr)
         for address in blocked:
             print(f"  {address}", file=sys.stderr)
         return 1
