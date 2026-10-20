@@ -35,6 +35,8 @@ jobs:
       BUCKET: gs://rayai-dev-devbox-hostprep/hostprep
       KERNEL_SHA256: 3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761
     steps:
+      - uses: actions/checkout@v4
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -52,26 +54,10 @@ jobs:
             gcloud compute ssh "$HOST" --project=rayai-dev --zone=us-central1-a \
               --tunnel-through-iap --quiet --command="set -eu; $1" -- -T
           }
-          # Reads each file once on the host and hashes exactly the bytes it
-          # streams, so a deploy renaming a new rootfs into place mid-copy
-          # cannot mix versions; the open file must not change while it is
-          # read, and the received copy must match that digest and size.
-          reader=$(base64 -w0 <<'PY'
-          import hashlib, os, sys
-          digest, out, size = hashlib.sha256(), sys.stdout.buffer, 0
-          with open(sys.argv[1], "rb") as source:
-              before = os.fstat(source.fileno())
-              for block in iter(lambda: source.read(1 << 20), b""):
-                  digest.update(block)
-                  out.write(block)
-                  size += len(block)
-              after = os.fstat(source.fileno())
-          out.flush()
-          key = lambda st: (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-          stable = key(before) == key(after) and after.st_size == size
-          sys.stderr.write("READ sha256=%s size=%d stable=%d\n" % (digest.hexdigest(), size, stable))
-          PY
-          )
+          # deploy/devbox/hostprep_reader.py streams each file in one read on
+          # the host, hashes exactly those bytes and reports whether the open
+          # file was written meanwhile; a rename over the path is harmless.
+          reader=$(base64 -w0 deploy/devbox/hostprep_reader.py)
           fetch() {
             local attempt read_line
             for attempt in 1 2 3; do
