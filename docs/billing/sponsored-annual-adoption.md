@@ -35,7 +35,7 @@ Use the existing operator authentication and `X-Actor-User-Id` header. First POS
 Preflight is observational and returns an evidence snapshot, original term,
 renewal amount and `preflight_fingerprint`. It requires the exact active
 sponsorship, annual licensed item and frozen monthly resource/rounding items.
-Debt, pending invoice items, nonzero historical base lines, uncertain grant
+Debt, pending invoice items, draft or nonzero historical base lines, uncertain grant
 issuance and unfinished invoice closes require reconciliation first. Existing
 completed invoice history is retained. Consumption may continue between
 preflight and apply; it is observed again and never reset.
@@ -55,7 +55,11 @@ field is empty. The adoption endpoint never guesses how to clear such an
 override. Resolve provider configuration using a separately verified procedure
 before applying local adoption. A zero-dollar proration is not evidence of a
 paid annual fee or a full annual discount. This path supports no collectible
-historical base line; it rejects discounted gross-fee reconciliation.
+historical base line; it rejects discounted gross-fee reconciliation. Historical
+annual service extending beyond the waiver also blocks adoption: clearing a
+timing override alone need not undo the provider’s previously billed-through
+state. Verify the full original-boundary renewal amount and service period in
+staging before approving a provider normalization procedure.
 
 ## Verification and recovery
 
@@ -75,7 +79,11 @@ and creates exactly one pending standard annual successor on the same
 subscription. Stripe owns collection. Only verified cash settlement for the
 exact annual item and service year activates the successor. Unpaid renewal
 creates no new allowance; late or repeated payment notifications cannot restart
-the first year. Cancellation preserves historical authority and custom limits.
+the first year. Waived benefits expire using database time even during a provider
+outage. Cancellation preserves unexpired paid coverage and continues receipt
+review until the paid term and final invoices are closed. Unexpected cancellation
+during the waiver or before paid activation requires support recovery; it does
+not silently forfeit the recorded term. Custom limits remain authoritative.
 
 A blocked operation exposes `last_error` and retries through the bounded annual
 reconciliation worker. Do not delete authority rows, rewrite dates, reset grants,

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -247,8 +248,11 @@ func (c *stripeHTTPClient) annualWaiverInventory(ctx context.Context, o sponsore
 			if line.Pricing.PriceDetails != nil && line.Pricing.PriceDetails.Price == o.Price && inv.Status != "void" {
 				// An explicit local waiver is adopted only when there is no collectible
 				// historical base line. Discounted gross invoices require separate accounting.
-				if line.Amount != 0 || (inv.Status != "paid" && inv.Status != "draft") {
+				if line.Amount != 0 || inv.Status != "paid" {
 					return nil, errors.New("historical annual fee needs explicit financial reconciliation")
+				}
+				if line.Period.End > o.End.Unix() {
+					return nil, errors.New("historical annual line extends into paid renewal; provider billed-through reconciliation required")
 				}
 			}
 		}
@@ -413,18 +417,19 @@ func (h *Handlers) sponsoredAnnualStatus(c *gin.Context, team, id uuid.UUID) {
 }
 
 func (h *Handlers) annualGrantEvidence(ctx context.Context, o sponsoredAnnualAuthority, reader db.DBTX, c *stripeHTTPClient) ([]map[string]any, error) {
-	rows, err := reader.Query(ctx, `SELECT stripe_credit_grant_id,amount_cents,extract(epoch FROM provider_invoice_end)::bigint+1 FROM billing_usage_entitlement WHERE contract_id=$1 AND state='issued' ORDER BY period_start`, o.Contract)
+	rows, err := reader.Query(ctx, `SELECT stripe_credit_grant_id,amount_cents,extract(epoch FROM provider_invoice_end)::bigint+1,issuance_evidence FROM billing_usage_entitlement WHERE contract_id=$1 AND state='issued' ORDER BY period_start`, o.Contract)
 	if err != nil {
 		return nil, err
 	}
 	type saved struct {
 		id          string
 		amount, end int64
+		evidence    []byte
 	}
 	var expected []saved
 	for rows.Next() {
 		var e saved
-		if err = rows.Scan(&e.id, &e.amount, &e.end); err != nil {
+		if err = rows.Scan(&e.id, &e.amount, &e.end, &e.evidence); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -458,7 +463,11 @@ func (h *Handlers) annualGrantEvidence(ctx context.Context, o sponsoredAnnualAut
 	var result []map[string]any
 	for _, e := range expected {
 		g, ok := byID[e.id]
-		if !ok || g.Amount.Monetary.Value != e.amount || g.Amount.Monetary.Currency != "usd" || g.ExpiresAt != e.end || g.Applicability.Scope.PriceType != "" {
+		var issued entitlementGrant
+		if err := json.Unmarshal(e.evidence, &issued); err != nil {
+			return nil, err
+		}
+		if !ok || g.VoidedAt != 0 || !reflect.DeepEqual(g, issued) || g.Amount.Monetary.Value != e.amount || g.Amount.Monetary.Currency != "usd" || g.ExpiresAt != e.end || g.Applicability.Scope.PriceType != "" {
 			return nil, errors.New("issued sponsored grant differs from provider history")
 		}
 		for _, price := range g.Applicability.Scope.Prices {

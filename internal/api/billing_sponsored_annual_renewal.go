@@ -2,7 +2,11 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/url"
+	"reflect"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,7 +20,8 @@ func (h *Handlers) reconcileSponsoredAnnualRenewal(ctx context.Context, o sponso
 	if sub.ID != o.Subscription || sub.Customer != o.Customer || sub.LiveMode != o.Live {
 		return errors.New("renewal subscription ownership changed")
 	}
-	if sub.Status != "active" && sub.Status != "past_due" {
+	terminal := sub.Status == "canceled" || sub.Status == "incomplete_expired"
+	if sub.Status != "active" && sub.Status != "past_due" && !terminal {
 		return errors.New("annual renewal is awaiting a usable subscription")
 	}
 	offer := proOffer{Key: "pro_annual", Price: o.Price, Amount: 1200000, Months: 12}
@@ -73,18 +78,51 @@ func (h *Handlers) reconcileSponsoredAnnualRenewal(ctx context.Context, o sponso
 	if current != "" {
 		ids = append(ids, current)
 	}
+	var historicalRaw []byte
+	if err = h.Pool.QueryRow(ctx, `SELECT COALESCE(provider_evidence->'waiver_inventory','[]'::jsonb) FROM billing_sponsored_annual_authority WHERE id=$1`, o.ID).Scan(&historicalRaw); err != nil {
+		return err
+	}
+	var historical []StripeInvoiceAmounts
+	if err = json.Unmarshal(historicalRaw, &historical); err != nil {
+		return err
+	}
 	var verified []proPaymentEvidence
+	var verifiedIDs []string
+	verificationFailed := false
 	seen := map[string]bool{}
 	for _, id := range ids {
 		if seen[id] {
 			continue
 		}
 		seen[id] = true
+		// Completed zero-fee history remains closure evidence, never cash coverage.
+		knownWaiver := false
+		for _, old := range historical {
+			if old.ID != id || old.Status != "paid" {
+				continue
+			}
+			var fresh StripeInvoiceAmounts
+			if err = client.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(id), nil, &fresh, ""); err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(old, fresh) {
+				return errors.New("adopted invoice history changed; financial reconciliation required")
+			}
+			knownWaiver = true
+			break
+		}
+		if knownWaiver {
+			verifiedIDs = append(verifiedIDs, id)
+			continue
+		}
 		receipt, paid, e := client.verifyProInvoice(ctx, id, offer, o.Customer, o.Subscription)
 		if e == nil && paid && !validAnnualReceipt(o, receipt) {
 			e = &proPaymentReviewError{reason: "annual receipt differs from adopted item or service year"}
 		}
 		if id == current {
+			if e == nil && !paid {
+				e = &proPaymentReviewError{reason: "annual receipt no longer proves cash payment"}
+			}
 			if observe := h.observeProPaymentReview(ctx, o.Team, id, receipt, e); observe != nil {
 				return observe
 			}
@@ -94,13 +132,22 @@ func (h *Handlers) reconcileSponsoredAnnualRenewal(ctx context.Context, o sponso
 		}
 		// The first discounted invoice is historical waiver evidence, never a receipt.
 		if e != nil {
+			verificationFailed = true
 			if id == sub.LatestInvoice {
 				return e
 			}
 			continue
 		}
+		verifiedIDs = append(verifiedIDs, id)
 		if paid && receipt.Start >= o.End.Unix() && annualReceiptPeriod(o, receipt) {
 			verified = append(verified, receipt)
+		}
+	}
+	terminalClosed := false
+	if terminal && next == "" && !verificationFailed {
+		terminalClosed, err = h.proInvoicesClosed(ctx, client, o.Team, o.Customer, o.Subscription, verifiedIDs)
+		if err != nil {
+			return err
 		}
 	}
 	tx, err = h.Pool.Begin(ctx)
@@ -141,15 +188,29 @@ func (h *Handlers) reconcileSponsoredAnnualRenewal(ctx context.Context, o sponso
 		}
 		covered = covered || (receipt.Start <= now.Unix() && receipt.End > now.Unix())
 	}
-	if covered && contract.Status == "pending" {
+	var unexpired bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_contract_payment WHERE contract_id=$1 AND service_period_end>clock_timestamp())`, o.Renewal).Scan(&unexpired); err != nil {
+		return err
+	}
+	var recoveryErr error
+	if terminal && contract.Status == "pending" {
+		recoveryErr = errors.New("paid subscription terminated before activation; billing recovery requires support")
+	}
+	if covered && contract.Status == "pending" && !terminal {
 		if _, err = q.ActivateCommercialContract(ctx, db.ActivateCommercialContractParams{TeamID: o.Team, ContractID: o.Renewal, ExpectedRevision: contract.Revision}); err != nil {
 			return err
 		}
 	}
 	// A renewal receipt cannot authorize an allowance before its service term.
 	state := "renewal_pending"
-	if covered {
+	if covered && recoveryErr == nil {
 		state = "renewed"
+	}
+	if terminal && contract.Status != "pending" && !unexpired && terminalClosed {
+		if _, err = q.EndCommercialContract(ctx, db.EndCommercialContractParams{TeamID: o.Team, ContractID: o.Renewal, ExpectedRevision: contract.Revision}); err != nil {
+			return err
+		}
+		state = "ended"
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET state=$2,invoice_cursor=NULLIF($3,''),last_error=NULL,next_check_at=clock_timestamp()+interval '30 seconds' WHERE team_id=$1`, o.Team, state, next); err != nil {
 		return err
@@ -158,7 +219,7 @@ func (h *Handlers) reconcileSponsoredAnnualRenewal(ctx context.Context, o sponso
 		return err
 	}
 
-	return err
+	return recoveryErr
 }
 
 func annualReceiptPeriod(o sponsoredAnnualAuthority, r proPaymentEvidence) bool {

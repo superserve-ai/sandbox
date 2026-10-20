@@ -3,10 +3,11 @@ package api
 import (
 	"context"
 	"errors"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/db"
-	"time"
 )
 
 func (h *Handlers) startSponsoredAnnualReconciliation(ctx context.Context) {
@@ -57,7 +58,27 @@ func (h *Handlers) startSponsoredAnnualReconciliation(ctx context.Context) {
 		}
 	}()
 }
+
+// Local benefit expiry cannot depend on provider availability or configuration.
+func (h *Handlers) expireSponsoredAnnualBenefits(ctx context.Context, team uuid.UUID) error {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = h.DB.WithTx(tx).LockTeamBillingAccount(ctx, team); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET state='renewal_pending' WHERE team_id=$1 AND state='active' AND waiver_ends_at<=clock_timestamp()`, team); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (h *Handlers) reconcileSponsoredAnnual(ctx context.Context, team uuid.UUID) error {
+	if err := h.expireSponsoredAnnualBenefits(ctx, team); err != nil {
+		return err
+	}
 	o, err := h.sponsoredAnnualAuthority(ctx, team, h.Pool)
 	if err != nil {
 		return err
@@ -97,29 +118,46 @@ func (h *Handlers) reconcileSponsoredAnnual(ctx context.Context, team uuid.UUID)
 	if !current || sub.Customer != o.Customer || sub.ID != o.Subscription || sub.LiveMode != o.Live {
 		return errors.New("annual adoption billing identity changed")
 	}
-	if sub.Status == "canceled" || sub.Status == "incomplete_expired" {
-		tx, e := h.Pool.Begin(ctx)
-		if e != nil {
-			return e
+	// Project lifecycle evidence even if configuration now needs recovery. Periods
+	// change only when the complete adopted resource calendar still validates.
+	calendarErr := validateSponsoredAnnualSubscription(o, sub, rounding, false)
+	var periodStart, periodEnd int64
+	if calendarErr == nil {
+		resources, _ := o.base().stripSubscription(sub)
+		for _, item := range resources.Items.Data {
+			if item.Price.ID != rounding {
+				periodStart, periodEnd = item.Start, item.End
+				break
+			}
 		}
-		defer tx.Rollback(ctx)
-		q := h.DB.WithTx(tx)
-		if _, e = q.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: o.Customer, Token: token}); e != nil {
-			return e
-		}
-		if _, e = q.LockTeamBillingAccount(ctx, team); e != nil {
-			return e
-		}
-		if _, e = tx.Exec(ctx, `UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1 AND status<>'ended'`, o.Renewal); e != nil {
-			return e
-		}
-		if _, e = tx.Exec(ctx, `UPDATE billing_sponsored_annual_authority SET state='ended' WHERE id=$1`, o.ID); e != nil {
-			return e
-		}
-		return tx.Commit(ctx)
 	}
-	if err = validateSponsoredAnnualSubscription(o, sub, rounding, false); err != nil {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
 		return err
+	}
+	defer tx.Rollback(ctx)
+	q := h.DB.WithTx(tx)
+	if _, err = q.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: o.Customer, Token: token}); err != nil {
+		return err
+	}
+	if _, err = q.LockTeamBillingAccount(ctx, team); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_status=$5,cancel_at_period_end=$6,current_period_start=CASE WHEN $7 THEN $8 ELSE current_period_start END,current_period_end=CASE WHEN $7 THEN $9 ELSE current_period_end END WHERE team_id=$1 AND stripe_customer_id=$2 AND stripe_subscription_id=$3 AND commercial_billing_anchor=$4`, team, o.Customer, o.Subscription, o.Start, sub.Status, sub.CancelAtPeriodEnd || sub.CancelAt > 0, calendarErr == nil && periodStart > 0, time.Unix(periodStart, 0), time.Unix(periodEnd, 0))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("annual adoption association changed during reconciliation")
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	if calendarErr != nil {
+		return calendarErr
+	}
+	if now.Before(o.End) && (sub.Status == "canceled" || sub.Status == "incomplete_expired") {
+		return errors.New("sponsored annual subscription terminated during waived term; billing recovery requires support")
 	}
 	if now.Before(o.End) {
 		return nil

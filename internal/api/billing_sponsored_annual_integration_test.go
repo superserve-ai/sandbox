@@ -33,6 +33,7 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	remaining := int64(2876543)
 	writes := 0
 	debt := false
+	var history []StripeInvoiceAmounts
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -52,7 +53,11 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 				out(map[string]any{"data": []any{map[string]any{"id": "in_debt", "customer": sub.Customer, "status": "open"}}})
 				return
 			}
-			out(map[string]any{"data": []any{}})
+			if r.URL.Query().Get("status") != "" {
+				out(map[string]any{"data": []any{}})
+				return
+			}
+			out(map[string]any{"data": history})
 		case "/v1/invoiceitems":
 			out(map[string]any{"data": []any{}})
 		case "/v1/billing/credit_grants":
@@ -112,6 +117,54 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	}
 	mu.Lock()
 	debt = false
+	mu.Unlock()
+	originalGrant, _ := json.Marshal(grant)
+	for _, change := range []func(){
+		func() { grant.VoidedAt = time.Now().Unix(); remaining = 0 },
+		func() { grant.Applicability.Scope.Prices[0].ID = "price_changed" },
+		func() { grant.EffectiveAt++ },
+	} {
+		mu.Lock()
+		change()
+		mu.Unlock()
+		if w := call(false, r); w.Code != 409 {
+			t.Fatal("changed grant accepted", w.Body.String())
+		}
+		mu.Lock()
+		_ = json.Unmarshal(originalGrant, &grant)
+		remaining = 2876543
+		mu.Unlock()
+	}
+	mu.Lock()
+	remaining = 0
+	mu.Unlock()
+	if w := call(false, r); w.Code != 200 {
+		t.Fatal("fully consumed unchanged grant rejected", w.Body.String())
+	}
+	annualHistory := StripeInvoiceAmounts{ID: "in_zero", Customer: sub.Customer, Status: "draft"}
+	rawHistory, _ := json.Marshal(map[string]any{"id": "in_zero", "customer": sub.Customer, "status": "draft", "parent": map[string]any{"subscription_details": map[string]any{"subscription": sub.ID}}, "lines": map[string]any{"data": []any{map[string]any{"amount": 0, "pricing": map[string]any{"price_details": map[string]any{"price": p.ID}}}}}})
+	_ = json.Unmarshal(rawHistory, &annualHistory)
+	mu.Lock()
+	remaining = 2876543
+	history = []StripeInvoiceAmounts{annualHistory}
+	mu.Unlock()
+	if w := call(false, r); w.Code != 409 {
+		t.Fatal("unresolved zero-fee draft accepted", w.Body.String())
+	}
+	mu.Lock()
+	history[0].Status = "paid"
+	mu.Unlock()
+	if w := call(false, r); w.Code != 200 {
+		t.Fatal("completed zero-fee history rejected", w.Body.String())
+	}
+	mu.Lock()
+	history[0].Lines.Data[0].Period.End = sponsor.End.Time.Unix() + 86400
+	mu.Unlock()
+	if w := call(false, r); w.Code != 409 {
+		t.Fatal("historical extra renewal day accepted", w.Body.String())
+	}
+	mu.Lock()
+	history[0].Lines.Data[0].Period.End = 0
 	mu.Unlock()
 	w := call(false, r)
 	if w.Code != 200 {
@@ -203,8 +256,12 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 	sub.Status = "canceled"
 	sub.EndedAt = time.Now().Unix()
 	mu.Unlock()
-	if err = h.reconcileSponsoredAnnual(ctx, team); err != nil {
-		t.Fatal("cancellation reconciliation", err)
+	if err = h.reconcileSponsoredAnnual(ctx, team); err == nil {
+		t.Fatal("unexpected waived-term cancellation did not request recovery")
+	}
+	var status, annualState string
+	if err = h.Pool.QueryRow(ctx, `SELECT a.stripe_subscription_status,b.state FROM team_billing_account a JOIN billing_sponsored_annual_authority b ON b.team_id=a.team_id WHERE a.team_id=$1`, team).Scan(&status, &annualState); err != nil || status != "canceled" || annualState != "active" {
+		t.Fatal("canceled lifecycle projection or bounded term lost", status, annualState, err)
 	}
 	if err = h.Pool.QueryRow(ctx, `SELECT max_sandboxes FROM team WHERE id=$1`, team).Scan(&limits); err != nil || limits != 777 {
 		t.Fatal("custom limits overwritten", limits, err)
@@ -235,7 +292,10 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(`UPDATE billing_sponsored_operation SET state='active' WHERE id=$1`, op)
-	exec(`INSERT INTO billing_sponsored_annual_authority(team_id,sponsorship_id,contract_id,idempotency_key,request,approved_by,customer_id,subscription_id,item_id,base_price_id,base_product_id,live_mode,home_region,starts_at,waiver_ends_at,provider_evidence) VALUES($1,$2,$3,'annual','{}',$4,$5,$6,'si_annual_'||$1::uuid::text,'price_annual','prod_annual',false,'use',$7,$8,'{}')`, team, op, contract, uuid.New(), customer, subscription, start, end)
+	historicalID := "in_waiver_" + team.String()
+	historical := StripeInvoiceAmounts{ID: historicalID, Customer: customer, Status: "paid"}
+	historyRaw, _ := json.Marshal(map[string]any{"waiver_inventory": []StripeInvoiceAmounts{historical}})
+	exec(`INSERT INTO billing_sponsored_annual_authority(team_id,sponsorship_id,contract_id,idempotency_key,request,approved_by,customer_id,subscription_id,item_id,base_price_id,base_product_id,live_mode,home_region,starts_at,waiver_ends_at,provider_evidence) VALUES($1,$2,$3,'annual','{}',$4,$5,$6,'si_annual_'||$1::uuid::text,'price_annual','prod_annual',false,'use',$7,$8,$9)`, team, op, contract, uuid.New(), customer, subscription, start, end, historyRaw)
 	o, err := h.sponsoredAnnualAuthority(ctx, team, h.Pool)
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +308,7 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 	sub.BillingMode.Type = "flexible"
 	sub.Items.Data = append(sub.Items.Data, invoiceSubscriptionItem{ID: o.Item, Quantity: 1, Price: p, Start: end.Unix(), End: annualBoundary(start, 24).Unix()})
 	invoiceID := "in_renewal_" + team.String()
-	var paid atomic.Bool
+	var paid, refunded, prorated atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("renewal attempted financial write %s %s", r.Method, r.URL.Path)
@@ -257,11 +317,17 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/invoices":
 			if paid.Load() {
-				fmt.Fprintf(w, `{"data":[{"id":%q}]}`, invoiceID)
+				fmt.Fprintf(w, `{"data":[{"id":%q,"status":"paid","amount_paid":1200000},{"id":%q,"status":"paid","amount_paid":0}]}`, invoiceID, historicalID)
 			} else {
-				fmt.Fprint(w, `{"data":[]}`)
+				fmt.Fprintf(w, `{"data":[{"id":%q,"status":"paid","amount_paid":0}]}`, historicalID)
 			}
+		case "/v1/invoices/" + historicalID:
+			_ = json.NewEncoder(w).Encode(historical)
 		case "/v1/invoices/" + invoiceID:
+			if prorated.Load() {
+				fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","currency":"usd","total":1196721,"amount_due":1196721,"amount_paid":1196721,"amount_remaining":0,"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"quantity":1,"amount":1196721,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"price_details":{"price":"price_annual","product":"prod_annual"}},"parent":{"subscription_item_details":{"subscription":%q,"subscription_item":%q,"proration":true}}}]}}`, invoiceID, customer, subscription, end.Unix()+86400, annualBoundary(start, 24).Unix(), subscription, o.Item)
+				return
+			}
 			fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","currency":"usd","total":1200000,"amount_due":1200000,"starting_balance":0,"ending_balance":0,"amount_paid":1200000,"amount_remaining":0,"status_transitions":{"paid_at":%d},"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"quantity":1,"amount":1200000,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"unit_amount_decimal":"1200000","price_details":{"price":"price_annual","product":"prod_annual"}},"parent":{"subscription_item_details":{"subscription":%q,"subscription_item":%q}}}]}}`, invoiceID, customer, end.Unix(), subscription, end.Unix(), annualBoundary(start, 24).Unix(), subscription, o.Item)
 		case "/v1/credit_notes":
 			fmt.Fprint(w, `{"data":[]}`)
@@ -270,7 +336,12 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 		case "/v1/payment_intents/pi_fixture":
 			fmt.Fprintf(w, `{"id":"pi_fixture","status":"succeeded","customer":%q,"currency":"usd","amount_received":1200000,"latest_charge":"ch_fixture"}`, customer)
 		case "/v1/charges/ch_fixture":
-			fmt.Fprintf(w, `{"id":"ch_fixture","customer":%q,"payment_intent":"pi_fixture","currency":"usd","paid":true,"captured":true,"amount_captured":1200000,"amount_refunded":0,"disputed":false}`, customer)
+			fmt.Fprintf(w, `{"id":"ch_fixture","customer":%q,"payment_intent":"pi_fixture","currency":"usd","paid":true,"captured":true,"amount_captured":1200000,"amount_refunded":%d,"disputed":false}`, customer, func() int {
+				if refunded.Load() {
+					return 1200000
+				}
+				return 0
+			}())
 		default:
 			t.Errorf("unexpected renewal request %s", r.URL.Path)
 			http.Error(w, "unexpected", 500)
@@ -287,6 +358,14 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 		t.Fatal("renewal before original boundary")
 	}
 	time.Sleep(time.Until(end.Add(20 * time.Millisecond)))
+	// Expiry must revoke the waived default benefits before any provider access.
+	if err = h.reconcileSponsoredAnnual(ctx, team); err == nil {
+		t.Fatal("missing provider unexpectedly accepted")
+	}
+	var limits int
+	if err = h.Pool.QueryRow(ctx, `SELECT max_sandboxes FROM team WHERE id=$1`, team).Scan(&limits); err != nil || limits == 1000 {
+		t.Fatal("waived benefits survived provider failure", limits, err)
+	}
 	for range 2 {
 		if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err != nil {
 			t.Fatal("unpaid renewal/replay", err)
@@ -303,6 +382,22 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 	}
 	paid.Store(true)
 	sub.LatestInvoice = invoiceID
+	prorated.Store(true)
+	if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err == nil {
+		t.Fatal("residual one-day-late annual proration accepted")
+	}
+	if err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_contract_payment WHERE contract_id=$1`, o.Renewal).Scan(&payments); err != nil || payments != 0 {
+		t.Fatal("residual proration conferred coverage", payments, err)
+	}
+	prorated.Store(false)
+	sub.Status = "canceled"
+	if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err == nil {
+		t.Fatal("terminal before activation did not require recovery")
+	}
+	if err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_contract_payment WHERE contract_id=$1`, o.Renewal).Scan(&payments); err != nil || payments != 1 {
+		t.Fatal("late canceled receipt lost", payments, err)
+	}
+	sub.Status = "active"
 	for range 2 {
 		if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err != nil {
 			t.Fatal("paid renewal/replay", err)
@@ -314,6 +409,23 @@ func TestSponsoredAnnualRenewalBoundary(t *testing.T) {
 	c, err = h.DB.GetCommercialContract(ctx, db.GetCommercialContractParams{TeamID: team, ContractID: o.Renewal})
 	if err != nil || c.Status != "active" {
 		t.Fatal("verified annual payment did not activate", c.Status, err)
+	}
+
+	sub.Status = "canceled"
+	if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err != nil {
+		t.Fatal("paid cancellation", err)
+	}
+	c, err = h.DB.GetCommercialContract(ctx, db.GetCommercialContractParams{TeamID: team, ContractID: o.Renewal})
+	if err != nil || c.Status != "active" {
+		t.Fatal("cancellation forfeited paid term", c.Status, err)
+	}
+	refunded.Store(true)
+	if err = h.reconcileSponsoredAnnualRenewal(ctx, o, sub, client, token); err == nil {
+		t.Fatal("canceled receipt refund was not reviewed")
+	}
+	var review bool
+	if err = h.Pool.QueryRow(ctx, `SELECT review_required FROM billing_pro_payment_verification WHERE invoice_id=$1`, invoiceID).Scan(&review); err != nil || !review {
+		t.Fatal("refund review not durable", review, err)
 	}
 
 }
