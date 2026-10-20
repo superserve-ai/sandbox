@@ -1,15 +1,14 @@
 name: Devbox Hostprep Seed
 
-# Copies the guest kernel and base rootfs from staging's hostprep artifacts,
-# which hosts are prepared from before CD injects boxd, into the devbox
-# hostprep bucket. Only if those objects do not exist does it read them from a
-# staging host, whose rootfs carries the boxd injected by its last deploy. The
-# kernel must match its pinned digest.
+# Copies the guest kernel and base rootfs from a staging host into the devbox
+# hostprep bucket, reading the host only. The kernel must match its pinned
+# digest; the rootfs carries the boxd injected by the host's last deploy,
+# which a box's own VMD install replaces.
 on:
   workflow_dispatch:
     inputs:
       host:
-        description: 'Staging host to read from if the staging hostprep objects do not exist'
+        description: 'Staging host to copy from'
         required: true
         default: superserve-vmd-staging
         type: string
@@ -31,7 +30,6 @@ jobs:
     environment: staging
     env:
       HOST: ${{ inputs.host }}
-      SOURCE: gs://superserve-artifact-backup-staging-usc1/hostprep
       BUCKET: gs://rayai-dev-devbox-hostprep/hostprep
       KERNEL_SHA256: 3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761
     steps:
@@ -78,32 +76,15 @@ jobs:
             echo "::error::Could not copy a consistent $2 after 3 attempts" >&2
             return 1
           }
-          listed=0
-          gcloud storage ls "$SOURCE/vmlinux-4.14-fuse" "$SOURCE/base.ext4" > /dev/null 2> "$work/ls.log" || listed=$?
-          if [ "$listed" -ne 0 ] && ! grep -q 'matched no objects' "$work/ls.log"; then
-            cat "$work/ls.log" >&2
-            echo "::error::Could not list $SOURCE; the staging identity needs read access to it" >&2
-            exit 1
-          fi
-          if [ "$listed" -eq 0 ]; then
-            origin="$SOURCE"
-            gcloud storage cp "$SOURCE/vmlinux-4.14-fuse" "$SOURCE/base.ext4" "$work/"
-            kernel=$(sha256sum "$work/vmlinux-4.14-fuse" | cut -d' ' -f1)
-            rootfs=$(sha256sum "$work/base.ext4" | cut -d' ' -f1)
-          else
-            cat "$work/ls.log" >&2
-            echo "::warning::$SOURCE lacks the hostprep objects; reading from $HOST, whose rootfs includes its injected boxd" >&2
-            origin="$HOST (rootfs includes the boxd injected by its last deploy)"
-            kernel=$(fetch /var/lib/sandbox/kernel/vmlinux-4.14-fuse vmlinux-4.14-fuse)
-            rootfs=$(fetch /var/lib/sandbox/rootfs/base.ext4 base.ext4)
-          fi
-          [ "$kernel" = "$KERNEL_SHA256" ] || { echo "::error::vmlinux-4.14-fuse from $origin has sha256 $kernel, not the pinned $KERNEL_SHA256"; exit 1; }
+          kernel=$(fetch /var/lib/sandbox/kernel/vmlinux-4.14-fuse vmlinux-4.14-fuse)
+          [ "$kernel" = "$KERNEL_SHA256" ] || { echo "::error::vmlinux-4.14-fuse on $HOST has sha256 $kernel, not the pinned $KERNEL_SHA256"; exit 1; }
+          rootfs=$(fetch /var/lib/sandbox/rootfs/base.ext4 base.ext4)
           gcloud storage cp "$work/vmlinux-4.14-fuse" "$work/base.ext4" "$BUCKET/"
           {
-            echo "## Devbox hostprep seeded from $origin"
+            echo "## Devbox hostprep seeded from $HOST"
             echo
             echo "- vmlinux-4.14-fuse: \`$KERNEL_SHA256\`"
-            echo "- base.ext4: \`$rootfs\`"
+            echo "- base.ext4: \`$rootfs\` (includes the boxd injected by the host's last deploy)"
             echo
             echo "If base.ext4 differs from DEVBOX_ROOTFS_DIGEST in deploy/devbox/runtime-pins.env, update that pin."
           } >> "$GITHUB_STEP_SUMMARY"
