@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -126,6 +127,20 @@ func validateSponsoredAnnualSubscription(o sponsoredAnnualAuthority, sub invoice
 				return errors.New("annual item does not retain the original service year")
 			}
 		}
+	}
+	roundingItems := 0
+	for _, item := range resources.Items.Data {
+		if rounding != "" && item.Price.ID == rounding {
+			roundingItems++
+			p := item.Price
+			amount, err := meterDecimal(p.UnitAmountDecimal)
+			if item.ID == "" || !p.Active || !proResourceShape(p) || p.Recurring.Meter == "" || err != nil || amount.Cmp(big.NewRat(1, 1)) != 0 {
+				return errors.New("rounding adjustment item must use an active USD monthly metered one-cent price")
+			}
+		}
+	}
+	if roundingItems != 1 {
+		return errors.New("subscription must include exactly one rounding adjustment item")
 	}
 	if err = validateFrozenProResources(resources, o.Params.ResourceTerms, rounding); err != nil {
 		return err

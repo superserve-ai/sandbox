@@ -178,6 +178,38 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 		t.Fatal(err)
 	}
 	r.Fingerprint = preview.Fingerprint
+	validItems := append([]invoiceSubscriptionItem(nil), sub.Items.Data...)
+	for _, invalid := range []string{"missing", "duplicate", "licensed", "amount", "meter"} {
+		mu.Lock()
+		sub.Items.Data = nil
+		for _, original := range validItems {
+			candidate := original
+			if candidate.Price.ID == "price_round" {
+				switch invalid {
+				case "missing":
+					continue
+				case "duplicate":
+					sub.Items.Data = append(sub.Items.Data, candidate)
+				case "licensed":
+					candidate.Price.Recurring.UsageType = "licensed"
+				case "amount":
+					candidate.Price.UnitAmountDecimal = "2"
+				case "meter":
+					candidate.Price.Recurring.Meter = ""
+				}
+			}
+			sub.Items.Data = append(sub.Items.Data, candidate)
+		}
+		mu.Unlock()
+		for _, apply := range []bool{false, true} {
+			if w := call(apply, r); w.Code != 409 || !strings.Contains(w.Body.String(), "rounding adjustment item") {
+				t.Fatalf("%s rounding item accepted (apply=%v): %d %s", invalid, apply, w.Code, w.Body.String())
+			}
+		}
+	}
+	mu.Lock()
+	sub.Items.Data = validItems
+	mu.Unlock()
 	var count int
 	if err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_sponsored_annual_authority WHERE team_id=$1`, team).Scan(&count); err != nil || count != 0 {
 		t.Fatal("preflight wrote authority", count, err)
