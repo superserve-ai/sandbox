@@ -90,17 +90,20 @@ storage rights, only the staging Terraform identity can write it, through the
 Devbox Hostprep Seed workflow.
 
 Dispatch Devbox Hostprep Seed (`.github/workflows/devbox-hostprep.yml`) from
-`main` once, preferably while no VMD deploy is running. It copies the guest kernel and
-base rootfs from staging Host 1 over IAP SSH, only reading the host. The
-kernel is never modified and must match the SHA-256 recorded in the
+`main` once. It copies the guest kernel and the pristine base rootfs from
+staging's non-secret host artifacts in
+`gs://superserve-artifact-backup-staging-usc1/hostprep/`, using the staging
+Terraform identity; the kernel must match the SHA-256 recorded in the
 [Host 2 identity runbook](../host2-identity-runbook.md), or the job stops.
-VMD deploys that change boxd re-inject it into the host's `base.ext4`, so its
-digest may legitimately differ from the runbook's `7494f228...`; any staging
-copy works because each box injects the boxd of its selected revision. The
-job reads each file once on the host, hashing exactly the bytes it sends, and
-accepts the copy only if the open file did not change during that read and
-the received bytes match the digest and size; it tries up to three times,
-then uploads both files and shows the rootfs digest in its summary.
+The rootfs on a running staging host is not pristine: every VMD deploy that
+changes boxd rewrites it with the new boxd. Only if the staging objects are
+unavailable does the job fall back to reading staging Host 1 over IAP SSH.
+That copy then includes the host's injected boxd, which a box's own VMD
+install replaces anyway. The fallback reads each file once on the host,
+hashing exactly the bytes it sends, and accepts the copy only if the open file
+did not change during that read and the received bytes match the digest and
+size. It tries up to three times. Either way the job uploads both files and
+shows the rootfs digest in its summary.
 
 Boxes verify both files against SHA-256 pins after download; the host
 bootstrap keeps them as `DEVBOX_KERNEL_DIGEST` and `DEVBOX_ROOTFS_DIGEST` in

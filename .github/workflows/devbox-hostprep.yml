@@ -1,13 +1,14 @@
 name: Devbox Hostprep Seed
 
-# Copies the guest kernel and base rootfs from a staging host into the devbox
-# hostprep bucket. The staging host is only read; the kernel must match its
-# pinned digest, and the rootfs must not change while it is copied.
+# Copies the guest kernel and pristine base rootfs from staging's hostprep
+# artifacts into the devbox hostprep bucket. Only if those objects are
+# unavailable does it read them from a staging host, whose rootfs carries the
+# boxd injected by its last deploy. The kernel must match its pinned digest.
 on:
   workflow_dispatch:
     inputs:
       host:
-        description: 'Staging host to copy from'
+        description: 'Staging host to read from if the staging hostprep objects are unavailable'
         required: true
         default: superserve-vmd-staging
         type: string
@@ -29,6 +30,7 @@ jobs:
     environment: staging
     env:
       HOST: ${{ inputs.host }}
+      SOURCE: gs://superserve-artifact-backup-staging-usc1/hostprep
       BUCKET: gs://rayai-dev-devbox-hostprep/hostprep
       KERNEL_SHA256: 3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761
     steps:
@@ -87,12 +89,22 @@ jobs:
             echo "::error::Could not copy a consistent $2 after 3 attempts" >&2
             return 1
           }
-          kernel=$(fetch /var/lib/sandbox/kernel/vmlinux-4.14-fuse vmlinux-4.14-fuse)
+          if gcloud storage ls "$SOURCE/vmlinux-4.14-fuse" "$SOURCE/base.ext4" > /dev/null 2> "$work/ls.log"; then
+            origin="$SOURCE"
+            gcloud storage cp "$SOURCE/vmlinux-4.14-fuse" "$SOURCE/base.ext4" "$work/"
+            kernel=$(sha256sum "$work/vmlinux-4.14-fuse" | cut -d' ' -f1)
+            rootfs=$(sha256sum "$work/base.ext4" | cut -d' ' -f1)
+          else
+            cat "$work/ls.log" >&2
+            echo "::warning::Staging hostprep objects unavailable; reading from $HOST, whose rootfs includes its injected boxd" >&2
+            origin="$HOST (rootfs includes the boxd injected by its last deploy)"
+            kernel=$(fetch /var/lib/sandbox/kernel/vmlinux-4.14-fuse vmlinux-4.14-fuse)
+            rootfs=$(fetch /var/lib/sandbox/rootfs/base.ext4 base.ext4)
+          fi
           [ "$kernel" = "$KERNEL_SHA256" ] || { echo "::error::vmlinux-4.14-fuse does not match its pinned digest"; exit 1; }
-          rootfs=$(fetch /var/lib/sandbox/rootfs/base.ext4 base.ext4)
           gcloud storage cp "$work/vmlinux-4.14-fuse" "$work/base.ext4" "$BUCKET/"
           {
-            echo "## Devbox hostprep seeded from $HOST"
+            echo "## Devbox hostprep seeded from $origin"
             echo
             echo "- vmlinux-4.14-fuse: \`$KERNEL_SHA256\`"
             echo "- base.ext4: \`$rootfs\`"
