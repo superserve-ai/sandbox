@@ -8,9 +8,6 @@ concurrency:
   group: terraform-checks-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-env:
-  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
-
 jobs:
   terraform-changes:
     runs-on: ubuntu-latest
@@ -141,6 +138,7 @@ jobs:
             environment: production
     environment: ${{ matrix.environment }}
     env:
+      TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
       TF_IN_AUTOMATION: "true"
       HAS_GCP_AUTH: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
       # Existing Monitoring channel resource names are non-secret references;
