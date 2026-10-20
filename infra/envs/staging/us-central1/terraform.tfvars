@@ -1,4 +1,12 @@
-promotion_evidence_enabled = true
+promotion_evidence_enabled  = true
+yc_claim_api_access_enabled = true
+yc_claim_api_enabled        = true
+yc_claims_enabled           = false
+yc_claim_console_url        = "https://console-git-codex-yc-claim-completion-superserve.vercel.app"
+yc_claim_api_secret_versions = {
+  capture = "3"
+  console = "3"
+}
 
 project_id                            = "rayai-dev"
 environment                           = "staging"
