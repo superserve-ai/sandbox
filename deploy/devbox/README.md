@@ -97,8 +97,10 @@ kernel is never modified and must match the SHA-256 recorded in the
 VMD deploys that change boxd re-inject it into the host's `base.ext4`, so its
 digest may legitimately differ from the runbook's `7494f228...`; any staging
 copy works because each box injects the boxd of its selected revision. The
-job stops if the rootfs changes during the copy, uploads both files and shows
-the rootfs digest in its summary.
+job reads each file once on the host, hashing exactly the bytes it sends, and
+accepts the copy only if the open file did not change during that read and
+the received bytes match the digest and size; it tries up to three times,
+then uploads both files and shows the rootfs digest in its summary.
 
 Boxes verify both files against SHA-256 pins after download; the host
 bootstrap keeps them as `DEVBOX_KERNEL_DIGEST` and `DEVBOX_ROOTFS_DIGEST` in
