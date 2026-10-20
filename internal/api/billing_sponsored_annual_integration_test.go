@@ -143,7 +143,7 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 		t.Fatal("fully consumed unchanged grant rejected", w.Body.String())
 	}
 	annualHistory := StripeInvoiceAmounts{ID: "in_zero", Customer: sub.Customer, Status: "draft"}
-	rawHistory, _ := json.Marshal(map[string]any{"id": "in_zero", "customer": sub.Customer, "status": "draft", "parent": map[string]any{"subscription_details": map[string]any{"subscription": sub.ID}}, "lines": map[string]any{"data": []any{map[string]any{"amount": 0, "pricing": map[string]any{"price_details": map[string]any{"price": p.ID}}}}}})
+	rawHistory, _ := json.Marshal(map[string]any{"id": "in_zero", "customer": sub.Customer, "status": "draft", "parent": map[string]any{"subscription_details": map[string]any{"subscription": sub.ID}}, "lines": map[string]any{"data": []any{map[string]any{"amount": 0, "pricing": map[string]any{"price_details": map[string]any{"price": p.ID}}, "parent": map[string]any{"subscription_item_details": map[string]any{"subscription": sub.ID, "subscription_item": item.ID}}}}}})
 	_ = json.Unmarshal(rawHistory, &annualHistory)
 	mu.Lock()
 	remaining = 2876543
@@ -178,6 +178,25 @@ func testSponsoredAnnualAdoption(t *testing.T, h *Handlers, team uuid.UUID, spon
 		t.Fatal(err)
 	}
 	r.Fingerprint = preview.Fingerprint
+	for _, status := range []string{"paid", "draft"} {
+		for _, amount := range []int64{0, 1200000} {
+			mu.Lock()
+			history[0].Status = status
+			history[0].Lines.Data[0].Amount = amount
+			history[0].Lines.Data[0].Pricing.PriceDetails.Price = "price_previous_annual"
+			mu.Unlock()
+			for _, apply := range []bool{false, true} {
+				if w := call(apply, r); w.Code != 409 || !strings.Contains(w.Body.String(), "historical annual item price differs") {
+					t.Fatalf("previous annual item price accepted (%s, %d, apply=%v): %d %s", status, amount, apply, w.Code, w.Body.String())
+				}
+			}
+		}
+	}
+	mu.Lock()
+	history[0].Status = "paid"
+	history[0].Lines.Data[0].Amount = 0
+	history[0].Lines.Data[0].Pricing.PriceDetails.Price = p.ID
+	mu.Unlock()
 	validItems := append([]invoiceSubscriptionItem(nil), sub.Items.Data...)
 	for _, invalid := range []string{"missing", "duplicate", "licensed", "amount", "meter"} {
 		mu.Lock()

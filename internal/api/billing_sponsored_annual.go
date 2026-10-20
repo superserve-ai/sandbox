@@ -260,7 +260,12 @@ func (c *stripeHTTPClient) annualWaiverInventory(ctx context.Context, o sponsore
 			return nil, errors.New("annual waiver invoice inventory is incomplete")
 		}
 		for _, line := range inv.Lines.Data {
-			if line.Pricing.PriceDetails != nil && line.Pricing.PriceDetails.Price == o.Price && inv.Status != "void" {
+			itemMatches := line.Parent.SubscriptionItemDetails != nil && line.Parent.SubscriptionItemDetails.SubscriptionItem == o.Item
+			priceMatches := line.Pricing.PriceDetails != nil && line.Pricing.PriceDetails.Price == o.Price
+			if inv.Status != "void" && (itemMatches || priceMatches) {
+				if itemMatches && !priceMatches {
+					return nil, errors.New("historical annual item price differs; explicit financial reconciliation required")
+				}
 				// An explicit local waiver is adopted only when there is no collectible
 				// historical base line. Discounted gross invoices require separate accounting.
 				if line.Amount != 0 || inv.Status != "paid" {
@@ -290,7 +295,7 @@ func (c *stripeHTTPClient) annualWaiverInventory(ctx context.Context, o sponsore
 		return nil, errors.New("annual preview ownership differs")
 	}
 	for _, line := range preview.Lines.Data {
-		if line.Pricing.PriceDetails != nil && line.Pricing.PriceDetails.Price == o.Price {
+		if (line.Parent.SubscriptionItemDetails != nil && line.Parent.SubscriptionItemDetails.SubscriptionItem == o.Item) || (line.Pricing.PriceDetails != nil && line.Pricing.PriceDetails.Price == o.Price) {
 			return nil, errors.New("first-year preview includes an annual fee")
 		}
 	}
