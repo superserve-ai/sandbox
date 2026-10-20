@@ -90,9 +90,10 @@ storage rights, only the staging Terraform identity can write it, through the
 Devbox Hostprep Seed workflow.
 
 Dispatch Devbox Hostprep Seed (`.github/workflows/devbox-hostprep.yml`) from
-`main` once. It copies the guest kernel and base rootfs from staging Host 1
-over IAP SSH, only reading the host: no staging bucket holds an established
-copy of these files, so the verified Host 1 files are the source, as the
+`main` once, preferably while no VMD deploy is running. It copies the guest
+kernel and base rootfs from staging Host 1 (the `host` input's default) over
+IAP SSH, only reading the host: no staging bucket holds an established copy of
+these files, so Host 1's files are the source, as the
 [Host 2 identity runbook](../host2-identity-runbook.md) also directs. The
 kernel is never modified and must match the SHA-256 recorded there, or the job
 stops. The rootfs is rewritten with the current boxd by every VMD deploy that
