@@ -5,7 +5,6 @@ name: Devbox Checks
 # the host identity installer, so changes to those run these checks too.
 on:
   pull_request:
-    branches: [main]
     paths:
       - 'deploy/devbox/**'
       - 'deploy/host-bootstrap/**'
@@ -16,6 +15,14 @@ on:
       - 'scripts/test_provision_devbox_stripe.py'
       - 'scripts/provision_storage_stripe.py'
       - 'scripts/migrate_database.py'
+      - 'scripts/migrate_devbox_shared_auth.py'
+      - 'scripts/test_devbox_shared_auth.py'
+      - 'scripts/migrate_shared_auth.py'
+      - 'scripts/test_shared_auth_migrations.py'
+      - 'scripts/test_migration_cli.py'
+      - 'scripts/migration-requirements.txt'
+      - 'supabase/shared-auth-history/**'
+      - 'supabase/shared-auth-migrations/**'
       - 'supabase/migrations/**'
       - 'internal/api/billing_pro_checkout.go'
   push:
@@ -30,6 +37,14 @@ on:
       - 'scripts/test_provision_devbox_stripe.py'
       - 'scripts/provision_storage_stripe.py'
       - 'scripts/migrate_database.py'
+      - 'scripts/migrate_devbox_shared_auth.py'
+      - 'scripts/test_devbox_shared_auth.py'
+      - 'scripts/migrate_shared_auth.py'
+      - 'scripts/test_shared_auth_migrations.py'
+      - 'scripts/test_migration_cli.py'
+      - 'scripts/migration-requirements.txt'
+      - 'supabase/shared-auth-history/**'
+      - 'supabase/shared-auth-migrations/**'
       - 'supabase/migrations/**'
       - 'internal/api/billing_pro_checkout.go'
 
@@ -37,6 +52,25 @@ permissions:
   contents: read
 
 jobs:
+  shared-auth:
+    name: Devbox Shared Auth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: '2.119.0'
+
+      - name: Install isolated migration dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/migration-venv"
+          "$RUNNER_TEMP/migration-venv/bin/python" -m pip install -r scripts/migration-requirements.txt
+          "$RUNNER_TEMP/migration-venv/bin/python" -I -c 'import psycopg'
+
+      - name: Validate disposable shared Auth initialization
+        run: '"$RUNNER_TEMP/migration-venv/bin/python" scripts/test_devbox_shared_auth.py'
+
   checks:
     name: Devbox Checks
     runs-on: ubuntu-latest

@@ -30,6 +30,9 @@ ROLES = ("anon", "authenticated", "service_role", "promotion_evidence_proxy")
 LEDGER = "shared_auth_migrations.schema_migrations"
 MUTEX = 6834211091020402
 OPTIONS = "-c statement_timeout=15000 -c lock_timeout=1000 -c transaction_timeout=30000"
+# Ordered statements recorded by the devbox installer's pinned CLI 2.119.0
+# for regional.AGGREGATE; unlike use4's historical receipt, CLI splits SQL.
+DEVBOX_BASELINE_HASH = "410eaddeb679e0114fbb667761e8f57e00327f99c9a0f927e4f39cf2023b5424"
 ACL_SQL = """
 REVOKE ALL ON TABLE public.yc_company_activation_authority FROM service_role;
 GRANT SELECT,INSERT,UPDATE ON TABLE public.yc_company_activation_authority TO service_role;
@@ -265,7 +268,12 @@ def prerequisites(conn, target):
     rows = ordinary_history(conn)
     require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION, ACCEPTANCE_VERSION) for row in rows), "shared_version_in_regional_history")
     aggregate = [row for row in rows if row[0] == regional.VERSION]
-    if target == "use4":
+    if target == "devbox":
+        require(len(aggregate) == 1 and aggregate[0][1] == regional.NAME
+                and hashlib.sha256(json.dumps(aggregate[0][2], separators=(",", ":"),
+                                               ensure_ascii=False).encode()).hexdigest() == DEVBOX_BASELINE_HASH,
+                "historical_aggregate_mismatch")
+    elif target == "use4":
         require(len(aggregate) == 1 and aggregate[0][1] == regional.NAME
                 and len(aggregate[0][2] or []) == 1
                 and hashlib.sha256(aggregate[0][2][0].encode()).hexdigest() == regional.SHA256,
@@ -510,6 +518,13 @@ def verify_changed_permissions(conn, migration, created_ledger=False):
 
 def apply(conn, target, revision, sql, execute=False, migration="authority"):
     require(target in ("staging", "use4"), "unsupported_auth_target")
+    return _apply(conn, target, revision, sql, execute, migration)
+
+
+def _apply(conn, target, revision, sql, execute=False, migration="authority"):
+    # The separate devbox entrypoint verifies its VM, database and lease before
+    # reaching this engine. The production CLI retains its project-bound guard.
+    require(target in ("staging", "use4", "devbox"), "unsupported_auth_target")
     require(re.fullmatch(r"[a-f0-9]{40}", revision), "invalid_revision")
     require(migration in ("authority", "claims", "approvals", "acceptances"), "unsupported_shared_migration")
     version, name, expected_hash, executed_sql, snapshot = (
