@@ -71,10 +71,10 @@ func (q *Queries) AcceptBuildPublication(ctx context.Context, id, attempt uuid.U
 
 // FinalizeTemplateBuild records readiness from the producer's own report. The
 // upload is a separate obligation, tracked by accepted_at.
-func (q *Queries) FinalizeTemplateBuild(ctx context.Context, id, attempt uuid.UUID, runtime json.RawMessage, rootfsAllocated, baseAllocated, deltaAllocated int64) (bool, error) {
+func (q *Queries) FinalizeTemplateBuild(ctx context.Context, id, attempt uuid.UUID, runtime json.RawMessage, rootfsAllocated, baseAllocated, deltaAllocated int64, allocationsVerified bool) (bool, error) {
 	var ok bool
-	err := q.db.QueryRow(ctx, `SELECT finalize_template_build($1,$2,$3,$4,$5,$6)`,
-		id, attempt, runtime, rootfsAllocated, baseAllocated, deltaAllocated).Scan(&ok)
+	err := q.db.QueryRow(ctx, `SELECT finalize_template_build($1,$2,$3,$4,$5,$6,$7)`,
+		id, attempt, runtime, rootfsAllocated, baseAllocated, deltaAllocated, allocationsVerified).Scan(&ok)
 	return ok, err
 }
 func (q *Queries) RecordBuildPublication(ctx context.Context, attempt uuid.UUID, host, bucket, generation, manifest string, files, runtime json.RawMessage, verified time.Time) (bool, error) {

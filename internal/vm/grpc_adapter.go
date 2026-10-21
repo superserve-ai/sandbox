@@ -721,6 +721,7 @@ func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildSta
 		resp.ResolvedDigest = snap.Result.ResolvedDigest
 		resp.SizeBytes = snap.Result.SizeBytes
 		resp.AllocatedBytesSupported = true
+		resp.AllocationsVerified = snap.Result.AllocationsVerified
 		resp.RootfsAllocatedBytes = snap.Result.RootfsAllocatedBytes
 		resp.BaseAllocatedBytes = snap.Result.BaseAllocatedBytes
 		resp.DeltaAllocatedBytes = snap.Result.DeltaAllocatedBytes

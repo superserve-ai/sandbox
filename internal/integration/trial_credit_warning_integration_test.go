@@ -373,6 +373,7 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 		VALUES ($1, 'shared.ext4', $2, 1073741824, 1073741824, repeat('0', 64))`, templateID, artifactPath); err != nil {
 		t.Fatalf("seed artifact warning manifest: %v", err)
 	}
+	seedHistoricalPositiveTeamAllocations(t, teamID, now.Add(-24*time.Hour))
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 		VALUES ($1, $2, 1024, $3)`, sandboxID, teamID, now.Add(-8*time.Hour)); err != nil {

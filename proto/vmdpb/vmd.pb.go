@@ -527,8 +527,10 @@ type GetBuildStatusResponse struct {
 	BaseAllocatedBytes      int64 `protobuf:"varint,14,opt,name=base_allocated_bytes,json=baseAllocatedBytes,proto3" json:"base_allocated_bytes,omitempty"`
 	DeltaAllocatedBytes     int64 `protobuf:"varint,15,opt,name=delta_allocated_bytes,json=deltaAllocatedBytes,proto3" json:"delta_allocated_bytes,omitempty"`
 	AllocatedBytesSupported bool  `protobuf:"varint,16,opt,name=allocated_bytes_supported,json=allocatedBytesSupported,proto3" json:"allocated_bytes_supported,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// True only when every declared allocation was successfully measured.
+	AllocationsVerified bool `protobuf:"varint,17,opt,name=allocations_verified,json=allocationsVerified,proto3" json:"allocations_verified,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *GetBuildStatusResponse) Reset() {
@@ -669,6 +671,13 @@ func (x *GetBuildStatusResponse) GetDeltaAllocatedBytes() int64 {
 func (x *GetBuildStatusResponse) GetAllocatedBytesSupported() bool {
 	if x != nil {
 		return x.AllocatedBytesSupported
+	}
+	return false
+}
+
+func (x *GetBuildStatusResponse) GetAllocationsVerified() bool {
+	if x != nil {
+		return x.AllocationsVerified
 	}
 	return false
 }
@@ -4279,7 +4288,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x15BuildTemplateResponse\x12\x1e\n" +
 	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"7\n" +
 	"\x15GetBuildStatusRequest\x12\x1e\n" +
-	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\x84\x05\n" +
+	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\xb7\x05\n" +
 	"\x16GetBuildStatusResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -4300,7 +4309,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x16rootfs_allocated_bytes\x18\r \x01(\x03R\x14rootfsAllocatedBytes\x120\n" +
 	"\x14base_allocated_bytes\x18\x0e \x01(\x03R\x12baseAllocatedBytes\x122\n" +
 	"\x15delta_allocated_bytes\x18\x0f \x01(\x03R\x13deltaAllocatedBytes\x12:\n" +
-	"\x19allocated_bytes_supported\x18\x10 \x01(\bR\x17allocatedBytesSupported\"4\n" +
+	"\x19allocated_bytes_supported\x18\x10 \x01(\bR\x17allocatedBytesSupported\x121\n" +
+	"\x14allocations_verified\x18\x11 \x01(\bR\x13allocationsVerified\"4\n" +
 	"\x12CancelBuildRequest\x12\x1e\n" +
 	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\x15\n" +
 	"\x13CancelBuildResponse\"8\n" +

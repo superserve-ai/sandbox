@@ -1494,6 +1494,22 @@ func testFrozenFractionalStorageReplay(t *testing.T, pool *pgxpool.Pool) {
 			exec(`INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id,base_path,created_at,destroyed_at) VALUES($1,$2,'example-fractional','deleted',1,1024,'default',$3,$4,$5)`, sandbox, team.ID, path, start, start.Add(time.Hour))
 			exec(`INSERT INTO template(team_id,name,status,build_spec,vcpu,memory_mib,disk_mib,rootfs_path) VALUES($1,'example-fractional','ready','{}',1,1024,1024,$2)`, team.ID, path)
 			exec(`INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256) SELECT id,'base.ext4',rootfs_path,1073745920,1073745920,repeat('0',64) FROM template WHERE team_id=$1`, team.ID)
+			// This fixture represents a measurement already known in January.
+			// Ordinary runtime writes cannot backdate template eligibility.
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `UPDATE artifact_manifest SET allocation_eligible_at=$2 WHERE path=$1`, path, start); err != nil {
+				t.Fatal(err)
+			}
+			if err = tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
 			exec(`UPDATE sandbox SET template_id=(SELECT id FROM template WHERE team_id=$1) WHERE id=$2`, team.ID, sandbox)
 			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason) VALUES($1,$2,1024,$3,$4,'deleted')`, sandbox, team.ID, start, start.Add(time.Hour))
 			rollup := func() {
@@ -1530,15 +1546,17 @@ func testFrozenFractionalStorageReplay(t *testing.T, pool *pgxpool.Pool) {
 				rollup()
 				check("7372814.0625", 0)
 			}
-			exec(`UPDATE artifact_manifest SET allocated_bytes=1073750016 WHERE path=$1`, path)
+			// Exercise historical correction detection through private interval
+			// data; a new template measurement applies only prospectively.
+			exec(`UPDATE sandbox_storage_interval SET disk_mib=1025 WHERE sandbox_id=$1`, sandbox)
 			rollup()
-			check("7372828.125", 1)
+			check("7376414.0625", 1)
 			actor := uuid.New()
 			exec(`INSERT INTO profile(id,email,provider,provider_id) VALUES($1,$2,'google',$3)`, actor, actor.String()+"@example.com", actor.String())
 			exec(`UPDATE billing_period_anomaly SET resolved_at=now(),resolved_by=$2 WHERE team_id=$1`, team.ID, actor)
-			exec(`UPDATE artifact_manifest SET allocated_bytes=1073741824 WHERE path=$1`, path)
+			exec(`UPDATE sandbox_storage_interval SET disk_mib=1023 WHERE sandbox_id=$1`, sandbox)
 			rollup()
-			check("7372800", 1)
+			check("7369214.0625", 1)
 		})
 	}
 }

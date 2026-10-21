@@ -296,18 +296,22 @@ type ApiKey struct {
 }
 
 type ArtifactManifest struct {
-	ID             uuid.UUID   `json:"id"`
-	SnapshotID     pgtype.UUID `json:"snapshot_id"`
-	TemplateID     pgtype.UUID `json:"template_id"`
-	FileName       string      `json:"file_name"`
-	Path           string      `json:"path"`
-	SizeBytes      int64       `json:"size_bytes"`
-	Sha256         string      `json:"sha256"`
-	BasePath       *string     `json:"base_path"`
-	GuestKernel    *string     `json:"guest_kernel"`
-	VmdVersion     *string     `json:"vmd_version"`
-	CreatedAt      time.Time   `json:"created_at"`
-	AllocatedBytes int64       `json:"allocated_bytes"`
+	ID                   uuid.UUID          `json:"id"`
+	SnapshotID           pgtype.UUID        `json:"snapshot_id"`
+	TemplateID           pgtype.UUID        `json:"template_id"`
+	FileName             string             `json:"file_name"`
+	Path                 string             `json:"path"`
+	SizeBytes            int64              `json:"size_bytes"`
+	Sha256               string             `json:"sha256"`
+	BasePath             *string            `json:"base_path"`
+	GuestKernel          *string            `json:"guest_kernel"`
+	VmdVersion           *string            `json:"vmd_version"`
+	CreatedAt            time.Time          `json:"created_at"`
+	AllocatedBytes       int64              `json:"allocated_bytes"`
+	AllocationMeasuredAt pgtype.Timestamptz `json:"allocation_measured_at"`
+	AllocationEligibleAt pgtype.Timestamptz `json:"allocation_eligible_at"`
+	AllocationBuildID    pgtype.UUID        `json:"allocation_build_id"`
+	AllocationAttemptID  pgtype.UUID        `json:"allocation_attempt_id"`
 }
 
 type AuditLog struct {

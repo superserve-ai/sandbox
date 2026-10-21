@@ -205,6 +205,8 @@ message GetBuildStatusResponse {
   int64 base_allocated_bytes = 14;
   int64 delta_allocated_bytes = 15;
   bool allocated_bytes_supported = 16;
+  // True only when every declared allocation was successfully measured.
+  bool allocations_verified = 17;
 }
 
 message CancelBuildRequest {
