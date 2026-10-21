@@ -15,8 +15,11 @@ isolated staging database. If staging points to production Auth, stop and establ
 an explicitly approved scope or isolated staging target before any writes or
 activation tests. Runtime retargeting requires coordination with its owning release.
 Deployments do not repeatedly inspect runtime secrets or change their configuration.
-The migration executor independently validates its actual privileged connection's
-project, required SQL, ledger and catalog on every invocation.
+The migration executor validates its actual privileged connection's project,
+source bytes and ordered migration receipts on each apply. If the selected receipt
+already matches, it returns without a migration lock or schema/ACL audit. The
+private ledger is trusted migration history: deployment does not continuously
+audit privileged out-of-band changes. Use explicit `inspect` to check drift.
 
 The reusable prerequisite preserves the exact source and successful push-CI gate.
 Compatible manual branch staging uses main's identical migration bundle; changes
@@ -29,8 +32,10 @@ target, required versions and source bundle. Each API-bearing full Terraform app
 and API deployment checks that receipt before changing the consumer. A failed-job
 only rerun cannot reuse an earlier attempt's receipt: **re-run all jobs** to execute
 the prerequisite again. These workflow receipts do not rewrite historical database
-ledger revisions; identical previously applied content remains valid after live
-executor verification. No receipt attests continuous runtime configuration state.
+ledger revisions; identical previously applied content remains valid after the
+executor checks its receipt. A no-op reports regional history unchanged because
+it performs only reads; an actual application compares history before and after
+its writes. No receipt attests continuous runtime configuration state.
 
 The manual **Apply shared Auth migration** workflow remains available for inspection
 and recovery through separately selected operations.
@@ -52,14 +57,15 @@ normalization), SHA-256 of the original, source revision, and catalog in the pri
 `shared_auth_migrations.schema_migrations` ledger. It does not create an approval,
 enroll a customer, or modify Stripe.
 
-An identical retry verifies and skips the applied migration. Source/history/catalog
-mismatch, an unrecorded existing schema, or an unknown ledger version stops the
-executor without repair. After a timeout or uncertain commit, run `inspect` before
+An identical retry checks the complete known receipt prefix and skips the applied
+migration. Source/receipt mismatch, missing predecessors, unknown ledger versions,
+or a partial/unreadable ledger stop without repair. New objects use strict DDL:
+conflicting unrecorded objects fail atomically rather than being adopted. Full
+catalog and historical privilege comparisons run only during explicit inspection. After a timeout or uncertain commit, run `inspect` before
 retrying. Never infer failure from a missing acknowledgement and replay SQL manually.
 After authority application is verified, select migration `claims` and repeat
 `inspect`, review, and separately authorized `apply`. Claims require the existing
-authority receipt and unchanged catalog; this operation never applies authority
-implicitly. It verifies the exact source hash and removes only the asserted outer
+authority receipt; this operation never applies authority implicitly. It verifies the exact source hash and removes only the asserted outer
 BEGIN/COMMIT from its execution copy. The claim schema, Auth lifecycle trigger,
 and private receipt then commit atomically. The receipt retains original bytes
 and executed SQL, including fixed restrictions on inherited trigger-function
@@ -73,9 +79,19 @@ authority-only executor deliberately refuses the additional ledger version.
 Future migrations still require an explicit extension and review.
 
 After claims, select `approvals` for the staff decision and notification schema.
-It requires the claim receipt and verifies the intentional replacements of the
-shared activation functions. Automated deployment prerequisites use the same
-executor and private ledger, and stop if any application or verification fails.
+It requires the claim receipt and checks effective access on the new objects and
+intentionally replaced functions. Automated deployment prerequisites use the same
+executor and private ledger, and stop if an application or receipt check fails.
+
+For a pending migration, the executor locks and rereads receipts before writing,
+so another executor's intervening commit cannot cause duplicate DDL. It checks
+only the selected migration's required setup and affected security surfaces,
+including effective access to a newly created private ledger. Shared versions in
+regional history are rejected before writes. It then captures one compatible
+catalog snapshot for the new receipt. It does not audit
+unchanged predecessors or run a full inspection after writing. Schema and receipt
+commit together, and success is emitted only after commit acknowledges. Existing
+statement, lock, and transaction timeouts remain in effect.
 
 Verify `inspect` reports `applied`, regional history is unchanged, and all deployed
 regions use the verified RPC authority. Then perform the

@@ -197,11 +197,15 @@ class SharedExecutionTests(unittest.TestCase):
             for command in calls:
                 self.assertEqual(command[-1], gate.SHARED_TARGETS[target])
                 self.assertEqual(command[command.index("--revision") + 1], SHA)
-        with patch.object(gate, "verify_checkout"), patch.object(gate.subprocess, "run", return_value=
-                subprocess.CompletedProcess([], 1, "", "private driver output")) as run:
-            with self.assertRaisesRegex(gate.GateError, "inspect before retrying"):
-                gate.apply_shared(self.env, "staging")
-            self.assertEqual(run.call_count, 1)
+        for failed_at in range(3):
+            outcomes = [subprocess.CompletedProcess([], 0, json.dumps(dict(
+                target="staging", version=version, state="applied", regional_history_unchanged=True)))
+                for version in list(gate.SHARED_MIGRATIONS.values())[:failed_at]]
+            outcomes.append(subprocess.CompletedProcess([], 1, "", "private driver output"))
+            with patch.object(gate, "verify_checkout"), patch.object(gate.subprocess, "run", side_effect=outcomes) as run:
+                with self.assertRaisesRegex(gate.GateError, "inspect before retrying"):
+                    gate.apply_shared(self.env, "staging")
+                self.assertEqual(run.call_count, failed_at + 1)
         for bad in (dict(target="staging", version=gate.SHARED_MIGRATIONS["authority"],
                          state="pending", regional_history_unchanged=True), {},
                     dict(target="use4", version=gate.SHARED_MIGRATIONS["authority"],

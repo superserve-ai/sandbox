@@ -340,28 +340,123 @@ def inspect(conn, sql, migration="authority"):
     return "applied" if selected in versions else "pending"
 
 
+def receipt_ledger_exists(conn):
+    privileged, schema, table = conn.execute(
+        "SELECT current_user='postgres' AND session_user='postgres' "
+        "AND current_setting('server_version_num')::int>=170000, "
+        "to_regnamespace('shared_auth_migrations') IS NOT NULL, to_regclass(%s) IS NOT NULL",
+        (LEDGER,)).fetchone()
+    require(privileged, "privileged_postgres_session_required")
+    require(schema == table, "partial_shared_ledger")
+    return table
+
+
+def receipt_versions(conn):
+    # The private ledger is authoritative during deployment; drift audits are explicit.
+    authority, claims, approvals = source(), claim_source(), approval_source()
+    expected = {
+        VERSION: (NAME, authority, authority + ACL_SQL, SOURCE_HASH),
+        CLAIM_VERSION: (CLAIM_NAME, claims, claim_execution(claims), CLAIM_HASH),
+        APPROVAL_VERSION: (APPROVAL_NAME, approvals, approval_execution(approvals), APPROVAL_HASH),
+    }
+    rows = conn.execute(f"SELECT version,name,source_sql,applied_sql,source_sha256,revision FROM {LEDGER} ORDER BY version").fetchall()
+    versions = {row[0] for row in rows}
+    require(len(versions) == len(rows) and versions <= expected.keys(), "unknown_shared_history")
+    require(CLAIM_VERSION not in versions or VERSION in versions, "claim_authority_history_missing")
+    require(APPROVAL_VERSION not in versions or CLAIM_VERSION in versions, "approval_claim_history_missing")
+    for version, name, original, executed, digest, revision in rows:
+        require((name, original, executed, digest) == expected[version]
+                and re.fullmatch(r"[a-f0-9]{40}", revision), "shared_history_mismatch")
+    return versions
+
+
+def verify_changed_permissions(conn, migration, created_ledger=False):
+    tables, functions = {
+        "authority": ((TABLE,), FUNCTIONS),
+        "claims": (CLAIM_TABLES, CLAIM_FUNCTIONS),
+        "approvals": (APPROVAL_TABLES, APPROVAL_FUNCTIONS + (CLAIM_FUNCTIONS[0], RPCS[1], RPCS[3])),
+    }[migration]
+    valid = conn.execute("""
+      WITH tables AS (SELECT unnest(%s::text[]) AS name),
+           functions AS (SELECT unnest(%s::text[]) AS name),
+           roles AS (SELECT unnest(%s::text[]) AS name)
+      SELECT
+        NOT EXISTS (SELECT FROM tables t LEFT JOIN pg_class c ON c.oid=to_regclass(t.name)
+                    WHERE c.oid IS NULL OR c.relkind<>'r' OR NOT c.relrowsecurity
+                       OR c.relowner<>'postgres'::regrole)
+        AND NOT EXISTS (
+          SELECT FROM tables t CROSS JOIN roles r
+          CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) p
+          WHERE has_table_privilege(r.name,t.name,p) <>
+                (t.name='public.yc_company_activation_authority' AND r.name='service_role'
+                 AND p IN ('SELECT','INSERT','UPDATE')))
+        AND NOT EXISTS (
+          SELECT FROM tables t CROSS JOIN roles r
+          CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','REFERENCES']) p
+          WHERE has_any_column_privilege(r.name,t.name,p) <>
+                (t.name='public.yc_company_activation_authority' AND r.name='service_role'
+                 AND p IN ('SELECT','INSERT','UPDATE')))
+        AND NOT EXISTS (SELECT FROM functions f LEFT JOIN pg_proc p ON p.oid=to_regprocedure(f.name)
+                        WHERE p.oid IS NULL OR p.proowner<>'postgres'::regrole)
+        AND NOT EXISTS (
+          SELECT FROM functions f CROSS JOIN roles r
+          WHERE has_function_privilege(r.name,f.name,'EXECUTE') <>
+            ((f.name=ANY(%s::text[]) AND r.name IN ('service_role','promotion_evidence_proxy'))
+             OR (f.name=ANY(%s::text[]) AND r.name='promotion_evidence_proxy')))
+        AND (%s<>'claims' OR EXISTS (
+          SELECT FROM pg_trigger WHERE tgrelid=to_regclass('auth.users')
+            AND tgname='yc_claim_auth_lifecycle' AND tgenabled='O' AND NOT tgisinternal))
+        AND (NOT %s OR NOT EXISTS (
+          SELECT FROM roles r
+          WHERE has_schema_privilege(r.name,'shared_auth_migrations','USAGE,CREATE')
+             OR has_table_privilege(r.name,%s,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')))
+    """, (list(tables), list(functions), list(ROLES), list(RPCS),
+          [CLAIM_FUNCTIONS[1], *APPROVAL_FUNCTIONS], migration, created_ledger, LEDGER)).fetchone()[0]
+    require(valid, "migration_privileges_mismatch")
+
+
 def apply(conn, target, revision, sql, execute=False, migration="authority"):
     require(target in ("staging", "use4"), "unsupported_auth_target")
     require(re.fullmatch(r"[a-f0-9]{40}", revision), "invalid_revision")
     require(migration in ("authority", "claims", "approvals"), "unsupported_shared_migration")
-    version, name, expected_hash, executed_sql, permissions, snapshot = (
-        (VERSION, NAME, SOURCE_HASH, sql + ACL_SQL, verify_permissions, catalog) if migration == "authority" else
-        (CLAIM_VERSION, CLAIM_NAME, CLAIM_HASH, claim_execution(sql), verify_claim_permissions, claim_catalog) if migration == "claims" else
-        (APPROVAL_VERSION, APPROVAL_NAME, APPROVAL_HASH, approval_execution(sql), verify_approval_permissions, approval_catalog))
+    version, name, expected_hash, executed_sql, snapshot = (
+        (VERSION, NAME, SOURCE_HASH, sql + ACL_SQL, catalog) if migration == "authority" else
+        (CLAIM_VERSION, CLAIM_NAME, CLAIM_HASH, claim_execution(sql), claim_catalog) if migration == "claims" else
+        (APPROVAL_VERSION, APPROVAL_NAME, APPROVAL_HASH, approval_execution(sql), approval_catalog))
     require(hashlib.sha256(sql.encode()).hexdigest() == expected_hash, "source_hash_mismatch")
-    with conn.transaction():
-        if execute:
-            require(conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (MUTEX,)).fetchone()[0], "shared_migration_busy")
-        else:
+    result = {"target": target, "version": version, "state": "applied", "regional_history_unchanged": True}
+    if not execute:
+        with conn.transaction():
             conn.execute("SET TRANSACTION READ ONLY")
-        before = prerequisites(conn, target)
-        state = inspect(conn, sql, migration)
-        if execute and state == "pending":
+            before = prerequisites(conn, target)
+            result["state"] = inspect(conn, sql, migration)
+            require(ordinary_history(conn) == before, "regional_history_changed")
+        return result
+
+    exists = receipt_ledger_exists(conn)
+    versions = receipt_versions(conn) if exists else set()
+    if version in versions:
+        return result
+    with conn.transaction():
+        require(conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (MUTEX,)).fetchone()[0], "shared_migration_busy")
+        # A different executor may have committed since the unlocked receipt read.
+        if not exists:
+            exists = receipt_ledger_exists(conn)
+        versions = receipt_versions(conn) if exists else set()
+        if version not in versions:
             if migration == "claims":
-                require(inspect(conn, source()) == "applied", "authority_migration_required")
+                require(VERSION in versions, "authority_migration_required")
             if migration == "approvals":
-                require(inspect(conn, claim_source(), "claims") == "applied", "claims_migration_required")
-            if not ledger_exists(conn):
+                require(CLAIM_VERSION in versions, "claims_migration_required")
+            roles, auth = conn.execute(
+                "SELECT (SELECT count(*) FROM pg_roles WHERE rolname=ANY(%s)), "
+                "to_regclass('auth.users') IS NOT NULL", (list(ROLES),)).fetchone()
+            require(roles == len(ROLES), "required_roles_missing")
+            require(migration == "authority" or auth, "existing_auth_setup_required")
+            before = ordinary_history(conn)
+            require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION) for row in before),
+                    "shared_version_in_regional_history")
+            if not exists:
                 conn.execute("""
                     CREATE SCHEMA shared_auth_migrations AUTHORIZATION postgres;
                     REVOKE ALL ON SCHEMA shared_auth_migrations FROM PUBLIC,anon,authenticated,service_role,promotion_evidence_proxy;
@@ -373,12 +468,11 @@ def apply(conn, target, revision, sql, execute=False, migration="authority"):
                     REVOKE ALL ON shared_auth_migrations.schema_migrations FROM PUBLIC,anon,authenticated,service_role,promotion_evidence_proxy;
                 """)
             conn.execute(executed_sql)
-            permissions(conn)
+            verify_changed_permissions(conn, migration, created_ledger=not exists)
             conn.execute(f"INSERT INTO {LEDGER}(version,name,source_sql,applied_sql,source_sha256,catalog,revision) VALUES(%s,%s,%s,%s,%s,%s,%s)",
                          (version, name, sql, executed_sql, expected_hash, Jsonb(snapshot(conn)), revision))
-            state = inspect(conn, sql, migration)
-        require(ordinary_history(conn) == before, "regional_history_changed")
-    return {"target": target, "version": version, "state": state, "regional_history_unchanged": True}
+            require(ordinary_history(conn) == before, "regional_history_changed")
+    return result
 
 
 def main():
