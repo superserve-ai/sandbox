@@ -108,7 +108,7 @@ LEFT JOIN billing_contract_waiver w ON w.contract_id=c.id AND p.id IS NULL
     AND billing_yc_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
 WHERE p.id IS NOT NULL OR w.id IS NOT NULL
 ON CONFLICT (team_id, kind, period_start) DO NOTHING
-RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id
+RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id, paired_waiver_id
 `
 
 type AdoptUsageEntitlementParams struct {
@@ -160,6 +160,7 @@ func (q *Queries) AdoptUsageEntitlement(ctx context.Context, arg AdoptUsageEntit
 		&i.CreatedAt,
 		&i.WaiverID,
 		&i.SponsorshipID,
+		&i.PairedWaiverID,
 	)
 	return i, err
 }
@@ -180,7 +181,7 @@ UPDATE billing_usage_entitlement e SET state = 'uncertain', first_attempt_at = a
 FROM contract c CROSS JOIN attempt
 WHERE e.team_id = c.team_id AND e.contract_id = c.id AND e.id = $4 AND e.state = 'pending'
     AND billing_contract_eligible(c::billing_commercial_contract, e.period_start, e.period_end) AND e.period_start <= clock_timestamp() AND e.period_end > clock_timestamp()
-RETURNING e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at, e.waiver_id, e.sponsorship_id
+RETURNING e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at, e.waiver_id, e.sponsorship_id, e.paired_waiver_id
 `
 
 type BeginImmediateUsageEntitlementIssuanceParams struct {
@@ -228,6 +229,7 @@ func (q *Queries) BeginImmediateUsageEntitlementIssuance(ctx context.Context, ar
 		&i.CreatedAt,
 		&i.WaiverID,
 		&i.SponsorshipID,
+		&i.PairedWaiverID,
 	)
 	return i, err
 }
@@ -249,7 +251,7 @@ UPDATE billing_usage_entitlement e SET state = 'uncertain', first_attempt_at = a
 FROM contract c CROSS JOIN attempt
 WHERE e.team_id = c.team_id AND e.contract_id = c.id AND e.id = $4 AND e.state = 'pending'
     AND billing_contract_eligible(c::billing_commercial_contract, e.period_start, e.period_end) AND e.period_start <= clock_timestamp() AND e.period_end > clock_timestamp()
-RETURNING e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at, e.waiver_id, e.sponsorship_id
+RETURNING e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at, e.waiver_id, e.sponsorship_id, e.paired_waiver_id
 `
 
 type BeginUsageEntitlementIssuanceParams struct {
@@ -297,6 +299,7 @@ func (q *Queries) BeginUsageEntitlementIssuance(ctx context.Context, arg BeginUs
 		&i.CreatedAt,
 		&i.WaiverID,
 		&i.SponsorshipID,
+		&i.PairedWaiverID,
 	)
 	return i, err
 }
@@ -306,18 +309,20 @@ WITH contract AS MATERIALIZED (
     SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_kind, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $1
         AND b.id = $2 FOR UPDATE
 )
-INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, waiver_id, sponsorship_id, kind, period_start, period_end, amount_cents, currency)
-SELECT c.team_id, c.id, p.id, w.id, sp.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
+INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, waiver_id, sponsorship_id, paired_waiver_id, kind, period_start, period_end, amount_cents, currency)
+SELECT c.team_id, c.id, p.id, w.id, sp.id, pw.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
 FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
 LEFT JOIN billing_contract_payment p ON p.contract_id = c.id
-    AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
+    AND billing_payment_authorizes_entitlement(c::billing_commercial_contract,p::billing_contract_payment,period.period_start,period.period_end)
 LEFT JOIN billing_contract_waiver w ON w.contract_id=c.id AND p.id IS NULL
     AND billing_yc_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
 LEFT JOIN billing_sponsored_operation sp ON sp.contract_id=c.id AND p.id IS NULL AND w.id IS NULL
     AND billing_sponsored_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
+LEFT JOIN billing_provider_pair_waiver pw ON pw.contract_id=c.id AND p.id IS NULL AND w.id IS NULL AND sp.id IS NULL
+    AND billing_provider_pair_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
 WHERE billing_contract_eligible(c::billing_commercial_contract, period.period_start, period.period_end)
 ON CONFLICT (team_id, kind, period_start) DO NOTHING
-RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id
+RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id, paired_waiver_id
 `
 
 type ClaimCurrentUsageEntitlementParams struct {
@@ -354,6 +359,7 @@ func (q *Queries) ClaimCurrentUsageEntitlement(ctx context.Context, arg ClaimCur
 		&i.CreatedAt,
 		&i.WaiverID,
 		&i.SponsorshipID,
+		&i.PairedWaiverID,
 	)
 	return i, err
 }
@@ -362,7 +368,7 @@ const confirmUsageEntitlementIssued = `-- name: ConfirmUsageEntitlementIssued :o
 UPDATE billing_usage_entitlement SET state = 'issued',
     stripe_credit_grant_id = $1, issuance_evidence = $2, issued_at = clock_timestamp()
 WHERE team_id = $3 AND id = $4 AND state = 'uncertain'
-RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id
+RETURNING id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id, paired_waiver_id
 `
 
 type ConfirmUsageEntitlementIssuedParams struct {
@@ -406,6 +412,7 @@ func (q *Queries) ConfirmUsageEntitlementIssued(ctx context.Context, arg Confirm
 		&i.CreatedAt,
 		&i.WaiverID,
 		&i.SponsorshipID,
+		&i.PairedWaiverID,
 	)
 	return i, err
 }
@@ -789,7 +796,7 @@ func (q *Queries) GetCurrentCommercialPlan(ctx context.Context, teamID uuid.UUID
 }
 
 const getCurrentUsageEntitlement = `-- name: GetCurrentUsageEntitlement :one
-SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id FROM billing_usage_entitlement WHERE team_id = $1 AND kind = $2
+SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id, paired_waiver_id FROM billing_usage_entitlement WHERE team_id = $1 AND kind = $2
     AND period_start <= clock_timestamp() AND period_end > clock_timestamp()
 `
 
@@ -827,12 +834,13 @@ func (q *Queries) GetCurrentUsageEntitlement(ctx context.Context, arg GetCurrent
 		&i.CreatedAt,
 		&i.WaiverID,
 		&i.SponsorshipID,
+		&i.PairedWaiverID,
 	)
 	return i, err
 }
 
 const getReplayableUsageEntitlement = `-- name: GetReplayableUsageEntitlement :one
-SELECT e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at, e.waiver_id, e.sponsorship_id FROM billing_usage_entitlement e JOIN billing_commercial_contract c ON c.id = e.contract_id
+SELECT e.id, e.team_id, e.contract_id, e.payment_id, e.kind, e.period_start, e.period_end, e.amount_cents, e.currency, e.issuance_source, e.provider_created_at, e.adopted_at, e.adopted_available_balance_cents, e.state, e.idempotency_key, e.first_attempt_at, e.request_payload, e.provider_invoice_start, e.provider_invoice_end, e.stripe_credit_grant_id, e.issuance_evidence, e.issued_at, e.created_at, e.waiver_id, e.sponsorship_id, e.paired_waiver_id FROM billing_usage_entitlement e JOIN billing_commercial_contract c ON c.id = e.contract_id
 WHERE e.team_id = $1 AND e.id = $2 AND e.state = 'uncertain'
     AND e.first_attempt_at > clock_timestamp() - interval '23 hours'
     AND e.period_start <= clock_timestamp() AND e.period_end > clock_timestamp()
@@ -873,12 +881,13 @@ func (q *Queries) GetReplayableUsageEntitlement(ctx context.Context, arg GetRepl
 		&i.CreatedAt,
 		&i.WaiverID,
 		&i.SponsorshipID,
+		&i.PairedWaiverID,
 	)
 	return i, err
 }
 
 const getUsageEntitlement = `-- name: GetUsageEntitlement :one
-SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id FROM billing_usage_entitlement WHERE team_id = $1 AND id = $2
+SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id, paired_waiver_id FROM billing_usage_entitlement WHERE team_id = $1 AND id = $2
 `
 
 type GetUsageEntitlementParams struct {
@@ -915,6 +924,7 @@ func (q *Queries) GetUsageEntitlement(ctx context.Context, arg GetUsageEntitleme
 		&i.CreatedAt,
 		&i.WaiverID,
 		&i.SponsorshipID,
+		&i.PairedWaiverID,
 	)
 	return i, err
 }
@@ -955,7 +965,7 @@ func (q *Queries) ListCommercialEntitlementSchedule(ctx context.Context, arg Lis
 }
 
 const listUncertainUsageEntitlements = `-- name: ListUncertainUsageEntitlements :many
-SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id FROM billing_usage_entitlement WHERE state = 'uncertain' AND id > $1
+SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at, waiver_id, sponsorship_id, paired_waiver_id FROM billing_usage_entitlement WHERE state = 'uncertain' AND id > $1
 ORDER BY id LIMIT $2
 `
 
@@ -999,6 +1009,7 @@ func (q *Queries) ListUncertainUsageEntitlements(ctx context.Context, arg ListUn
 			&i.CreatedAt,
 			&i.WaiverID,
 			&i.SponsorshipID,
+			&i.PairedWaiverID,
 		); err != nil {
 			return nil, err
 		}

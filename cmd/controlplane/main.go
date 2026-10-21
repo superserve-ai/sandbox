@@ -243,6 +243,7 @@ func run() error {
 		defer handlers.PromotionAuthPool.Close()
 	}
 	handlers.StartYCClaimMail(ctx)
+	handlers.StartYCOfferAcceptance(ctx)
 	handlers.Stripe = api.NewStripeBillingClient(cfg)
 
 	// Product-usage analytics — no-op when POSTHOG_KEY is unset.

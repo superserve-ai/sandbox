@@ -28,7 +28,7 @@ MIGRATION_INPUTS = (
 # Runtime routing is established by the release contract, not secret labels.
 SHARED_TARGETS = {"staging": "rifhalqzxgskwajjgipj", "use4": "xompkvadqplatcchfqjq"}
 SHARED_MIGRATIONS = {"authority": "20261016070000", "claims": "20261016174553",
-                     "approvals": "20261020224623"}
+                     "approvals": "20261020224623", "acceptances": "20261021135531"}
 
 
 def check_shared_requirement(env):

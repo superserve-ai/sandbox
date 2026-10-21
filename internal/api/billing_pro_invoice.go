@@ -31,6 +31,9 @@ func (h *Handlers) loadInvoiceBase(ctx context.Context, team uuid.UUID, a *invoi
 	if len(readers) > 0 {
 		reader = readers[0]
 	}
+	if paired, err := loadInvoiceProviderPair(ctx, reader, team, a); err != nil || paired {
+		return err
+	}
 	err := reader.QueryRow(ctx, `SELECT base_price_id,charge_amount_cents,charge_interval_months,entitlement_anchor FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND offer_key IN ('pro_monthly','pro_annual','yc_2026') ORDER BY created_at DESC LIMIT 1`, team, a.Customer, a.Subscription).Scan(&a.Base.Price, &a.Base.Amount, &a.Base.Months, &a.Base.Anchor)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = nil
