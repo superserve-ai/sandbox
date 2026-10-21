@@ -374,7 +374,7 @@ def verify_changed_permissions(conn, migration, created_ledger=False):
     tables, functions = {
         "authority": ((TABLE,), FUNCTIONS),
         "claims": (CLAIM_TABLES, CLAIM_FUNCTIONS),
-        "approvals": (APPROVAL_TABLES, APPROVAL_FUNCTIONS + (CLAIM_FUNCTIONS[0], RPCS[1], RPCS[3])),
+        "approvals": (APPROVAL_TABLES + ("public.yc_claim",), APPROVAL_FUNCTIONS + (CLAIM_FUNCTIONS[0], RPCS[1], RPCS[3])),
     }[migration]
     valid = conn.execute("""
       WITH tables AS (SELECT unnest(%s::text[]) AS name),

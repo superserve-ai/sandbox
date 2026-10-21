@@ -424,6 +424,17 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
         self.assertFalse(shared.approval_objects_present(self.conn))
         self.assertEqual(self.sql(f"SELECT count(*) FROM {shared.LEDGER}"), "2")
 
+    def test_altered_claim_table_permissions_fail_before_receipt_commit(self):
+        self.apply()
+        self.apply_claims()
+        self.sql("GRANT SELECT ON public.yc_claim TO anon")
+        before = self.history()
+        with self.assertRaisesRegex(shared.SharedMigrationError, "migration_privileges_mismatch"):
+            self.apply_approvals()
+        self.assertFalse(shared.approval_objects_present(self.conn))
+        self.assertEqual(self.sql(f"SELECT count(*) FROM {shared.LEDGER}"), "2")
+        self.assertEqual(self.history(), before)
+
     def test_new_ledger_rejects_inherited_default_access(self):
         self.sql("CREATE ROLE migration_ledger_writer; GRANT migration_ledger_writer TO service_role; "
                  "ALTER ROLE service_role BYPASSRLS; "
