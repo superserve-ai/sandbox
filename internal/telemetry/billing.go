@@ -126,7 +126,7 @@ func (r *OTelRecorder) RecordBillingBacklog(ctx context.Context, state string, c
 		return
 	}
 	switch state {
-	case "pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted", "entitlement_due", "entitlement_paid_missing", "entitlement_debt_unknown", "yc_approval_notification":
+	case "pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted", "entitlement_due", "entitlement_paid_missing", "entitlement_debt_unknown", "yc_approval_notification", "yc_offer_acceptance":
 	default:
 		state = "unknown"
 	}

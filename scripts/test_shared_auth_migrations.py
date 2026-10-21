@@ -77,6 +77,64 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
     def apply_approvals(self, execute=True):
         return shared.apply(self.conn, "use4", self.revision, shared.approval_source(), execute, "approvals")
 
+    def apply_acceptances(self, execute=True):
+        return shared.apply(self.conn, "use4", self.revision, shared.acceptance_source(), execute, "acceptances")
+
+    def test_acceptance_atomicity_security_and_receipt_compatibility(self):
+        with self.assertRaisesRegex(shared.SharedMigrationError, "approvals_migration_required"):
+            self.apply_acceptances()
+        self.apply()
+        self.apply_claims()
+        self.apply_approvals()
+        prior = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        history = self.history()
+        with patch.object(shared, "acceptance_catalog", side_effect=shared.SharedMigrationError("snapshot_failure")):
+            with self.assertRaisesRegex(shared.SharedMigrationError, "snapshot_failure"):
+                self.apply_acceptances()
+        self.assertFalse(shared.acceptance_objects_present(self.conn))
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version"), prior)
+        self.apply_acceptances()
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m WHERE version<>'{shared.ACCEPTANCE_VERSION}' ORDER BY version"), prior)
+        self.assertEqual(self.history(), history)
+        self.assertEqual(self.apply_acceptances(False)["state"], "applied")
+        for sql in (
+            "GRANT SELECT ON public.yc_offer_acceptance_authority TO authenticated",
+            "GRANT EXECUTE ON FUNCTION public.yc_preferred_staff_rpc(text,jsonb) TO service_role",
+            "ALTER TABLE public.yc_preferred_identity_review DISABLE ROW LEVEL SECURITY",
+            "GRANT SELECT ON public.yc_financial_authorization TO authenticated",
+            "GRANT EXECUTE ON FUNCTION public.yc_financial_touch(text) TO service_role",
+            "ALTER TABLE public.yc_financial_invalidation DISABLE ROW LEVEL SECURITY",
+        ):
+            with self.conn.transaction(force_rollback=True):
+                self.conn.execute(sql)
+                with self.assertRaisesRegex(shared.SharedMigrationError, "privileges_mismatch"):
+                    self.apply_acceptances(False)
+
+    def test_acceptance_hardening_preserves_exact_predecessor_receipts(self):
+        self.apply()
+        self.apply_claims()
+        self.apply_approvals()
+        before = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        self.apply_acceptances()
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m WHERE version<>'{shared.ACCEPTANCE_VERSION}' ORDER BY version"), before)
+        for helper in ("authority", "claims", "approvals", "acceptances"):
+            source = {"authority": shared.source, "claims": shared.claim_source,
+                      "approvals": shared.approval_source, "acceptances": shared.acceptance_source}[helper]()
+            self.assertEqual(shared.inspect(self.conn, source, helper), "applied")
+        # Compatibility ignores only the intended new path suffix in old
+        # receipts. The new receipt must still reject changes to any old body,
+        # privileges or search_path, including a rollback to the unsafe path.
+        for statement in (
+            "ALTER FUNCTION public.yc_claim_rpc(text,jsonb) SET search_path=pg_catalog,public,auth",
+            "ALTER FUNCTION public.lock_yc_activation_authority(uuid,uuid,text) SET search_path=pg_catalog,public",
+            "ALTER FUNCTION public.read_yc_activation_authority(text,uuid) SET search_path=pg_catalog,public,pg_temp",
+            "ALTER FUNCTION public.yc_staff_claim_rpc(text,jsonb) SET statement_timeout='1s'",
+        ):
+            with self.conn.transaction(force_rollback=True):
+                self.conn.execute(statement)
+                with self.assertRaisesRegex(shared.SharedMigrationError, "shared_catalog_mismatch"):
+                    shared.inspect(self.conn, shared.acceptance_source(), "acceptances")
+
     def test_approval_requires_claims_and_preserves_receipts(self):
         self.assertEqual(self.apply_approvals(False)["state"], "pending")
         with self.assertRaisesRegex(shared.SharedMigrationError, "claims_migration_required"):
@@ -321,7 +379,7 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
 
     def check_query_budgets(self, target):
         migrations = (("authority", shared.source, 11), ("claims", shared.claim_source, 17),
-                      ("approvals", shared.approval_source, 21))
+                      ("approvals", shared.approval_source, 21), ("acceptances", shared.acceptance_source, 17))
         before = self.history()
         with patch.object(shared, "inspect", side_effect=AssertionError("implicit audit")):
             for migration, source, budget in migrations:
@@ -333,7 +391,7 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
                 self.assertLess(time.monotonic() - started, 20)
         receipt = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
         with contextlib.ExitStack() as stack:
-            for function in ("inspect", "ledger_exists", "catalog", "claim_catalog", "approval_catalog",
+            for function in ("inspect", "ledger_exists", "catalog", "claim_catalog", "approval_catalog", "acceptance_catalog",
                              "ordinary_history", "verify_changed_permissions", "verify_permissions",
                              "verify_claim_permissions", "verify_approval_permissions"):
                 stack.enter_context(patch.object(shared, function, side_effect=AssertionError("no-op audit")))
@@ -346,7 +404,7 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
                 result = shared.apply(measured, target, self.revision, source(), True, migration)
                 self.assertEqual(result["state"], "applied")
                 self.assertTrue(result["regional_history_unchanged"])
-            self.assertEqual(measured.calls, 6)
+            self.assertEqual(measured.calls, 8)
             self.assertEqual(measured.transactions, 0)
             self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(self.history(), before)

@@ -21,7 +21,7 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 	r.RecordBillingWork(ctx, "raw-secret", true, time.Second, 2)
 	r.RecordBillingWork(ctx, "funding_observation", true, time.Second, 1)
 	r.RecordBillingLag(ctx, 3600)
-	for _, state := range []string{"pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted", "entitlement_paid_missing", "entitlement_debt_unknown", "yc_approval_notification"} {
+	for _, state := range []string{"pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted", "entitlement_paid_missing", "entitlement_debt_unknown", "yc_approval_notification", "yc_offer_acceptance"} {
 		r.RecordBillingBacklog(ctx, state, 3, 90)
 	}
 	r.RecordBillingReconciliation(ctx, "raw-secret", 10, nil, nil)
@@ -54,8 +54,17 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 					t.Fatalf("funding errors collapsed into unknown: %+v", operations)
 				}
 			case "billing_event_backlog_capped":
-				if points := m.Data.(metricdata.Gauge[int64]).DataPoints; len(points) != 9 {
+				points := m.Data.(metricdata.Gauge[int64]).DataPoints
+				if len(points) != 10 {
 					t.Fatalf("collapsed event states: %+v", points)
+				}
+				acceptance := false
+				for _, point := range points {
+					state, _ := point.Attributes.Value("state")
+					acceptance = acceptance || state.AsString() == "yc_offer_acceptance"
+				}
+				if !acceptance {
+					t.Fatal("acceptance backlog lost its exported state")
 				}
 			case "billing_reconciliation_total":
 				results := map[string]bool{}

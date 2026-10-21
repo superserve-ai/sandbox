@@ -27,6 +27,8 @@ MIGRATION_INPUTS = (
 
 # Runtime routing is established by the release contract, not secret labels.
 SHARED_TARGETS = {"staging": "rifhalqzxgskwajjgipj", "use4": "xompkvadqplatcchfqjq"}
+# Accepted-offer consumers require explicit target preparation; see
+# deploy/shared-auth-preparation.md. Unrelated deployments retain this baseline.
 SHARED_MIGRATIONS = {"authority": "20261016070000", "claims": "20261016174553",
                      "approvals": "20261020224623"}
 

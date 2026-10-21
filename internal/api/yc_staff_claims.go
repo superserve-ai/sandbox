@@ -20,7 +20,7 @@ func (h *Handlers) ycStaffRPC(ctx context.Context, op string, p any) (json.RawMe
 		return nil, err
 	}
 	var out json.RawMessage
-	err = h.PromotionAuthPool.QueryRow(ctx, "SELECT public.yc_staff_claim_rpc($1,$2::jsonb)", op, b).Scan(&out)
+	err = h.PromotionAuthPool.QueryRow(ctx, "SELECT public.yc_preferred_staff_rpc($1,$2::jsonb)", op, b).Scan(&out)
 	return out, err
 }
 
@@ -51,7 +51,19 @@ func (h *Handlers) GetStaffYCClaim(c *gin.Context) {
 	if _, ok := h.requireYCStaff(c, platformBillingReadPermission); !ok {
 		return
 	}
-	h.GetOperatorYCClaim(c)
+	id, err := uuid.Parse(c.Param("claim_id"))
+	if err != nil {
+		respondErrorMsg(c, "invalid_claim", "Invalid claim.", 400)
+		return
+	}
+	ctx, cancel := promotionContext(c)
+	defer cancel()
+	out, err := h.ycStaffRPC(ctx, "operator-get", gin.H{"id": id})
+	if err != nil {
+		ycClaimError(c, err)
+		return
+	}
+	c.Data(200, "application/json", out)
 }
 
 func (h *Handlers) DecideStaffYCClaim(c *gin.Context) {
@@ -60,15 +72,17 @@ func (h *Handlers) DecideStaffYCClaim(c *gin.Context) {
 		return
 	}
 	var in struct {
-		ID        uuid.UUID `json:"id"`
-		UserID    uuid.UUID `json:"user_id"`
-		TeamID    uuid.UUID `json:"team_id"`
-		RequestID uuid.UUID `json:"request_id"`
-		Revision  *int64    `json:"expected_revision"`
-		Decision  string    `json:"decision"`
-		Reason    string    `json:"reason"`
-		Evidence  string    `json:"evidence_reference"`
-		Company   string    `json:"company_identity"`
+		ID              uuid.UUID  `json:"id"`
+		UserID          uuid.UUID  `json:"user_id"`
+		TeamID          uuid.UUID  `json:"team_id"`
+		RequestID       uuid.UUID  `json:"request_id"`
+		Revision        *int64     `json:"expected_revision"`
+		Decision        string     `json:"decision"`
+		Reason          string     `json:"reason"`
+		Evidence        string     `json:"evidence_reference"`
+		Company         string     `json:"company_identity"`
+		ReviewRequestID *uuid.UUID `json:"review_request_id"`
+		ReviewRevision  *int64     `json:"review_revision"`
 	}
 	if !decodePromotionRequest(c, &in) {
 		return
@@ -82,6 +96,14 @@ func (h *Handlers) DecideStaffYCClaim(c *gin.Context) {
 	ctx, cancel := promotionContext(c)
 	defer cancel()
 	p := gin.H{"id": in.ID, "actor_id": actor, "request_id": in.RequestID, "expected_revision": *in.Revision, "reason": in.Reason, "evidence_reference": in.Evidence, "home_region": ycClaimRegion()}
+	if (in.ReviewRequestID == nil) != (in.ReviewRevision == nil) || (in.ReviewRequestID != nil && (*in.ReviewRequestID == uuid.Nil || *in.ReviewRevision < 0 || in.Decision != "approve")) {
+		respondErrorMsg(c, "invalid_review", "Exact review identity and revision required for approval.", 400)
+		return
+	}
+	if in.ReviewRequestID != nil {
+		p["review_request_id"] = *in.ReviewRequestID
+		p["review_revision"] = *in.ReviewRevision
+	}
 	var out json.RawMessage
 	var err error
 	if in.Decision == "approve" {

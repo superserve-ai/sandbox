@@ -4,6 +4,9 @@ API and Terraform control-plane deployments run the existing shared Auth executo
 before regional migrations: `authority`, `claims`, then `approvals`. Staging uses
 its isolated authority; both production regions use the primary production
 authority (`use4`). Proxy-only deployments retain their regional prerequisite.
+Acceptance is prepared separately before releasing its consumers; follow the
+[target-specific preparation procedure](../../deploy/shared-auth-preparation.md).
+An ordinary deployment receipt does not establish acceptance readiness.
 All executors share the existing `database-migrations` queue. Do not add new shared versions to
 `supabase_migrations.schema_migrations`: the ordinary runner has no matching input
 and will refuse subsequent deployments.
@@ -99,3 +102,31 @@ regions use the verified RPC authority. Then perform the
 Local database tests establish atomicity, privilege checks and regional-runner
 compatibility; they do not establish staging card setup, product access, grants or
 overage invoice behavior. Production customer activation remains a separate action.
+
+After approvals, explicit `acceptances` preparation adds immutable customer
+acceptance and preferred-account review authority. General deployment applies
+only the three baseline migrations (six database calls on an already-applied
+path), while validating any known optional acceptance receipt in the protected
+ledger. It does not apply acceptance or produce acceptance-preparation evidence.
+Release the compatible executor first, then retain exact-target full inspection
+evidence before releasing acceptance consumers, including new targets, restores
+and changed Auth connections. This migration does not enable provider adapters
+or automated provisioning. Original receipt snapshots remain unchanged;
+explicit inspection also audits the new tables, RPCs and writer triggers.
+
+The acceptance migration also creates exact financial authorization receipts and a
+separate regional invalidation outbox. Relevant Auth identity, identity-history,
+claim-decision and company-revocation writes serialize with issuance using private
+user, email-hash, claim and company generation rows. This adds bounded row writes
+per relevant mutation and one retained row per distinct key, including unrelated
+Auth identities; ordinary sign-in telemetry and status reads do not write these
+rows. Fixed-snapshot transactions that race authorization may receive a normal
+serialization failure and must retry. Unrelated transactions are not rejected by
+isolation level. Auth triggers never lock claims or company authority.
+
+An invalidated receipt remains audit/recovery evidence. The regional owner must
+commit a permanent exact-target fence and any required commercial-authority
+revocation before acknowledging delivery. Until then the public state is
+`revocation_pending`; current invalidity immediately denies issuance and readiness.
+Historical credits, usage and audit records remain intact. These tables and APIs
+do not themselves enable financial finalization or a provider adapter.
