@@ -34,6 +34,8 @@ class MachineActivationConfigurationTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         cls.directory = Path(cls.tmp.name)
+        candidate = EAST / 'qm-machine-commissioning.tfvars'
+        (cls.directory / candidate.name).write_text(candidate.read_text())
         variables = (EAST / 'variables.tf').read_text()
         main = (EAST / 'main.tf').read_text()
         declarations = '\n'.join(match(r'(^variable "' + name + r'" \{.*?^\})', variables)
@@ -54,11 +56,12 @@ class MachineActivationConfigurationTest(unittest.TestCase):
             declarations + '\nlocals { ' + environment + ' }\n' + activation +
             '\noutput "env" { value = ' + env + ' }\n')
 
-    def plan(self, config=None, valid=True, omit=False, **root_values):
+    def plan(self, config=None, valid=True, omit=False, var_file=None, **root_values):
         values = root_values if omit else root_values | {'qm_machine_identity_activation': config}
         (self.directory / 'test.auto.tfvars.json').write_text(json.dumps(values))
         command = ['terraform', '-chdir=' + str(self.directory)]
-        result = subprocess.run(command + ['plan', '-input=false', '-refresh=false', '-lock=false', '-out=test.plan'],
+        options = ['-var-file=' + var_file] if var_file else []
+        result = subprocess.run(command + ['plan', '-input=false', '-refresh=false', '-lock=false', '-out=test.plan'] + options,
                                 text=True, capture_output=True, timeout=30)
         if not valid:
             self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -85,6 +88,11 @@ class MachineActivationConfigurationTest(unittest.TestCase):
             'QM_MACHINE_AUTH_OPERATOR_READY': 'true',
         }
         self.assertEqual(after, before | expected)
+
+    def test_commissioning_candidate_requires_explicit_var_file(self):
+        self.assertFalse(any(key.startswith('QM_MACHINE_AUTH_') for key in self.plan(omit=True)))
+        explicit = self.plan(omit=True, var_file='qm-machine-commissioning.tfvars')
+        self.assertEqual(explicit, self.plan(CONFIG))
 
     def test_each_false_predicate_is_preserved(self):
         for name in ('ownership_ready', 'verifier_ready', 'operator_ready'):
