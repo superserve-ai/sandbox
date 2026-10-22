@@ -124,7 +124,7 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		return err
 	}
 	if calendarPending {
-		return fmt.Errorf("YC calendar reconciliation is required before invoice enrollment; retry YC activation and follow docs/billing/yc-calendar-recovery.md on conflict")
+		return fmt.Errorf("YC calendar reconciliation is required before invoice enrollment; retry YC activation and follow the Billing plans, entitlements and calendar recovery runbook on conflict")
 	}
 	if err = h.loadInvoiceBase(ctx, team, &a, tx); err != nil {
 		return err

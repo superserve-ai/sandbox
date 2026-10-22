@@ -372,7 +372,7 @@ jobs:
           # local-SSD array onto the host's dedicated background-data
           # disk) is deliberately NOT set here yet. The Terraform disk
           # is attached but not formatted or mounted — that step is
-          # manual (see host-dr-runbook.md) — and deploy-vmd.py's mount
+          # manual — and deploy-vmd.py's mount
           # precondition refuses to deploy with this set against an
           # absent mount, which would block every future deploy to this
           # host until someone notices and preps it out of band. Enable

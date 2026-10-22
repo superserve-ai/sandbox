@@ -3,7 +3,7 @@
 # Runs only from main. The runner resolves branches to SHAs and provisions
 # with the devbox environment's credentials; the selected revisions are
 # checked out and built on the box, never on the runner. See
-# deploy/devbox/README.md.
+# the Set up and operate a sandbox devbox runbook.
 
 name: Devbox Create
 

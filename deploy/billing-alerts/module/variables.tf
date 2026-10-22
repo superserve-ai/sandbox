@@ -38,7 +38,7 @@ variable "labels" {
 variable "runbook_url" {
   description = "Actionable billing recovery procedure; may use the public repository runbook."
   type        = string
-  default     = "https://github.com/superserve-ai/sandbox/blob/main/docs/pro-billing.md#entitlement-alert-response"
+  default     = "https://github.com/superserve-ai/sandbox/blob/b9d0f462cd59583657c6219c54677e1fd6e8ce4e/docs/pro-billing.md#entitlement-alert-response"
 }
 
 variable "manage_paid_missing" {

@@ -203,7 +203,7 @@ def host_identity_preflight():
             sys.exit(1)
         PY
         then
-            echo "ERROR: missing or invalid host identity; complete deploy/host-generation-rollout.md identity installation before retrying (host unchanged)" >&2
+            echo "ERROR: missing or invalid host identity; complete identity installation in the Host and control-plane identity preparation runbook before retrying (host unchanged)" >&2
             exit 1
         fi
     """)

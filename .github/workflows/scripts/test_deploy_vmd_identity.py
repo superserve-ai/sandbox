@@ -53,7 +53,7 @@ class IdentityPreflightTests(unittest.TestCase):
             with self.subTest(state=state, env=env):
                 result = self.exercise(state, env)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn('complete deploy/host-generation-rollout.md', result.stderr)
+                self.assertIn('Host and control-plane identity preparation runbook', result.stderr)
 
     def test_deploy_checks_identity_before_upload_even_with_all_inputs(self):
         for supplied in (False, True):
