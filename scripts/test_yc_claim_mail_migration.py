@@ -8,7 +8,8 @@ Each test creates and drops its own database; existing databases are not reset.
 import os
 import unittest
 import uuid
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
@@ -106,6 +107,16 @@ class ClaimMailMigrationTest(unittest.TestCase):
             "FROM pg_control_system()").fetchone()
         binding = dict(system_identifier=system, database_oid=oid, server_port=port, database_name=self.database)
         before = self.history()
+        # libpq uses hostaddr as the active peer even when host is loopback.
+        for host, hostaddr in (("127.0.0.1", "192.0.2.1"), ("::1", "2001:db8::1"),
+                               ("127.0.0.1", "")):
+            remote = SimpleNamespace(autocommit=True, info=SimpleNamespace(
+                transaction_status=shared.TransactionStatus.IDLE, host=host, hostaddr=hostaddr),
+                execute=Mock(side_effect=AssertionError("must reject before database query")))
+            for execute in (False, True):
+                with self.assertRaisesRegex(shared.SharedMigrationError, "local_connection_required"):
+                    shared.apply_bound_devbox_claim_mail(remote, self.revision, **binding, execute=execute)
+            remote.execute.assert_not_called()
         with psycopg.connect(self.dsn) as transactional:
             with self.assertRaisesRegex(shared.SharedMigrationError, "idle_autocommit_connection_required"):
                 shared.apply_bound_devbox_claim_mail(transactional, self.revision, **binding)

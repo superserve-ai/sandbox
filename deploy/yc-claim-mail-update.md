@@ -41,6 +41,8 @@ operator procedure. Saved identity values alone are not current proof. Load
 PostgreSQL connection with literal loopback host `127.0.0.1` or `::1`,
 `autocommit=True`, and no open transaction. Hostnames such as `localhost` are
 not accepted, matching the existing operator connection guard.
+Both the configured host and libpq's active peer address must be loopback;
+a remote `hostaddr` cannot override a loopback host.
 The entry rejects other connection modes before querying or changing the database.
 Keep credentials out of command arguments and
 output. The supported additive entry point is:

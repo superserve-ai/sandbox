@@ -610,7 +610,8 @@ def apply_bound_devbox_claim_mail(conn, revision, *, system_identifier, database
             isinstance(server_port, int) and 1 <= server_port <= 65535 and
             isinstance(database_name, str) and bool(database_name),
             "invalid_database_binding")
-    require(conn.info.host in ("127.0.0.1", "::1"), "local_connection_required")
+    require(conn.info.host in ("127.0.0.1", "::1") and
+            conn.info.hostaddr in ("127.0.0.1", "::1"), "local_connection_required")
     actual = conn.execute("""SELECT current_database(),current_user,session_user,
         (SELECT system_identifier::text FROM pg_control_system()),
         (SELECT oid::text FROM pg_database WHERE datname=current_database()),inet_server_port(),
