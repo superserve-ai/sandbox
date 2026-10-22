@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+# Dedicated validation artifact; never used by the ordinary release workflow.
+FROM golang:1.26.10-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -tags=yc_staging_validation -ldflags "-s -w" -o /bin/controlplane ./cmd/controlplane
+
+FROM alpine:3.21
+RUN apk add --no-cache --upgrade ca-certificates ca-certificates-bundle tzdata
+COPY --from=build /bin/controlplane /usr/local/bin/controlplane
+EXPOSE 8080
+ENTRYPOINT ["controlplane"]

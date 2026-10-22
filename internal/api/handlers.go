@@ -39,6 +39,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
+	"github.com/superserve-ai/sandbox/internal/ycclaims"
 )
 
 // VMDClient is the interface for talking to a VM daemon.
@@ -151,6 +152,8 @@ type HostRegistry interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
+	YCClaimVerifier                  ycclaims.CaptureVerifier
+	YCClaimValidation                ycclaims.CaptureValidation
 	RenewalChoices                   *renewalChoiceService
 	YCOfferAcceptance                *YCOfferAcceptanceService
 	ProviderPairEntitlementAuthority ProviderPairEntitlementAuthority

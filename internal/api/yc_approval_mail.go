@@ -35,8 +35,22 @@ func (h *Handlers) ycApprovalMailRPC(ctx context.Context, op string, p any) (jso
 }
 
 func (h *Handlers) deliverYCApprovalMail(ctx context.Context, sender EmailSender, origin, from string) (bool, error) {
+	return deliverYCApprovalMail(ctx, h.ycApprovalMailRPC, sender, origin, from, nil)
+}
+
+func deliverYCApprovalMail(ctx context.Context, rpc func(context.Context, string, any) (json.RawMessage, error), sender EmailSender, origin, from string, scope *ycApprovalMailScope) (bool, error) {
+	op := "lease"
+	params := map[string]any{}
+	if scope != nil {
+		if scope.claimID == uuid.Nil || !time.Now().Before(scope.expires) {
+			return false, errors.New("validation approval mail scope expired or invalid")
+		}
+		op = "lease-for-claim"
+		params["claim_id"] = scope.claimID
+	}
 	lease := uuid.New()
-	raw, err := h.ycApprovalMailRPC(ctx, "lease", map[string]any{"lease_id": lease})
+	params["lease_id"] = lease
+	raw, err := rpc(ctx, op, params)
 	if err != nil {
 		return false, err
 	}
@@ -47,6 +61,9 @@ func (h *Handlers) deliverYCApprovalMail(ctx context.Context, sender EmailSender
 	if j.ClaimID == uuid.Nil {
 		return false, nil
 	}
+	if scope != nil && j.ClaimID != scope.claimID {
+		return false, errors.New("approval lease returned an unrelated claim")
+	}
 	deliveryErr := sendYCApprovalMail(ctx, sender, origin, from, j)
 	var unknown *unknownEmailOutcomeError
 	var rejected *rejectedEmailError
@@ -54,11 +71,11 @@ func (h *Handlers) deliverYCApprovalMail(ctx context.Context, sender EmailSender
 	// also fails, the pre-dispatch unknown state requires an audited retry.
 	ackctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	_, ackErr := h.ycApprovalMailRPC(ackctx, "finish", map[string]any{"id": j.ClaimID, "message_id": j.MessageID, "lease_id": lease, "success": deliveryErr == nil, "unknown": errors.As(deliveryErr, &unknown), "rejected": errors.As(deliveryErr, &rejected)})
+	_, ackErr := rpc(ackctx, "finish", map[string]any{"id": j.ClaimID, "message_id": j.MessageID, "lease_id": lease, "success": deliveryErr == nil, "unknown": errors.As(deliveryErr, &unknown), "rejected": errors.As(deliveryErr, &rejected)})
 	return true, errors.Join(deliveryErr, ackErr)
 }
 
-func (h *Handlers) startYCApprovalMail(ctx context.Context, sender EmailSender, origin, from string) {
+func (h *Handlers) startYCApprovalMail(ctx context.Context, sender EmailSender, origin, from string, scope *ycApprovalMailScope) {
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -69,8 +86,11 @@ func (h *Handlers) startYCApprovalMail(ctx context.Context, sender EmailSender, 
 			case <-ticker.C:
 			}
 			for range 4 {
+				if scope != nil && !time.Now().Before(scope.expires) {
+					return
+				}
 				jobctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				found, err := h.deliverYCApprovalMail(jobctx, sender, origin, from)
+				found, err := deliverYCApprovalMail(jobctx, h.ycApprovalMailRPC, sender, origin, from, scope)
 				cancel()
 				if err != nil {
 					log.Warn().Msg("YC approval notification pending retry or operator review")

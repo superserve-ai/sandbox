@@ -96,7 +96,11 @@ func (h *Handlers) SubmitYCClaim(c *gin.Context) {
 		respondErrorMsg(c, "rate_limited", "Please try again later.", 429)
 		return
 	}
-	e, ref, err := ycclaims.NewVerifier().Verify(ctx, in.Link)
+	verify := h.YCClaimVerifier
+	if verify == nil {
+		verify = ycclaims.VerifyCapture
+	}
+	e, ref, err := verify(ctx, in.Link, email)
 	if err != nil {
 		status := 400
 		if errors.Is(err, ycclaims.ErrUnavailable) {

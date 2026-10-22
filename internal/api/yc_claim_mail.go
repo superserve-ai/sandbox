@@ -83,13 +83,21 @@ func (h *Handlers) StartYCClaimMail(ctx context.Context) {
 		return
 	}
 	h.startYCApprovalMonitoring(ctx)
+	scope, validation, scopeErr := h.ycValidationMailScope()
+	if scopeErr != nil {
+		log.Warn().Msg("validation approval mail disabled: invalid binding, target, claim or expiry")
+		return
+	}
 	origin, err := h.ycConsoleOrigin()
 	sender, from := h.EmailTransport.Sender(os.Getenv("YC_EMAIL_API_KEY")), os.Getenv("YC_EMAIL_FROM")
 	if err != nil || sender == nil || from == "" {
 		log.Warn().Msg("YC claim mail disabled; configure console origin and email provider before enabling claim capture")
 		return
 	}
-	h.startYCApprovalMail(ctx, sender, origin, from)
+	h.startYCApprovalMail(ctx, sender, origin, from, scope)
+	if validation {
+		return // Mismatch validation never starts confirmation delivery or expiry maintenance.
+	}
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()

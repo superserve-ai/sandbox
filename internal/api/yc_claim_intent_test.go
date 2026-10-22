@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/ycclaims"
 )
 
 func TestYCClaimAdmissionTransactions(t *testing.T) {
@@ -72,6 +74,62 @@ func TestYCClaimAdmissionTransactions(t *testing.T) {
 	}
 	roleTx.Rollback(ctx)
 	h := &Handlers{Pool: pool, PromotionAuthPool: pool}
+	t.Run("capture verifier retains authentication budget and durable replay", func(t *testing.T) {
+		t.Setenv("YC_CLAIM_CAPTURE_TOKEN", strings.Repeat("c", 32))
+		t.Setenv("YC_CLAIM_CONSOLE_TOKEN", strings.Repeat("s", 32))
+		calls := 0
+		link := "https://www.ycombinator.com/verify/controlled-capture"
+		h.YCClaimVerifier = func(_ context.Context, gotLink, email string) (ycclaims.Evidence, string, error) {
+			calls++
+			if gotLink != link || email != "capture@example.test" {
+				t.Fatal(gotLink, email)
+			}
+			return ycclaims.Evidence{Verified: true, Name: "Founder", Email: "founder@example.test", Companies: []ycclaims.Company{{Name: "Example", Batch: "W26", DirectoryURL: "https://www.ycombinator.com/companies/controlled-capture"}}}, ycclaims.Hash(link), nil
+		}
+		defer func() { h.YCClaimVerifier = nil }()
+		router := gin.New()
+		router.POST("/capture", YCClaimAuth("YC_CLAIM_CAPTURE_TOKEN"), h.SubmitYCClaim)
+		request := func(token, raw string) *httptest.ResponseRecorder {
+			r := httptest.NewRequest("POST", "/capture", strings.NewReader(raw))
+			r.Header.Set("Authorization", "Bearer "+token)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, r)
+			return w
+		}
+		body := `{"email":"Capture@Example.test","link":"` + link + `"}`
+		if w := request(strings.Repeat("s", 32), body); w.Code != 401 || calls != 0 {
+			t.Fatal(w.Code, calls)
+		}
+		if w := request(strings.Repeat("c", 32), `{"email":"capture@example.test","link":"http://invalid.test"}`); w.Code != 400 || calls != 0 {
+			t.Fatal(w.Code, calls)
+		}
+		var id string
+		for range 2 {
+			w := request(strings.Repeat("c", 32), body)
+			var result struct {
+				ID    string `json:"id"`
+				State string `json:"state"`
+			}
+			if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &result) != nil || result.State != "manual_review" || result.ID == "" {
+				t.Fatal(w.Code, w.Body.String())
+			}
+			if id != "" && id != result.ID {
+				t.Fatal("capture replay created another claim")
+			}
+			id = result.ID
+		}
+		var claims, mail int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM yc_claim WHERE id=$1`, id).Scan(&claims); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM yc_claim_mail WHERE claim_id=$1`, id).Scan(&mail); err != nil || claims != 1 || mail != 0 {
+			t.Fatal(claims, mail, err)
+		}
+		exec(`UPDATE yc_claim_rate SET requests=5 WHERE bucket=$1`, ycclaims.Hash("capture@example.test"))
+		if w := request(strings.Repeat("c", 32), body); w.Code != 429 || calls != 2 {
+			t.Fatal("budget bypassed", w.Code, calls)
+		}
+	})
 	rpc := func(op string, p gin.H) map[string]any {
 		t.Helper()
 		raw, e := h.ycClaimRPC(ctx, op, p)

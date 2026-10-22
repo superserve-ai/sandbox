@@ -39,6 +39,9 @@ jobs:
       - name: Run unit tests
         run: go test -v -short -count=1 -race ./...
 
+      - name: Test restricted staging capture artifact
+        run: go test -short -count=1 -race -tags=yc_staging_validation ./internal/ycclaims ./cmd/controlplane
+
       - name: Run deploy-script tests
         run: python3 -m unittest discover -s .github/workflows/scripts -p 'test_*.py'
 

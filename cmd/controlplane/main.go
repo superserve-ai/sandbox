@@ -210,6 +210,8 @@ func run() error {
 	queries := dbq.New(dbPool)
 
 	handlers := api.NewHandlers(vmdClient, queries, cfg)
+	handlers.YCClaimValidation = newYCStagingCaptureVerifier(ctx)
+	handlers.YCClaimVerifier = handlers.YCClaimValidation.Verifier
 	// Machine identity is enabled only after the durable authority schema is
 	// present. This is the executable issuance/readiness gate for mixed-version
 	// rollouts; an unavailable authority fails closed instead of falling back to
