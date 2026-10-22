@@ -1,6 +1,7 @@
 """Run the claim-mail upgrade against a disposable local PostgreSQL database.
 
-Set YC_CLAIM_TEST_DATABASE_URL to a local PostgreSQL 17+ administrator URL.
+Set YC_CLAIM_TEST_DATABASE_URL to a PostgreSQL 17+ administrator URL using
+the literal loopback host 127.0.0.1 or ::1, matching the operator connection guard.
 Each test creates and drops its own database; existing databases are not reset.
 """
 
@@ -25,7 +26,7 @@ class ClaimMailMigrationTest(unittest.TestCase):
 
     def setUp(self):
         dsn = type(self).dsn
-        self.assertIn(conninfo_to_dict(dsn).get("host"), ("127.0.0.1", "localhost", "::1"))
+        self.assertIn(conninfo_to_dict(dsn).get("host"), ("127.0.0.1", "::1"))
         self.admin = psycopg.connect(dsn, autocommit=True)
         self.addCleanup(self.admin.close)
         self.database = "claim_mail_" + uuid.uuid4().hex
@@ -117,11 +118,10 @@ class ClaimMailMigrationTest(unittest.TestCase):
         with self.assertRaisesRegex(shared.SharedMigrationError, "unsupported_auth_target"):
             shared.apply(self.conn, "devbox", self.revision, shared.mail_lease_source(), True, "claim-mail")
         self.assertEqual(self.history(), before)
-        self.assertEqual(shared.apply_bound_devbox_claim_mail(self.conn, self.revision, **binding)["state"], "pending")
-        self.assertEqual(shared.apply_bound_devbox_claim_mail(self.conn, self.revision, **binding, execute=True)["state"], "applied")
-        after = self.history()
-        shared.apply_bound_devbox_claim_mail(self.conn, self.revision, **binding, execute=True)
-        self.assertEqual(self.history(), after)
+        for execute in (False, True):
+            with self.assertRaisesRegex(shared.SharedMigrationError, "historical_aggregate_mismatch"):
+                shared.apply_bound_devbox_claim_mail(self.conn, self.revision, **binding, execute=execute)
+        self.assertEqual(self.history(), before)
 
     def test_missing_baseline_and_unknown_history_are_rejected(self):
         before = self.history()

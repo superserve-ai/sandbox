@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import shutil
 import time
 from unittest.mock import patch
 import unittest
@@ -43,6 +44,70 @@ class ClaimMailMigrationTest(mail_test.ClaimMailMigrationTest, cli_test.Migratio
     def setUpClass(cls):
         cli_test.MigrationCLITest.setUpClass.__func__(cls)
         cls.dsn = f"postgresql://postgres@127.0.0.1:{cls.port}/postgres?sslmode=disable"
+
+
+class DevboxClaimMailMigrationTest(cli_test.MigrationCLITest):
+    test_fresh_database = None
+
+    def test_installed_baseline_inspect_apply_inspect_replay_and_drift(self):
+        # Reproduce the installer's actual CLI-written ordered history, including
+        # the regional migrations. A single aggregate string is a different ledger.
+        self.sql("CREATE SCHEMA auth; CREATE TABLE auth.users(id uuid PRIMARY KEY,created_at timestamptz,"
+                 "email text,email_confirmed_at timestamptz,deleted_at timestamptz);")
+        for role in shared.ROLES[:-1]:
+            self.sql(f"CREATE ROLE {role}")
+        regional.verified_aggregate(cli_test.ROOT)
+        self.copy_migrations()
+        for source in (cli_test.ROOT / "supabase/shared-auth-history").glob("*.sql"):
+            shutil.copyfile(source, self.migrations / source.name)
+        self.assertEqual(cli_test.run(cli_test.CLI, "--version").stdout.splitlines()[0], regional.CLI_VERSION)
+        self.push()
+        url = f"postgresql://postgres@127.0.0.1:{self.port}/{self.database}?sslmode=disable"
+        with psycopg.connect(url, autocommit=True, options=shared.OPTIONS) as conn:
+            fixture = mail_test.ClaimMailMigrationTest()
+            fixture.conn, fixture.revision = conn, "a" * 40
+            fixture.apply("authority", shared.source())
+            fixture.apply("claims", shared.claim_source())
+            fixture.later_migrations()
+            conn.execute("INSERT INTO auth.users(id,email) VALUES(gen_random_uuid(),'existing@example.test')")
+            users = conn.execute("SELECT * FROM auth.users").fetchall()
+            before = shared.ordinary_history(conn)
+            original = fixture.history()
+            self.assertEqual(len(next(r[2] for r in before if r[0] == regional.VERSION)), 23)
+            system, oid, port = conn.execute("SELECT system_identifier::text, "
+                "(SELECT oid::text FROM pg_database WHERE datname=current_database()),inet_server_port() "
+                "FROM pg_control_system()").fetchone()
+            binding = dict(system_identifier=system, database_oid=oid, server_port=port, database_name=self.database)
+            def run(execute=False):
+                return shared.apply_bound_devbox_claim_mail(conn, fixture.revision, **binding, execute=execute)
+            def assert_drift_rejected():
+                for mutation in ("statements[2:cardinality(statements)]",
+                                 "ARRAY(SELECT s FROM unnest(statements) WITH ORDINALITY AS t(s,n) ORDER BY n DESC)",
+                                 "array_append(statements, 'SELECT 1')"):
+                    conn.execute(f"UPDATE supabase_migrations.schema_migrations SET statements={mutation} WHERE version=%s",
+                                 (regional.VERSION,))
+                    for execute in (False, True):
+                        with self.assertRaisesRegex(shared.SharedMigrationError, "historical_aggregate_mismatch"):
+                            run(execute)
+                    self.assertEqual(fixture.history(), receipts)
+                    conn.execute("UPDATE supabase_migrations.schema_migrations SET statements=%s WHERE version=%s",
+                                 (next(r[2] for r in before if r[0] == regional.VERSION), regional.VERSION))
+            receipts = original
+            assert_drift_rejected()
+            with self.assertRaisesRegex(shared.SharedMigrationError, "unexpected_historical_aggregate"):
+                shared.prerequisites(conn, "staging")
+            with self.assertRaisesRegex(shared.SharedMigrationError, "historical_aggregate_mismatch"):
+                shared.prerequisites(conn, "use4")
+            self.assertEqual(run()["state"], "pending")
+            self.assertEqual(run(True)["state"], "applied")
+            self.assertEqual(run()["state"], "applied")
+            receipts = fixture.history()
+            self.assertEqual(run(True)["state"], "applied")
+            self.assertEqual(fixture.history(), receipts)
+            assert_drift_rejected()
+            self.assertEqual([r for r in receipts if r[0] != shared.MAIL_LEASE_VERSION], original)
+            self.assertEqual(shared.ordinary_history(conn), before)
+            self.assertEqual(conn.execute("SELECT * FROM auth.users").fetchall(), users)
 
 
 class SharedAuthMigrationTest(cli_test.MigrationCLITest):

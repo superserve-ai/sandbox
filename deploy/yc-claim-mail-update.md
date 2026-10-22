@@ -38,7 +38,9 @@ The execution owner must first revalidate the host/instance/runtime identity,
 lease, candidate revision, and database binding using the existing protected
 operator procedure. Saved identity values alone are not current proof. Load
 `migrate_shared_auth` from the pinned reviewed source and use the already-verified
-loopback PostgreSQL connection with `autocommit=True` and no open transaction.
+PostgreSQL connection with literal loopback host `127.0.0.1` or `::1`,
+`autocommit=True`, and no open transaction. Hostnames such as `localhost` are
+not accepted, matching the existing operator connection guard.
 The entry rejects other connection modes before querying or changing the database.
 Keep credentials out of command arguments and
 output. The supported additive entry point is:
@@ -58,6 +60,10 @@ result = shared.apply_bound_devbox_claim_mail(
 This call verifies the actual server system identifier, current database OID,
 server port and database name, administrator identity and PostgreSQL version. It can only select
 this repair. It does not replace the operator's outer host and connection checks.
+Every call also verifies the exact ordered signup-evidence baseline written by
+the pinned installer CLI. Missing, changed, or reordered baseline statements are
+rejected on inspection, application, and replay; staging and production history
+rules remain unchanged.
 
 1. Inspect with `execute=False`; require `pending` or `applied`. Stop on drift.
 2. On the same verified connection/source/binding, call with `execute=True`.

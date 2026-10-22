@@ -82,6 +82,7 @@ MAIL_LEASE_VERSION = "20261022031858"
 MAIL_LEASE_NAME = "yc_claim_mail_lease_aliases"
 MAIL_LEASE_HASH = "602eb662d8bb53b0e298fdb9e2aea518278718ef985dfa403513c16ab6ce31e1"
 MAIL_LEASE_BODY_HASH = "1a95c22740b395df59e14f9164810d53ef07d978ac130341d69cf8fd0c6f08b7"
+DEVBOX_BASELINE_HASH = "410eaddeb679e0114fbb667761e8f57e00327f99c9a0f927e4f39cf2023b5424"
 
 
 class SharedMigrationError(Exception):
@@ -336,7 +337,12 @@ def prerequisites(conn, target):
     rows = ordinary_history(conn)
     require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION, ACCEPTANCE_VERSION, MAIL_LEASE_VERSION) for row in rows), "shared_version_in_regional_history")
     aggregate = [row for row in rows if row[0] == regional.VERSION]
-    if target == "use4":
+    if target == "devbox":
+        require(len(aggregate) == 1 and aggregate[0][1] == regional.NAME
+                and hashlib.sha256(json.dumps(aggregate[0][2], separators=(",", ":"),
+                                               ensure_ascii=False).encode()).hexdigest() == DEVBOX_BASELINE_HASH,
+                "historical_aggregate_mismatch")
+    elif target == "use4":
         require(len(aggregate) == 1 and aggregate[0][1] == regional.NAME
                 and len(aggregate[0][2] or []) == 1
                 and hashlib.sha256(aggregate[0][2][0].encode()).hexdigest() == regional.SHA256,
@@ -611,6 +617,7 @@ def apply_bound_devbox_claim_mail(conn, revision, *, system_identifier, database
         current_setting('server_version_num')::int>=170000""").fetchone()
     require(actual == (database_name, "postgres", "postgres", system_identifier, database_oid, server_port, True),
             "database_identity_mismatch")
+    prerequisites(conn, "devbox")
     return _apply(conn, "devbox", revision, mail_lease_source(), execute, "claim-mail")
 
 
