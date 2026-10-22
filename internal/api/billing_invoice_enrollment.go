@@ -324,6 +324,13 @@ func (h *Handlers) validateInvoiceEnrollment(ctx context.Context, team uuid.UUID
 }
 
 func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription, reader db.DBTX) error {
+	if a.Base.Item != "" {
+		o, err := h.sponsoredAnnualAuthority(ctx, team, reader)
+		if err != nil {
+			return err
+		}
+		return validateSponsoredAnnualSubscription(o, sub, a.Price, false)
+	}
 	var stripErr error
 	sub, stripErr = a.Base.stripSubscription(sub)
 	if stripErr != nil {

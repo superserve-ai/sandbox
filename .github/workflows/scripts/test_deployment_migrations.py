@@ -1,6 +1,7 @@
 """Exercise deployment prerequisites without cloud credentials or migrations."""
 
 from pathlib import Path
+import json
 import re
 import subprocess
 import tempfile
@@ -117,7 +118,14 @@ class RevisionTests(unittest.TestCase):
             # An inherited SQL or preparation-helper change cannot use main's
             # migrations as proof, even after an application-only commit.
             for path in (migrations / "20990102000000_branch.sql",
-                         root / "scripts/snapshot_reference_index.py"):
+                         root / "scripts/snapshot_reference_index.py",
+                         root / "scripts/migrate_shared_auth.py",
+                         root / ".github/workflows/deployment-migrations.yml",
+                         root / ".github/workflows/scripts/deployment_migration_gate.py",
+                         root / ".github/workflows/deploy-api.yml",
+                         root / ".github/workflows/terraform-cd.yml",
+                         root / ".github/workflows/scripts/migration_gate.py",
+                         root / ".github/workflows/scripts/wait-for-push-ci.py"):
                 with self.subTest(path=path.relative_to(root)):
                     git("reset", "--hard", branch)
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +141,115 @@ class RevisionTests(unittest.TestCase):
                         gate.verify_revision(dict(env, GITHUB_SHA=tip, DEPLOYMENT_REVISION=tip))
 
 
+class SharedExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.env = dict(GITHUB_SHA=SHA, MIGRATION_REVISION=SHA, GITHUB_RUN_ID="123",
+                        GITHUB_RUN_ATTEMPT="1", SHARED_AUTH_REQUIRED="true")
+        self.bundle = patch.object(gate, "bundle_identity", return_value="c" * 64)
+        self.bundle.start()
+        self.addCleanup(self.bundle.stop)
+
+    def test_workflow_cli_modes_emit_executed_step_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "outputs"
+            env = dict(self.env, GITHUB_OUTPUT=str(output))
+            verification = gate.verification_identity(env, "staging", Path("migration-source"))
+            with patch.dict(gate.os.environ, env), patch.object(gate.sys, "argv", [
+                    "gate", "--apply-shared", "--target", "staging"]), \
+                    patch.object(gate, "apply_shared", return_value=verification) as execute:
+                self.assertEqual(gate.main(), 0)
+                execute.assert_called_once()
+            self.assertEqual(json.loads(output.read_text().strip().split("=", 1)[1]), verification)
+            output.write_text("")
+            with patch.dict(gate.os.environ, dict(env, SHARED_VERIFICATION=json.dumps(verification))), \
+                    patch.object(gate.sys, "argv", ["gate", "--record-receipt", "--target", "staging"]):
+                self.assertEqual(gate.main(), 0)
+            receipt = json.loads(output.read_text().strip().split("=", 1)[1])
+            self.assertEqual(receipt["regional_targets"], ["staging"])
+            with patch.dict(gate.os.environ, dict(env, MIGRATION_RECEIPT=json.dumps(receipt))), \
+                    patch.object(gate.sys, "argv", ["gate", "--verify-receipt", "--target", "staging"]):
+                self.assertEqual(gate.main(), 0)
+
+    def test_only_proxy_can_omit_shared_prerequisite(self):
+        for caller in ("deploy-api", "terraform-cd", "new-consumer", "deploy-proxy"):
+            env = dict(self.env, GITHUB_REPOSITORY="example/repo", SHARED_AUTH_REQUIRED="false",
+                       GITHUB_WORKFLOW_REF=f"example/repo/.github/workflows/{caller}.yml@refs/heads/main")
+            if caller == "deploy-proxy":
+                gate.check_shared_requirement(env)
+            else:
+                with self.assertRaises(gate.GateError):
+                    gate.check_shared_requirement(env)
+            gate.check_shared_requirement(dict(env, SHARED_AUTH_REQUIRED="true"))
+
+    def test_executor_order_and_failure_cannot_emit_success(self):
+        for target in ("staging", "use4"):
+            calls = []
+            def execute(command, **kwargs):
+                calls.append(command)
+                selected = command[command.index("--migration") + 1]
+                return subprocess.CompletedProcess(command, 0, json.dumps(dict(
+                    target=target, version=gate.SHARED_MIGRATIONS[selected],
+                    state="applied", regional_history_unchanged=True)))
+            with patch.object(gate, "verify_checkout"), patch.object(gate.subprocess, "run", side_effect=execute):
+                result = gate.apply_shared(self.env, target)
+            self.assertEqual(result, gate.verification_identity(self.env, target, Path("migration-source")))
+            self.assertEqual([c[c.index("--migration") + 1] for c in calls], list(gate.SHARED_MIGRATIONS))
+            for command in calls:
+                self.assertEqual(command[-1], gate.SHARED_TARGETS[target])
+                self.assertEqual(command[command.index("--revision") + 1], SHA)
+        for failed_at in range(3):
+            outcomes = [subprocess.CompletedProcess([], 0, json.dumps(dict(
+                target="staging", version=version, state="applied", regional_history_unchanged=True)))
+                for version in list(gate.SHARED_MIGRATIONS.values())[:failed_at]]
+            outcomes.append(subprocess.CompletedProcess([], 1, "", "private driver output"))
+            with patch.object(gate, "verify_checkout"), patch.object(gate.subprocess, "run", side_effect=outcomes) as run:
+                with self.assertRaisesRegex(gate.GateError, "inspect before retrying"):
+                    gate.apply_shared(self.env, "staging")
+                self.assertEqual(run.call_count, failed_at + 1)
+        for bad in (dict(target="staging", version=gate.SHARED_MIGRATIONS["authority"],
+                         state="pending", regional_history_unchanged=True), {},
+                    dict(target="use4", version=gate.SHARED_MIGRATIONS["authority"],
+                         state="applied", regional_history_unchanged=True)):
+            with patch.object(gate, "verify_checkout"), patch.object(gate.subprocess, "run", return_value=
+                    subprocess.CompletedProcess([], 0, json.dumps(bad))), self.assertRaises(gate.GateError):
+                gate.apply_shared(self.env, "staging")
+
+    def receipt(self, target="staging"):
+        verification = gate.verification_identity(self.env, target, Path("migration-source"))
+        return gate.record_receipt(dict(self.env, SHARED_VERIFICATION=json.dumps(verification)), target)
+
+    def test_partial_rerun_requires_new_actual_shared_execution(self):
+        receipt = self.receipt()
+        env = dict(self.env, MIGRATION_RECEIPT=json.dumps(receipt))
+        gate.verify_receipt(env, "staging")
+        rerun = dict(env, GITHUB_RUN_ATTEMPT="2")
+        for old_output in (json.dumps(receipt), "null", ""):
+            with self.subTest(output=old_output), self.assertRaises((gate.GateError, ValueError)):
+                gate.verify_receipt(dict(rerun, MIGRATION_RECEIPT=old_output), "staging")
+        old_shared = gate.verification_identity(self.env, "staging", Path("migration-source"))
+        with self.assertRaises(gate.GateError):
+            gate.record_receipt(dict(rerun, SHARED_VERIFICATION=json.dumps(old_shared)), "staging")
+        new_shared = gate.verification_identity(rerun, "staging", Path("migration-source"))
+        current = gate.record_receipt(dict(rerun, SHARED_VERIFICATION=json.dumps(new_shared)), "staging")
+        gate.verify_receipt(dict(rerun, MIGRATION_RECEIPT=json.dumps(current)), "staging")
+
+    def test_receipt_cannot_cross_sources_runs_targets_or_incomplete_regions(self):
+        receipt = self.receipt("use4")
+        gate.verify_receipt(dict(self.env, MIGRATION_RECEIPT=json.dumps(receipt)), "use4")
+        for change in (dict(run_id="456"), dict(deployment_revision=OLD), dict(migration_revision=OLD),
+                       dict(project="other-project"), dict(bundle="d" * 64), dict(shared_versions=[]),
+                       dict(regional_targets=["use4"]), dict(target="staging")):
+            with self.subTest(change=change), self.assertRaises(gate.GateError):
+                gate.verify_receipt(dict(self.env, MIGRATION_RECEIPT=json.dumps(dict(receipt, **change))), "use4")
+        with self.assertRaises(gate.GateError):
+            gate.verify_receipt(dict(self.env, MIGRATION_RECEIPT=json.dumps(self.receipt())), "use4")
+        # Compatible branch deployments deliberately have a different source SHA.
+        branch = dict(self.env, MIGRATION_REVISION=OLD)
+        verification = gate.verification_identity(branch, "staging", Path("migration-source"))
+        receipt = gate.record_receipt(dict(branch, SHARED_VERIFICATION=json.dumps(verification)), "staging")
+        gate.verify_receipt(dict(branch, MIGRATION_RECEIPT=json.dumps(receipt)), "staging")
+
+
 def job_blocks(workflow):
     body = workflow.split("\njobs:\n", 1)[1]
     starts = list(re.finditer(r"^  ([a-z][a-z0-9-]*):\n", body, re.M))
@@ -146,6 +263,47 @@ def dependencies(block):
 
 
 class DependencyTests(unittest.TestCase):
+    def test_shared_execution_precedes_regions_and_receipt_follows_all_regions(self):
+        source = (WORKFLOWS / "deployment-migrations.yml").read_text()
+        jobs = job_blocks(source)
+        for job, target, final_region in (("staging", "staging", "staging"), ("production", "use4", "usw2")):
+            block = jobs[job]
+            self.assertLess(block.index("--apply-shared"), block.index("migrate_database.py"))
+            self.assertLess(block.index(f"migrate_database.py {final_region} push"), block.index("--record-receipt"))
+            self.assertIn("SHARED_VERIFICATION: ${{ steps.shared.outputs.verification }}", block)
+            self.assertIn("receipt: ${{ steps.receipt.outputs.receipt }}", block)
+            self.assertNotIn("always()", block)
+        for workflow in ("deploy-api.yml", "terraform-cd.yml"):
+            caller = job_blocks((WORKFLOWS / workflow).read_text())["wait-for-migrations"]
+            self.assertIn("shared_auth_required: true", caller)
+        self.assertNotIn("shared_auth_required", (WORKFLOWS / "deploy-proxy.yml").read_text())
+
+    def test_partial_rerun_checks_all_consumer_jobs_before_mutation(self):
+        consumers = {
+            "deploy-api.yml": {"deploy-staging": "Deploy to Cloud Run", "deploy-production": "Deploy use4 cell to Cloud Run"},
+            "terraform-cd.yml": {
+                "staging-us-central1-infra": "Terraform apply staging/us-central1",
+                "staging-us-central1-api": "Deploy to Cloud Run",
+                "production-us-west2-infra": "Terraform apply production/us-west2",
+                "production-us-west2-api": "Deploy to Cloud Run",
+                "production-us-east4-infra": "Terraform apply production/us-east4",
+                "production-us-east4-api": "Deploy to Cloud Run",
+            },
+        }
+        for workflow, expected in consumers.items():
+            jobs = job_blocks((WORKFLOWS / workflow).read_text())
+            actual = {job for job, block in jobs.items() if "--verify-receipt" in block}
+            self.assertEqual(actual, set(expected))
+            for job, mutation in expected.items():
+                block = jobs[job]
+                self.assertIn("wait-for-migrations", dependencies(block))
+                consumer = ("          terraform apply -input=false -auto-approve tfplan" if job.endswith("-infra")
+                            else "- name: " + mutation)
+                self.assertLess(block.index("--verify-receipt"), block.index(consumer))
+                self.assertIn("MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}", block)
+                receipt = "staging_receipt" if "staging" in job else "production_receipt"
+                self.assertIn("MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs." + receipt + " }}", block)
+
     def test_failed_cancelled_or_skipped_prerequisite_blocks_every_deployment(self):
         for workflow, prerequisite in (("deploy-api.yml", "wait-for-migrations"),
                                        ("deploy-proxy.yml", "migrations"), ("terraform-cd.yml", "wait-for-migrations")):

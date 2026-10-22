@@ -10,11 +10,28 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+// This gate is intentionally closed until the customer acceptance consumer
+// supplies durable acceptance authority. Omitted claim IDs cannot bypass it.
+func requireYCClaimAcceptance(ctx context.Context, q db.DBTX, team uuid.UUID) error {
+	var allowed bool
+	if err := q.QueryRow(ctx, `SELECT (public.yc_staff_claim_rpc('activation-allowed',jsonb_build_object('team_id',$1::uuid))->>'allowed')::boolean`, team).Scan(&allowed); err != nil {
+		return err
+	}
+	if !allowed {
+		return errors.New("YC offer requires customer acceptance")
+	}
+	return nil
+}
 
 func (h *Handlers) ycAuthorityPreflight(ctx context.Context, team uuid.UUID, in ycApproval) error {
 	if h.PromotionAuthPool == nil {
 		return errors.New("shared company approval authority is unavailable")
+	}
+	if err := requireYCClaimAcceptance(ctx, h.PromotionAuthPool, team); err != nil {
+		return err
 	}
 	var conflict bool
 	err := h.PromotionAuthPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.read_yc_activation_authority($1,$2) WHERE (company_identity<>$1 OR team_id<>$2 OR home_region<>$3 OR revoked_at IS NOT NULL))`, in.CompanyIdentity, team, in.Region).Scan(&conflict)
@@ -33,6 +50,12 @@ func (h *Handlers) ycAuthorityPreflight(ctx context.Context, team uuid.UUID, in 
 // A bound claim carries its audited existing-account exception into billing.
 // Adopt that authority without rewriting evidence or opening general plan choice.
 func (h *Handlers) ycClaimApproval(ctx context.Context, team uuid.UUID, in ycApproval) (uuid.UUID, error) {
+	if h.PromotionAuthPool == nil {
+		return uuid.Nil, errors.New("shared company approval authority unavailable")
+	}
+	if err := requireYCClaimAcceptance(ctx, h.PromotionAuthPool, team); err != nil {
+		return uuid.Nil, err
+	}
 	id, err := uuid.Parse(in.ClaimID)
 	if err != nil {
 		return uuid.Nil, errors.New("invalid YC claim identity")
@@ -75,6 +98,12 @@ func (h *Handlers) ycClaimApproval(ctx context.Context, team uuid.UUID, in ycApp
 	return claim.Approval, nil
 }
 func (h *Handlers) reserveYCAuthority(ctx context.Context, team, actor uuid.UUID, in ycApproval) (uuid.UUID, error) {
+	if h.PromotionAuthPool == nil {
+		return uuid.Nil, errors.New("shared company approval authority unavailable")
+	}
+	if err := requireYCClaimAcceptance(ctx, h.PromotionAuthPool, team); err != nil {
+		return uuid.Nil, err
+	}
 	if in.ClaimID != "" {
 		return h.ycClaimApproval(ctx, team, in)
 	}
@@ -85,6 +114,9 @@ func (h *Handlers) reserveYCAuthority(ctx context.Context, team, actor uuid.UUID
 func (h *Handlers) verifyYCAuthority(ctx context.Context, o ycOperation) error {
 	if h.PromotionAuthPool == nil {
 		return errors.New("shared company approval authority is unavailable")
+	}
+	if err := requireYCClaimAcceptance(ctx, h.PromotionAuthPool, o.Team); err != nil {
+		return err
 	}
 	var valid bool
 	err := h.PromotionAuthPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.read_yc_activation_authority($4,$2) WHERE approval_id=$1 AND team_id=$2 AND home_region=$3 AND company_identity=$4 AND offer_key='yc_2026' AND offer_version=1 AND revoked_at IS NULL)`, o.ID, o.Team, o.Request.Region, o.Request.CompanyIdentity).Scan(&valid)
@@ -142,6 +174,9 @@ func (h *Handlers) lockYCAuthority(ctx context.Context, o ycOperation) (func(), 
 	}
 	_, err = tx.Exec(ctx, `SET LOCAL idle_in_transaction_session_timeout='60s'`)
 	var valid bool
+	if err == nil {
+		err = requireYCClaimAcceptance(ctx, tx, o.Team)
+	}
 	if err == nil {
 		err = tx.QueryRow(ctx, `SELECT public.lock_yc_activation_authority($1,$2,$3)`, o.ID, o.Team, o.Request.Region).Scan(&valid)
 	}

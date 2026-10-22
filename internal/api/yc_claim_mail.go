@@ -36,7 +36,7 @@ func sendYCClaimMail(ctx context.Context, sender EmailSender, origin, from strin
 		From:           from,
 		To:             j.Email,
 		Subject:        "Confirm your email for the Superserve YC offer",
-		Text:           "Confirm your email address to continue your YC claim:\n\n" + link + "\n\nThis link expires in 24 hours. After confirmation, sign up or sign in using this email and select your authorized team. Eligibility approval does not enable Pro access or issue credits; billing activation and a payment method are separate steps. If you did not request this, ignore this email.",
+		Text:           "Confirm your email address to continue your YC claim:\n\n" + link + "\n\nThis link expires in 24 hours. After confirmation, sign up or sign in using this email and select your authorized team. Eligibility approval does not enable Pro access or issue credits; review and acceptance of the offer are separate steps. No card is required for eligible new YC signups. If you did not request this, ignore this email.",
 		IdempotencyKey: "yc-claim/" + j.MessageID.String(),
 	})
 }
@@ -47,12 +47,14 @@ func (h *Handlers) StartYCClaimMail(ctx context.Context) {
 	if h.PromotionAuthPool == nil {
 		return
 	}
+	h.startYCApprovalMonitoring(ctx)
 	origin, err := ycConsoleOrigin()
 	sender, from := h.EmailTransport.Sender(os.Getenv("YC_EMAIL_API_KEY")), os.Getenv("YC_EMAIL_FROM")
 	if err != nil || sender == nil || from == "" {
-		log.Warn().Msg("YC confirmation mail disabled; configure console origin and email provider before enabling claim capture")
+		log.Warn().Msg("YC claim mail disabled; configure console origin and email provider before enabling claim capture")
 		return
 	}
+	h.startYCApprovalMail(ctx, sender, origin, from)
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()

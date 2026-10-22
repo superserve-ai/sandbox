@@ -2497,8 +2497,11 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, read
 	var denialReason string
 	switch state {
 	case "acquired", "existing", "blocked":
-	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending":
+	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending", "sponsored":
 		denialReason = state
+		if state == "sponsored" {
+			denialReason = "sponsored_onboarding"
+		}
 	case "authority_unavailable":
 		return &stripePromotionPreReservation{
 			EventID: event.ID, TeamID: account.TeamID, UserID: userID,
@@ -3068,10 +3071,23 @@ type stripePromotionPendingGrant struct {
 
 func (*stripePromotionPendingGrant) Error() string { return "Stripe promotion grant is ready" }
 
-func prepareStripePromotionGrant(ctx context.Context, q *db.Queries, teamID, userID uuid.UUID, eventID, customerID string) error {
+func prepareStripePromotionGrant(ctx context.Context, tx pgx.Tx, teamID, userID uuid.UUID, eventID, customerID string) error {
+	q := db.New(tx)
 	previouslyAttempted, err := q.StripePromotionWasAttempted(ctx, db.StripePromotionWasAttemptedParams{TeamID: pgtype.UUID{Bytes: teamID, Valid: true}, UserID: userID})
 	if err != nil {
 		return err
+	}
+	if !previouslyAttempted {
+		var sponsored bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_operation o JOIN team_billing_account a ON a.team_id=o.team_id WHERE o.team_id=$1 AND (o.state IN ('approved','active','revoking') OR (o.customer_id IS NOT NULL AND o.subscription_id IS NOT NULL)) AND (o.customer_id IS NULL OR o.customer_id=$2) AND (o.subscription_id IS NULL OR o.subscription_id=a.stripe_subscription_id))`, teamID, customerID).Scan(&sponsored); err != nil {
+			return err
+		}
+		if sponsored {
+			if err = q.ReleaseStripePromotionForEvent(ctx, db.ReleaseStripePromotionForEventParams{TeamID: teamID, UserID: userID, EventID: eventID}); err != nil {
+				return err
+			}
+			return recordStripePromotionDenial(ctx, tx, eventID, teamID, userID, "sponsored_onboarding")
+		}
 	}
 	attemptedAt, err := q.MarkStripePromotionAttempt(ctx, db.MarkStripePromotionAttemptParams{TeamID: pgtype.UUID{Bytes: teamID, Valid: true}, UserID: userID, EventID: stringPtr(eventID)})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -3201,7 +3217,8 @@ func (h *Handlers) finalizeRecordedStripePromotion(ctx context.Context, conn *pg
 	return nil
 }
 
-func (h *Handlers) settleStaleStripePromotion(ctx context.Context, q *db.Queries, account db.GetTeamBillingAccountByStripeCustomerIDRow, eventID, customerID string) error {
+func (h *Handlers) settleStaleStripePromotion(ctx context.Context, tx pgx.Tx, account db.GetTeamBillingAccountByStripeCustomerIDRow, eventID, customerID string) error {
+	q := db.New(tx)
 	if !account.StripeActivationUserID.Valid || derefString(account.StripeActivationCreditReservationEventID) != eventID ||
 		account.StripeActivationCreditGrantedAt.Valid || derefString(account.StripeActivationCreditGrantID) != "" {
 		return nil
@@ -3212,11 +3229,21 @@ func (h *Handlers) settleStaleStripePromotion(ctx context.Context, q *db.Queries
 		return err
 	}
 	if !attempted {
+		var sponsored bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_operation o JOIN team_billing_account a ON a.team_id=o.team_id WHERE o.team_id=$1 AND (o.state IN ('approved','active','revoking') OR (o.customer_id IS NOT NULL AND o.subscription_id IS NOT NULL)) AND (o.customer_id IS NULL OR o.customer_id=$2) AND (o.subscription_id IS NULL OR o.subscription_id=a.stripe_subscription_id))`, account.TeamID, customerID).Scan(&sponsored); err != nil {
+			return err
+		}
+		if sponsored {
+			if err = q.ReleaseStripePromotionForEvent(ctx, db.ReleaseStripePromotionForEventParams{TeamID: account.TeamID, UserID: userID, EventID: eventID}); err != nil {
+				return err
+			}
+			return recordStripePromotionDenial(ctx, tx, eventID, account.TeamID, userID, "sponsored_onboarding")
+		}
 		// Release and mark the webhook processed in the same transaction. Any
 		// failure rolls both back, so the next delivery retries the cleanup.
 		return q.ReleaseStripePromotionForEvent(ctx, db.ReleaseStripePromotionForEventParams{TeamID: account.TeamID, UserID: userID, EventID: eventID})
 	}
-	return prepareStripePromotionGrant(ctx, q, account.TeamID, userID, eventID, customerID)
+	return prepareStripePromotionGrant(ctx, tx, account.TeamID, userID, eventID, customerID)
 }
 
 func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Context, tx pgx.Tx, event stripeEventEnvelope, preReservation *stripePromotionPreReservation) error {
@@ -3435,7 +3462,7 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 		// A lifecycle event can establish the subscription ID before checkout
 		// completion. Matching expiration still wins over that association.
 		if expired {
-			return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
+			return h.settleStaleStripePromotion(ctx, tx, account, event.ID, obj.Customer)
 		}
 		associated := stripeSubscriptionMatchesCurrentAssociation(account, obj.ID)
 		if event.Type == "customer.subscription.created" {
@@ -3444,7 +3471,7 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 				return errStripeCheckoutAssociationPending
 			}
 			if ignore {
-				return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
+				return h.settleStaleStripePromotion(ctx, tx, account, event.ID, obj.Customer)
 			}
 			associated = true
 		} else if !associated && !canAssociateStripeSubscription(account, obj) {
@@ -3459,7 +3486,7 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 				// cancellation continuation discovers and settles its grant.
 				return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
 			}
-			return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
+			return h.settleStaleStripePromotion(ctx, tx, account, event.ID, obj.Customer)
 		}
 		if account.StripeSubscriptionEventAt.Valid {
 			previousAt := account.StripeSubscriptionEventAt.Time.UTC()
@@ -3471,7 +3498,7 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 				if cancellation && account.StripeActivationCreditReservedAt.Valid {
 					return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
 				}
-				return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
+				return h.settleStaleStripePromotion(ctx, tx, account, event.ID, obj.Customer)
 			}
 		}
 		if event.Type == "customer.subscription.deleted" {
@@ -3588,7 +3615,7 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 				if err := q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, UserID: activationUser, StripeGrantID: ""}); err != nil {
 					return wrapPromotionReservationErr(err)
 				}
-				return prepareStripePromotionGrant(ctx, q, account.TeamID, uuid.UUID(activationUser.Bytes), event.ID, obj.Customer)
+				return prepareStripePromotionGrant(ctx, tx, account.TeamID, uuid.UUID(activationUser.Bytes), event.ID, obj.Customer)
 			}
 			if err := q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, UserID: activationUser, StripeGrantID: derefString(account.StripeActivationCreditGrantID)}); err != nil {
 				return err

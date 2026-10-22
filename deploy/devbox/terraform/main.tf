@@ -30,14 +30,14 @@ locals {
   # IAM conditions can match resource names but not labels, so a fixed name
   # prefix is what keeps the devbox identity away from staging VMs, disks and
   # buckets that share this project.
-  instance_name_prefix = "projects/${var.project_id}/zones/${var.zone}/instances/${var.resource_name_prefix}"
-  disk_name_prefix     = "projects/${var.project_id}/zones/${var.zone}/disks/${var.resource_name_prefix}"
+  instance_name_prefix = { for zone in var.zones : zone => "projects/${var.project_id}/zones/${zone}/instances/${var.resource_name_prefix}" }
+  disk_name_prefix     = { for zone in var.zones : zone => "projects/${var.project_id}/zones/${zone}/disks/${var.resource_name_prefix}" }
   bucket_name_prefix   = "projects/_/buckets/${var.bucket_name_prefix}"
 
-  devbox_compute_condition = join(" || ", [
-    "(resource.type == \"compute.googleapis.com/Instance\" && resource.name.startsWith(\"${local.instance_name_prefix}\"))",
-    "(resource.type == \"compute.googleapis.com/Disk\" && resource.name.startsWith(\"${local.disk_name_prefix}\"))",
-  ])
+  devbox_compute_condition = { for zone in var.zones : zone => join(" || ", [
+    "(resource.type == \"compute.googleapis.com/Instance\" && resource.name.startsWith(\"${local.instance_name_prefix[zone]}\"))",
+    "(resource.type == \"compute.googleapis.com/Disk\" && resource.name.startsWith(\"${local.disk_name_prefix[zone]}\"))",
+  ]) }
   devbox_storage_condition = join(" || ", [
     "(resource.type == \"storage.googleapis.com/Bucket\" && resource.name.startsWith(\"${local.bucket_name_prefix}\"))",
     "(resource.type == \"storage.googleapis.com/Object\" && resource.name.startsWith(\"${local.bucket_name_prefix}\"))",
@@ -176,6 +176,9 @@ resource "google_service_account_iam_member" "ci_workload_identity" {
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository_id/${var.github_repository_id}"
 }
 
+# OS Login does not honour the name condition on these grants, so the create
+# workflow also binds roles/compute.osAdminLogin on each new instance itself;
+# getIamPolicy and setIamPolicy below allow that, on devbox instances only.
 resource "google_project_iam_custom_role" "lifecycle" {
   project     = var.project_id
   role_id     = "superserveDevboxLifecycle"
@@ -191,9 +194,11 @@ resource "google_project_iam_custom_role" "lifecycle" {
     "compute.instances.create",
     "compute.instances.delete",
     "compute.instances.get",
+    "compute.instances.getIamPolicy",
     "compute.instances.getSerialPortOutput",
     "compute.instances.osAdminLogin",
     "compute.instances.osLogin",
+    "compute.instances.setIamPolicy",
     "compute.instances.setLabels",
     "compute.instances.setMetadata",
     "compute.instances.setServiceAccount",
@@ -241,7 +246,11 @@ resource "google_project_iam_custom_role" "discovery" {
   ]
 }
 
+# One binding per zone: a binding's condition cannot change in place, so adding
+# a zone must add a binding rather than rewrite an existing one.
 resource "google_project_iam_member" "ci_lifecycle" {
+  for_each = local.devbox_compute_condition
+
   project = var.project_id
   role    = google_project_iam_custom_role.lifecycle.name
   member  = local.ci_member
@@ -249,8 +258,13 @@ resource "google_project_iam_member" "ci_lifecycle" {
   condition {
     title       = "devbox-resources-only"
     description = "Devbox VMs, disks and buckets, matched by name prefix."
-    expression  = join(" || ", [local.devbox_compute_condition, local.devbox_storage_condition])
+    expression  = join(" || ", [each.value, local.devbox_storage_condition])
   }
+}
+
+moved {
+  from = google_project_iam_member.ci_lifecycle
+  to   = google_project_iam_member.ci_lifecycle["us-central1-a"]
 }
 
 resource "google_project_iam_custom_role" "bucket_create" {
@@ -276,16 +290,16 @@ resource "google_project_iam_member" "operator_discovery" {
 }
 
 resource "google_project_iam_member" "engineer_access" {
-  for_each = toset(var.engineer_members)
+  for_each = { for pair in setproduct(var.engineer_members, var.zones) : "${pair[0]} ${pair[1]}" => { member = pair[0], zone = pair[1] } }
 
   project = var.project_id
   role    = google_project_iam_custom_role.access.name
-  member  = each.value
+  member  = each.value.member
 
   condition {
-    title       = "devbox-instances-only"
+    title       = "devbox-instances-only-${each.value.zone}"
     description = "Devbox VMs, matched by name prefix."
-    expression  = "resource.type == \"compute.googleapis.com/Instance\" && resource.name.startsWith(\"${local.instance_name_prefix}\")"
+    expression  = "resource.type == \"compute.googleapis.com/Instance\" && resource.name.startsWith(\"${local.instance_name_prefix[each.value.zone]}\")"
   }
 }
 
@@ -343,13 +357,14 @@ resource "google_project_iam_member" "box_bucket_objects" {
 
 resource "google_recaptcha_enterprise_key" "devbox" {
   project      = var.project_id
-  display_name = "superserve-devbox-localhost"
+  display_name = "superserve-devbox"
   labels       = local.labels
 
+  # Boxes are only reached through local port forwarding, so the key is not
+  # bound to a domain; it is a development key with no production use.
   web_settings {
     integration_type  = "SCORE"
-    allow_all_domains = false
-    allowed_domains   = ["localhost"]
+    allow_all_domains = true
   }
 
   depends_on = [google_project_service.required]

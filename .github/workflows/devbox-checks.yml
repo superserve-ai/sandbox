@@ -1,12 +1,15 @@
 name: Devbox Checks
 
 # Devbox changes stay off every deploy trigger path, so their checks live here
-# rather than in ci.yml.
+# rather than in ci.yml. The devbox renders the fleet host bootstrap and reuses
+# the host identity installer, so changes to those run these checks too.
 on:
   pull_request:
     branches: [main]
     paths:
       - 'deploy/devbox/**'
+      - 'deploy/host-bootstrap/**'
+      - 'deploy/install-host-identity.py'
       - '.github/workflows/scripts/devbox*'
       - '.github/workflows/devbox-checks.yml'
       - 'scripts/provision_devbox_stripe.py'
@@ -19,6 +22,8 @@ on:
     branches: [main]
     paths:
       - 'deploy/devbox/**'
+      - 'deploy/host-bootstrap/**'
+      - 'deploy/install-host-identity.py'
       - '.github/workflows/scripts/devbox*'
       - '.github/workflows/devbox-checks.yml'
       - 'scripts/provision_devbox_stripe.py'
@@ -53,3 +58,6 @@ jobs:
 
       - name: Run Stripe catalog bootstrap tests
         run: python3 -m unittest discover -s scripts -p 'test_provision_devbox_stripe.py'
+
+      - name: Check devbox shell scripts
+        run: find deploy/devbox -name '*.sh' -print0 | xargs -0 -r shellcheck -x -P SCRIPTDIR

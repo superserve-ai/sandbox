@@ -95,6 +95,7 @@ locals {
 
   controlplane_secret_ids = toset(concat(
     [for config in values(local.promotion_evidence_secrets) : config.secret],
+    [for config in values(local.qm_team_service_secrets) : config.secret],
     [for config in values(local.yc_claim_secrets) : config.secret],
     var.yc_claim_api_access_enabled ? [
       google_secret_manager_secret.yc_claim["capture-token"].secret_id,
@@ -143,5 +144,19 @@ locals {
       module.iam.service_account_emails["superserve_api"],
       google_service_account.vmd_runtime.email,
     ]
+  }
+}
+
+locals {
+  qm_team_service_env = var.qm_team_service == null ? {} : {
+    QM_TEAM_NAMESPACE    = var.qm_team_service.namespace
+    QM_TEAM_AUTHORITY_ID = var.qm_team_service.authority_id
+    QM_TEAM_REGION       = var.qm_team_service.home_region
+  }
+  qm_team_service_secrets = var.qm_team_service == null ? {} : {
+    QM_TEAM_SERVICE_TOKEN = {
+      secret  = var.qm_team_service.credential_secret_id
+      version = var.qm_team_service.credential_secret_version
+    }
   }
 }

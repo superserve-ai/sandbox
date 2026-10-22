@@ -27,13 +27,40 @@ env:
   TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
 
 jobs:
+  release-scope:
+    name: Classify the one-time East issuance enablement
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      east_usage_only: ${{ steps.scope.outputs.east_usage_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect the separately approved East-only release
+        id: scope
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/east_usage_entitlements_release.py landing \
+            --before "$BEFORE" --after "$AFTER" >> "$GITHUB_OUTPUT"
+      - name: Hold automatic rollout for the East-only release
+        if: steps.scope.outputs.east_usage_only == 'true'
+        run: echo 'East issuance source landed. All automatic applies and image deployments are held for separate plan approval.' >> "$GITHUB_STEP_SUMMARY"
+
   wait-for-migrations:
+    needs: [release-scope]
+    if: needs.release-scope.outputs.east_usage_only == 'false'
     uses: ./.github/workflows/deployment-migrations.yml
     permissions:
       contents: read
       actions: read
     with:
       revision: ${{ github.sha }}
+      shared_auth_required: true
       production: true
     secrets: inherit
 
@@ -103,9 +130,12 @@ jobs:
       - name: Terraform apply staging/us-central1
         env:
           TF_VAR_proxy_generation_frontends_enabled: ${{ vars.PROXY_STAGING_FRONTEND_MIGRATED == 'true' && 'true' || 'false' }}
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.staging_receipt }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: staging/us-central1" >> "$GITHUB_STEP_SUMMARY"
+          python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target staging
           cd infra/envs/staging/us-central1
           terraform init -input=false
           terraform validate
@@ -119,7 +149,7 @@ jobs:
     name: Deploy API staging/us-central1
     runs-on: ubuntu-latest
     environment: staging
-    needs: [build-api-image, staging-us-central1-infra]
+    needs: [build-api-image, staging-us-central1-infra, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -156,6 +186,12 @@ jobs:
           docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target staging
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.staging_receipt }}
 
       - name: Deploy to Cloud Run
         run: |
@@ -282,7 +318,7 @@ jobs:
     name: Apply production/us-west2
     runs-on: ubuntu-latest
     environment: production
-    needs: [staging-us-central1-api, production-us-central1-bootstrap]
+    needs: [staging-us-central1-api, production-us-central1-bootstrap, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -311,6 +347,12 @@ jobs:
           set -euo pipefail
           command -v jq
           command -v curl
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       - name: Terraform apply production/us-west2
         run: |
@@ -355,7 +397,7 @@ jobs:
     name: Deploy API production/us-west2
     runs-on: ubuntu-latest
     environment: production
-    needs: [build-api-image, production-us-west2-infra]
+    needs: [build-api-image, production-us-west2-infra, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -392,6 +434,12 @@ jobs:
           docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       - name: Deploy to Cloud Run
         run: |
@@ -493,9 +541,12 @@ jobs:
   # against that cell.
   production-us-east4-infra:
     name: Apply production/us-east4
+    # Clear only after the separately approved flag apply and runtime verification.
+    # Default closed also protects later pushes during the enablement window.
+    if: vars.EAST_USAGE_ENTITLEMENTS_APPLIED == 'true'
     runs-on: ubuntu-latest
     environment: production
-    needs: [staging-us-central1-api, production-us-central1-bootstrap]
+    needs: [staging-us-central1-api, production-us-central1-bootstrap, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -518,6 +569,12 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       - name: Terraform apply production/us-east4
         env:
@@ -565,7 +622,7 @@ jobs:
     name: Deploy API production/us-east4
     runs-on: ubuntu-latest
     environment: production
-    needs: [build-api-image, production-us-east4-infra]
+    needs: [build-api-image, production-us-east4-infra, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -602,6 +659,12 @@ jobs:
           docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       - name: Deploy to Cloud Run
         run: |

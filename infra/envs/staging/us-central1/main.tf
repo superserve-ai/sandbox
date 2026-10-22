@@ -217,7 +217,7 @@ module "api" {
   service_name          = "superserve-api"
   service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
-  env = {
+  env = merge({
     BILLING_USAGE_ENTITLEMENTS_ENABLED = "true"
     YC_CONSOLE_URL                     = var.yc_claim_console_url
     YC_EMAIL_FROM                      = var.yc_claim_email_from
@@ -274,13 +274,16 @@ module "api" {
     STRIPE_API_VERSION  = "2026-05-27.dahlia"
     APP_ALLOWED_ORIGINS = "https://console-staging.superserve.ai"
 
+    # Cloud Run front-end hop; staging has no load balancer in front of the API.
+    TRUSTED_PROXY_CIDRS = "169.254.0.0/16"
+
     # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
 
     # identity the runtime impersonates to delete from it.
 
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
-  }
-  secrets = merge(local.promotion_evidence_secrets, local.yc_claim_secrets, {
+  }, local.qm_team_service_env)
+  secrets = merge(local.promotion_evidence_secrets, local.yc_claim_secrets, local.qm_team_service_secrets, {
     OPERATOR_API_TOKEN = {
       secret = google_secret_manager_secret.operator_api_token.secret_id
     }

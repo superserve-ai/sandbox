@@ -45,15 +45,22 @@ class Box:
 
     @property
     def instance(self):
-        return next(iter(self.of('instance')), None)
+        """The instance the box lives on: a fallback attempt in an earlier zone can leave another one behind."""
+        return max(self.of('instance'), default=None, key=lambda i: (
+            bool(i.manifest) and i.manifest.get('zone') == i.zone and i.manifest.get('state') != 'creating',
+            _created(i.created) or 0))
 
     @property
     def primary(self):
         return self.instance or next(r for r in self.resources if not r.adopted)
 
     @property
+    def zones(self):
+        return sorted({r.zone for r in self.resources if r.zone})
+
+    @property
     def zone(self):
-        return next((r.zone for r in self.resources if r.zone), '')
+        return ', '.join(self.zones)
 
     @property
     def owner(self):
@@ -75,8 +82,9 @@ class Box:
 
     @property
     def unhandled(self):
-        known = {(r['type'], r['name'], r.get('zone')) for r in contract.resources(self.name, self.devbox_id)}
-        recorded = self.instance.recorded if self.instance else []
+        known = {(r['type'], r['name'], r.get('zone')) for zone in contract.DEVBOX_ZONES
+                 for r in contract.resources(self.name, self.devbox_id, zone)}
+        recorded = [r for i in self.of('instance') for r in i.recorded]
         return [f'{r.get("type")} {r.get("name")}' if isinstance(r, dict) else str(r) for r in recorded
                 if not isinstance(r, dict) or (r.get('type'), r.get('name'), r.get('zone')) not in known]
 
@@ -149,7 +157,7 @@ class Gcloud:
 
 
 def expected(name, devbox_id):
-    return {(r['type'], r['name']) for r in contract.resources(name, devbox_id)}
+    return {(r['type'], r['name']) for zone in contract.DEVBOX_ZONES for r in contract.resources(name, devbox_id, zone)}
 
 
 def leftovers(name, devbox_id):
@@ -222,8 +230,10 @@ def _placement(resource, project):
     match = PROJECT_IN_LINK.search(resource.link)
     if not match or match.group(1) != project:
         return f'not in project {project}'
-    if resource.zone != contract.ZONE:
-        return f'not in zone {contract.ZONE}'
+    try:
+        contract.validate_zone(resource.zone)
+    except contract.ContractError:
+        return f'not in a devbox zone ({", ".join(contract.DEVBOX_ZONES)})'
     return None
 
 
@@ -249,6 +259,8 @@ def _unadoptable(resource, group):
     foreign = [u for u in resource.users if u not in links]
     if foreign:
         return f'unlabelled and attached to {", ".join(map(_last, foreign))}'
+    if resource.kind != 'bucket' and resource.zone not in {r.zone for r in group if not r.adopted}:
+        return 'unlabelled and in a zone where the devbox that would claim it has no labelled resource'
     created = _created(resource.created)
     born = [t for t in (_created(r.created) for r in group if not r.adopted) if t is not None]
     if created is None or not born:
@@ -362,7 +374,7 @@ def render(boxes, ignored, now):
         if reachable:
             lines += ['', 'Access (IAP tunnel):', '']
             for box in reachable:
-                lines += [f'`{box.name}`:', '```', contract.forwarding_command(box.name, box.zone), '```']
+                lines += [f'`{box.name}`:', '```', contract.forwarding_command(box.name, box.instance.zone), '```']
     if ignored:
         lines += ['', 'Ignored resources (never destroyed by these workflows):', '']
         lines += [f'- {r.kind} `{r.name}`: {reason}' for r, reason in ignored]
@@ -439,10 +451,10 @@ def _owned_elsewhere(resource, name, devbox_id):
             and (resource.kind, resource.name) in expected(name, other))
 
 
-def _delete(cloud, resource, instance):
+def _delete(cloud, resource, instances):
     if resource.kind == 'bucket':
         return cloud.delete_bucket(resource.name)
-    foreign = [u for u in resource.users if not instance or u != instance.link]
+    foreign = [u for u in resource.users if u not in {i.link for i in instances}]
     if foreign:
         return f'disk {resource.name} is attached to {", ".join(map(_last, foreign))}; not deleted'
     return cloud.delete_disk(resource.name, resource.zone)
@@ -468,17 +480,17 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
         if error:
             raise SystemExit(f'Could not label unlabelled {resource.kind} {resource.name} of {name} ({devbox_id}) '
                              f'before deleting; nothing was deleted, rerun to retry: {error}')
-    instance = box.instance
-    if instance and box.manifest is not None:
+    for marked in [i for i in box.of('instance') if i.manifest is not None]:
         try:
-            error = cloud.set_metadata(instance.name, instance.zone, contract.MANIFEST_METADATA_KEY,
-                                       json.dumps(contract.with_state(box.manifest, 'destroying')))
+            error = cloud.set_metadata(marked.name, marked.zone, contract.MANIFEST_METADATA_KEY,
+                                       json.dumps(contract.with_state(marked.manifest, 'destroying')))
         except contract.ContractError as invalid:
             error = str(invalid)
         if error:
-            print(f'::warning::Could not mark {name} as destroying: {error}')
-    failures = [cloud.delete_instance(instance.name, instance.zone)] if instance else []
-    failures += [_delete(cloud, r, instance) for r in box.resources if r.kind != 'instance']
+            print(f'::warning::Could not mark {name} in {marked.zone} as destroying: {error}')
+    instances = box.of('instance')
+    failures = [cloud.delete_instance(i.name, i.zone) for i in instances]
+    failures += [_delete(cloud, r, instances) for r in box.resources if r.kind != 'instance']
     try:
         remaining, left = find_with_blocked(cloud, project, name, devbox_id)
     except CLOUD_ERRORS as error:

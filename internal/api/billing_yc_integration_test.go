@@ -172,6 +172,7 @@ func ensureYCTestAuthority(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	if exists {
+		ensureYCTestClaims(t, pool)
 		return
 	}
 	if _, err := pool.Exec(t.Context(), `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='promotion_evidence_proxy') THEN CREATE ROLE promotion_evidence_proxy; END IF; END $$; GRANT USAGE ON SCHEMA public TO promotion_evidence_proxy`); err != nil {
@@ -187,6 +188,33 @@ func ensureYCTestAuthority(t *testing.T, pool *pgxpool.Pool) {
 	defer pool.Exec(t.Context(), `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM anon,authenticated`)
 	if _, err = pool.Exec(t.Context(), string(raw)); err != nil {
 		t.Fatal(err)
+	}
+	ensureYCTestClaims(t, pool)
+}
+
+func ensureYCTestClaims(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(t.Context(), `CREATE SCHEMA IF NOT EXISTS auth; CREATE TABLE IF NOT EXISTS auth.users(id uuid PRIMARY KEY,email text,email_confirmed_at timestamptz,deleted_at timestamptz,created_at timestamptz NOT NULL DEFAULT now()); ALTER TABLE auth.users ADD COLUMN IF NOT EXISTS email text, ADD COLUMN IF NOT EXISTS email_confirmed_at timestamptz, ADD COLUMN IF NOT EXISTS deleted_at timestamptz, ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now()`); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []struct{ object, file string }{
+		{"yc_claim", "20261016174553_yc_claim_authority.sql"},
+		{"yc_claim_approval_mail", "20261020224623_yc_staff_claim_approval_notification.sql"},
+	} {
+		var present bool
+		if err := pool.QueryRow(t.Context(), "SELECT to_regclass('public.' || $1) IS NOT NULL", m.object).Scan(&present); err != nil {
+			t.Fatal(err)
+		}
+		if present {
+			continue
+		}
+		b, err := os.ReadFile("../../supabase/shared-auth-migrations/" + m.file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = pool.Exec(t.Context(), string(b)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

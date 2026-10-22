@@ -14,7 +14,6 @@ class TerraformAgreementTest(unittest.TestCase):
     def test_names_match_the_iam_conditions(self):
         self.assertEqual(PROFILE["resource_name_prefix"], TFVARS["resource_name_prefix"])
         self.assertEqual(PROFILE["bucket"]["name_prefix"], TFVARS["bucket_name_prefix"])
-        self.assertEqual(PROFILE["zone"], TFVARS["zone"])
         self.assertEqual(PROFILE["project"], TFVARS["project_id"])
 
     def test_instances_land_where_iap_ssh_is_allowed(self):

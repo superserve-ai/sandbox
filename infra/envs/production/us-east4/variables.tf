@@ -188,3 +188,34 @@ variable "alert_runbook_base_url" {
     error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
   }
 }
+
+variable "qm_machine_identity_activation" {
+  description = "Reviewed machine-identity activation record. Null leaves issuance disabled; readiness predicates require deployed evidence."
+  type = object({
+    contract_revision = string
+    environment       = string
+    ownership_ready   = bool
+    verifier_ready    = bool
+    operator_ready    = bool
+  })
+  default  = null
+  nullable = true
+
+  validation {
+    condition = var.qm_machine_identity_activation == null ? true : (
+      var.qm_machine_identity_activation.contract_revision == "machine-identity-v1" &&
+      var.qm_machine_identity_activation.environment == "production" &&
+      var.qm_machine_identity_activation.ownership_ready != null &&
+      var.qm_machine_identity_activation.verifier_ready != null &&
+      var.qm_machine_identity_activation.operator_ready != null
+    )
+    error_message = "Machine activation requires machine-identity-v1, production, and three explicit readiness booleans."
+  }
+
+  validation {
+    condition = var.qm_machine_identity_activation == null ? true : (
+      var.project_id == "rayai-prod" && var.environment == "production" && var.region == "us-east4"
+    )
+    error_message = "Machine activation is supported only by the rayai-prod production us-east4 root."
+  }
+}

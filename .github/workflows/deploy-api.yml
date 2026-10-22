@@ -75,6 +75,7 @@ on:
       - 'supabase/shared-auth-history/**'
       - 'supabase/shared-auth-migrations/**'
       - 'scripts/migrate_database.py'
+      - 'scripts/migrate_shared_auth.py'
       - 'scripts/snapshot_reference_index.py'
       - 'scripts/retained_storage_recovery.py'
       - 'scripts/recovery_evidence.py'
@@ -88,6 +89,7 @@ on:
       - '.github/workflows/scripts/test_migration_gate.py'
       - '.github/workflows/scripts/wait-for-push-ci.py'
       - '.github/workflows/deployment-migrations.yml'
+      - '.github/workflows/terraform-cd.yml'
       - '.github/workflows/scripts/deployment_migration_gate.py'
 
 jobs:
@@ -116,6 +118,7 @@ jobs:
       actions: read
     with:
       revision: ${{ github.sha }}
+      shared_auth_required: true
       production: ${{ github.event_name == 'push' || inputs.environment == 'production' }}
       allow_branch_staging: ${{ github.event_name == 'workflow_dispatch' && inputs.environment != 'production' }}
     secrets: inherit
@@ -179,6 +182,12 @@ jobs:
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
 
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target staging
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.staging_receipt }}
+
       - name: Deploy to Cloud Run
         run: |
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
@@ -216,7 +225,7 @@ jobs:
           curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
 
   deploy-production:
-    needs: [detect-changes, build-api-image, deploy-staging]
+    needs: [detect-changes, build-api-image, deploy-staging, wait-for-migrations]
     if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && (github.event_name != 'push' || needs.detect-changes.outputs.infra_changed != 'true')
     runs-on: ubuntu-latest
     environment: production
@@ -252,6 +261,12 @@ jobs:
           docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       # use4 is the primary production cell — api.superserve.ai routes here — so
       # it deploys FIRST, right after the image push, before the usw secondary

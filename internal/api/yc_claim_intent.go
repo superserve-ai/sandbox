@@ -15,12 +15,20 @@ import (
 // A timeout never removes either fence; an audited rejection can release local
 // plan selection only after the shared authority has been revoked.
 func (h *Handlers) ycBindWithIntent(ctx context.Context, op string, p gin.H) (json.RawMessage, error) {
+	return h.ycBindWithIntentRPC(ctx, op, p, h.ycClaimRPC)
+}
+
+func (h *Handlers) ycBindWithIntentRPC(ctx context.Context, op string, p gin.H, rpc func(context.Context, string, any) (json.RawMessage, error)) (json.RawMessage, error) {
 	team := p["team_id"]
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
 	var created time.Time
 	if err = tx.QueryRow(ctx, "SELECT created_at FROM public.team WHERE id=$1 FOR UPDATE", team).Scan(&created); err != nil {
 		return nil, err
@@ -53,7 +61,12 @@ func (h *Handlers) ycBindWithIntent(ctx context.Context, op string, p gin.H) (js
 	if op == "approve" {
 		prepare = "prepare-approve"
 	}
-	out, err := h.ycClaimRPC(ctx, prepare, p)
+	// Admission holds regional locks while preparing the shared claim. Bound
+	// this wait so revoke (claim -> authority) and dispatch (authority ->
+	// regional) cannot form a cross-database cycle until the request deadline.
+	prepareCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	out, err := rpc(prepareCtx, prepare, p)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +96,7 @@ func (h *Handlers) ycBindWithIntent(ctx context.Context, op string, p gin.H) (js
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return h.ycClaimRPC(ctx, op, p)
+	return rpc(ctx, op, p)
 }
 
 // Wait for an admission transaction even if its intent row is not visible yet.

@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -191,6 +193,28 @@ func RateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 			c.Next()
 		}
 	}
+}
+
+// ApplyTrustedProxies limits which hops ClientIP believes in X-Forwarded-For:
+// it walks the header right to left and returns the first address not in
+// cidrs, so entries a caller prepends are never reached. raw is a
+// comma-separated CIDR list; empty keeps gin's default of trusting every hop.
+func ApplyTrustedProxies(r *gin.Engine, raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var cidrs []string
+	for _, c := range strings.Split(raw, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			cidrs = append(cidrs, c)
+		}
+	}
+	// An empty slice would make gin trust no hop and key every caller on the
+	// load balancer's address, so a list of only separators is a config error.
+	if len(cidrs) == 0 {
+		return fmt.Errorf("no CIDRs in %q", raw)
+	}
+	return r.SetTrustedProxies(cidrs)
 }
 
 // TeamRateLimit returns a Gin middleware that enforces per-team rate limiting.

@@ -22,6 +22,8 @@ jobs:
           filters: |
             plan:
               - "infra/**"
+              - "deploy/billing-alerts/**"
+              - ".github/workflows/billing-alert-rollout.yml"
               - "scripts/terraform-*.sh"
               - "scripts/provision-host.py"
               - "deploy/host-provisioning-hold.sh"
@@ -45,7 +47,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Check Terraform formatting
-        run: terraform fmt -check -recursive infra/
+        run: terraform fmt -check -recursive infra/ && terraform fmt -check -recursive deploy/billing-alerts/
 
   terraform-validate:
     name: Terraform Validate
@@ -92,6 +94,19 @@ jobs:
           terraform -chdir=infra/modules/observability init -backend=false -input=false
           terraform -chdir=infra/modules/observability test
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test billing alert behavior and rollout boundary
+        run: |
+          terraform -chdir=deploy/billing-alerts/module init -backend=false -input=false
+          terraform -chdir=deploy/billing-alerts/module test -json -verbose > /tmp/billing-alert-tests.jsonl
+          curl -fsSL https://github.com/prometheus/prometheus/releases/download/v3.15.0/prometheus-3.15.0.linux-amd64.tar.gz -o /tmp/prometheus.tar.gz
+          tar -xzf /tmp/prometheus.tar.gz -C /tmp prometheus-3.15.0.linux-amd64/promtool
+          python3 scripts/test-billing-alerts.py /tmp/billing-alert-tests.jsonl /tmp/prometheus-3.15.0.linux-amd64/promtool
+          python3 -m unittest discover -s deploy/billing-alerts -p 'test_*.py'
+
       - name: Test managed host logging policy
         run: |
           terraform -chdir=infra/modules/host-logging init -backend=false -input=false
@@ -132,6 +147,9 @@ jobs:
             environment: production
           - name: production-us-west2
             dir: infra/envs/production/us-west2
+            environment: production
+          - name: production-billing-alerts
+            dir: deploy/billing-alerts/terraform
             environment: production
           - name: production-us-east4
             dir: infra/envs/production/us-east4

@@ -30,6 +30,17 @@ on:
         required: true
         default: '24'
         type: string
+      zone:
+        description: 'Zone (auto tries each us-central1 devbox zone in turn when one is out of capacity)'
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - us-central1-a
+          - us-central1-b
+          - us-central1-c
+          - us-central1-f
 
 permissions:
   contents: read
@@ -41,6 +52,7 @@ jobs:
       name: ${{ steps.prepare.outputs.name }}
       owner: ${{ steps.prepare.outputs.owner }}
       lifetime_hours: ${{ steps.prepare.outputs.lifetime_hours }}
+      zone: ${{ steps.prepare.outputs.zone }}
       sandbox_branch: ${{ steps.prepare.outputs.sandbox_branch }}
       sandbox_sha: ${{ steps.prepare.outputs.sandbox_sha }}
       ui_branch: ${{ steps.prepare.outputs.ui_branch }}
@@ -53,6 +65,7 @@ jobs:
         env:
           INPUT_NAME: ${{ inputs.name }}
           INPUT_LIFETIME_HOURS: ${{ inputs.lifetime_hours }}
+          INPUT_ZONE: ${{ inputs.zone }}
           INPUT_SANDBOX_BRANCH: ${{ inputs.sandbox_branch }}
           INPUT_UI_BRANCH: ${{ inputs.ui_branch }}
         run: python3 .github/workflows/scripts/devbox_workflow.py prepare-create
@@ -90,9 +103,12 @@ jobs:
       - name: Create devbox
         env:
           DEVBOX_ATTEMPT_FILE: ${{ runner.temp }}/devbox-attempt.json
+          DEVBOX_CI_SERVICE_ACCOUNT: ${{ vars.DEVBOX_GCP_SERVICE_ACCOUNT }}
+          DEVBOX_ENGINEER_MEMBERS: ${{ vars.DEVBOX_GCP_ENGINEER_MEMBERS }}
           NAME: ${{ needs.prepare.outputs.name }}
           OWNER: ${{ needs.prepare.outputs.owner }}
           LIFETIME_HOURS: ${{ needs.prepare.outputs.lifetime_hours }}
+          ZONE: ${{ needs.prepare.outputs.zone }}
           SANDBOX_BRANCH: ${{ needs.prepare.outputs.sandbox_branch }}
           SANDBOX_SHA: ${{ needs.prepare.outputs.sandbox_sha }}
           UI_BRANCH: ${{ needs.prepare.outputs.ui_branch }}
@@ -106,6 +122,7 @@ jobs:
           DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG: ${{ vars.DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG }}
           DEVBOX_CONFIG_RECAPTCHA_SITE_KEY: ${{ vars.DEVBOX_CONFIG_RECAPTCHA_SITE_KEY }}
           DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID: ${{ vars.DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID }}
+          DEVBOX_CONFIG_RECAPTCHA_SCORE_THRESHOLD: ${{ vars.DEVBOX_CONFIG_RECAPTCHA_SCORE_THRESHOLD }}
         run: python3 .github/workflows/scripts/devbox_workflow.py create
 
       - name: Mark an interrupted create failed

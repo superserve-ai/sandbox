@@ -1,6 +1,6 @@
 module github.com/superserve-ai/sandbox
 
-go 1.25.0
+go 1.26.10
 
 require (
 	cloud.google.com/go/kms v1.31.0

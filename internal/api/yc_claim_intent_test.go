@@ -55,7 +55,7 @@ func TestYCClaimAdmissionTransactions(t *testing.T) {
  CREATE TABLE public.billing_signup_choice(team_id uuid PRIMARY KEY,state text,offer_key text);
  CREATE TABLE public.billing_commercial_contract(id uuid PRIMARY KEY,team_id uuid);`)
 	exec(`DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF; END $$;`)
-	for _, path := range []string{filepath.Join("..", "..", "supabase", "shared-auth-migrations", "20261016174553_yc_claim_authority.sql"), os.Getenv("YC_AUTHORITY_TEST_MIGRATION"), filepath.Join("..", "..", "supabase", "migrations", "20261016174554_yc_claim_team_intent.sql")} {
+	for _, path := range []string{filepath.Join("..", "..", "supabase", "shared-auth-migrations", "20261016174553_yc_claim_authority.sql"), os.Getenv("YC_AUTHORITY_TEST_MIGRATION"), filepath.Join("..", "..", "supabase", "shared-auth-migrations", "20261020224623_yc_staff_claim_approval_notification.sql"), filepath.Join("..", "..", "supabase", "migrations", "20261016174554_yc_claim_team_intent.sql")} {
 		b, e := os.ReadFile(path)
 		if e != nil {
 			t.Fatal(e)

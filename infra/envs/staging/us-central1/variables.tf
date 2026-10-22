@@ -135,3 +135,27 @@ variable "notification_channel_ids" {
   type        = list(string)
   default     = []
 }
+
+variable "qm_team_service" {
+  description = "Enable the organization-team service only after authority installation and dedicated credential publication. References only; never supply token bytes."
+  type = object({
+    namespace                 = string
+    authority_id              = string
+    home_region               = string
+    credential_secret_id      = string
+    credential_secret_version = string
+  })
+  default = null
+
+  validation {
+    condition = var.qm_team_service == null ? true : alltrue([
+      can(regex("^[a-z][a-z0-9-]{2,39}$", var.qm_team_service.namespace)),
+      can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.qm_team_service.authority_id)),
+      var.qm_team_service.authority_id != "00000000-0000-0000-0000-000000000000",
+      contains(["use", "usw"], var.qm_team_service.home_region),
+      can(regex("^qm-team-service-token-[a-z0-9-]+$", var.qm_team_service.credential_secret_id)),
+      can(regex("^[1-9][0-9]*$", var.qm_team_service.credential_secret_version)),
+    ])
+    error_message = "Organization-team configuration requires a namespace, canonical nonzero authority UUID, use/usw region, dedicated qm-team-service-token-* secret ID and positive numeric secret version."
+  }
+}

@@ -1,0 +1,136 @@
+name: Billing Alert Rollout
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Prepare a plan or apply an already reviewed saved plan
+        type: choice
+        options: [plan, apply]
+        default: plan
+        required: true
+      expected_revision:
+        description: Full reviewed main commit SHA
+        type: string
+        required: true
+      plan_run_id:
+        description: Successful plan run ID (required for apply)
+        type: string
+      plan_sha256:
+        description: Reviewed binary plan SHA256 (required for apply)
+        type: string
+
+concurrency:
+  group: control-plane-deploy
+  queue: max
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  ALERT_ROOT: deploy/billing-alerts/terraform
+
+jobs:
+  verify-request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify exact main revision and operation
+        env:
+          EXPECTED_REVISION: ${{ inputs.expected_revision }}
+          OPERATION: ${{ inputs.operation }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          PLAN_SHA256: ${{ inputs.plan_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ && "$EXPECTED_REVISION" == "$GITHUB_SHA" ]] || exit 1
+          case "$OPERATION" in
+            plan) [[ -z "$PLAN_RUN_ID" && -z "$PLAN_SHA256" ]] ;;
+            apply) [[ "$PLAN_RUN_ID" =~ ^[0-9]+$ && "$PLAN_SHA256" =~ ^[0-9a-f]{64}$ ]] ;;
+            *) exit 1 ;;
+          esac
+
+  plan:
+    needs: verify-request
+    if: inputs.operation == 'plan'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.14.9'
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Prepare bounded saved plan
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/billing-plan"
+          terraform -chdir="$ALERT_ROOT" init -input=false -lockfile=readonly
+          terraform -chdir="$ALERT_ROOT" plan -input=false -lock-timeout=5m -out="$RUNNER_TEMP/billing-plan/alerts.tfplan"
+          terraform -chdir="$ALERT_ROOT" show -json "$RUNNER_TEMP/billing-plan/alerts.tfplan" | python3 deploy/billing-alerts/check_plan.py
+          terraform -chdir="$ALERT_ROOT" show -no-color "$RUNNER_TEMP/billing-plan/alerts.tfplan" > "$RUNNER_TEMP/billing-plan/plan.txt"
+          sha256sum "$RUNNER_TEMP/billing-plan/alerts.tfplan" | tee -a "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/billing-plan/plan.txt" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: billing-alert-plan
+          path: ${{ runner.temp }}/billing-plan/
+          retention-days: 3
+
+  apply:
+    needs: verify-request
+    if: inputs.operation == 'apply'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify saved-plan provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PLAN_RUN_ID" > "$RUNNER_TEMP/plan-run.json"
+          jq -e --arg sha "$GITHUB_SHA" '
+            .head_sha == $sha and .head_branch == "main" and
+            .event == "workflow_dispatch" and .conclusion == "success" and
+            .path == ".github/workflows/billing-alert-rollout.yml"
+          ' "$RUNNER_TEMP/plan-run.json"
+      - uses: actions/download-artifact@v4
+        with:
+          name: billing-alert-plan
+          path: ${{ runner.temp }}/billing-plan/
+          run-id: ${{ inputs.plan_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify reviewed plan digest
+        env:
+          PLAN_SHA256: ${{ inputs.plan_sha256 }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$PLAN_SHA256" "$RUNNER_TEMP/billing-plan/alerts.tfplan" | sha256sum -c -
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.14.9'
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Apply the reviewed saved plan
+        run: |
+          set -euo pipefail
+          terraform -chdir="$ALERT_ROOT" init -input=false -lockfile=readonly
+          terraform -chdir="$ALERT_ROOT" show -json "$RUNNER_TEMP/billing-plan/alerts.tfplan" | python3 deploy/billing-alerts/check_plan.py
+          terraform -chdir="$ALERT_ROOT" apply -input=false -lock-timeout=5m "$RUNNER_TEMP/billing-plan/alerts.tfplan"

@@ -103,6 +103,7 @@ jobs:
           DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG: ${{ vars.DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG }}
           DEVBOX_CONFIG_RECAPTCHA_SITE_KEY: ${{ vars.DEVBOX_CONFIG_RECAPTCHA_SITE_KEY }}
           DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID: ${{ vars.DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID }}
+          DEVBOX_CONFIG_RECAPTCHA_SCORE_THRESHOLD: ${{ vars.DEVBOX_CONFIG_RECAPTCHA_SCORE_THRESHOLD }}
         run: python3 .github/workflows/scripts/devbox_workflow.py deploy
 
       - name: Mark an interrupted deploy failed

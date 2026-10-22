@@ -26,7 +26,7 @@ func (h *Handlers) PendingYCClaims(c *gin.Context) {
 	}
 	ctx, cancel := promotionContext(c)
 	defer cancel()
-	out, e := h.ycClaimRPC(ctx, "pending", p)
+	out, e := h.ycStaffRPC(ctx, "activation-pending", p)
 	if e != nil {
 		ycClaimError(c, e)
 		return

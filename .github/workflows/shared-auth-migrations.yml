@@ -16,11 +16,11 @@ on:
         default: staging
         options: [staging, use4]
       migration:
-        description: 'Authority first; claims require the authority migration already applied'
+        description: 'Apply in order: authority, claims, then approvals'
         required: true
         type: choice
         default: authority
-        options: [authority, claims]
+        options: [authority, claims, approvals]
       runtime_project:
         description: 'Project verified from the deployed runtime authority connection'
         required: true

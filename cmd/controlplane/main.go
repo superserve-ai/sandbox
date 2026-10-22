@@ -360,6 +360,9 @@ func run() error {
 	go handlers.RunComputeReconciliation(ctx, enforcementSource)
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
+	if err := api.ApplyTrustedProxies(router, os.Getenv("TRUSTED_PROXY_CIDRS")); err != nil {
+		log.Fatal().Err(err).Msg("TRUSTED_PROXY_CIDRS")
+	}
 
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped

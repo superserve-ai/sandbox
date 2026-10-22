@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # --- Build stage ---
-FROM golang:1.25-alpine3.21 AS build
+FROM golang:1.26.10-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /bin/controlplane ./cmd/controlpl
 # --- Runtime stage ---
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache --upgrade ca-certificates ca-certificates-bundle tzdata
 COPY --from=build /bin/controlplane /usr/local/bin/controlplane
 
 EXPOSE 8080

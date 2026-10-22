@@ -28,6 +28,7 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	if h.Pool == nil {
 		return
 	}
+	h.startSponsoredAnnualReconciliation(ctx)
 	if _, ok := h.Stripe.(*stripeHTTPClient); !ok {
 		return
 	}
@@ -275,7 +276,16 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		return next, err
 	}
 	if !paid && c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
-		if _, err = h.reconcileProCheckout(ctx, team, false); err != nil {
+		var adopted bool
+		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE renewal_contract_id=$1)`, id).Scan(&adopted); err != nil {
+			return next, err
+		}
+		if adopted {
+			err = h.reconcileSponsoredAnnual(ctx, team)
+		} else {
+			_, err = h.reconcileProCheckout(ctx, team, false)
+		}
+		if err != nil {
 			return next, err
 		}
 	}

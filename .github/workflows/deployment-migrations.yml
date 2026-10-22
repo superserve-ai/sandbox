@@ -9,12 +9,22 @@ on:
       production:
         required: true
         type: boolean
+      shared_auth_required:
+        default: false
+        type: boolean
       allow_branch_staging:
         default: false
         type: boolean
       resume_run_id:
         default: ''
         type: string
+    outputs:
+      migration_revision:
+        value: ${{ jobs.gate.outputs.migration_revision }}
+      staging_receipt:
+        value: ${{ jobs.staging.outputs.receipt }}
+      production_receipt:
+        value: ${{ jobs.production.outputs.receipt }}
 
 permissions:
   contents: read
@@ -31,6 +41,7 @@ env:
   DEPLOYMENT_PRODUCTION: ${{ inputs.production && 'true' || 'false' }}
   ALLOW_BRANCH_STAGING: ${{ inputs.allow_branch_staging && 'true' || 'false' }}
   RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+  SHARED_AUTH_REQUIRED: ${{ inputs.shared_auth_required && 'true' || 'false' }}
 
 jobs:
   gate:
@@ -49,6 +60,8 @@ jobs:
 
   staging:
     needs: [gate]
+    outputs:
+      receipt: ${{ steps.receipt.outputs.receipt }}
     runs-on: ubuntu-latest
     environment: staging
     env:
@@ -65,6 +78,13 @@ jobs:
         with:
           version: '2.119.0'
       - run: python3 -m pip install -r migration-source/scripts/migration-requirements.txt
+      - name: Apply and verify shared staging authority
+        if: inputs.shared_auth_required
+        id: shared
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --apply-shared --target staging
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
       - name: Apply all staging migrations for the deployment
         run: |
           python3 .github/workflows/scripts/deployment_migration_gate.py --verify-revision
@@ -73,9 +93,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
 
+      - name: Record completed staging prerequisites
+        if: inputs.shared_auth_required
+        id: receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --record-receipt --target staging
+        env:
+          SHARED_VERIFICATION: ${{ steps.shared.outputs.verification }}
+
   production:
     if: inputs.production
     needs: [gate, staging]
+    outputs:
+      receipt: ${{ steps.receipt.outputs.receipt }}
     runs-on: ubuntu-latest
     environment: production
     env:
@@ -92,6 +121,13 @@ jobs:
         with:
           version: '2.119.0'
       - run: python3 -m pip install -r migration-source/scripts/migration-requirements.txt
+      - name: Apply and verify shared production authority
+        if: inputs.shared_auth_required
+        id: shared
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --apply-shared --target use4
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
       - name: Apply all primary production migrations for the deployment
         run: |
           python3 .github/workflows/scripts/deployment_migration_gate.py --verify-revision
@@ -106,3 +142,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
+
+      - name: Record completed production prerequisites
+        if: inputs.shared_auth_required
+        id: receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --record-receipt --target use4
+        env:
+          SHARED_VERIFICATION: ${{ steps.shared.outputs.verification }}

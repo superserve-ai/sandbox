@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 import sys
 import unittest
 
@@ -18,7 +19,7 @@ SHA_C = "c" * 40
 def manifest():
     return contract.new_manifest(
         name="awille-ai-dev-a7f3c9", devbox_id="3f9c0a1b2c4d", owner="awille-ai", actor="awille-ai",
-        created_at=CREATED, expires_at=contract.expiry(CREATED, 24),
+        created_at=CREATED, expires_at=contract.expiry(CREATED, 24), zone="us-central1-c",
         revisions={"sandbox": {"branch": "main", "sha": SHA_A}, "ui": {"branch": "main", "sha": SHA_B}})
 
 
@@ -261,12 +262,44 @@ class ComponentTests(unittest.TestCase):
                 contract.parse_components(bad)
 
     def test_forwarding_command_covers_contract_ports(self):
-        command = contract.forwarding_command("my-box")
-        self.assertTrue(command.startswith("gcloud compute ssh devbox-my-box --zone=us-central1-a "
+        command = contract.forwarding_command("my-box", "us-central1-b")
+        self.assertTrue(command.startswith("gcloud compute ssh devbox-my-box --zone=us-central1-b "
                                            "--project=rayai-dev --tunnel-through-iap -- -N "))
         for port in (3000, 8080, 54321, 8025, 8090):
             self.assertIn(f"-L {port}:127.0.0.1:{port}", command)
         self.assertNotIn("54322", command)
+
+
+class ZoneTests(unittest.TestCase):
+    def test_zone_candidates(self):
+        self.assertEqual(contract.zone_candidates("auto"), list(contract.DEVBOX_ZONES))
+        self.assertEqual(contract.zone_candidates(""), list(contract.DEVBOX_ZONES))
+        self.assertEqual(contract.zone_candidates(" us-central1-f "), ["us-central1-f"])
+        for bad in ("us-east1-b", "us-central1-d", "us-central1", "AUTO"):
+            with self.subTest(zone=bad), self.assertRaises(contract.ContractError):
+                contract.zone_candidates(bad)
+
+    def test_zones_match_the_terraform_iam_conditions(self):
+        tfvars = (Path(__file__).resolve().parents[3] / "deploy/devbox/terraform/terraform.tfvars").read_text()
+        zones = re.search(r"^zones\s*=\s*\[(.*)\]$", tfvars, re.M)
+        self.assertIsNotNone(zones, "terraform.tfvars must list the devbox zones")
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', zones.group(1))), contract.DEVBOX_ZONES)
+
+    def test_zones_stay_in_the_devbox_region(self):
+        self.assertEqual(len(set(contract.DEVBOX_ZONES)), len(contract.DEVBOX_ZONES))
+        for zone in contract.DEVBOX_ZONES:
+            self.assertEqual(zone.rsplit("-", 1)[0], contract.REGION)
+
+    def test_zone_of_reads_gce_zone_urls(self):
+        self.assertEqual(contract.zone_of({"zone": "projects/p/zones/us-central1-c"}), "us-central1-c")
+        with self.assertRaises(contract.ContractError):
+            contract.zone_of({"zone": "projects/p/zones/us-east1-b"})
+
+    def test_manifest_zone_must_be_a_devbox_zone(self):
+        self.assertEqual(manifest()["zone"], "us-central1-c")
+        self.assertEqual({r.get("zone") for r in manifest()["resources"]}, {"us-central1-c", None})
+        with self.assertRaises(contract.ContractError):
+            contract.validate_manifest({**manifest(), "zone": "us-east1-b"})
 
 
 if __name__ == "__main__":

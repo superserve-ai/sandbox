@@ -14,7 +14,10 @@ import secrets
 SCHEMA_VERSION = 1
 MANAGED_BY = "superserve-devbox"
 PROJECT = "rayai-dev"
-ZONE = "us-central1-a"
+REGION = "us-central1"
+# Zonal resources may live in any of these; create tries them in this order.
+DEVBOX_ZONES = ("us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f")
+AUTO_ZONE = "auto"
 MANIFEST_METADATA_KEY = "devbox-manifest"
 # The devbox project also hosts staging, so the workflow identity's IAM is
 # conditioned on these name prefixes; labels carry the bare devbox name.
@@ -216,7 +219,23 @@ def select_instance(instances, name):
     return instance
 
 
-def resources(name, devbox_id, zone=ZONE):
+def validate_zone(zone):
+    if zone not in DEVBOX_ZONES:
+        raise ContractError(f"Zone {zone!r} is not a devbox zone ({', '.join(DEVBOX_ZONES)})")
+    return zone
+
+
+def zone_candidates(value):
+    value = (value or "").strip() or AUTO_ZONE
+    return list(DEVBOX_ZONES) if value == AUTO_ZONE else [validate_zone(value)]
+
+
+def zone_of(resource):
+    return validate_zone((resource.get("zone") or "").rsplit("/", 1)[-1])
+
+
+def resources(name, devbox_id, zone):
+    validate_zone(zone)
     return [
         {"type": "instance", "name": instance_name(name), "zone": zone},
         {"type": "disk", "name": instance_name(name), "zone": zone},
@@ -233,8 +252,8 @@ def revision(branch, sha):
     return {"branch": branch, "sha": sha}
 
 
-def new_manifest(*, name, devbox_id, owner, actor, created_at, expires_at, revisions,
-                 project=PROJECT, zone=ZONE):
+def new_manifest(*, name, devbox_id, owner, actor, created_at, expires_at, revisions, zone,
+                 project=PROJECT):
     revisions = {key: revision(revisions[key]["branch"], revisions[key]["sha"]) for key in REPOSITORIES}
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -267,6 +286,7 @@ def validate_manifest(manifest):
         if not isinstance(manifest.get(key), str) or not manifest[key]:
             raise ContractError(f"Manifest field {key!r} is missing")
     validate_name(manifest["name"])
+    validate_zone(manifest["zone"])
     validate_devbox_id(manifest["devbox_id"])
     parse_iso(manifest["created_at"])
     parse_iso(manifest["expires_at"])
@@ -377,7 +397,8 @@ def record_deploy(manifest, *, at, actor, components, revisions, migrations, res
     return validate_manifest(updated)
 
 
-def forwarding_command(name, zone=ZONE, project=PROJECT):
+def forwarding_command(name, zone, project=PROJECT):
+    validate_zone(zone)
     forwards = " ".join(f"-L {port}:127.0.0.1:{port}" for _, port in FORWARDED_PORTS)
     return (f"gcloud compute ssh {instance_name(name)} --zone={zone} --project={project} "
             f"--tunnel-through-iap -- -N {forwards}")

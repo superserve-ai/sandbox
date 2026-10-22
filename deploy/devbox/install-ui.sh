@@ -8,8 +8,9 @@
 #
 # Inputs:
 #   /etc/superserve-devbox/devbox.env    non-secret settings from CI
-#                                        (DEVBOX_UI_SHA; RECAPTCHA_SITE_KEY and
-#                                        RECAPTCHA_PROJECT_ID, optional)
+#                                        (DEVBOX_UI_SHA; RECAPTCHA_SITE_KEY,
+#                                        RECAPTCHA_PROJECT_ID and
+#                                        RECAPTCHA_SCORE_THRESHOLD, optional)
 #   /etc/superserve-devbox/secrets.env   CI secrets (RECAPTCHA_API_KEY,
 #                                        optional)
 #   /etc/superserve-devbox/local-secrets.env  plain KEY=value keys and the
@@ -147,6 +148,7 @@ RUNTIME_VARS=(
   "PROMOTION_ACCOUNT_TOKEN=$promotion_account_token"
   "PROMOTION_ACCOUNT_PRIVATE_KEY=$(<"$PROMOTION_KEY")"
   "RECAPTCHA_PROJECT_ID=$(env_get "$DEVBOX_ENV" RECAPTCHA_PROJECT_ID)"
+  "RECAPTCHA_SCORE_THRESHOLD=$(env_get "$DEVBOX_ENV" RECAPTCHA_SCORE_THRESHOLD)"
   "RECAPTCHA_API_KEY=$(env_get "$CI_SECRETS" RECAPTCHA_API_KEY)"
 )
 

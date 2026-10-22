@@ -1,6 +1,6 @@
 project_id                 = "rayai-dev"
 region                     = "us-central1"
-zone                       = "us-central1-a"
+zones                      = ["us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f"]
 subnet_cidr                = "10.70.0.0/24"
 network_tag                = "superserve-devbox"
 resource_name_prefix       = "devbox-"

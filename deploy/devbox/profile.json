@@ -1,7 +1,6 @@
 {
   "schema_version": 1,
   "project": "rayai-dev",
-  "zone": "us-central1-a",
   "region": "us-central1",
   "resource_name_prefix": "devbox-",
   "labels": {
