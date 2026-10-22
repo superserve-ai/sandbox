@@ -99,6 +99,29 @@ class DevboxClaimMailMigrationTest(cli_test.MigrationCLITest):
             with self.assertRaisesRegex(shared.SharedMigrationError, "historical_aggregate_mismatch"):
                 shared.prerequisites(conn, "use4")
             self.assertEqual(run()["state"], "pending")
+            # A second executor can change history after the unlocked precheck.
+            # The writer must reject that new baseline after acquiring its lock.
+            rpc_before = shared.mail_lease_catalog(conn)
+            real_prerequisites = shared.prerequisites
+            prechecked = False
+            with psycopg.connect(url, autocommit=True) as other:
+                def change_after_precheck(connection, target):
+                    nonlocal prechecked
+                    result = real_prerequisites(connection, target)
+                    if not prechecked:
+                        prechecked = True
+                        other.execute("UPDATE supabase_migrations.schema_migrations "
+                                      "SET statements=array_append(statements, 'SELECT 1') WHERE version=%s",
+                                      (regional.VERSION,))
+                    return result
+                with patch.object(shared, "prerequisites", side_effect=change_after_precheck):
+                    with self.assertRaisesRegex(shared.SharedMigrationError, "historical_aggregate_mismatch"):
+                        run(True)
+            self.assertTrue(prechecked)
+            self.assertEqual(fixture.history(), original)
+            self.assertEqual(shared.mail_lease_catalog(conn), rpc_before)
+            conn.execute("UPDATE supabase_migrations.schema_migrations SET statements=%s WHERE version=%s",
+                         (next(r[2] for r in before if r[0] == regional.VERSION), regional.VERSION))
             self.assertEqual(run(True)["state"], "applied")
             self.assertEqual(run()["state"], "applied")
             receipts = fixture.history()

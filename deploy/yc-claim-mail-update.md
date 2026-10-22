@@ -28,6 +28,9 @@ For a verified production or staging authority target, use the existing CLI and
 its runtime-project/connection guards, selecting `--migration claim-mail` for
 `inspect`, then `apply`, then `inspect`. Use the same reviewed revision for all
 three steps. Do not route a disposable target through the staging CLI.
+The existing `Apply shared Auth migration` manual workflow also offers
+`claim-mail` for staging and use4. Its normal revision and runtime-project guards
+still apply; selecting the repair does not add it to automatic deployments.
 
 ## Already-initialized disposable target
 
@@ -66,6 +69,8 @@ Every call also verifies the exact ordered signup-evidence baseline written by
 the pinned installer CLI. Missing, changed, or reordered baseline statements are
 rejected on inspection, application, and replay; staging and production history
 rules remain unchanged.
+The first write repeats this verification inside the migration transaction after
+acquiring the advisory lock, so history changed after the initial check is rejected.
 
 1. Inspect with `execute=False`; require `pending` or `applied`. Stop on drift.
 2. On the same verified connection/source/binding, call with `execute=True`.

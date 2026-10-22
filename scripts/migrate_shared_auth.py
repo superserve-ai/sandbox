@@ -665,7 +665,7 @@ def _apply(conn, target, revision, sql, execute=False, migration="authority"):
                 "to_regclass('auth.users') IS NOT NULL", (list(ROLES),)).fetchone()
             require(roles == len(ROLES), "required_roles_missing")
             require(migration == "authority" or auth, "existing_auth_setup_required")
-            before = ordinary_history(conn)
+            before = prerequisites(conn, target) if target == "devbox" else ordinary_history(conn)
             require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION, ACCEPTANCE_VERSION, MAIL_LEASE_VERSION) for row in before),
                     "shared_version_in_regional_history")
             if not exists:
