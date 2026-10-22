@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,12 +21,45 @@ type ycMailJob struct {
 	Token     string    `json:"token"`
 }
 
-func ycConsoleOrigin() (string, error) {
+func (h *Handlers) ycConsoleOrigin() (string, error) {
 	u, e := url.Parse(os.Getenv("YC_CONSOLE_URL"))
-	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+	if e != nil || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("YC console origin is not configured")
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && h.ycLocalMailConfigured() && ycLoopbackOrigin(u)) {
 		return "", errors.New("YC console origin is not configured")
 	}
 	return u.Scheme + "://" + u.Host, nil
+}
+
+// Local HTTP links require both a loopback API bind and the selected local SMTP
+// transport. These are configuration prerequisites, not a devbox identity check.
+func (h *Handlers) ycLocalMailConfigured() bool {
+	if h.Config == nil || !net.ParseIP(h.Config.Host).IsLoopback() {
+		return false
+	}
+	host, port, err := net.SplitHostPort(h.EmailTransport.SMTPAddr)
+	n, portErr := strconv.Atoi(port)
+	return err == nil && portErr == nil && n > 0 && n <= 65535 &&
+		(host == "localhost" || net.ParseIP(host).IsLoopback())
+}
+
+func ycLoopbackOrigin(u *url.URL) bool {
+	host := u.Hostname()
+	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+		return false
+	}
+	if u.RawPath != "" || u.ForceQuery {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		return err == nil && n > 0 && n <= 65535 && u.Host == net.JoinHostPort(host, port)
+	}
+	if host == "::1" {
+		return u.Host == "[::1]"
+	}
+	return u.Host == host
 }
 
 func sendYCClaimMail(ctx context.Context, sender EmailSender, origin, from string, j ycMailJob) error {
@@ -48,7 +83,7 @@ func (h *Handlers) StartYCClaimMail(ctx context.Context) {
 		return
 	}
 	h.startYCApprovalMonitoring(ctx)
-	origin, err := ycConsoleOrigin()
+	origin, err := h.ycConsoleOrigin()
 	sender, from := h.EmailTransport.Sender(os.Getenv("YC_EMAIL_API_KEY")), os.Getenv("YC_EMAIL_FROM")
 	if err != nil || sender == nil || from == "" {
 		log.Warn().Msg("YC claim mail disabled; configure console origin and email provider before enabling claim capture")
