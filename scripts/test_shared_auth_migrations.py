@@ -11,6 +11,7 @@ import psycopg
 import migrate_database as regional
 import migrate_shared_auth as shared
 import test_migration_cli as cli_test
+import test_yc_claim_mail_migration as mail_test
 
 
 class MeasuredConnection:
@@ -33,6 +34,15 @@ class MeasuredConnection:
     def transaction(self):
         self.transactions += 1
         return self.conn.transaction()
+
+
+class ClaimMailMigrationTest(mail_test.ClaimMailMigrationTest, cli_test.MigrationCLITest):
+    test_fresh_database = None
+
+    @classmethod
+    def setUpClass(cls):
+        cli_test.MigrationCLITest.setUpClass.__func__(cls)
+        cls.dsn = f"postgresql://postgres@127.0.0.1:{cls.port}/postgres?sslmode=disable"
 
 
 class SharedAuthMigrationTest(cli_test.MigrationCLITest):
