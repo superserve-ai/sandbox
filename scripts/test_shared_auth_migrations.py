@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import re
 import shutil
 import time
 from unittest.mock import patch
@@ -13,6 +14,22 @@ import migrate_database as regional
 import migrate_shared_auth as shared
 import test_migration_cli as cli_test
 import test_yc_claim_mail_migration as mail_test
+import test_yc_approval_mail_scope_migration as approval_mail_test
+
+
+class SharedMigrationWorkflowTest(unittest.TestCase):
+    def test_manual_workflow_exposes_cli_migration_choices(self):
+        output = io.StringIO()
+        with patch("sys.argv", ["migrate_shared_auth.py", "--help"]), contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit) as stopped:
+                shared.main()
+        self.assertEqual(stopped.exception.code, 0)
+        cli = re.search(r"--migration \{([^}]+)\}", output.getvalue()).group(1)
+        workflow = (shared.ROOT / ".github/workflows/shared-auth-migrations.yml").read_text()
+        selector = workflow.split("      migration:", 1)[1].split("      runtime_project:", 1)[0]
+        choices = re.search(r"options: \[([^]]+)\]", selector).group(1)
+        self.assertEqual([value.strip() for value in choices.split(",")],
+                         [value.strip() for value in cli.split(",")])
 
 
 class MeasuredConnection:
@@ -38,6 +55,15 @@ class MeasuredConnection:
 
 
 class ClaimMailMigrationTest(mail_test.ClaimMailMigrationTest, cli_test.MigrationCLITest):
+    test_fresh_database = None
+
+    @classmethod
+    def setUpClass(cls):
+        cli_test.MigrationCLITest.setUpClass.__func__(cls)
+        cls.dsn = f"postgresql://postgres@127.0.0.1:{cls.port}/postgres?sslmode=disable"
+
+
+class ApprovalMailScopeMigrationTest(approval_mail_test.ApprovalMailScopeMigrationTest, cli_test.MigrationCLITest):
     test_fresh_database = None
 
     @classmethod

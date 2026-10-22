@@ -82,6 +82,10 @@ MAIL_LEASE_VERSION = "20261022031858"
 MAIL_LEASE_NAME = "yc_claim_mail_lease_aliases"
 MAIL_LEASE_HASH = "602eb662d8bb53b0e298fdb9e2aea518278718ef985dfa403513c16ab6ce31e1"
 MAIL_LEASE_BODY_HASH = "1a95c22740b395df59e14f9164810d53ef07d978ac130341d69cf8fd0c6f08b7"
+APPROVAL_SCOPE_VERSION = "20261022232449"
+APPROVAL_SCOPE_NAME = "yc_approval_mail_claim_scope"
+APPROVAL_SCOPE_HASH = "ce4bb72dcba919e1eae646a89026d4c0195a00fcb13753941d57263396bc949a"
+APPROVAL_SCOPE_BODY_HASH = "5f3544387c1f0731454cf82af02dbd63e00aaed107d5dac94c4238edafa93b64"
 DEVBOX_BASELINE_HASH = "410eaddeb679e0114fbb667761e8f57e00327f99c9a0f927e4f39cf2023b5424"
 
 
@@ -324,6 +328,63 @@ def ordinary_history(conn):
     return conn.execute("SELECT version,name,statements FROM supabase_migrations.schema_migrations ORDER BY version").fetchall()
 
 
+def approval_scope_source(root=ROOT):
+    data = (root / "supabase/shared-auth-migrations" / f"{APPROVAL_SCOPE_VERSION}_{APPROVAL_SCOPE_NAME}.sql").read_bytes()
+    require(hashlib.sha256(data).hexdigest() == APPROVAL_SCOPE_HASH, "source_hash_mismatch")
+    return data.decode("utf-8")
+
+
+def approval_scope_execution(sql):
+    require(hashlib.sha256(sql.encode()).hexdigest() == APPROVAL_SCOPE_HASH, "source_hash_mismatch")
+    prefix = "-- Shared Auth only. Preserve the existing approval mail RPC attributes and privileges.\nBEGIN;\n"
+    require(sql.startswith(prefix) and sql.endswith("COMMIT;\n"), "approval_scope_transaction_wrapper_mismatch")
+    return sql[len(prefix):-len("COMMIT;\n")]
+
+
+def approval_scope_objects_present(conn):
+    return conn.execute("SELECT EXISTS (SELECT FROM pg_proc WHERE oid=to_regprocedure(%s) "
+                        "AND encode(sha256(convert_to(prosrc,'UTF8')),'hex')=%s)",
+                        (APPROVAL_FUNCTIONS[1], APPROVAL_SCOPE_BODY_HASH)).fetchone()[0]
+
+
+def approval_scope_catalog(conn):
+    return {"functions": conn.execute("""SELECT jsonb_agg(jsonb_build_array(
+        p.oid::regprocedure::text,pg_get_functiondef(p.oid),pg_get_userbyid(p.proowner),p.proacl))
+        FROM pg_proc p WHERE p.oid=to_regprocedure(%s)""", (APPROVAL_FUNCTIONS[1],)).fetchone()[0]}
+
+
+def verify_approval_scope_permissions(conn):
+    verify_changed_permissions(conn, "approval-mail-scope")
+
+
+def approval_mail_definitions(value):
+    if isinstance(value, dict):
+        for function in value.get("functions") or ():
+            if function[0] == "yc_claim_approval_mail_rpc(text,jsonb)":
+                yield function
+        for child in value.values():
+            yield from approval_mail_definitions(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from approval_mail_definitions(child)
+
+
+def verify_approval_scope_predecessor(conn):
+    recorded = conn.execute(f"SELECT catalog FROM {LEDGER} WHERE version=%s", (ACCEPTANCE_VERSION,)).fetchone()[0]
+    expected = list(approval_mail_definitions(recorded))
+    require(len(expected) == 1 and approval_scope_catalog(conn)["functions"] == expected,
+            "approval_scope_predecessor_mismatch")
+
+
+def predecessor_approval_scope_catalog(current):
+    sql = approval_scope_source()
+    original, scoped = sql.split("$original$", 2)[1], sql.split("$scoped$", 2)[1]
+    for function in approval_mail_definitions(current):
+        require(function[1].count(scoped) == 1, "approval_scope_function_mismatch")
+        function[1] = function[1].replace(scoped, original, 1)
+    return current
+
+
 def prerequisites(conn, target):
     require(conn.execute("SELECT current_user='postgres' AND session_user='postgres' "
                          "AND current_setting('server_version_num')::int>=170000").fetchone()[0],
@@ -335,7 +396,7 @@ def prerequisites(conn, target):
     require(conn.execute("SELECT count(*) FROM pg_roles WHERE rolname=ANY(%s)", (list(ROLES),)).fetchone()[0] == len(ROLES),
             "required_roles_missing")
     rows = ordinary_history(conn)
-    require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION, ACCEPTANCE_VERSION, MAIL_LEASE_VERSION) for row in rows), "shared_version_in_regional_history")
+    require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION, ACCEPTANCE_VERSION, MAIL_LEASE_VERSION, APPROVAL_SCOPE_VERSION) for row in rows), "shared_version_in_regional_history")
     aggregate = [row for row in rows if row[0] == regional.VERSION]
     if target == "devbox":
         require(len(aggregate) == 1 and aggregate[0][1] == regional.NAME
@@ -468,6 +529,7 @@ def inspect(conn, sql, migration="authority"):
     approval_sql = sql if migration == "approvals" else approval_source()
     acceptance_sql = sql if migration == "acceptances" else acceptance_source()
     mail_sql = sql if migration == "claim-mail" else mail_lease_source()
+    scope_sql = sql if migration == "approval-mail-scope" else approval_scope_source()
     definitions = {
         VERSION: (NAME, authority_sql, authority_sql + ACL_SQL, SOURCE_HASH, objects_present, verify_permissions, catalog),
         CLAIM_VERSION: (CLAIM_NAME, claim_sql, claim_execution(claim_sql), CLAIM_HASH,
@@ -478,6 +540,8 @@ def inspect(conn, sql, migration="authority"):
                              acceptance_objects_present, verify_acceptance_permissions, acceptance_catalog),
         MAIL_LEASE_VERSION: (MAIL_LEASE_NAME, mail_sql, mail_lease_execution(mail_sql), MAIL_LEASE_HASH,
                              mail_lease_objects_present, verify_mail_lease_permissions, mail_lease_catalog),
+        APPROVAL_SCOPE_VERSION: (APPROVAL_SCOPE_NAME, scope_sql, approval_scope_execution(scope_sql), APPROVAL_SCOPE_HASH,
+                                 approval_scope_objects_present, verify_approval_scope_permissions, approval_scope_catalog),
     }
     if not ledger_exists(conn):
         require(not objects_present(conn) and not claim_objects_present(conn) and not approval_objects_present(conn) and not acceptance_objects_present(conn), "schema_without_shared_history")
@@ -489,6 +553,7 @@ def inspect(conn, sql, migration="authority"):
     require(APPROVAL_VERSION not in versions or CLAIM_VERSION in versions, "approval_claim_history_missing")
     require(ACCEPTANCE_VERSION not in versions or APPROVAL_VERSION in versions, "acceptance_approval_history_missing")
     require(MAIL_LEASE_VERSION not in versions or CLAIM_VERSION in versions, "mail_lease_claim_history_missing")
+    require(APPROVAL_SCOPE_VERSION not in versions or ACCEPTANCE_VERSION in versions, "approval_scope_acceptance_history_missing")
     for version, name, stored_sql, applied_sql, stored_hash, stored_catalog, revision in rows:
         expected_name, original, executed, expected_hash, present, permissions, snapshot = definitions[version]
         require(name == expected_name and stored_sql == original and applied_sql == executed and stored_hash == expected_hash
@@ -501,7 +566,9 @@ def inspect(conn, sql, migration="authority"):
             actual = predecessor_authority_catalog(conn, stored_catalog)
         else:
             actual = snapshot(conn)
-        if ACCEPTANCE_VERSION in versions and version != ACCEPTANCE_VERSION:
+        if APPROVAL_SCOPE_VERSION in versions and version != APPROVAL_SCOPE_VERSION:
+            actual = predecessor_approval_scope_catalog(actual)
+        if ACCEPTANCE_VERSION in versions and version not in (ACCEPTANCE_VERSION, APPROVAL_SCOPE_VERSION):
             # The optional mail fix can be applied before or after hardening.
             mail_already_hardened = (version == MAIL_LEASE_VERSION and
                 "SET search_path TO 'pg_catalog', 'public', 'auth', 'pg_temp'\n" in stored_catalog["functions"][0][1])
@@ -513,7 +580,7 @@ def inspect(conn, sql, migration="authority"):
     for version, definition in definitions.items():
         if version not in versions:
             require(not definition[4](conn), "schema_without_shared_history")
-    selected = {"authority": VERSION, "claims": CLAIM_VERSION, "approvals": APPROVAL_VERSION, "acceptances": ACCEPTANCE_VERSION, "claim-mail": MAIL_LEASE_VERSION}[migration]
+    selected = {"authority": VERSION, "claims": CLAIM_VERSION, "approvals": APPROVAL_VERSION, "acceptances": ACCEPTANCE_VERSION, "claim-mail": MAIL_LEASE_VERSION, "approval-mail-scope": APPROVAL_SCOPE_VERSION}[migration]
     return "applied" if selected in versions else "pending"
 
 
@@ -532,12 +599,14 @@ def receipt_versions(conn):
     # The private ledger is authoritative during deployment; drift audits are explicit.
     authority, claims, approvals, acceptances = source(), claim_source(), approval_source(), acceptance_source()
     mail = mail_lease_source()
+    scope = approval_scope_source()
     expected = {
         VERSION: (NAME, authority, authority + ACL_SQL, SOURCE_HASH),
         CLAIM_VERSION: (CLAIM_NAME, claims, claim_execution(claims), CLAIM_HASH),
         APPROVAL_VERSION: (APPROVAL_NAME, approvals, approval_execution(approvals), APPROVAL_HASH),
         ACCEPTANCE_VERSION: (ACCEPTANCE_NAME, acceptances, acceptance_execution(acceptances), ACCEPTANCE_HASH),
         MAIL_LEASE_VERSION: (MAIL_LEASE_NAME, mail, mail_lease_execution(mail), MAIL_LEASE_HASH),
+        APPROVAL_SCOPE_VERSION: (APPROVAL_SCOPE_NAME, scope, approval_scope_execution(scope), APPROVAL_SCOPE_HASH),
     }
     rows = conn.execute(f"SELECT version,name,source_sql,applied_sql,source_sha256,revision FROM {LEDGER} ORDER BY version").fetchall()
     versions = {row[0] for row in rows}
@@ -546,6 +615,7 @@ def receipt_versions(conn):
     require(APPROVAL_VERSION not in versions or CLAIM_VERSION in versions, "approval_claim_history_missing")
     require(ACCEPTANCE_VERSION not in versions or APPROVAL_VERSION in versions, "acceptance_approval_history_missing")
     require(MAIL_LEASE_VERSION not in versions or CLAIM_VERSION in versions, "mail_lease_claim_history_missing")
+    require(APPROVAL_SCOPE_VERSION not in versions or ACCEPTANCE_VERSION in versions, "approval_scope_acceptance_history_missing")
     for version, name, original, executed, digest, revision in rows:
         require((name, original, executed, digest) == expected[version]
                 and re.fullmatch(r"[a-f0-9]{40}", revision), "shared_history_mismatch")
@@ -559,6 +629,7 @@ def verify_changed_permissions(conn, migration, created_ledger=False):
         "approvals": (APPROVAL_TABLES + ("public.yc_claim",), APPROVAL_FUNCTIONS + (CLAIM_FUNCTIONS[0], RPCS[1], RPCS[3])),
         "acceptances": (ACCEPTANCE_TABLES, ACCEPTANCE_CHANGED_FUNCTIONS),
         "claim-mail": ((), (CLAIM_FUNCTIONS[1],)),
+        "approval-mail-scope": ((), (APPROVAL_FUNCTIONS[1],)),
     }[migration]
     valid = conn.execute("""
       WITH tables AS (SELECT unnest(%s::text[]) AS name),
@@ -629,13 +700,14 @@ def apply(conn, target, revision, sql, execute=False, migration="authority"):
 
 def _apply(conn, target, revision, sql, execute=False, migration="authority"):
     require(re.fullmatch(r"[a-f0-9]{40}", revision), "invalid_revision")
-    require(migration in ("authority", "claims", "approvals", "acceptances", "claim-mail"), "unsupported_shared_migration")
+    require(migration in ("authority", "claims", "approvals", "acceptances", "claim-mail", "approval-mail-scope"), "unsupported_shared_migration")
     version, name, expected_hash, executed_sql, snapshot = (
         (VERSION, NAME, SOURCE_HASH, sql + ACL_SQL, catalog) if migration == "authority" else
         (CLAIM_VERSION, CLAIM_NAME, CLAIM_HASH, claim_execution(sql), claim_catalog) if migration == "claims" else
         (APPROVAL_VERSION, APPROVAL_NAME, APPROVAL_HASH, approval_execution(sql), approval_catalog) if migration == "approvals" else
         (ACCEPTANCE_VERSION, ACCEPTANCE_NAME, ACCEPTANCE_HASH, acceptance_execution(sql), acceptance_catalog) if migration == "acceptances" else
-        (MAIL_LEASE_VERSION, MAIL_LEASE_NAME, MAIL_LEASE_HASH, mail_lease_execution(sql), mail_lease_catalog))
+        (MAIL_LEASE_VERSION, MAIL_LEASE_NAME, MAIL_LEASE_HASH, mail_lease_execution(sql), mail_lease_catalog) if migration == "claim-mail" else
+        (APPROVAL_SCOPE_VERSION, APPROVAL_SCOPE_NAME, APPROVAL_SCOPE_HASH, approval_scope_execution(sql), approval_scope_catalog))
     require(hashlib.sha256(sql.encode()).hexdigest() == expected_hash, "source_hash_mismatch")
     result = {"target": target, "version": version, "state": "applied", "regional_history_unchanged": True}
     if not execute:
@@ -663,13 +735,15 @@ def _apply(conn, target, revision, sql, execute=False, migration="authority"):
                 require(CLAIM_VERSION in versions, "claims_migration_required")
             if migration == "acceptances":
                 require(APPROVAL_VERSION in versions, "approvals_migration_required")
+            if migration == "approval-mail-scope":
+                require(ACCEPTANCE_VERSION in versions, "acceptances_migration_required")
             roles, auth = conn.execute(
                 "SELECT (SELECT count(*) FROM pg_roles WHERE rolname=ANY(%s)), "
                 "to_regclass('auth.users') IS NOT NULL", (list(ROLES),)).fetchone()
             require(roles == len(ROLES), "required_roles_missing")
             require(migration == "authority" or auth, "existing_auth_setup_required")
             before = prerequisites(conn, target) if target == "devbox" else ordinary_history(conn)
-            require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION, ACCEPTANCE_VERSION, MAIL_LEASE_VERSION) for row in before),
+            require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION, ACCEPTANCE_VERSION, MAIL_LEASE_VERSION, APPROVAL_SCOPE_VERSION) for row in before),
                     "shared_version_in_regional_history")
             if not exists:
                 conn.execute("""
@@ -684,6 +758,8 @@ def _apply(conn, target, revision, sql, execute=False, migration="authority"):
                 """)
             if migration == "claim-mail":
                 verify_mail_lease_predecessor(conn, versions)
+            if migration == "approval-mail-scope":
+                verify_approval_scope_predecessor(conn)
             conn.execute(executed_sql)
             verify_changed_permissions(conn, migration, created_ledger=not exists)
             conn.execute(f"INSERT INTO {LEDGER}(version,name,source_sql,applied_sql,source_sha256,catalog,revision) VALUES(%s,%s,%s,%s,%s,%s,%s)",
@@ -696,7 +772,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=("staging", "use4"))
     parser.add_argument("action", choices=("inspect", "apply"))
-    parser.add_argument("--migration", choices=("authority", "claims", "approvals", "acceptances", "claim-mail"), default="authority")
+    parser.add_argument("--migration", choices=("authority", "claims", "approvals", "acceptances", "claim-mail", "approval-mail-scope"), default="authority")
     parser.add_argument("--revision", required=True)
     parser.add_argument("--runtime-project", required=True,
                         help="Previously verified runtime authority project, not an inferred environment label")
@@ -707,7 +783,7 @@ def main():
                 "source_revision_mismatch")
         url = regional.migration_connection_url(os.environ.get("DATABASE_URL", ""), args.target)
         with psycopg.connect(url, autocommit=True, connect_timeout=10, options=OPTIONS, sslmode="require") as conn:
-            sql = {"authority": source, "claims": claim_source, "approvals": approval_source, "acceptances": acceptance_source, "claim-mail": mail_lease_source}[args.migration]()
+            sql = {"authority": source, "claims": claim_source, "approvals": approval_source, "acceptances": acceptance_source, "claim-mail": mail_lease_source, "approval-mail-scope": approval_scope_source}[args.migration]()
             result = apply(conn, args.target, args.revision, sql, args.action == "apply", args.migration)
         print(json.dumps(result, sort_keys=True))
     except Exception as error:
