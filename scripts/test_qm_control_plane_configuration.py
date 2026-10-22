@@ -46,6 +46,7 @@ class OrganizationTeamConfigurationTest(unittest.TestCase):
         # Keep the real merge/set expressions; replace unrelated external
         # resources with distinct fixtures so removed grants/settings are visible.
         fixtures = {
+            'local.qm_machine_identity_env': {},
             'local.promotion_evidence_secrets': {'PROMOTION_CAPTURE_TOKEN': {'secret': 'promotion-fixture'}},
             'local.yc_claim_secrets': {'YC_CLAIM_TOKEN': {'secret': 'claim-fixture'}},
             'var.yc_claim_api_access_enabled': True,

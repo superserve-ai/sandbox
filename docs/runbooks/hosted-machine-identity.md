@@ -241,6 +241,22 @@ authority-refresh failure, restore/rotation, sandbox recreation, and safe
 attribution remain required pre-production gates; this local checkpoint does
 not claim those measurements passed.
 
+## Staging configuration
+
+The `infra/envs/staging/us-central1` root exposes the same nullable
+`qm_machine_identity_activation` object for `rayai-dev`, `staging`, and
+`us-central1`. Its default is `null`, emitting no machine activation fields.
+A supplied record must name `machine-identity-v1` and `staging`, with all three
+readiness booleans explicit; false remains false. The configured environment
+comes independently from the staging root. Existing team-service configuration
+and operator-token delivery are unchanged. Staging has no readiness exemption:
+bind compatible schema/API/VMD/proxy and operator evidence before supplying
+true predicates, then use the existing release process and bounded staging
+acceptance procedure. This source wiring neither activates issuance nor
+proves the actual operator secret or serving deployment is ready. A merge can
+still trigger the normal shared deployment workflow; inspect its actual plans
+and effects even when the activation input remains null.
+
 ## Production East configuration
 
 The `infra/envs/production/us-east4` root accepts the nullable

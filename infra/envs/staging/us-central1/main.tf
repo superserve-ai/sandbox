@@ -208,6 +208,17 @@ module "artifact_storage" {
   labels = local.common_labels
 }
 
+locals {
+  qm_machine_identity_env = var.qm_machine_identity_activation == null ? {} : {
+    QM_MACHINE_AUTH_CONTRACT_REVISION      = var.qm_machine_identity_activation.contract_revision
+    QM_MACHINE_AUTH_ENVIRONMENT            = var.qm_machine_identity_activation.environment
+    QM_MACHINE_AUTH_CONFIGURED_ENVIRONMENT = local.environment
+    QM_MACHINE_AUTH_OWNERSHIP_READY        = tostring(var.qm_machine_identity_activation.ownership_ready)
+    QM_MACHINE_AUTH_VERIFIER_READY         = tostring(var.qm_machine_identity_activation.verifier_ready)
+    QM_MACHINE_AUTH_OPERATOR_READY         = tostring(var.qm_machine_identity_activation.operator_ready)
+  }
+}
+
 module "api" {
   source = "../../../modules/api"
 
@@ -282,7 +293,7 @@ module "api" {
     # identity the runtime impersonates to delete from it.
 
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
-  }, local.qm_team_service_env)
+  }, local.qm_team_service_env, local.qm_machine_identity_env)
   secrets = merge(local.promotion_evidence_secrets, local.yc_claim_secrets, local.qm_team_service_secrets, {
     OPERATOR_API_TOKEN = {
       secret = google_secret_manager_secret.operator_api_token.secret_id
