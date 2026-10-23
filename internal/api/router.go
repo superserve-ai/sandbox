@@ -244,6 +244,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/teams/:team_id/sandboxes", h.ListPlatformTeamSandboxes)
 		internal.GET("/teams/:team_id/sandboxes/:sandbox_id", h.GetPlatformTeamSandbox)
 		internal.GET("/billing", h.ListPlatformBilling)
+		internal.GET("/billing/mrr", h.GetPlatformBillingMRR)
 		internal.GET("/teams/:team_id/billing/usage", h.GetPlatformTeamBillingUsage)
 		internal.GET("/teams/:team_id/billing/periods", h.ListPlatformTeamBillingPeriods)
 		internal.POST("/billing/cutover", h.EstablishBillingCutover)
