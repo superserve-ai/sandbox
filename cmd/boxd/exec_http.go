@@ -107,6 +107,27 @@ func (r *execRequest) toStartRequest() *pb.StartRequest {
 }
 
 // handleExec runs the command to completion and returns the result in
+// parseProcessEvent safely extracts the output payload, exit code, or start signal from a pb.ProcessEvent.
+// It guards against nil Event, nil Data, nil Output, and nil End pointers.
+func parseProcessEvent(ev *pb.ProcessEvent) (output any, exitCode *int32, isStart bool) {
+	if ev == nil {
+		return nil, nil, false
+	}
+	switch x := ev.Event.(type) {
+	case *pb.ProcessEvent_Data:
+		if x.Data != nil {
+			return x.Data.Output, nil, false
+		}
+	case *pb.ProcessEvent_End:
+		if x.End != nil {
+			return nil, &x.End.ExitCode, false
+		}
+	case *pb.ProcessEvent_Start:
+		return nil, nil, true
+	}
+	return nil, nil, false
+}
+
 // one JSON body.
 func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -161,12 +182,23 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		}
 		return append(dst, b[:i]...)
 	}
+
 	emit := func(ev *pb.ProcessEvent) error {
 		mu.Lock()
 		defer mu.Unlock()
-		switch x := ev.Event.(type) {
-		case *pb.ProcessEvent_Data:
-			switch out := x.Data.Output.(type) {
+		output, exitCodePtr, isStart := parseProcessEvent(ev)
+		if isStart {
+			if tSpawn.IsZero() {
+				tSpawn = time.Now()
+			}
+			return nil
+		}
+		if exitCodePtr != nil {
+			exitCode = *exitCodePtr
+			return nil
+		}
+		if output != nil {
+			switch out := output.(type) {
 			case *pb.DataEvent_Stdout:
 				stdout = appendCapped(stdout, out.Stdout)
 			case *pb.DataEvent_Stderr:
@@ -174,12 +206,6 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 			case *pb.DataEvent_PtyData:
 				stdout = appendCapped(stdout, out.PtyData)
 			}
-		case *pb.ProcessEvent_Start:
-			if tSpawn.IsZero() {
-				tSpawn = time.Now()
-			}
-		case *pb.ProcessEvent_End:
-			exitCode = x.End.ExitCode
 		}
 		return nil
 	}
@@ -272,12 +298,18 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 	}()
 
 	emit := func(ev *pb.ProcessEvent) error {
+		output, exitCodePtr, isStart := parseProcessEvent(ev)
+		if isStart {
+			return nil
+		}
 		payload := map[string]any{
 			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 		}
-		switch x := ev.Event.(type) {
-		case *pb.ProcessEvent_Data:
-			switch out := x.Data.Output.(type) {
+		if exitCodePtr != nil {
+			payload["exit_code"] = *exitCodePtr
+			payload["finished"] = true
+		} else if output != nil {
+			switch out := output.(type) {
 			case *pb.DataEvent_Stdout:
 				payload["stdout"] = string(out.Stdout)
 			case *pb.DataEvent_Stderr:
@@ -285,11 +317,6 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 			case *pb.DataEvent_PtyData:
 				payload["stdout"] = string(out.PtyData)
 			}
-		case *pb.ProcessEvent_End:
-			payload["exit_code"] = x.End.ExitCode
-			payload["finished"] = true
-		case *pb.ProcessEvent_Start:
-			return nil
 		}
 
 		raw, err := json.Marshal(payload)
