@@ -265,6 +265,65 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/plan:
+    get:
+      operationId: getBillingPlan
+      tags: [Billing]
+      summary: Get the team's plan
+      description: |
+        Returns the plan the authenticated team is on, its limits, the current
+        billing period and any plan change waiting to take effect. `plan` is
+        null until the team has been assigned a plan. Requires `billing:read`.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: The team's plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlanResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /billing/plan-change-preview:
+    get:
+      operationId: previewBillingPlanChange
+      tags: [Billing]
+      summary: Preview a plan change
+      description: |
+        Says when moving the authenticated team to a plan would take effect and
+        the limits it would then have, or why the team cannot make that move.
+        Requires `billing:read`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: target_plan
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [free, starter, pro_monthly]
+      responses:
+        "200":
+          description: When and how the change would apply
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlanChangePreview"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /teams/{team_id}/billing/usage:
     parameters:
       - name: team_id
@@ -5186,6 +5245,80 @@ components:
             max_template_disk_mib:
               type: integer
               nullable: true
+    BillingPlanResponse:
+      type: object
+      required: [plan, period, pending_change]
+      properties:
+        plan:
+          type: object
+          nullable: true
+          required: [plan_key, kind, display_name, limits, effective_from]
+          properties:
+            plan_key:
+              type: string
+            kind:
+              type: string
+              enum: [free, prepaid, subscription, legacy_payg, custom]
+            display_name:
+              type: string
+            limits:
+              $ref: "#/components/schemas/BillingPlanLimits"
+            effective_from:
+              type: string
+              format: date-time
+        period:
+          type: object
+          required: [start, end]
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+        pending_change:
+          type: object
+          nullable: true
+          required: [id, target_plan_key, target_display_name, effective_at, undoable, pauses_running]
+          properties:
+            id:
+              type: string
+              format: uuid
+            target_plan_key:
+              type: string
+            target_display_name:
+              type: string
+            effective_at:
+              type: string
+              format: date-time
+            undoable:
+              type: boolean
+            pauses_running:
+              type: boolean
+    BillingPlanChangePreview:
+      type: object
+      required: [target_plan_key, target_display_name, target_kind, pauses_running, limits]
+      properties:
+        target_plan_key:
+          type: string
+        target_display_name:
+          type: string
+        target_kind:
+          type: string
+          enum: [free, prepaid, subscription, legacy_payg, custom]
+        timing:
+          type: string
+          enum: [immediate, end_of_billing_period, after_purchase]
+        effective_at:
+          type: string
+          format: date-time
+        pauses_running:
+          type: boolean
+        limits:
+          $ref: "#/components/schemas/BillingPlanLimits"
+        blocked:
+          type: string
+          description: Why the team cannot make this change; absent when it can.
     BillingPricingResponse:
       type: object
       required: [plan_key, plan_name, currency, rates]

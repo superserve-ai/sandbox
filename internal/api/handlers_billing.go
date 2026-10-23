@@ -251,28 +251,17 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	}
 
 	now := h.nowUTC()
-	periodStart, periodEnd := billing.CurrentBillingPeriod(now)
 	account, accountErr := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
 	if accountErr != nil && !errors.Is(accountErr, pgx.ErrNoRows) {
 		log.Error().Err(accountErr).Str("team_id", teamID.String()).Msg("load billing account failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	if accountErr == nil && account.CommercialBillingAnchor.Valid {
-		if start, end, anchored := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, now); anchored {
-			periodStart, periodEnd = start, end
-		}
-	}
-	period, err := h.DB.GetActiveTeamBillingPeriod(c.Request.Context(), teamID)
+	periodStart, periodEnd, err := h.currentBillingPeriod(c.Request.Context(), teamID, account.CommercialBillingAnchor, now)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetActiveTeamBillingPeriod failed")
-			respondError(c, ErrInternal)
-			return
-		}
-	} else if !(accountErr == nil && account.CommercialBillingAnchor.Valid) {
-		periodStart = period.PeriodStart
-		periodEnd = period.PeriodEnd
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetActiveTeamBillingPeriod failed")
+		respondError(c, ErrInternal)
+		return
 	}
 
 	var (
@@ -830,6 +819,28 @@ func billingUsageSeriesTimezone(raw string) (*time.Location, error) {
 		return nil, errors.New("invalid timezone")
 	}
 	return time.LoadLocation(raw)
+}
+
+// currentBillingPeriod is the period a team's billing page reports: the
+// anniversary period once the team has a commercial anchor, else its open
+// billing period, else the calendar month.
+func (h *Handlers) currentBillingPeriod(ctx context.Context, team uuid.UUID, anchor pgtype.Timestamptz, now time.Time) (time.Time, time.Time, error) {
+	if anchor.Valid {
+		if start, end, anchored := billing.AnniversaryPeriod(anchor.Time, now); anchored {
+			return start, end, nil
+		}
+		start, end := billing.CurrentBillingPeriod(now)
+		return start, end, nil
+	}
+	period, err := h.DB.GetActiveTeamBillingPeriod(ctx, team)
+	if err == nil {
+		return period.PeriodStart, period.PeriodEnd, nil
+	}
+	start, end := billing.CurrentBillingPeriod(now)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = nil
+	}
+	return start, end, err
 }
 
 func (h *Handlers) requireBillingRead(c *gin.Context) (uuid.UUID, bool) {
