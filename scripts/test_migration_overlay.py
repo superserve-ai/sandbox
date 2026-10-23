@@ -184,9 +184,22 @@ class MigrationOverlayTest(cli_test.MigrationCLITest):
         self.sql("INSERT INTO supabase_migrations.schema_migrations(version,name,statements) "
                  "VALUES ('20990101000000','later_release',ARRAY['SELECT 1;']);")
         history = self.history()
-        with self.assertRaisesRegex(migration.MigrationError, "stage=migration_preview category=cli_exit"):
+        with self.assertRaises(migration.MigrationError) as error:
             self.invoke("staging")
+        # The CLI's own output never reaches the log, so the refusal has to name
+        # the difference itself or the failure is undiagnosable from the run.
+        self.assertRegex(str(error.exception), "stage=migration_preview category=cli_exit")
+        self.assertIn("remote_only=20990101000000", str(error.exception))
+        self.assertIn("local_only=none", str(error.exception))
         self.assertEqual(self.history(), history)
+
+    def test_preview_failure_detail_degrades_without_masking_the_refusal(self):
+        self.invoke("staging")
+        self.sql("INSERT INTO supabase_migrations.schema_migrations(version,name,statements) "
+                 "VALUES ('20990101000000','later_release',ARRAY['SELECT 1;']);")
+        with patch.object(migration, "history_divergence", side_effect=OSError):
+            with self.assertRaisesRegex(migration.MigrationError, "stage=migration_preview category=cli_exit"):
+                self.invoke("staging")
 
     def test_east_existing_history_and_guards(self):
         self.copy_migrations("20261002155219")
