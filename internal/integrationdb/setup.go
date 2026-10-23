@@ -144,6 +144,14 @@ func FindMigrationsDir() (string, error) {
 
 // ApplyMigrations executes the repository migrations in filename order.
 func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
+	// Plain PostgreSQL test clusters lack the hosted backend role. Create it
+	// before migrations so permission tests exercise the actual migration grants.
+	if _, err := pool.Exec(ctx, `DO $$ BEGIN
+ CREATE ROLE service_role NOLOGIN NOSUPERUSER NOBYPASSRLS;
+ EXCEPTION WHEN duplicate_object THEN NULL;
+ END $$`); err != nil {
+		return fmt.Errorf("prepare backend test role: %w", err)
+	}
 	migrationsDir, err := FindMigrationsDir()
 	if err != nil {
 		return err

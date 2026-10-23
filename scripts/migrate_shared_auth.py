@@ -629,11 +629,12 @@ def apply(conn, target, revision, sql, execute=False, migration="authority"):
 
 def _apply(conn, target, revision, sql, execute=False, migration="authority"):
     require(re.fullmatch(r"[a-f0-9]{40}", revision), "invalid_revision")
-    require(migration in ("authority", "claims", "approvals", "claim-mail"), "unsupported_shared_migration")
+    require(migration in ("authority", "claims", "approvals", "acceptances", "claim-mail"), "unsupported_shared_migration")
     version, name, expected_hash, executed_sql, snapshot = (
         (VERSION, NAME, SOURCE_HASH, sql + ACL_SQL, catalog) if migration == "authority" else
         (CLAIM_VERSION, CLAIM_NAME, CLAIM_HASH, claim_execution(sql), claim_catalog) if migration == "claims" else
         (APPROVAL_VERSION, APPROVAL_NAME, APPROVAL_HASH, approval_execution(sql), approval_catalog) if migration == "approvals" else
+        (ACCEPTANCE_VERSION, ACCEPTANCE_NAME, ACCEPTANCE_HASH, acceptance_execution(sql), acceptance_catalog) if migration == "acceptances" else
         (MAIL_LEASE_VERSION, MAIL_LEASE_NAME, MAIL_LEASE_HASH, mail_lease_execution(sql), mail_lease_catalog))
     require(hashlib.sha256(sql.encode()).hexdigest() == expected_hash, "source_hash_mismatch")
     result = {"target": target, "version": version, "state": "applied", "regional_history_unchanged": True}
@@ -660,6 +661,8 @@ def _apply(conn, target, revision, sql, execute=False, migration="authority"):
                 require(VERSION in versions, "authority_migration_required")
             if migration in ("approvals", "claim-mail"):
                 require(CLAIM_VERSION in versions, "claims_migration_required")
+            if migration == "acceptances":
+                require(APPROVAL_VERSION in versions, "approvals_migration_required")
             roles, auth = conn.execute(
                 "SELECT (SELECT count(*) FROM pg_roles WHERE rolname=ANY(%s)), "
                 "to_regclass('auth.users') IS NOT NULL", (list(ROLES),)).fetchone()
@@ -693,7 +696,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=("staging", "use4"))
     parser.add_argument("action", choices=("inspect", "apply"))
-    parser.add_argument("--migration", choices=("authority", "claims", "approvals", "claim-mail"), default="authority")
+    parser.add_argument("--migration", choices=("authority", "claims", "approvals", "acceptances", "claim-mail"), default="authority")
     parser.add_argument("--revision", required=True)
     parser.add_argument("--runtime-project", required=True,
                         help="Previously verified runtime authority project, not an inferred environment label")
@@ -704,7 +707,7 @@ def main():
                 "source_revision_mismatch")
         url = regional.migration_connection_url(os.environ.get("DATABASE_URL", ""), args.target)
         with psycopg.connect(url, autocommit=True, connect_timeout=10, options=OPTIONS, sslmode="require") as conn:
-            sql = {"authority": source, "claims": claim_source, "approvals": approval_source, "claim-mail": mail_lease_source}[args.migration]()
+            sql = {"authority": source, "claims": claim_source, "approvals": approval_source, "acceptances": acceptance_source, "claim-mail": mail_lease_source}[args.migration]()
             result = apply(conn, args.target, args.revision, sql, args.action == "apply", args.migration)
         print(json.dumps(result, sort_keys=True))
     except Exception as error:

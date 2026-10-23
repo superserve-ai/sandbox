@@ -175,7 +175,7 @@ func (h *Handlers) ListYCClaims(c *gin.Context) {
 	}
 	ctx, cancel := promotionContext(c)
 	defer cancel()
-	out, err := h.ycClaimRPC(ctx, "lookup", gin.H{"user_id": in.UserID})
+	out, err := h.ycPreferredRPC(ctx, "lookup", gin.H{"user_id": in.UserID})
 	if err != nil {
 		ycClaimError(c, err)
 		return

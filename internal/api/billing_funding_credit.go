@@ -84,6 +84,9 @@ func fundingGrantCoversResources(g entitlementGrant, requiredPrices []string) bo
 // Purchase evidence survives both configuration rotations and an explicit Free
 // transition. Never reinterpret an old scoped grant using today's price IDs.
 func (h *Handlers) fundingCreditResourcePrices(ctx context.Context, team uuid.UUID, customer string) ([]string, error) {
+	if prices, paired, err := fundingPairCreditResourcePrices(ctx, h.Pool, team, customer); paired || err != nil {
+		return prices, err
+	}
 	var payload []byte
 	var storage bool
 	var rounding string
@@ -109,6 +112,33 @@ FROM evidence e WHERE e.payload IS NOT NULL AND e.payload<>'null'::jsonb ORDER B
 		return nil, err
 	}
 	return fundingRequiredCreditPrices(params.ResourceTerms, storage, rounding)
+}
+
+func fundingPairCreditResourcePrices(ctx context.Context, reader db.DBTX, team uuid.UUID, customer string) ([]string, bool, error) {
+	a := invoiceAccount{Customer: customer}
+	var storage bool
+	err := reader.QueryRow(ctx, `SELECT COALESCE(NULLIF(a.stripe_subscription_id,''),
+ (SELECT r.subscription_id FROM billing_plan_release r WHERE r.team_id=$1 AND r.customer_id=$2 AND r.subscription_id IS NOT NULL ORDER BY r.released_at DESC LIMIT 1),''),storage_billing_activated($1)
+ FROM team_billing_account a WHERE a.team_id=$1 AND a.stripe_customer_id=$2`, team, customer).Scan(&a.Subscription, &storage)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if a.Subscription == "" {
+		return nil, false, nil
+	}
+	paired, err := loadInvoiceProviderPair(ctx, reader, team, &a)
+	if err != nil || !paired {
+		return nil, paired, err
+	}
+	digest, err := a.Pair.Terms.Digest()
+	if err != nil || digest != a.Pair.Identity.ProviderTermsDigest {
+		return nil, true, errors.New("frozen provider resource digest differs")
+	}
+	prices, err := fundingRequiredCreditPrices(a.Pair.Terms.Resources, storage, a.Pair.Terms.Rounding.PriceID)
+	return prices, true, err
 }
 
 func (h *Handlers) fundingPAYGCreditResourcePrices(ctx context.Context, team uuid.UUID, customer string) ([]string, error) {

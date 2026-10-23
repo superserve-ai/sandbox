@@ -16,11 +16,11 @@ on:
         default: staging
         options: [staging, use4]
       migration:
-        description: 'Apply authority, claims, then approvals; claim-mail is an optional repair after claims'
+        description: 'Explicit preparation: authority, claims, approvals, then acceptances; claim-mail repairs claims'
         required: true
         type: choice
         default: authority
-        options: [authority, claims, approvals, claim-mail]
+        options: [authority, claims, approvals, acceptances, claim-mail]
       runtime_project:
         description: 'Project verified from the deployed runtime authority connection'
         required: true

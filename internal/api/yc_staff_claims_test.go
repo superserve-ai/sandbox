@@ -150,7 +150,7 @@ func staffTestPool(t *testing.T) *pgxpool.Pool {
  CREATE TABLE team_billing_account(team_id uuid PRIMARY KEY,stripe_customer_id text,stripe_subscription_id text,checkout_initializing_at timestamptz,stripe_activation_credit_reserved_at timestamptz,stripe_activation_credit_grant_id text);
  CREATE TABLE billing_signup_choice(team_id uuid PRIMARY KEY,state text,offer_key text);
  CREATE TABLE billing_commercial_contract(id uuid PRIMARY KEY,team_id uuid);`)
-	for _, name := range []string{"20261016070000_yc_company_activation_authority.sql", "20261016174553_yc_claim_authority.sql", "20261020224623_yc_staff_claim_approval_notification.sql"} {
+	for _, name := range []string{"20261016070000_yc_company_activation_authority.sql", "20261016174553_yc_claim_authority.sql", "20261020224623_yc_staff_claim_approval_notification.sql", "20261021135531_yc_offer_acceptance_authority.sql"} {
 		b, err := os.ReadFile(filepath.Join("..", "..", "supabase", "shared-auth-migrations", name))
 		if err != nil {
 			t.Fatal(err)
