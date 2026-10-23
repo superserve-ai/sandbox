@@ -70,7 +70,7 @@ func newProFixture(t *testing.T, offer string) (*proProviderFixture, *gin.Engine
 	}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
-	cfg := &config.Config{SystemTeamID: testSystemTeamID.String(), StripeSecretKey: "sk_test_example", StripeAPIBaseURL: srv.URL, StripeAPIVersion: "2026-07-29.dahlia", StripeWebhookSecret: testStripeWebhookSecret, StripeProMonthlyPriceID: "price_pro_monthly", StripeProAnnualPriceID: "price_pro_annual", StripeCheckoutPriceIDs: []string{"price_cpu", "price_memory", "price_storage"}, AppAllowedOrigins: []string{"https://app.superserve.test"}}
+	cfg := &config.Config{SystemTeamID: testSystemTeamID.String(), StripeSecretKey: "sk_test_example", StripeAPIBaseURL: srv.URL, StripeAPIVersion: "2026-07-29.dahlia", StripeWebhookSecret: testStripeWebhookSecret, StripeProMonthlyPriceID: "price_pro_monthly", StripeProAnnualPriceID: "price_pro_annual", StripePlanPriceIDs: map[string]string{"example_monthly": "price_example_monthly"}, StripeCheckoutPriceIDs: []string{"price_cpu", "price_memory", "price_storage"}, AppAllowedOrigins: []string{"https://app.superserve.test"}}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
 	h.Stripe = api.NewStripeBillingClient(cfg)

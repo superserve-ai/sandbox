@@ -777,6 +777,17 @@ type BillingPeriodCloseWork struct {
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 }
 
+type BillingPlan struct {
+	OfferKey             string `json:"offer_key"`
+	Family               string `json:"family"`
+	DisplayName          string `json:"display_name"`
+	ChargeIntervalMonths int32  `json:"charge_interval_months"`
+	ChargeAmountCents    int64  `json:"charge_amount_cents"`
+	MonthlyCreditCents   int64  `json:"monthly_credit_cents"`
+	Available            bool   `json:"available"`
+	SortOrder            int32  `json:"sort_order"`
+}
+
 type BillingPlanRelease struct {
 	ID               uuid.UUID   `json:"id"`
 	TeamID           uuid.UUID   `json:"team_id"`

@@ -79,7 +79,7 @@ func (h *Handlers) sponsoredLocalPreflight(ctx context.Context, q db.DBTX, team 
 	err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended')
  OR EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.team_id=$1 AND (o.state NOT IN ('revoked','expired') OR EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.sponsorship_id=o.id AND e.period_end>clock_timestamp())))
  OR EXISTS(SELECT 1 FROM billing_yc_operation WHERE team_id=$1 AND NOT billing_yc_released($1))
- OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND state<>'selecting' AND offer_key IN ('pro_monthly','pro_annual'))
+ OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND state<>'selecting' AND offer_key IN `+paidPlanOffers+`)
  OR EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1 AND (checkout_initializing_at IS NOT NULL OR checkout_may_exist))`, team).Scan(&conflict)
 	if err != nil {
 		return err

@@ -137,7 +137,7 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 		}
 		var checkout *StripeRetrievedCheckoutSession
 		if retainedCheckout {
-			if operation.Valid || offer == nil || (*offer != "pro_monthly" && *offer != "pro_annual") || !locked.CheckoutInitializingAt.Valid {
+			if operation.Valid || offer == nil || *offer == "free" || !locked.CheckoutInitializingAt.Valid {
 				return errFundingPlanTransition
 			}
 			choice, e := scanProChoice(tx.QueryRow(ctx, `SELECT `+proChoiceColumns+` FROM billing_signup_choice WHERE team_id=$1`, team))

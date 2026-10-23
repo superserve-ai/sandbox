@@ -129,10 +129,14 @@ class SourceAgreementTests(unittest.TestCase):
         self.assertEqual({u["resource"]: Decimal(u["usd_per_second"]) for u in USAGE},
                          {k: Decimal(v) for k, v in rates.items()})
 
-    def test_pro_amounts_match_the_api_offers(self):
+    def test_pro_amounts_match_the_plan_catalog(self):
+        expected = {p["offer"]: p["cents"] for p in PRO}
+        catalog = (ROOT / "supabase/migrations/20261023000000_billing_plan_catalog.sql").read_text()
+        seeded = dict(re.findall(r"\('(pro_\w+)', 'pro', 'Pro', \d+, (\d+),", catalog))
+        self.assertEqual(expected, {k: int(v) for k, v in seeded.items()})
         source = (ROOT / "internal/api/billing_pro_checkout.go").read_text()
-        offers = dict(re.findall(r'case "(pro_\w+)":\s*return proOffer\{Key: key, Amount: (\d+)', source))
-        self.assertEqual({p["offer"]: p["cents"] for p in PRO}, {k: int(v) for k, v in offers.items()})
+        legacy = dict(re.findall(r'"(pro_\w+)":\s*\{Key: "pro_\w+", Amount: (\d+)', source))
+        self.assertEqual(expected, {k: int(v) for k, v in legacy.items()})
 
 
 if __name__ == "__main__":

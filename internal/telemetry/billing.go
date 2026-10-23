@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"math"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -178,7 +179,7 @@ func (r *OTelRecorder) RecordProBillingBacklog(ctx context.Context, offer string
 	if r == nil || r.billing == nil {
 		return
 	}
-	if offer != "pro_monthly" && offer != "pro_annual" {
+	if !planOfferLabel(offer) {
 		offer = "unknown"
 	}
 	opt := metric.WithAttributes(attribute.String("offer", offer))
@@ -186,4 +187,19 @@ func (r *OTelRecorder) RecordProBillingBacklog(ctx context.Context, offer string
 	r.billing.proPaidAge.Record(ctx, math.Max(0, paidAge), opt)
 	r.billing.proOverdue.Record(ctx, max(0, min(overdue, 1000)), opt)
 	r.billing.proOverdueAge.Record(ctx, math.Max(0, overdueAge), opt)
+}
+
+// planOfferLabel accepts the plan catalog's "<family>_<interval>" key shape so
+// arbitrary values cannot add label cardinality.
+func planOfferLabel(offer string) bool {
+	family, interval, ok := strings.Cut(offer, "_")
+	if !ok || family == "" || len(family) > 16 || (interval != "monthly" && interval != "annual") {
+		return false
+	}
+	for _, r := range family {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
 }

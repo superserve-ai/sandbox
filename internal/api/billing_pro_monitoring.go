@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
@@ -38,7 +39,15 @@ func (h *Handlers) startProBillingMonitoring(ctx context.Context) {
 	}()
 }
 func (h *Handlers) sampleProBillingBacklog(ctx context.Context, recorder telemetry.ProBillingRecorder) error {
-	for _, offer := range []string{"pro_monthly", "pro_annual"} {
+	rows, err := h.Pool.Query(ctx, `SELECT offer_key FROM billing_plan ORDER BY sort_order,offer_key`)
+	if err != nil {
+		return err
+	}
+	offers, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	for _, offer := range offers {
 		var paid, overdue int64
 		var paidAge, overdueAge float64
 		err := h.Pool.QueryRow(ctx, `SELECT

@@ -621,11 +621,22 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	})
 }
 
-var commercialPlanNames = map[string]string{"pro_monthly": "Pro Monthly", "pro_annual": "Pro Annual", "yc_2026": "YC Pro Annual"}
+var commercialPlanNames = map[string]string{"yc_2026": "YC Pro Annual"}
+
+// catalogPlanName combines a catalog plan's display name with its interval,
+// e.g. "Pro Monthly".
+func catalogPlanName(displayName string, intervalMonths int32) string {
+	if intervalMonths == 12 {
+		return displayName + " Annual"
+	}
+	return displayName + " Monthly"
+}
 
 func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryPlan {
 	name, ok := commercialPlanNames[row.OfferKey]
-	if !ok {
+	if !ok && row.PlanDisplayName != "" {
+		name = catalogPlanName(row.PlanDisplayName, row.ChargeIntervalMonths)
+	} else if !ok {
 		name = row.OfferKey
 	}
 	price := float64(row.ChargeAmountCents) / 100

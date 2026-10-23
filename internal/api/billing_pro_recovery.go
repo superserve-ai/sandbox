@@ -217,11 +217,10 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 			return "retryable", nil
 		}
 	}
-	offer, err := proOfferTerms(choice.Offer)
+	offer, err := choice.frozenOffer()
 	if err != nil {
 		return "", err
 	}
-	offer.Price = choice.Price
 	ids, nextCursor, err := client.proInvoices(ctx, session.CustomerID, sub.ID, derefString(choice.InvoiceCursor))
 	if err != nil {
 		return "", err
@@ -410,7 +409,8 @@ func (h *Handlers) StartProPaymentReconciliation(ctx context.Context) {
 	}()
 }
 func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error) {
-	rows, err := h.Pool.Query(ctx, `WITH candidate AS (SELECT team_id FROM billing_signup_choice WHERE offer_key IN ('pro_monthly','pro_annual') AND next_check_at<=clock_timestamp() ORDER BY next_check_at,team_id FOR UPDATE SKIP LOCKED LIMIT 4) UPDATE billing_signup_choice c SET next_check_at=clock_timestamp()+interval '2 minutes' FROM candidate WHERE c.team_id=candidate.team_id RETURNING c.team_id`)
+	// offer_key<>'free' matches the partial recovery index predicate.
+	rows, err := h.Pool.Query(ctx, `WITH candidate AS (SELECT team_id FROM billing_signup_choice WHERE offer_key<>'free' AND offer_key IN `+paidPlanOffers+` AND next_check_at<=clock_timestamp() ORDER BY next_check_at,team_id FOR UPDATE SKIP LOCKED LIMIT 4) UPDATE billing_signup_choice c SET next_check_at=clock_timestamp()+interval '2 minutes' FROM candidate WHERE c.team_id=candidate.team_id RETURNING c.team_id`)
 	if err != nil {
 		return 0, err
 	}
@@ -482,7 +482,7 @@ func (h *Handlers) validateProResourceIdentities(ctx context.Context, team uuid.
 			return errors.New("Pro resource price is missing")
 		}
 	}
-	offer, err := proOfferTerms(params.Metadata["commercial_offer"])
+	offer, err := frozenProOffer(params.Metadata["commercial_offer"], params)
 	if err != nil {
 		return err
 	}

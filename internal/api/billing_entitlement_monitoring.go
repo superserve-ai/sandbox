@@ -72,7 +72,7 @@ func (h *Handlers) startEntitlementCoverageMonitoring(ctx context.Context) {
 
 func (h *Handlers) entitlementCoveragePage(ctx context.Context, after uuid.UUID, at time.Time, limit int) ([]entitlementCoverageSample, error) {
 	rows, err := h.Pool.Query(ctx, `WITH page AS MATERIALIZED (
- SELECT * FROM billing_commercial_contract WHERE status='active' AND offer_key IN ('pro_monthly','pro_annual','yc_2026','sponsored_usage') AND id>$1 ORDER BY id LIMIT $3
+ SELECT * FROM billing_commercial_contract WHERE status='active' AND (offer_key IN ('yc_2026','sponsored_usage') OR offer_key IN `+paidPlanOffers+`) AND id>$1 ORDER BY id LIMIT $3
 )
 SELECT c.id,
  CASE WHEN c.starts_at<=p.period_start AND (c.ends_at IS NULL OR c.ends_at>=p.period_end)
