@@ -418,6 +418,20 @@ type BillingContractPayment struct {
 	Evidence                    []byte    `json:"evidence"`
 }
 
+type BillingContractPromotion struct {
+	ContractID        uuid.UUID      `json:"contract_id"`
+	TeamID            uuid.UUID      `json:"team_id"`
+	DiscountID        string         `json:"discount_id"`
+	PromotionCode     string         `json:"promotion_code"`
+	CouponID          string         `json:"coupon_id"`
+	CouponDuration    string         `json:"coupon_duration"`
+	AmountOffCents    *int64         `json:"amount_off_cents"`
+	PercentOff        pgtype.Numeric `json:"percent_off"`
+	CheckoutInvoiceID string         `json:"checkout_invoice_id"`
+	DiscountedCents   int64          `json:"discounted_cents"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
 type BillingContractWaiver struct {
 	ID                   uuid.UUID `json:"id"`
 	TeamID               uuid.UUID `json:"team_id"`

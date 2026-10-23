@@ -3492,7 +3492,7 @@ components:
         Usage included with the plan for the current monthly period. Unused
         amounts expire at period_end. Null when the plan includes no usage this
         period.
-      required: [amount_usd, period_start, period_end, status]
+      required: [amount_usd, amount_cents, period_start, period_end, status]
       properties:
         amount_usd:
           type: number
@@ -3510,6 +3510,25 @@ components:
             issued once the credit is on the account; pending while it is being
             granted; not_issued when it has not been granted, for example while
             a payment is outstanding.
+        amount_cents:
+          type: integer
+          format: int64
+        used_cents:
+          type: integer
+          format: int64
+          description: >-
+            Usage charges so far this period, in cents. Present only once the
+            included usage is issued and covers the current billing period.
+        remaining_cents:
+          type: integer
+          format: int64
+          description: Included usage not yet used, in cents.
+        overage_cents:
+          type: integer
+          format: int64
+          description: >-
+            Usage beyond the included amount, in cents. Credit carried over from
+            another plan may still cover it.
 
     BillingSummaryPermissions:
       type: object

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -33,6 +34,18 @@ type proPaymentEvidence struct {
 	Reference  string
 	Start, End int64
 	Raw        []byte
+	Discount   *proInvoiceDiscount
+}
+
+// proInvoiceDiscount is a promotion code discount on a Pro checkout invoice.
+type proInvoiceDiscount struct {
+	ID              string  `json:"id"`
+	PromotionCode   string  `json:"promotion_code"`
+	Coupon          string  `json:"coupon"`
+	Duration        string  `json:"duration"`
+	AmountOffCents  *int64  `json:"amount_off_cents,omitempty"`
+	PercentOff      float64 `json:"percent_off,omitempty"`
+	DiscountedCents int64   `json:"discounted_cents"`
 }
 
 func (c *stripeHTTPClient) verifyProInvoice(ctx context.Context, id string, o proOffer, customer, subscription string) (proPaymentEvidence, bool, error) {
@@ -44,12 +57,34 @@ func (c *stripeHTTPClient) verifyProInvoice(ctx context.Context, id string, o pr
 	if inv.ID != id || inv.Customer != customer || inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription != subscription || inv.Lines.HasMore {
 		return ev, false, &proPaymentReviewError{reason: "base invoice ownership or line evidence is incomplete"}
 	}
+	// A pricing v2 purchase may carry one promotion code on its checkout
+	// invoice. Every later invoice is verified exactly as before.
+	checkout := (o.PricingV2 || o.Promotion != nil) && inv.BillingReason == "subscription_create"
+	var promotion string
+	if checkout {
+		ids := []string{}
+		for _, d := range inv.Discounts {
+			ids = append(ids, d.ID)
+		}
+		for _, d := range inv.DiscountAmounts {
+			ids = append(ids, d.Discount)
+		}
+		for _, id := range ids {
+			if id == "" || (promotion != "" && id != promotion) || (o.Promotion != nil && id != o.Promotion.ID) {
+				return ev, false, &proPaymentReviewError{reason: "checkout invoice needs exactly one promotion code discount"}
+			}
+			promotion = id
+		}
+	}
 	var found bool
+	var discount int64
 	for _, line := range inv.Lines.Data {
 		if line.Pricing.PriceDetails == nil || line.Pricing.PriceDetails.Price != o.Price {
 			continue
 		}
-		if found || line.Parent.SubscriptionItemDetails == nil || line.Parent.SubscriptionItemDetails.Subscription != subscription || line.Parent.SubscriptionItemDetails.Proration || line.Amount != o.Amount || line.Currency != "usd" || line.Quantity != 1 || baseLineHasCredits(line) || line.Period.End <= line.Period.Start {
+		var credited bool
+		discount, credited = checkoutLineDiscount(line, promotion)
+		if found || line.Parent.SubscriptionItemDetails == nil || line.Parent.SubscriptionItemDetails.Subscription != subscription || line.Parent.SubscriptionItemDetails.Proration || line.Amount != o.Amount || line.Currency != "usd" || line.Quantity != 1 || credited || line.Period.End <= line.Period.Start {
 			return ev, false, &proPaymentReviewError{reason: "base invoice line differs from expected offer"}
 		}
 		found = true
@@ -62,8 +97,34 @@ func (c *stripeHTTPClient) verifyProInvoice(ctx context.Context, id string, o pr
 	if !found {
 		return ev, false, nil
 	}
-	if inv.Currency != "usd" || inv.PaidOutOfBand || inv.AmountRemaining != 0 || inv.AmountPaid < o.Amount || inv.AmountPaid != inv.AmountDue || inv.EndingBalance == nil || inv.StatusTransitions.PaidAt <= 0 || len(inv.Taxes) > 0 {
+	if checkout {
+		var invoiceDiscount int64
+		for _, d := range inv.DiscountAmounts {
+			invoiceDiscount += d.Amount
+		}
+		if invoiceDiscount != discount {
+			return ev, false, &proPaymentReviewError{reason: "invoice discount is not limited to the licensed fee"}
+		}
+	}
+	if inv.Currency != "usd" || inv.PaidOutOfBand || inv.AmountRemaining != 0 || inv.AmountPaid < o.Amount-discount || inv.AmountPaid != inv.AmountDue || inv.EndingBalance == nil || inv.StatusTransitions.PaidAt <= 0 || len(inv.Taxes) > 0 {
 		return ev, false, &proPaymentReviewError{reason: "base invoice lacks supported cash settlement"}
+	}
+	switch {
+	case promotion != "" && o.Promotion == nil:
+		// Coupon details are read once, before the contract records them; a
+		// coupon deleted later must not invalidate a paid invoice.
+		d, err := c.proInvoiceDiscount(ctx, id, discount)
+		if err != nil {
+			return ev, false, err
+		}
+		if d.ID != promotion {
+			return ev, false, &proPaymentReviewError{reason: "checkout invoice discount evidence changed"}
+		}
+		ev.Discount = &d
+	case promotion != "":
+		d := *o.Promotion
+		d.DiscountedCents = discount
+		ev.Discount = &d
 	}
 	if err := c.verifyProCreditNotes(ctx, inv, o.Price); err != nil {
 		return ev, false, err
@@ -125,13 +186,90 @@ func (c *stripeHTTPClient) verifyProInvoice(ctx context.Context, id string, o pr
 		return ev, false, &proPaymentReviewError{reason: "invoice cash payments do not cover its paid total"}
 	}
 	ev.Reference = fmt.Sprint(references)
+	if len(references) == 0 {
+		ev.Reference = "discounted:" + id
+	}
 	ev.Raw, _ = json.Marshal(struct {
-		Invoice  proPaidInvoice    `json:"invoice"`
-		Payments any               `json:"payments"`
-		Intents  any               `json:"payment_intents"`
-		Charges  []json.RawMessage `json:"charges"`
-	}{inv, payments, intents, charges})
+		Invoice  proPaidInvoice      `json:"invoice"`
+		Payments any                 `json:"payments"`
+		Intents  any                 `json:"payment_intents"`
+		Charges  []json.RawMessage   `json:"charges"`
+		Discount *proInvoiceDiscount `json:"discount,omitempty"`
+	}{inv, payments, intents, charges, ev.Discount})
 	return ev, true, nil
+}
+
+// checkoutLineDiscount returns the promotion's reduction of a licensed fee
+// line on a checkout invoice, and whether the line carries anything else that
+// reduces the fee. Without a promotion this is exactly baseLineHasCredits.
+func checkoutLineDiscount(line StripeInvoiceAmountLine, promotion string) (int64, bool) {
+	if promotion == "" {
+		return 0, baseLineHasCredits(line)
+	}
+	for _, raw := range line.Discounts {
+		var id string
+		if json.Unmarshal(raw, &id) != nil {
+			var object struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(raw, &object) != nil {
+				return 0, true
+			}
+			id = object.ID
+		}
+		if id != promotion {
+			return 0, true
+		}
+	}
+	var discount int64
+	for _, credit := range line.PretaxCredits {
+		switch {
+		case credit.Type == "discount" && credit.Amount == 0:
+		case credit.Type == "discount" && credit.Discount == promotion && credit.Amount > 0:
+			discount += credit.Amount
+		default:
+			return 0, true
+		}
+	}
+	return discount, discount > line.Amount
+}
+
+// proInvoiceDiscount reads the single promotion code discount that reduced a
+// checkout invoice by discounted cents.
+func (c *stripeHTTPClient) proInvoiceDiscount(ctx context.Context, invoice string, discounted int64) (proInvoiceDiscount, error) {
+	var expanded struct {
+		ID        string `json:"id"`
+		Discounts []struct {
+			ID            string `json:"id"`
+			PromotionCode string `json:"promotion_code"`
+			Source        struct {
+				Coupon struct {
+					ID         string   `json:"id"`
+					Duration   string   `json:"duration"`
+					AmountOff  *int64   `json:"amount_off"`
+					PercentOff *float64 `json:"percent_off"`
+					Currency   string   `json:"currency"`
+				} `json:"coupon"`
+			} `json:"source"`
+		} `json:"discounts"`
+	}
+	q := url.Values{"expand[]": {"discounts.source.coupon"}}
+	if err := c.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(invoice)+"?"+q.Encode(), nil, &expanded, ""); err != nil {
+		return proInvoiceDiscount{}, err
+	}
+	if expanded.ID != invoice || len(expanded.Discounts) != 1 {
+		return proInvoiceDiscount{}, &proPaymentReviewError{reason: "checkout invoice needs exactly one promotion code discount"}
+	}
+	d := expanded.Discounts[0]
+	coupon := d.Source.Coupon
+	if d.ID == "" || d.PromotionCode == "" || coupon.ID == "" || (coupon.AmountOff == nil) == (coupon.PercentOff == nil) || (coupon.AmountOff != nil && coupon.Currency != "usd") {
+		return proInvoiceDiscount{}, &proPaymentReviewError{reason: "checkout invoice discount is not a supported promotion code"}
+	}
+	out := proInvoiceDiscount{ID: d.ID, PromotionCode: d.PromotionCode, Coupon: coupon.ID, Duration: coupon.Duration, AmountOffCents: coupon.AmountOff, DiscountedCents: discounted}
+	if coupon.PercentOff != nil {
+		out.PercentOff = *coupon.PercentOff
+	}
+	return out, nil
 }
 
 // Each pass revisits the newest page and advances one historical page. This
@@ -268,6 +406,9 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 		return err
 	}
 	for _, receipt := range receipts {
+		if err = recordPaymentPromotion(ctx, tx, choice.Team, contract.ID, receipt); err != nil {
+			return err
+		}
 		_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: choice.Team, ContractID: contract.ID, InvoiceID: receipt.Invoice.ID, PaymentReference: receipt.Reference, CustomerID: sub.Customer, SubscriptionID: &sub.ID, BasePriceID: choice.Price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: offer.Amount, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, InvoiceAmountRemainingCents: 0, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), VerifiedAt: verifiedAt, Evidence: receipt.Raw})
 		if errors.Is(err, pgx.ErrNoRows) {
 			_, err = q.GetCommercialBasePayment(ctx, db.GetCommercialBasePaymentParams{TeamID: choice.Team, ContractID: contract.ID, InvoiceID: receipt.Invoice.ID})
@@ -359,6 +500,11 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 			if err != nil {
 				return err
 			}
+			if offer.PricingV2 {
+				if err = assignCheckoutPlan(ctx, tx, choice, offer, contract.ID); err != nil {
+					return err
+				}
+			}
 		}
 		// This shared SQL operation ends the trial without requesting a promotion.
 		if err = q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: choice.Team, UserID: pgtype.UUID{}, StripeGrantID: ""}); err != nil {
@@ -382,7 +528,7 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 }
 
 func proMeteredPeriod(sub invoiceSubscription, offer proOffer) (int64, int64, error) {
-	if sub.BillingMode.Type != "flexible" || sub.AutomaticTax.Enabled || len(sub.Discounts) != 0 || sub.Items.HasMore {
+	if sub.BillingMode.Type != "flexible" || sub.AutomaticTax.Enabled || (len(sub.Discounts) != 0 && !offer.PricingV2) || sub.Items.HasMore {
 		return 0, 0, errors.New("unsupported Pro subscription configuration")
 	}
 	var start, end int64
@@ -416,4 +562,95 @@ func proMeteredPeriod(sub invoiceSubscription, offer proOffer) (int64, int64, er
 		return 0, 0, errors.New("Pro subscription is missing base or usage items")
 	}
 	return start, end, nil
+}
+
+// assignCheckoutPlan puts a team that paid for a pricing v2 plan on it from
+// activation, with the terms and limits frozen at checkout. It reads nothing
+// that can change after payment, so a catalog edit cannot block activation.
+func assignCheckoutPlan(ctx context.Context, tx pgx.Tx, choice proChoice, offer proOffer, contract uuid.UUID) error {
+	terms := planTerms{OfferKey: choice.Offer, DisplayName: offer.Name, FeeCents: offer.Amount, IntervalMonths: offer.Months, MonthlyCreditCents: offer.Credit,
+		VersionID: offer.VersionID, Version: offer.Version, PricingVersion: "v2", Family: offer.Family, Kind: "subscription", Grants: offer.Grants, Allowance: offer.Allowance, Matching: offer.Matching, Limits: *offer.Limits}
+	_, err := assignTeamPlan(ctx, tx, planAssignment{Team: choice.Team, Terms: terms, Source: planSourceCheckout, Actor: &choice.Actor, Reason: "paid checkout", ContractID: &contract, Key: "checkout:" + contract.String()})
+	return err
+}
+
+// recordPaymentPromotion records the promotion a contract's checkout invoice
+// carried, and how much of its licensed fee the promotion covered. It runs
+// before the receipt, whose cash check reads it.
+func recordPaymentPromotion(ctx context.Context, tx pgx.Tx, team, contract uuid.UUID, receipt proPaymentEvidence) error {
+	d := receipt.Discount
+	if d == nil {
+		return nil
+	}
+	if receipt.Invoice.BillingReason != "subscription_create" {
+		return errors.New("only a checkout invoice may carry a promotion")
+	}
+	var percent *float64
+	if d.AmountOffCents == nil {
+		percent = &d.PercentOff
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO billing_contract_promotion(contract_id,team_id,discount_id,promotion_code,coupon_id,coupon_duration,amount_off_cents,percent_off,checkout_invoice_id,discounted_cents) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (contract_id) DO NOTHING`, contract, team, d.ID, d.PromotionCode, d.Coupon, d.Duration, d.AmountOffCents, percent, receipt.Invoice.ID, d.DiscountedCents)
+	if err != nil || tag.RowsAffected() == 1 {
+		return err
+	}
+	var same bool
+	if err = tx.QueryRow(ctx, `SELECT discount_id=$2 AND checkout_invoice_id=$3 AND discounted_cents=$4 FROM billing_contract_promotion WHERE contract_id=$1`, contract, d.ID, receipt.Invoice.ID, d.DiscountedCents).Scan(&same); err != nil {
+		return err
+	}
+	if !same {
+		return errors.New("contract already has a different promotion")
+	}
+	return nil
+}
+
+// contractPromotion returns the promotion recorded for a contract, if any.
+func contractPromotion(ctx context.Context, q db.DBTX, contract uuid.UUID) (*proInvoiceDiscount, error) {
+	return scanContractPromotion(q.QueryRow(ctx, `SELECT `+contractPromotionColumns+` FROM billing_contract_promotion WHERE contract_id=$1`, contract))
+}
+
+// subscriptionPromotion returns the promotion recorded for the newest contract
+// on a subscription, for paths that know the subscription but not its contract.
+func subscriptionPromotion(ctx context.Context, q db.DBTX, subscription string) (*proInvoiceDiscount, error) {
+	return scanContractPromotion(q.QueryRow(ctx, `SELECT `+contractPromotionColumns+` FROM billing_contract_promotion p JOIN billing_commercial_contract c ON c.id=p.contract_id WHERE c.subscription_id=$1 ORDER BY c.created_at DESC LIMIT 1`, subscription))
+}
+
+const contractPromotionColumns = `discount_id,promotion_code,coupon_id,coupon_duration,amount_off_cents,percent_off::float8,discounted_cents`
+
+func scanContractPromotion(row pgx.Row) (*proInvoiceDiscount, error) {
+	var d proInvoiceDiscount
+	var percent *float64
+	err := row.Scan(&d.ID, &d.PromotionCode, &d.Coupon, &d.Duration, &d.AmountOffCents, &percent, &d.DiscountedCents)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if percent != nil {
+		d.PercentOff = *percent
+	}
+	return &d, nil
+}
+
+// clearProCheckoutDiscount removes the checkout promotion from the
+// subscription once the contract has recorded it, so renewals bill the full
+// fee and invoice enrollment, which refuses discounted subscriptions, proceeds.
+func (h *Handlers) clearProCheckoutDiscount(ctx context.Context, client *stripeHTTPClient, sub invoiceSubscription) (invoiceSubscription, error) {
+	if len(sub.Discounts) == 0 {
+		return sub, nil
+	}
+	promotion, err := subscriptionPromotion(ctx, h.Pool, sub.ID)
+	if err != nil {
+		return sub, err
+	}
+	if promotion == nil {
+		return sub, errors.New("subscription has a discount but no recorded checkout promotion; operator review required if the checkout invoice is already recorded")
+	}
+	if len(sub.Discounts) != 1 || sub.Discounts[0] != promotion.ID {
+		return sub, errors.New("subscription discount differs from the checkout promotion code; operator review required")
+	}
+	if err = client.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(sub.ID), url.Values{"discounts": {""}, "proration_behavior": {"none"}}, nil, ""); err != nil {
+		return sub, err
+	}
+	return client.invoiceSubscription(ctx, sub.ID)
 }

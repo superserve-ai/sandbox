@@ -153,6 +153,7 @@ type StripeCreateCheckoutSessionParams struct {
 	ResourceTerms            []StripeCheckoutResourceTerms `json:",omitempty"`
 	PlanTerms                *StripeCheckoutPlanTerms      `json:",omitempty"`
 	Flexible                 bool
+	AllowPromotionCodes      bool `json:",omitempty"`
 	CustomerID               string
 	SuccessURL               string
 	CancelURL                string
@@ -172,6 +173,13 @@ type StripeCheckoutPlanTerms struct {
 	VersionID uuid.UUID
 	Matching  *planMatching `json:",omitempty"`
 	Limits    *planLimits   `json:",omitempty"`
+	// PricingV2 purchases also freeze the plan identity they assign.
+	PricingV2   bool           `json:",omitempty"`
+	Family      string         `json:",omitempty"`
+	Version     int32          `json:",omitempty"`
+	DisplayName string         `json:",omitempty"`
+	Grants      []planGrant    `json:",omitempty"`
+	Allowance   *planAllowance `json:",omitempty"`
 }
 
 type StripeCheckoutSession struct {
@@ -494,6 +502,9 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	}
 	if params.Flexible {
 		form.Set("subscription_data[billing_mode][type]", "flexible")
+	}
+	if params.AllowPromotionCodes {
+		form.Set("allow_promotion_codes", "true")
 	}
 	if params.BasePriceID != "" {
 		i := len(params.PriceIDs)

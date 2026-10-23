@@ -145,6 +145,23 @@ type billingSummaryIncludedUsage struct {
 	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
 	Status      string    `json:"status"`
+	// Usage against the allowance, set once it is issued and when it covers
+	// exactly the current billing period. Credit carried from other plans is
+	// not counted.
+	AmountCents    int64  `json:"amount_cents"`
+	UsedCents      *int64 `json:"used_cents,omitempty"`
+	RemainingCents *int64 `json:"remaining_cents,omitempty"`
+	OverageCents   *int64 `json:"overage_cents,omitempty"`
+}
+
+// measure fills in usage against the allowance for the billing period.
+func (u *billingSummaryIncludedUsage) measure(periodStart, periodEnd time.Time, chargesUSD float64) {
+	if u == nil || u.Status != "issued" || !u.PeriodStart.Equal(periodStart) || !u.PeriodEnd.Equal(periodEnd) {
+		return
+	}
+	used := int64(math.Round(math.Max(chargesUSD, 0) * 100))
+	remaining, overage := max(u.AmountCents-used, 0), max(used-u.AmountCents, 0)
+	u.UsedCents, u.RemainingCents, u.OverageCents = &used, &remaining, &overage
 }
 
 type billingTrialBalance struct {
@@ -483,6 +500,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		storageBillingEnabled,
 	)
 	summaryResources := billingSummaryResourcesFromState(resourceStates, vcpuSeconds, memoryGibSeconds, storageGibSeconds, charges)
+	plan.IncludedUsage.measure(periodStart, periodEnd, charges.CurrentChargesUSD)
 	creditSource, creditStatus := "local_trial", "available"
 	var stripeBalance, stripeApplied, stripeRemaining *float64
 	var creditsApplied, creditsRemaining, expectedInvoice *float64
@@ -657,6 +675,7 @@ func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryP
 			}
 		}
 		plan.IncludedUsage = &billingSummaryIncludedUsage{
+			AmountCents: *row.PeriodAmountCents,
 			AmountUSD:   float64(*row.PeriodAmountCents) / 100,
 			PeriodStart: row.PeriodStart.Time,
 			PeriodEnd:   row.PeriodEnd.Time,

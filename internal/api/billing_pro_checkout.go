@@ -27,7 +27,15 @@ type proOffer struct {
 	Version    int32
 	Pricing    string
 	Matching   *planMatching
+	Grants     []planGrant
+	Allowance  *planAllowance
 	Limits     *planLimits
+	// PricingV2 purchases accept a promotion code at checkout and assign the
+	// team's plan when they activate.
+	PricingV2 bool
+	Family    string
+	// Promotion is the discount the contract was sold with, if any.
+	Promotion *proInvoiceDiscount
 }
 
 // Purchases started before the plan catalog carry no frozen terms.
@@ -54,7 +62,7 @@ func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, error) {
 	if err != nil {
 		return proOffer{Key: key}, err
 	}
-	return proOffer{Key: key, Name: t.DisplayName, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key)}, nil
+	return proOffer{Key: key, Name: t.DisplayName, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key), Family: t.Family, Grants: t.Grants, Allowance: t.Allowance}, nil
 }
 
 // checkoutOffer returns the frozen terms of the team's pending purchase of key,
@@ -77,7 +85,7 @@ func (h *Handlers) checkoutOffer(ctx context.Context, team uuid.UUID, key string
 func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proOffer, error) {
 	t := payload.PlanTerms
 	if t == nil {
-		if o, ok := legacyProOffers[key]; ok {
+		if o, ok := legacyProOffers[key]; ok && !payload.AllowPromotionCodes {
 			return o, nil
 		}
 		return proOffer{}, errors.New("unsupported offer")
@@ -85,7 +93,14 @@ func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proO
 	if t.Amount <= 0 || t.Credit <= 0 || (t.Months != 1 && t.Months != 12) {
 		return proOffer{}, errors.New("invalid frozen plan terms")
 	}
-	return proOffer{Key: key, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits}, nil
+	if payload.AllowPromotionCodes != t.PricingV2 || (t.PricingV2 && (t.Months != 1 || t.VersionID == uuid.Nil || t.Limits == nil || t.Limits.MaxConcurrent == nil || t.Family == "" || t.Version <= 0)) {
+		return proOffer{}, errors.New("invalid frozen pricing v2 terms")
+	}
+	o := proOffer{Key: key, Name: t.DisplayName, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits, PricingV2: t.PricingV2, Family: t.Family, Version: t.Version, Grants: t.Grants, Allowance: t.Allowance}
+	if t.PricingV2 {
+		o.Pricing = "v2"
+	}
+	return o, nil
 }
 
 func (c proChoice) frozenOffer() (proOffer, error) {
@@ -197,6 +212,16 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	}
 	params := StripeCreateCheckoutSessionParams{CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms,
 		PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: offer.Months, Credit: offer.Credit, VersionID: offer.VersionID, Matching: offer.Matching, Limits: offer.Limits}}
+	v2 := offer.Pricing == "v2"
+	if v2 && !resuming {
+		params.AllowPromotionCodes = true
+		params.PlanTerms.Grants, params.PlanTerms.Allowance = offer.Grants, offer.Allowance
+		params.PlanTerms.PricingV2, params.PlanTerms.Family, params.PlanTerms.Version, params.PlanTerms.DisplayName = true, offer.Family, offer.Version, offer.Name
+		if _, err = frozenProOffer(offer.Key, params); err != nil {
+			respondErrorMsg(c, "service_unavailable", "Pro plan configuration requires verification", 503)
+			return
+		}
+	}
 	if offer.Months == 12 {
 		// Checkout cannot mix annual fees with monthly usage. Keep the actual
 		// request frozen so older replicas also replay the base-only session.
@@ -227,7 +252,18 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	if state == "committed" || (selected != nil && *selected != offer.Key) || account.StripeSubscriptionID != nil || account.TrialEndedAt.Valid || account.StripeActivationCreditReservedAt.Valid || account.StripeActivationCreditGrantID != nil {
+	if !v2 && !resuming {
+		_, assigned, assignmentErr := currentTeamPlan(ctx, tx, team)
+		if assignmentErr != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if assigned {
+			proConflict(c)
+			return
+		}
+	}
+	if state == "committed" || (v2 && !resuming && account.CommercialBillingAnchor.Valid) || (selected != nil && *selected != offer.Key) || account.StripeSubscriptionID != nil || (account.TrialEndedAt.Valid && !v2) || account.StripeActivationCreditReservedAt.Valid || account.StripeActivationCreditGrantID != nil {
 		proConflict(c)
 		return
 	}

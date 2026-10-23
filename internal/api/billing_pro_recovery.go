@@ -221,6 +221,11 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 	if err != nil {
 		return "", err
 	}
+	if offer.PricingV2 {
+		if offer.Promotion, err = subscriptionPromotion(ctx, h.Pool, sub.ID); err != nil {
+			return "", err
+		}
+	}
 	ids, nextCursor, err := client.proInvoices(ctx, session.CustomerID, sub.ID, derefString(choice.InvoiceCursor))
 	if err != nil {
 		return "", err
@@ -333,7 +338,13 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 	if errors.Is(err, errProEnrollmentPending) {
 		// Payment is already durable. Provider or local enrollment failures
 		// leave activation pending and the existing worker can retry safely.
-		err = h.enrollInvoiceAccount(ctx, team, nil)
+		err = nil
+		if offer.PricingV2 {
+			sub, err = h.clearProCheckoutDiscount(ctx, client, sub)
+		}
+		if err == nil {
+			err = h.enrollInvoiceAccount(ctx, team, nil)
+		}
 		if err == nil {
 			sub, err = client.invoiceSubscription(ctx, session.SubscriptionID)
 		}
