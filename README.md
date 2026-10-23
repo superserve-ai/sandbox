@@ -93,9 +93,11 @@ export ALLOW_EPHEMERAL_SEED=1
 
 make db-up
 make db-wait        # wait for postgres to accept connections
-make migrate-local  # apply supabase/migrations/ before first run
+make migrate-up     # apply supabase/migrations/ before first run (alias for migrate-local)
 make run-controlplane
 ```
+
+If port 5432 is already bound on your host, override `DB_PORT` (e.g., `DB_PORT=5433 make db-reset db-wait`).
 
 `ALLOW_EPHEMERAL_SEED=1` is for local development only. Production must set `SANDBOX_ACCESS_TOKEN_SEED` explicitly.
 
