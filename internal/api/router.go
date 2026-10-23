@@ -170,6 +170,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// credential the hosts themselves possess.
 	operator := r.Group("/internal")
 	operator.Use(OperatorAuth(), InternalActorFromHeader())
+	h.registerCommercialOfferRoutes(operator)
 	{
 		operator.GET("/yc/claims/:claim_id", TeamCreationPrivacy(), h.GetOperatorYCClaim)
 		operator.GET("/yc/claims", TeamCreationPrivacy(), h.PendingYCClaims)

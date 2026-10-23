@@ -1736,8 +1736,12 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 			return
 		}
 	}
-	customerID, err := h.ensureStripeCustomer(c.Request.Context(), teamID)
+	customerID, err := h.ensureCheckoutStripeCustomer(c.Request.Context(), teamID)
 	if err != nil {
+		if errors.Is(err, errCommercialOfferConflict) {
+			proConflict(c)
+			return
+		}
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("ensure Stripe customer failed")
 		respondError(c, ErrInternal)
 		return
@@ -3935,6 +3939,10 @@ func (h *Handlers) authorizeTeamBillingRead(c *gin.Context, platform bool) (uuid
 }
 
 func (h *Handlers) ensureStripeCustomer(ctx context.Context, teamID uuid.UUID) (string, error) {
+	return h.ensureStripeCustomerBeforeCreate(ctx, teamID, nil)
+}
+
+func (h *Handlers) ensureStripeCustomerBeforeCreate(ctx context.Context, teamID uuid.UUID, beforeCreate func() error) (string, error) {
 	account, err := h.DB.GetTeamBillingAccount(ctx, teamID)
 	if err == nil && account.StripeCustomerID != nil && strings.TrimSpace(*account.StripeCustomerID) != "" {
 		return *account.StripeCustomerID, nil
@@ -3945,6 +3953,11 @@ func (h *Handlers) ensureStripeCustomer(ctx context.Context, teamID uuid.UUID) (
 	team, err := h.DB.GetTeam(ctx, teamID)
 	if err != nil {
 		return "", err
+	}
+	if beforeCreate != nil {
+		if err := beforeCreate(); err != nil {
+			return "", err
+		}
 	}
 	customer, err := h.Stripe.CreateCustomer(ctx, StripeCreateCustomerParams{
 		TeamID:         teamID,

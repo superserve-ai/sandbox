@@ -136,8 +136,12 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondErrorMsg(c, "service_unavailable", "Pro resource configuration requires verification", 503)
 		return
 	}
-	customer, err := h.ensureStripeCustomer(c.Request.Context(), team)
+	customer, err := h.ensureCheckoutStripeCustomer(c.Request.Context(), team)
 	if err != nil {
+		if errors.Is(err, errCommercialOfferConflict) {
+			proConflict(c)
+			return
+		}
 		respondError(c, ErrInternal)
 		return
 	}
