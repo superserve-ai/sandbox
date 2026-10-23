@@ -51,9 +51,12 @@ run "east_triage" {
   assert {
     condition = (
       google_monitoring_alert_policy.ids_triage.conditions[0].condition_matched_log[0].label_extractors == tomap({
-        threat_id         = "EXTRACT(jsonPayload.threat_id)"
-        threat_name       = "EXTRACT(jsonPayload.name)"
-        source_ip_address = "EXTRACT(jsonPayload.source_ip_address)"
+        threat_id   = "EXTRACT(jsonPayload.threat_id)"
+        threat_name = "EXTRACT(jsonPayload.name)"
+      }) &&
+      google_monitoring_alert_policy.ids_medium.conditions[0].condition_matched_log[0].label_extractors == tomap({
+        threat_id   = "EXTRACT(jsonPayload.threat_id)"
+        threat_name = "EXTRACT(jsonPayload.name)"
       }) &&
       google_monitoring_alert_policy.ids_triage.alert_strategy[0].notification_rate_limit[0].period == "300s" &&
       google_monitoring_alert_policy.ids_medium.alert_strategy[0].notification_rate_limit[0].period == "300s" &&
@@ -77,6 +80,16 @@ run "east_triage" {
       strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "open a separate urgent incident")
     )
     error_message = "Collection, conservative attribution, and separate manual escalation must remain intact."
+  }
+
+  assert {
+    condition = alltrue([
+      for policy in [google_monitoring_alert_policy.ids_triage, google_monitoring_alert_policy.ids_medium] :
+      !strcontains(policy.documentation[0].content, "source_ip_address") &&
+      strcontains(policy.documentation[0].content, "Google load balancer hop") &&
+      strcontains(policy.documentation[0].content, "load balancer request logs")
+    ])
+    error_message = "Documentation must not read the IDS source address from an extracted label and must send on-call to load balancer request logs for the real client."
   }
   assert {
     condition = strcontains(
@@ -172,9 +185,12 @@ run "west_triage" {
   assert {
     condition = (
       google_monitoring_alert_policy.ids_triage.conditions[0].condition_matched_log[0].label_extractors == tomap({
-        threat_id         = "EXTRACT(jsonPayload.threat_id)"
-        threat_name       = "EXTRACT(jsonPayload.name)"
-        source_ip_address = "EXTRACT(jsonPayload.source_ip_address)"
+        threat_id   = "EXTRACT(jsonPayload.threat_id)"
+        threat_name = "EXTRACT(jsonPayload.name)"
+      }) &&
+      google_monitoring_alert_policy.ids_medium.conditions[0].condition_matched_log[0].label_extractors == tomap({
+        threat_id   = "EXTRACT(jsonPayload.threat_id)"
+        threat_name = "EXTRACT(jsonPayload.name)"
       }) &&
       google_monitoring_alert_policy.ids_triage.alert_strategy[0].notification_rate_limit[0].period == "300s" &&
       google_monitoring_alert_policy.ids_medium.alert_strategy[0].notification_rate_limit[0].period == "300s" &&
