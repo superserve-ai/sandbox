@@ -838,7 +838,7 @@ func TestRenewalChoiceMonthlyCalendarAdmissionMatchesDispatch(t *testing.T) {
 	}
 	for _, option := range view.Options {
 		if option.Choice == "monthly" {
-			if option.Available || option.UnavailableReason != "integration_unavailable" {
+			if !option.Available || option.UnavailableReason != "" {
 				t.Fatal(option)
 			}
 		} else if !option.Available {
@@ -846,15 +846,15 @@ func TestRenewalChoiceMonthlyCalendarAdmissionMatchesDispatch(t *testing.T) {
 		}
 	}
 	req := renewalChoiceRequest{ID: uuid.New(), Choice: "monthly", ApprovalRevision: a.authority.Revision, Acceptance: a.authority.Acceptance, ChoiceRevision: before.Revision}
-	if _, err := s.submit(t.Context(), a.key, a.actor, req); !errors.Is(err, errRenewalDisabled) {
+	if _, err := s.submit(t.Context(), a.key, a.actor, req); err != nil {
 		t.Fatal(err)
 	}
 	after, err := s.status(t.Context(), a.key, a.actor)
-	if err != nil || after.Revision != before.Revision || after.Requested != nil || after.Confirmed.Request.Choice != "annual" || provider.writes.Load() != 0 {
-		t.Fatal("unsupported choice changed journal", after, err)
+	if err != nil || after.Revision <= before.Revision || after.Requested == nil || after.Requested.Request.Choice != "monthly" || after.Confirmed.Request.Choice != "annual" || provider.writes.Load() != 0 {
+		t.Fatal("monthly request did not preserve confirmed annual", after, err)
 	}
-	if _, ok := store.requests[req.ID]; ok {
-		t.Fatal("rejected request persisted")
+	if _, ok := store.requests[req.ID]; !ok {
+		t.Fatal("accepted request missing")
 	}
 }
 

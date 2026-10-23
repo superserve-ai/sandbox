@@ -39,6 +39,16 @@ func RenewalSuccessorRequester(ctx context.Context, tx pgx.Tx, b ContractProvide
 type renewalFinancialFinalizer func(context.Context, YCAcceptanceRecord, string, uuid.UUID, string, time.Time, func(context.Context, pgx.Tx, YCFinancialAuthorization) error) error
 type renewalBenefitRemoval func(context.Context, YCAcceptanceRecord, uuid.UUID, uuid.UUID, func(context.Context, pgx.Tx) error) error
 
+func renewalGrantFeeStart(b ContractProviderBinding, now time.Time) (time.Time, time.Time, error) {
+	start, _, ok := billing.AnniversaryPeriod(b.Anchor, now)
+	months := (start.Year()-b.Anchor.Year())*12 + int(start.Month()-b.Anchor.Month()) - 12
+	if !ok || months < 0 || (b.Terms.FeeMonths != 1 && b.Terms.FeeMonths != 12) {
+		return time.Time{}, time.Time{}, errRenewalPending
+	}
+	first := (b.StartsAt.Year()-b.FeeAnchor.Year())*12 + int(b.StartsAt.Month()-b.FeeAnchor.Month())
+	return start, annualBoundary(b.FeeAnchor, first+months/int(b.Terms.FeeMonths)*int(b.Terms.FeeMonths)), nil
+}
+
 type acceptedRenewalSuccessors struct {
 	Authority *acceptedRenewalAuthority
 	Handlers  *Handlers
@@ -107,16 +117,10 @@ func (a *acceptedRenewalSuccessors) ReconcileFinancial(ctx context.Context, k re
 		}
 		return errRenewalConflict
 	}
-	start, _, ok := billing.AnniversaryPeriod(b.Anchor, time.Now().UTC())
-	if !ok {
-		return errRenewalPending
+	start, feeStart, err := renewalGrantFeeStart(b, time.Now().UTC())
+	if err != nil {
+		return err
 	}
-	months := (start.Year()-b.Anchor.Year())*12 + int(start.Month()-b.Anchor.Month()) - 12
-	if months < 0 {
-		return errRenewalPending
-	}
-	first := (b.StartsAt.Year()-b.FeeAnchor.Year())*12 + int(b.StartsAt.Month()-b.FeeAnchor.Month())
-	feeStart := annualBoundary(b.FeeAnchor, first+months/int(b.Terms.FeeMonths)*int(b.Terms.FeeMonths))
 	inventory, err := a.Client.renewalFeeInvoices(ctx, b)
 	if err != nil {
 		return pending("review_required")

@@ -81,8 +81,6 @@ func (s *renewalChoiceService) view(ctx context.Context, k renewalChoiceKey, act
 				option.UnavailableReason = "boundary_passed"
 			case j.Requested != nil && (j.Requested.State == "dispatched" || j.Requested.State == "outcome_unknown"):
 				option.UnavailableReason = "change_pending"
-			case !renewalCalendarSupported(choice, a.Binding.Anchor, k.Boundary):
-				option.UnavailableReason = "integration_unavailable"
 			case err != nil || validateRenewalTerms(choice, terms) != nil:
 				option.UnavailableReason = "catalog_unavailable"
 			default:

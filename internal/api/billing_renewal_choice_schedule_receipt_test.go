@@ -11,15 +11,15 @@ import (
 	"time"
 )
 
-func TestRenewalChoiceMonthlyCalendarMismatchStopsBeforeCreation(t *testing.T) {
+func TestRenewalChoiceMonthlyCalendarUsesFeeBoundary(t *testing.T) {
 	k, op, request, response, _ := renewalReceiptFixture(t, "monthly")
 	op.Binding.Anchor = time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)
 	k.Boundary = annualBoundary(op.Binding.Anchor, 12)
 	op.Steps = nil
-	if _, err := buildRenewalScheduleStep(k, op, renewalScheduleSnapshot{BindingHash: renewalHash(op.Binding), Anchor: op.Binding.Anchor, Boundary: k.Boundary}); err == nil {
-		t.Fatal("created a schedule for unsupported fee calendar")
+	if _, err := buildRenewalScheduleStep(k, op, renewalScheduleSnapshot{BindingHash: renewalHash(op.Binding), Anchor: op.Binding.Anchor, Boundary: k.Boundary}); err != nil {
+		t.Fatal("monthly calendar blocked schedule creation", err)
 	}
-	// A saved older request must not be confirmed by the new verifier either.
+	// The fee phase ends on the boundary cadence; the allowance keeps original S.
 	form, _ := url.ParseQuery(request.Form)
 	form.Set("phases[0][start_date]", strconv.FormatInt(op.Binding.Anchor.Unix(), 10))
 	form.Set("phases[0][end_date]", strconv.FormatInt(k.Boundary.Unix(), 10))
@@ -27,11 +27,11 @@ func TestRenewalChoiceMonthlyCalendarMismatchStopsBeforeCreation(t *testing.T) {
 	request.Form, request.BindingHash = form.Encode(), renewalHash(op.Binding)
 	op.Steps = []renewalChoiceStep{{Request: request, State: "dispatched"}}
 	var writes atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { writes.Add(1) }))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { writes.Add(1); w.WriteHeader(http.StatusBadRequest) }))
 	defer server.Close()
 	p := &renewalScheduleProvider{Client: &stripeHTTPClient{baseURL: server.URL, httpClient: server.Client(), apiVersion: renewalStripeVersion}, Merchant: op.Binding.Merchant, Verifier: &fixtureRenewalVerifier{}, BoundaryWritesVerified: true}
-	if _, err := p.DispatchStep(t.Context(), k, op, request); err == nil || writes.Load() != 0 {
-		t.Fatal("saved unsupported request bypassed calendar gate", err, writes.Load())
+	if _, err := p.DispatchStep(t.Context(), k, op, request); err == nil || err.Error() != "schedule request returned 400" || writes.Load() != 1 {
+		t.Fatal("monthly calendar blocked dispatch", err, writes.Load())
 	}
 	response["current_phase"] = map[string]any{"start_date": op.Binding.Anchor.Unix(), "end_date": k.Boundary.Unix()}
 	phases := response["phases"].([]any)
@@ -40,8 +40,13 @@ func TestRenewalChoiceMonthlyCalendarMismatchStopsBeforeCreation(t *testing.T) {
 	phases[1].(map[string]any)["start_date"] = k.Boundary.Unix()
 	phases[1].(map[string]any)["end_date"] = annualBoundary(k.Boundary, 1).Unix()
 	raw, _ := json.Marshal(response)
+	if _, err := verifyRenewalScheduleReceipt(k, op, request, raw, k.Boundary.Add(-time.Hour)); err != nil {
+		t.Fatal("valid distinct fee cadence rejected", err)
+	}
+	phases[1].(map[string]any)["end_date"] = annualBoundary(op.Binding.Anchor, 13).Unix()
+	raw, _ = json.Marshal(response)
 	if _, err := verifyRenewalScheduleReceipt(k, op, request, raw, k.Boundary.Add(-time.Hour)); err == nil {
-		t.Fatal("confirmed a Monthly period rejected by payment cadence")
+		t.Fatal("allowance calendar substituted for the actual fee period")
 	}
 }
 

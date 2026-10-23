@@ -15,6 +15,8 @@ type acceptedRenewalAuthority struct {
 	Verifier       renewalScheduleVerifier
 	Monthly        *ProviderPairTerms
 	MonthlyVersion int
+	Merchant       string
+	Live           *bool
 }
 
 func (a *acceptedRenewalAuthority) ready() bool {
@@ -38,6 +40,9 @@ func (a *acceptedRenewalAuthority) accepted(ctx context.Context, q db.DBTX, k re
 		return r, b, err
 	}
 	if !actual.Boundary.Equal(k.Boundary) || b.Identity.AcceptanceID != r.ID || b.Identity.ApprovalSemanticRevision != r.ApprovalRevision || b.Identity.TermsDigest != r.TermsDigest {
+		return r, b, errRenewalConflict
+	}
+	if (a.Merchant != "" && b.Identity.Merchant != a.Merchant) || (a.Live != nil && b.Identity.Live != *a.Live) {
 		return r, b, errRenewalConflict
 	}
 	var revoked bool

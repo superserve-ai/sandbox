@@ -67,11 +67,6 @@ func buildRenewalScheduleStep(k renewalChoiceKey, op renewalChoiceOperation, sna
 	if !validRenewalKey(k) || !validRenewalBinding(op.Binding, k) || snapshot.BindingHash != renewalHash(op.Binding) || !snapshot.Anchor.Equal(op.Binding.Anchor) || !snapshot.Boundary.Equal(k.Boundary) {
 		return r, errRenewalConflict
 	}
-	// The paired payment verifier currently retains the original-anchor cadence.
-	// Do not schedule a Monthly period whose provider end cannot satisfy it.
-	if !renewalCalendarSupported(op.Request.Choice, op.Binding.Anchor, k.Boundary) {
-		return r, errRenewalDisabled
-	}
 	form := url.Values{}
 	if snapshot.Schedule == "" {
 		if len(op.Steps) != 0 {
@@ -140,9 +135,6 @@ func buildRenewalScheduleStep(k renewalChoiceKey, op renewalChoiceOperation, sna
 
 func (p *renewalScheduleProvider) DispatchStep(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, r renewalChoiceStepRequest) (renewalChoiceStepProof, error) {
 	if !p.ready(op) || r.BindingHash != renewalHash(op.Binding) || r.Merchant != p.Merchant || r.Version != p.Client.apiVersion {
-		return renewalChoiceStepProof{}, errRenewalDisabled
-	}
-	if !renewalCalendarSupported(op.Request.Choice, op.Binding.Anchor, k.Boundary) {
 		return renewalChoiceStepProof{}, errRenewalDisabled
 	}
 	// GetBody=nil disables net/http's transparent retry of an idempotent POST.
