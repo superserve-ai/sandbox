@@ -290,6 +290,126 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/plan-changes:
+    post:
+      operationId: requestBillingPlanChange
+      tags: [Billing]
+      summary: Downgrade or switch to Free
+      description: |
+        Moves the authenticated team to a lower plan. Leaving Pro or a custom
+        plan takes effect at the end of the billing period and can be undone
+        until shortly before; leaving Starter for Free takes effect at once. A
+        move to Free pauses all running sandboxes when it takes effect.
+        Upgrades happen on purchase instead. Repeating a request with the same
+        idempotency key returns the original change. Send the preview_token from
+        the confirmed preview; changed terms, limits or effective boundary return
+        409 and require another preview and confirmation. Moves to Free require
+        confirm_pauses_running=true. End-of-period requests also require
+        expected_effective_at matching the confirmed preview. Omit that field for
+        immediate changes. Requires `billing:write`.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target_plan, idempotency_key, preview_token]
+              properties:
+                target_plan:
+                  type: string
+                  enum: [free, starter, pro_monthly]
+                idempotency_key:
+                  type: string
+                  maxLength: 200
+                preview_token:
+                  type: string
+                  minLength: 64
+                  maxLength: 64
+                  description: Token from the confirmed exit preview, binding its assignment, terms, limits and effective boundary. Immediate moves bind to immediate timing.
+                expected_effective_at:
+                  type: string
+                  format: date-time
+                  description: Required when preview timing is end_of_billing_period and must exactly match the confirmed effective_at. Omit for immediate changes. Stale or missing date preconditions return 409 without scheduling.
+                confirm_pauses_running:
+                  type: boolean
+                  description: Must be true when target_plan is free, confirming that all running compute will be paused.
+                reason:
+                  type: string
+                  maxLength: 2000
+      responses:
+        "200":
+          description: The plan change
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlanChange"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: The change could not be completed; retry with the same request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /billing/plan-changes/{change_id}/undo:
+    post:
+      operationId: undoBillingPlanChange
+      tags: [Billing]
+      summary: Undo a scheduled plan change
+      description: |
+        Withdraws a customer-originated change for the authenticated team while
+        it is still undoable; the team stays on its plan. Staff-originated
+        changes require the operator endpoint and are not found here. Undoing
+        a customer change twice is harmless. Requires `billing:write`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: change_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The plan change
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlanChange"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: The change could not be completed; retry with the same request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /billing/plan-change-preview:
     get:
       operationId: previewBillingPlanChange
@@ -5293,8 +5413,35 @@ components:
               format: date-time
             undoable:
               type: boolean
+              description: Whether this change is undoable through the current API channel. Customer reads return false for staff-originated changes.
             pauses_running:
               type: boolean
+    BillingPlanChange:
+      type: object
+      required: [id, target_plan_key, target_display_name, target_kind, effective_at, pauses_running, state, undoable, limits]
+      properties:
+        id:
+          type: string
+          format: uuid
+        target_plan_key:
+          type: string
+        target_display_name:
+          type: string
+        target_kind:
+          type: string
+          enum: [free, prepaid, subscription, legacy_payg, custom]
+        effective_at:
+          type: string
+          format: date-time
+        pauses_running:
+          type: boolean
+        state:
+          type: string
+          enum: [scheduled, applied, completed, undone]
+        undoable:
+          type: boolean
+        limits:
+          $ref: "#/components/schemas/BillingPlanLimits"
     BillingPlanChangePreview:
       type: object
       required: [target_plan_key, target_display_name, target_kind, pauses_running, limits]
@@ -5316,6 +5463,11 @@ components:
           type: boolean
         limits:
           $ref: "#/components/schemas/BillingPlanLimits"
+        preview_token:
+          type: string
+          minLength: 64
+          maxLength: 64
+          description: Present for an available downgrade or exit; return it unchanged when confirming the request.
         blocked:
           type: string
           description: Why the team cannot make this change; absent when it can.

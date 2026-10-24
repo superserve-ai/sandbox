@@ -285,7 +285,13 @@ func (h *Handlers) GetTeamPlanAssignments(c *gin.Context) {
 	if len(history) > 0 && history[0].EffectiveTo == nil {
 		current = &history[0]
 	}
-	c.JSON(http.StatusOK, gin.H{"current": current, "history": history})
+	pending, err := pendingCustomerPlanChange(c.Request.Context(), h.Pool, team, "staff")
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("load pending plan change failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"current": current, "history": history, "pending_change": pending})
 }
 
 type customerPlan struct {
@@ -342,6 +348,10 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	if err == nil {
 		start, end, err = reader.currentBillingPeriod(ctx, team, anchor, h.nowUTC())
 	}
+	var pending *customerPendingPlanChange
+	if err == nil {
+		pending, err = pendingCustomerPlanChange(ctx, tx, team, "customer")
+	}
 	if err == nil {
 		err = tx.Commit(ctx)
 	}
@@ -358,7 +368,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
 		"period":         customerBillingPeriod{Start: start, End: end},
-		"pending_change": (*customerPendingPlanChange)(nil),
+		"pending_change": pending,
 	})
 }
 
@@ -403,6 +413,7 @@ type customerPlanChangePreview struct {
 	PausesRunning     bool       `json:"pauses_running"`
 	Limits            planLimits `json:"limits"`
 	Blocked           string     `json:"blocked,omitempty"`
+	PreviewToken      string     `json:"preview_token,omitempty"`
 }
 
 // GetBillingPlanChangePreview tells a team when a move to a plan would take
@@ -425,6 +436,10 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 	}
 	var current teamPlan
 	var assigned bool
+	var pricing pricingPublicState
+	if err == nil {
+		pricing, err = h.publicPricingState(ctx)
+	}
 	if err == nil {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
 	}
@@ -442,20 +457,33 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		preview.Blocked = "this plan is no longer offered"
 	default:
 		preview.Timing, preview.Blocked = planChangeRule(current.Kind, kind)
+		if !pricing.EntryOpen && preview.Timing == planChangeAfterPurchase {
+			preview.Timing, preview.Blocked = "", "new plans are not available yet"
+		}
+	}
+	if preview.Blocked == "" && kind == planKindFree {
+		ready, err := planChangePausesReady(ctx, h.Pool)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if !ready {
+			preview.Blocked = planChangePausesUnavailable
+		}
 	}
 	if preview.Blocked == "" {
 		preview.PausesRunning = kind == planKindFree
 		at := h.nowUTC()
 		if preview.Timing == planChangeEndOfPeriod {
-			var anchor pgtype.Timestamptz
-			err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
-			if errors.Is(err, pgx.ErrNoRows) {
-				err = nil
-			}
-			if err == nil {
-				_, at, err = h.currentBillingPeriod(ctx, team, anchor, at)
-			}
+			_, at, err = h.planChangeBoundary(ctx, team, current, at)
 			if err != nil {
+				var conflict teamPlanChangeConflictError
+				if errors.As(err, &conflict) {
+					preview.Timing, preview.Blocked = "", conflict.reason
+					c.JSON(http.StatusOK, preview)
+					return
+				}
 				log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
 				respondError(c, ErrInternal)
 				return
@@ -463,6 +491,12 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		}
 		if preview.Timing != planChangeAfterPurchase {
 			preview.EffectiveAt = &at
+			preview.PreviewToken, err = planChangeConsentToken(current, terms, preview.Timing, at)
+			if err != nil {
+				log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
+				respondError(c, ErrInternal)
+				return
+			}
 		}
 	} else {
 		preview.Timing = ""

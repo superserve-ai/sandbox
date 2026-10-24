@@ -476,6 +476,7 @@ func run() error {
 	handlers.StartProPaymentReconciliation(ctx)
 	handlers.StartUsageEntitlementService(ctx)
 	handlers.StartFundingObservationService(ctx)
+	handlers.StartTeamPlanChangeService(ctx)
 
 	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out
 	// to a Slack webhook and an email notifier; each channel is independently

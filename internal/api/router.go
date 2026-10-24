@@ -108,6 +108,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/billing/pricing", h.GetBillingPricing)
 		api.GET("/billing/plan", h.GetBillingPlan)
 		api.GET("/billing/plan-change-preview", h.GetBillingPlanChangePreview)
+		api.POST("/billing/plan-changes", h.RequestBillingPlanChange)
+		api.POST("/billing/plan-changes/:change_id/undo", h.UndoBillingPlanChange)
 		api.GET("/teams/:team_id/billing/usage", h.GetTeamBillingUsage)
 		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
 		api.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetTeamBillingExportPreview)
@@ -179,6 +181,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.POST("/yc/claims/decision", TeamCreationPrivacy(), h.DecideYCClaim)
 		// Billing recovery requires a credential unavailable to VMD hosts.
 		operator.POST("/teams/:team_id/billing/plan-assignments", h.AssignTeamPlan)
+		operator.POST("/teams/:team_id/billing/plan-changes", h.RequestTeamPlanChange)
+		operator.POST("/teams/:team_id/billing/plan-changes/:change_id/undo", h.UndoTeamPlanChange)
 		operator.POST("/teams/:team_id/billing/sponsored-annual/preflight", h.SponsoredAnnualPreflight)
 		operator.POST("/teams/:team_id/billing/sponsored-annual", h.SponsoredAnnualApply)
 		operator.GET("/teams/:team_id/billing/sponsored-annual/:operation_id", h.SponsoredAnnualStatus)
