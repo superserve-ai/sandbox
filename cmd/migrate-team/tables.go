@@ -21,6 +21,7 @@ const profileScope = `id IN (
 	UNION SELECT approved_by FROM team_billing_period WHERE team_id = $1 AND approved_by IS NOT NULL
 	UNION SELECT resolved_by FROM billing_period_anomaly WHERE team_id = $1 AND resolved_by IS NOT NULL
 	UNION SELECT assigned_by FROM team_pricing_plan WHERE team_id = $1 AND assigned_by IS NOT NULL
+	UNION SELECT assigned_by FROM team_plan_assignment WHERE team_id = $1 AND assigned_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_grant WHERE team_id = $1 AND created_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_ledger WHERE team_id = $1 AND created_by IS NOT NULL
 	UNION SELECT user_id FROM stripe_checkout_publication_decision WHERE team_id = $1
@@ -75,6 +76,7 @@ var membershipTables = map[string]bool{
 var migratedTables = []tableSpec{
 	{"profile", profileScope},
 	{"team", "id = $1"},
+	{"team_plan_assignment", "team_id = $1"},
 	{"team_feature_flag", "team_id = $1"},
 	// Checkout publication decisions and subscription associations are
 	// immutable financial authority. Copy and verify them before the account

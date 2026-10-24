@@ -586,6 +586,9 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	if err := lockSourcePromotionMigration(ctx, sourceTx, cfg.teamID); err != nil {
 		return err
 	}
+	if err := lockSourceAssignments(ctx, sourceTx, cfg.teamID); err != nil {
+		return err
+	}
 	if err := checkRetainedAccountingReady(ctx, sourceTx, cfg.teamID); err != nil {
 		return err
 	}
@@ -1025,6 +1028,7 @@ var insertOnlyTables = map[string]bool{
 	"stripe_checkout_generation_authority":     true,
 	"stripe_checkout_publication_decision":     true,
 	"stripe_checkout_publication_subscription": true,
+	"team_plan_assignment":                     true,
 }
 
 // These records deliberately outlive source-team purge. They are immutable
@@ -1034,10 +1038,11 @@ var retainedAfterPurgeTables = map[string]bool{
 	"stripe_checkout_generation_authority":     true,
 	"stripe_checkout_publication_decision":     true,
 	"stripe_checkout_publication_subscription": true,
+	"team_plan_assignment":                     true,
 }
 
 // allColumns lists a table's column names in attnum order.
-func allColumns(ctx context.Context, dst *pgxpool.Pool, table string) ([]string, error) {
+func allColumns(ctx context.Context, dst querier, table string) ([]string, error) {
 	rows, err := dst.Query(ctx, `
 		SELECT a.attname FROM pg_attribute a
 		WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped
@@ -1071,7 +1076,7 @@ var conflictTargets = map[string]string{
 	"retained_storage_measurement_obligation": "(migration_identity)",
 }
 
-func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (string, error) {
+func conflictClause(ctx context.Context, dst querier, table string) (string, error) {
 	if table == "billing_finalization_attempt" {
 		return `ON CONFLICT (team_id) DO UPDATE SET last_attempt_at =
 GREATEST(billing_finalization_attempt.last_attempt_at, EXCLUDED.last_attempt_at)`, nil
@@ -1150,7 +1155,7 @@ GREATEST(billing_finalization_attempt.last_attempt_at, EXCLUDED.last_attempt_at)
 // the source moved on (background writers keep running through the freeze).
 // Tables without a primary key fall back to DO NOTHING with a warning;
 // validate's per-row checksums remain the backstop either way.
-func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
+func copyTableRows(ctx context.Context, src querier, dst migrationDestination, t tableSpec, teamID uuid.UUID, transform rowTransform) (copied, skipped int64, err error) {
 	selectQ := fmt.Sprintf(`SELECT to_jsonb(t) FROM %s t WHERE %s`, t.name, t.effectiveCopyScope())
 	conflict, err := conflictClause(ctx, dst, t.name)
 	if err != nil {
@@ -1265,7 +1270,7 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 // baseline key belonging to another team from being treated as an idempotent
 // retry.  A local generated-id collision is harmless because the insert omits
 // that id; a durable identity collision across teams is a hard refusal.
-func assertAccountingIdentityOwnership(ctx context.Context, dst *pgxpool.Pool, table string, payload []byte) error {
+func assertAccountingIdentityOwnership(ctx context.Context, dst querier, table string, payload []byte) error {
 	var collision bool
 	switch table {
 	case "retained_storage_measurement_obligation":
@@ -1401,6 +1406,9 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 	}
 	if detached {
 		log.Info().Msg("validate: source is detached; parity no longer applies, checking dest liveness instead")
+		if err := validateRetainedAssignments(ctx, src, dst, cfg.teamID); err != nil {
+			return nil, err
+		}
 		return validateDetachedDest(ctx, dst, cfg)
 	}
 
@@ -1801,7 +1809,14 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	if err := lockSourcePromotionMigration(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
+	if err := lockSourceAssignments(ctx, tx, cfg.teamID); err != nil {
+		return err
+	}
 	if err := checkRetainedAccountingReady(ctx, tx, cfg.teamID); err != nil {
+		return err
+	}
+
+	if err := requireAssignmentParity(ctx, tx, dst, cfg.teamID); err != nil {
 		return err
 	}
 
@@ -1978,6 +1993,9 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	if err := lockSourcePromotionMigration(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
+	if err := lockSourceAssignments(ctx, tx, cfg.teamID); err != nil {
+		return err
+	}
 	if err := checkRetainedAccountingReady(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
@@ -2014,6 +2032,10 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	} else if len(builds) > 0 {
 		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
 	}
+	if err := validateRetainedAssignments(ctx, tx, dst, cfg.teamID); err != nil {
+		return err
+	}
+
 	// Rows locked: an auto-delete that committed after the checks above is
 	// visible now and its teardown would cascade with the row below.
 	if blockers, err := activeSandboxes(ctx, tx, cfg.teamID); err != nil {

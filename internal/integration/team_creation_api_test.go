@@ -321,46 +321,72 @@ func TestIntegration_TeamCreationRequestPrivileges(t *testing.T) {
 }
 
 func TestIntegration_TeamCreationServiceRoleCreateAndRecover(t *testing.T) {
-	pool := teamCreationDatabase(t, func(pool *pgxpool.Pool) {
-		// Supabase supplies these defaults before migrations narrow individual ACLs.
-		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role`)
-		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role`)
-		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO service_role`)
-	})
-	servicePool := teamCreationServiceRolePool(t, pool)
-	client := newTeamCreationClient(t, servicePool)
-	ctx := context.Background()
-	actor := uuid.New()
-	claims := teamCreationClaims(actor, uuid.NewString(), "Service role team")
+	for _, pricing := range []string{"legacy", "v2"} {
+		t.Run(pricing, func(t *testing.T) {
+			pool := teamCreationDatabase(t, func(pool *pgxpool.Pool) {
+				// Supabase supplies these defaults before migrations narrow individual ACLs.
+				rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role`)
+				rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role`)
+				rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO service_role`)
+			})
+			rolloutExec(t, pool, `UPDATE billing_pricing_switch SET pricing_version=$1`, pricing)
+			servicePool := teamCreationServiceRolePool(t, pool)
+			client := newTeamCreationClient(t, servicePool)
+			tx, err := servicePool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			rolloutExec(t, tx, `CREATE TEMP TABLE forged_team(id uuid)`)
+			localIdentityError(t, tx, "42501", `CREATE TRIGGER forged_signup AFTER INSERT ON forged_team FOR EACH ROW EXECUTE FUNCTION assign_new_team_free_plan()`)
+			if err := tx.Rollback(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			actor := uuid.New()
+			claims := teamCreationClaims(actor, uuid.NewString(), "Service role team")
 
-	var currentRole string
-	if err := servicePool.QueryRow(ctx, `SELECT current_user`).Scan(&currentRole); err != nil || currentRole != "service_role" {
-		t.Fatalf("provisioning pool role=%q want=service_role err=%v", currentRole, err)
-	}
-	created := teamCreationSnapshot(t, client.call(claims, nil))
-	id := uuid.MustParse(created["id"])
-	teamCreationOutcome(t, pool, id, "granted")
+			var currentRole string
+			if err := servicePool.QueryRow(ctx, `SELECT current_user`).Scan(&currentRole); err != nil || currentRole != "service_role" {
+				t.Fatalf("provisioning pool role=%q want=service_role err=%v", currentRole, err)
+			}
+			created := teamCreationSnapshot(t, client.call(claims, nil))
+			id := uuid.MustParse(created["id"])
+			if pricing == "v2" {
+				if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_plan_assignment a JOIN team t ON t.id=a.team_id WHERE a.team_id=$1 AND a.kind='free' AND a.source='signup' AND a.effective_to IS NULL AND t.max_sandboxes=(a.limits->>'max_concurrent')::integer`, id); n != 1 {
+					t.Fatalf("service-role signup did not apply Free assignment and limits: %d", n)
+				}
+			} else if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_plan_assignment WHERE team_id=$1`, id); n != 0 {
+				t.Fatalf("legacy signup created %d plan assignments", n)
+			}
+			outcome := "granted"
+			if pricing == "v2" {
+				outcome = "promotion_ineligible"
+			}
+			teamCreationOutcome(t, pool, id, outcome)
 
-	for _, check := range []struct {
-		name  string
-		query string
-		args  []any
-	}{
-		{"profile", `SELECT count(*) FROM profile WHERE id=$1`, []any{actor}},
-		{"promotion evidence", `SELECT count(*) FROM promotion_identity_evidence WHERE user_id=$1`, []any{actor}},
-		{"owner membership", `SELECT count(*) FROM team_member WHERE team_id=$1 AND profile_id=$2 AND role='owner'`, []any{id, actor}},
-		{"active membership", `SELECT count(*) FROM team_memberships WHERE team_id=$1 AND user_id=$2 AND status='active'`, []any{id, actor}},
-		{"owner RBAC", `SELECT count(*) FROM user_role_assignments a JOIN roles r ON r.id=a.role_id WHERE a.team_id=$1 AND a.user_id=$2 AND a.revoked_at IS NULL AND r.name='team_owner'`, []any{id, actor}},
-		{"durable result", `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1 AND cell=$2 AND request_id=$3 AND team_id=$4`, []any{actor, claims["region"], claims["request_id"], id}},
-	} {
-		if n := teamCreationCount(t, pool, check.query, check.args...); n != 1 {
-			t.Fatalf("%s count=%d want=1", check.name, n)
-		}
-	}
+			for _, check := range []struct {
+				name  string
+				query string
+				args  []any
+			}{
+				{"profile", `SELECT count(*) FROM profile WHERE id=$1`, []any{actor}},
+				{"promotion evidence", `SELECT count(*) FROM promotion_identity_evidence WHERE user_id=$1`, []any{actor}},
+				{"owner membership", `SELECT count(*) FROM team_member WHERE team_id=$1 AND profile_id=$2 AND role='owner'`, []any{id, actor}},
+				{"active membership", `SELECT count(*) FROM team_memberships WHERE team_id=$1 AND user_id=$2 AND status='active'`, []any{id, actor}},
+				{"owner RBAC", `SELECT count(*) FROM user_role_assignments a JOIN roles r ON r.id=a.role_id WHERE a.team_id=$1 AND a.user_id=$2 AND a.revoked_at IS NULL AND r.name='team_owner'`, []any{id, actor}},
+				{"durable result", `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1 AND cell=$2 AND request_id=$3 AND team_id=$4`, []any{actor, claims["region"], claims["request_id"], id}},
+			} {
+				if n := teamCreationCount(t, pool, check.query, check.args...); n != 1 {
+					t.Fatalf("%s count=%d want=1", check.name, n)
+				}
+			}
 
-	recovered := teamCreationSnapshot(t, client.call(teamCreationRecover(claims), nil))
-	if recovered["id"] != created["id"] || recovered["name"] != created["name"] || recovered["region"] != created["region"] {
-		t.Fatalf("recovery changed committed result: create=%v recover=%v", created, recovered)
+			recovered := teamCreationSnapshot(t, client.call(teamCreationRecover(claims), nil))
+			if recovered["id"] != created["id"] || recovered["name"] != created["name"] || recovered["region"] != created["region"] {
+				t.Fatalf("recovery changed committed result: create=%v recover=%v", created, recovered)
+			}
+		})
 	}
 }
 

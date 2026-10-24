@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1008,21 +1007,12 @@ func TestIntegration_UnassignedFreeEntryWaitsForPricingAdoption(t *testing.T) {
 }
 
 func TestIntegration_PricingEntryReaderUsesRestrictedRole(t *testing.T) {
-	tx, err := testPool.Begin(t.Context())
+	pool := teamCreationDatabase(t)
+	tx, err := pool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	if _, err := tx.Exec(t.Context(), `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF; END $$; DROP FUNCTION billing_lock_pricing_public_state()`); err != nil {
-		t.Fatal(err)
-	}
-	migration, err := os.ReadFile("../../supabase/migrations/20261024131000_pricing_adoption_entry.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(t.Context(), string(migration)); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := tx.Exec(t.Context(), `SET LOCAL ROLE service_role`); err != nil {
 		t.Fatal(err)
 	}
