@@ -53,6 +53,20 @@ func (c *stripeHTTPClient) retrieveEntitlementGrant(ctx context.Context, id stri
 	return g, err
 }
 
+func (c *stripeHTTPClient) createCreditGrant(ctx context.Context, form url.Values, key string) (entitlementGrant, error) {
+	var g entitlementGrant
+	if err := c.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &g, key); err != nil {
+		return g, err
+	}
+	if g.ID == "" || g.Customer != form.Get("customer") {
+		return g, errors.New("created grant identity differs from request")
+	}
+	if g.VoidedAt != 0 {
+		return g, errors.New("created grant was voided; operator recovery required")
+	}
+	return g, nil
+}
+
 // The form is derived exclusively from the saved request, including omission of
 // effective_at. Replays never substitute a new timestamp or idempotency key.
 func entitlementGrantForm(raw []byte, expected []map[string]string) (url.Values, error) {

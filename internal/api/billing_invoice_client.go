@@ -24,6 +24,7 @@ type StripeInvoiceAmounts struct {
 		PaidAt      int64 `json:"paid_at"`
 		FinalizedAt int64 `json:"finalized_at"`
 	} `json:"status_transitions"`
+	AmountPaid      *int64            `json:"amount_paid,omitempty"`
 	AmountRemaining *int64            `json:"amount_remaining"`
 	PeriodStart     int64             `json:"period_start"`
 	PeriodEnd       int64             `json:"period_end"`

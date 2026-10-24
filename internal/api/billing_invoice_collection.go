@@ -34,6 +34,7 @@ func invoiceSettlementHash(inv StripeInvoiceAmounts) string {
 	inv.AutoAdvance = false
 	inv.StatusTransitions.PaidAt = 0
 	inv.AmountRemaining = nil
+	inv.AmountPaid = nil
 	inv.Lines.Data = append([]StripeInvoiceAmountLine(nil), inv.Lines.Data...)
 	sort.Slice(inv.Lines.Data, func(i, j int) bool { return inv.Lines.Data[i].ID < inv.Lines.Data[j].ID })
 	raw, _ := json.Marshal(inv)

@@ -65,6 +65,8 @@ func TestInvoiceCollectionSettlementFingerprint(t *testing.T) {
 	inv.Status = "paid"
 	zero := int64(0)
 	inv.AmountRemaining = &zero
+	paid := int64(500)
+	inv.AmountPaid = &paid
 	inv.StatusTransitions.PaidAt = 200
 	inv.Lines.Data[0], inv.Lines.Data[1] = inv.Lines.Data[1], inv.Lines.Data[0]
 	if invoiceSettlementHash(inv) != saved {

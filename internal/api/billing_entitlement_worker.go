@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"sort"
 	"sync"
 	"time"
@@ -34,6 +33,7 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	}
 	workers := 8
 	h.startEntitlementCoverageMonitoring(ctx)
+	h.startMatchingCredits(ctx, h.Stripe.(*stripeHTTPClient))
 	h.startSponsoredReconciliation(ctx)
 	if h.Config != nil && h.Config.BillingEntitlementWorkers >= 2 {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)
@@ -468,12 +468,9 @@ func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCom
 	if err != nil {
 		return err
 	}
-	var grant entitlementGrant
-	if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey); err != nil {
+	grant, err := client.createCreditGrant(ctx, form, e.IdempotencyKey)
+	if err != nil {
 		return err
-	}
-	if grant.VoidedAt != 0 {
-		return errors.New("created grant was voided; operator recovery required")
 	}
 	raw, _ := json.Marshal(grant)
 	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
