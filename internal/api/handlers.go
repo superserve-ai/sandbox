@@ -30,6 +30,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/authz"
 	"github.com/superserve-ai/sandbox/internal/backup"
+	"github.com/superserve-ai/sandbox/internal/billing/provisioning"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -175,6 +176,7 @@ type Handlers struct {
 	Encryptor          secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
 	Signer             *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
 	Stripe             StripeBillingClient
+	OfferProvisioning  *provisioning.Service // Set verified adapters before startup; nil disables provisioning.
 	TrialWarningSender TrialCreditWarningSender
 	// EmailTransport selects how every API email is delivered.
 	EmailTransport EmailTransport
