@@ -70,11 +70,7 @@ var quotaChecks = []quotaCheck{
 		return int(r.ActiveSandboxCount), int(r.MaxSandboxes)
 	}},
 	{"templates", func(r db.ListTeamQuotaUsageRow) (int, int) {
-		limit := defaultMaxTemplates
-		if r.MaxTemplates != nil {
-			limit = int(*r.MaxTemplates)
-		}
-		return int(r.TemplateCount), limit
+		return int(r.TemplateCount), int(r.MaxTemplates)
 	}},
 }
 

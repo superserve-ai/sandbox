@@ -99,12 +99,12 @@ paths:
     get:
       operationId: getPublicBillingPlans
       tags: [Billing]
-      summary: List purchasable subscription plans
+      summary: List plan cards for the live pricing model
       description: |
-        Returns the subscription plans new customers can currently buy, with
-        their price, included monthly usage credit, and resource limits. This
-        endpoint is unauthenticated so signup pages can render from the same
-        plan catalog used by checkout.
+        Returns the live pricing model, its published plan cards (including
+        display-only families such as Enterprise) and the subscription offers
+        new customers can currently buy. This endpoint is unauthenticated so
+        signup pages render from the same plan catalog used by checkout.
       responses:
         "200":
           description: Purchasable subscription plans
@@ -5009,12 +5009,145 @@ components:
 
     BillingPlansResponse:
       type: object
-      required: [plans]
+      required: [pricing_version, cards, plans]
       properties:
-        plans:
+        pricing_version:
+          type: string
+          enum: [legacy, v2]
+          description: Pricing model that is live for new customers.
+        cards:
           type: array
           items:
+            $ref: "#/components/schemas/BillingPlanCard"
+        plans:
+          type: array
+          description: Offers new customers can check out.
+          items:
             $ref: "#/components/schemas/BillingPlan"
+    BillingPlanCard:
+      type: object
+      required: [family, version, kind, name, price_label, tagline, features, display_only, monthly, annual, credit_summary, monthly_credit_cents, allowance, matching, limits]
+      properties:
+        family:
+          type: string
+        version:
+          type: integer
+        kind:
+          type: string
+          enum: [free, prepaid, subscription, legacy_payg, custom]
+        name:
+          type: string
+        price_label:
+          type: string
+          description: Price as shown on the card, e.g. `$250/month`. Empty when the card shows its fees.
+        tagline:
+          type: string
+        features:
+          type: array
+          items:
+            type: string
+        display_only:
+          type: boolean
+          description: Shown for contact-sales plans that cannot be bought online.
+        monthly:
+          $ref: "#/components/schemas/BillingPlanPrice"
+        annual:
+          $ref: "#/components/schemas/BillingPlanPrice"
+        credit_summary:
+          type: string
+          description: The credit schedule in words, e.g. `$1,000 every month`.
+        monthly_credit_cents:
+          type: integer
+          format: int64
+          nullable: true
+          description: Credit included every month, when the schedule is a uniform monthly grant.
+        allowance:
+          type: object
+          nullable: true
+          required: [amount_cents, amount_usd, period, on_exhausted, summary]
+          description: Usage included in the plan.
+          properties:
+            amount_cents:
+              type: integer
+              format: int64
+              description: Included usage in USD cents per period, priced at the current rate card for compute allowances.
+            amount_usd:
+              type: string
+              description: Included usage in USD per period as an exact decimal, e.g. `0.1332`; compute allowances are priced at the current rate card. `amount_cents` is this amount rounded to the cent.
+            period:
+              type: string
+              enum: [day_window, month]
+              description: "`day_window` is 24 hours from the first sandbox start; `month` is the billing month."
+            on_exhausted:
+              type: string
+              enum: [pause, payg]
+              description: Whether sandboxes pause or usage continues pay as you go once the allowance is used.
+            compute:
+              type: object
+              required: [seconds, vcpu, memory_gib]
+              description: Present when the allowance is defined as compute time.
+              properties:
+                seconds:
+                  type: integer
+                vcpu:
+                  type: integer
+                memory_gib:
+                  type: integer
+            summary:
+              type: string
+              description: The allowance in words, e.g. `$250 of usage included every month`.
+        matching:
+          type: object
+          nullable: true
+          required: [matching_bps, cap_cents]
+          description: Matching credit on customer-paid usage, up to a lifetime cap per contract.
+          properties:
+            matching_bps:
+              type: integer
+              description: Share of customer-paid usage matched, in basis points (10000 = 100%).
+            cap_cents:
+              type: integer
+              format: int64
+        limits:
+          $ref: "#/components/schemas/BillingPlanLimits"
+    BillingPlanLimits:
+      type: object
+      required: [max_concurrent, max_vcpu, max_memory_mib, max_disk_mib, max_templates]
+      properties:
+        max_concurrent:
+          type: integer
+          nullable: true
+          description: Running sandboxes at once.
+        max_vcpu:
+          type: integer
+          nullable: true
+          description: vCPUs per sandbox.
+        max_memory_mib:
+          type: integer
+          nullable: true
+        max_disk_mib:
+          type: integer
+          nullable: true
+        max_templates:
+          type: integer
+          nullable: true
+    BillingPlanPrice:
+      type: object
+      nullable: true
+      required: [offer_key, price_cents, monthly_equivalent_cents, available]
+      properties:
+        offer_key:
+          type: string
+        price_cents:
+          type: integer
+          format: int64
+          description: Fee in USD cents per billing interval.
+        monthly_equivalent_cents:
+          type: integer
+          format: int64
+        available:
+          type: boolean
+          description: Whether new customers can check out this offer.
     BillingPlan:
       type: object
       required: [key, family, name, interval_months, price_cents, monthly_credit_cents, limits]

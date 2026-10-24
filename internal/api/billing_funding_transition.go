@@ -43,6 +43,10 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 		return err
 	}
 	defer tx.Rollback(ctx)
+	rawPricing, entryOpen, err := lockPricingEntry(ctx, tx)
+	if err != nil {
+		return err
+	}
 	if lease != nil {
 		if err = lease.lock(ctx, h.DB.WithTx(tx)); err != nil {
 			return err
@@ -94,6 +98,29 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 	}
 	needsRelease := (operation.Valid && !ycReleased) || (offer != nil && *offer != "free")
 	if !needsRelease {
+		if offer != nil && *offer == "free" && choiceState == "committed" {
+			return tx.Commit(ctx)
+		}
+		if rawPricing == "v2" && !entryOpen {
+			return errFundingPlanTransition
+		}
+		if rawPricing == "v2" {
+			var assigned, available bool
+			if err = tx.QueryRow(ctx, `SELECT to_regclass('team_plan_assignment') IS NOT NULL`).Scan(&available); err != nil {
+				return err
+			}
+			if available {
+				err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL AND kind='free')`, team).Scan(&assigned)
+				if err != nil {
+					return err
+				}
+			}
+			if !assigned {
+				return errFundingPlanTransition
+			}
+		}
+		// "free" here is the legacy pay-as-you-go choice, not the v2 Free
+		// plan family; v2 code reads a team's plan from its plan assignment.
 		_, err = tx.Exec(ctx, `INSERT INTO billing_signup_choice(team_id,offer_key,state) VALUES($1,'free','committed') ON CONFLICT(team_id) DO UPDATE SET offer_key='free',state='committed',revision=billing_signup_choice.revision+1`, team)
 		if err != nil {
 			return err
