@@ -318,7 +318,11 @@ func (h *Handlers) ycPreflight(ctx context.Context, team uuid.UUID, in ycApprova
 			return params, sub, err
 		}
 	}
-	if err = client.ycGrantPreflight(ctx, in.Customer, "", in.ExistingGrantID); err != nil {
+	staff, err := h.issuedStaffCredits(ctx, h.Pool, in.Customer)
+	if err != nil {
+		return params, sub, err
+	}
+	if err = client.ycGrantPreflight(ctx, in.Customer, "", in.ExistingGrantID, staff); err != nil {
 		return params, sub, err
 	}
 	if in.ExistingGrantID != "" {

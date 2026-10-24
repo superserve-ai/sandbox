@@ -12,7 +12,9 @@ import (
 
 // No unrelated live grant can silently become an additional YC allowance.
 // Historical expired/voided grants are retained and do not block adoption.
-func (c *stripeHTTPClient) ycGrantPreflight(ctx context.Context, customer, contract, approved string) error {
+// Issued staff credits are known one-off usage credit, not a competing
+// allowance, so they are skipped.
+func (c *stripeHTTPClient) ycGrantPreflight(ctx context.Context, customer, contract, approved string, staff map[string]staffCredit) error {
 	var list struct {
 		Data    []entitlementGrant `json:"data"`
 		HasMore bool               `json:"has_more"`
@@ -29,7 +31,7 @@ func (c *stripeHTTPClient) ycGrantPreflight(ctx context.Context, customer, contr
 		if g.Customer != customer {
 			return errors.New("grant inventory customer differs")
 		}
-		if g.VoidedAt != 0 || (g.ExpiresAt > 0 && g.ExpiresAt <= time.Now().Unix()) {
+		if g.VoidedAt != 0 || (g.ExpiresAt > 0 && g.ExpiresAt <= time.Now().Unix()) || isStaffCredit(g, staff) {
 			continue
 		}
 		live++

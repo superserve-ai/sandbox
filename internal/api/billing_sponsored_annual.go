@@ -521,8 +521,12 @@ func (h *Handlers) annualGrantEvidence(ctx context.Context, o sponsoredAnnualAut
 		result = append(result, map[string]any{"grant": g, "remaining_cents": balance})
 		delete(byID, g.ID)
 	}
+	staff, err := h.issuedStaffCredits(ctx, reader, o.Customer)
+	if err != nil {
+		return nil, err
+	}
 	for _, g := range byID {
-		if g.VoidedAt == 0 && (g.ExpiresAt == 0 || g.ExpiresAt > time.Now().Unix()) {
+		if g.VoidedAt == 0 && (g.ExpiresAt == 0 || g.ExpiresAt > time.Now().Unix()) && !isStaffCredit(g, staff) {
 			return nil, errors.New("unrecognized unexpired credit conflicts with annual adoption")
 		}
 	}

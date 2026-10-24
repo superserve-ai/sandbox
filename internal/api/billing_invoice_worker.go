@@ -22,17 +22,21 @@ import (
 
 var errInvoiceAssociationChanged = errors.New("invoice account association changed")
 
-func (h *Handlers) invoiceAccount(ctx context.Context, team uuid.UUID) (invoiceAccount, bool, error) {
+func (h *Handlers) invoiceAccount(ctx context.Context, team uuid.UUID, readers ...db.DBTX) (invoiceAccount, bool, error) {
+	var reader db.DBTX = h.Pool
+	if len(readers) > 0 {
+		reader = readers[0]
+	}
 	var a invoiceAccount
 	var currentCustomer, currentSubscription *string
-	err := h.Pool.QueryRow(ctx, `SELECT i.customer_id,i.subscription_id,i.adjustment_price_id,i.adjustment_event_name,i.adjustment_meter_id,i.enrolled_at,b.stripe_customer_id,b.stripe_subscription_id FROM billing_invoice_account i JOIN team_billing_account b USING(team_id) WHERE team_id=$1`, team).Scan(&a.Customer, &a.Subscription, &a.Price, &a.Event, &a.Meter, &a.EnrolledAt, &currentCustomer, &currentSubscription)
+	err := reader.QueryRow(ctx, `SELECT i.customer_id,i.subscription_id,i.adjustment_price_id,i.adjustment_event_name,i.adjustment_meter_id,i.enrolled_at,b.stripe_customer_id,b.stripe_subscription_id FROM billing_invoice_account i JOIN team_billing_account b USING(team_id) WHERE team_id=$1`, team).Scan(&a.Customer, &a.Subscription, &a.Price, &a.Event, &a.Meter, &a.EnrolledAt, &currentCustomer, &currentSubscription)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return a, false, nil
 	}
 	if err != nil {
 		return a, false, err
 	}
-	if err = h.loadInvoiceBase(ctx, team, &a); err != nil {
+	if err = h.loadInvoiceBase(ctx, team, &a, reader); err != nil {
 		return a, true, err
 	}
 	if currentCustomer == nil || currentSubscription == nil || *currentCustomer != a.Customer || *currentSubscription != a.Subscription {
@@ -43,12 +47,16 @@ func (h *Handlers) invoiceAccount(ctx context.Context, team uuid.UUID) (invoiceA
 
 // A queued replacement cannot take ownership of a previously frozen period.
 // Retain the saved association until those invoices are settled and released.
-func (h *Handlers) invoiceAccountForPeriod(ctx context.Context, p billing.ExportPeriod) (invoiceAccount, bool, error) {
-	a, enrolled, err := h.invoiceAccount(ctx, p.TeamID)
+func (h *Handlers) invoiceAccountForPeriod(ctx context.Context, p billing.ExportPeriod, readers ...db.DBTX) (invoiceAccount, bool, error) {
+	var reader db.DBTX = h.Pool
+	if len(readers) > 0 {
+		reader = readers[0]
+	}
+	a, enrolled, err := h.invoiceAccount(ctx, p.TeamID, reader)
 	if !errors.Is(err, errInvoiceAssociationChanged) || !a.EnrolledAt.Before(p.End) {
 		return a, enrolled, err
 	}
-	err = h.Pool.QueryRow(ctx, `SELECT b.stripe_customer_id,b.stripe_subscription_id
+	err = reader.QueryRow(ctx, `SELECT b.stripe_customer_id,b.stripe_subscription_id
         FROM team_billing_period p JOIN billing_incremental_period i USING(team_id,period_start,period_end)
         JOIN billing_invoice_enrollment w USING(team_id) JOIN team_billing_account b USING(team_id)
         WHERE p.team_id=$1 AND p.period_start=$2 AND p.period_end=$3
@@ -705,20 +713,48 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if plan.AdjustmentCents > int64(len(items)) || plan.AdjustmentCents < -int64(len(items)) {
 		return plan, fmt.Errorf("invoice difference exceeds supported rounding correction")
 	}
-	var sponsored bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND charge_kind='sponsored_entitlement' AND starts_at<=$4 AND ends_at>=$5)`, p.TeamID, a.Customer, a.Subscription, p.Start, p.End).Scan(&sponsored); err != nil {
+	path, err := h.invoiceCreditPath(ctx, p, a, h.Pool)
+	if err != nil {
 		return plan, err
 	}
-	if a.Base.Price != "" || sponsored {
+	switch path {
+	case invoiceCreditsEntitlement:
 		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
-	} else {
+	case invoiceCreditsReleasedFunding:
 		var released bool
-		released, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client)
-		if err == nil && !released {
-			plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+		if released, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client); err == nil && !released {
+			err = errors.New("released funding credit changed while planning the invoice")
 		}
+	default:
+		plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
 	}
 	return plan, err
+}
+
+type invoiceCreditSource int
+
+const (
+	invoiceCreditsLedger invoiceCreditSource = iota
+	invoiceCreditsEntitlement
+	invoiceCreditsReleasedFunding
+)
+
+// invoiceCreditPath picks how a period's invoice accounts for credit: the
+// entitlement inventory for contract-backed periods, the released funding
+// inventory, or the usage-only credit ledger.
+func (h *Handlers) invoiceCreditPath(ctx context.Context, p billing.ExportPeriod, a invoiceAccount, reader db.DBTX) (invoiceCreditSource, error) {
+	var sponsored bool
+	if err := reader.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND charge_kind='sponsored_entitlement' AND starts_at<=$4 AND ends_at>=$5)`, p.TeamID, a.Customer, a.Subscription, p.Start, p.End).Scan(&sponsored); err != nil {
+		return invoiceCreditsLedger, err
+	}
+	if a.Base.Price != "" || sponsored {
+		return invoiceCreditsEntitlement, nil
+	}
+	_, released, err := h.releasedFundingCreditContract(ctx, p.TeamID, a, reader)
+	if err != nil || !released {
+		return invoiceCreditsLedger, err
+	}
+	return invoiceCreditsReleasedFunding, nil
 }
 
 // Quantity drift is provisional only for accounts under a durable invoice hold.

@@ -965,6 +965,24 @@ type BillingSponsoredPromotionRecovery struct {
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 }
 
+type BillingStaffCreditGrant struct {
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	IdempotencyKey      string             `json:"idempotency_key"`
+	CustomerID          string             `json:"customer_id"`
+	AmountCents         int64              `json:"amount_cents"`
+	Reason              string             `json:"reason"`
+	RequestedBy         uuid.UUID          `json:"requested_by"`
+	RequestedAt         time.Time          `json:"requested_at"`
+	State               string             `json:"state"`
+	StripeCreditGrantID *string            `json:"stripe_credit_grant_id"`
+	IssuedAt            pgtype.Timestamptz `json:"issued_at"`
+	IssuanceEvidence    []byte             `json:"issuance_evidence"`
+	Attempts            int32              `json:"attempts"`
+	AttemptedAt         pgtype.Timestamptz `json:"attempted_at"`
+	LastError           *string            `json:"last_error"`
+}
+
 type BillingUsageEntitlement struct {
 	ID                           uuid.UUID          `json:"id"`
 	TeamID                       uuid.UUID          `json:"team_id"`

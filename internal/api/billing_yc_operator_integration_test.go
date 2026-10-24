@@ -84,6 +84,18 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 }
 
 func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, methodType, recoveryFailure, recoveryState string, create ...bool) {
+	runYCOperatorAdoptionFixture(t, existing, methodType, recoveryFailure, recoveryState, false, create...)
+}
+
+func TestYCOperatorAdoptionWithStaffCredit(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("approved_grant=%t", existing), func(t *testing.T) {
+			runYCOperatorAdoptionFixture(t, existing, "card", "", "", true)
+		})
+	}
+}
+
+func runYCOperatorAdoptionFixture(t *testing.T, existing bool, methodType, recoveryFailure, recoveryState string, withStaff bool, create ...bool) {
 	computeOnly := len(create) > 1 && create[1]
 	newSubscription := len(create) > 0 && create[0]
 	subscriptionCreated := !newSubscription
@@ -163,6 +175,7 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 	rounding.Recurring.IntervalCount = 1
 	rounding.Recurring.Meter = "mtr_round"
 	prices[rounding.ID] = rounding
+	staff := &staffCreditStripe{t: t, customer: customer}
 	grant := testEntitlementGrant()
 	grant.ID = "credgr_" + team.ID.String()
 	grant.Customer = customer
@@ -287,6 +300,10 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 			}
 			output(map[string]any{"data": meters})
 		case r.URL.Path == "/v1/billing/credit_grants":
+			if r.Method == http.MethodPost && r.Form.Get("metadata[staff_credit_grant]") != "" {
+				staff.ServeHTTP(w, r)
+				return
+			}
 			if r.Method == http.MethodPost {
 				grantWrites++
 				grant.Metadata = map[string]string{"entitlement_id": r.Form.Get("metadata[entitlement_id]")}
@@ -300,14 +317,27 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 				http.Error(w, "lost response", 503)
 				return
 			}
-			grants := []entitlementGrant{}
-			if existing || issued {
+			grants := append([]entitlementGrant{}, staff.grants...)
+			if issued {
+				grants = append([]entitlementGrant{grant}, grants...)
+			} else if existing {
 				grants = append(grants, grant)
 			}
-			output(map[string]any{"data": grants})
+			more := false
+			if limit, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && limit > 0 && len(grants) > limit {
+				grants = grants[:limit]
+				more = true
+			}
+			output(map[string]any{"data": grants, "has_more": more})
 		case r.URL.Path == "/v1/billing/credit_grants/"+grant.ID:
 			output(grant)
+		case len(staff.grants) > 0 && r.URL.Path == "/v1/billing/credit_grants/"+staff.grants[0].ID:
+			output(staff.grants[0])
 		case r.URL.Path == "/v1/billing/credit_balance_summary":
+			if len(staff.grants) > 0 && r.URL.Query().Get("filter[credit_grant]") == staff.grants[0].ID {
+				staff.ServeHTTP(w, r)
+				return
+			}
 			output(map[string]any{"balances": []any{map[string]any{"ledger_balance": map[string]any{"monetary": map[string]any{"currency": "usd", "value": 0}}}}})
 		case r.URL.Path == "/v1/invoices" || r.URL.Path == "/v1/billing/credit_balance_transactions":
 			output(map[string]any{"data": []any{}})
@@ -318,6 +348,13 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 	}))
 	defer srv.Close()
 	h.Stripe = &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+	if withStaff {
+		credit, err := h.grantStaffCredit(t.Context(), team.ID, uuid.New(), staffCreditRequest{Key: "before-yc", AmountCents: 100, Reason: "Usage correction"})
+		if err != nil || credit.State != "issued" || staff.creates != 1 {
+			t.Fatalf("staff credit issuance: %+v %v", credit, err)
+		}
+		writes = 0
+	}
 	in.CompanyIdentity = "https://www.ycombinator.com/companies/fixture-" + team.ID.String()
 	in.Merchant = "acct_fixture"
 	in.Region = "use"
@@ -555,8 +592,29 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 		if eerr = h.prepareEntitlementCredits(t.Context(), billing.ExportPeriod{TeamID: team.ID, Start: anchor, End: anchor.AddDate(0, 1, 0)}, account, "in_overage", &plan, h.Stripe.(*stripeHTTPClient)); eerr != nil {
 			t.Fatal("depleted adopted grant blocked overages", eerr)
 		}
-		if plan.CreditBeforeCents != 0 {
-			t.Fatal("fabricated remaining credit")
+		expectedCredit := int64(0)
+		if withStaff {
+			expectedCredit = 100
+		}
+		if plan.CreditBeforeCents != expectedCredit {
+			t.Fatalf("invoice credits changed: got %d want %d", plan.CreditBeforeCents, expectedCredit)
+		}
+	}
+	if withStaff {
+		scope := []string{"price_round"}
+		for _, key := range keys {
+			scope = append(scope, "price_"+key)
+		}
+		credits, err := h.eligibleInvoiceCredits(t.Context(), customer, anchor.AddDate(0, 1, 0).Unix(), scope, h.Stripe.(*stripeHTTPClient))
+		if err != nil || len(credits) != 1 || credits[0].ID != staff.grants[0].ID || credits[0].Before != 100 {
+			t.Fatalf("staff credit missing from invoice accounting: %+v %v", credits, err)
+		}
+		var preserved bool
+		if err = h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM billing_staff_credit_grant WHERE team_id=$1 AND state='issued' AND stripe_credit_grant_id=$2) AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement WHERE team_id=$1 AND stripe_credit_grant_id=$2)`, team.ID, staff.grants[0].ID).Scan(&preserved); err != nil || !preserved {
+			t.Fatalf("YC adoption consumed staff credit: %v", err)
+		}
+		if staff.creates != 1 {
+			t.Fatalf("duplicated staff grant: %d", staff.creates)
 		}
 	}
 	methodOwner = "acct_other"
