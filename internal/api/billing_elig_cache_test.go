@@ -43,8 +43,8 @@ func TestBillingEligCacheServesBothVerdicts(t *testing.T) {
 		teamID := uuid.New()
 
 		for i := 0; i < 5; i++ {
-			got, err := h.teamBillingEligibleCached(context.Background(), teamID)
-			if err != nil || got != eligible {
+			got, err := h.teamSandboxAdmissionCached(context.Background(), teamID)
+			if err != nil || got.eligible != eligible {
 				t.Fatalf("eligible=%v call %d: got=%v err=%v", eligible, i, got, err)
 			}
 		}
@@ -69,7 +69,7 @@ func TestBillingEligCacheCoalescesBurst(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if got, err := h.teamBillingEligibleCached(context.Background(), teamID); err != nil || !got {
+			if got, err := h.teamSandboxAdmissionCached(context.Background(), teamID); err != nil || !got.eligible {
 				t.Errorf("got=%v err=%v", got, err)
 			}
 		}()
@@ -117,7 +117,7 @@ func TestBillingEligCacheHardCap(t *testing.T) {
 	h := eligMockHandlers(&reads, &answer, nil)
 
 	for i := 0; i < billingEligCacheMaxEntries+100; i++ {
-		if _, err := h.teamBillingEligibleCached(context.Background(), uuid.New()); err != nil {
+		if _, err := h.teamSandboxAdmissionCached(context.Background(), uuid.New()); err != nil {
 			t.Fatalf("call %d: %v", i, err)
 		}
 	}

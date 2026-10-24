@@ -3146,6 +3146,23 @@ func TestYCClaimHistoryBlocksMigration(t *testing.T) {
 
 func TestPlanAssignmentMigration(t *testing.T) {
 	ctx := context.Background()
+	t.Run("released adoption refuses destination import", func(t *testing.T) {
+		mustExec(t, srcPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+		team := uuid.New()
+		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "released-import-"+team.String())
+		mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
+		mustExec(t, dstPool, `UPDATE billing_pricing_adoption SET region='usw',system_team_id=$1,state='released',evidence='{}',released_at=clock_timestamp()`, uuid.New())
+		t.Cleanup(func() { mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`) })
+		spec, _ := tableByName("team")
+		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || !strings.Contains(err.Error(), "regional team import is unavailable") {
+			t.Fatalf("released cell accepted imported planless authority: %v", err)
+		}
+		var exists bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&exists); err != nil || exists {
+			t.Fatalf("destination published: %v %v", exists, err)
+		}
+	})
+
 	t.Run("source lock fences direct first assignment", func(t *testing.T) {
 		team := uuid.New()
 		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "locked-assignment-"+team.String())
@@ -3270,6 +3287,60 @@ func TestPlanAssignmentMigration(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	for _, cell := range []string{"source", "destination"} {
+		for _, state := range []string{"allowance", "pause"} {
+			t.Run(cell+" "+state+" authority refuses migration", func(t *testing.T) {
+				team := uuid.New()
+				mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "free-authority-"+team.String())
+				pool := srcPool
+				if cell == "destination" {
+					pool = dstPool
+					mustExec(t, pool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "free-authority-"+team.String())
+				}
+				if state == "allowance" {
+					mustExec(t, pool, `INSERT INTO billing_free_allowance(team_id,window_started_at,resets_at,allowance_usd,used_usd,blocked_until,evaluated_at) VALUES($1,now(),now()+interval '24 hours',1,2,now()+interval '24 hours',now())`, team)
+				} else {
+					mustExec(t, pool, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'plan_change','accepted exit')`, team)
+					mustExec(t, pool, `SELECT request_team_pause_all($1,'plan_switch_free')`, team)
+				}
+				if cell == "source" {
+					tx, err := srcPool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer tx.Rollback(ctx)
+					if err := lockSourceAssignments(ctx, tx, team); err == nil || !strings.Contains(err.Error(), "pause authority transfer") {
+						t.Fatalf("cutover not refused: %v", err)
+					}
+					tx.Rollback(ctx)
+				}
+				spec, _ := tableByName("team")
+				if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || !strings.Contains(err.Error(), "pause authority transfer") {
+					t.Fatalf("copy not refused: %v", err)
+				}
+				if cell == "source" {
+					var exists bool
+					if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&exists); err != nil || exists {
+						t.Fatalf("destination published: %v %v", exists, err)
+					}
+				}
+			})
+		}
+	}
+
+	t.Run("destination allowance created after copy blocks cutover", func(t *testing.T) {
+		team := uuid.New()
+		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "cutover-allowance-"+team.String())
+		spec, _ := tableByName("team")
+		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, dstPool, `INSERT INTO billing_free_allowance(team_id,window_started_at,resets_at,allowance_usd,used_usd,blocked_until,evaluated_at) VALUES($1,now(),now()+interval '24 hours',1,2,now()+interval '24 hours',now())`, team)
+		if err := requireAssignmentParity(ctx, srcPool, dstPool, team); err == nil || !strings.Contains(err.Error(), "pause authority transfer") {
+			t.Fatalf("cutover accepted new destination authority: %v", err)
+		}
+	})
+
 	t.Run("contract authority refuses before team insert", func(t *testing.T) {
 		team, contract := uuid.New(), uuid.New()
 		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "contract-"+team.String())

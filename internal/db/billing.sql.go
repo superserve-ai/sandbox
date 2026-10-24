@@ -416,6 +416,36 @@ func (q *Queries) BlockTeamBillingPeriod(ctx context.Context, arg BlockTeamBilli
 	return i, err
 }
 
+const claimFreeAllowanceRetries = `-- name: ClaimFreeAllowanceRetries :many
+WITH due AS (
+ SELECT team_id FROM billing_free_allowance_retry WHERE next_attempt_at<=clock_timestamp()
+ ORDER BY next_attempt_at,team_id LIMIT 10 FOR UPDATE SKIP LOCKED
+)
+UPDATE billing_free_allowance_retry r
+SET next_attempt_at=clock_timestamp()+interval '15 seconds',attempts=r.attempts+1
+FROM due WHERE r.team_id=due.team_id RETURNING r.team_id
+`
+
+func (q *Queries) ClaimFreeAllowanceRetries(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, claimFreeAllowanceRetries)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var team_id uuid.UUID
+		if err := rows.Scan(&team_id); err != nil {
+			return nil, err
+		}
+		items = append(items, team_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const claimStripeWebhookProcessingLease = `-- name: ClaimStripeWebhookProcessingLease :one
 INSERT INTO stripe_webhook_processing_lease(customer_id, token, expires_at)
 VALUES($1, $2, now() + interval '1 minute')
@@ -523,6 +553,15 @@ func (q *Queries) ClaimTrialCreditWarningForLifecycle(ctx context.Context, arg C
 	return claim_token, err
 }
 
+const clearFreeAllowanceRetry = `-- name: ClearFreeAllowanceRetry :exec
+DELETE FROM billing_free_allowance_retry WHERE team_id=$1
+`
+
+func (q *Queries) ClearFreeAllowanceRetry(ctx context.Context, teamID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, clearFreeAllowanceRetry, teamID)
+	return err
+}
+
 const completeStripeActivationCreditRevocation = `-- name: CompleteStripeActivationCreditRevocation :one
 WITH account AS (
     UPDATE team_billing_account a
@@ -591,6 +630,24 @@ type CompleteTrialCreditWarningParams struct {
 func (q *Queries) CompleteTrialCreditWarning(ctx context.Context, arg CompleteTrialCreditWarningParams) error {
 	_, err := q.db.Exec(ctx, completeTrialCreditWarning, arg.TeamID, arg.ClaimToken)
 	return err
+}
+
+const countPricingV2ActivationPending = `-- name: CountPricingV2ActivationPending :one
+SELECT count(*)::int FROM team t CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
+WHERE t.home_region=$1 AND t.id<>$2
+  AND b.bucket IN ('free','legacy_payg','blocked','lapsed','contract')
+`
+
+type CountPricingV2ActivationPendingParams struct {
+	Region       string    `json:"region"`
+	SystemTeamID uuid.UUID `json:"system_team_id"`
+}
+
+func (q *Queries) CountPricingV2ActivationPending(ctx context.Context, arg CountPricingV2ActivationPendingParams) (int32, error) {
+	row := q.db.QueryRow(ctx, countPricingV2ActivationPending, arg.Region, arg.SystemTeamID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const createBillingPeriodAnomaly = `-- name: CreateBillingPeriodAnomaly :one
@@ -988,6 +1045,44 @@ func (q *Queries) GetCurrentStripeActivationUser(ctx context.Context, teamID uui
 	return user_id, err
 }
 
+const getFreeAllowance = `-- name: GetFreeAllowance :one
+SELECT (e.window_started_at IS NOT NULL)::boolean AS has_window,
+       COALESCE(e.window_started_at, now())::timestamptz AS window_started_at,
+       COALESCE(e.resets_at, now())::timestamptz AS resets_at,
+       e.allowance_usd::numeric AS allowance_usd,
+       e.used_usd::numeric AS used_usd,
+       (a.team_id IS NOT NULL OR e.used_usd >= e.allowance_usd)::boolean AS exhausted,
+       now()::timestamptz AS as_of
+FROM billing_free_allowance_eval($1::uuid) e
+LEFT JOIN billing_free_allowance a
+  ON a.team_id = $1::uuid AND a.window_started_at = e.window_started_at AND a.blocked_until > now()
+`
+
+type GetFreeAllowanceRow struct {
+	HasWindow       bool           `json:"has_window"`
+	WindowStartedAt time.Time      `json:"window_started_at"`
+	ResetsAt        time.Time      `json:"resets_at"`
+	AllowanceUsd    pgtype.Numeric `json:"allowance_usd"`
+	UsedUsd         pgtype.Numeric `json:"used_usd"`
+	Exhausted       bool           `json:"exhausted"`
+	AsOf            time.Time      `json:"as_of"`
+}
+
+func (q *Queries) GetFreeAllowance(ctx context.Context, teamID uuid.UUID) (GetFreeAllowanceRow, error) {
+	row := q.db.QueryRow(ctx, getFreeAllowance, teamID)
+	var i GetFreeAllowanceRow
+	err := row.Scan(
+		&i.HasWindow,
+		&i.WindowStartedAt,
+		&i.ResetsAt,
+		&i.AllowanceUsd,
+		&i.UsedUsd,
+		&i.Exhausted,
+		&i.AsOf,
+	)
+	return i, err
+}
+
 const getLegacyStripeActivationUser = `-- name: GetLegacyStripeActivationUser :one
 WITH owners AS (
     SELECT tm.profile_id AS user_id
@@ -1019,6 +1114,17 @@ func (q *Queries) GetLegacyStripeActivationUser(ctx context.Context, teamID uuid
 	var user_id uuid.UUID
 	err := row.Scan(&user_id)
 	return user_id, err
+}
+
+const getPricingVersion = `-- name: GetPricingVersion :one
+SELECT billing_pricing_version()::text AS pricing_version
+`
+
+func (q *Queries) GetPricingVersion(ctx context.Context) (string, error) {
+	row := q.db.QueryRow(ctx, getPricingVersion)
+	var pricing_version string
+	err := row.Scan(&pricing_version)
+	return pricing_version, err
 }
 
 const getRecentTrialBurnSample = `-- name: GetRecentTrialBurnSample :one
@@ -1767,6 +1873,43 @@ func (q *Queries) GetTeamCreditBalance(ctx context.Context, teamID uuid.UUID) (p
 	return balance_usd, err
 }
 
+const getTeamSandboxAdmission = `-- name: GetTeamSandboxAdmission :one
+SELECT team_sandbox_billing_eligible($1) AS eligible,
+       (f.free_since IS NOT NULL)::boolean AS shape_limited,
+       COALESCE(f.max_vcpu, 0)::int AS max_vcpu,
+       COALESCE(f.max_memory_mib, 0)::int AS max_memory_mib,
+       COALESCE(f.max_disk_mib, 0)::int AS max_disk_mib,
+       (billing_free_allowance_blocked_until($1) IS NOT NULL)::boolean AS allowance_blocked,
+       COALESCE(billing_free_allowance_blocked_until($1), now())::timestamptz AS allowance_resets_at
+FROM (SELECT 1) one
+LEFT JOIN billing_free_plan($1) f ON true
+`
+
+type GetTeamSandboxAdmissionRow struct {
+	Eligible          bool      `json:"eligible"`
+	ShapeLimited      bool      `json:"shape_limited"`
+	MaxVcpu           int32     `json:"max_vcpu"`
+	MaxMemoryMib      int32     `json:"max_memory_mib"`
+	MaxDiskMib        int32     `json:"max_disk_mib"`
+	AllowanceBlocked  bool      `json:"allowance_blocked"`
+	AllowanceResetsAt time.Time `json:"allowance_resets_at"`
+}
+
+func (q *Queries) GetTeamSandboxAdmission(ctx context.Context, teamID uuid.UUID) (GetTeamSandboxAdmissionRow, error) {
+	row := q.db.QueryRow(ctx, getTeamSandboxAdmission, teamID)
+	var i GetTeamSandboxAdmissionRow
+	err := row.Scan(
+		&i.Eligible,
+		&i.ShapeLimited,
+		&i.MaxVcpu,
+		&i.MaxMemoryMib,
+		&i.MaxDiskMib,
+		&i.AllowanceBlocked,
+		&i.AllowanceResetsAt,
+	)
+	return i, err
+}
+
 const getTeamTrackedStorageSeries = `-- name: GetTeamTrackedStorageSeries :many
 SELECT starts.bucket_start::timestamptz AS period_start,
  (storage_mib_seconds($1::uuid,starts.bucket_start,ends.bucket_end,$2::boolean)/1024.0)::numeric AS storage_gib_seconds
@@ -2308,6 +2451,46 @@ func (q *Queries) ListExportedTeamBillingPeriods(ctx context.Context, batchSize 
 	return items, nil
 }
 
+const listFreeTeamsWithActiveSandboxes = `-- name: ListFreeTeamsWithActiveSandboxes :many
+SELECT a.team_id
+FROM team_plan_assignment a
+WHERE a.effective_to IS NULL
+  AND a.kind = 'free'
+  AND a.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+  AND NOT EXISTS(SELECT 1 FROM billing_free_allowance_retry r WHERE r.team_id=a.team_id)
+  AND EXISTS (
+      SELECT 1 FROM sandbox s
+      WHERE s.team_id = a.team_id AND s.destroyed_at IS NULL AND s.status = 'active'
+  )
+ORDER BY a.team_id
+LIMIT $2
+`
+
+type ListFreeTeamsWithActiveSandboxesParams struct {
+	AfterTeamID pgtype.UUID `json:"after_team_id"`
+	BatchLimit  int32       `json:"batch_limit"`
+}
+
+func (q *Queries) ListFreeTeamsWithActiveSandboxes(ctx context.Context, arg ListFreeTeamsWithActiveSandboxesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listFreeTeamsWithActiveSandboxes, arg.AfterTeamID, arg.BatchLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var team_id uuid.UUID
+		if err := rows.Scan(&team_id); err != nil {
+			return nil, err
+		}
+		items = append(items, team_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPricingRatesForPlanAt = `-- name: ListPricingRatesForPlanAt :many
 WITH ranked_rates AS (
     SELECT
@@ -2373,6 +2556,110 @@ func (q *Queries) ListPricingRatesForPlanAt(ctx context.Context, arg ListPricing
 			&i.Unit,
 			&i.PriceUsd,
 			&i.EffectiveFrom,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPricingV2ActivationBuckets = `-- name: ListPricingV2ActivationBuckets :many
+SELECT t.id AS team_id, b.bucket::text AS bucket, COALESCE(b.reason, '')::text AS reason, COALESCE(b.stripe_customer_id, '')::text AS stripe_customer_id
+FROM team t
+CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
+WHERE t.home_region = $1
+  AND t.id <> $2
+ORDER BY t.id
+`
+
+type ListPricingV2ActivationBucketsParams struct {
+	Region       string    `json:"region"`
+	SystemTeamID uuid.UUID `json:"system_team_id"`
+}
+
+type ListPricingV2ActivationBucketsRow struct {
+	TeamID           uuid.UUID `json:"team_id"`
+	Bucket           string    `json:"bucket"`
+	Reason           string    `json:"reason"`
+	StripeCustomerID string    `json:"stripe_customer_id"`
+}
+
+func (q *Queries) ListPricingV2ActivationBuckets(ctx context.Context, arg ListPricingV2ActivationBucketsParams) ([]ListPricingV2ActivationBucketsRow, error) {
+	rows, err := q.db.Query(ctx, listPricingV2ActivationBuckets, arg.Region, arg.SystemTeamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPricingV2ActivationBucketsRow{}
+	for rows.Next() {
+		var i ListPricingV2ActivationBucketsRow
+		if err := rows.Scan(
+			&i.TeamID,
+			&i.Bucket,
+			&i.Reason,
+			&i.StripeCustomerID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPricingV2ActivationPending = `-- name: ListPricingV2ActivationPending :many
+SELECT t.id AS team_id, b.bucket::text AS bucket, COALESCE(b.reason, '')::text AS reason, COALESCE(b.stripe_customer_id, '')::text AS stripe_customer_id
+FROM team t
+CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
+WHERE t.home_region = $1
+  AND t.id <> $2
+  AND b.bucket IN ('free', 'legacy_payg', 'blocked', 'lapsed', 'contract')
+  AND ROW(b.bucket = 'lapsed', t.id) > ROW($3::boolean, $4::uuid)
+ORDER BY (b.bucket = 'lapsed'), t.id
+LIMIT $5
+`
+
+type ListPricingV2ActivationPendingParams struct {
+	Region       string    `json:"region"`
+	SystemTeamID uuid.UUID `json:"system_team_id"`
+	AfterLapsed  bool      `json:"after_lapsed"`
+	AfterTeamID  uuid.UUID `json:"after_team_id"`
+	BatchLimit   int32     `json:"batch_limit"`
+}
+
+type ListPricingV2ActivationPendingRow struct {
+	TeamID           uuid.UUID `json:"team_id"`
+	Bucket           string    `json:"bucket"`
+	Reason           string    `json:"reason"`
+	StripeCustomerID string    `json:"stripe_customer_id"`
+}
+
+func (q *Queries) ListPricingV2ActivationPending(ctx context.Context, arg ListPricingV2ActivationPendingParams) ([]ListPricingV2ActivationPendingRow, error) {
+	rows, err := q.db.Query(ctx, listPricingV2ActivationPending,
+		arg.Region,
+		arg.SystemTeamID,
+		arg.AfterLapsed,
+		arg.AfterTeamID,
+		arg.BatchLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPricingV2ActivationPendingRow{}
+	for rows.Next() {
+		var i ListPricingV2ActivationPendingRow
+		if err := rows.Scan(
+			&i.TeamID,
+			&i.Bucket,
+			&i.Reason,
+			&i.StripeCustomerID,
 		); err != nil {
 			return nil, err
 		}
@@ -2516,7 +2803,7 @@ func (q *Queries) ListTeamCreditGrants(ctx context.Context, teamID uuid.UUID) ([
 	return items, nil
 }
 
-const listTeamsWithActiveIneligibleSandboxes = `-- name: ListTeamsWithActiveIneligibleSandboxes :many
+const listTeamsWithBillingPauseDue = `-- name: ListTeamsWithBillingPauseDue :many
 WITH active_teams AS MATERIALIZED (
     SELECT DISTINCT s.team_id
     FROM sandbox s
@@ -2524,14 +2811,18 @@ WITH active_teams AS MATERIALIZED (
       AND s.status = 'active'
       AND s.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 )
-SELECT team_id
-FROM active_teams
-WHERE NOT team_sandbox_billing_eligible(team_id)
-ORDER BY team_id
+SELECT a.team_id
+FROM active_teams a
+WHERE NOT team_sandbox_billing_eligible(a.team_id)
+   OR EXISTS (
+       SELECT 1 FROM billing_team_pause_target t
+       WHERE t.team_id = a.team_id AND t.done_at IS NULL
+   )
+ORDER BY a.team_id
 LIMIT $1
 `
 
-type ListTeamsWithActiveIneligibleSandboxesParams struct {
+type ListTeamsWithBillingPauseDueParams struct {
 	BatchLimit  int32       `json:"batch_limit"`
 	AfterTeamID pgtype.UUID `json:"after_team_id"`
 }
@@ -2541,8 +2832,8 @@ type ListTeamsWithActiveIneligibleSandboxesParams struct {
 // team. Inlined in the WHERE clause the planner may evaluate it per active
 // sandbox row — the function does three reads, and this sweep runs on a
 // timer against every control-plane instance.
-func (q *Queries) ListTeamsWithActiveIneligibleSandboxes(ctx context.Context, arg ListTeamsWithActiveIneligibleSandboxesParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listTeamsWithActiveIneligibleSandboxes, arg.BatchLimit, arg.AfterTeamID)
+func (q *Queries) ListTeamsWithBillingPauseDue(ctx context.Context, arg ListTeamsWithBillingPauseDueParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listTeamsWithBillingPauseDue, arg.BatchLimit, arg.AfterTeamID)
 	if err != nil {
 		return nil, err
 	}
@@ -3319,6 +3610,17 @@ func (q *Queries) RecordTrialCreditWarningRejection(ctx context.Context, arg Rec
 	return result.RowsAffected(), nil
 }
 
+const refreshFreeAllowance = `-- name: RefreshFreeAllowance :one
+SELECT billing_free_allowance_refresh($1::uuid) AS blocked
+`
+
+func (q *Queries) RefreshFreeAllowance(ctx context.Context, teamID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, refreshFreeAllowance, teamID)
+	var blocked bool
+	err := row.Scan(&blocked)
+	return blocked, err
+}
+
 const refreshTeamTrialEligibility = `-- name: RefreshTeamTrialEligibility :exec
 INSERT INTO team_trial_eligibility_cache (team_id, eligible, updated_at)
 SELECT $1, refresh_team_trial_eligibility($1), now()
@@ -3421,6 +3723,22 @@ ON CONFLICT (team_id) DO NOTHING
 func (q *Queries) RequestStripeActivationCreditRevocation(ctx context.Context, teamID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, requestStripeActivationCreditRevocation, teamID)
 	return err
+}
+
+const requestTeamPauseAll = `-- name: RequestTeamPauseAll :one
+SELECT request_team_pause_all($1::uuid, $2::text)::int AS targets
+`
+
+type RequestTeamPauseAllParams struct {
+	TeamID uuid.UUID `json:"team_id"`
+	Reason string    `json:"reason"`
+}
+
+func (q *Queries) RequestTeamPauseAll(ctx context.Context, arg RequestTeamPauseAllParams) (int32, error) {
+	row := q.db.QueryRow(ctx, requestTeamPauseAll, arg.TeamID, arg.Reason)
+	var targets int32
+	err := row.Scan(&targets)
+	return targets, err
 }
 
 const reserveStripePromotion = `-- name: ReserveStripePromotion :one
@@ -3611,6 +3929,17 @@ func (q *Queries) ResumeTeamBillingCheckout(ctx context.Context, arg ResumeTeamB
 	return i, err
 }
 
+const scheduleFreeAllowanceRetry = `-- name: ScheduleFreeAllowanceRetry :exec
+INSERT INTO billing_free_allowance_retry(team_id)
+SELECT id FROM team WHERE id=$1
+ON CONFLICT(team_id) DO NOTHING
+`
+
+func (q *Queries) ScheduleFreeAllowanceRetry(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, scheduleFreeAllowanceRetry, id)
+	return err
+}
+
 const setBillingUsageExportIdempotencyKey = `-- name: SetBillingUsageExportIdempotencyKey :one
 UPDATE billing_usage_export
 SET stripe_idempotency_key = $1,
@@ -3735,6 +4064,22 @@ func (q *Queries) SetTeamFeatureFlag(ctx context.Context, arg SetTeamFeatureFlag
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const settleTeamPauseTargets = `-- name: SettleTeamPauseTargets :execrows
+UPDATE billing_team_pause_target t
+SET done_at = now()
+WHERE t.team_id = $1
+  AND t.done_at IS NULL
+  AND billing_pause_target_settled(t)
+`
+
+func (q *Queries) SettleTeamPauseTargets(ctx context.Context, teamID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, settleTeamPauseTargets, teamID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const stripeCheckoutPublicationFailed = `-- name: StripeCheckoutPublicationFailed :one

@@ -604,6 +604,22 @@ type BillingFinalizationAttempt struct {
 	LastAttemptAt time.Time `json:"last_attempt_at"`
 }
 
+type BillingFreeAllowance struct {
+	TeamID          uuid.UUID          `json:"team_id"`
+	WindowStartedAt time.Time          `json:"window_started_at"`
+	ResetsAt        time.Time          `json:"resets_at"`
+	AllowanceUsd    pgtype.Numeric     `json:"allowance_usd"`
+	UsedUsd         pgtype.Numeric     `json:"used_usd"`
+	BlockedUntil    pgtype.Timestamptz `json:"blocked_until"`
+	EvaluatedAt     time.Time          `json:"evaluated_at"`
+}
+
+type BillingFreeAllowanceRetry struct {
+	TeamID        uuid.UUID `json:"team_id"`
+	NextAttemptAt time.Time `json:"next_attempt_at"`
+	Attempts      int64     `json:"attempts"`
+}
+
 type BillingFundingAccount struct {
 	TeamID             uuid.UUID          `json:"team_id"`
 	Observe            bool               `json:"observe"`
@@ -864,6 +880,50 @@ type BillingPlanVersion struct {
 	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
 }
 
+type BillingPricingAdoption struct {
+	Singleton    bool               `json:"singleton"`
+	Region       *string            `json:"region"`
+	SystemTeamID pgtype.UUID        `json:"system_team_id"`
+	Epoch        uuid.UUID          `json:"epoch"`
+	State        string             `json:"state"`
+	Evidence     []byte             `json:"evidence"`
+	ReleasedAt   pgtype.Timestamptz `json:"released_at"`
+}
+
+type BillingPricingAdoptionCreditHold struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Reason     string    `json:"reason"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+type BillingPricingAdoptionCreditResolution struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	AssignmentID uuid.UUID `json:"assignment_id"`
+	Source       []byte    `json:"source"`
+	VerifiedAt   time.Time `json:"verified_at"`
+}
+
+type BillingPricingAdoptionEvent struct {
+	ID        uuid.UUID `json:"id"`
+	Epoch     uuid.UUID `json:"epoch"`
+	Region    *string   `json:"region"`
+	Action    string    `json:"action"`
+	Actor     string    `json:"actor"`
+	Reason    string    `json:"reason"`
+	Details   []byte    `json:"details"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type BillingPricingAdoptionInventory struct {
+	Epoch        uuid.UUID   `json:"epoch"`
+	TeamID       uuid.UUID   `json:"team_id"`
+	AssignmentID pgtype.UUID `json:"assignment_id"`
+	Bucket       string      `json:"bucket"`
+	Reason       string      `json:"reason"`
+	Present      bool        `json:"present"`
+	ObservedAt   time.Time   `json:"observed_at"`
+}
+
 type BillingPricingSwitch struct {
 	Singleton      bool        `json:"singleton"`
 	PricingVersion string      `json:"pricing_version"`
@@ -1040,6 +1100,21 @@ type BillingSponsoredPromotionRecovery struct {
 	BeforeEvidence []byte             `json:"before_evidence"`
 	AfterEvidence  []byte             `json:"after_evidence"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+type BillingTeamPauseRequest struct {
+	AssignmentID uuid.UUID `json:"assignment_id"`
+	TeamID       uuid.UUID `json:"team_id"`
+	RequestedAt  time.Time `json:"requested_at"`
+}
+
+type BillingTeamPauseTarget struct {
+	SandboxID    uuid.UUID          `json:"sandbox_id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	AssignmentID uuid.UUID          `json:"assignment_id"`
+	Reason       string             `json:"reason"`
+	RequestedAt  time.Time          `json:"requested_at"`
+	DoneAt       pgtype.Timestamptz `json:"done_at"`
 }
 
 type BillingUsageEntitlement struct {

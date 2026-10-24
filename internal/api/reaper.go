@@ -74,6 +74,9 @@ func (h *Handlers) trialEligibilityLoop(ctx context.Context, interval time.Durat
 		if interval > 0 && interval < deadline {
 			deadline = interval
 		}
+		fctx, fcancel := context.WithTimeout(ctx, deadline/2)
+		defer fcancel()
+		sentrylog.RunSafe("billing-free-allowance", func() { h.refreshFreeAllowances(fctx) })
 		qctx, cancel := context.WithTimeout(ctx, deadline)
 		defer cancel()
 		sentrylog.RunSafe("billing-trial-eligibility", func() { h.refreshActiveTrialEligibility(qctx) })
@@ -404,8 +407,9 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxR
 	h.pauseClaimed(ctx, sbx, leaseUntil, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout", logger)
 }
 
-func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxRow, claimedAt time.Time, logger zerolog.Logger) {
+func (h *Handlers) pauseForBilling(ctx context.Context, sbx db.ClaimBillingPauseSandboxRow, claimedAt time.Time, logger zerolog.Logger) {
 	leaseUntil := leaseDeadline(sbx.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
+	trigger := pauseTrigger(sbx.PauseOpTrigger)
 	h.pauseClaimed(ctx, db.ClaimExpiredSandboxRow{
 		ID:                  sbx.ID,
 		TeamID:              sbx.TeamID,
@@ -416,7 +420,7 @@ func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBilli
 		PauseOpID:           sbx.PauseOpID,
 		PauseOpLeaseVersion: sbx.PauseOpLeaseVersion,
 		PauseOpLeaseUntil:   sbx.PauseOpLeaseUntil,
-	}, leaseUntil, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss", logger)
+	}, leaseUntil, trigger, trigger+"_pause", pauseActivity(trigger), "billing: sandbox paused for "+trigger, logger)
 }
 
 func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxRow, leaseUntil time.Time, trigger, transition, activity, successMessage string, logger zerolog.Logger) {

@@ -88,11 +88,11 @@ type reaperMockDBTX struct {
 }
 
 func isListSQL(sql string) bool {
-	return strings.Contains(sql, "-- name: ListExpiredSandboxes ") || strings.Contains(sql, "-- name: ListBillingIneligibleSandboxes ")
+	return strings.Contains(sql, "-- name: ListExpiredSandboxes ") || strings.Contains(sql, "-- name: ListBillingPauseSandboxes ")
 }
 
 func isClaimSQL(sql string) bool {
-	return strings.Contains(sql, "-- name: ClaimExpiredSandbox ") || strings.Contains(sql, "-- name: ClaimBillingIneligibleSandbox ")
+	return strings.Contains(sql, "-- name: ClaimExpiredSandbox ") || strings.Contains(sql, "-- name: ClaimBillingPauseSandbox ")
 }
 
 func (m *reaperMockDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -668,7 +668,7 @@ func TestBillingPause_FreeWorkerStartsTheNextPause(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		h.pauseBillingIneligibleTeam(context.Background(), teamID)
+		h.pauseBillingTeam(context.Background(), teamID)
 	}()
 	defer func() {
 		releaseOnce.Do(func() { close(release) })

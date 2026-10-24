@@ -44,7 +44,7 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 			log.Error().Err(err).Msg("billing: claim trial eligibility sweep lease failed")
 			return
 		}
-		h.reconcileActiveIneligibleTeams(ctx)
+		h.reconcileBillingPauses(ctx)
 		return
 	}
 	teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{AfterTeamID: afterID, BatchLimit: billingTrialEligibilityPageSize})
@@ -52,85 +52,37 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 		log.Error().Err(err).Msg("billing: list active trial teams failed")
 		return
 	}
-	// A short page is the end of the population, and so is an empty one: a
-	// full prior page may have ended exactly on the final row. Both restart
-	// the cursor so newly eligible teams are not hidden behind a stale one.
-	// Dispatch stops at the tick deadline, so the cursor may only advance as
-	// far as the page actually got: moving it to the last team of a page cut
-	// short would skip every team the pass never reached. Teams are dispatched
-	// in order, so the completed set is a prefix and its end is the resume
-	// point.
-	done := make([]atomic.Bool, len(teams))
-	dispatched := 0
-	if len(teams) > 0 {
-		sem := make(chan struct{}, 10)
-		var wg sync.WaitGroup
-	dispatch:
-		for i, teamID := range teams {
-			select {
-			case <-ctx.Done():
-				break dispatch
-			case sem <- struct{}{}:
-			}
-			dispatched = i + 1
-			wg.Add(1)
-			go func(i int, teamID uuid.UUID) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				if err := h.DB.RefreshTeamTrialEligibility(ctx, teamID); err != nil {
-					log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")
-					return
-				}
-				h.pauseBillingIneligibleTeam(ctx, teamID)
-				done[i].Store(true)
-			}(i, teamID)
+	next, advance := processSweepPage(ctx, teams, billingTrialEligibilityPageSize, func(teamID uuid.UUID) bool {
+		if err := h.DB.RefreshTeamTrialEligibility(ctx, teamID); err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")
+			return false
 		}
-		wg.Wait()
+		h.pauseBillingTeam(ctx, teamID)
+		return true
+	})
+	if advance {
+		h.advanceSweepCursor(ctx, trialEligibilitySweepName, next)
 	}
-	progress := 0
-	for progress < dispatched && done[progress].Load() {
-		progress++
-	}
-	switch {
-	case len(teams) == 0:
-		// End of the population, reached either because a full page stopped
-		// exactly on the final row or because the remainder disappeared between
-		// pages. Either way the cursor must clear, or it stays at the highest
-		// UUID and nothing is ever refreshed again.
-		h.advanceTrialEligibilityCursor(ctx, pgtype.UUID{})
-	case progress == 0:
-		// A page with work in it that finished none: leave the cursor where a
-		// later tick retries the same teams.
-	case progress == len(teams) && len(teams) < int(billingTrialEligibilityPageSize):
-		// End of the population; the next sweep starts over so teams that
-		// became eligible meanwhile are not hidden behind a stale cursor.
-		h.advanceTrialEligibilityCursor(ctx, pgtype.UUID{})
-	default:
-		h.advanceTrialEligibilityCursor(ctx, pgtype.UUID{Bytes: teams[progress-1], Valid: true})
-	}
-	h.reconcileActiveIneligibleTeams(ctx)
+	h.reconcileBillingPauses(ctx)
 }
 
-// reconcileActiveIneligibleTeams is the durable safety net for terminal
-// subscription transitions. It scans all active teams, not just trials, so a
-// restart or a failed webhook goroutine cannot leave paid sandboxes running.
-func (h *Handlers) reconcileActiveIneligibleTeams(ctx context.Context) {
+func (h *Handlers) reconcileBillingPauses(ctx context.Context) {
 	var after *uuid.UUID
 	for {
 		var afterID pgtype.UUID
 		if after != nil {
 			afterID = pgtype.UUID{Bytes: *after, Valid: true}
 		}
-		teams, err := h.DB.ListTeamsWithActiveIneligibleSandboxes(ctx, db.ListTeamsWithActiveIneligibleSandboxesParams{AfterTeamID: afterID, BatchLimit: 1000})
+		teams, err := h.DB.ListTeamsWithBillingPauseDue(ctx, db.ListTeamsWithBillingPauseDueParams{AfterTeamID: afterID, BatchLimit: 1000})
 		if err != nil {
-			log.Error().Err(err).Msg("billing: list active ineligible teams failed")
+			log.Error().Err(err).Msg("billing: list teams with billing pauses due failed")
 			return
 		}
 		if len(teams) == 0 {
 			return
 		}
 		dispatchBounded(ctx, teams, 10, func(teamID uuid.UUID) {
-			h.pauseBillingIneligibleTeam(ctx, teamID)
+			h.pauseBillingTeam(ctx, teamID)
 		})
 		last := teams[len(teams)-1]
 		after = &last
@@ -157,44 +109,42 @@ func (h *Handlers) reconcileActivatedSandbox(ctx context.Context, teamID uuid.UU
 		// No per-team retry: reads fail here exactly when the DB is already
 		// struggling, and high create churn would bank one untracked retry
 		// per team, all firing together 30s later. The 30s sweep
-		// (trialEligibilityLoop → reconcileActiveIneligibleTeams) already
 		// re-covers every team on the same timescale a retry would, with
 		// bounded, paced concurrency.
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: activation eligibility check failed; 30s sweep will re-cover")
 		return
 	}
 	if !verdict.(bool) {
-		h.pauseBillingIneligibleTeam(ctx, teamID)
+		h.pauseBillingTeam(ctx, teamID)
 	}
 }
 
-// pauseBillingIneligibleTeam claims and pauses active sandboxes after Stripe
-// reports a terminal subscription state. Claiming is DB-atomic and the VMD
-// saga runs in the background so webhook acknowledgement is not held on host
-// work. A later reconciliation can safely pick up any rows beyond the batch.
-func (h *Handlers) pauseBillingIneligibleTeam(ctx context.Context, teamID uuid.UUID) {
+func (h *Handlers) pauseBillingTeam(ctx context.Context, teamID uuid.UUID) {
 	// Claims stop with ctx; a pause already in flight finishes on its own
 	// detached budget.
 	cleanupCtx := context.WithoutCancel(ctx)
 	claimed, err := claimBatch(ctx, billingPauseWorkers, billingPauseCap, func(ctx context.Context, limit int32) ([]uuid.UUID, error) {
-		return h.DB.ListBillingIneligibleSandboxes(ctx, db.ListBillingIneligibleSandboxesParams{TeamID: teamID, Limit: limit})
-	}, func(ctx context.Context, id uuid.UUID) (db.ClaimBillingIneligibleSandboxRow, error) {
-		row, err := h.DB.ClaimBillingIneligibleSandbox(ctx, db.ClaimBillingIneligibleSandboxParams{ID: id, TeamID: teamID, LeaseSeconds: pauseLeaseSeconds})
+		return h.DB.ListBillingPauseSandboxes(ctx, db.ListBillingPauseSandboxesParams{TeamID: teamID, Limit: limit})
+	}, func(ctx context.Context, id uuid.UUID) (db.ClaimBillingPauseSandboxRow, error) {
+		row, err := h.DB.ClaimBillingPauseSandbox(ctx, db.ClaimBillingPauseSandboxParams{ID: id, TeamID: teamID, LeaseSeconds: pauseLeaseSeconds})
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			log.Error().Err(err).Str("sandbox_id", id.String()).Msg("billing: claim ineligible sandbox failed")
+			log.Error().Err(err).Str("sandbox_id", id.String()).Msg("billing: claim sandbox for billing pause failed")
 		}
 		return row, err
-	}, func(sbx db.ClaimBillingIneligibleSandboxRow, claimedAt time.Time) {
+	}, func(sbx db.ClaimBillingPauseSandboxRow, claimedAt time.Time) {
 		itemCtx, itemCancel := context.WithTimeout(cleanupCtx, 2*time.Minute)
 		defer itemCancel()
-		h.pauseBillingIneligible(itemCtx, sbx, claimedAt, log.Logger)
+		h.pauseForBilling(itemCtx, sbx, claimedAt, log.Logger)
 	})
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: list ineligible sandboxes failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: list sandboxes for billing pause failed")
 		h.retryBillingEligibilityReconciliation(teamID)
 		return
 	}
 	if claimed == 0 {
+		if _, err := h.DB.SettleTeamPauseTargets(ctx, teamID); err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: settle team pause targets failed")
+		}
 		return
 	}
 	if int32(claimed) >= billingPauseCap {
@@ -212,7 +162,7 @@ func (h *Handlers) retryBillingEligibilityReconciliation(teamID uuid.UUID) {
 		<-timer.C
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		h.pauseBillingIneligibleTeam(ctx, teamID)
+		h.pauseBillingTeam(ctx, teamID)
 	}()
 }
 
@@ -251,21 +201,61 @@ func (h *Handlers) scheduleBillingEligibilityReconciliation(ctx context.Context,
 			}
 			return
 		}
-		h.pauseBillingIneligibleTeam(qctx, account.TeamID)
+		h.pauseBillingTeam(qctx, account.TeamID)
 	})
 }
 
-// advanceTrialEligibilityCursor persists the resume point on its own budget.
 // The pass context carries the tick deadline and dispatch stops when it
 // expires, so writing progress through it would fail exactly when there is
 // progress worth keeping, and every later tick would restart at the same
 // position. The holder fence still applies.
-func (h *Handlers) advanceTrialEligibilityCursor(ctx context.Context, next pgtype.UUID) {
+func (h *Handlers) advanceSweepCursor(ctx context.Context, name string, next pgtype.UUID) {
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := h.DB.AdvanceSweepCursor(saveCtx, db.AdvanceSweepCursorParams{
-		Name: trialEligibilitySweepName, LockedBy: db.SweepHolderID(), CursorID: next,
+		Name: name, LockedBy: db.SweepHolderID(), CursorID: next,
 	}); err != nil {
-		log.Error().Err(err).Msg("billing: advance trial eligibility cursor failed")
+		log.Error().Err(err).Str("sweep", name).Msg("billing: advance sweep cursor failed")
+	}
+}
+
+func processSweepPage(ctx context.Context, teams []uuid.UUID, pageSize int32, work func(uuid.UUID) bool) (next pgtype.UUID, advance bool) {
+	done := make([]atomic.Bool, len(teams))
+	dispatched := 0
+	if len(teams) > 0 {
+		sem := make(chan struct{}, 10)
+		var wg sync.WaitGroup
+	dispatch:
+		for i, teamID := range teams {
+			select {
+			case <-ctx.Done():
+				break dispatch
+			case sem <- struct{}{}:
+			}
+			dispatched = i + 1
+			wg.Add(1)
+			go func(i int, teamID uuid.UUID) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if work(teamID) {
+					done[i].Store(true)
+				}
+			}(i, teamID)
+		}
+		wg.Wait()
+	}
+	progress := 0
+	for progress < dispatched && done[progress].Load() {
+		progress++
+	}
+	switch {
+	case len(teams) == 0:
+		return pgtype.UUID{}, true
+	case progress == 0:
+		return pgtype.UUID{}, false
+	case progress == len(teams) && len(teams) < int(pageSize):
+		return pgtype.UUID{}, true
+	default:
+		return pgtype.UUID{Bytes: teams[progress-1], Valid: true}, true
 	}
 }

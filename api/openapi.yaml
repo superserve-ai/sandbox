@@ -324,6 +324,45 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/free-allowance:
+    get:
+      operationId: getFreeAllowance
+      tags: [Billing]
+      summary: Get the Free plan compute allowance
+      description: |
+        Returns the authenticated team's Free plan compute allowance for the
+        current 24-hour window. The window starts at the first sandbox start
+        after the previous window ended. Usage counts compute only (vCPU and
+        memory at the team's current rates); disk is not counted. When the
+        allowance is used up, running sandboxes are paused and starts and
+        resumes are refused with `free_allowance_exhausted` until `resets_at`.
+
+        `applies` is false, and every other field null, when the team is not
+        on the Free plan. Amounts are decimal cents.
+
+        Access requires `billing:read` and the `tenant_usage_dashboard`
+        rollout gate to be enabled for the team.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Free plan allowance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FreeAllowanceResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+
   /teams/{team_id}/billing/usage:
     parameters:
       - name: team_id
@@ -5245,6 +5284,44 @@ components:
             max_template_disk_mib:
               type: integer
               nullable: true
+    FreeAllowanceResponse:
+      type: object
+      required: [applies, window_started_at, resets_at, allowance_cents, used_cents, remaining_cents, paused, paused_reason, as_of]
+      properties:
+        applies:
+          type: boolean
+          description: Whether the team is on the Free plan.
+        window_started_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Start of the current window; null when no window is open, so the next sandbox start opens one.
+        resets_at:
+          type: string
+          format: date-time
+          nullable: true
+        allowance_cents:
+          type: number
+          nullable: true
+        used_cents:
+          type: number
+          nullable: true
+          description: Compute used in the current window, never above allowance_cents.
+        remaining_cents:
+          type: number
+          nullable: true
+        paused:
+          type: boolean
+          nullable: true
+          description: True once the allowance is used up; sandboxes stay paused until resets_at.
+        paused_reason:
+          type: string
+          nullable: true
+          enum: [free_allowance_exhausted, null]
+        as_of:
+          type: string
+          format: date-time
+          nullable: true
     BillingPlanResponse:
       type: object
       required: [plan, period, pending_change]

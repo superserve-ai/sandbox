@@ -160,6 +160,9 @@ DO $$ DECLARE r text; f regprocedure; BEGIN
  END LOOP;
  FOREACH f IN ARRAY ARRAY['guard_team_plan_assignment()'::regprocedure,'apply_assignment_limits(uuid,jsonb)'::regprocedure,'team_plan_assignment_apply_limits()'::regprocedure,'team_limits_follow_assignment()'::regprocedure] LOOP
   EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
+  FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
+   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I',f,r); END IF;
+  END LOOP;
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
  END LOOP;
 END $$;

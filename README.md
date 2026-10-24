@@ -143,3 +143,150 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). We use the Developer Certificate of Orig
 OCVSAL 1.0 — see [LICENSE](LICENSE).
 
 Built on [Firecracker](https://github.com/firecracker-microvm/firecracker) (Apache 2.0).
+
+### Pricing v2 migration
+
+Deploy the Free allowance migration and billing pause worker before applying
+existing teams to Free. Schema alone queues pause requests but an older API
+worker does not consume them. Requests are durable and scoped to the assigned
+plan: restarting a worker resumes outstanding targets, and retrying a request
+does not capture a later customer resume. Existing assignments and pause targets
+continue to be serviced when the pricing switch is turned off.
+
+Free shape enforcement runs inside existing create/resume SQL. An indexed team
+row lock and open-assignment lookup serialize admission with plan changes. The
+lock does not wait: a concurrent plan change or regional import returns a
+retryable `503 service_unavailable`, avoiding a wait on provider operations.
+Existing admission phase latency measurements include this work. Run the local
+SQL/guard percentile benchmark with:
+
+```bash
+go test -tags integration ./internal/integration -run '^$' -bench '^BenchmarkFreeShapeAdmission$' -benchtime=100x
+```
+
+Migration is a human-run CLI, with no startup job or HTTP apply endpoint. Point
+`DATABASE_URL` and `TEAM_CREATION_REGION` at one region at a time. Set
+`SYSTEM_TEAM_ID` to a valid nonzero UUID to exclude the system team; apply refuses missing or malformed values. Configure `STRIPE_SECRET_KEY`
+and `STRIPE_API_VERSION` to resolve lapsed customers' remaining credit.
+
+```bash
+go run ./cmd/pricing-v2-migrate report --format json
+```
+
+Review the report, enable pricing v2 through the staff pricing-switch API, then
+run the explicit apply command with an operator identity and reason:
+
+```bash
+go run ./cmd/pricing-v2-migrate apply --confirm --actor operator@example.com --reason 'pricing migration'
+go run ./cmd/pricing-v2-migrate report --format json
+```
+
+Active commercial contracts are linked to initial assignments with their stored
+financial terms, grant schedules and frozen limits. The CLI leaves pending
+contracts, in-flight commercial operations, system teams and managed-billing
+teams for review. Existing assignments are preserved. Free assignments queue
+running sandboxes for pause in the same transaction. No Stripe charges, credit
+grants or contract transitions are performed by backfill.
+
+Apply scans bounded pages past deferred customers. If a complete pass makes no
+progress it exits with the unresolved count; inspect the report and rerun after
+the provider or busy team recovers. Committed assignments survive interruption.
+
+Regional team migration refuses existing Free allowance or pause state in either
+cell. These rows are not transferred by `migrate-team`; coordinate their financial
+and operational authority transfer before copy or cutover.
+
+### Regional adoption barrier
+
+Raw pricing v2 starts a durable PREPARING epoch. It does not release public v2
+entry when apply finishes. A raw pricing rollback rotates the epoch, clears the
+release and retains existing assignments and commitments. Each regional database
+binds its adoption state to an explicit region and nonzero system-team UUID.
+
+`billing_pricing_public_state()` returns `pricing_version`, `entry_open`, and
+`epoch`. Raw legacy returns legacy/closed for v2 entry; preparing v2 returns legacy/closed;
+consistent released v2 returns v2/open. Missing state returns exactly one
+legacy/closed/NULL-epoch row. Ordinary legacy route behavior is handled separately. Public catalog and entry owners must consume this
+helper before public v2 exposure. This migration does not change their call sites.
+During preparation subscription offers must be unavailable, and an old unassigned
+Free choice must fail without writing a choice or assignment.
+
+New-entry writers call
+`billing_assert_pricing_entry_open(expected_epoch uuid DEFAULT NULL, expected_pricing_version text DEFAULT NULL)`
+after durable idempotency replay. It holds switch/adoption SHARE locks through the
+transaction and raises `55000` when closed or stale. Supply both expected values
+for terms already loaded; otherwise call with neither and load terms under those
+locks. An epoch alone does not detect preparation becoming released. Entry owners
+map closed entry to 409. Existing assignment reads, exits, undo and committed
+workers retain their authority independently of this gate.
+
+Human operations, with private region/database/provider configuration already set:
+
+```bash
+go run ./cmd/pricing-v2-migrate prepare --confirm --actor "$W5_ADOPTION_ACTOR" --reason "$W5_ADOPTION_REASON"
+go run ./cmd/pricing-v2-migrate report --format json
+```
+
+After the approved owner integrations, schema and consuming worker are deployed,
+set raw v2 through the existing staff switch interface. This starts a new
+PREPARING epoch. Public exposure must still use the effective-state helper.
+Then run the human adoption and persist the exhaustive residual inventory:
+
+```bash
+go run ./cmd/pricing-v2-migrate apply --confirm --actor "$W5_ADOPTION_ACTOR" --reason "$W5_ADOPTION_REASON" --batch 200
+go run ./cmd/pricing-v2-migrate capture --confirm --actor "$W5_ADOPTION_ACTOR" --reason "$W5_ADOPTION_REASON"
+go run ./cmd/pricing-v2-migrate report --format json
+```
+
+`report` is read-only and includes the adoption epoch, effective public state and
+all non-system unassigned teams in the cell, including skipped teams and teams
+whose home-region label differs. `capture` durably upserts the epoch inventory and
+records an audit event. Apply also captures after each batch. Eligible `remaining`
+can be zero while exhaustive residuals are nonzero. Resolve financial operations
+through their owners and rerun; no implicit legacy/quarantine exceptions exist.
+
+Release is a separate explicit operation against the current capture epoch:
+
+```bash
+go run ./cmd/pricing-v2-migrate release --confirm --actor "$W5_ADOPTION_ACTOR" --reason "$W5_ADOPTION_REASON" --epoch "$W5_ADOPTION_EPOCH" --evidence-file "$W5_ADOPTION_EVIDENCE"
+```
+
+The evidence JSON must include `region`, `system_team_id`, `epoch`, matching full 40-character
+`assembled_sha`, `schema_sha` and `worker_sha`, nonempty `deployment_reference`
+and `worker_reference`, and `verified_worker: true`. These are recorded operator
+attestations referencing actual assembled deployment and worker-consumption
+receipts, not an automatic observation of a running worker. Local test evidence
+must never be used for a real release. External review, CI, owner entry and route
+prerequisites and deployment evidence remain separate required release gates.
+
+`billing_release_pricing_adoption(region text, system_team_id uuid, epoch uuid, actor text, reason text, evidence jsonb)`
+requires READ COMMITTED isolation and unfiltered row visibility, and locks
+switch/adoption state, published Free terms and every live non-system team
+before recapturing inventory. Existing billing accounts are locked first, followed by team UPDATE locks to fence new account insertion. Every such team must have an open durable assignment;
+any residual, unresolved financial obligation, allowance retry or unsettled pause target returns `released: false`, persists the
+blocked inventory/event and makes the CLI exit nonzero. Enabled signup/shape
+triggers and allowance/pause schema are required. Successful release records its
+evidence and opens the effective public v2 gate. Signup holds the switch lock and
+assigns Free even during preparation, so release cannot miss a planless newborn.
+Regional imports also fence on the switch and refuse every raw-v2 destination.
+Service roles can read/assert the gate but cannot prepare, capture or release it.
+
+Allowance refresh failures are handed to an indexed durable retry queue before
+normal sweep progress is acknowledged. Queued teams are excluded from normal
+pages; bounded retry claims match worker capacity so a slow prefix cannot starve
+later teams. Interrupted dispatched work gets a separate bounded persistence
+budget; if that handoff fails, the cursor remains before the failed prefix.
+Outstanding allowance retries also block adoption release and regional transfer.
+This work runs in the background and adds no sandbox start/resume I/O.
+
+Adoption inventories financial obligations independently of assignment existence.
+Pending checkouts/contracts, managed billing and unresolved YC/sponsored operations
+remain blockers after assignment. Unknown provider reads are durably retained across
+epoch rotation and cleared only by a successfully validated initial CLI assignment.
+Existing Stripe authority requires a durable validation receipt bound to the current
+assignment and customer/subscription/status. Changed source identity invalidates
+that receipt. Active-contract assignments require matching migrated contract authority.
+Unreconciled financial assignments remain held for owner reconciliation; assignment alone is insufficient.
+Do not clear hold rows manually. Public exposure caching must be removed by its
+owners and previously served TTLs drained before release; local source checks do
+not establish that drain or deployment evidence.

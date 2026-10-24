@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
@@ -1052,25 +1054,51 @@ func billingAccountHasEstablishedSubscription(account db.GetTeamBillingAccountRo
 	}
 }
 
-func (h *Handlers) requireBillingEligible(c *gin.Context, teamID uuid.UUID) bool {
+func (h *Handlers) requireSandboxAdmission(c *gin.Context, teamID uuid.UUID) bool {
 	// Lightweight handler tests use a query mock without the billing schema;
 	// production handlers always have a pool-backed database.
 	if h.Pool == nil {
 		return true
 	}
 	started := time.Now()
-	eligible, err := h.teamBillingEligibleCached(c.Request.Context(), teamID)
+	admission, err := h.teamSandboxAdmissionCached(c.Request.Context(), teamID)
 	log.Debug().Str("team_id", teamID.String()).Int64("billing_eligibility_ms", time.Since(started).Milliseconds()).Msg("billing eligibility check")
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read sandbox billing eligibility failed")
 		respondError(c, ErrInternal)
 		return false
 	}
-	if !eligible {
-		respondErrorMsg(c, "billing_ineligible", "Sandbox usage is unavailable until billing is active", http.StatusPaymentRequired)
+	if !admission.eligible {
+		if admission.allowanceResetsAt != nil {
+			respondFreeAllowanceExhausted(c, *admission.allowanceResetsAt)
+		} else {
+			respondErrorMsg(c, "billing_ineligible", "Sandbox usage is unavailable until billing is active", http.StatusPaymentRequired)
+		}
 		return false
 	}
 	return true
+}
+
+func respondSandboxExceedsPlan(c *gin.Context, limit *sandboxShapeLimit, vcpu, memoryMib, diskMib int32) {
+	limits := gin.H{}
+	var allowed []string
+	for _, d := range []struct {
+		key, unit string
+		cap       int32
+	}{{"max_vcpu", "vCPU", limit.vcpu}, {"max_memory_mib", "MiB memory", limit.memoryMib}, {"max_disk_mib", "MiB disk", limit.diskMib}} {
+		if d.cap > 0 {
+			limits[d.key] = d.cap
+			allowed = append(allowed, fmt.Sprintf("%d %s", d.cap, d.unit))
+		}
+	}
+	c.JSON(http.StatusPaymentRequired, gin.H{
+		"error": gin.H{
+			"code": "sandbox_exceeds_plan_limits",
+			"message": fmt.Sprintf("This sandbox (%d vCPU, %d MiB memory, %d MiB disk) is larger than your plan allows (%s). Upgrade your plan or use a smaller template.",
+				vcpu, memoryMib, diskMib, strings.Join(allowed, ", ")),
+			"limits": limits,
+		},
+	})
 }
 
 func currentBillingPeriod(now time.Time) (time.Time, time.Time) {
@@ -1292,4 +1320,31 @@ func billingTrialRunway(row db.GetTeamTrialRunwayRow, eligible bool, state strin
 	default:
 		return "unknown", &observed
 	}
+}
+
+func respondSandboxAdmissionError(c *gin.Context, err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	if pgErr.Code == "SS003" {
+		respondErrorMsg(c, "service_unavailable", "Team plan assignment is changing; retry the request", http.StatusServiceUnavailable)
+		return true
+	}
+	if pgErr.Code != "SS002" {
+		return false
+	}
+	var shape struct {
+		MaxVCPU   int32 `json:"max_vcpu"`
+		MaxMemory int32 `json:"max_memory_mib"`
+		MaxDisk   int32 `json:"max_disk_mib"`
+		VCPU      int32 `json:"vcpu"`
+		Memory    int32 `json:"memory_mib"`
+		Disk      int32 `json:"disk_mib"`
+	}
+	if json.Unmarshal([]byte(pgErr.Detail), &shape) != nil {
+		return false
+	}
+	respondSandboxExceedsPlan(c, &sandboxShapeLimit{vcpu: shape.MaxVCPU, memoryMib: shape.MaxMemory, diskMib: shape.MaxDisk}, shape.VCPU, shape.Memory, shape.Disk)
+	return true
 }

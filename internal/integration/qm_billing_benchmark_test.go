@@ -96,7 +96,7 @@ func BenchmarkQMManagedBilling(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			query := strings.Split(strings.Split(string(source), "-- name: ListTeamsWithActiveIneligibleSandboxes :many\n")[1], "-- name: ActivateTeamBilling")[0]
+			query := strings.Split(strings.Split(string(source), "-- name: ListTeamsWithBillingPauseDue :many\n")[1], "-- name: ActivateTeamBilling")[0]
 			query = strings.ReplaceAll(query, "sqlc.narg(after_team_id)", "NULL")
 			query = strings.ReplaceAll(query, "sqlc.arg(batch_limit)", "1000")
 			for _, fn := range []string{"pg_temp.qm_baseline_eligibility", "team_sandbox_billing_eligible"} {
