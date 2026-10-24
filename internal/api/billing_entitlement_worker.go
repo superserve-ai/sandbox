@@ -38,24 +38,15 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	if h.Config != nil && h.Config.BillingEntitlementWorkers >= 2 {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)
 	}
-	for _, retry := range []bool{false, true} {
-		go func() {
-			for ctx.Err() == nil {
-				count, err := h.usageEntitlementBatch(ctx, retry, workers/2)
-				if err != nil {
-					log.Warn().Err(err).Msg("usage entitlement scheduler failed")
-				}
-				wait := time.Second
-				if count == 0 {
-					wait = 5 * time.Second
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(wait):
-				}
-			}
-		}()
+	for lane, retry := range []bool{false, true} {
+		var idleDelay time.Duration
+		go runEntitlementLane(ctx, workers/2, func(ctx context.Context, limit int) ([]entitlementJob, error) {
+			jobs, delay, err := h.claimUsageEntitlementsWithDelay(ctx, retry, limit, lane)
+			idleDelay = delay
+			return jobs, err
+		}, h.runUsageEntitlementJob, func(context.Context) time.Duration {
+			return idleDelay
+		})
 	}
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -79,26 +70,110 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 		}
 	}()
 }
-func (h *Handlers) usageEntitlementBatch(ctx context.Context, retry bool, limit int) (int, error) {
+
+// One dispatcher per lane refills capacity as jobs complete. Empty polling is
+// shared by the lane, so increasing worker capacity does not multiply idle I/O.
+func runEntitlementLane(ctx context.Context, workers int, claim func(context.Context, int) ([]entitlementJob, error), process func(context.Context, entitlementJob), idle func(context.Context) time.Duration) {
+	done := make(chan struct{}, workers)
+	active := 0
+	var pollAt time.Time
+	for ctx.Err() == nil {
+		draining := true
+		for draining {
+			select {
+			case <-done:
+				active--
+			default:
+				draining = false
+			}
+		}
+		if active < workers && !pollAt.After(time.Now()) {
+			available := workers - active
+			jobs, err := claim(ctx, available)
+			if err != nil {
+				log.Warn().Err(err).Msg("usage entitlement scheduler failed")
+				pollAt = time.Now().Add(time.Second)
+			} else {
+				for _, job := range jobs {
+					active++
+					go func() { process(ctx, job); done <- struct{}{} }()
+				}
+				pollAt = time.Time{}
+				if len(jobs) < available {
+					pollAt = time.Now().Add(idle(ctx))
+				}
+			}
+		}
+		if active == workers || pollAt.IsZero() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				active--
+			}
+		} else {
+			timer := time.NewTimer(max(0, time.Until(pollAt)))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-done:
+				timer.Stop()
+				active--
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+func entitlementPollDelay(until time.Duration, slot int) time.Duration {
+	delay := max(100*time.Millisecond, min(5*time.Second, until))
+	// Stagger idle lanes without postponing the next due deadline.
+	if delay == 5*time.Second {
+		delay -= time.Duration((slot*37)%200) * time.Millisecond
+	}
+	return delay
+}
+
+func (h *Handlers) claimUsageEntitlements(ctx context.Context, retry bool, limit int) ([]entitlementJob, error) {
+	jobs, _, err := h.claimUsageEntitlementsWithDelay(ctx, retry, limit, 0)
+	return jobs, err
+}
+
+// The next-due observation shares the claim snapshot and excludes our newly
+// claimed rows. Concurrent inserts and earlier reschedules are rediscovered
+// within five seconds, even when the snapshot contains no eligible work.
+func (h *Handlers) claimUsageEntitlementsWithDelay(ctx context.Context, retry bool, limit, slot int) ([]entitlementJob, time.Duration, error) {
 	claim, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	token := uuid.New()
-	rows, err := h.Pool.Query(claim, `WITH due AS (SELECT contract_id FROM billing_entitlement_work WHERE next_check_at<=clock_timestamp() AND (failures>0)=$2 AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_check_at,contract_id FOR UPDATE SKIP LOCKED LIMIT $3)
- UPDATE billing_entitlement_work w SET lease_token=$1,lease_until=clock_timestamp()+interval '1 minute',next_check_at=clock_timestamp()+interval '1 minute' FROM due WHERE w.contract_id=due.contract_id RETURNING w.contract_id`, token, retry, limit)
+	rows, err := h.Pool.Query(claim, `WITH due AS (SELECT contract_id FROM billing_entitlement_work WHERE next_check_at<=clock_timestamp() AND (failures>0)=$2 AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_check_at,contract_id FOR UPDATE SKIP LOCKED LIMIT $3),
+ claimed AS (UPDATE billing_entitlement_work w SET lease_token=$1,lease_until=clock_timestamp()+interval '1 minute',next_check_at=clock_timestamp()+interval '1 minute' FROM due WHERE w.contract_id=due.contract_id RETURNING w.contract_id),
+ next_due AS (SELECT COALESCE((SELECT CASE WHEN w.next_check_at='infinity'::timestamptz THEN 5::double precision ELSE extract(epoch FROM w.next_check_at-clock_timestamp())::double precision END FROM billing_entitlement_work w WHERE (w.failures>0)=$2 AND (w.lease_until IS NULL OR w.lease_until<clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM claimed c WHERE c.contract_id=w.contract_id) ORDER BY w.next_check_at,w.contract_id LIMIT 1),5) AS seconds)
+ SELECT c.contract_id,n.seconds FROM next_due n LEFT JOIN claimed c ON true`, token, retry, limit)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
+	defer rows.Close()
 	var jobs []entitlementJob
+	var seconds float64
 	for rows.Next() {
-		j := entitlementJob{Token: token}
-		if err = rows.Scan(&j.Contract); err != nil {
-			rows.Close()
-			return 0, err
+		var contract pgtype.UUID
+		if err = rows.Scan(&contract, &seconds); err != nil {
+			return nil, 0, err
 		}
-		jobs = append(jobs, j)
+		if contract.Valid {
+			jobs = append(jobs, entitlementJob{Contract: contract.Bytes, Token: token})
+		}
 	}
-	err = rows.Err()
-	rows.Close()
+	if err = rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return jobs, entitlementPollDelay(time.Duration(max(0.1, min(5, seconds))*float64(time.Second)), slot), nil
+}
+
+func (h *Handlers) usageEntitlementBatch(ctx context.Context, retry bool, limit int) (int, error) {
+	jobs, err := h.claimUsageEntitlements(ctx, retry, limit)
 	if err != nil {
 		return 0, err
 	}
@@ -107,14 +182,18 @@ func (h *Handlers) usageEntitlementBatch(ctx context.Context, retry bool, limit 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			work, cancel := context.WithTimeout(ctx, 45*time.Second)
-			defer cancel()
-			_ = h.processEntitlementJob(work, j)
+			h.runUsageEntitlementJob(ctx, j)
 		}()
 	}
 	wg.Wait()
 	return len(jobs), nil
 }
+func (h *Handlers) runUsageEntitlementJob(ctx context.Context, j entitlementJob) {
+	work, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	_ = h.processEntitlementJob(work, j)
+}
+
 func (h *Handlers) processEntitlementJob(ctx context.Context, j entitlementJob) error {
 	started := time.Now()
 	next, err := h.reconcileUsageEntitlement(ctx, j.Contract)
@@ -137,7 +216,7 @@ func (h *Handlers) processEntitlementJob(ctx context.Context, j entitlementJob) 
  failures=CASE WHEN $4::text IS NULL THEN 0 ELSE least(failures+1,10000) END,
  problem_since=CASE WHEN $4::text IS NULL THEN NULL ELSE COALESCE(problem_since,clock_timestamp()) END,
  last_error=$4,
- alerted_at=CASE WHEN (($4::text IS NOT NULL AND COALESCE(problem_since,clock_timestamp())<clock_timestamp()-interval '5 minutes') OR EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=$1 AND e.state<>'issued' AND (e.state='uncertain' OR NOT (EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL))) AND (e.first_attempt_at<clock_timestamp()-interval '5 minutes' OR e.period_end<clock_timestamp()+interval '15 minutes'))) AND (alerted_at IS NULL OR alerted_at<clock_timestamp()-interval '1 hour') THEN clock_timestamp() ELSE alerted_at END
+ alerted_at=CASE WHEN (($4::text IS NOT NULL AND COALESCE(problem_since,clock_timestamp())<clock_timestamp()-interval '5 minutes') OR EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=$1 AND e.state<>'issued' AND (e.state='uncertain' OR NOT (EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_provider_pair_revocation r WHERE r.contract_id=e.contract_id))) AND (e.first_attempt_at<clock_timestamp()-interval '5 minutes' OR e.period_end<clock_timestamp()+interval '15 minutes'))) AND (alerted_at IS NULL OR alerted_at<clock_timestamp()-interval '1 hour') THEN clock_timestamp() ELSE alerted_at END
  FROM previous WHERE contract_id=previous.old_contract_id AND lease_token=$2 RETURNING alerted_at) SELECT finished.alerted_at IS DISTINCT FROM previous.old_alerted_at FROM finished CROSS JOIN previous`, j.Contract, j.Token, next, message).Scan(&alert)
 	if alert {
 		_, incidentErr := h.Pool.Exec(ack, `INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence,platform_failure_at)
@@ -168,6 +247,14 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err != nil {
 		return next, err
 	}
+	pair, pairErr := loadContractProviderBinding(ctx, h.Pool, id)
+	if pairErr != nil && !errors.Is(pairErr, pgx.ErrNoRows) {
+		return next, pairErr
+	}
+	paired := pairErr == nil
+	if paired && (pair.Identity.TeamID != team || pair.CustomerID != c.CustomerID || pair.UsageSubscriptionID != c.SubscriptionID) {
+		return next, errors.New("paired entitlement billing identity differs")
+	}
 	// Recover a possible success before deciding whether a new period is eligible.
 	var unresolved uuid.UUID
 	err = h.Pool.QueryRow(ctx, `SELECT id FROM billing_usage_entitlement WHERE contract_id=$1 AND state<>'issued' ORDER BY period_start LIMIT 1`, id).Scan(&unresolved)
@@ -192,7 +279,19 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 				return next, errors.New("unknown grant outcome exceeded safe replay window; operator recovery required")
 			}
 		}
-		if c.OfferKey == "yc_2026" {
+		if paired {
+			var revoked bool
+			if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_provider_pair_revocation WHERE contract_id=$1)`, id).Scan(&revoked); err != nil {
+				return next, err
+			}
+			if revoked {
+				if e.State == "uncertain" {
+					return next, nil
+				}
+				return time.Now().Add(time.Hour), nil
+			}
+		}
+		if c.OfferKey == "yc_2026" && !paired {
 			operation, e := h.ycOperation(ctx, team)
 			if e != nil {
 				return next, e
@@ -213,7 +312,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 				return time.Now().Add(time.Hour), nil
 			}
 		}
-		if e.State == "pending" && c.OfferKey == "yc_2026" {
+		if e.State == "pending" && c.OfferKey == "yc_2026" && !paired {
 			var revoked bool
 			if err = h.Pool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM billing_yc_operation WHERE contract_id=$1`, c.ID).Scan(&revoked); err != nil {
 				return next, err
@@ -241,18 +340,41 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 			return time.Now().Add(time.Hour), nil
 		}
 	}
+	if paired {
+		var revoked bool
+		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_provider_pair_revocation WHERE contract_id=$1)`, id).Scan(&revoked); err != nil {
+			return next, err
+		}
+		if revoked {
+			return time.Now().Add(time.Hour), nil
+		}
+	}
 	start, end, ok := billing.AnniversaryPeriod(c.EntitlementAnchor, time.Now())
 	if !ok {
 		return next, errors.New("commercial anniversary unavailable")
 	}
+	completedNext := end.Add(time.Second)
+	if paired && completedNext.After(next) {
+		// Current paired readiness depends on bounded authority and debt evidence,
+		// including after this period's grant has already been issued.
+		completedNext = next
+	}
 	e, err := h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: c.EntitlementKind})
 	if err == nil && e.State == "issued" {
+		if paired {
+			return completedNext, h.refreshIssuedProviderPair(ctx, pair, c, e, client)
+		}
 		return end.Add(time.Second), nil
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return next, err
 	}
-	if c.OfferKey == "yc_2026" {
+	if paired {
+		if err = h.withProviderPairEntitlementAuthority(ctx, pair, func(context.Context, pgx.Tx) error { return nil }); err != nil {
+			return next, err
+		}
+	}
+	if c.OfferKey == "yc_2026" && !paired {
 		operation, e := h.ycOperation(ctx, team)
 		if e != nil {
 			return next, e
@@ -261,7 +383,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 			return next, e
 		}
 	}
-	if c.OfferKey == "yc_2026" {
+	if c.OfferKey == "yc_2026" && !paired {
 		var allowed bool
 		if err = h.Pool.QueryRow(ctx, `SELECT billing_yc_covered(c,$2,$3,true) FROM billing_commercial_contract c WHERE id=$1`, id, start, end).Scan(&allowed); err != nil {
 			return next, err
@@ -272,21 +394,23 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	}
 	// Reuse the verified payment path; an invoice event alone cannot establish coverage.
 	var paid bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_contract_payment p WHERE contract_id=$1 AND service_period_start<=$2 AND service_period_end>=$3 AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required))`, id, start, end).Scan(&paid); err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_contract_payment p JOIN billing_commercial_contract c ON c.id=p.contract_id WHERE p.contract_id=$1 AND billing_payment_authorizes_entitlement(c,p,$2,$3) AND ($4 OR NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required)))`, id, start, end, paired).Scan(&paid); err != nil {
 		return next, err
 	}
 	if !paid && c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
-		var adopted bool
-		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE renewal_contract_id=$1)`, id).Scan(&adopted); err != nil {
-			return next, err
-		}
-		if adopted {
-			err = h.reconcileSponsoredAnnual(ctx, team)
-		} else {
-			_, err = h.reconcileProCheckout(ctx, team, false)
-		}
-		if err != nil {
-			return next, err
+		if !paired {
+			var adopted bool
+			if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE renewal_contract_id=$1)`, id).Scan(&adopted); err != nil {
+				return next, err
+			}
+			if adopted {
+				err = h.reconcileSponsoredAnnual(ctx, team)
+			} else {
+				_, err = h.reconcileProCheckout(ctx, team, false)
+			}
+			if err != nil {
+				return next, err
+			}
 		}
 	}
 	token := uuid.New()
@@ -308,11 +432,22 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	}
 	if debt != "" {
 		evidence, _ := json.Marshal(map[string]string{"unpaid_invoice": debt})
+		if paired {
+			if err = h.observeProviderPairDebt(ctx, c, debt); err != nil {
+				return next, err
+			}
+		}
 		_, err = h.Pool.Exec(ctx, `INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence) VALUES($1,$2,$3,$4) ON CONFLICT(contract_id,period_start) DO UPDATE SET observed_at=clock_timestamp(),evidence=EXCLUDED.evidence`, id, start, end, evidence)
 		if err == nil {
 			_, err = h.Pool.Exec(ctx, `INSERT INTO billing_entitlement_debt(contract_id,period_start,invoice_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, id, start, debt)
 		}
 		return next, err
+	}
+	if paired && !paid && c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
+		found, err := h.discoverProviderPairReceipt(ctx, pair, c, start, end, token, client)
+		if err != nil || !found {
+			return next, err
+		}
 	}
 	// A prior debt observation cannot excuse a later platform failure after settlement.
 	if _, err = h.Pool.Exec(ctx, `UPDATE billing_entitlement_withheld SET evidence='{}'::jsonb WHERE contract_id=$1 AND period_start=$2`, id, start); err != nil {
@@ -378,17 +513,34 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
 		// Refresh the exact covering receipt through the existing payment verifier.
 		var paymentInvoice string
-		if err = h.Pool.QueryRow(ctx, `SELECT invoice_id FROM billing_contract_payment WHERE contract_id=$1 AND service_period_start<=$2 AND service_period_end>=$3 ORDER BY service_period_start DESC,invoice_id LIMIT 1`, id, start, end).Scan(&paymentInvoice); err != nil {
+		if err = h.Pool.QueryRow(ctx, `SELECT p.invoice_id FROM billing_contract_payment p JOIN billing_commercial_contract c ON c.id=p.contract_id WHERE p.contract_id=$1 AND billing_payment_authorizes_entitlement(c,p,$2,$3) ORDER BY p.service_period_start DESC,p.invoice_id LIMIT 1`, id, start, end).Scan(&paymentInvoice); err != nil {
 			return next, err
 		}
-		payment, verified, verifyErr := client.verifyProInvoice(ctx, paymentInvoice, proOffer{Key: c.OfferKey, Price: c.BasePriceID, Amount: c.ChargeAmountCents, Months: c.ChargeIntervalMonths}, c.CustomerID, c.SubscriptionID)
+		var payment proPaymentEvidence
+		var verified bool
+		var verifyErr error
+		if paired {
+			payment, verifyErr = client.verifyProviderPairPayment(ctx, pair, paymentInvoice)
+			verified = verifyErr == nil
+		} else {
+			payment, verified, verifyErr = client.verifyProInvoice(ctx, paymentInvoice, proOffer{Key: c.OfferKey, Price: c.BasePriceID, Amount: c.ChargeAmountCents, Months: c.ChargeIntervalMonths}, c.CustomerID, c.SubscriptionID)
+		}
+		if paired && verifyErr == nil {
+			var same bool
+			if err = h.Pool.QueryRow(ctx, `SELECT service_period_start=$3 AND service_period_end=$4 AND payment_reference=$5 FROM billing_contract_payment WHERE contract_id=$1 AND invoice_id=$2`, id, paymentInvoice, time.Unix(payment.Start, 0), time.Unix(payment.End, 0), payment.Reference).Scan(&same); err != nil {
+				return next, err
+			}
+			if !same {
+				verifyErr = &proPaymentReviewError{reason: "paired payment changed its immutable receipt period or settlement identity"}
+			}
+		}
 		if observeErr := h.observeProPaymentReview(ctx, team, paymentInvoice, payment, verifyErr); observeErr != nil {
 			return next, observeErr
 		}
 		if verifyErr != nil {
 			return next, verifyErr
 		}
-		if !verified || payment.Start > start.Unix() || payment.End < end.Unix() {
+		if !verified || (!paired && (payment.Start > start.Unix() || payment.End < end.Unix())) {
 			return next, errors.New("current base coverage could not be freshly verified")
 		}
 	}
@@ -398,6 +550,9 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		return next, err
 	}
 	if debt != "" {
+		if paired {
+			return next, h.observeProviderPairDebt(ctx, c, debt)
+		}
 		return next, nil
 	}
 	var observed time.Time
@@ -409,7 +564,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err != nil {
 		return next, fmt.Errorf("observe entitlement collection: %w", err)
 	}
-	if c.OfferKey == "yc_2026" {
+	if c.OfferKey == "yc_2026" && !paired {
 		operation, e := h.ycOperation(ctx, team)
 		if e != nil {
 			return next, e
@@ -421,24 +576,33 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		defer authority()
 	}
 
-	if e.ID == uuid.Nil {
-		e, err = h.DB.ClaimCurrentUsageEntitlement(ctx, db.ClaimCurrentUsageEntitlementParams{TeamID: team, ContractID: id})
-		if errors.Is(err, pgx.ErrNoRows) {
-			e, err = h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: c.EntitlementKind})
-		}
+	if paired {
+		raw, _ := json.Marshal(prices)
+		e, err = h.prepareProviderPairEntitlement(ctx, pair, db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: team, ContractID: id, InvoiceStart: pgtype.Timestamptz{Time: mapped.Start, Valid: true}, InvoiceEnd: pgtype.Timestamptz{Time: mapped.End, Valid: true}, Prices: raw}, prices)
 		if err != nil {
 			return next, err
 		}
 	}
-	if e.State == "pending" {
-		raw, _ := json.Marshal(prices)
-		e, err = h.beginValidatedUsageEntitlementIssuance(ctx, db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: team, ContractID: id, EntitlementID: e.ID, InvoiceStart: pgtype.Timestamptz{Time: mapped.Start, Valid: true}, InvoiceEnd: pgtype.Timestamptz{Time: mapped.End, Valid: true}, Prices: raw}, prices)
-		if err != nil {
-			return next, err
+	if !paired {
+		if e.ID == uuid.Nil {
+			e, err = h.DB.ClaimCurrentUsageEntitlement(ctx, db.ClaimCurrentUsageEntitlementParams{TeamID: team, ContractID: id})
+			if errors.Is(err, pgx.ErrNoRows) {
+				e, err = h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: c.EntitlementKind})
+			}
+			if err != nil {
+				return next, err
+			}
+		}
+		if e.State == "pending" {
+			raw, _ := json.Marshal(prices)
+			e, err = h.beginValidatedUsageEntitlementIssuance(ctx, db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: team, ContractID: id, EntitlementID: e.ID, InvoiceStart: pgtype.Timestamptz{Time: mapped.Start, Valid: true}, InvoiceEnd: pgtype.Timestamptz{Time: mapped.End, Valid: true}, Prices: raw}, prices)
+			if err != nil {
+				return next, err
+			}
 		}
 	}
 	if e.State == "issued" {
-		return end.Add(time.Second), nil
+		return completedNext, nil
 	}
 	e, err = h.DB.GetReplayableUsageEntitlement(ctx, db.GetReplayableUsageEntitlementParams{TeamID: team, EntitlementID: e.ID})
 	if err != nil {
@@ -457,7 +621,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err = tx.Commit(ctx); err != nil {
 		return next, err
 	}
-	return end.Add(time.Second), h.dispatchUsageEntitlement(ctx, c, e, client, prices)
+	return completedNext, h.dispatchUsageEntitlement(ctx, c, e, client, prices)
 }
 
 func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCommercialContract, e db.BillingUsageEntitlement, client *stripeHTTPClient, prices []map[string]string) error {
@@ -468,16 +632,31 @@ func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCom
 	if err != nil {
 		return err
 	}
+	pair, pairErr := loadContractProviderBinding(ctx, h.Pool, c.ID)
+	if pairErr != nil && !errors.Is(pairErr, pgx.ErrNoRows) {
+		return pairErr
+	}
+	var attempt uuid.UUID
+	if pairErr == nil {
+		attempt, err = h.admitProviderPairDispatch(ctx, pair, e, form.Encode())
+		if err != nil {
+			return err
+		}
+	}
 	var grant entitlementGrant
-	if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey); err != nil {
+	err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey)
+	if attempt != uuid.Nil {
+		if finishErr := h.finishProviderPairDispatch(ctx, attempt, err); finishErr != nil {
+			return errors.Join(err, finishErr)
+		}
+	}
+	if err != nil {
 		return err
 	}
 	if grant.VoidedAt != 0 {
 		return errors.New("created grant was voided; operator recovery required")
 	}
-	raw, _ := json.Marshal(grant)
-	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
-	return err
+	return h.confirmEntitlementGrant(ctx, c, e, grant)
 }
 
 func (h *Handlers) entitlementClosingInvoice(ctx context.Context, c db.BillingCommercialContract, start time.Time, client *stripeHTTPClient) error {
@@ -541,9 +720,7 @@ func (h *Handlers) discoverUsageEntitlement(ctx context.Context, c db.BillingCom
 	if grant.VoidedAt != 0 {
 		return errors.New("recovered grant was voided; operator recovery required")
 	}
-	raw, _ := json.Marshal(grant)
-	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
-	return err
+	return h.confirmEntitlementGrant(ctx, c, e, grant)
 }
 
 // Commit issuance intent only after the exact database-generated request is valid.

@@ -59,15 +59,17 @@ WITH contract AS MATERIALIZED (
     SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id)
         AND b.id = sqlc.arg(contract_id) FOR UPDATE
 )
-INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, waiver_id, sponsorship_id, kind, period_start, period_end, amount_cents, currency)
-SELECT c.team_id, c.id, p.id, w.id, sp.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
+INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, waiver_id, sponsorship_id, paired_waiver_id, kind, period_start, period_end, amount_cents, currency)
+SELECT c.team_id, c.id, p.id, w.id, sp.id, pw.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
 FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
 LEFT JOIN billing_contract_payment p ON p.contract_id = c.id
-    AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
+    AND billing_payment_authorizes_entitlement(c::billing_commercial_contract,p::billing_contract_payment,period.period_start,period.period_end)
 LEFT JOIN billing_contract_waiver w ON w.contract_id=c.id AND p.id IS NULL
     AND billing_yc_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
 LEFT JOIN billing_sponsored_operation sp ON sp.contract_id=c.id AND p.id IS NULL AND w.id IS NULL
     AND billing_sponsored_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
+LEFT JOIN billing_provider_pair_waiver pw ON pw.contract_id=c.id AND p.id IS NULL AND w.id IS NULL AND sp.id IS NULL
+    AND billing_provider_pair_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
 WHERE billing_contract_eligible(c::billing_commercial_contract, period.period_start, period.period_end)
 ON CONFLICT (team_id, kind, period_start) DO NOTHING
 RETURNING *;

@@ -139,7 +139,14 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		return err
 	}
 	replacement := enrolled && (existing.Customer != a.Customer || existing.Subscription != a.Subscription)
-	if enrolled {
+	if a.Pair != nil {
+		if requested != nil && (requested.Price != a.Price || requested.Event != a.Event || requested.Meter != "" && requested.Meter != a.Meter) {
+			return fmt.Errorf("requested rounding configuration differs from immutable provider pair")
+		}
+		if enrolled && (replacement || existing.Price != a.Price || existing.Event != a.Event || existing.Meter != a.Meter) {
+			return fmt.Errorf("existing invoice enrollment differs from immutable provider pair")
+		}
+	} else if enrolled {
 		if requested != nil && (requested.Price != existing.Price || requested.Event != existing.Event) {
 			return fmt.Errorf("existing rounding configuration differs; explicit recovery required")
 		}
@@ -166,7 +173,7 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		a.Price, a.Event, a.Meter = catalog.Price, catalog.Event, catalog.Meter
 	}
 	for _, resource := range h.billingResourceStates(true) {
-		if a.Base.Price == "" && (a.Price == resource.StripePriceID || a.Event == resource.StripeEventName) {
+		if a.Pair == nil && a.Base.Price == "" && (a.Price == resource.StripePriceID || a.Event == resource.StripeEventName) {
 			return fmt.Errorf("rounding price and event must be separate from resource usage")
 		}
 	}
@@ -324,6 +331,9 @@ func (h *Handlers) validateInvoiceEnrollment(ctx context.Context, team uuid.UUID
 }
 
 func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription, reader db.DBTX) error {
+	if a.Pair != nil {
+		return validatePairUsageSubscription(*a.Pair, a, sub)
+	}
 	if a.Base.Item != "" {
 		o, err := h.sponsoredAnnualAuthority(ctx, team, reader)
 		if err != nil {

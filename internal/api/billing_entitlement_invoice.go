@@ -53,7 +53,7 @@ func (h *Handlers) prepareEntitlementCredits(ctx context.Context, p billing.Expo
 		return err
 	}
 	var revoked bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation WHERE contract_id=$1 AND revoked_at<$2) OR EXISTS(SELECT 1 FROM billing_sponsored_operation WHERE contract_id=$1 AND revoked_at<$2)`, contract, p.End).Scan(&revoked); err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation WHERE contract_id=$1 AND revoked_at<$2) OR EXISTS(SELECT 1 FROM billing_sponsored_operation WHERE contract_id=$1 AND revoked_at<$2) OR EXISTS(SELECT 1 FROM billing_provider_pair_revocation WHERE contract_id=$1 AND revoked_at<$2)`, contract, p.End).Scan(&revoked); err != nil {
 		return err
 	}
 	if revoked && state != "uncertain" && state != "issued" {
