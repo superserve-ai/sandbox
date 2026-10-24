@@ -25,6 +25,7 @@ jobs:
           python3 scripts/test_migration_overlay.py
           python3 scripts/test_migration_execution.py
           python3 scripts/test_shared_auth_migrations.py
+          python3 scripts/test_catalog_seed_reconciliation.py
 
   unit-tests:
     name: Unit Tests
