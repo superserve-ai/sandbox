@@ -51,6 +51,9 @@ type proProviderFixture struct {
 	handlers                                          *api.Handlers
 	creates                                           int
 	keys                                              []string
+	catalogPrices                                     map[string]string
+	priceCreates                                      []string
+	failBasePriceRead                                 bool
 }
 
 func newProFixture(t *testing.T, offer string) (*proProviderFixture, *gin.Engine, string) {
@@ -70,7 +73,7 @@ func newProFixture(t *testing.T, offer string) (*proProviderFixture, *gin.Engine
 	}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
-	cfg := &config.Config{SystemTeamID: testSystemTeamID.String(), StripeSecretKey: "sk_test_example", StripeAPIBaseURL: srv.URL, StripeAPIVersion: "2026-07-29.dahlia", StripeWebhookSecret: testStripeWebhookSecret, StripeProMonthlyPriceID: "price_pro_monthly", StripeProAnnualPriceID: "price_pro_annual", StripePlanPriceIDs: map[string]string{"starter_monthly": "price_starter_monthly"}, StripeCheckoutPriceIDs: []string{"price_cpu", "price_memory", "price_storage"}, AppAllowedOrigins: []string{"https://app.superserve.test"}}
+	cfg := &config.Config{SystemTeamID: testSystemTeamID.String(), StripeSecretKey: "sk_test_example", StripeAPIBaseURL: srv.URL, StripeAPIVersion: "2026-07-29.dahlia", StripeWebhookSecret: testStripeWebhookSecret, StripeProMonthlyPriceID: "price_pro_monthly", StripeProAnnualPriceID: "price_pro_annual", StripePlanPriceIDs: map[string]string{"example_monthly": "price_example_monthly"}, StripeCheckoutPriceIDs: []string{"price_cpu", "price_memory", "price_storage"}, AppAllowedOrigins: []string{"https://app.superserve.test"}}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
 	h.Stripe = api.NewStripeBillingClient(cfg)
@@ -84,6 +87,27 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 	write := func(v any) { _ = json.NewEncoder(w).Encode(v) }
 	basePrice := map[string]any{"id": f.price, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": fmt.Sprint(f.amount), "recurring": map[string]any{"usage_type": "licensed", "interval": f.interval, "interval_count": 1}}
 	switch {
+	case r.URL.Path == "/v1/prices" && r.Method == "POST":
+		_ = r.ParseForm()
+		lookup := r.Form.Get("lookup_key")
+		if !strings.HasPrefix(lookup, "superserve_plan_") || r.Form.Get("recurring[usage_type]") != "licensed" || r.Form.Get("currency") != "usd" {
+			http.Error(w, "unexpected price creation", 400)
+			return
+		}
+		f.priceCreates = append(f.priceCreates, r.Header.Get("Idempotency-Key"))
+		if f.catalogPrices == nil {
+			f.catalogPrices = map[string]string{}
+		}
+		f.price = "price_catalog_" + fmt.Sprint(len(f.priceCreates))
+		f.catalogPrices[lookup] = f.price
+		f.amount, _ = strconv.ParseInt(r.Form.Get("unit_amount"), 10, 64)
+		write(map[string]any{"id": f.price})
+	case r.URL.Path == "/v1/prices" && strings.HasPrefix(r.URL.Query().Get("lookup_keys[]"), "superserve_plan_"):
+		data := []any{}
+		if id := f.catalogPrices[r.URL.Query().Get("lookup_keys[]")]; id != "" {
+			data = append(data, map[string]any{"id": id})
+		}
+		write(map[string]any{"data": data})
 	case r.URL.Path == "/v1/prices":
 		write(map[string]any{"data": []any{map[string]any{"id": "price_round"}}})
 	case r.URL.Path == "/v1/billing/credit_grants":
@@ -135,6 +159,10 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		write(map[string]any{})
 	case r.URL.Path == "/v1/prices/"+f.price:
+		if f.failBasePriceRead {
+			http.Error(w, "injected price read failure", 500)
+			return
+		}
 		write(basePrice)
 	case strings.HasPrefix(r.URL.Path, "/v1/prices/price_"):
 		if f.resumeOnResourceRead {

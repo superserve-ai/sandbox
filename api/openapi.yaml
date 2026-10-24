@@ -99,12 +99,12 @@ paths:
     get:
       operationId: getPublicBillingPlans
       tags: [Billing]
-      summary: List purchasable subscription plans
+      summary: List plan cards for the live pricing model
       description: |
-        Returns the subscription plans new customers can currently buy, with
-        their price, included monthly usage credit, and resource limits. This
-        endpoint is unauthenticated so signup pages can render from the same
-        plan catalog used by checkout.
+        Returns the live pricing model, its published plan cards (including
+        display-only families such as Enterprise) and the subscription offers
+        new customers can currently buy. This endpoint is unauthenticated so
+        signup pages render from the same plan catalog used by checkout.
       responses:
         "200":
           description: Purchasable subscription plans
@@ -262,6 +262,65 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /billing/plan:
+    get:
+      operationId: getBillingPlan
+      tags: [Billing]
+      summary: Get the team's plan
+      description: |
+        Returns the plan the authenticated team is on, its limits, the current
+        billing period and any plan change waiting to take effect. `plan` is
+        null until the team has been assigned a plan. Requires `billing:read`.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: The team's plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlanResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /billing/plan-change-preview:
+    get:
+      operationId: previewBillingPlanChange
+      tags: [Billing]
+      summary: Preview a plan change
+      description: |
+        Says when moving the authenticated team to a plan would take effect and
+        the limits it would then have, or why the team cannot make that move.
+        Requires `billing:read`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: target_plan
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [free, starter, pro_monthly]
+      responses:
+        "200":
+          description: When and how the change would apply
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlanChangePreview"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -717,6 +776,102 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /billing/prepaid:
+    get:
+      operationId: getPrepaidCredit
+      tags: [Billing]
+      summary: Get prepaid credit balance, auto-recharge settings and recent purchases
+      description: Requires `billing:read`. Available whether or not prepaid plans are active, so existing balances stay visible.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Prepaid credit summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PrepaidCreditSummary"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /billing/prepaid/checkout:
+    post:
+      operationId: createPrepaidCheckout
+      tags: [Billing]
+      summary: Buy prepaid credit
+      description: Requires `billing:write`. The first purchase opens the subscription checkout with the credit as a one-time charge; later purchases open a one-time payment checkout that saves the card. Credit is issued after the payment is verified.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount_cents, success_url, cancel_url]
+              properties:
+                amount_cents:
+                  type: integer
+                  format: int64
+                  minimum: 500
+                  multipleOf: 500
+                success_url:
+                  type: string
+                  format: uri
+                cancel_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Prepaid plans are not active, the plan cannot buy credit, or too many purchases are unspent.
+        "503":
+          description: Prepaid credit is temporarily at capacity.
+  /billing/prepaid/auto-recharge:
+    put:
+      operationId: putPrepaidAutoRecharge
+      tags: [Billing]
+      summary: Configure prepaid auto-recharge
+      description: Requires `billing:write`. Turning auto-recharge off always succeeds. Turning it on needs active prepaid plans and a card saved by an earlier purchase.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+                threshold_cents:
+                  type: integer
+                  format: int64
+                  minimum: 500
+                  multipleOf: 500
+                amount_cents:
+                  type: integer
+                  format: int64
+                  minimum: 500
+                  multipleOf: 500
+      responses:
+        "200":
+          description: Updated prepaid credit summary without purchases
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PrepaidCreditSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Prepaid plans are not active, the plan cannot buy credit, or no card is saved.
   /stripe/customer-portal-session:
     post:
       operationId: createStripeCustomerPortalSession
@@ -3072,6 +3227,76 @@ components:
         string; the tagged form routes the request to the sandbox's home
         region. Endpoints accept both forms interchangeably.
 
+    PrepaidCreditSummary:
+      type: object
+      required: [balance_cents, low_balance, auto_recharge, has_saved_card, purchases]
+      properties:
+        balance_cents:
+          type: integer
+          format: int64
+        low_balance:
+          type: boolean
+          description: Balance is below $5 and auto-recharge is off.
+        has_saved_card:
+          type: boolean
+        auto_recharge:
+          type: object
+          required: [enabled, in_flight]
+          properties:
+            enabled:
+              type: boolean
+            threshold_cents:
+              type: integer
+              format: int64
+              nullable: true
+            amount_cents:
+              type: integer
+              format: int64
+              nullable: true
+            disabled_reason:
+              type: string
+              nullable: true
+            disabled_at:
+              type: string
+              format: date-time
+              nullable: true
+            in_flight:
+              type: boolean
+        purchases:
+          type: array
+          items:
+            type: object
+            required: [id, source, amount_cents, state, created_at]
+            properties:
+              id:
+                type: string
+                format: uuid
+              team_id:
+                type: string
+                format: uuid
+              source:
+                type: string
+                enum: [checkout, auto_recharge]
+              amount_cents:
+                type: integer
+                format: int64
+              state:
+                type: string
+                enum: [pending, paid, credited, failed]
+              failure_reason:
+                type: string
+                nullable: true
+              paid_at:
+                type: string
+                format: date-time
+                nullable: true
+              credited_at:
+                type: string
+                format: date-time
+                nullable: true
+              created_at:
+                type: string
+                format: date-time
     BillingSessionResponse:
       type: object
       required: [url]
@@ -5009,22 +5234,155 @@ components:
 
     BillingPlansResponse:
       type: object
-      required: [plans]
+      required: [pricing_version, cards, plans]
       properties:
-        plans:
+        pricing_version:
+          type: string
+          enum: [legacy, v2]
+          description: Pricing model that is live for new customers.
+        cards:
           type: array
           items:
+            $ref: "#/components/schemas/BillingPlanCard"
+        plans:
+          type: array
+          description: Offers new customers can check out.
+          items:
             $ref: "#/components/schemas/BillingPlan"
+    BillingPlanCard:
+      type: object
+      required: [family, version, kind, name, price_label, tagline, features, display_only, monthly, annual, credit_summary, monthly_credit_cents, allowance, matching, limits]
+      properties:
+        family:
+          type: string
+        version:
+          type: integer
+        kind:
+          type: string
+          enum: [free, prepaid, subscription, legacy_payg, custom]
+        name:
+          type: string
+        price_label:
+          type: string
+          description: Price as shown on the card, e.g. `$250/month`. Empty when the card shows its fees.
+        tagline:
+          type: string
+        features:
+          type: array
+          items:
+            type: string
+        display_only:
+          type: boolean
+          description: Shown for contact-sales plans that cannot be bought online.
+        monthly:
+          $ref: "#/components/schemas/BillingPlanPrice"
+        annual:
+          $ref: "#/components/schemas/BillingPlanPrice"
+        credit_summary:
+          type: string
+          description: The credit schedule in words, e.g. `$1,000 every month`.
+        monthly_credit_cents:
+          type: integer
+          format: int64
+          nullable: true
+          description: Credit included every month, when the schedule is a uniform monthly grant.
+        allowance:
+          type: object
+          nullable: true
+          required: [amount_cents, amount_usd, period, on_exhausted, summary]
+          description: Usage included in the plan.
+          properties:
+            amount_cents:
+              type: integer
+              format: int64
+              description: Included usage in USD cents per period, priced at the current rate card for compute allowances.
+            amount_usd:
+              type: string
+              description: Included usage in USD per period as an exact decimal, e.g. `0.1332`; compute allowances are priced at the current rate card. `amount_cents` is this amount rounded to the cent.
+            period:
+              type: string
+              enum: [day_window, month]
+              description: "`day_window` is 24 hours from the first sandbox start; `month` is the billing month."
+            on_exhausted:
+              type: string
+              enum: [pause, payg]
+              description: Whether sandboxes pause or usage continues pay as you go once the allowance is used.
+            compute:
+              type: object
+              required: [seconds, vcpu, memory_gib]
+              description: Present when the allowance is defined as compute time.
+              properties:
+                seconds:
+                  type: integer
+                vcpu:
+                  type: integer
+                memory_gib:
+                  type: integer
+            summary:
+              type: string
+              description: The allowance in words, e.g. `$250 of usage included every month`.
+        matching:
+          type: object
+          nullable: true
+          required: [matching_bps, cap_cents]
+          description: Matching credit on customer-paid usage, up to a lifetime cap per contract.
+          properties:
+            matching_bps:
+              type: integer
+              description: Share of customer-paid usage matched, in basis points (10000 = 100%).
+            cap_cents:
+              type: integer
+              format: int64
+        limits:
+          $ref: "#/components/schemas/BillingPlanLimits"
+    BillingPlanLimits:
+      type: object
+      required: [max_concurrent, max_vcpu, max_memory_mib, max_disk_mib, max_templates]
+      properties:
+        max_concurrent:
+          type: integer
+          nullable: true
+          description: Running sandboxes at once.
+        max_vcpu:
+          type: integer
+          nullable: true
+          description: vCPUs per sandbox.
+        max_memory_mib:
+          type: integer
+          nullable: true
+        max_disk_mib:
+          type: integer
+          nullable: true
+        max_templates:
+          type: integer
+          nullable: true
+    BillingPlanPrice:
+      type: object
+      nullable: true
+      required: [offer_key, price_cents, monthly_equivalent_cents, available]
+      properties:
+        offer_key:
+          type: string
+        price_cents:
+          type: integer
+          format: int64
+          description: Fee in USD cents per billing interval.
+        monthly_equivalent_cents:
+          type: integer
+          format: int64
+        available:
+          type: boolean
+          description: Whether new customers can check out this offer.
     BillingPlan:
       type: object
       required: [key, family, name, interval_months, price_cents, monthly_credit_cents, limits]
       properties:
         key:
           type: string
-          description: Offer key used to start checkout, e.g. `starter_monthly`.
+          description: Offer key used to start checkout, e.g. `pro_monthly`.
         family:
           type: string
-          description: Plan family shared by its monthly and annual offers, e.g. `starter`.
+          description: Plan family shared by its monthly and annual offers, e.g. `pro`.
         name:
           type: string
         interval_months:
@@ -5053,6 +5411,80 @@ components:
             max_template_disk_mib:
               type: integer
               nullable: true
+    BillingPlanResponse:
+      type: object
+      required: [plan, period, pending_change]
+      properties:
+        plan:
+          type: object
+          nullable: true
+          required: [plan_key, kind, display_name, limits, effective_from]
+          properties:
+            plan_key:
+              type: string
+            kind:
+              type: string
+              enum: [free, prepaid, subscription, legacy_payg, custom]
+            display_name:
+              type: string
+            limits:
+              $ref: "#/components/schemas/BillingPlanLimits"
+            effective_from:
+              type: string
+              format: date-time
+        period:
+          type: object
+          required: [start, end]
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+        pending_change:
+          type: object
+          nullable: true
+          required: [id, target_plan_key, target_display_name, effective_at, undoable, pauses_running]
+          properties:
+            id:
+              type: string
+              format: uuid
+            target_plan_key:
+              type: string
+            target_display_name:
+              type: string
+            effective_at:
+              type: string
+              format: date-time
+            undoable:
+              type: boolean
+            pauses_running:
+              type: boolean
+    BillingPlanChangePreview:
+      type: object
+      required: [target_plan_key, target_display_name, target_kind, pauses_running, limits]
+      properties:
+        target_plan_key:
+          type: string
+        target_display_name:
+          type: string
+        target_kind:
+          type: string
+          enum: [free, prepaid, subscription, legacy_payg, custom]
+        timing:
+          type: string
+          enum: [immediate, end_of_billing_period, after_purchase]
+        effective_at:
+          type: string
+          format: date-time
+        pauses_running:
+          type: boolean
+        limits:
+          $ref: "#/components/schemas/BillingPlanLimits"
+        blocked:
+          type: string
+          description: Why the team cannot make this change; absent when it can.
     BillingPricingResponse:
       type: object
       required: [plan_key, plan_name, currency, rates]

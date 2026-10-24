@@ -533,7 +533,7 @@ func (h *Handlers) adoptYCGrant(ctx context.Context, o ycOperation, c db.Billing
 	if err != nil {
 		return err
 	}
-	if grants, err = h.withoutMatchingGrants(ctx, grants); err != nil {
+	if grants, err = h.withoutLedgerOwnedGrants(ctx, grants); err != nil {
 		return err
 	}
 	grantID := ""

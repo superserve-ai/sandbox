@@ -282,7 +282,7 @@ func TestMatchingCreditProWorkedExample(t *testing.T) {
 		t.Fatal("matched credit must not expire and must cover all metered usage", form)
 	}
 	g := m.grants[r.Grant]
-	kept, err := m.f.h.withoutMatchingGrants(t.Context(), []billing.InvoiceCreditGrant{{ID: g.ID}, {ID: "credgr_other"}})
+	kept, err := m.f.h.withoutLedgerOwnedGrants(t.Context(), []billing.InvoiceCreditGrant{{ID: g.ID}, {ID: "credgr_other"}})
 	if err != nil || len(kept) != 1 || kept[0].ID != "credgr_other" {
 		t.Fatal("matching grant offered for adoption by another flow", kept, err)
 	}

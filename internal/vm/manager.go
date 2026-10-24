@@ -8007,6 +8007,14 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		return fmt.Errorf("restore for recording: %w", err)
 	}
 
+	// Without a command in the recording, every sandbox faults in the exec
+	// path (boxd's handler, the shell, process creation) one page at a time on
+	// its first command. Best-effort: a failure only leaves those pages out.
+	if err := recordFirstExec(ctx, inst.IP); err != nil {
+		m.log.Warn().Err(err).Str("template_vm", vmID).
+			Msg("exec during recording failed; trace covers the wake only")
+	}
+
 	warmup := 10 * time.Second
 	if m.cfg.UffdRecordMaxSeconds > 0 {
 		warmup = time.Duration(m.cfg.UffdRecordMaxSeconds) * time.Second

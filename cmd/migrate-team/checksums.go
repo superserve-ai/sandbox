@@ -115,7 +115,7 @@ func diffChecksums(src, dst map[string]int) (srcOnly, dstOnly int) {
 // by each table's primary key, so a retry probes at most one bounded copy
 // batch through the destination index instead of rescanning all retained
 // generations and decoding/hash-canonicalizing them a second time.
-func verifyRetainedBatch(ctx context.Context, dst *pgxpool.Pool, table string, batch []json.RawMessage) error {
+func verifyRetainedBatch(ctx context.Context, dst querier, table string, batch []json.RawMessage) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -236,6 +236,7 @@ func contentDriftUnderLock(ctx context.Context, tx pgx.Tx, dst *pgxpool.Pool, cf
 		{tableSpec{name: "sandbox", scope: "team_id = $1"}, sandboxTf},
 		{tableSpec{name: "sandbox_secret", scope: sandboxScope}, nil},
 		{tableSpec{name: "secret", scope: "team_id = $1"}, nil},
+		{tableSpec{name: "team_plan_assignment", scope: "team_id = $1"}, nil},
 	}
 	for _, chk := range checks {
 		srcSums := map[string]int{}

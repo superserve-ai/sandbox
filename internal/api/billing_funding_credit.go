@@ -330,6 +330,11 @@ func (h *Handlers) observeProviderFundingGrants(ctx context.Context, client *str
 	fail := func(err error) (int64, time.Time, pgtype.Timestamptz, any, func([]fundingPeriodReserve) error, error) {
 		return 0, at, expiry, nil, nil, err
 	}
+	if snapshot, ok, err := h.aggregateFundingGrants(ctx, client, team, customer, at); err != nil {
+		return fail(err)
+	} else if ok {
+		return h.observeFundingReservations(ctx, client, team, customer, at, snapshot)
+	}
 	if err := client.doForm(ctx, http.MethodGet, "/v1/billing/credit_grants?"+url.Values{"customer": {customer}, "limit": {"100"}}.Encode(), nil, &inventory, ""); err != nil {
 		return fail(err)
 	}
@@ -400,120 +405,37 @@ func (h *Handlers) observeProviderFundingGrants(ctx context.Context, client *str
 			expiry = pgtype.Timestamptz{Valid: true, Time: time.Unix(grant.ExpiresAt, 0)}
 		}
 	}
-	if total == 0 {
-		return 0, start, expiry, balances, nil, nil
-	}
-	// Drafts may reserve grants for charges outside the measured sandbox ledger.
-	// Creation can predate the grant, so inspect the entire draft inventory.
-	var drafts struct {
-		Data    []StripeInvoiceAmounts `json:"data"`
-		HasMore bool                   `json:"has_more"`
-	}
-	if err := client.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"customer": {customer}, "status": {"draft"}, "limit": {"100"}}.Encode(), nil, &drafts, ""); err != nil {
-		return fail(err)
-	}
-	if drafts.HasMore || len(drafts.Data) > 2 {
-		return fail(errors.New("draft credit inventory exceeds observation bound"))
-	}
-	draftHashes := map[string]string{}
-	for _, draft := range drafts.Data {
-		if draft.ID == "" || draft.Customer != customer || draft.Status != "draft" || draft.BillingReason != "subscription_cycle" || draft.Lines.HasMore || len(draft.Lines.Data) > 5 || draftHashes[draft.ID] != "" {
-			return fail(errors.New("draft credit reservations lack owned usage identity"))
-		}
-		draftHashes[draft.ID] = invoiceSettlementHash(draft)
-	}
-	var invoices struct {
-		Data    []StripeInvoiceAmounts `json:"data"`
-		HasMore bool                   `json:"has_more"`
-	}
-	if err := client.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"customer": {customer}, "limit": {"100"}, "created[gte]": {strconv.FormatInt(start.Unix(), 10)}}.Encode(), nil, &invoices, ""); err != nil {
-		return fail(err)
-	}
-	if invoices.HasMore {
-		return fail(errors.New("funding invoice inventory exceeds observation bound"))
-	}
-	for _, inv := range invoices.Data {
-		if inv.Customer != customer || inv.ID == "" {
-			return fail(errors.New("funding invoice identity mismatch"))
-		}
-		if inv.Status == "draft" {
-			if draftHashes[inv.ID] != invoiceSettlementHash(inv) {
-				return fail(errors.New("draft credit reservation changed during observation"))
+	return h.observeFundingReservations(ctx, client, team, customer, at, fundingGrantSnapshot{
+		Total: total, Start: start, Expiry: expiry, Evidence: balances,
+		Reserved: func() *big.Int {
+			reserved := new(big.Int)
+			for _, balance := range providerBalances {
+				reserved.Add(reserved, big.NewInt(balance.Ledger-balance.Available))
 			}
-			continue
-		}
-		credits := false
-		for _, credit := range inv.PretaxCredits {
-			if credit.Type == "credit_balance_transaction" || credit.CreditBalanceTransaction != "" {
-				credits = true
-			}
-		}
-		if !credits {
-			continue
-		}
-		var settled bool
-		if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_invoice_close j JOIN team_billing_period p USING(team_id,period_start,period_end) WHERE j.team_id=$1 AND j.invoice_id=$2 AND j.state='released' AND p.finalized_at IS NOT NULL AND billing_invoice_close_matches(j.team_id,j.period_start,j.period_end))`, team, inv.ID).Scan(&settled); err != nil {
-			return fail(err)
-		}
-		if !settled {
-			return fail(errors.New("provider credit debit is not reconciled to local usage"))
-		}
-	}
-	verify := func(coverage []fundingPeriodReserve) error {
-		reserved := new(big.Int)
-		for _, balance := range providerBalances {
-			reserved.Add(reserved, big.NewInt(balance.Ledger-balance.Available))
-		}
-		attributed := new(big.Int)
-		for _, draft := range drafts.Data {
-			if err := h.validateFundingDraft(ctx, team, draft, coverage); err != nil {
-				return err
-			}
-			for _, credit := range draft.PretaxCredits {
-				if credit.Type == "credit_balance_transaction" || credit.CreditBalanceTransaction != "" {
-					attributed.Add(attributed, big.NewInt(credit.Amount))
+			return reserved
+		},
+		Stable: func(ctx context.Context) error {
+			for id, before := range balances {
+				after, err := fundingProviderGrantBalance(ctx, client, customer, id)
+				if err != nil {
+					return err
+				}
+				if after.Ledger != before || after != providerBalances[id] {
+					return errors.New("funding credit ledger changed during observation")
+				}
+				grant, err := client.retrieveEntitlementGrant(ctx, id)
+				if err != nil {
+					return err
+				}
+				a, _ := json.Marshal(grant)
+				b, _ := json.Marshal(grants[id])
+				if string(a) != string(b) {
+					return errors.New("funding credit grant changed during observation")
 				}
 			}
-		}
-		if reserved.Cmp(attributed) != 0 {
-			return errors.New("grant reservations differ from attributed owned drafts")
-		}
-		for id, before := range balances {
-			after, err := fundingProviderGrantBalance(ctx, client, customer, id)
-			if err != nil {
-				return err
-			}
-			if after.Ledger != before || after != providerBalances[id] {
-				return errors.New("funding credit ledger changed during observation")
-			}
-			grant, err := client.retrieveEntitlementGrant(ctx, id)
-			if err != nil {
-				return err
-			}
-			a, _ := json.Marshal(grant)
-			b, _ := json.Marshal(grants[id])
-			if string(a) != string(b) {
-				return errors.New("funding credit grant changed during observation")
-			}
-		}
-		var current struct {
-			Data    []StripeInvoiceAmounts `json:"data"`
-			HasMore bool                   `json:"has_more"`
-		}
-		if err := client.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"customer": {customer}, "status": {"draft"}, "limit": {"100"}}.Encode(), nil, &current, ""); err != nil {
-			return err
-		}
-		if current.HasMore || len(current.Data) != len(draftHashes) {
-			return errors.New("draft credit inventory changed during observation")
-		}
-		for _, draft := range current.Data {
-			if draft.Status != "draft" || draftHashes[draft.ID] != invoiceSettlementHash(draft) {
-				return errors.New("draft credit reservation changed during observation")
-			}
-		}
-		return nil
-	}
-	return total, start, expiry, balances, verify, nil
+			return nil
+		},
+	})
 }
 
 func (h *Handlers) validateFundingDraft(ctx context.Context, team uuid.UUID, inv StripeInvoiceAmounts, coverage []fundingPeriodReserve) error {
@@ -608,4 +530,119 @@ func validateFundingDraftCoverage(inv StripeInvoiceAmounts, p billing.ExportPeri
 		return errors.New("draft obligations exceed reserved outstanding usage")
 	}
 	return nil
+}
+
+// fundingGrantSnapshot is one observation of a customer's spendable credit and
+// how to re-read it, so draft reservations are checked the same way however
+// the balance was read.
+type fundingGrantSnapshot struct {
+	Total    int64
+	Start    time.Time
+	Expiry   pgtype.Timestamptz
+	Evidence any
+	Reserved func() *big.Int
+	Stable   func(context.Context) error
+}
+
+func (h *Handlers) observeFundingReservations(ctx context.Context, client *stripeHTTPClient, team uuid.UUID, customer string, at time.Time, snap fundingGrantSnapshot) (int64, time.Time, pgtype.Timestamptz, any, func([]fundingPeriodReserve) error, error) {
+	total, start, expiry, balances := snap.Total, snap.Start, snap.Expiry, snap.Evidence
+	fail := func(err error) (int64, time.Time, pgtype.Timestamptz, any, func([]fundingPeriodReserve) error, error) {
+		return 0, at, expiry, nil, nil, err
+	}
+	if total == 0 {
+		return 0, start, expiry, balances, nil, nil
+	}
+	// Drafts may reserve grants for charges outside the measured sandbox ledger.
+	// Creation can predate the grant, so inspect the entire draft inventory.
+	var drafts struct {
+		Data    []StripeInvoiceAmounts `json:"data"`
+		HasMore bool                   `json:"has_more"`
+	}
+	if err := client.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"customer": {customer}, "status": {"draft"}, "limit": {"100"}}.Encode(), nil, &drafts, ""); err != nil {
+		return fail(err)
+	}
+	if drafts.HasMore || len(drafts.Data) > 2 {
+		return fail(errors.New("draft credit inventory exceeds observation bound"))
+	}
+	draftHashes := map[string]string{}
+	for _, draft := range drafts.Data {
+		if draft.ID == "" || draft.Customer != customer || draft.Status != "draft" || draft.BillingReason != "subscription_cycle" || draft.Lines.HasMore || len(draft.Lines.Data) > 5 || draftHashes[draft.ID] != "" {
+			return fail(errors.New("draft credit reservations lack owned usage identity"))
+		}
+		draftHashes[draft.ID] = invoiceSettlementHash(draft)
+	}
+	var invoices struct {
+		Data    []StripeInvoiceAmounts `json:"data"`
+		HasMore bool                   `json:"has_more"`
+	}
+	if err := client.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"customer": {customer}, "limit": {"100"}, "created[gte]": {strconv.FormatInt(start.Unix(), 10)}}.Encode(), nil, &invoices, ""); err != nil {
+		return fail(err)
+	}
+	if invoices.HasMore {
+		return fail(errors.New("funding invoice inventory exceeds observation bound"))
+	}
+	for _, inv := range invoices.Data {
+		if inv.Customer != customer || inv.ID == "" {
+			return fail(errors.New("funding invoice identity mismatch"))
+		}
+		if inv.Status == "draft" {
+			if draftHashes[inv.ID] != invoiceSettlementHash(inv) {
+				return fail(errors.New("draft credit reservation changed during observation"))
+			}
+			continue
+		}
+		credits := false
+		for _, credit := range inv.PretaxCredits {
+			if credit.Type == "credit_balance_transaction" || credit.CreditBalanceTransaction != "" {
+				credits = true
+			}
+		}
+		if !credits {
+			continue
+		}
+		var settled bool
+		if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_invoice_close j JOIN team_billing_period p USING(team_id,period_start,period_end) WHERE j.team_id=$1 AND j.invoice_id=$2 AND j.state='released' AND p.finalized_at IS NOT NULL AND billing_invoice_close_matches(j.team_id,j.period_start,j.period_end))`, team, inv.ID).Scan(&settled); err != nil {
+			return fail(err)
+		}
+		if !settled {
+			return fail(errors.New("provider credit debit is not reconciled to local usage"))
+		}
+	}
+	verify := func(coverage []fundingPeriodReserve) error {
+		reserved := snap.Reserved()
+		attributed := new(big.Int)
+		for _, draft := range drafts.Data {
+			if err := h.validateFundingDraft(ctx, team, draft, coverage); err != nil {
+				return err
+			}
+			for _, credit := range draft.PretaxCredits {
+				if credit.Type == "credit_balance_transaction" || credit.CreditBalanceTransaction != "" {
+					attributed.Add(attributed, big.NewInt(credit.Amount))
+				}
+			}
+		}
+		if reserved.Cmp(attributed) != 0 {
+			return errors.New("grant reservations differ from attributed owned drafts")
+		}
+		if err := snap.Stable(ctx); err != nil {
+			return err
+		}
+		var current struct {
+			Data    []StripeInvoiceAmounts `json:"data"`
+			HasMore bool                   `json:"has_more"`
+		}
+		if err := client.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"customer": {customer}, "status": {"draft"}, "limit": {"100"}}.Encode(), nil, &current, ""); err != nil {
+			return err
+		}
+		if current.HasMore || len(current.Data) != len(draftHashes) {
+			return errors.New("draft credit inventory changed during observation")
+		}
+		for _, draft := range current.Data {
+			if draft.Status != "draft" || draftHashes[draft.ID] != invoiceSettlementHash(draft) {
+				return errors.New("draft credit reservation changed during observation")
+			}
+		}
+		return nil
+	}
+	return total, start, expiry, balances, verify, nil
 }
