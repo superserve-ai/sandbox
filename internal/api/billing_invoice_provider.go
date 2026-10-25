@@ -281,28 +281,45 @@ func (c *stripeHTTPClient) invoiceEnrollmentBoundary(ctx context.Context, a invo
 // The first version supports the non-expiring, all-metered USD grants issued by
 // the application. An incompatible grant is held for reconciliation, not guessed.
 func (c *stripeHTTPClient) invoiceCreditLedger(ctx context.Context, customer string, periodEnd int64) (int64, error) {
-	var grants struct {
-		Data []struct {
-			ID          string `json:"id"`
-			VoidedAt    int64  `json:"voided_at"`
-			ExpiresAt   int64  `json:"expires_at"`
-			EffectiveAt int64  `json:"effective_at"`
-			Scope       struct {
-				Scope struct {
-					PriceType string `json:"price_type"`
-				} `json:"scope"`
-			} `json:"applicability_config"`
-		} `json:"data"`
-		HasMore bool `json:"has_more"`
+	type ledgerGrant = struct {
+		ID          string `json:"id"`
+		VoidedAt    int64  `json:"voided_at"`
+		ExpiresAt   int64  `json:"expires_at"`
+		EffectiveAt int64  `json:"effective_at"`
+		Scope       struct {
+			Scope struct {
+				PriceType string `json:"price_type"`
+			} `json:"scope"`
+		} `json:"applicability_config"`
 	}
-	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/credit_grants?"+url.Values{"customer": {customer}, "limit": {"100"}}.Encode(), nil, &grants, ""); err != nil {
-		return 0, err
-	}
-	if grants.HasMore {
-		return 0, fmt.Errorf("credit grant inventory exceeds reconciliation limit")
+	var grants []ledgerGrant
+	cursor := ""
+	for page := 0; ; page++ {
+		if page == 20 {
+			return 0, fmt.Errorf("credit grant inventory exceeds reconciliation limit")
+		}
+		q := url.Values{"customer": {customer}, "limit": {"100"}}
+		if cursor != "" {
+			q.Set("starting_after", cursor)
+		}
+		var list struct {
+			Data    []ledgerGrant `json:"data"`
+			HasMore bool          `json:"has_more"`
+		}
+		if err := c.doForm(ctx, http.MethodGet, "/v1/billing/credit_grants?"+q.Encode(), nil, &list, ""); err != nil {
+			return 0, err
+		}
+		grants = append(grants, list.Data...)
+		if !list.HasMore {
+			break
+		}
+		if len(list.Data) == 0 {
+			return 0, fmt.Errorf("empty incomplete credit grant page")
+		}
+		cursor = list.Data[len(list.Data)-1].ID
 	}
 	var total int64
-	for _, g := range grants.Data {
+	for _, g := range grants {
 		if g.VoidedAt != 0 {
 			continue
 		}

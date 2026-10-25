@@ -17,7 +17,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-var errMatchingDeferred = errors.New("matching credit issuance deferred")
+var errCreditIssuanceDeferred = errors.New("credit issuance deferred")
 
 type matchingTerms struct {
 	MatchingBps int32
@@ -312,9 +312,9 @@ func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHT
 		switch {
 		case issueErr == nil:
 			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET failures=0,last_error=NULL WHERE id=$1`, id)
-		case errors.Is(issueErr, errMatchingDeferred) || errors.Is(issueErr, errCreditInventoryPending):
+		case errors.Is(issueErr, errCreditIssuanceDeferred) || errors.Is(issueErr, errCreditInventoryPending):
 			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET last_error=$2,
- next_attempt_at=clock_timestamp()+CASE WHEN $3 AND created_at<clock_timestamp()-interval '1 day' THEN interval '1 hour' ELSE interval '30 seconds' END WHERE id=$1`, id, issueErr.Error(), errors.Is(issueErr, errMatchingDeferred))
+ next_attempt_at=clock_timestamp()+CASE WHEN $3 AND created_at<clock_timestamp()-interval '1 day' THEN interval '1 hour' ELSE interval '30 seconds' END WHERE id=$1`, id, issueErr.Error(), errors.Is(issueErr, errCreditIssuanceDeferred))
 			issueErr = nil
 		default:
 			log.Error().Err(issueErr).Str("matching_credit_id", id.String()).Msg("matching credit issuance failed; inspect before replaying")
@@ -327,10 +327,6 @@ func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHT
 	return errors.Join(errs...)
 }
 
-// Issuance shares the invoice closer's per-team lock and waits until every
-// ended period is released: a close freezes or recomputes the eligible credit
-// set for its period, so a grant appearing before release could wedge it. A
-// grant issued while no period awaits closing simply funds the next invoice.
 func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPClient, id uuid.UUID) error {
 	var team, contract uuid.UUID
 	var customer, key, invoice, current string
@@ -339,30 +335,11 @@ func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPCl
 	if err := h.Pool.QueryRow(ctx, `SELECT team_id,contract_id,customer_id,idempotency_key,invoice_id,state,acknowledged_at IS NOT NULL,flagged_at IS NOT NULL,first_attempt_at FROM billing_matching_credit WHERE id=$1`, id).Scan(&team, &contract, &customer, &key, &invoice, &current, &acknowledged, &flagged, &attempted); err != nil {
 		return err
 	}
-	lock, err := h.Pool.Begin(ctx)
+	release, err := h.holdCreditIssuanceFence(ctx, team)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_ = lock.Rollback(cleanup)
-	}()
-	var locked, closing bool
-	if err = lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked); err != nil {
-		return err
-	}
-	if !locked {
-		return errMatchingDeferred
-	}
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account a USING(team_id)
- WHERE p.team_id=$1 AND p.period_end<=clock_timestamp() AND p.period_end>a.enrolled_at
-  AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE (j.team_id,j.period_start,j.period_end)=(p.team_id,p.period_start,p.period_end) AND j.state='released'))`, team).Scan(&closing); err != nil {
-		return err
-	}
-	if closing {
-		return fmt.Errorf("%w: an ended billing period is not yet released", errMatchingDeferred)
-	}
+	defer release()
 	if current == "uncertain" {
 		found, err := h.recoverMatchingCredit(ctx, client, id, contract, customer)
 		if err != nil || found {
@@ -372,7 +349,7 @@ func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPCl
 			return errors.New("matching credit outcome unknown after the replay window; operator recovery required")
 		}
 		if flagged && !acknowledged {
-			return fmt.Errorf("%w: uncertain matching credit is held for provider recovery", errMatchingDeferred)
+			return fmt.Errorf("%w: uncertain matching credit is held for provider recovery", errCreditIssuanceDeferred)
 		}
 	}
 	if (current == "pending" || current == "uncertain") && !acknowledged {
@@ -384,7 +361,7 @@ func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPCl
 			log.Warn().Str("matching_credit_id", id.String()).Str("invoice_id", invoice).Str("reason", reason).Msg("matched invoice was reversed before issuance; staff review required")
 			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET flagged_at=clock_timestamp(),flag_reason=$2,flag_evidence=$3 WHERE id=$1 AND state IN ('pending','uncertain') AND flagged_at IS NULL`, id, reason, evidence)
 			if err == nil && current == "uncertain" {
-				return fmt.Errorf("%w: reversed uncertain matching credit requires provider recovery", errMatchingDeferred)
+				return fmt.Errorf("%w: reversed uncertain matching credit requires provider recovery", errCreditIssuanceDeferred)
 			}
 			return err
 		}
@@ -396,7 +373,7 @@ func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPCl
  WHERE id=$1 AND state IN ('pending','uncertain') AND (flagged_at IS NULL OR acknowledged_at IS NOT NULL) RETURNING state,request_payload,first_attempt_at`, id).Scan(&state, &payload, &first)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if current == "pending" || current == "uncertain" {
-			return fmt.Errorf("%w: matching credit dispatch is held", errMatchingDeferred)
+			return fmt.Errorf("%w: matching credit dispatch is held", errCreditIssuanceDeferred)
 		}
 		return nil
 	}
@@ -621,13 +598,14 @@ func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, custo
 	return "", nil, nil
 }
 
-// Matching credit is owned by its ledger; no other flow may adopt it.
-func (h *Handlers) withoutMatchingGrants(ctx context.Context, grants []billing.InvoiceCreditGrant) ([]billing.InvoiceCreditGrant, error) {
+// Matching and purchased credit are owned by their ledgers; no other flow may adopt them.
+func (h *Handlers) withoutLedgerOwnedGrants(ctx context.Context, grants []billing.InvoiceCreditGrant) ([]billing.InvoiceCreditGrant, error) {
 	ids := make([]string, len(grants))
 	for i, g := range grants {
 		ids[i] = g.ID
 	}
-	rows, err := h.Pool.Query(ctx, `SELECT stripe_credit_grant_id FROM billing_matching_credit WHERE stripe_credit_grant_id=ANY($1)`, ids)
+	rows, err := h.Pool.Query(ctx, `SELECT stripe_credit_grant_id FROM billing_matching_credit WHERE stripe_credit_grant_id=ANY($1)
+ UNION ALL SELECT stripe_credit_grant_id FROM billing_prepaid_purchase WHERE stripe_credit_grant_id=ANY($1)`, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -651,4 +629,40 @@ func (h *Handlers) withoutMatchingGrants(ctx context.Context, grants []billing.I
 		}
 	}
 	return kept, nil
+}
+
+// Issuance shares the invoice closer's per-team lock and waits until every
+// ended period is released: a close freezes or recomputes the eligible credit
+// set for its period, so a grant appearing before release could wedge it. A
+// grant issued while no period awaits closing simply funds the next invoice.
+func (h *Handlers) holdCreditIssuanceFence(ctx context.Context, team uuid.UUID) (func(), error) {
+	lock, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	release := func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = lock.Rollback(cleanup)
+	}
+	var locked, closing bool
+	if err = lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked); err != nil {
+		release()
+		return nil, err
+	}
+	if !locked {
+		release()
+		return nil, errCreditIssuanceDeferred
+	}
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account a USING(team_id)
+ WHERE p.team_id=$1 AND p.period_end<=clock_timestamp() AND p.period_end>a.enrolled_at
+  AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE (j.team_id,j.period_start,j.period_end)=(p.team_id,p.period_start,p.period_end) AND j.state='released'))`, team).Scan(&closing); err != nil {
+		release()
+		return nil, err
+	}
+	if closing {
+		release()
+		return nil, fmt.Errorf("%w: an ended billing period is not yet released", errCreditIssuanceDeferred)
+	}
+	return release, nil
 }

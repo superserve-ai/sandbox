@@ -91,7 +91,7 @@ func (h *Handlers) fundingObservationBatch(ctx context.Context) (int, error) {
 	rows, err := h.Pool.Query(claim, `WITH due AS (
  SELECT team_id FROM billing_funding_account WHERE observe AND next_check_at<=clock_timestamp()
  AND (lease_until IS NULL OR lease_until<clock_timestamp())
- ORDER BY next_check_at,team_id FOR UPDATE SKIP LOCKED LIMIT 4)
+ ORDER BY next_check_at,team_id FOR UPDATE SKIP LOCKED LIMIT (SELECT batch_size FROM billing_funding_policy WHERE singleton))
  UPDATE billing_funding_account w SET lease_token=$1,lease_until=clock_timestamp()+interval '1 minute',next_check_at=clock_timestamp()+interval '1 minute'
  FROM due WHERE w.team_id=due.team_id RETURNING w.team_id`, token)
 	if err != nil {

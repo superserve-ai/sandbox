@@ -106,6 +106,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/billing/summary", h.GetBillingSummary)
 		api.GET("/billing/usage-series", h.GetBillingUsageSeries)
 		api.GET("/billing/pricing", h.GetBillingPricing)
+		api.GET("/billing/plan", h.GetBillingPlan)
+		api.GET("/billing/plan-change-preview", h.GetBillingPlanChangePreview)
 		api.GET("/teams/:team_id/billing/usage", h.GetTeamBillingUsage)
 		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
 		api.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetTeamBillingExportPreview)
@@ -115,6 +117,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/stripe/plan-choice", h.CommitFreeSignupPlan)
 		api.POST("/stripe/pro-checkout/recover", h.RecoverProCheckout)
 		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
+		api.GET("/billing/prepaid", h.GetPrepaidCredit)
+		api.POST("/billing/prepaid/checkout", h.CreatePrepaidCheckout)
+		api.PUT("/billing/prepaid/auto-recharge", h.PutPrepaidAutoRecharge)
 
 		// RBAC Phase 2b customer-facing team management.
 		api.GET("/teams/:team_id/management", h.GetTeamManagement)
@@ -176,9 +181,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.GET("/yc/claims", TeamCreationPrivacy(), h.PendingYCClaims)
 		operator.POST("/yc/claims/decision", TeamCreationPrivacy(), h.DecideYCClaim)
 		// Billing recovery requires a credential unavailable to VMD hosts.
+		operator.POST("/teams/:team_id/billing/prepaid/auto-recharge/disable", h.DisablePlatformAutoRecharge)
+		operator.POST("/teams/:team_id/billing/prepaid/purchases/:purchase_id/reversal", h.ResolvePrepaidReversal)
 		operator.POST("/teams/:team_id/billing/matching", h.AttachTeamMatchingRule)
 		operator.POST("/teams/:team_id/billing/matching/revoke", h.RevokeTeamMatchingRule)
 		operator.POST("/teams/:team_id/billing/matching/credits/:credit_id/acknowledge", h.AcknowledgeMatchingCreditFlag)
+		operator.POST("/teams/:team_id/billing/plan-assignments", h.AssignTeamPlan)
 		operator.POST("/teams/:team_id/billing/sponsored-annual/preflight", h.SponsoredAnnualPreflight)
 		operator.POST("/teams/:team_id/billing/sponsored-annual", h.SponsoredAnnualApply)
 		operator.GET("/teams/:team_id/billing/sponsored-annual/:operation_id", h.SponsoredAnnualStatus)
@@ -215,6 +223,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.GET("/abuse/trusted-identities", h.ListPlatformAbuseTrustedIdentities)
 		operator.POST("/abuse/trusted-identities", h.AddPlatformAbuseTrustedIdentity)
 		operator.POST("/abuse/trusted-identities/:identity_id/revoke", h.RevokePlatformAbuseTrustedIdentity)
+		operator.POST("/billing/catalog/plans", h.CreatePlanVersionDraft)
+		operator.PUT("/billing/catalog/plans/:version_id", h.UpdatePlanVersionDraft)
+		operator.DELETE("/billing/catalog/plans/:version_id", h.DeletePlanVersionDraft)
+		operator.POST("/billing/catalog/plans/:version_id/publish", h.PublishPlanVersion)
+		operator.POST("/billing/catalog/plans/:version_id/retire", h.RetirePlanVersion)
+		operator.POST("/billing/pricing-version", h.SetPlatformPricingVersion)
 	}
 
 	machineAdministration := operator.Group("/machine-identity", machineAdministrationAuthorization())
@@ -247,7 +261,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/teams/:team_id/sandboxes", h.ListPlatformTeamSandboxes)
 		internal.GET("/teams/:team_id/sandboxes/:sandbox_id", h.GetPlatformTeamSandbox)
 		internal.GET("/billing", h.ListPlatformBilling)
+		internal.GET("/billing/catalog", h.GetPlatformBillingCatalog)
+		internal.GET("/billing/catalog/preview", h.PreviewPlanSchedule)
+		internal.GET("/billing/pricing-version", h.GetPlatformPricingVersion)
 		internal.GET("/teams/:team_id/billing/usage", h.GetPlatformTeamBillingUsage)
+		internal.GET("/teams/:team_id/billing/plan-assignments", h.GetTeamPlanAssignments)
 		internal.GET("/teams/:team_id/billing/periods", h.ListPlatformTeamBillingPeriods)
 		internal.POST("/billing/cutover", h.EstablishBillingCutover)
 		internal.POST("/teams/:team_id/billing/anchor", h.EstablishCommercialBillingAnchor)
@@ -257,6 +275,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/teams/:team_id/billing/periods/:period_id/export-accounting", h.GetBillingExportAccounting)
 		internal.GET("/teams/:team_id/billing/matching", h.GetTeamMatchingCredit)
 		internal.GET("/billing/matching/flags", h.ListMatchingCreditFlags)
+		internal.GET("/teams/:team_id/billing/prepaid", h.GetPlatformTeamPrepaid)
+		internal.GET("/billing/prepaid/purchases", h.ListPrepaidPurchases)
+		internal.GET("/billing/prepaid/reversals", h.ListPrepaidReversals)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

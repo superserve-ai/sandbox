@@ -278,6 +278,20 @@ func postBoxd(ctx context.Context, vmIP, path string, body []byte) ([]byte, erro
 	return reply, nil
 }
 
+// recordFirstExec runs one command the way an SDK client does: a shell
+// string on the streaming endpoint, so the recorded pages are the ones a
+// sandbox's first command touches.
+func recordFirstExec(ctx context.Context, vmIP string) error {
+	body, _ := json.Marshal(struct {
+		Command  string `json:"command"`
+		TimeoutS int    `json:"timeout_s"`
+	}{Command: "true", TimeoutS: 10})
+	ectx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, err := postBoxd(ectx, vmIP, "/exec/stream", body)
+	return err
+}
+
 // waitForGuestWake tells a restored guest to correct its clock and release its
 // workload, and waits for it to confirm. Returns ErrGuestClockUnready as soon
 // as the guest reports it cannot, so the caller retries the unfrozen way.

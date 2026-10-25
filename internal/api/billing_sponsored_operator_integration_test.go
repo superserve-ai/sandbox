@@ -37,10 +37,14 @@ func sponsoredOperatorScenario(t *testing.T, scenario string) {
 		}
 	}
 	exec(`UPDATE team SET home_region='use' WHERE id=$1`, team)
+	var budget int32
+	if err := h.Pool.QueryRow(ctx, `SELECT max_observed_teams FROM billing_funding_policy WHERE singleton`).Scan(&budget); err != nil {
+		t.Fatal(err)
+	}
 	exec(`UPDATE billing_funding_policy SET max_observed_teams=100 WHERE singleton`)
 	t.Cleanup(func() {
 		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false,enforce=false WHERE team_id=$1`, team)
-		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=4 WHERE singleton`)
+		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=$1 WHERE singleton`, budget)
 	})
 	h.Config = &config.Config{TeamCreationRegion: "use", BillingUsageEntitlementsEnabled: true}
 	now := time.Now().UTC()

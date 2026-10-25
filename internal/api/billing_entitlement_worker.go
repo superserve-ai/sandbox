@@ -34,6 +34,7 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	workers := 8
 	h.startEntitlementCoverageMonitoring(ctx)
 	h.startMatchingCredits(ctx, h.Stripe.(*stripeHTTPClient))
+	h.startPrepaidCredits(ctx, h.Stripe.(*stripeHTTPClient))
 	h.startSponsoredReconciliation(ctx)
 	if h.Config != nil && h.Config.BillingEntitlementWorkers >= 2 {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)

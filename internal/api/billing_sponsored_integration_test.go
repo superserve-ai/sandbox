@@ -93,10 +93,14 @@ func TestSponsoredEligibilityConfirmedExpiryAndConflicts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	var budget int32
+	if err := f.h.Pool.QueryRow(ctx, `SELECT max_observed_teams FROM billing_funding_policy WHERE singleton`).Scan(&budget); err != nil {
+		t.Fatal(err)
+	}
 	exec(`UPDATE billing_funding_policy SET max_observed_teams=100 WHERE singleton`)
 	t.Cleanup(func() {
 		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false,enforce=false WHERE team_id=$1`, f.c.TeamID)
-		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=4 WHERE singleton`)
+		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=$1 WHERE singleton`, budget)
 	})
 	exec(`UPDATE billing_funding_account SET observe=true,enforce=true WHERE team_id=$1`, f.c.TeamID)
 	refresh := func(amount int) {

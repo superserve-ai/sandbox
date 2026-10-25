@@ -503,5 +503,15 @@ class TargetTests(unittest.TestCase):
         self.assertNotIn('secret', str(raised.exception))
 
 
+class CohortTests(unittest.TestCase):
+    def test_cohort_covers_every_catalog_plan_once_the_catalog_exists(self):
+        catalog = gate.cohort_sql(True)
+        self.assertIn("SELECT offer_key FROM billing_plan", catalog)
+        self.assertIn("c.offer_key='yc_2026'", catalog)
+        before = gate.cohort_sql(False)
+        self.assertNotIn('billing_plan', before.replace('billing_plan_', ''))
+        self.assertIn("('pro_monthly'),('pro_annual')", before)
+
+
 if __name__ == '__main__':
     unittest.main()

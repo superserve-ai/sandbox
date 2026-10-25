@@ -8,9 +8,10 @@ SELECT
     t.name,
     COALESCE(sc.active_sandbox_count, 0)::int AS active_sandbox_count,
     t.max_sandboxes,
-    t.max_templates,
+    lim.max_templates::int AS max_templates,
     COALESCE(tpl.cnt, 0)::int AS template_count
 FROM team t
+CROSS JOIN LATERAL team_effective_limits(t.id) lim
 LEFT JOIN team_active_sandbox_counts sc ON sc.team_id = t.id
 LEFT JOIN (
     SELECT team_id, COUNT(*) AS cnt
@@ -99,3 +100,8 @@ SELECT EXISTS (
       AND m.status = 'active' AND a.scope_type = 'team' AND a.revoked_at IS NULL
       AND lower(btrim(p.email)) = sqlc.arg(recipient)::text
 )::boolean AS current;
+
+-- name: GetTeamEffectiveLimits :one
+SELECT max_concurrent::int AS max_concurrent, max_vcpu::int AS max_vcpu, max_memory_mib::int AS max_memory_mib,
+    max_disk_mib::int AS max_disk_mib, max_templates::int AS max_templates
+FROM team_effective_limits(sqlc.arg(team_id)::uuid);

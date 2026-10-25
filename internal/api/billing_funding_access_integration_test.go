@@ -101,12 +101,16 @@ func TestFundingCohortBudgetAndOptInInvalidation(t *testing.T) {
 	h, first := fundingTransitionFixture(t)
 	_, second := fundingTransitionFixture(t)
 	ctx := t.Context()
+	var budget int32
+	if err := h.Pool.QueryRow(ctx, `SELECT max_observed_teams FROM billing_funding_policy WHERE singleton`).Scan(&budget); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := h.Pool.Exec(ctx, `UPDATE billing_funding_policy SET max_observed_teams=1 WHERE singleton`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false,enforce=false WHERE team_id=ANY($1::uuid[])`, []uuid.UUID{first, second})
-		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=4 WHERE singleton`)
+		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=$1 WHERE singleton`, budget)
 	})
 	if _, err := h.Pool.Exec(ctx, `UPDATE billing_funding_account SET observed_generation=generation,credit_usd=1,credit_valid_until=now()+interval '1 minute' WHERE team_id=$1`, first); err != nil {
 		t.Fatal(err)

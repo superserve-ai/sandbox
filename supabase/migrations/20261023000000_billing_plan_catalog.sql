@@ -3,13 +3,6 @@
 -- are never deleted because contracts keep referencing their offer_key.
 -- Stripe price IDs differ per environment and stay in API configuration.
 -- Every plan activates with its own limits.
-INSERT INTO plan_limits
-    SELECT 'starter_monthly', max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib
-    FROM plan_limits WHERE offer_key = 'free';
-INSERT INTO plan_limits
-    SELECT 'starter_annual', max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib
-    FROM plan_limits WHERE offer_key = 'free';
-
 CREATE TABLE billing_plan (
     offer_key text PRIMARY KEY REFERENCES plan_limits(offer_key) CHECK (offer_key ~ '^[a-z][a-z0-9]*_(monthly|annual)$'),
     family text NOT NULL CHECK (family ~ '^[a-z][a-z0-9]*$'),
@@ -47,10 +40,7 @@ CREATE TRIGGER billing_plan_identity_guard BEFORE DELETE OR UPDATE OF offer_key 
 CREATE TRIGGER billing_plan_truncate_guard BEFORE TRUNCATE ON billing_plan
     FOR EACH STATEMENT EXECUTE FUNCTION guard_billing_plan_identity();
 
--- Starter stays unavailable until its annual price and credits are decided.
 INSERT INTO billing_plan VALUES
-    ('starter_monthly', 'starter', 'Starter', 1, 10000, 10000, false, 10),
-    ('starter_annual', 'starter', 'Starter', 12, 100000, 10000, false, 11),
     ('pro_monthly', 'pro', 'Pro', 1, 120000, 100000, true, 20),
     ('pro_annual', 'pro', 'Pro', 12, 1200000, 100000, true, 21);
 
