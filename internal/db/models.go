@@ -822,6 +822,7 @@ type BillingPlanRelease struct {
 	ProviderStatus   string      `json:"provider_status"`
 	ProviderEvidence []byte      `json:"provider_evidence"`
 	ReleasedAt       time.Time   `json:"released_at"`
+	PlanChangeID     pgtype.UUID `json:"plan_change_id"`
 }
 
 type BillingPlanVersion struct {
@@ -2072,6 +2073,41 @@ type TeamPlanAssignment struct {
 	Reason         string             `json:"reason"`
 	IdempotencyKey *string            `json:"idempotency_key"`
 	CreatedAt      time.Time          `json:"created_at"`
+}
+
+type TeamPlanChange struct {
+	ID                        uuid.UUID          `json:"id"`
+	TeamID                    uuid.UUID          `json:"team_id"`
+	FromAssignmentID          uuid.UUID          `json:"from_assignment_id"`
+	TargetPlanKey             string             `json:"target_plan_key"`
+	TargetKind                string             `json:"target_kind"`
+	TargetTerms               []byte             `json:"target_terms"`
+	TargetLimits              []byte             `json:"target_limits"`
+	EffectiveAt               time.Time          `json:"effective_at"`
+	PausesRunning             bool               `json:"pauses_running"`
+	SubscriptionID            *string            `json:"subscription_id"`
+	RequestedBy               uuid.UUID          `json:"requested_by"`
+	RequestedVia              string             `json:"requested_via"`
+	Reason                    string             `json:"reason"`
+	IdempotencyKey            string             `json:"idempotency_key"`
+	RequestedAt               time.Time          `json:"requested_at"`
+	TerminalUndoOf            pgtype.UUID        `json:"terminal_undo_of"`
+	State                     string             `json:"state"`
+	ProviderCancelRequestedAt pgtype.Timestamptz `json:"provider_cancel_requested_at"`
+	ProviderCancelPreexisting bool               `json:"provider_cancel_preexisting"`
+	ProviderCancelAt          pgtype.Timestamptz `json:"provider_cancel_at"`
+	ProviderRenewedAt         pgtype.Timestamptz `json:"provider_renewed_at"`
+	UndoneAt                  pgtype.Timestamptz `json:"undone_at"`
+	UndoneBy                  pgtype.UUID        `json:"undone_by"`
+	UndoReason                *string            `json:"undo_reason"`
+	AppliedAt                 pgtype.Timestamptz `json:"applied_at"`
+	AppliedAssignmentID       pgtype.UUID        `json:"applied_assignment_id"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	NextCheckAt               time.Time          `json:"next_check_at"`
+	LeaseToken                pgtype.UUID        `json:"lease_token"`
+	LeaseUntil                pgtype.Timestamptz `json:"lease_until"`
+	Failures                  int32              `json:"failures"`
+	LastError                 *string            `json:"last_error"`
 }
 
 type TeamPricingPlan struct {

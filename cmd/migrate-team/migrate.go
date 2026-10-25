@@ -123,6 +123,15 @@ func run(ctx context.Context, cfg config) error {
 	}
 	log.Info().Str("phase", cfg.phase).Str("team", teamName).Str("team_id", cfg.teamID.String()).Msg("migrate-team")
 
+	if err := refusePlanChangeMigration(ctx, src, cfg.teamID); err != nil {
+		return fmt.Errorf("source: %w", err)
+	}
+	if dst != nil {
+		if err := refusePlanChangeMigration(ctx, dst, cfg.teamID); err != nil {
+			return fmt.Errorf("destination: %w", err)
+		}
+	}
+
 	if err := checkYCClaimMigration(ctx, src, cfg.teamID); err != nil {
 		return err
 	}

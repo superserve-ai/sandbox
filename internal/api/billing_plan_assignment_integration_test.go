@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -539,6 +540,109 @@ func TestStaffPlanAssignmentWaitsForAdoptionAndReplaysCommitment(t *testing.T) {
 		t.Fatalf("off requests changed assignment history: %+v %v", history, err)
 	}
 
+}
+
+func TestStaffPlanAssignmentRejectsOtherPricingVersion(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	ctx := t.Context()
+	schema := "staff_entry_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := h.Pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := h.Pool.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := h.Pool.Exec(ctx, "CREATE FUNCTION "+schema+`.billing_lock_pricing_public_state()
+RETURNS TABLE(entry_open boolean) LANGUAGE sql AS 'SELECT true'`); err != nil {
+		t.Fatal(err)
+	}
+	config := h.Pool.Config()
+	config.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	staff := &Handlers{Pool: pool, DB: db.New(pool)}
+	actor, outsider := uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{actor, outsider} {
+		if _, err := h.Pool.Exec(ctx, `INSERT INTO profile(id,email,provider,provider_id) VALUES($1,$2,'google',$3)`, id, "staff-"+id.String()+"@superserve.ai", id.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.Pool.Exec(ctx, `INSERT INTO user_role_assignments(user_id,role_id,scope_type)
+SELECT $1,id,'platform' FROM roles WHERE name='platform_admin'`, actor); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPERATOR_API_TOKEN", "staff-model-operator")
+	t.Setenv("INTERNAL_API_TOKEN", "staff-model-internal")
+	router := SetupRouter(ctx, staff, pool)
+	request := func(body staffPlanAssignmentBody, user uuid.UUID, token string) *httptest.ResponseRecorder {
+		t.Helper()
+		payload, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/internal/teams/"+team.String()+"/billing/plan-assignments", strings.NewReader(string(payload)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set(internalActorHeader, user.String())
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	versions := make(map[string]uuid.UUID)
+	for _, model := range []string{"legacy", "v2"} {
+		var id uuid.UUID
+		if err := h.Pool.QueryRow(ctx, `INSERT INTO billing_plan_version(pricing_version,family,version,kind,display_name,max_sandboxes)
+VALUES($1,'custom_'||substr(md5(random()::text),1,8),1,'custom','Example deal',250) RETURNING id`, model).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.Pool.Exec(ctx, `SELECT publish_billing_plan_version($1,$2)`, id, uuid.New()); err != nil {
+			t.Fatal(err)
+		}
+		versions[model] = id
+	}
+	setPricingVersion(t, h, "v2")
+	beforeMax, beforeCPU := limitsOf(t, h, team)
+	body := staffPlanAssignmentBody{Key: "custom-entry", VersionID: versions["legacy"], Reason: "custom approval"}
+	if w := request(body, actor, "staff-model-internal"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("infrastructure token accepted: %d %s", w.Code, w.Body)
+	}
+	if w := request(body, outsider, "staff-model-operator"); w.Code != http.StatusForbidden {
+		t.Fatalf("actor without platform role accepted: %d %s", w.Code, w.Body)
+	}
+	if w := request(body, actor, "staff-model-operator"); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "invalid_plan") {
+		t.Fatalf("legacy custom entry under v2: %d %s", w.Code, w.Body)
+	}
+	history, err := teamPlanHistory(ctx, h.Pool, team, 10)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("rejected entry changed history: %+v %v", history, err)
+	}
+	if max, cpu := limitsOf(t, h, team); max != beforeMax || !reflect.DeepEqual(cpu, beforeCPU) {
+		t.Fatalf("rejected entry changed limits: %d %v", max, cpu)
+	}
+	body.VersionID = versions["v2"]
+	w := request(body, actor, "staff-model-operator")
+	var plan teamPlan
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &plan) != nil || plan.VersionID == nil || *plan.VersionID != body.VersionID {
+		t.Fatalf("v2 custom entry: %d %s", w.Code, w.Body)
+	}
+	setPricingVersion(t, h, "legacy")
+	w = request(body, actor, "staff-model-operator")
+	var replay teamPlan
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &replay) != nil || replay.ID != plan.ID {
+		t.Fatalf("persisted entry replay after pricing rollback: %d %s", w.Code, w.Body)
+	}
+	body.Key = "new-after-off"
+	if w := request(body, actor, "staff-model-operator"); w.Code != http.StatusConflict {
+		t.Fatalf("new staff entry while off: %d %s", w.Code, w.Body)
+	}
+	if current, ok, err := currentTeamPlan(ctx, h.Pool, team); err != nil || !ok || current.ID != plan.ID {
+		t.Fatalf("pricing rollback changed assignment authority: %+v %v %v", current, ok, err)
+	}
 }
 
 func TestPlanAssignmentHistorySurvivesTeamDeletion(t *testing.T) {
