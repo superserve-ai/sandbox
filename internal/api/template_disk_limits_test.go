@@ -8,6 +8,22 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
+// legacyLimits applies the pay-as-you-go plan's caps where a team row
+// leaves them open, as team_effective_limits does.
+func legacyLimits(team db.Team) teamLimits {
+	l := teamLimits{MaxVCPU: 2, MaxMemoryMiB: 2048, MaxDiskMiB: 8192, MaxTemplates: 10}
+	if team.MaxTemplateVcpu != nil {
+		l.MaxVCPU = *team.MaxTemplateVcpu
+	}
+	if team.MaxTemplateMemoryMib != nil {
+		l.MaxMemoryMiB = *team.MaxTemplateMemoryMib
+	}
+	if team.MaxTemplateDiskMib != nil {
+		l.MaxDiskMiB = *team.MaxTemplateDiskMib
+	}
+	return l
+}
+
 func TestValidateTemplateShapeDiskLimits(t *testing.T) {
 	systemID := uuid.New()
 	customerID := uuid.New()
@@ -38,7 +54,7 @@ func TestValidateTemplateShapeDiskLimits(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := validateTemplateShape(tc.team, systemID, 1, 1024, tc.disk); got != tc.want {
+			if got := validateTemplateShape(tc.team.ID, systemID, legacyLimits(tc.team), 1, 1024, tc.disk); got != tc.want {
 				t.Fatalf("validateTemplateShape() = %q, want %q", got, tc.want)
 			}
 		})
@@ -67,9 +83,37 @@ func TestValidateTemplateShapeComputeCeilings(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := validateTemplateShape(tc.team, systemID, tc.vcpu, tc.mem, 4096); got != tc.want {
+			if got := validateTemplateShape(tc.team.ID, systemID, legacyLimits(tc.team), tc.vcpu, tc.mem, 4096); got != tc.want {
 				t.Fatalf("validateTemplateShape() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestTemplateShapeDefaultsStayWithinTeamLimits(t *testing.T) {
+	team, systemID := uuid.New(), uuid.New()
+	small := teamLimits{MaxVCPU: 1, MaxMemoryMiB: 512, MaxDiskMiB: 2048}
+	two := int32(2)
+	cases := []struct {
+		name    string
+		team    uuid.UUID
+		limits  teamLimits
+		vcpu    *int32
+		want    [3]int32
+		invalid bool
+	}{
+		{"legacy defaults", team, legacyLimits(db.Team{ID: team}), nil, [3]int32{1, 1024, 4096}, false},
+		{"capped at a smaller plan", team, small, nil, [3]int32{1, 512, 2048}, false},
+		{"explicit sizes are not capped", team, small, &two, [3]int32{2, 512, 2048}, true},
+		{"system team keeps the defaults", systemID, small, nil, [3]int32{1, 1024, 4096}, false},
+	}
+	for _, tc := range cases {
+		vcpu, mem, disk := templateShape(tc.team, systemID, tc.limits, tc.vcpu, nil, nil)
+		if got := [3]int32{vcpu, mem, disk}; got != tc.want {
+			t.Errorf("%s: shape = %v, want %v", tc.name, got, tc.want)
+		}
+		if msg := validateTemplateShape(tc.team, systemID, tc.limits, vcpu, mem, disk); (msg != "") != tc.invalid {
+			t.Errorf("%s: validation = %q", tc.name, msg)
+		}
 	}
 }

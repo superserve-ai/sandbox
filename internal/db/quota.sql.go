@@ -52,6 +52,33 @@ func (q *Queries) ClearQuotaAlert(ctx context.Context, arg ClearQuotaAlertParams
 	return err
 }
 
+const getTeamEffectiveLimits = `-- name: GetTeamEffectiveLimits :one
+SELECT max_concurrent::int AS max_concurrent, max_vcpu::int AS max_vcpu, max_memory_mib::int AS max_memory_mib,
+    max_disk_mib::int AS max_disk_mib, max_templates::int AS max_templates
+FROM team_effective_limits($1::uuid)
+`
+
+type GetTeamEffectiveLimitsRow struct {
+	MaxConcurrent int32 `json:"max_concurrent"`
+	MaxVcpu       int32 `json:"max_vcpu"`
+	MaxMemoryMib  int32 `json:"max_memory_mib"`
+	MaxDiskMib    int32 `json:"max_disk_mib"`
+	MaxTemplates  int32 `json:"max_templates"`
+}
+
+func (q *Queries) GetTeamEffectiveLimits(ctx context.Context, teamID uuid.UUID) (GetTeamEffectiveLimitsRow, error) {
+	row := q.db.QueryRow(ctx, getTeamEffectiveLimits, teamID)
+	var i GetTeamEffectiveLimitsRow
+	err := row.Scan(
+		&i.MaxConcurrent,
+		&i.MaxVcpu,
+		&i.MaxMemoryMib,
+		&i.MaxDiskMib,
+		&i.MaxTemplates,
+	)
+	return i, err
+}
+
 const getTeamNotifyEmail = `-- name: GetTeamNotifyEmail :one
 SELECT p.email
 FROM team_member tm
@@ -192,9 +219,10 @@ SELECT
     t.name,
     COALESCE(sc.active_sandbox_count, 0)::int AS active_sandbox_count,
     t.max_sandboxes,
-    t.max_templates,
+    lim.max_templates::int AS max_templates,
     COALESCE(tpl.cnt, 0)::int AS template_count
 FROM team t
+CROSS JOIN LATERAL team_effective_limits(t.id) lim
 LEFT JOIN team_active_sandbox_counts sc ON sc.team_id = t.id
 LEFT JOIN (
     SELECT team_id, COUNT(*) AS cnt
@@ -210,7 +238,7 @@ type ListTeamQuotaUsageRow struct {
 	Name               string    `json:"name"`
 	ActiveSandboxCount int32     `json:"active_sandbox_count"`
 	MaxSandboxes       int32     `json:"max_sandboxes"`
-	MaxTemplates       *int32    `json:"max_templates"`
+	MaxTemplates       int32     `json:"max_templates"`
 	TemplateCount      int32     `json:"template_count"`
 }
 

@@ -253,6 +253,9 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 			return tx.Commit(ctx)
 		}
 		contract, err = q.CreateCommercialContract(ctx, db.CreateCommercialContractParams{TeamID: choice.Team, OfferKey: choice.Offer, StartsAt: time.Unix(anchor, 0), CustomerID: sub.Customer, SubscriptionID: sub.ID, BasePriceID: choice.Price, ChargeAmountCents: offer.Amount, ChargeIntervalMonths: offer.Months, EntitlementKind: "metered_usage", EntitlementAmountCents: offer.Credit, EntitlementCadence: "monthly", EntitlementAnchor: time.Unix(anchor, 0)})
+		if err == nil && offer.Limits != nil {
+			err = freezeContractLimits(ctx, tx, contract.ID, *offer.Limits)
+		}
 	}
 	if err != nil {
 		return err

@@ -212,6 +212,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.GET("/abuse/trusted-identities", h.ListPlatformAbuseTrustedIdentities)
 		operator.POST("/abuse/trusted-identities", h.AddPlatformAbuseTrustedIdentity)
 		operator.POST("/abuse/trusted-identities/:identity_id/revoke", h.RevokePlatformAbuseTrustedIdentity)
+		operator.POST("/billing/catalog/plans", h.CreatePlanVersionDraft)
+		operator.PUT("/billing/catalog/plans/:version_id", h.UpdatePlanVersionDraft)
+		operator.DELETE("/billing/catalog/plans/:version_id", h.DeletePlanVersionDraft)
+		operator.POST("/billing/catalog/plans/:version_id/publish", h.PublishPlanVersion)
+		operator.POST("/billing/catalog/plans/:version_id/retire", h.RetirePlanVersion)
+		operator.POST("/billing/pricing-version", h.SetPlatformPricingVersion)
 	}
 
 	machineAdministration := operator.Group("/machine-identity", machineAdministrationAuthorization())
@@ -244,6 +250,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/teams/:team_id/sandboxes", h.ListPlatformTeamSandboxes)
 		internal.GET("/teams/:team_id/sandboxes/:sandbox_id", h.GetPlatformTeamSandbox)
 		internal.GET("/billing", h.ListPlatformBilling)
+		internal.GET("/billing/catalog", h.GetPlatformBillingCatalog)
+		internal.GET("/billing/catalog/preview", h.PreviewPlanSchedule)
+		internal.GET("/billing/pricing-version", h.GetPlatformPricingVersion)
 		internal.GET("/teams/:team_id/billing/usage", h.GetPlatformTeamBillingUsage)
 		internal.GET("/teams/:team_id/billing/periods", h.ListPlatformTeamBillingPeriods)
 		internal.POST("/billing/cutover", h.EstablishBillingCutover)

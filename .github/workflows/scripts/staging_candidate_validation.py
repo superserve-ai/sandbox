@@ -194,14 +194,23 @@ def check_history(rows, root, policy=None):
             require(name == source_name and actual == expected, 'Stored migration SQL differs from reviewed source')
 
 
-COHORT_SQL = """
+# Paid plans are every catalog offer once the plan catalog exists. Validation
+# also runs before that migration is applied, when only the Pro offers exist.
+PAID_OFFERS_SQL = {
+    True: "SELECT offer_key FROM billing_plan",
+    False: "VALUES ('pro_monthly'),('pro_annual')",
+}
+
+
+def cohort_sql(has_catalog):
+    return f"""
 SELECT c.id::text,c.team_id::text,c.offer_key,c.starts_at::text,c.ends_at::text,
  c.entitlement_anchor::text,c.customer_id,c.subscription_id,
  EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=c.id
   AND e.state='issued' AND e.period_start<=now() AND e.period_end>now()) AS current_issued,
  (SELECT count(*) FROM billing_usage_entitlement e WHERE e.contract_id=c.id AND e.state<>'issued') AS unresolved
 FROM billing_commercial_contract c
-WHERE c.status='active' AND c.offer_key IN ('pro_monthly','pro_annual','yc_2026')
+WHERE c.status='active' AND (c.offer_key='yc_2026' OR c.offer_key IN ({PAID_OFFERS_SQL[has_catalog]}))
  AND c.starts_at<=now() AND (c.ends_at IS NULL OR c.ends_at>now()) ORDER BY c.id
 """
 
@@ -217,7 +226,8 @@ def database_state(url, root, *, applied=False, policy=None):
                 'Database execution settings unavailable')
         require(snapshot_reference_index.check(conn), 'Unrelated index preparation required')
         rows = [list(row) for row in conn.execute('SELECT version,name,statements FROM supabase_migrations.schema_migrations ORDER BY version')]
-        cohort = [list(row) for row in conn.execute(COHORT_SQL)]
+        has_catalog = conn.execute("SELECT to_regclass('public.billing_plan') IS NOT NULL").fetchone()[0]
+        cohort = [list(row) for row in conn.execute(cohort_sql(has_catalog))]
         operations = [list(row) for row in conn.execute(
             "SELECT id::text,team_id::text,state,resource_terms,customer_id,subscription_id,"
             "starts_at::text,ends_at::text,revoked_at::text,cancel_pending FROM billing_yc_operation "

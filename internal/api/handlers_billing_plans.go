@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
 )
 
@@ -15,6 +14,8 @@ type billingPlanLimits struct {
 	MaxTemplateDiskMiB   *int32 `json:"max_template_disk_mib"`
 }
 
+// billingPlan is a purchasable offer, in the shape the plan catalog first
+// published.
 type billingPlan struct {
 	Key                string            `json:"key"`
 	Family             string            `json:"family"`
@@ -25,39 +26,144 @@ type billingPlan struct {
 	Limits             billingPlanLimits `json:"limits"`
 }
 
-// GetPublicBillingPlans lists the plans new customers can buy in this
-// environment. Like public pricing it is unauthenticated so signup pages
-// render from the catalog.
+type billingPlanPrice struct {
+	OfferKey               string `json:"offer_key"`
+	PriceCents             int64  `json:"price_cents"`
+	MonthlyEquivalentCents int64  `json:"monthly_equivalent_cents"`
+	Available              bool   `json:"available"`
+}
+
+type billingPlanAllowance struct {
+	planAllowance
+	Summary string `json:"summary"`
+}
+
+type billingPlanCard struct {
+	Family             string                `json:"family"`
+	Version            int32                 `json:"version"`
+	Kind               string                `json:"kind"`
+	Name               string                `json:"name"`
+	PriceLabel         string                `json:"price_label"`
+	Tagline            string                `json:"tagline"`
+	Features           []string              `json:"features"`
+	DisplayOnly        bool                  `json:"display_only"`
+	Monthly            *billingPlanPrice     `json:"monthly"`
+	Annual             *billingPlanPrice     `json:"annual"`
+	CreditSummary      string                `json:"credit_summary"`
+	MonthlyCreditCents *int64                `json:"monthly_credit_cents"`
+	Allowance          *billingPlanAllowance `json:"allowance"`
+	Matching           *planMatching         `json:"matching"`
+	Limits             planLimits            `json:"limits"`
+}
+
+func allowanceSummary(a *planAllowance) string {
+	if a == nil {
+		return ""
+	}
+	period := map[string]string{"day_window": "every 24 hours", "month": "every month"}[a.Period]
+	if a.Compute != nil {
+		return formatUSDCents(a.AmountCents) + " of compute " + period
+	}
+	return formatUSDCents(a.AmountCents) + " of usage included " + period
+}
+
+func (h *Handlers) planCard(v planVersion, allowance *planAllowance) billingPlanCard {
+	card := billingPlanCard{Family: v.Family, Version: v.Version, Kind: v.Kind, Name: v.DisplayName, PriceLabel: v.PriceLabel, Tagline: v.Tagline,
+		Features: v.Features, DisplayOnly: v.DisplayOnly, CreditSummary: planCreditSummary(v.CreditSchedule), Matching: v.Matching, Limits: v.Limits}
+	if allowance != nil {
+		card.Allowance = &billingPlanAllowance{planAllowance: *allowance, Summary: allowanceSummary(allowance)}
+	}
+	if credit, uniform := uniformMonthlyCredit(v.CreditSchedule); uniform {
+		card.MonthlyCreditCents = &credit
+	}
+	priced := func(months int32, key string) bool {
+		return v.sellable() && h.planPriced(planTerms{OfferKey: key, Version: v.Version, PricingVersion: v.PricingVersion, IntervalMonths: months})
+	}
+	if v.MonthlyFeeCents != nil {
+		card.Monthly = &billingPlanPrice{OfferKey: v.Family + "_monthly", PriceCents: *v.MonthlyFeeCents, MonthlyEquivalentCents: *v.MonthlyFeeCents, Available: priced(1, v.Family+"_monthly")}
+	}
+	if v.AnnualFeeCents != nil {
+		card.Annual = &billingPlanPrice{OfferKey: v.Family + "_annual", PriceCents: *v.AnnualFeeCents, MonthlyEquivalentCents: *v.AnnualFeeCents / 12, Available: priced(12, v.Family+"_annual")}
+	}
+	return card
+}
+
+// purchasablePlans lists the offers new customers can check out.
+func purchasablePlans(cards []billingPlanCard) []billingPlan {
+	plans := []billingPlan{}
+	for _, card := range cards {
+		for _, price := range []*billingPlanPrice{card.Monthly, card.Annual} {
+			if price == nil || !price.Available || card.MonthlyCreditCents == nil || card.Limits.MaxConcurrent == nil {
+				continue
+			}
+			months := int32(1)
+			if price == card.Annual {
+				months = 12
+			}
+			plans = append(plans, billingPlan{Key: price.OfferKey, Family: card.Family, Name: card.Name, IntervalMonths: months, PriceCents: price.PriceCents,
+				MonthlyCreditCents: *card.MonthlyCreditCents, Limits: billingPlanLimits{MaxSandboxes: *card.Limits.MaxConcurrent, MaxTemplateVCPU: card.Limits.MaxVCPU,
+					MaxTemplateMemoryMiB: card.Limits.MaxMemoryMiB, MaxTemplateDiskMiB: card.Limits.MaxDiskMiB}})
+		}
+	}
+	return plans
+}
+
+// GetPublicBillingPlans returns the live pricing model and its public plan
+// cards. Like public pricing it is unauthenticated so the website and signup
+// pages render from the catalog.
 func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 	if h.Pool == nil {
 		respondErrorMsg(c, "service_unavailable", "plans are not available", http.StatusServiceUnavailable)
 		return
 	}
-	rows, err := h.Pool.Query(c.Request.Context(), `SELECT p.offer_key,p.family,p.display_name,p.charge_interval_months,p.charge_amount_cents,p.monthly_credit_cents,
- l.max_sandboxes,l.max_template_vcpu,l.max_template_memory_mib,l.max_template_disk_mib
- FROM billing_plan p JOIN plan_limits l USING(offer_key) WHERE p.available ORDER BY p.sort_order,p.offer_key`)
+	ctx := c.Request.Context()
+	state, err := h.publicPricingState(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("read pricing version failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	rows, err := h.Pool.Query(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE state='published' AND public AND pricing_version=$1 ORDER BY sort_order,family`, state.Version)
 	if err != nil {
 		log.Error().Err(err).Msg("list billing plans failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	all, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (billingPlan, error) {
-		var p billingPlan
-		err := row.Scan(&p.Key, &p.Family, &p.Name, &p.IntervalMonths, &p.PriceCents, &p.MonthlyCreditCents,
-			&p.Limits.MaxSandboxes, &p.Limits.MaxTemplateVCPU, &p.Limits.MaxTemplateMemoryMiB, &p.Limits.MaxTemplateDiskMiB)
-		return p, err
-	})
-	if err != nil {
-		log.Error().Err(err).Msg("list billing plans failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	plans := []billingPlan{}
-	for _, p := range all {
-		if h.Config != nil && h.Config.PlanPriceID(p.Key) != "" {
-			plans = append(plans, p)
+	var versions []planVersion
+	for rows.Next() {
+		v, err := scanPlanVersion(rows)
+		if err != nil {
+			rows.Close()
+			log.Error().Err(err).Msg("list billing plans failed")
+			respondError(c, ErrInternal)
+			return
 		}
+		versions = append(versions, v)
 	}
-	c.Header("Cache-Control", publicPricingCacheControl)
-	c.JSON(http.StatusOK, gin.H{"plans": plans})
+	if err = rows.Err(); err != nil {
+		log.Error().Err(err).Msg("list billing plans failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	cards := []billingPlanCard{}
+	for _, v := range versions {
+		allowance, err := h.resolveAllowance(ctx, v.Allowance)
+		if err != nil {
+			log.Error().Err(err).Msg("price plan allowance failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		card := h.planCard(v, allowance)
+		if !state.EntryOpen && !state.LegacyOpen {
+			if card.Monthly != nil {
+				card.Monthly.Available = false
+			}
+			if card.Annual != nil {
+				card.Annual.Available = false
+			}
+		}
+		cards = append(cards, card)
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"pricing_version": state.Version, "cards": cards, "plans": purchasablePlans(cards)})
 }

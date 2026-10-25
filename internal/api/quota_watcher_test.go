@@ -40,8 +40,8 @@ func TestComputeQuotaAlerts(t *testing.T) {
 	rows := []db.ListTeamQuotaUsageRow{
 		{ID: atThreshold, Name: "at", ActiveSandboxCount: 80, MaxSandboxes: 100},
 		{ID: below, Name: "below", ActiveSandboxCount: 79, MaxSandboxes: 100, TemplateCount: 1},
-		{ID: tmplDefault, Name: "tdefault", MaxSandboxes: 100, TemplateCount: 8}, // MaxTemplates nil -> default
-		{ID: tmplOverride, Name: "toverride", MaxSandboxes: 100, MaxTemplates: ptrInt32(200), TemplateCount: 10},
+		{ID: tmplDefault, Name: "tdefault", MaxSandboxes: 100, MaxTemplates: 10, TemplateCount: 8},
+		{ID: tmplOverride, Name: "toverride", MaxSandboxes: 100, MaxTemplates: 200, TemplateCount: 10},
 		{ID: zeroLimit, Name: "zero", ActiveSandboxCount: 5, MaxSandboxes: 0},
 	}
 
