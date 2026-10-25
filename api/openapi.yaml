@@ -95,6 +95,34 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/plans/public:
+    get:
+      operationId: getPublicBillingPlans
+      tags: [Billing]
+      summary: List purchasable subscription plans
+      description: |
+        Returns the subscription plans new customers can currently buy, with
+        their price, included monthly usage credit, and resource limits. This
+        endpoint is unauthenticated so signup pages can render from the same
+        plan catalog used by checkout.
+      responses:
+        "200":
+          description: Purchasable subscription plans
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlansResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          description: Plans are not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /billing/summary:
     get:
       operationId: getBillingSummary
@@ -399,7 +427,7 @@ paths:
       operationId: createStripeCheckoutSession
       tags: [Billing]
       summary: Create a Stripe Checkout session
-      description: Pro offers are available only during uncommitted new-team onboarding. Checkout completion is followed by authoritative payment verification.
+      description: Plan offers are available only during uncommitted new-team onboarding. Checkout completion is followed by authoritative payment verification.
       security:
         - apiKey: []
       requestBody:
@@ -412,9 +440,10 @@ paths:
               properties:
                 offer:
                   type: string
-                  enum: [free, pro_monthly, pro_annual]
+                  pattern: "^(free|[a-z][a-z0-9]*_(monthly|annual))$"
                   default: free
-                  description: Backend-owned offer key; price IDs are never accepted from the caller.
+                  example: pro_monthly
+                  description: Backend-owned offer key, `free` or an available plan from `GET /billing/plans/public`; price IDs are never accepted from the caller.
                 success_url:
                   type: string
                   format: uri
@@ -429,7 +458,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/BillingSessionResponse"
         "202":
-          description: Provider outcome is uncertain; use Pro recovery before another purchase or plan selection.
+          description: Provider outcome is uncertain; use plan purchase recovery before another purchase or plan selection.
         "409":
           description: Plan already committed or a purchase is awaiting confirmation.
         "400":
@@ -536,7 +565,7 @@ paths:
       operationId: commitFreeSignupPlan
       tags: [Billing]
       summary: Commit Free onboarding
-      description: Requires billing:write. Commits Free access without requiring a payment method. A pending or committed Pro purchase returns 409 and retains its payment and benefits. Enterprise sales onboarding also uses this Free access decision.
+      description: Requires billing:write. Commits Free access without requiring a payment method. A pending or committed plan purchase returns 409 and retains its payment and benefits. Enterprise sales onboarding also uses this Free access decision.
       security:
         - apiKey: []
       requestBody:
@@ -560,7 +589,7 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "409":
-          description: A Pro purchase is pending or committed
+          description: A plan purchase is pending or committed
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -568,7 +597,7 @@ paths:
     post:
       operationId: recoverProCheckout
       tags: [Billing]
-      summary: Reconcile the original Pro purchase
+      summary: Reconcile the original plan purchase
       description: Requires billing:write. Retrieves the original Checkout and verifies subscription and cash payment evidence. Restart closes an open unpaid session before allowing a new plan selection. Uncertain outcomes retain the billing fence; account access remains available.
       security:
         - apiKey: []
@@ -3390,7 +3419,7 @@ components:
       properties:
         key:
           type: string
-          description: free, pro_monthly, or pro_annual.
+          description: free, a plan catalog offer key such as pro_annual, or a managed offer such as yc_2026.
           example: pro_annual
         name:
           type: string
@@ -5001,6 +5030,52 @@ components:
           type: string
           description: Prefix-shaped sample of the proxy token issued for this provider (e.g. `sk-ant-api03-...`).
 
+    BillingPlansResponse:
+      type: object
+      required: [plans]
+      properties:
+        plans:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingPlan"
+    BillingPlan:
+      type: object
+      required: [key, family, name, interval_months, price_cents, monthly_credit_cents, limits]
+      properties:
+        key:
+          type: string
+          description: Offer key used to start checkout, e.g. `pro_monthly`.
+        family:
+          type: string
+          description: Plan family shared by its monthly and annual offers, e.g. `pro`.
+        name:
+          type: string
+        interval_months:
+          type: integer
+          enum: [1, 12]
+        price_cents:
+          type: integer
+          format: int64
+          description: Subscription price in USD cents per billing interval.
+        monthly_credit_cents:
+          type: integer
+          format: int64
+          description: Metered usage credit in USD cents included each month.
+        limits:
+          type: object
+          required: [max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib]
+          properties:
+            max_sandboxes:
+              type: integer
+            max_template_vcpu:
+              type: integer
+              nullable: true
+            max_template_memory_mib:
+              type: integer
+              nullable: true
+            max_template_disk_mib:
+              type: integer
+              nullable: true
     BillingPricingResponse:
       type: object
       required: [plan_key, plan_name, currency, rates]

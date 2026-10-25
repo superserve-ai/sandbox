@@ -16,7 +16,7 @@ var errProResourcesUnpaid = errors.New("annual usage attachment awaits verified 
 // base fee. A complete provider inventory recovers success even after request
 // idempotency expires; partial or removed inventories require explicit recovery.
 func (c *stripeHTTPClient) ensureProDeferredResources(ctx context.Context, sub invoiceSubscription, params StripeCreateCheckoutSessionParams, receipts []proPaymentEvidence) (invoiceSubscription, error) {
-	offer, err := proOfferTerms(params.Metadata["commercial_offer"])
+	offer, err := frozenProOffer(params.Metadata["commercial_offer"], params)
 	if err != nil || offer.Months != 12 || len(params.PriceIDs) != 0 || !params.Flexible || params.BasePriceID == "" || params.IdempotencyKey == "" || params.Metadata["checkout_generation"] == "" {
 		return sub, errors.New("invalid deferred annual checkout terms")
 	}

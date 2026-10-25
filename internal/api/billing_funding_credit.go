@@ -91,7 +91,7 @@ func (h *Handlers) fundingCreditResourcePrices(ctx context.Context, team uuid.UU
  SELECT COALESCE(NULLIF(a.stripe_subscription_id,''),(SELECT r.subscription_id FROM billing_plan_release r WHERE r.team_id=$1 AND r.customer_id=$2 AND r.subscription_id IS NOT NULL ORDER BY r.released_at DESC LIMIT 1)) subscription
  FROM team_billing_account a WHERE a.team_id=$1 AND a.stripe_customer_id=$2
 ), evidence AS (
- SELECT c.request_payload payload,1 priority FROM billing_signup_choice c,identity i WHERE c.team_id=$1 AND c.subscription_id=i.subscription AND c.offer_key IN ('pro_monthly','pro_annual')
+ SELECT c.request_payload payload,1 priority FROM billing_signup_choice c,identity i WHERE c.team_id=$1 AND c.subscription_id=i.subscription AND c.offer_key IN `+paidPlanOffers+`
  UNION ALL SELECT o.resource_terms,2 FROM identity i CROSS JOIN LATERAL (SELECT resource_terms FROM billing_sponsored_operation WHERE team_id=$1 AND customer_id=$2 AND subscription_id=i.subscription ORDER BY approved_at DESC,id DESC LIMIT 1) o
  UNION ALL SELECT o.resource_terms,2 FROM billing_yc_operation o,identity i WHERE o.team_id=$1 AND o.customer_id=$2 AND o.subscription_id=i.subscription
  UNION ALL SELECT r.previous_choice->'request_payload',3 FROM billing_plan_release r,identity i WHERE r.team_id=$1 AND r.customer_id=$2 AND r.subscription_id=i.subscription

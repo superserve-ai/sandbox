@@ -103,3 +103,23 @@ func TestLoadEmailTransport(t *testing.T) {
 		})
 	}
 }
+
+func TestPlanPriceIDs(t *testing.T) {
+	ids, err := planPriceIDs(" starter_monthly = price_a ,starter_annual=price_b")
+	if err != nil || len(ids) != 2 || ids["starter_monthly"] != "price_a" || ids["starter_annual"] != "price_b" {
+		t.Fatalf("ids=%v err=%v", ids, err)
+	}
+	for _, raw := range []string{"starter_monthly", "starter_monthly=", "=price_a", "starter_monthly=price_a,starter_monthly=price_b"} {
+		if _, err := planPriceIDs(raw); err == nil {
+			t.Errorf("%q: expected error", raw)
+		}
+	}
+	c := Config{StripeProAnnualPriceID: "price_pro", StripePlanPriceIDs: map[string]string{"starter_monthly": "price_a"}}
+	if c.PlanPriceID("pro_annual") != "price_pro" || c.PlanPriceID("starter_monthly") != "price_a" || c.PlanPriceID("starter_annual") != "" {
+		t.Fatal("unexpected plan price lookup")
+	}
+	c.StripePlanPriceIDs["pro_annual"] = "price_pro_repriced"
+	if c.PlanPriceID("pro_annual") != "price_pro_repriced" || c.StripeProAnnualPriceID != "price_pro" {
+		t.Fatal("a catalog Pro price must override checkout only")
+	}
+}

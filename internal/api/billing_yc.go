@@ -243,10 +243,12 @@ func (h *Handlers) ycPreflight(ctx context.Context, team uuid.UUID, in ycApprova
 	if err := client.ycMerchant(ctx, in); err != nil {
 		return params, sub, err
 	}
-	offer, err := h.proOffer("pro_annual")
-	if err != nil {
-		return params, sub, err
+	offer := legacyProOffers["pro_annual"]
+	offer.Price = h.Config.StripeProAnnualPriceID
+	if offer.Price == "" {
+		return params, sub, errors.New("Pro annual price is not configured")
 	}
+	var err error
 	if err = client.validateProPrice(ctx, offer); err != nil {
 		return params, sub, err
 	}

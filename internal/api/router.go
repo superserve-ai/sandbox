@@ -129,6 +129,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.GET("/health", h.Health)
 	// Public pricing is intentionally unauthenticated so the marketing site can render current PAYG rates from the same source as billing.
 	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
+	r.GET("/billing/plans/public", h.GetPublicBillingPlans)
 	r.POST("/stripe/webhook", h.HandleStripeWebhook)
 	r.POST("/internal/teams", TeamCreationPrivacy(), TeamCreationInternalAuth(), h.CreateInternalTeam)
 	r.POST("/internal/qm/authorize", TeamCreationPrivacy(), h.QMAuthHandler())

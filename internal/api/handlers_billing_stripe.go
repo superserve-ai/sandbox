@@ -151,6 +151,7 @@ type StripeCreateCheckoutSessionParams struct {
 	BasePriceID              string
 	DeferredResourcePriceIDs []string                      `json:",omitempty"`
 	ResourceTerms            []StripeCheckoutResourceTerms `json:",omitempty"`
+	PlanTerms                *StripeCheckoutPlanTerms      `json:",omitempty"`
 	Flexible                 bool
 	CustomerID               string
 	SuccessURL               string
@@ -160,6 +161,14 @@ type StripeCreateCheckoutSessionParams struct {
 	PriceIDs                 []string
 	IdempotencyKey           string
 	ExpiresAt                *time.Time
+}
+
+// StripeCheckoutPlanTerms freezes the catalog terms a purchase started with.
+// It is recorded with the request and never sent to Stripe.
+type StripeCheckoutPlanTerms struct {
+	Amount int64
+	Months int32
+	Credit int64
 }
 
 type StripeCheckoutSession struct {
@@ -1652,7 +1661,7 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 	}
 	if h.Pool != nil {
 		var proPending bool
-		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN ('pro_monthly','pro_annual'))`, teamID).Scan(&proPending); err != nil {
+		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, teamID).Scan(&proPending); err != nil {
 			respondError(c, ErrInternal)
 			return
 		}

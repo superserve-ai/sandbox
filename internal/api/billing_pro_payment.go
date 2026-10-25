@@ -196,11 +196,10 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 	if !current.Generation.Equal(choice.Generation) || current.Offer != choice.Offer || derefString(a.StripeCustomerID) != sub.Customer || (current.Subscription != nil && *current.Subscription != sub.ID) {
 		return errors.New("Pro association changed during verification")
 	}
-	offer, err := proOfferTerms(choice.Offer)
+	offer, err := choice.frozenOffer()
 	if err != nil {
 		return err
 	}
-	offer.Price = choice.Price
 	var start, end int64
 	if resourcesReady {
 		start, end, err = proMeteredPeriod(sub, offer)
@@ -253,7 +252,7 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 		if ended {
 			return tx.Commit(ctx)
 		}
-		contract, err = q.CreateCommercialContract(ctx, db.CreateCommercialContractParams{TeamID: choice.Team, OfferKey: choice.Offer, StartsAt: time.Unix(anchor, 0), CustomerID: sub.Customer, SubscriptionID: sub.ID, BasePriceID: choice.Price, ChargeAmountCents: offer.Amount, ChargeIntervalMonths: offer.Months, EntitlementKind: "metered_usage", EntitlementAmountCents: 100000, EntitlementCadence: "monthly", EntitlementAnchor: time.Unix(anchor, 0)})
+		contract, err = q.CreateCommercialContract(ctx, db.CreateCommercialContractParams{TeamID: choice.Team, OfferKey: choice.Offer, StartsAt: time.Unix(anchor, 0), CustomerID: sub.Customer, SubscriptionID: sub.ID, BasePriceID: choice.Price, ChargeAmountCents: offer.Amount, ChargeIntervalMonths: offer.Months, EntitlementKind: "metered_usage", EntitlementAmountCents: offer.Credit, EntitlementCadence: "monthly", EntitlementAnchor: time.Unix(anchor, 0)})
 	}
 	if err != nil {
 		return err

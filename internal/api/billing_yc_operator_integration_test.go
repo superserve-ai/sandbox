@@ -4,6 +4,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -31,6 +32,26 @@ func TestYCOperatorComputeOnlyCredits(t *testing.T) {
 		t.Run(fmt.Sprint(existing), func(t *testing.T) { runYCOperatorAdoption(t, existing, "card", false, true) })
 	}
 }
+
+var ycOperatorPlanPrices map[string]string
+
+// Repricing Pro annual moves catalog checkout to a new Stripe price; YC keeps
+// STRIPE_PRO_ANNUAL_PRICE_ID at the fixed YC amount.
+func TestYCOperatorAdoptionIgnoresPlanCatalogRepricing(t *testing.T) {
+	fixture := newEntitlementFixture(t, true, true)
+	if _, err := fixture.h.Pool.Exec(t.Context(), `UPDATE billing_plan SET charge_amount_cents=1500000 WHERE offer_key='pro_annual'`); err != nil {
+		t.Fatal(err)
+	}
+	ycOperatorPlanPrices = map[string]string{"pro_annual": "price_pro_annual_repriced"}
+	t.Cleanup(func() {
+		ycOperatorPlanPrices = nil
+		if _, err := fixture.h.Pool.Exec(context.Background(), `UPDATE billing_plan SET charge_amount_cents=1200000 WHERE offer_key='pro_annual'`); err != nil {
+			t.Error(err)
+		}
+	})
+	runYCOperatorAdoption(t, false, "card")
+}
+
 func TestYCOperatorLinkAdoption(t *testing.T) { runYCOperatorAdoption(t, true, "link") }
 
 func TestYCOperatorLinkCreatesSubscriptionOnce(t *testing.T) {
@@ -102,7 +123,7 @@ func runYCOperatorAdoptionWithRecoveryFailure(t *testing.T, existing bool, metho
 	sub.Items.Data[0].End = ycAnnualEnd(anchor).Unix()
 	sub.Items.Data[0].Price.Active = true
 	p.ResourceTerms = nil
-	h.Config = &config.Config{TeamCreationRegion: "use", StripeProAnnualPriceID: p.BasePriceID, BillingUsageEntitlementsEnabled: true}
+	h.Config = &config.Config{TeamCreationRegion: "use", StripeProAnnualPriceID: p.BasePriceID, StripePlanPriceIDs: ycOperatorPlanPrices, BillingUsageEntitlementsEnabled: true}
 	prices := map[string]storagePrice{p.BasePriceID: sub.Items.Data[0].Price}
 	rates, err := h.DB.ListActivePricingRatesForTeam(t.Context(), db.ListActivePricingRatesForTeamParams{TeamID: team.ID, EffectiveAt: now})
 	if err != nil {
