@@ -344,6 +344,16 @@ type BackupWalk struct {
 	StartedAt time.Time `json:"started_at"`
 }
 
+type BillingCommercialCheckoutAttempt struct {
+	ID            uuid.UUID          `json:"id"`
+	TeamID        uuid.UUID          `json:"team_id"`
+	State         string             `json:"state"`
+	CreatedAt     time.Time          `json:"created_at"`
+	PreparedUntil time.Time          `json:"prepared_until"`
+	DispatchedAt  pgtype.Timestamptz `json:"dispatched_at"`
+	CustomerID    *string            `json:"customer_id"`
+}
+
 type BillingCommercialContract struct {
 	ID                     uuid.UUID          `json:"id"`
 	TeamID                 uuid.UUID          `json:"team_id"`
@@ -369,6 +379,76 @@ type BillingCommercialContract struct {
 	CollectionEvidence          []byte             `json:"collection_evidence"`
 	Revision                    int64              `json:"revision"`
 	CreatedAt                   time.Time          `json:"created_at"`
+}
+
+type BillingCommercialOfferActivation struct {
+	AssignmentID    uuid.UUID `json:"assignment_id"`
+	TeamID          uuid.UUID `json:"team_id"`
+	ContractID      uuid.UUID `json:"contract_id"`
+	MerchantAccount string    `json:"merchant_account"`
+	LiveMode        bool      `json:"live_mode"`
+	Anchor          time.Time `json:"anchor"`
+	EndsAt          time.Time `json:"ends_at"`
+	MaterializedAt  time.Time `json:"materialized_at"`
+}
+
+type BillingCommercialOfferAssignment struct {
+	ID              uuid.UUID   `json:"id"`
+	TeamID          uuid.UUID   `json:"team_id"`
+	ApprovalID      uuid.UUID   `json:"approval_id"`
+	CompanyIdentity string      `json:"company_identity"`
+	HomeRegion      string      `json:"home_region"`
+	OfferKey        string      `json:"offer_key"`
+	OfferVersion    int32       `json:"offer_version"`
+	IdempotencyKey  string      `json:"idempotency_key"`
+	RateCardKey     string      `json:"rate_card_key"`
+	RateIds         []uuid.UUID `json:"rate_ids"`
+	PricingAt       time.Time   `json:"pricing_at"`
+	ResourceRates   []byte      `json:"resource_rates"`
+	Request         []byte      `json:"request"`
+	AssignedBy      uuid.UUID   `json:"assigned_by"`
+	Reason          string      `json:"reason"`
+	Reference       string      `json:"reference"`
+	AssignedAt      time.Time   `json:"assigned_at"`
+}
+
+type BillingCommercialOfferAudit struct {
+	ID           uuid.UUID   `json:"id"`
+	TeamID       uuid.UUID   `json:"team_id"`
+	ActorID      uuid.UUID   `json:"actor_id"`
+	Action       string      `json:"action"`
+	AssignmentID pgtype.UUID `json:"assignment_id"`
+	ObservedAt   time.Time   `json:"observed_at"`
+}
+
+type BillingCommercialOfferPeriod struct {
+	AssignmentID    uuid.UUID `json:"assignment_id"`
+	TeamID          uuid.UUID `json:"team_id"`
+	MonthOffset     int32     `json:"month_offset"`
+	StartsAt        time.Time `json:"starts_at"`
+	EndsAt          time.Time `json:"ends_at"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	AmountCents     int64     `json:"amount_cents"`
+	AllowanceSource string    `json:"allowance_source"`
+}
+
+type BillingCommercialOfferVersion struct {
+	OfferKey               string    `json:"offer_key"`
+	Version                int32     `json:"version"`
+	RateCardKey            string    `json:"rate_card_key"`
+	PlanTier               string    `json:"plan_tier"`
+	Currency               string    `json:"currency"`
+	TermMonths             int32     `json:"term_months"`
+	ChargeAmountCents      int64     `json:"charge_amount_cents"`
+	ChargeIntervalMonths   int32     `json:"charge_interval_months"`
+	InitialFeeWaived       bool      `json:"initial_fee_waived"`
+	PaymentRequirement     string    `json:"payment_requirement"`
+	DefaultSuccessorFamily string    `json:"default_successor_family"`
+	AllowanceSource        string    `json:"allowance_source"`
+	MonthlyAllowanceCents  []int64   `json:"monthly_allowance_cents"`
+	Rollover               bool      `json:"rollover"`
+	Proration              bool      `json:"proration"`
+	PublishedAt            time.Time `json:"published_at"`
 }
 
 type BillingContractEntitlementSchedule struct {
