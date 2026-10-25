@@ -9,5 +9,5 @@ import (
 
 // RequireBillingEligibleForTest exercises the create/resume gate with a fresh handler.
 func RequireBillingEligibleForTest(h *Handlers, c *gin.Context, teamID uuid.UUID) bool {
-	return h.requireBillingEligible(c, teamID)
+	return h.requireSandboxAdmission(c, teamID)
 }

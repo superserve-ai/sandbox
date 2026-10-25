@@ -969,7 +969,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondErrorMsg(c, "abuse_denied", "Sandbox operation is not permitted", http.StatusForbidden)
 		return "", false
 	}
-	if !h.requireBillingEligible(c, teamID) {
+	if !h.requireSandboxAdmission(c, teamID) {
 		return "", false
 	}
 
@@ -993,6 +993,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	if errors.Is(err, pgx.ErrNoRows) && claimParams.MachinePrincipalID.Valid && !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
 		return "", false
 	}
+
 	if err == pgx.ErrNoRows && settled != nil {
 		// The caller's wait is its lookup, not this claim.
 		tWait := time.Now()
@@ -1004,6 +1005,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		claimed, err = h.DB.ClaimResume(c.Request.Context(), claimParams)
 	}
 	if err != nil {
+		if respondSandboxAdmissionError(c, err) {
+			return "", false
+		}
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
 			// in paused state. Surface as conflict; client retries.
@@ -3154,7 +3158,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
-	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) || !h.requireBillingEligible(c, teamID) {
+	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) {
+		return
+	}
+	if !h.requireSandboxAdmission(c, teamID) {
 		return
 	}
 
@@ -3226,6 +3233,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			deltaDir = filepath.Dir(deltaPath)
 		}
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
+
 		imageVcpu = uint32(tpl.Vcpu)
 		imageMemMiB = uint32(tpl.MemoryMib)
 		fromTemplateName = tpl.Name
@@ -3261,6 +3269,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			respondErrorMsg(c, "conflict", fmt.Sprintf("a %q snapshot cannot create a sandbox yet", snap.Kind), http.StatusConflict)
 			return
 		}
+
 		source = snap
 		basePath = snap.BasePath
 		imageVcpu, imageMemMiB = uint32(snap.VcpuCount), uint32(snap.MemoryMib)
@@ -3745,6 +3754,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			respondSourceGone()
 			return
 		}
+		if respondSandboxAdmissionError(c, dbErr) {
+			return
+		}
 		if quotaExceeded {
 			h.respondQuotaExceeded(c, teamID)
 			return
@@ -3769,6 +3781,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		l.Error().Err(dbErr).Str("reason", transientReason).Msg("CreateSandbox: INSERT failed")
 		if sourceRace {
 			respondSourceGone()
+			return
+		}
+		if respondSandboxAdmissionError(c, dbErr) {
 			return
 		}
 		if quotaExceeded {

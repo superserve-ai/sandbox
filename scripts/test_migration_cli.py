@@ -94,5 +94,30 @@ class MigrationCLITest(unittest.TestCase):
         self.assert_no_pending_migrations()
 
 
+class BillingRolesMigrationCLITest(MigrationCLITest):
+    test_fresh_database = None
+
+    def test_fresh_database_with_billing_roles(self):
+        self.sql("CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role")
+        self.copy_migrations()
+        self.push()
+        tables = ("billing_pro_upgrade_setup", "billing_pro_upgrade",
+                  "billing_pro_upgrade_catchup", "billing_pro_released_invoice")
+        for table in tables:
+            with self.subTest(table=table):
+                self.assertEqual(self.sql(
+                    f"SELECT relrowsecurity FROM pg_class WHERE oid='public.{table}'::regclass"), "t")
+                for role in ("anon", "authenticated", "service_role"):
+                    for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                        expected = "t" if role == "service_role" and privilege != "DELETE" else "f"
+                        self.assertEqual(self.sql(
+                            f"SELECT has_table_privilege('{role}','public.{table}','{privilege}')"), expected)
+                self.assertEqual(self.sql(
+                    "SELECT count(*) FROM pg_policies WHERE schemaname='public' "
+                    f"AND tablename='{table}' AND roles=ARRAY['service_role']::name[] "
+                    "AND cmd='ALL' AND qual='true' AND with_check='true'"), "1")
+        self.assert_no_pending_migrations()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

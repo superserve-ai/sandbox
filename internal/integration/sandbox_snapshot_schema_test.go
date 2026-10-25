@@ -275,3 +275,35 @@ func TestSandboxSnapshotInsertDoesNotBlockSandboxCreate(t *testing.T) {
 		t.Fatalf("sandbox insert blocked behind an open snapshot insert: %v", err)
 	}
 }
+
+func TestSandboxSnapshotInsertDoesNotBlockFreeAdmission(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	team, _ := seedTeamAndKey(t)
+	source := seedPausedSandbox(t, team)
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET vcpu_count=1,memory_mib=1024,disk_mib=4096 WHERE id=$1`, source); err != nil {
+		t.Fatal(err)
+	}
+	assignFreePlan(t, team, time.Now())
+	capture, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer capture.Rollback(context.Background())
+	if _, err := capture.Exec(ctx, `INSERT INTO sandbox_snapshot(team_id,sandbox_id,kind,host_id,vcpu_count,memory_mib,disk_mib,base_path) VALUES($1,$2,'fs','default',1,1024,4096,'/base.ext4')`, team, source); err != nil {
+		t.Fatal(err)
+	}
+	admitted, err := insertSandboxRow(ctx, team, "snapshot-free-admission")
+	if err != nil {
+		t.Fatalf("snapshot prevented allowed Free create: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox(team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib) VALUES($1,'snapshot-oversized','starting','default',2,1024,4096)`, team); pgCode(err) != "SS002" {
+		t.Fatalf("snapshot changed Free shape enforcement: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status='paused' WHERE id=$1`, admitted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{ID: source, TeamID: team, LockKey: source.String()}); err != nil {
+		t.Fatalf("snapshot prevented allowed Free resume: %v", err)
+	}
+}

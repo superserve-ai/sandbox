@@ -21,6 +21,9 @@ func lockSourcePromotionMigration(ctx context.Context, tx pgx.Tx, teamID uuid.UU
 	if err := checkYCClaimMigration(ctx, tx, teamID); err != nil {
 		return err
 	}
+	if err := checkProUpgradeMigration(ctx, tx, teamID); err != nil {
+		return err
+	}
 	var expanded, canonical, provenance, claims bool
 	if err := tx.QueryRow(ctx, `SELECT
 		to_regclass('public.user_promotion_entitlement') IS NOT NULL,

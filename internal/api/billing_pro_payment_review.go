@@ -76,7 +76,7 @@ func (c *stripeHTTPClient) verifyProCreditNotes(ctx context.Context, inv proPaid
 
 func (c *stripeHTTPClient) verifyProCharge(ctx context.Context, id, intent, customer string, amount int64) (json.RawMessage, error) {
 	if id == "" {
-		return nil, errors.New("paid intent is missing its charge")
+		return nil, &proPaymentReviewError{reason: "paid intent is missing its charge"}
 	}
 	var charge struct {
 		ID, Customer, Currency   string
@@ -90,7 +90,7 @@ func (c *stripeHTTPClient) verifyProCharge(ctx context.Context, id, intent, cust
 	}
 	raw, _ := json.Marshal(charge)
 	if charge.ID != id || charge.Customer != customer || charge.PaymentIntent != intent || charge.Currency != "usd" || !charge.Paid || !charge.Captured || charge.AmountCaptured < amount {
-		return raw, errors.New("charge does not prove owned captured payment")
+		return raw, &proPaymentReviewError{reason: "charge does not prove owned captured payment", evidence: raw}
 	}
 	if charge.AmountRefunded != 0 || charge.Disputed {
 		return raw, &proPaymentReviewError{reason: "base payment charge was refunded or disputed; allocation requires review", evidence: raw}

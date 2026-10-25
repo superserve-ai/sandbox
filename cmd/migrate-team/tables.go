@@ -153,6 +153,8 @@ var migratedTables = []tableSpec{
 // alone. Printed by plan and copy so the decision is visible in the runbook
 // transcript.
 var skippedTables = []struct{ name, reason string }{
+	{"billing_pro_upgrade, billing_pro_upgrade_setup, billing_pro_upgrade_catchup", "any Pro upgrade history blocks migration pending coordinated financial authority transfer"},
+	{"team_plan_change", "assigned teams and change history require coordinated scheduling, replay and provider authority transfer"},
 	{"yc_claim_team_intent", "any claim history blocks migration pending coordinated shared authority transfer"},
 	{"qm_organization_teams, qm_team_service_authority", "permanent organization authority; any matching source or destination team binding refuses every phase"},
 	{"proxy_audit", "append-only request audit; stays in the source cell"},

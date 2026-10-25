@@ -223,7 +223,7 @@ END $$;
 
 -- Both take the family lock before any row lock, so a concurrent publish and
 -- retire of one family serialize instead of deadlocking.
-CREATE FUNCTION publish_billing_plan_version(p_id uuid, p_actor uuid) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION publish_billing_plan_version(p_id uuid, p_actor uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE d billing_plan_version;
 BEGIN
     SELECT * INTO d FROM billing_plan_version WHERE id = p_id;
@@ -247,7 +247,7 @@ BEGIN
     UPDATE billing_plan_version SET state = 'published', published_by = p_actor, published_at = clock_timestamp() WHERE id = p_id;
 END $$;
 
-CREATE FUNCTION retire_billing_plan_version(p_id uuid, p_actor uuid) RETURNS void LANGUAGE plpgsql AS $$
+CREATE FUNCTION retire_billing_plan_version(p_id uuid, p_actor uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE d billing_plan_version;
 BEGIN
     SELECT * INTO d FROM billing_plan_version WHERE id = p_id;
@@ -438,7 +438,7 @@ DO $$ DECLARE r text; t text; f text; BEGIN
                 EXECUTE format('REVOKE ALL ON %I FROM %I', t, r);
                 IF r = 'service_role' THEN
                     EXECUTE format('GRANT SELECT ON %I TO service_role', t);
-                    EXECUTE format('CREATE POLICY %I ON %I TO service_role USING (true)', t || '_backend', t);
+                    EXECUTE format('CREATE POLICY %I ON %I FOR SELECT TO service_role USING (true)', t || '_backend', t);
                 END IF;
             END IF;
         END LOOP;
@@ -454,6 +454,23 @@ DO $$ DECLARE r text; t text; f text; BEGIN
             END IF;
         END LOOP;
     END LOOP;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        GRANT INSERT, DELETE ON billing_plan_version TO service_role;
+        GRANT UPDATE (kind, public, display_name, price_label, tagline, features, sort_order, display_only, self_serve,
+            monthly_fee_cents, annual_fee_cents, credit_schedule, matching_bps, cap_cents, allowance_period,
+            allowance_on_exhausted, allowance_cents, allowance_compute_seconds, allowance_compute_vcpu,
+            allowance_compute_memory_gib, max_sandboxes, max_template_vcpu, max_template_memory_mib,
+            max_template_disk_mib, max_templates) ON billing_plan_version TO service_role;
+        CREATE POLICY billing_plan_version_insert ON billing_plan_version FOR INSERT TO service_role WITH CHECK (state = 'draft');
+        CREATE POLICY billing_plan_version_update ON billing_plan_version FOR UPDATE TO service_role USING (state = 'draft') WITH CHECK (state = 'draft');
+        CREATE POLICY billing_plan_version_delete ON billing_plan_version FOR DELETE TO service_role USING (state = 'draft');
+        GRANT INSERT (actor_id, action, version_id, reason, terms) ON billing_catalog_audit TO service_role;
+        CREATE POLICY billing_catalog_audit_insert ON billing_catalog_audit FOR INSERT TO service_role WITH CHECK (true);
+        GRANT INSERT (contract_id, max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates)
+            ON billing_contract_limits TO service_role;
+        CREATE POLICY billing_contract_limits_insert ON billing_contract_limits FOR INSERT TO service_role WITH CHECK (true);
+        GRANT EXECUTE ON FUNCTION publish_billing_plan_version(uuid,uuid), retire_billing_plan_version(uuid,uuid) TO service_role;
+    END IF;
     -- Triggers and functions run as the writing role, which can be
     -- service_role, so the helpers they call stay executable for it.
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN

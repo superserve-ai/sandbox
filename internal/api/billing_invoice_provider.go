@@ -56,11 +56,13 @@ type invoiceSubscription struct {
 }
 
 type invoiceSubscriptionItem struct {
-	ID       string       `json:"id"`
-	Quantity int64        `json:"quantity"`
-	Price    storagePrice `json:"price"`
-	Start    int64        `json:"current_period_start"`
-	End      int64        `json:"current_period_end"`
+	Created  int64             `json:"created"`
+	Metadata map[string]string `json:"metadata"`
+	ID       string            `json:"id"`
+	Quantity int64             `json:"quantity"`
+	Price    storagePrice      `json:"price"`
+	Start    int64             `json:"current_period_start"`
+	End      int64             `json:"current_period_end"`
 }
 
 type invoiceAccount struct {

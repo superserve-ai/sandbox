@@ -277,6 +277,10 @@ func TestIntegration_TeamCreationRequestPrivileges(t *testing.T) {
 			if err := tx.QueryRow(ctx, `SELECT has_function_privilege(current_user, 'create_team_with_signup_trial(text,uuid,text,text)', 'EXECUTE')`).Scan(&canCreate); err != nil || canCreate != (role == "service_role") {
 				t.Fatalf("policy provisioning privilege for %s=%t err=%v", role, canCreate, err)
 			}
+			if role != "service_role" {
+				rolloutExec(t, tx, `CREATE TEMP TABLE signup_trigger_probe(id uuid) ON COMMIT DROP`)
+				localIdentityError(t, tx, "42501", `CREATE TRIGGER signup_trigger_probe AFTER INSERT ON signup_trigger_probe FOR EACH ROW EXECUTE FUNCTION public.assign_new_team_free_plan()`)
+			}
 			const insert = `INSERT INTO team_creation_requests(actor_id,cell,request_id,name,region,team_id) VALUES($1,'use',$2,'Role test team','use',$3)`
 			const recover = `SELECT r.name, r.region, CASE WHEN r.deleted_at IS NULL THEN t.id END
 				FROM team_creation_requests r LEFT JOIN team t ON t.id=r.team_id
@@ -1150,4 +1154,40 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 			t.Fatal("unavailable authority wrote profile")
 		}
 	})
+}
+
+func TestIntegration_TeamCreationServiceRoleV2Signup(t *testing.T) {
+	pool := teamCreationDatabase(t, func(pool *pgxpool.Pool) {
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role`)
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role`)
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO service_role`)
+	})
+	rolloutExec(t, pool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
+	service := teamCreationServiceRolePool(t, pool)
+	client := newTeamCreationClient(t, service)
+	created := teamCreationSnapshot(t, client.call(teamCreationClaims(uuid.New(), uuid.NewString(), "V2 service role team"), nil))
+	id := uuid.MustParse(created["id"])
+	var kind string
+	var concurrent, seconds int
+	if err := pool.QueryRow(t.Context(), `SELECT kind,(limits->>'max_concurrent')::int,(terms#>>'{allowance,compute,seconds}')::int FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, id).Scan(&kind, &concurrent, &seconds); err != nil || kind != "free" || concurrent != 1 || seconds != 7200 {
+		t.Fatalf("service signup terms: kind=%q concurrent=%d seconds=%d err=%v", kind, concurrent, seconds, err)
+	}
+	tx, err := service.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	localIdentityError(t, tx, "42501", `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	localIdentityError(t, tx, "42501", `UPDATE billing_plan_version SET display_name='Changed' WHERE family='free' AND state='published'`)
+	if err := tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, pool, `SELECT retire_billing_plan_version(id,NULL) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'`)
+	name := "missing-free-" + uuid.NewString()
+	if _, err := service.Exec(t.Context(), `INSERT INTO team(name) VALUES($1)`, name); pgCode(err) != "55000" {
+		t.Fatalf("service signup without Free: %v", err)
+	}
+	if count := teamCreationCount(t, pool, `SELECT count(*) FROM team WHERE name=$1`, name); count != 0 {
+		t.Fatalf("planless service team persisted: %d", count)
+	}
 }

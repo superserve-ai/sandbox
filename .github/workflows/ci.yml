@@ -201,7 +201,7 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
           YC_CLAIM_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
           YC_AUTHORITY_TEST_MIGRATION: ${{ github.workspace }}/supabase/shared-auth-migrations/20261016070000_yc_company_activation_authority.sql
-        run: go test -v -race -tags integration -count=1 -timeout 2m -run '^(TestYC|TestSponsored|TestEntitlement|TestInvoiceCredit|TestInvoiceDiscovery|TestEmptyCredit|TestPlanTerms|TestPlanAssignment|TestStaffPlanAssignment)' ./internal/api
+        run: go test -v -race -tags integration -count=1 -timeout 2m -run '^(TestYC|TestSponsored|TestEntitlement|TestInvoiceCredit|TestInvoiceDiscovery|TestEmptyCredit|TestPlanTerms|TestPlanAssignment|TestStaffPlanAssignment|TestTeamPlanChange)' ./internal/api
 
       - name: Run retained storage API race contracts
         env:

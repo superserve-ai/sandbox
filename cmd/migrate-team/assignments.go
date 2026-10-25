@@ -20,8 +20,44 @@ func lockSourceAssignments(ctx context.Context, tx pgx.Tx, team uuid.UUID) error
 	if _, err := tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE`, team); err != nil {
 		return fmt.Errorf("lock source assignment owner: %w", err)
 	}
-	_, err := tx.Exec(ctx, `SELECT id FROM team_plan_assignment WHERE team_id=$1 FOR UPDATE`, team)
-	return err
+	if _, err := tx.Exec(ctx, `SELECT id FROM team_plan_assignment WHERE team_id=$1 FOR UPDATE`, team); err != nil {
+		return err
+	}
+	if err := checkFreePauseTransfer(ctx, tx, team); err != nil {
+		return err
+	}
+	return refusePlanChangeMigration(ctx, tx, team)
+}
+
+func refusePlanChangeMigration(ctx context.Context, q querier, team uuid.UUID) error {
+	var unsupported bool
+	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)
+        OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=$1)`, team).Scan(&unsupported); err != nil {
+		return fmt.Errorf("check plan change migration authority: %w", err)
+	}
+	if unsupported {
+		return fmt.Errorf("assigned teams and plan change history cannot migrate until scheduling, replay and provider authority can transfer together")
+	}
+	return nil
+}
+
+func checkFreePauseTransfer(ctx context.Context, q querier, team uuid.UUID) error {
+	for _, table := range []string{"billing_free_allowance", "billing_team_pause_request", "billing_team_pause_target", "billing_free_allowance_retry", "billing_pricing_adoption_credit_hold", "billing_pricing_adoption_credit_resolution"} {
+		var exists bool
+		if err := q.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+pgx.Identifier{table}.Sanitize()+` WHERE team_id=$1)`, team).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("%s state requires coordinated Free allowance and pause authority transfer before team migration", table)
+		}
+	}
+	return nil
 }
 
 func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, spec tableSpec, team uuid.UUID, transform rowTransform) (int64, int64, error) {
@@ -130,6 +166,14 @@ func assignmentSnapshot(ctx context.Context, src querier, team uuid.UUID) ([]byt
 }
 
 func checkAssignmentReferences(ctx context.Context, src querier, dst pgx.Tx, team uuid.UUID) error {
+	for _, q := range []querier{src, dst} {
+		if err := checkFreePauseTransfer(ctx, q, team); err != nil {
+			return err
+		}
+		if err := checkProUpgradeMigration(ctx, q, team); err != nil {
+			return err
+		}
+	}
 	var contractBacked bool
 	if err := src.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND contract_id IS NOT NULL)`, team).Scan(&contractBacked); err != nil {
 		return err
@@ -168,6 +212,11 @@ func checkAssignmentReferences(ctx context.Context, src querier, dst pgx.Tx, tea
 }
 
 func requireAssignmentParity(ctx context.Context, src, dst querier, team uuid.UUID) error {
+	for _, q := range []querier{src, dst} {
+		if err := checkFreePauseTransfer(ctx, q, team); err != nil {
+			return err
+		}
+	}
 	spec := tableSpec{"team_plan_assignment", "team_id=$1"}
 	source, err := rowChecksums(ctx, src, spec, team, nil)
 	if err != nil {

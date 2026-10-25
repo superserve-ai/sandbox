@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -499,7 +500,7 @@ func TestIntegration_PlanCatalogPendingCheckoutResumesAfterRetire(t *testing.T) 
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.priceCreates) != 0 || f.creates != 2 || f.keys[0] != f.keys[1] {
+	if len(f.priceCreates) != 0 || f.creates != 1 {
 		t.Fatalf("resume changed the frozen request: creates=%d keys=%v prices=%v", f.creates, f.keys, f.priceCreates)
 	}
 }
@@ -1013,6 +1014,16 @@ func TestIntegration_PricingEntryReaderUsesRestrictedRole(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(t.Context(), `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF; END $$; GRANT USAGE ON SCHEMA public TO service_role; DROP FUNCTION billing_lock_pricing_public_state()`); err != nil {
+		t.Fatal(err)
+	}
+	migration, err := os.ReadFile("../../supabase/migrations/20261024131000_pricing_adoption_entry.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), string(migration)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := tx.Exec(t.Context(), `SET LOCAL ROLE service_role`); err != nil {
 		t.Fatal(err)
 	}

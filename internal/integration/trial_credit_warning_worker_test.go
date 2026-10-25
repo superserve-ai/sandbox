@@ -439,7 +439,7 @@ func (q warningDispatchScope) Query(ctx context.Context, sql string, args ...any
 	if strings.Contains(sql, "-- name: ListTeamsWithTrialCredits") {
 		sql = strings.ReplaceAll(sql, "WHERE g.reason =", "WHERE g.team_id = '"+q.team.String()+"'::uuid AND g.reason =")
 	}
-	if strings.Contains(sql, "-- name: ListTeamsWithActiveIneligibleSandboxes") {
+	if strings.Contains(sql, "-- name: ListTeamsWithBillingPauseDue") {
 		sql = strings.ReplaceAll(sql, "WHERE s.destroyed_at IS NULL", "WHERE s.team_id = '"+q.team.String()+"'::uuid AND s.destroyed_at IS NULL")
 	}
 	if strings.Contains(sql, "-- name: ListTrialCreditWarningTeams") {

@@ -148,11 +148,18 @@ type StripeBillingCreditGrant struct {
 }
 
 type StripeCreateCheckoutSessionParams struct {
+	ReleaseID                *uuid.UUID `json:",omitempty"`
+	OperationID              uuid.UUID  `json:",omitempty"`
+	OneOffProduct            string     `json:",omitempty"`
+	SetupOnly                bool       `json:",omitempty"`
+	OneOffAmount             int64      `json:",omitempty"`
+	OneOffName               string     `json:",omitempty"`
 	BasePriceID              string
 	DeferredResourcePriceIDs []string                      `json:",omitempty"`
 	ResourceTerms            []StripeCheckoutResourceTerms `json:",omitempty"`
 	PlanTerms                *StripeCheckoutPlanTerms      `json:",omitempty"`
 	Flexible                 bool
+	AllowPromotionCodes      bool `json:",omitempty"`
 	CustomerID               string
 	SuccessURL               string
 	CancelURL                string
@@ -166,12 +173,21 @@ type StripeCreateCheckoutSessionParams struct {
 // StripeCheckoutPlanTerms freezes the catalog terms a purchase started with.
 // It is recorded with the request and never sent to Stripe.
 type StripeCheckoutPlanTerms struct {
-	Amount    int64
-	Months    int32
-	Credit    int64
-	VersionID uuid.UUID
-	Matching  *planMatching `json:",omitempty"`
-	Limits    *planLimits   `json:",omitempty"`
+	PredecessorKnown  bool       `json:",omitempty"`
+	InitialAssignment *uuid.UUID `json:",omitempty"`
+	Amount            int64
+	Months            int32
+	Credit            int64
+	VersionID         uuid.UUID
+	Matching          *planMatching `json:",omitempty"`
+	Limits            *planLimits   `json:",omitempty"`
+	// PricingV2 purchases also freeze the plan identity they assign.
+	PricingV2   bool           `json:",omitempty"`
+	Family      string         `json:",omitempty"`
+	Version     int32          `json:",omitempty"`
+	DisplayName string         `json:",omitempty"`
+	Grants      []planGrant    `json:",omitempty"`
+	Allowance   *planAllowance `json:",omitempty"`
 }
 
 type StripeCheckoutSession struct {
@@ -476,8 +492,34 @@ func (c *stripeHTTPClient) GetCreditGrantLedgerBalance(ctx context.Context, cust
 }
 
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {
+	if params.OneOffAmount > 0 && len(params.PriceIDs) > 0 {
+		return StripeCheckoutSession{}, errors.New("one-off Checkout cannot include recurring items")
+	}
+	if params.SetupOnly && (params.OneOffAmount != 0 || len(params.PriceIDs) > 0 || params.BasePriceID != "") {
+		return StripeCheckoutSession{}, errors.New("card setup Checkout cannot include payment items")
+	}
 	form := url.Values{}
 	form.Set("mode", "subscription")
+	if params.SetupOnly {
+		form.Set("mode", "setup")
+		form.Set("payment_method_types[0]", "card")
+	}
+	if params.OneOffAmount > 0 {
+		form.Set("mode", "payment")
+		form.Set("payment_method_types[0]", "card")
+		form.Set("payment_intent_data[setup_future_usage]", "off_session")
+		form.Set("invoice_creation[enabled]", "true")
+		form.Set("line_items[0][price_data][currency]", "usd")
+		form.Set("line_items[0][price_data][unit_amount]", strconv.FormatInt(params.OneOffAmount, 10))
+		if params.OneOffProduct != "" {
+			form.Set("line_items[0][price_data][product]", params.OneOffProduct)
+		} else {
+			form.Set("line_items[0][price_data][product_data][name]", params.OneOffName)
+		}
+		form.Set("custom_text[submit][message]", params.OneOffName)
+		form.Set("invoice_creation[invoice_data][description]", params.OneOffName)
+		form.Set("line_items[0][quantity]", "1")
+	}
 	form.Set("customer", params.CustomerID)
 	form.Set("success_url", params.SuccessURL)
 	form.Set("cancel_url", params.CancelURL)
@@ -487,15 +529,25 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	}
 	for key, value := range params.Metadata {
 		form.Set("metadata["+key+"]", value)
-		form.Set("subscription_data[metadata]["+key+"]", value)
+		if params.SetupOnly {
+			form.Set("setup_intent_data[metadata]["+key+"]", value)
+		} else if params.OneOffAmount > 0 {
+			form.Set("payment_intent_data[metadata]["+key+"]", value)
+			form.Set("invoice_creation[invoice_data][metadata]["+key+"]", value)
+		} else {
+			form.Set("subscription_data[metadata]["+key+"]", value)
+		}
 	}
 	for i, priceID := range params.PriceIDs {
 		form.Set(fmt.Sprintf("line_items[%d][price]", i), priceID)
 	}
-	if params.Flexible {
+	if params.Flexible && params.OneOffAmount == 0 {
 		form.Set("subscription_data[billing_mode][type]", "flexible")
 	}
-	if params.BasePriceID != "" {
+	if params.AllowPromotionCodes {
+		form.Set("allow_promotion_codes", "true")
+	}
+	if params.BasePriceID != "" && params.OneOffAmount == 0 {
 		i := len(params.PriceIDs)
 		form.Set(fmt.Sprintf("line_items[%d][price]", i), params.BasePriceID)
 		form.Set(fmt.Sprintf("line_items[%d][quantity]", i), "1")

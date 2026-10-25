@@ -338,7 +338,7 @@ func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, te
 	}
 	if a.Base.Price != "" {
 		var payload []byte
-		if err := reader.QueryRow(ctx, `SELECT request_payload FROM billing_signup_choice WHERE team_id=$1 AND subscription_id=$2 UNION ALL SELECT resource_terms || jsonb_build_object('CustomerID',customer_id) FROM billing_yc_operation WHERE team_id=$1 AND subscription_id=$2`, team, a.Subscription).Scan(&payload); err != nil {
+		if err := reader.QueryRow(ctx, `SELECT request_payload FROM billing_pro_upgrade WHERE team_id=$1 AND subscription_id=$2 AND state<>'expired' UNION ALL SELECT request_payload FROM billing_signup_choice WHERE team_id=$1 AND subscription_id=$2 AND NOT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND subscription_id=$2 AND state<>'expired') UNION ALL SELECT resource_terms || jsonb_build_object('CustomerID',customer_id) FROM billing_yc_operation WHERE team_id=$1 AND subscription_id=$2`, team, a.Subscription).Scan(&payload); err != nil {
 			return err
 		}
 		var params StripeCreateCheckoutSessionParams

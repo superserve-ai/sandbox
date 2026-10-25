@@ -559,21 +559,21 @@ func TestIntegration_PauseOperation_BillingClaimMintsTheOperation(t *testing.T) 
 	eligible, _ := seedTeamAndKey(t)
 	other := seedActiveSandbox(t, eligible, "pause-op-billing-eligible")
 
-	ids, err := testQueries.ListBillingIneligibleSandboxes(ctx, db.ListBillingIneligibleSandboxesParams{TeamID: ineligible, Limit: 10})
+	ids, err := testQueries.ListBillingPauseSandboxes(ctx, db.ListBillingPauseSandboxesParams{TeamID: ineligible, Limit: 10})
 	if err != nil {
-		t.Fatalf("ListBillingIneligibleSandboxes: %v", err)
+		t.Fatalf("ListBillingPauseSandboxes: %v", err)
 	}
 	if !slices.Contains(ids, id) {
 		t.Fatalf("ineligible list %v does not include the sandbox", ids)
 	}
-	if listed, err := testQueries.ListBillingIneligibleSandboxes(ctx, db.ListBillingIneligibleSandboxesParams{TeamID: eligible, Limit: 10}); err != nil || slices.Contains(listed, other) {
+	if listed, err := testQueries.ListBillingPauseSandboxes(ctx, db.ListBillingPauseSandboxesParams{TeamID: eligible, Limit: 10}); err != nil || slices.Contains(listed, other) {
 		t.Fatalf("eligible team's list = %v (err %v), want its sandbox left alone", listed, err)
 	}
-	claimed, err := testQueries.ClaimBillingIneligibleSandbox(ctx, db.ClaimBillingIneligibleSandboxParams{ID: id, TeamID: ineligible, LeaseSeconds: 90})
+	claimed, err := testQueries.ClaimBillingPauseSandbox(ctx, db.ClaimBillingPauseSandboxParams{ID: id, TeamID: ineligible, LeaseSeconds: 90})
 	if err != nil || !claimed.PauseOpID.Valid || claimed.PauseOpLeaseVersion != 1 {
 		t.Fatalf("billing claim = %+v, %v; want the row with a minted operation at version 1", claimed, err)
 	}
-	if _, err := testQueries.ClaimBillingIneligibleSandbox(ctx, db.ClaimBillingIneligibleSandboxParams{ID: id, TeamID: ineligible, LeaseSeconds: 90}); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := testQueries.ClaimBillingPauseSandbox(ctx, db.ClaimBillingPauseSandboxParams{ID: id, TeamID: ineligible, LeaseSeconds: 90}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("second claim of a claimed row = %v, want no rows", err)
 	}
 	var trigger string

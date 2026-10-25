@@ -697,7 +697,6 @@ RETURNING *;
 -- only, a failed resume returns the row to paused with the deadline it had,
 -- and activation clears it.
 -- A machine caller supplies its principal so the claim itself enforces ownership.
--- 0 rows: owner mismatch, not paused, or another resume claimed it.
 UPDATE sandbox
 SET status = 'resuming', updated_at = now()
 FROM (
@@ -739,6 +738,9 @@ WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND (sqlc.narg('machine_principal_id')::uuid IS NULL
        OR (x.machine_owner_principal_id = sqlc.narg('machine_principal_id')
            AND x.machine_owner_team_id = sandbox.team_id))
+  AND (sqlc.narg('max_vcpu')::int IS NULL OR sandbox.vcpu_count <= sqlc.narg('max_vcpu')::int)
+  AND (sqlc.narg('max_memory_mib')::int IS NULL OR sandbox.memory_mib <= sqlc.narg('max_memory_mib')::int)
+  AND (sqlc.narg('max_disk_mib')::int IS NULL OR sandbox.disk_mib <= sqlc.narg('max_disk_mib')::int)
 RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
@@ -1257,30 +1259,28 @@ SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 
--- name: ListBillingIneligibleSandboxes :many
--- Active sandboxes of a team whose billing eligibility was lost, oldest
--- first, unlocked; ClaimBillingIneligibleSandbox takes them one at a time.
+-- name: ListBillingPauseSandboxes :many
 SELECT s.id
 FROM sandbox s
 WHERE s.team_id = $1
   AND s.destroyed_at IS NULL
   AND s.status = 'active'
-  AND NOT team_sandbox_billing_eligible(s.team_id)
+  AND billing_pause_reason(s.team_id, s.id) IS NOT NULL
 ORDER BY s.created_at ASC
 LIMIT $2;
 
--- name: ClaimBillingIneligibleSandbox :one
--- Claims one listed candidate under FOR UPDATE SKIP LOCKED, re-checking
--- eligibility; no rows means another replica has it or it no longer applies.
-WITH candidates AS (
+-- name: ClaimBillingPauseSandbox :one
+WITH locked AS (
   SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
   FROM sandbox s
   WHERE s.id = sqlc.arg(id)::uuid
     AND s.team_id = sqlc.arg(team_id)::uuid
     AND s.destroyed_at IS NULL
     AND s.status = 'active'
-    AND NOT team_sandbox_billing_eligible(s.team_id)
   FOR UPDATE OF s SKIP LOCKED
+), candidates AS MATERIALIZED (
+  SELECT l.*, billing_pause_reason(l.team_id, l.id) AS reason
+  FROM locked l
 ), paused AS (
   UPDATE sandbox
   SET status = 'pausing', updated_at = now(),
@@ -1289,12 +1289,13 @@ WITH candidates AS (
       pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
       pause_op_lease_version = sandbox.pause_op_lease_version + 1,
       pause_op_attention_at = NULL,
-      pause_op_trigger = 'billing_ineligible',
+      pause_op_trigger = candidates.reason,
       pause_op_actor_id = NULL
   FROM candidates
   WHERE sandbox.id = candidates.id
+    AND candidates.reason IS NOT NULL
   RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config,
-            sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until
+            sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until, sandbox.pause_op_trigger
 ), closed_intervals AS (
   UPDATE sandbox_active_interval
   SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
@@ -1309,7 +1310,7 @@ WITH candidates AS (
   RETURNING sandbox_id
 )
 SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
-       p.pause_op_id, p.pause_op_lease_version, p.pause_op_lease_until
+       p.pause_op_id, p.pause_op_lease_version, p.pause_op_lease_until, p.pause_op_trigger
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id;
 

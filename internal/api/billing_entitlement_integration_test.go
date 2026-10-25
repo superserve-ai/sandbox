@@ -101,6 +101,10 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,$2,$3,$4)`, team.ID, customer, subscription, anchor)
 	yc := len(annual) > 1 && annual[1]
 	sponsored := len(annual) > 4 && annual[4]
+	discount := int64(0)
+	if len(annual) > 5 && annual[5] {
+		discount = 25000
+	}
 	var ycID, ycContract uuid.UUID
 	if yc {
 		ensureYCTestAuthority(t, pool)
@@ -152,7 +156,10 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = h.DB.RecordCommercialBasePayment(t.Context(), db.RecordCommercialBasePaymentParams{TeamID: team.ID, ContractID: c.ID, InvoiceID: "in_paid_" + team.ID.String(), PaymentReference: "pay_" + uuid.NewString(), CustomerID: customer, SubscriptionID: &subscription, BasePriceID: "price_base", ServicePeriodStart: anchor, ServicePeriodEnd: coverageEnd, BaseAmountPaidCents: amount, InvoiceAmountPaidCents: amount, Currency: "usd", PaidAt: start, VerifiedAt: now, Evidence: []byte(`{"paid":true}`)})
+		if discount > 0 {
+			exec(`INSERT INTO billing_contract_promotion(contract_id,team_id,discount_id,promotion_code,coupon_id,coupon_duration,amount_off_cents,checkout_invoice_id,discounted_cents) VALUES($1,$2,'di_promo','promo_example','coupon_example','once',$3,$4,$3)`, c.ID, team.ID, discount, "in_paid_"+team.ID.String())
+		}
+		_, err = h.DB.RecordCommercialBasePayment(t.Context(), db.RecordCommercialBasePaymentParams{TeamID: team.ID, ContractID: c.ID, InvoiceID: "in_paid_" + team.ID.String(), PaymentReference: "pay_" + uuid.NewString(), CustomerID: customer, SubscriptionID: &subscription, BasePriceID: "price_base", ServicePeriodStart: anchor, ServicePeriodEnd: coverageEnd, BaseAmountPaidCents: amount, InvoiceAmountPaidCents: amount - discount, Currency: "usd", PaidAt: start, VerifiedAt: now, Evidence: []byte(`{"paid":true}`)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -195,11 +202,15 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 				fmt.Fprint(w, `{"id":"ambiguous"}`)
 				return
 			}
-			fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","currency":"usd","total":%d,"amount_due":%d,"starting_balance":0,"ending_balance":0,"amount_paid":%d,"amount_remaining":0,"status_transitions":{"paid_at":%d},"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"quantity":1,"amount":%d,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"price_details":{"price":"price_base"}},"parent":{"subscription_item_details":{"subscription":%q}}}]}}`, "in_paid_"+team.ID.String(), customer, amount, amount, amount, anchor.Unix(), subscription, amount, anchor.Unix(), coverageEnd.Unix(), subscription)
+			promotion := ""
+			if discount > 0 {
+				promotion = fmt.Sprintf(`"billing_reason":"subscription_create","discounts":["di_promo"],"total_discount_amounts":[{"amount":%d,"discount":"di_promo"}],`, discount)
+			}
+			fmt.Fprintf(w, `{"id":%q,"customer":%q,%s"status":"paid","currency":"usd","total":%d,"amount_due":%d,"starting_balance":0,"ending_balance":0,"amount_paid":%d,"amount_remaining":0,"status_transitions":{"paid_at":%d},"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"quantity":1,"amount":%d,"currency":"usd","discounts":%s,"pretax_credit_amounts":%s,"period":{"start":%d,"end":%d},"pricing":{"price_details":{"price":"price_base"}},"parent":{"subscription_item_details":{"subscription":%q}}}]}}`, "in_paid_"+team.ID.String(), customer, promotion, amount-discount, amount-discount, amount-discount, anchor.Unix(), subscription, amount, map[bool]string{true: `["di_promo"]`, false: `[]`}[discount > 0], map[bool]string{true: fmt.Sprintf(`[{"type":"discount","amount":%d,"discount":"di_promo"}]`, discount), false: `[]`}[discount > 0], anchor.Unix(), coverageEnd.Unix(), subscription)
 		case "/v1/invoices/in_prior_" + team.ID.String():
 			fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","amount_remaining":0,"total":0,"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[]}}`, "in_prior_"+team.ID.String(), customer, subscription)
 		case "/v1/invoice_payments":
-			fmt.Fprintf(w, `{"data":[{"id":"inpay_example","invoice":%q,"status":"paid","currency":"usd","amount_paid":%d,"payment":{"type":"payment_intent","payment_intent":"pi_example"}}]}`, "in_paid_"+team.ID.String(), amount)
+			fmt.Fprintf(w, `{"data":[{"id":"inpay_example","invoice":%q,"status":"paid","currency":"usd","amount_paid":%d,"payment":{"type":"payment_intent","payment_intent":"pi_example"}}]}`, "in_paid_"+team.ID.String(), amount-discount)
 		case "/v1/payment_intents/pi_example":
 			fmt.Fprintf(w, `{"id":"pi_example","status":"succeeded","customer":%q,"currency":"usd","amount_received":%d,"latest_charge":"ch_example"}`, customer, amount)
 		case "/v1/charges/ch_example":
@@ -319,6 +330,20 @@ func TestEntitlementWorkerIntegration(t *testing.T) {
 	}
 	if f.grants.Load() != 1 {
 		t.Fatal("later debt duplicated issued grant")
+	}
+}
+func TestEntitlementIssuesAfterPromotedCheckoutInvoice(t *testing.T) {
+	f := newEntitlementFixture(t, false, false, false, false, false, true)
+	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil {
+		t.Fatal(err)
+	}
+	e, err := f.h.DB.GetCurrentUsageEntitlement(t.Context(), db.GetCurrentUsageEntitlementParams{TeamID: f.c.TeamID, Kind: f.c.EntitlementKind})
+	if err != nil || e.State != "issued" || f.grants.Load() != 1 {
+		t.Fatalf("credit after a discounted checkout invoice: state=%q grants=%d err=%v", e.State, f.grants.Load(), err)
+	}
+	var review bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT COALESCE(bool_or(review_required),false) FROM billing_pro_payment_verification WHERE invoice_id=$1`, "in_paid_"+f.c.TeamID.String()).Scan(&review); err != nil || review {
+		t.Fatalf("discounted checkout invoice sent to review: %v %v", review, err)
 	}
 }
 func TestEntitlementInventoryResumesBeyondFirstPage(t *testing.T) {

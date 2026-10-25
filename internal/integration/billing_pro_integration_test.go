@@ -24,6 +24,7 @@ import (
 )
 
 type proProviderFixture struct {
+	upgrade                                           *proUpgradeProviderFixture
 	rounded, held                                     bool
 	resourcesAttached, failAttach, loseAttachResponse bool
 	attachCalls                                       int
@@ -54,6 +55,10 @@ type proProviderFixture struct {
 	catalogPrices                                     map[string]string
 	priceCreates                                      []string
 	failBasePriceRead                                 bool
+	discount, renewalDiscount                         int64
+	subDiscount                                       bool
+	discountCleared                                   int
+	promotionCodes                                    bool
 }
 
 func newProFixture(t *testing.T, offer string) (*proProviderFixture, *gin.Engine, string) {
@@ -84,8 +89,11 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
+	if f.upgrade != nil && f.serveUpgrade(w, r) {
+		return
+	}
 	write := func(v any) { _ = json.NewEncoder(w).Encode(v) }
-	basePrice := map[string]any{"id": f.price, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": fmt.Sprint(f.amount), "recurring": map[string]any{"usage_type": "licensed", "interval": f.interval, "interval_count": 1}}
+	basePrice := map[string]any{"product": "prod_pro_fixture", "id": f.price, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": fmt.Sprint(f.amount), "recurring": map[string]any{"usage_type": "licensed", "interval": f.interval, "interval_count": 1}}
 	switch {
 	case r.URL.Path == "/v1/prices" && r.Method == "POST":
 		_ = r.ParseForm()
@@ -154,6 +162,13 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "lost attachment response", 500)
 				return
 			}
+		} else if r.Form.Has("discounts") {
+			if r.Form.Get("discounts") != "" || r.Form.Get("proration_behavior") != "none" {
+				http.Error(w, "unexpected discount change", 400)
+				return
+			}
+			f.subDiscount = false
+			f.discountCleared++
 		} else if r.Form.Has("pause_collection[behavior]") {
 			f.held = r.Form.Get("pause_collection[behavior]") == "keep_as_draft"
 		}
@@ -187,6 +202,7 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Checkout does not support prices with different billing intervals", 400)
 			return
 		}
+		f.promotionCodes = r.Form.Get("allow_promotion_codes") == "true"
 		f.metadata = map[string]string{}
 		for _, k := range []string{"checkout_generation", "activation_user_id", "commercial_offer"} {
 			f.metadata[k] = r.Form.Get("metadata[" + k + "]")
@@ -212,7 +228,11 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 		if f.paid {
 			paid = "paid"
 		}
-		write(map[string]any{"id": f.session, "customer": f.customer, "client_reference_id": f.team.String(), "mode": "subscription", "status": f.status, "payment_status": paid, "subscription": sub, "metadata": f.metadata})
+		url := ""
+		if f.status == "open" {
+			url = "https://checkout.stripe.test/example"
+		}
+		write(map[string]any{"id": f.session, "url": url, "customer": f.customer, "client_reference_id": f.team.String(), "mode": "subscription", "status": f.status, "payment_status": paid, "subscription": sub, "metadata": f.metadata})
 	case r.URL.Path == "/v1/subscriptions/"+f.sub:
 		items := []any{map[string]any{"id": "si_base", "quantity": 1, "price": basePrice, "current_period_start": f.baseStart, "current_period_end": f.baseEnd}}
 		var resourcePrices []string
@@ -225,7 +245,11 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 		for _, p := range resourcePrices {
 			items = append(items, map[string]any{"id": "si_" + p, "price": map[string]any{"id": p, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": f.resourceRate(p), "recurring": map[string]any{"usage_type": "metered", "interval": "month", "interval_count": 1, "meter": f.resourceMeter(p)}}, "current_period_start": f.anchor, "current_period_end": time.Unix(f.anchor, 0).UTC().AddDate(0, 1, 0).Unix()})
 		}
-		write(map[string]any{"id": f.sub, "latest_invoice": "in_" + strings.ReplaceAll(f.team.String(), "-", "") + fmt.Sprint(f.baseStart), "customer": f.customer, "status": f.subscriptionStatus(), "pause_collection": func() any {
+		discounts := []string{}
+		if f.subDiscount {
+			discounts = append(discounts, "di_promo")
+		}
+		write(map[string]any{"id": f.sub, "discounts": discounts, "latest_invoice": "in_" + strings.ReplaceAll(f.team.String(), "-", "") + fmt.Sprint(f.baseStart), "customer": f.customer, "status": f.subscriptionStatus(), "pause_collection": func() any {
 			if f.held {
 				return map[string]any{"behavior": "keep_as_draft", "resumes_at": f.holdResumesAt}
 			}
@@ -254,14 +278,40 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 			months = 12
 		}
 		invoiceEnd := time.Unix(invoiceStart, 0).UTC().AddDate(0, months, 0).Unix()
-		write(map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/v1/invoices/"), "customer": f.customer, "status": func() string {
+		reason, discount := "subscription_cycle", f.renewalDiscount
+		if invoiceStart == f.anchor {
+			reason, discount = "subscription_create", f.discount
+		}
+		due := f.amount - discount
+		discounts, totals, credits := []any{}, []any{}, []any{}
+		if discount > 0 {
+			totals = append(totals, map[string]any{"amount": discount, "discount": "di_promo"})
+			credits = append(credits, map[string]any{"type": "discount", "amount": discount, "discount": "di_promo"})
+			discounts = append(discounts, "di_promo")
+			if r.URL.Query().Get("expand[]") == "discounts.source.coupon" {
+				discounts = []any{map[string]any{"id": "di_promo", "promotion_code": "promo_example", "source": map[string]any{"coupon": map[string]any{"id": "coupon_example", "duration": map[bool]string{true: "forever", false: "once"}[f.renewalDiscount > 0], "amount_off": f.discount, "currency": "usd"}}}}
+			}
+		}
+		paidAt := time.Now().Unix()
+		if f.upgrade != nil {
+			paidAt = f.handlers.Now().Unix()
+		}
+		write(map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/v1/invoices/"), "customer": f.customer, "billing_reason": reason, "discounts": discounts, "total_discount_amounts": totals, "status": func() string {
 			if f.paid {
 				return "paid"
 			}
 			return "open"
-		}(), "currency": "usd", "total": f.amount, "amount_due": f.amount, "ending_balance": 0, "amount_paid": f.amount, "amount_remaining": 0, "post_payment_credit_notes_amount": f.creditNote, "status_transitions": map[string]any{"paid_at": time.Now().Unix()}, "parent": map[string]any{"subscription_details": map[string]any{"subscription": f.sub}}, "lines": map[string]any{"data": []any{map[string]any{"quantity": 1, "amount": f.amount, "currency": "usd", "period": map[string]any{"start": invoiceStart, "end": invoiceEnd}, "pricing": map[string]any{"price_details": map[string]any{"price": f.price}}, "parent": map[string]any{"subscription_item_details": map[string]any{"subscription": f.sub}}}}}})
+		}(), "currency": "usd", "subtotal": f.amount, "total": due, "amount_due": due, "ending_balance": 0, "amount_paid": due, "amount_remaining": 0, "post_payment_credit_notes_amount": f.creditNote, "status_transitions": map[string]any{"paid_at": paidAt}, "parent": map[string]any{"subscription_details": map[string]any{"subscription": f.sub}}, "lines": map[string]any{"data": []any{map[string]any{"quantity": 1, "amount": f.amount, "currency": "usd", "pretax_credit_amounts": credits, "period": map[string]any{"start": invoiceStart, "end": invoiceEnd}, "pricing": map[string]any{"price_details": map[string]any{"price": f.price}}, "parent": map[string]any{"subscription_item_details": map[string]any{"subscription": f.sub}}}}}})
 	case r.URL.Path == "/v1/invoice_payments":
-		write(map[string]any{"data": []any{map[string]any{"id": "inpay_example", "invoice": r.URL.Query().Get("invoice"), "status": "paid", "currency": "usd", "amount_paid": f.amount, "payment": map[string]any{"type": "payment_intent", "payment_intent": "pi_example"}}}})
+		paid := f.amount - f.renewalDiscount
+		if strings.HasSuffix(r.URL.Query().Get("invoice"), fmt.Sprint(f.anchor)) {
+			paid = f.amount - f.discount
+		}
+		payments := []any{}
+		if paid > 0 {
+			payments = append(payments, map[string]any{"id": "inpay_example", "invoice": r.URL.Query().Get("invoice"), "status": "paid", "currency": "usd", "amount_paid": paid, "payment": map[string]any{"type": "payment_intent", "payment_intent": "pi_example"}})
+		}
+		write(map[string]any{"data": payments})
 	case r.URL.Path == "/v1/payment_intents/pi_example":
 		write(map[string]any{"id": "pi_example", "customer": f.customer, "status": "succeeded", "currency": "usd", "amount_received": f.amount, "latest_charge": "ch_example"})
 	case r.URL.Path == "/v1/charges/ch_example":
@@ -605,7 +655,15 @@ func TestIntegration_ProTerminalPaymentBeforeActivationRemainsFenced(t *testing.
 		assertTerminalPaidPending(t, f)
 	}
 	assertProResponse(t, r, key, "/stripe/plan-choice", `{"offer":"free"}`, 409, "plan_conflict")
-	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 409, "plan_conflict")
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 202, "payment_confirmation_pending")
+	var fresh map[string]any
+	if err := json.Unmarshal([]byte(proCheckoutBody("pro_monthly")), &fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh["operation_id"] = uuid.NewString()
+	payload, _ := json.Marshal(fresh)
+	assertProResponse(t, r, key, "/stripe/checkout-session", string(payload), 409, "plan_conflict")
+
 }
 
 func TestIntegration_ProCheckoutTermsSurviveConfigurationChange(t *testing.T) {

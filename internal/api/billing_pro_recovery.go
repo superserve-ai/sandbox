@@ -42,10 +42,23 @@ func (h *Handlers) RecoverProCheckout(c *gin.Context) {
 		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
 		return
 	}
+	if outcome == "payment_method_required" {
+		if target, e := h.proUpgradeSetupURL(c.Request.Context(), team); e == nil {
+			c.JSON(http.StatusOK, gin.H{"outcome": outcome, "url": target})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"outcome": outcome})
 }
 
 func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, restart bool) (string, error) {
+	if upgrade, err := h.proUpgrade(ctx, team); err == nil {
+		return h.reconcileProUpgrade(ctx, upgrade, restart)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	client, ok := h.Stripe.(*stripeHTTPClient)
@@ -221,6 +234,11 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 	if err != nil {
 		return "", err
 	}
+	if offer.PricingV2 {
+		if offer.Promotion, err = subscriptionPromotion(ctx, h.Pool, sub.ID); err != nil {
+			return "", err
+		}
+	}
 	ids, nextCursor, err := client.proInvoices(ctx, session.CustomerID, sub.ID, derefString(choice.InvoiceCursor))
 	if err != nil {
 		return "", err
@@ -333,7 +351,13 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 	if errors.Is(err, errProEnrollmentPending) {
 		// Payment is already durable. Provider or local enrollment failures
 		// leave activation pending and the existing worker can retry safely.
-		err = h.enrollInvoiceAccount(ctx, team, nil)
+		err = nil
+		if offer.PricingV2 {
+			sub, err = h.clearProCheckoutDiscount(ctx, client, sub)
+		}
+		if err == nil {
+			err = h.enrollInvoiceAccount(ctx, team, nil)
+		}
 		if err == nil {
 			sub, err = client.invoiceSubscription(ctx, session.SubscriptionID)
 		}
@@ -409,8 +433,12 @@ func (h *Handlers) StartProPaymentReconciliation(ctx context.Context) {
 	}()
 }
 func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error) {
+	released, err := h.releasedProInvoiceTick(ctx)
+	if err != nil {
+		return released, err
+	}
 	// offer_key<>'free' matches the partial recovery index predicate.
-	rows, err := h.Pool.Query(ctx, `WITH candidate AS (SELECT team_id FROM billing_signup_choice WHERE offer_key<>'free' AND offer_key IN `+paidPlanOffers+` AND next_check_at<=clock_timestamp() ORDER BY next_check_at,team_id FOR UPDATE SKIP LOCKED LIMIT 4) UPDATE billing_signup_choice c SET next_check_at=clock_timestamp()+interval '2 minutes' FROM candidate WHERE c.team_id=candidate.team_id RETURNING c.team_id`)
+	rows, err := h.Pool.Query(ctx, `WITH candidate AS (SELECT team_id FROM billing_signup_choice WHERE offer_key<>'free' AND offer_key IN `+paidPlanOffers+` AND next_check_at<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM billing_pro_upgrade u WHERE u.team_id=billing_signup_choice.team_id AND u.state NOT IN ('expired','ended')) ORDER BY next_check_at,team_id FOR UPDATE SKIP LOCKED LIMIT 4), legacy AS (UPDATE billing_signup_choice c SET next_check_at=clock_timestamp()+interval '2 minutes' FROM candidate WHERE c.team_id=candidate.team_id RETURNING c.team_id), upgrade_candidate AS (SELECT id FROM billing_pro_upgrade WHERE state NOT IN ('expired','ended') AND team_id IS NOT NULL AND next_check_at<=clock_timestamp() ORDER BY next_check_at,id FOR UPDATE SKIP LOCKED LIMIT 4), upgrades AS (UPDATE billing_pro_upgrade u SET next_check_at=clock_timestamp()+interval '2 minutes' FROM upgrade_candidate c WHERE u.id=c.id RETURNING u.team_id) SELECT team_id FROM legacy UNION SELECT team_id FROM upgrades`)
 	if err != nil {
 		return 0, err
 	}
@@ -449,13 +477,14 @@ func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error
 				}
 				ack, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 				_, saveErr := h.Pool.Exec(ack, `UPDATE billing_signup_choice SET last_error=$2 WHERE team_id=$1`, team, message)
+				_, upgradeSaveErr := h.Pool.Exec(ack, `UPDATE billing_pro_upgrade SET last_error=$2 WHERE team_id=$1 AND state<>'expired'`, team, message)
 				cancel()
-				currentBillingRecorder().RecordBillingWork(ctx, "pro_payment", e != nil || saveErr != nil, time.Since(started), 1)
+				currentBillingRecorder().RecordBillingWork(ctx, "pro_payment", e != nil || saveErr != nil || upgradeSaveErr != nil, time.Since(started), 1)
 			}
 		}()
 	}
 	wg.Wait()
-	return len(teams), ctx.Err()
+	return released + len(teams), ctx.Err()
 }
 
 func (h *Handlers) validateProResourceIdentities(ctx context.Context, team uuid.UUID, sub invoiceSubscription, params StripeCreateCheckoutSessionParams) error {

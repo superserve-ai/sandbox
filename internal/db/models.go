@@ -418,6 +418,20 @@ type BillingContractPayment struct {
 	Evidence                    []byte    `json:"evidence"`
 }
 
+type BillingContractPromotion struct {
+	ContractID        uuid.UUID      `json:"contract_id"`
+	TeamID            uuid.UUID      `json:"team_id"`
+	DiscountID        string         `json:"discount_id"`
+	PromotionCode     string         `json:"promotion_code"`
+	CouponID          string         `json:"coupon_id"`
+	CouponDuration    string         `json:"coupon_duration"`
+	AmountOffCents    *int64         `json:"amount_off_cents"`
+	PercentOff        pgtype.Numeric `json:"percent_off"`
+	CheckoutInvoiceID string         `json:"checkout_invoice_id"`
+	DiscountedCents   int64          `json:"discounted_cents"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
 type BillingContractWaiver struct {
 	ID                   uuid.UUID `json:"id"`
 	TeamID               uuid.UUID `json:"team_id"`
@@ -602,6 +616,22 @@ type BillingExportWork struct {
 type BillingFinalizationAttempt struct {
 	TeamID        uuid.UUID `json:"team_id"`
 	LastAttemptAt time.Time `json:"last_attempt_at"`
+}
+
+type BillingFreeAllowance struct {
+	TeamID          uuid.UUID          `json:"team_id"`
+	WindowStartedAt time.Time          `json:"window_started_at"`
+	ResetsAt        time.Time          `json:"resets_at"`
+	AllowanceUsd    pgtype.Numeric     `json:"allowance_usd"`
+	UsedUsd         pgtype.Numeric     `json:"used_usd"`
+	BlockedUntil    pgtype.Timestamptz `json:"blocked_until"`
+	EvaluatedAt     time.Time          `json:"evaluated_at"`
+}
+
+type BillingFreeAllowanceRetry struct {
+	TeamID        uuid.UUID `json:"team_id"`
+	NextAttemptAt time.Time `json:"next_attempt_at"`
+	Attempts      int64     `json:"attempts"`
 }
 
 type BillingFundingAccount struct {
@@ -822,6 +852,7 @@ type BillingPlanRelease struct {
 	ProviderStatus   string      `json:"provider_status"`
 	ProviderEvidence []byte      `json:"provider_evidence"`
 	ReleasedAt       time.Time   `json:"released_at"`
+	PlanChangeID     pgtype.UUID `json:"plan_change_id"`
 }
 
 type BillingPlanVersion struct {
@@ -864,6 +895,50 @@ type BillingPlanVersion struct {
 	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
 }
 
+type BillingPricingAdoption struct {
+	Singleton    bool               `json:"singleton"`
+	Region       *string            `json:"region"`
+	SystemTeamID pgtype.UUID        `json:"system_team_id"`
+	Epoch        uuid.UUID          `json:"epoch"`
+	State        string             `json:"state"`
+	Evidence     []byte             `json:"evidence"`
+	ReleasedAt   pgtype.Timestamptz `json:"released_at"`
+}
+
+type BillingPricingAdoptionCreditHold struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Reason     string    `json:"reason"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+type BillingPricingAdoptionCreditResolution struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	AssignmentID uuid.UUID `json:"assignment_id"`
+	Source       []byte    `json:"source"`
+	VerifiedAt   time.Time `json:"verified_at"`
+}
+
+type BillingPricingAdoptionEvent struct {
+	ID        uuid.UUID `json:"id"`
+	Epoch     uuid.UUID `json:"epoch"`
+	Region    *string   `json:"region"`
+	Action    string    `json:"action"`
+	Actor     string    `json:"actor"`
+	Reason    string    `json:"reason"`
+	Details   []byte    `json:"details"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type BillingPricingAdoptionInventory struct {
+	Epoch        uuid.UUID   `json:"epoch"`
+	TeamID       uuid.UUID   `json:"team_id"`
+	AssignmentID pgtype.UUID `json:"assignment_id"`
+	Bucket       string      `json:"bucket"`
+	Reason       string      `json:"reason"`
+	Present      bool        `json:"present"`
+	ObservedAt   time.Time   `json:"observed_at"`
+}
+
 type BillingPricingSwitch struct {
 	Singleton      bool        `json:"singleton"`
 	PricingVersion string      `json:"pricing_version"`
@@ -900,6 +975,70 @@ type BillingProPaymentVerification struct {
 	ReviewRequired bool      `json:"review_required"`
 	ObservedAt     time.Time `json:"observed_at"`
 	Evidence       []byte    `json:"evidence"`
+}
+
+type BillingProReleasedInvoice struct {
+	ReleaseID        uuid.UUID `json:"release_id"`
+	InvoiceID        string    `json:"invoice_id"`
+	ContractID       uuid.UUID `json:"contract_id"`
+	State            string    `json:"state"`
+	Receipt          []byte    `json:"receipt"`
+	PaymentReference *string   `json:"payment_reference"`
+	Revision         int64     `json:"revision"`
+	VerifiedRevision int64     `json:"verified_revision"`
+	CreditState      string    `json:"credit_state"`
+	NextCheckAt      time.Time `json:"next_check_at"`
+	LastError        *string   `json:"last_error"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type BillingProUpgrade struct {
+	ID                     uuid.UUID          `json:"id"`
+	TeamID                 pgtype.UUID        `json:"team_id"`
+	ActorID                uuid.UUID          `json:"actor_id"`
+	CustomerID             string             `json:"customer_id"`
+	SubscriptionID         *string            `json:"subscription_id"`
+	OfferKey               string             `json:"offer_key"`
+	RequestPayload         []byte             `json:"request_payload"`
+	Anchor                 time.Time          `json:"anchor"`
+	PeriodStart            time.Time          `json:"period_start"`
+	PeriodEnd              time.Time          `json:"period_end"`
+	QuotedAt               time.Time          `json:"quoted_at"`
+	AmountCents            int64              `json:"amount_cents"`
+	State                  string             `json:"state"`
+	SessionID              *string            `json:"session_id"`
+	PaymentEvidence        []byte             `json:"payment_evidence"`
+	PaymentReviewRequired  bool               `json:"payment_review_required"`
+	PaymentReviewEvidence  []byte             `json:"payment_review_evidence"`
+	PaymentReviewCheckedAt pgtype.Timestamptz `json:"payment_review_checked_at"`
+	PaymentMethodID        *string            `json:"payment_method_id"`
+	GrantID                *string            `json:"grant_id"`
+	GrantAttemptedAt       pgtype.Timestamptz `json:"grant_attempted_at"`
+	RecurringAttemptedAt   pgtype.Timestamptz `json:"recurring_attempted_at"`
+	BaseCreatedAt          pgtype.Timestamptz `json:"base_created_at"`
+	InitialAssignmentID    pgtype.UUID        `json:"initial_assignment_id"`
+	ContractID             pgtype.UUID        `json:"contract_id"`
+	NextCheckAt            time.Time          `json:"next_check_at"`
+	LastError              *string            `json:"last_error"`
+}
+
+type BillingProUpgradeCatchup struct {
+	ID          uuid.UUID `json:"id"`
+	UpgradeID   uuid.UUID `json:"upgrade_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	AmountCents int64     `json:"amount_cents"`
+	CreatedAt   time.Time `json:"created_at"`
+	InvoiceID   *string   `json:"invoice_id"`
+}
+
+type BillingProUpgradeSetup struct {
+	ID             uuid.UUID `json:"id"`
+	UpgradeID      uuid.UUID `json:"upgrade_id"`
+	RequestPayload []byte    `json:"request_payload"`
+	CreatedAt      time.Time `json:"created_at"`
+	SessionID      *string   `json:"session_id"`
+	State          string    `json:"state"`
 }
 
 type BillingProviderCredit struct {
@@ -1040,6 +1179,21 @@ type BillingSponsoredPromotionRecovery struct {
 	BeforeEvidence []byte             `json:"before_evidence"`
 	AfterEvidence  []byte             `json:"after_evidence"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+type BillingTeamPauseRequest struct {
+	AssignmentID uuid.UUID `json:"assignment_id"`
+	TeamID       uuid.UUID `json:"team_id"`
+	RequestedAt  time.Time `json:"requested_at"`
+}
+
+type BillingTeamPauseTarget struct {
+	SandboxID    uuid.UUID          `json:"sandbox_id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	AssignmentID uuid.UUID          `json:"assignment_id"`
+	Reason       string             `json:"reason"`
+	RequestedAt  time.Time          `json:"requested_at"`
+	DoneAt       pgtype.Timestamptz `json:"done_at"`
 }
 
 type BillingUsageEntitlement struct {
@@ -2072,6 +2226,41 @@ type TeamPlanAssignment struct {
 	Reason         string             `json:"reason"`
 	IdempotencyKey *string            `json:"idempotency_key"`
 	CreatedAt      time.Time          `json:"created_at"`
+}
+
+type TeamPlanChange struct {
+	ID                        uuid.UUID          `json:"id"`
+	TeamID                    uuid.UUID          `json:"team_id"`
+	FromAssignmentID          uuid.UUID          `json:"from_assignment_id"`
+	TargetPlanKey             string             `json:"target_plan_key"`
+	TargetKind                string             `json:"target_kind"`
+	TargetTerms               []byte             `json:"target_terms"`
+	TargetLimits              []byte             `json:"target_limits"`
+	EffectiveAt               time.Time          `json:"effective_at"`
+	PausesRunning             bool               `json:"pauses_running"`
+	SubscriptionID            *string            `json:"subscription_id"`
+	RequestedBy               uuid.UUID          `json:"requested_by"`
+	RequestedVia              string             `json:"requested_via"`
+	Reason                    string             `json:"reason"`
+	IdempotencyKey            string             `json:"idempotency_key"`
+	RequestedAt               time.Time          `json:"requested_at"`
+	TerminalUndoOf            pgtype.UUID        `json:"terminal_undo_of"`
+	State                     string             `json:"state"`
+	ProviderCancelRequestedAt pgtype.Timestamptz `json:"provider_cancel_requested_at"`
+	ProviderCancelPreexisting bool               `json:"provider_cancel_preexisting"`
+	ProviderCancelAt          pgtype.Timestamptz `json:"provider_cancel_at"`
+	ProviderRenewedAt         pgtype.Timestamptz `json:"provider_renewed_at"`
+	UndoneAt                  pgtype.Timestamptz `json:"undone_at"`
+	UndoneBy                  pgtype.UUID        `json:"undone_by"`
+	UndoReason                *string            `json:"undo_reason"`
+	AppliedAt                 pgtype.Timestamptz `json:"applied_at"`
+	AppliedAssignmentID       pgtype.UUID        `json:"applied_assignment_id"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	NextCheckAt               time.Time          `json:"next_check_at"`
+	LeaseToken                pgtype.UUID        `json:"lease_token"`
+	LeaseUntil                pgtype.Timestamptz `json:"lease_until"`
+	Failures                  int32              `json:"failures"`
+	LastError                 *string            `json:"last_error"`
 }
 
 type TeamPricingPlan struct {

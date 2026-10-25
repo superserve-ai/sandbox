@@ -290,6 +290,126 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/plan-changes:
+    post:
+      operationId: requestBillingPlanChange
+      tags: [Billing]
+      summary: Downgrade or switch to Free
+      description: |
+        Moves the authenticated team to a lower plan. Leaving Pro or a custom
+        plan takes effect at the end of the billing period and can be undone
+        until shortly before; leaving Starter for Free takes effect at once. A
+        move to Free pauses all running sandboxes when it takes effect.
+        Upgrades happen on purchase instead. Repeating a request with the same
+        idempotency key returns the original change. Send the preview_token from
+        the confirmed preview; changed terms, limits or effective boundary return
+        409 and require another preview and confirmation. Moves to Free require
+        confirm_pauses_running=true. End-of-period requests also require
+        expected_effective_at matching the confirmed preview. Omit that field for
+        immediate changes. Requires `billing:write`.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target_plan, idempotency_key, preview_token]
+              properties:
+                target_plan:
+                  type: string
+                  enum: [free, starter, pro_monthly]
+                idempotency_key:
+                  type: string
+                  maxLength: 200
+                preview_token:
+                  type: string
+                  minLength: 64
+                  maxLength: 64
+                  description: Token from the confirmed exit preview, binding its assignment, terms, limits and effective boundary. Immediate moves bind to immediate timing.
+                expected_effective_at:
+                  type: string
+                  format: date-time
+                  description: Required when preview timing is end_of_billing_period and must exactly match the confirmed effective_at. Omit for immediate changes. Stale or missing date preconditions return 409 without scheduling.
+                confirm_pauses_running:
+                  type: boolean
+                  description: Must be true when target_plan is free, confirming that all running compute will be paused.
+                reason:
+                  type: string
+                  maxLength: 2000
+      responses:
+        "200":
+          description: The plan change
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlanChange"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: The change could not be completed; retry with the same request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /billing/plan-changes/{change_id}/undo:
+    post:
+      operationId: undoBillingPlanChange
+      tags: [Billing]
+      summary: Undo a scheduled plan change
+      description: |
+        Withdraws a customer-originated change for the authenticated team while
+        it is still undoable; the team stays on its plan. Staff-originated
+        changes require the operator endpoint and are not found here. Undoing
+        a customer change twice is harmless. Requires `billing:write`.
+      security:
+        - apiKey: []
+      parameters:
+        - name: change_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The plan change
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlanChange"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: The change could not be completed; retry with the same request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /billing/plan-change-preview:
     get:
       operationId: previewBillingPlanChange
@@ -323,6 +443,45 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
+
+  /billing/free-allowance:
+    get:
+      operationId: getFreeAllowance
+      tags: [Billing]
+      summary: Get the Free plan compute allowance
+      description: |
+        Returns the authenticated team's Free plan compute allowance for the
+        current 24-hour window. The window starts at the first sandbox start
+        after the previous window ended. Usage counts compute only (vCPU and
+        memory at the team's current rates); disk is not counted. When the
+        allowance is used up, running sandboxes are paused and starts and
+        resumes are refused with `free_allowance_exhausted` until `resets_at`.
+
+        `applies` is false, and every other field null, when the team is not
+        on the Free plan. Amounts are decimal cents.
+
+        Access requires `billing:read` and the `tenant_usage_dashboard`
+        rollout gate to be enabled for the team.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Free plan allowance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FreeAllowanceResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 
   /teams/{team_id}/billing/usage:
     parameters:
@@ -3492,7 +3651,7 @@ components:
         Usage included with the plan for the current monthly period. Unused
         amounts expire at period_end. Null when the plan includes no usage this
         period.
-      required: [amount_usd, period_start, period_end, status]
+      required: [amount_usd, amount_cents, period_start, period_end, status]
       properties:
         amount_usd:
           type: number
@@ -3510,6 +3669,25 @@ components:
             issued once the credit is on the account; pending while it is being
             granted; not_issued when it has not been granted, for example while
             a payment is outstanding.
+        amount_cents:
+          type: integer
+          format: int64
+        used_cents:
+          type: integer
+          format: int64
+          description: >-
+            Usage charges so far this period, in cents. Present only once the
+            included usage is issued and covers the current billing period.
+        remaining_cents:
+          type: integer
+          format: int64
+          description: Included usage not yet used, in cents.
+        overage_cents:
+          type: integer
+          format: int64
+          description: >-
+            Usage beyond the included amount, in cents. Credit carried over from
+            another plan may still cover it.
 
     BillingSummaryPermissions:
       type: object
@@ -5245,6 +5423,44 @@ components:
             max_template_disk_mib:
               type: integer
               nullable: true
+    FreeAllowanceResponse:
+      type: object
+      required: [applies, window_started_at, resets_at, allowance_cents, used_cents, remaining_cents, paused, paused_reason, as_of]
+      properties:
+        applies:
+          type: boolean
+          description: Whether the team is on the Free plan.
+        window_started_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Start of the current window; null when no window is open, so the next sandbox start opens one.
+        resets_at:
+          type: string
+          format: date-time
+          nullable: true
+        allowance_cents:
+          type: number
+          nullable: true
+        used_cents:
+          type: number
+          nullable: true
+          description: Compute used in the current window, never above allowance_cents.
+        remaining_cents:
+          type: number
+          nullable: true
+        paused:
+          type: boolean
+          nullable: true
+          description: True once the allowance is used up; sandboxes stay paused until resets_at.
+        paused_reason:
+          type: string
+          nullable: true
+          enum: [free_allowance_exhausted, null]
+        as_of:
+          type: string
+          format: date-time
+          nullable: true
     BillingPlanResponse:
       type: object
       required: [plan, period, pending_change]
@@ -5293,8 +5509,35 @@ components:
               format: date-time
             undoable:
               type: boolean
+              description: Whether this change is undoable through the current API channel. Customer reads return false for staff-originated changes.
             pauses_running:
               type: boolean
+    BillingPlanChange:
+      type: object
+      required: [id, target_plan_key, target_display_name, target_kind, effective_at, pauses_running, state, undoable, limits]
+      properties:
+        id:
+          type: string
+          format: uuid
+        target_plan_key:
+          type: string
+        target_display_name:
+          type: string
+        target_kind:
+          type: string
+          enum: [free, prepaid, subscription, legacy_payg, custom]
+        effective_at:
+          type: string
+          format: date-time
+        pauses_running:
+          type: boolean
+        state:
+          type: string
+          enum: [scheduled, applied, completed, undone]
+        undoable:
+          type: boolean
+        limits:
+          $ref: "#/components/schemas/BillingPlanLimits"
     BillingPlanChangePreview:
       type: object
       required: [target_plan_key, target_display_name, target_kind, pauses_running, limits]
@@ -5316,6 +5559,11 @@ components:
           type: boolean
         limits:
           $ref: "#/components/schemas/BillingPlanLimits"
+        preview_token:
+          type: string
+          minLength: 64
+          maxLength: 64
+          description: Present for an available downgrade or exit; return it unchanged when confirming the request.
         blocked:
           type: string
           description: Why the team cannot make this change; absent when it can.

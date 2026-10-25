@@ -24,6 +24,8 @@ type invoiceBase struct {
 	Months       int32
 	Anchor       time.Time
 	TerminatedAt int64
+	StartsAt     int64
+	SeparateFees [12]int64
 }
 
 func (h *Handlers) loadInvoiceBase(ctx context.Context, team uuid.UUID, a *invoiceAccount, readers ...db.DBTX) error {
@@ -31,12 +33,45 @@ func (h *Handlers) loadInvoiceBase(ctx context.Context, team uuid.UUID, a *invoi
 	if len(readers) > 0 {
 		reader = readers[0]
 	}
-	err := reader.QueryRow(ctx, `SELECT base_price_id,charge_amount_cents,charge_interval_months,entitlement_anchor FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND (offer_key='yc_2026' OR offer_key IN `+paidPlanOffers+`) ORDER BY created_at DESC LIMIT 1`, team, a.Customer, a.Subscription).Scan(&a.Base.Price, &a.Base.Amount, &a.Base.Months, &a.Base.Anchor)
+	var contract uuid.UUID
+	err := reader.QueryRow(ctx, `SELECT id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_anchor,extract(epoch from starts_at)::bigint FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND (offer_key='yc_2026' OR offer_key IN `+paidPlanOffers+`) ORDER BY created_at DESC LIMIT 1`, team, a.Customer, a.Subscription).Scan(&contract, &a.Base.Price, &a.Base.Amount, &a.Base.Months, &a.Base.Anchor, &a.Base.StartsAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = nil
 	}
 	if err != nil {
 		return err
+	}
+	if contract != uuid.Nil {
+		var review bool
+		if err = reader.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE contract_id=$1 AND payment_review_required)`, contract).Scan(&review); err != nil {
+			return err
+		}
+		if review {
+			return errors.New("one-off upgrade payment requires review before invoice close")
+		}
+		rows, e := reader.Query(ctx, `SELECT extract(epoch from j.period_start)::bigint FROM billing_pro_upgrade_catchup j JOIN billing_pro_upgrade u ON u.id=j.upgrade_id JOIN billing_contract_payment p ON p.contract_id=u.contract_id AND p.invoice_id=j.invoice_id AND p.service_period_start=j.period_start AND p.service_period_end=j.period_end WHERE u.contract_id=$1`, contract)
+		if e != nil {
+			return e
+		}
+		index := 0
+		for rows.Next() {
+			var boundary int64
+			if e = rows.Scan(&boundary); e != nil {
+				rows.Close()
+				return e
+			}
+			if index >= len(a.Base.SeparateFees) {
+				rows.Close()
+				return errors.New("too many separately paid upgrade periods")
+			}
+			a.Base.SeparateFees[index] = boundary
+			index++
+		}
+		e = rows.Err()
+		rows.Close()
+		if e != nil {
+			return e
+		}
 	}
 	return h.loadSponsoredAnnualBase(ctx, team, a, reader)
 }
@@ -79,10 +114,19 @@ func (b invoiceBase) stripSubscription(sub invoiceSubscription) (invoiceSubscrip
 	sub.Items.Data = items
 	return sub, nil
 }
+func (b invoiceBase) separatelyPaid(boundary int64) bool {
+	for _, paid := range b.SeparateFees {
+		if paid != 0 && paid == boundary {
+			return true
+		}
+	}
+	return false
+}
+
 func (b invoiceBase) expectedFee(boundary time.Time) (int64, int64, int64, error) {
 	b.Anchor = b.Anchor.UTC()
 	boundary = boundary.UTC()
-	if b.Price == "" || (b.TerminatedAt > 0 && boundary.Unix() >= b.TerminatedAt) {
+	if b.separatelyPaid(boundary.Unix()) || b.Price == "" || (b.StartsAt > 0 && boundary.Unix() < b.StartsAt) || (b.TerminatedAt > 0 && boundary.Unix() >= b.TerminatedAt) {
 		return 0, 0, 0, nil
 	}
 	start, _, ok := billing.AnniversaryPeriod(b.Anchor, boundary)

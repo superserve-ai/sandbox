@@ -503,7 +503,7 @@ func (h *Handlers) PublishPlanVersion(c *gin.Context) {
 		return
 	}
 	if _, ok = h.catalogWrite(c, actor, "publish", reason, func(ctx context.Context, tx pgx.Tx) (uuid.UUID, []byte, error) {
-		if _, err := tx.Exec(ctx, `SELECT 1 FROM billing_pricing_switch FOR SHARE`); err != nil {
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM billing_lock_pricing_public_state()`); err != nil {
 			return id, nil, err
 		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('billing-catalog:' || $1 || ':' || $2)::bigint)`, v.Family, v.PricingVersion); err != nil {
