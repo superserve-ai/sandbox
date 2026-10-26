@@ -61,7 +61,7 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if !ok || (current.Kind != planKindFree && current.Kind != planKindPrepaid) {
 		return errors.New("this team's plan cannot buy prepaid credit")
 	}
-	terms, err := h.planTerms(ctx, "starter")
+	terms, err := h.planTermsForPricingVersion(ctx, "starter", raw, tx)
 	if err != nil {
 		return err
 	}

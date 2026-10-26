@@ -1719,23 +1719,27 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		respondErrorMsg(c, "bad_request", "success_url and cancel_url are required", http.StatusBadRequest)
 		return
 	}
-	successURL, err := h.validateBillingRedirectURL(req.SuccessURL)
-	if err != nil {
-		if errors.Is(err, errBillingRedirectOriginsNotConfigured) {
-			respondErrorMsg(c, "service_unavailable", "billing redirect origins are not configured", http.StatusServiceUnavailable)
+	var err error
+	successURL, cancelURL := req.SuccessURL, req.CancelURL
+	if prepaid == nil || !prepaid.acceptedRedirects {
+		successURL, err = h.validateBillingRedirectURL(req.SuccessURL)
+		if err != nil {
+			if errors.Is(err, errBillingRedirectOriginsNotConfigured) {
+				respondErrorMsg(c, "service_unavailable", "billing redirect origins are not configured", http.StatusServiceUnavailable)
+				return
+			}
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 			return
 		}
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-	cancelURL, err := h.validateBillingRedirectURL(req.CancelURL)
-	if err != nil {
-		if errors.Is(err, errBillingRedirectOriginsNotConfigured) {
-			respondErrorMsg(c, "service_unavailable", "billing redirect origins are not configured", http.StatusServiceUnavailable)
+		cancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
+		if err != nil {
+			if errors.Is(err, errBillingRedirectOriginsNotConfigured) {
+				respondErrorMsg(c, "service_unavailable", "billing redirect origins are not configured", http.StatusServiceUnavailable)
+				return
+			}
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 			return
 		}
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
 	}
 	exportEnabled, err := h.billingExportEnabled(c.Request.Context(), teamID)
 	if err != nil {
@@ -1786,6 +1790,9 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		keyParts = append(append([]string(nil), priceIDs...), "prepaid:"+strconv.FormatInt(prepaid.AmountCents, 10))
 	}
 	requestKey := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, keyParts)
+	if prepaid != nil && prepaid.OperationID != uuid.Nil {
+		requestKey += ":prepaid-operation:" + prepaid.OperationID.String()
+	}
 	attemptID := uuid.New()
 	var checkoutAccount db.TeamBillingAccount
 	if trusted {
@@ -1826,6 +1833,9 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 	var purchaseID uuid.UUID
 	if prepaid != nil {
 		purchaseID = prepaidCheckoutPurchaseID(teamID, leaseStartedAt, prepaid.AmountCents)
+		if prepaid.OperationID != uuid.Nil {
+			purchaseID = prepaid.OperationID
+		}
 		if err := h.recordCheckoutPurchase(c.Request.Context(), purchaseID, teamID, customerID, checkoutActor, prepaid.AmountCents, ""); err != nil {
 			h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
 			if errors.Is(err, errPrepaidTooManyUnspent) {
@@ -1836,9 +1846,33 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 				respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 				return
 			}
+			if errors.Is(err, errPrepaidPaymentPending) {
+				if prepaid.OperationID != uuid.Nil {
+					c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: purchaseID, State: "pending"})
+				} else {
+					respondErrorMsg(c, "payment_confirmation_pending", "checkout outcome requires recovery", http.StatusAccepted)
+				}
+				return
+			}
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("freeze prepaid checkout terms failed")
 			respondError(c, ErrInternal)
 			return
+		}
+		if prepaid.OperationID != uuid.Nil {
+			// A fresh subscription lease must not extend the original purchase's
+			// settlement deadline. Stripe cannot open a payable session after expiry.
+			if err := h.Pool.QueryRow(c.Request.Context(), `SELECT payment_first_attempt_at+interval '23 hours' FROM billing_prepaid_purchase WHERE id=$1`, purchaseID).Scan(&expiresAt); err != nil {
+				h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
+				respondError(c, ErrInternal)
+				return
+			}
+			// Fence the entire generation, including concurrent resumes. An older
+			// generation may already have a session and must retain its replay key.
+			if !prepaidCheckoutGenerationCanCreate(leaseStartedAt, expiresAt) {
+				h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
+				c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: purchaseID, State: "pending"})
+				return
+			}
 		}
 		oneTime = []StripeCheckoutOneTimeLine{prepaidCheckoutOneTimeLine(purchaseID, prepaid.AmountCents)}
 	}
@@ -1884,6 +1918,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 			respondError(c, ErrInternal)
 			return
 		}
+	}
+	if prepaid != nil && prepaid.OperationID != uuid.Nil {
+		c.JSON(http.StatusOK, prepaidOperationResponse{ID: session.ID, URL: session.URL, PurchaseID: purchaseID, State: "pending"})
+		return
 	}
 	c.JSON(http.StatusOK, billingSessionResponse{ID: session.ID, URL: session.URL})
 }

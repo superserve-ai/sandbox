@@ -940,6 +940,16 @@ type BillingPrepaidAutoRecharge struct {
 	NotifiedAt     pgtype.Timestamptz `json:"notified_at"`
 }
 
+type BillingPrepaidCheckoutOperation struct {
+	ID          uuid.UUID `json:"id"`
+	TeamID      uuid.UUID `json:"team_id"`
+	ActorID     uuid.UUID `json:"actor_id"`
+	AmountCents int64     `json:"amount_cents"`
+	SuccessUrl  string    `json:"success_url"`
+	CancelUrl   string    `json:"cancel_url"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type BillingPrepaidPurchase struct {
 	ID                       uuid.UUID          `json:"id"`
 	TeamID                   uuid.UUID          `json:"team_id"`

@@ -798,7 +798,7 @@ paths:
       operationId: createPrepaidCheckout
       tags: [Billing]
       summary: Buy prepaid credit
-      description: Requires `billing:write`. The first purchase opens the subscription checkout with the credit as a one-time charge; later purchases open a one-time payment checkout that saves the card. Credit is issued after the payment is verified.
+      description: Requires `billing:write`. The first purchase opens the subscription checkout with the credit as a one-time charge; later purchases open a one-time payment checkout that saves the card. Credit is issued after the payment is verified. Supply a stable operation_id to retry a purchase after an uncertain response. It is also the purchase_id; its authenticated team, actor, amount, and validated return URLs are immutable. A browser cancel return leaves an open checkout resumable; only verified expiry or failure closes it.
       security:
         - apiKey: []
       requestBody:
@@ -809,6 +809,10 @@ paths:
               type: object
               required: [amount_cents, success_url, cancel_url]
               properties:
+                operation_id:
+                  type: string
+                  format: uuid
+                  description: Optional durable purchase identity. Reuse the same ID and request body until the purchase reaches a terminal state.
                 amount_cents:
                   type: integer
                   format: int64
@@ -822,15 +826,31 @@ paths:
                   format: uri
       responses:
         "200":
-          description: Checkout session created
+          description: Checkout created or replayed, or the existing purchase is paid, credited, or failed.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/BillingSessionResponse"
+                type: object
+                properties:
+                  id:
+                    type: string
+                  url:
+                    type: string
+                    format: uri
+                  purchase_id:
+                    type: string
+                    format: uuid
+                    description: Present when operation_id was supplied.
+                  state:
+                    type: string
+                    enum: [pending, paid, credited, failed]
+                    description: Present when operation_id was supplied. Only an open checkout includes a URL.
+        "202":
+          description: The operation is pending recovery or payment verification. Retain its operation_id; no new payment is implied.
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
-          description: Prepaid plans are not active, the plan cannot buy credit, or too many purchases are unspent.
+          description: Prepaid plans are not active, the plan cannot buy credit, too many purchases are unspent, or operation_id is bound to a different authenticated team, actor, amount, or return URL.
         "503":
           description: Prepaid credit is temporarily at capacity.
   /billing/prepaid/auto-recharge:
@@ -3231,6 +3251,9 @@ components:
       type: object
       required: [balance_cents, low_balance, auto_recharge, has_saved_card, purchases]
       properties:
+        checkout_idempotency_supported:
+          type: boolean
+          description: True only when this backend supports durable operation_id checkout retries. Clients must require true before submitting retry-capable purchases; absence is false.
         balance_cents:
           type: integer
           format: int64

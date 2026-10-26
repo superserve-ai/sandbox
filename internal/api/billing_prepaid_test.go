@@ -55,3 +55,20 @@ func TestInvoiceCreditLedgerPagesBeyondOneHundredGrants(t *testing.T) {
 		t.Fatal(total, err)
 	}
 }
+
+func TestPrepaidCheckoutGenerationCreationBoundary(t *testing.T) {
+	generation := time.Date(2026, 1, 1, 0, 0, 0, 900000000, time.UTC)
+	for _, tc := range []struct {
+		remaining time.Duration
+		want      bool
+	}{
+		{30*time.Minute - time.Second, false},
+		{30 * time.Minute, false},
+		{30*time.Minute + time.Second, true},
+		{23 * time.Hour, true},
+	} {
+		if got := prepaidCheckoutGenerationCanCreate(generation, generation.Add(tc.remaining)); got != tc.want {
+			t.Fatalf("remaining %v: got %v want %v", tc.remaining, got, tc.want)
+		}
+	}
+}

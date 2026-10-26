@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,9 +16,10 @@ import (
 )
 
 type prepaidCheckoutBody struct {
-	AmountCents int64  `json:"amount_cents"`
-	SuccessURL  string `json:"success_url"`
-	CancelURL   string `json:"cancel_url"`
+	OperationID uuid.UUID `json:"operation_id,omitempty"`
+	AmountCents int64     `json:"amount_cents"`
+	SuccessURL  string    `json:"success_url"`
+	CancelURL   string    `json:"cancel_url"`
 }
 
 type prepaidAutoRechargeBody struct {
@@ -43,6 +45,7 @@ const prepaidAutoRechargeJSON = `jsonb_build_object('enabled',COALESCE(a.enabled
 func (h *Handlers) prepaidSummary(ctx context.Context, team uuid.UUID, purchases int) ([]byte, error) {
 	var raw []byte
 	err := h.Pool.QueryRow(ctx, `SELECT jsonb_build_object(
+ 'checkout_idempotency_supported',true,
  'balance_cents',CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END,
  'low_balance',(CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END)<500 AND NOT COALESCE(a.enabled,false),
  'auto_recharge',`+prepaidAutoRechargeJSON+`,
@@ -87,19 +90,76 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	client, _ := h.Stripe.(*stripeHTTPClient)
+	recoverOperation := func() bool {
+		handled, resumeErr := h.resumePrepaidCheckoutOperation(c, client, team, actor, req)
+		if resumeErr != nil {
+			log.Warn().Err(resumeErr).Str("team_id", team.String()).Str("purchase_id", req.OperationID.String()).Msg("prepaid checkout operation awaits recovery")
+			c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: req.OperationID, State: "pending"})
+		}
+		return handled || resumeErr != nil
+	}
+	acceptedRedirects := false
+	if req.OperationID != uuid.Nil {
+		for _, raw := range []*string{&req.SuccessURL, &req.CancelURL} {
+			if parsed, parseErr := url.Parse(strings.TrimSpace(*raw)); parseErr == nil {
+				*raw = parsed.String()
+			}
+		}
+		acceptedRedirects, err = h.acceptedPrepaidCheckoutOperation(ctx, team, actor, req)
+		if err != nil {
+			if errors.Is(err, errPrepaidOperationConflict) {
+				respondErrorMsg(c, "operation_conflict", err.Error(), 409)
+			} else {
+				respondError(c, ErrInternal)
+			}
+			return
+		}
+		if acceptedRedirects && recoverOperation() {
+			return
+		}
+	}
+	// Managed billing and other entry policies govern new dispatch, while an
+	// already accepted payment remains recoverable under its immutable identity.
 	var managed bool
 	if err = h.Pool.QueryRow(ctx, `SELECT qm_team_managed_billing($1)`, team).Scan(&managed); err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
 	if managed {
-		respondErrorMsg(c, "forbidden", "This team's billing is managed by QM", http.StatusForbidden)
+		if acceptedRedirects {
+			c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: req.OperationID, State: "pending"})
+		} else {
+			respondErrorMsg(c, "forbidden", "This team's billing is managed by QM", http.StatusForbidden)
+		}
 		return
 	}
-	client, ok := h.Stripe.(*stripeHTTPClient)
-	if !ok {
+	if client == nil {
 		respondErrorMsg(c, "service_unavailable", "Stripe billing is not configured", http.StatusServiceUnavailable)
 		return
+	}
+	if req.OperationID != uuid.Nil && !acceptedRedirects {
+		req.SuccessURL, err = h.validateBillingRedirectURL(req.SuccessURL)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "invalid success_url", 400)
+			return
+		}
+		req.CancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "invalid cancel_url", 400)
+			return
+		}
+		if err = h.bindPrepaidCheckoutOperation(ctx, team, actor, req); err != nil {
+			if errors.Is(err, errPrepaidOperationConflict) {
+				respondErrorMsg(c, "operation_conflict", err.Error(), 409)
+			} else {
+				respondError(c, ErrInternal)
+			}
+			return
+		}
+		if recoverOperation() {
+			return
+		}
 	}
 	capacity, err := h.prepaidCapacityAvailable(ctx, team)
 	if err != nil {
@@ -125,20 +185,23 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return
 	}
 	if !billingAccountHasEstablishedSubscription(account) {
-		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents})
+		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID, acceptedRedirects: acceptedRedirects})
 		return
 	}
-	successURL, err := h.validateBillingRedirectURL(req.SuccessURL)
-	if err != nil {
-		respondErrorMsg(c, "bad_request", "invalid success_url", http.StatusBadRequest)
-		return
+	successURL, cancelURL := req.SuccessURL, req.CancelURL
+	if !acceptedRedirects {
+		successURL, err = h.validateBillingRedirectURL(req.SuccessURL)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "invalid success_url", http.StatusBadRequest)
+			return
+		}
+		cancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "invalid cancel_url", http.StatusBadRequest)
+			return
+		}
 	}
-	cancelURL, err := h.validateBillingRedirectURL(req.CancelURL)
-	if err != nil {
-		respondErrorMsg(c, "bad_request", "invalid cancel_url", http.StatusBadRequest)
-		return
-	}
-	session, err := h.startPrepaidPaymentCheckout(ctx, client, team, actor, derefString(account.StripeCustomerID), req.AmountCents, successURL, cancelURL)
+	session, err := h.startPrepaidPaymentCheckout(ctx, client, team, actor, derefString(account.StripeCustomerID), req.AmountCents, successURL, cancelURL, req.OperationID)
 	if err != nil {
 		if errors.Is(err, errPrepaidTooManyUnspent) {
 			respondErrorMsg(c, "conflict", errPrepaidTooManyUnspent.Error(), http.StatusConflict)
@@ -150,6 +213,10 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		}
 		log.Error().Err(err).Str("team_id", team.String()).Msg("create prepaid checkout failed")
 		respondErrorMsg(c, "bad_gateway", "checkout could not be created; try again", http.StatusBadGateway)
+		return
+	}
+	if req.OperationID != uuid.Nil {
+		c.JSON(http.StatusOK, prepaidOperationResponse{ID: session.ID, URL: session.URL, PurchaseID: req.OperationID, State: "pending"})
 		return
 	}
 	c.JSON(http.StatusOK, billingSessionResponse{ID: session.ID, URL: session.URL})

@@ -199,6 +199,15 @@ func (h *Handlers) settlePrepaidPurchase(ctx context.Context, client *stripeHTTP
 		}
 	}
 	if source == "checkout" {
+		// Record verified cash before holding first-subscription fulfillment. The
+		// managed account policy forbids the association needed to complete it.
+		var managedFirst bool
+		if err := h.Pool.QueryRow(ctx, `SELECT COALESCE(payment_evidence->'checkout_session'->>'mode'='subscription',payment_request IS NULL) AND qm_team_managed_billing(team_id) FROM billing_prepaid_purchase WHERE id=$1`, id).Scan(&managedFirst); err != nil {
+			return err
+		}
+		if managedFirst {
+			return errPrepaidPaymentPending
+		}
 		if err := assignStarterAfterPurchase(ctx, h, team, id); err != nil {
 			return err
 		}

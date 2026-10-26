@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // planTerms are a catalog plan's current terms. Contracts and plan
@@ -118,7 +119,7 @@ func (h *Handlers) planTerms(ctx context.Context, offerKey string) (planTerms, e
 	return h.planTermsForPricingVersion(ctx, offerKey, model)
 }
 
-func (h *Handlers) planTermsForPricingVersion(ctx context.Context, offerKey, model string) (planTerms, error) {
+func (h *Handlers) planTermsForPricingVersion(ctx context.Context, offerKey, model string, readers ...db.DBTX) (planTerms, error) {
 	family, months, ok := planOfferInterval(offerKey)
 	if !ok && planFamilyPattern(offerKey) {
 		family, ok = offerKey, true
@@ -126,7 +127,11 @@ func (h *Handlers) planTermsForPricingVersion(ctx context.Context, offerKey, mod
 	if !ok || h.Pool == nil {
 		return planTerms{}, errUnknownPlan
 	}
-	v, err := scanPlanVersion(h.Pool.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version
+	var reader db.DBTX = h.Pool
+	if len(readers) > 0 {
+		reader = readers[0]
+	}
+	v, err := scanPlanVersion(reader.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version
  WHERE family=$1 AND state<>'draft' ORDER BY (pricing_version=$2 AND state='published') DESC, pricing_version=$2 DESC, state='published' DESC, retired_at DESC NULLS LAST, version DESC LIMIT 1`, family, model))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return planTerms{}, errUnknownPlan
@@ -134,7 +139,7 @@ func (h *Handlers) planTermsForPricingVersion(ctx context.Context, offerKey, mod
 	if err != nil {
 		return planTerms{}, err
 	}
-	t, err := h.termsOfVersion(ctx, v, months)
+	t, err := h.termsOfVersion(ctx, v, months, readers...)
 	if v.PricingVersion != model {
 		// Legacy pay as you go stays in force for the teams on it under v2:
 		// not sold, but still assignable.
@@ -174,7 +179,7 @@ func (h *Handlers) listAssignableVersions(ctx context.Context) ([]planVersion, e
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (planVersion, error) { return scanPlanVersion(row) })
 }
 
-func (h *Handlers) termsOfVersion(ctx context.Context, v planVersion, months int32) (planTerms, error) {
+func (h *Handlers) termsOfVersion(ctx context.Context, v planVersion, months int32, readers ...db.DBTX) (planTerms, error) {
 	if v.DisplayOnly {
 		return planTerms{}, errUnknownPlan
 	}
@@ -195,7 +200,7 @@ func (h *Handlers) termsOfVersion(ctx context.Context, v planVersion, months int
 	default:
 		return planTerms{}, errUnknownPlan
 	}
-	allowance, err := h.resolveAllowance(ctx, v.Allowance)
+	allowance, err := h.resolveAllowance(ctx, v.Allowance, readers...)
 	if err != nil {
 		return planTerms{}, err
 	}
@@ -208,7 +213,7 @@ func (h *Handlers) termsOfVersion(ctx context.Context, v planVersion, months int
 
 // resolveAllowance prices a compute allowance at the public rate card, the
 // same rates public pricing shows, rounded half up to the cent.
-func (h *Handlers) resolveAllowance(ctx context.Context, a *planAllowance) (*planAllowance, error) {
+func (h *Handlers) resolveAllowance(ctx context.Context, a *planAllowance, readers ...db.DBTX) (*planAllowance, error) {
 	if a == nil {
 		return nil, nil
 	}
@@ -217,7 +222,11 @@ func (h *Handlers) resolveAllowance(ctx context.Context, a *planAllowance) (*pla
 		resolved.AmountUSD = decimalString(big.NewRat(a.AmountCents, 100))
 		return &resolved, nil
 	}
-	rows, err := h.DB.ListActivePricingRates(ctx, publicPricingPlanKey)
+	queries := h.DB
+	if len(readers) > 0 {
+		queries = db.New(readers[0])
+	}
+	rows, err := queries.ListActivePricingRates(ctx, publicPricingPlanKey)
 	if err != nil {
 		return nil, err
 	}
