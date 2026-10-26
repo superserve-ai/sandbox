@@ -83,3 +83,60 @@ func TestInvoiceCalendarRejectsMonthEndCollision(t *testing.T) {
 		t.Fatalf("stable mismatched calendar rejected: %v", err)
 	}
 }
+
+func TestInvoiceCalendarInitialPeriodUsesProviderStart(t *testing.T) {
+	parse := func(s string) time.Time {
+		v, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	for _, tc := range []struct{ name, start, anchor string }{
+		{"backdated month", "2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"},
+		{"partial first month", "2026-10-25T12:00:00Z", "2026-11-01T00:00:00Z"},
+		{"short month end", "2027-02-28T12:00:00Z", "2027-03-31T12:00:00Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start, anchor := parse(tc.start), parse(tc.anchor)
+			var sub invoiceSubscription
+			sub.StartDate, sub.BillingCycleAnchor = start.Unix(), anchor.Unix()
+			item := invoiceSubscriptionItem{Start: start.Unix(), End: anchor.Unix()}
+			item.Price.ID = "cpu"
+			sub.Items.Data = []invoiceSubscriptionItem{item}
+			p := billing.ExportPeriod{Start: start, End: anchor}
+			got, err := invoiceCalendarPeriod(p, sub, "round")
+			if err != nil || got != p {
+				t.Fatalf("initial period = %+v, %v", got, err)
+			}
+			if err := invoiceCalendarCompatible(start, sub, "round"); err != nil {
+				t.Fatalf("initial calendar: %v", err)
+			}
+			nextStart, nextEnd, _ := billing.AnniversaryPeriod(anchor, anchor)
+			sub.Items.Data[0].Start, sub.Items.Data[0].End = nextStart.Unix(), nextEnd.Unix()
+			renewal := billing.ExportPeriod{Start: nextStart, End: nextEnd}
+			if got, err := invoiceCalendarPeriod(renewal, sub, "round"); err != nil || got != renewal {
+				t.Fatalf("renewal = %+v, %v", got, err)
+			}
+			sub.Items.Data[0] = item
+			for _, mutate := range []func(*invoiceSubscription){
+				func(s *invoiceSubscription) { s.StartDate = 0 },
+				func(s *invoiceSubscription) { s.StartDate = start.Add(-time.Second).Unix() },
+				func(s *invoiceSubscription) { s.Items.Data[0].End++ },
+				func(s *invoiceSubscription) {
+					other := item
+					other.Price.ID = "memory"
+					other.Start++
+					s.Items.Data = append(s.Items.Data, other)
+				},
+			} {
+				bad := sub
+				bad.Items.Data = append([]invoiceSubscriptionItem{}, sub.Items.Data...)
+				mutate(&bad)
+				if _, err := invoiceCalendarPeriod(p, bad, "round"); err == nil {
+					t.Fatal("accepted unproven initial calendar")
+				}
+			}
+		})
+	}
+}

@@ -67,7 +67,7 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	var sub invoiceSubscription
 	sub.ID, sub.Customer, sub.Status, sub.DefaultPaymentMethod = *u.Subscription, u.Customer, "active", "pm_example"
 	sub.BillingMode.Type = "flexible"
-	sub.BillingCycleAnchor = anchor.Unix()
+	sub.StartDate, sub.BillingCycleAnchor = anchor.Unix(), end.Unix()
 	if err = json.Unmarshal([]byte(`{"behavior":"keep_as_draft"}`), &sub.PauseCollection); err != nil {
 		t.Fatal(err)
 	}

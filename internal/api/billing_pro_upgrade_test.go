@@ -93,3 +93,24 @@ func TestProUpgradeCatchupNeverInventsOrdinaryRenewals(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestProUpgradeAcceptsBackdatedInitialProviderPeriod(t *testing.T) {
+	anchor := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	end := anchor.AddDate(0, 1, 0)
+	u := proUpgrade{Customer: "cus_example", Subscription: stringPtr("sub_example"), Anchor: anchor}
+	var sub invoiceSubscription
+	if err := json.Unmarshal([]byte(`{"id":"sub_example","customer":"cus_example","status":"active","billing_mode":{"type":"flexible"},"items":{"data":[{"price":{"id":"price_cpu","currency":"usd","billing_scheme":"per_unit","unit_amount_decimal":"1","recurring":{"usage_type":"metered","interval":"month","interval_count":1,"meter":"meter_cpu"}}}]}}`), &sub); err != nil {
+		t.Fatal(err)
+	}
+	sub.StartDate, sub.BillingCycleAnchor = anchor.Unix(), end.Unix()
+	sub.Items.Data[0].Start, sub.Items.Data[0].End = anchor.Unix(), end.Unix()
+	p := StripeCreateCheckoutSessionParams{BasePriceID: "price_pro", ResourceTerms: []StripeCheckoutResourceTerms{{PriceID: "price_cpu", MeterID: "meter_cpu", EventName: "cpu", UnitAmountDecimal: "1"}}}
+	start, stop, err := validateProUpgradeSubscription(u, p, sub, "", anchor.Add(24*24*time.Hour))
+	if err != nil || !start.Equal(anchor) || !stop.Equal(end) {
+		t.Fatalf("preserved calendar %s→%s: %v", start, stop, err)
+	}
+	sub.Items.Data[0].Start++
+	if _, _, err := validateProUpgradeSubscription(u, p, sub, "", anchor.Add(24*24*time.Hour)); err == nil {
+		t.Fatal("accepted a changed commercial period")
+	}
+}

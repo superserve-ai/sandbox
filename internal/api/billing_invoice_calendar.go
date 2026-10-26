@@ -18,7 +18,6 @@ func invoiceCalendarPeriod(p billing.ExportPeriod, sub invoiceSubscription, roun
 	if sub.BillingCycleAnchor <= 0 {
 		return result, fmt.Errorf("subscription billing cycle anchor is missing")
 	}
-	anchor := time.Unix(sub.BillingCycleAnchor, 0).UTC()
 	var start, end int64
 	for _, item := range sub.Items.Data {
 		if item.Price.ID == roundingPrice {
@@ -32,12 +31,12 @@ func invoiceCalendarPeriod(p billing.ExportPeriod, sub invoiceSubscription, roun
 		}
 		start, end = item.Start, item.End
 	}
-	actualStart, actualEnd, ok := billing.AnniversaryPeriod(anchor, time.Unix(start, 0))
+	actualStart, actualEnd, ok := providerInvoicePeriod(sub, time.Unix(start, 0))
 	if !ok || actualStart.Unix() != start || actualEnd.Unix() != end {
 		return result, fmt.Errorf("subscription calendar is not a regular monthly cycle")
 	}
 	_, last := meterObservationWindow(p.Start, p.End)
-	result.Start, result.End, ok = billing.AnniversaryPeriod(anchor, last.Add(-time.Second))
+	result.Start, result.End, ok = providerInvoicePeriod(sub, last.Add(-time.Second))
 	if !ok || !result.Start.Before(p.End) || result.End.Before(p.End) {
 		return result, fmt.Errorf("commercial period cannot be assigned to this subscription calendar")
 	}
@@ -47,6 +46,26 @@ func invoiceCalendarPeriod(p billing.ExportPeriod, sub invoiceSubscription, roun
 		return result, fmt.Errorf("commercial close timestamp is outside observable invoice window")
 	}
 	return result, nil
+}
+
+// Stripe's billing anchor is the first renewal boundary. A backdated or
+// partial initial period can precede it, but must be proven by start_date.
+func providerInvoicePeriod(sub invoiceSubscription, at time.Time) (time.Time, time.Time, bool) {
+	anchor := time.Unix(sub.BillingCycleAnchor, 0).UTC()
+	if !at.Before(anchor) {
+		return billing.AnniversaryPeriod(anchor, at)
+	}
+	start := time.Unix(sub.StartDate, 0).UTC()
+	previousMonthEnd := time.Date(anchor.Year(), anchor.Month(), 0, anchor.Hour(), anchor.Minute(), anchor.Second(), 0, time.UTC)
+	day := anchor.Day()
+	if day > previousMonthEnd.Day() {
+		day = previousMonthEnd.Day()
+	}
+	earliest := time.Date(previousMonthEnd.Year(), previousMonthEnd.Month(), day, anchor.Hour(), anchor.Minute(), anchor.Second(), 0, time.UTC)
+	if sub.StartDate <= 0 || start.Before(earliest) || !start.Before(anchor) || at.Before(start) {
+		return time.Time{}, time.Time{}, false
+	}
+	return start, anchor, true
 }
 
 // Different month-end anchors can collapse two commercial periods onto one
