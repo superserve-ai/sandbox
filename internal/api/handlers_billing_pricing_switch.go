@@ -1,9 +1,11 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog/log"
 )
 
@@ -54,37 +56,31 @@ func (h *Handlers) SetPlatformPricingVersion(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	tx, err := h.Pool.Begin(ctx)
+	var state pricingSwitchState
+	var changed bool
+	err := h.Pool.QueryRow(ctx, `SELECT pricing_version,changed_by::text,reason,to_char(changed_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'),changed FROM billing_transition_pricing_version($1,$2,$3)`, req.PricingVersion, actor, reason).
+		Scan(&state.PricingVersion, &state.ChangedBy, &state.Reason, &state.ChangedAt, &changed)
 	if err != nil {
-		respondError(c, ErrInternal)
-		return
-	}
-	defer tx.Rollback(ctx)
-	var current string
-	if err = tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch FOR UPDATE`).Scan(&current); err != nil {
-		log.Error().Err(err).Msg("lock pricing switch failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	if current == req.PricingVersion {
-		if err = tx.Rollback(ctx); err != nil {
-			log.Error().Err(err).Msg("release pricing switch failed")
-			respondError(c, ErrInternal)
-			return
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch {
+			case pgErr.Code == "22023" && pgErr.ConstraintName == "billing_pricing_transition_input":
+				respondErrorMsg(c, "bad_request", "valid pricing version and reason required", http.StatusBadRequest)
+				return
+			case pgErr.Code == "42501" && pgErr.ConstraintName == "billing_pricing_transition_actor":
+				respondError(c, ErrForbidden)
+				return
+			case pgErr.Code == "55000" && pgErr.ConstraintName == "billing_pricing_transition_prerequisite":
+				respondErrorMsg(c, "conflict", "pricing transition prerequisites are not ready", http.StatusConflict)
+				return
+			}
 		}
-	} else {
-		if _, err = tx.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version=$1,changed_by=$2,reason=$3,changed_at=clock_timestamp()`, req.PricingVersion, actor, reason); err == nil {
-			_, err = tx.Exec(ctx, `INSERT INTO billing_pricing_switch_audit(actor_id,from_version,to_version,reason) VALUES($1,$2,$3,$4)`, actor, current, req.PricingVersion, reason)
-		}
-		if err == nil {
-			err = tx.Commit(ctx)
-		}
-		forgetPricingVersion()
-	}
-	if err != nil {
 		log.Error().Err(err).Msg("flip pricing switch failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	h.writePricingSwitch(c)
+	if changed {
+		forgetPricingVersion()
+	}
+	c.JSON(http.StatusOK, state)
 }
