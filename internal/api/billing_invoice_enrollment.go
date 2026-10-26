@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -20,6 +21,63 @@ import (
 const invoiceRoundingEvent = "invoice_rounding_cents_v1"
 const invoiceRoundingLookup = "invoice_rounding_usd_monthly_v1"
 const invoiceRoundingProduct = "prod_invoice_rounding_v1"
+
+// enrollInitialProviderPair records a freshly verified hold in the caller's
+// activation transaction. It never creates catalog objects or changes Stripe.
+func enrollInitialProviderPair(ctx context.Context, tx pgx.Tx, contract uuid.UUID, verified VerifiedProviderPair) error {
+	now := time.Now()
+	if tx == nil || verified.seal == ([32]byte{}) || verified.seal != pairSeal(verified) || verified.VerifiedAt.After(now) || now.Sub(verified.VerifiedAt) > time.Minute || verified.Input.validate() != nil {
+		return errors.New("fresh initial provider pair proof required for enrollment")
+	}
+	b, err := loadContractProviderBinding(ctx, tx, contract)
+	if err != nil {
+		return err
+	}
+	p := verified.Input
+	if b.Identity != p.Identity || !reflect.DeepEqual(b.Terms, p.Terms) || b.CustomerID != p.CustomerID || b.UsageSubscriptionID != p.UsageSubscriptionID || b.FeeSubscriptionID != p.FeeSubscriptionID || b.FeeItemID != p.FeeItemID || !b.Anchor.Equal(p.Anchor) || !b.StartsAt.Equal(p.Anchor) || b.EndsAt == nil || !b.EndsAt.Equal(annualBoundary(p.Anchor, 12)) {
+		return errors.New("initial enrollment differs from immutable provider binding")
+	}
+	var same bool
+	err = tx.QueryRow(ctx, `SELECT stripe_customer_id=$2 AND stripe_subscription_id=$3
+ AND stripe_subscription_status='active' AND commercial_billing_anchor=$4 AND feature_enabled('billing_export_enabled',team_id)
+ FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, p.Identity.TeamID, p.CustomerID, p.UsageSubscriptionID, p.Anchor).Scan(&same)
+	if err != nil {
+		return err
+	}
+	if !same {
+		return errors.New("initial enrollment account or rollout differs")
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO billing_invoice_enrollment(team_id,customer_id,subscription_id,started_at)
+ VALUES($1,$2,$3,$4) ON CONFLICT(team_id) DO UPDATE SET started_at=COALESCE(billing_invoice_enrollment.started_at,EXCLUDED.started_at)
+ WHERE billing_invoice_enrollment.customer_id=EXCLUDED.customer_id AND billing_invoice_enrollment.subscription_id=EXCLUDED.subscription_id
+ AND billing_invoice_enrollment.completed_at IS NULL`, p.Identity.TeamID, p.CustomerID, p.UsageSubscriptionID, p.Anchor)
+	if err != nil {
+		return err
+	}
+	err = tx.QueryRow(ctx, `SELECT customer_id=$2 AND subscription_id=$3 AND started_at=$4 FROM billing_invoice_enrollment WHERE team_id=$1`, p.Identity.TeamID, p.CustomerID, p.UsageSubscriptionID, p.Anchor).Scan(&same)
+	if err != nil {
+		return err
+	}
+	if !same {
+		return errors.New("initial invoice enrollment boundary differs")
+	}
+	r := p.Terms.Rounding
+	_, err = tx.Exec(ctx, `INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at)
+ VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(team_id) DO NOTHING`, p.Identity.TeamID, p.CustomerID, p.UsageSubscriptionID, r.PriceID, r.EventName, r.MeterID, p.Anchor)
+	if err != nil {
+		return err
+	}
+	err = tx.QueryRow(ctx, `SELECT customer_id=$2 AND subscription_id=$3 AND adjustment_price_id=$4 AND adjustment_event_name=$5 AND adjustment_meter_id=$6 AND enrolled_at=$7
+ FROM billing_invoice_account WHERE team_id=$1`, p.Identity.TeamID, p.CustomerID, p.UsageSubscriptionID, r.PriceID, r.EventName, r.MeterID, p.Anchor).Scan(&same)
+	if err != nil {
+		return err
+	}
+	if !same {
+		return errors.New("initial invoice account differs")
+	}
+	_, err = tx.Exec(ctx, `UPDATE billing_invoice_enrollment SET completed_at=COALESCE(completed_at,clock_timestamp()),last_error=NULL WHERE team_id=$1`, p.Identity.TeamID)
+	return err
+}
 
 // Stable provider identities work across regions and beyond Stripe's request
 // idempotency retention. Conflicts are retried through a fresh lookup.
@@ -139,7 +197,14 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		return err
 	}
 	replacement := enrolled && (existing.Customer != a.Customer || existing.Subscription != a.Subscription)
-	if enrolled {
+	if a.Pair != nil {
+		if requested != nil && (requested.Price != a.Price || requested.Event != a.Event || requested.Meter != "" && requested.Meter != a.Meter) {
+			return fmt.Errorf("requested rounding configuration differs from immutable provider pair")
+		}
+		if enrolled && (replacement || existing.Price != a.Price || existing.Event != a.Event || existing.Meter != a.Meter) {
+			return fmt.Errorf("existing invoice enrollment differs from immutable provider pair")
+		}
+	} else if enrolled {
 		if requested != nil && (requested.Price != existing.Price || requested.Event != existing.Event) {
 			return fmt.Errorf("existing rounding configuration differs; explicit recovery required")
 		}
@@ -166,7 +231,7 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		a.Price, a.Event, a.Meter = catalog.Price, catalog.Event, catalog.Meter
 	}
 	for _, resource := range h.billingResourceStates(true) {
-		if a.Base.Price == "" && (a.Price == resource.StripePriceID || a.Event == resource.StripeEventName) {
+		if a.Pair == nil && a.Base.Price == "" && (a.Price == resource.StripePriceID || a.Event == resource.StripeEventName) {
 			return fmt.Errorf("rounding price and event must be separate from resource usage")
 		}
 	}
@@ -324,6 +389,9 @@ func (h *Handlers) validateInvoiceEnrollment(ctx context.Context, team uuid.UUID
 }
 
 func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription, reader db.DBTX) error {
+	if a.Pair != nil {
+		return validatePairUsageSubscription(*a.Pair, a, sub)
+	}
 	if a.Base.Item != "" {
 		o, err := h.sponsoredAnnualAuthority(ctx, team, reader)
 		if err != nil {

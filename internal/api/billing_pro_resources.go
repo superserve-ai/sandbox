@@ -120,7 +120,9 @@ func (h *Handlers) billingSubscriptionResourceStates(ctx context.Context, team u
 	if len(readers) > 0 {
 		reader = readers[0]
 	}
-	err := reader.QueryRow(ctx, `WITH evidence AS (SELECT s.request_payload,1 priority FROM billing_signup_choice s
+	err := reader.QueryRow(ctx, `WITH evidence AS (SELECT jsonb_build_object('ResourceTerms',b.binding->'terms'->'resources') request_payload,0 priority FROM billing_contract_provider_binding b
+        WHERE b.team_id=$1 AND b.usage_subscription_id=COALESCE(NULLIF($2,''),(SELECT stripe_subscription_id FROM team_billing_account WHERE team_id=$1))
+        UNION ALL SELECT s.request_payload,1 priority FROM billing_signup_choice s
         WHERE s.team_id=$1 AND s.offer_key IN ('pro_monthly','pro_annual')
         AND s.subscription_id=COALESCE(NULLIF($2,''),(SELECT stripe_subscription_id FROM team_billing_account WHERE team_id=$1))
         UNION ALL SELECT resource_terms,2 FROM (SELECT resource_terms FROM billing_sponsored_operation WHERE team_id=$1 AND subscription_id=COALESCE(NULLIF($2,''),(SELECT stripe_subscription_id FROM team_billing_account WHERE team_id=$1)) ORDER BY approved_at DESC,id DESC LIMIT 1) sponsor

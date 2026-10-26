@@ -9,9 +9,10 @@ import (
 )
 
 type entitlementCoverageSample struct {
-	Contract uuid.UUID
-	Age      float64
-	Unknown  bool
+	Contract      uuid.UUID
+	Age           float64
+	Unknown       bool
+	PairExpiryAge float64
 }
 
 // Audit contracts rather than queue entries: a missing or deferred work item
@@ -21,6 +22,8 @@ func (h *Handlers) startEntitlementCoverageMonitoring(ctx context.Context) {
 		var after uuid.UUID
 		var missing, unknown int64
 		var oldest, unknownOldest float64
+		var expired int64
+		var expiryOldest float64
 		at := time.Now()
 		for ctx.Err() == nil {
 			wait := 30 * time.Second
@@ -38,6 +41,10 @@ func (h *Handlers) startEntitlementCoverageMonitoring(ctx context.Context) {
 				} else {
 					for _, row := range rows {
 						after = row.Contract
+						if row.PairExpiryAge > 0 {
+							expired = min(expired+1, 1000)
+							expiryOldest = max(expiryOldest, row.PairExpiryAge)
+						}
 						if row.Age <= 15*60 {
 							continue
 						}
@@ -53,12 +60,15 @@ func (h *Handlers) startEntitlementCoverageMonitoring(ctx context.Context) {
 					} else {
 						currentBillingRecorder().RecordBillingBacklog(ctx, "entitlement_paid_missing", missing, oldest)
 						currentBillingRecorder().RecordBillingBacklog(ctx, "entitlement_debt_unknown", unknown, unknownOldest)
+						currentBillingRecorder().RecordBillingBacklog(ctx, "entitlement_pair_refresh_expired", expired, expiryOldest)
 						after, missing, unknown, oldest, unknownOldest = uuid.Nil, 0, 0, 0, 0
+						expired, expiryOldest = 0, 0
 						at = time.Now()
 					}
 				}
 			} else {
 				after, missing, unknown, oldest, unknownOldest = uuid.Nil, 0, 0, 0, 0
+				expired, expiryOldest = 0, 0
 				at = time.Now()
 			}
 			select {
@@ -83,8 +93,14 @@ SELECT c.id,
  NOT COALESCE(c.collection_has_overdue_balance IS FALSE AND c.collection_valid_until>$2
   AND c.collection_evidence->>'gate'='finalized_invoice_gate_v1'
   AND (c.collection_evidence->>'period_start')::timestamptz=p.period_start
-  AND (c.collection_evidence->>'period_end')::timestamptz=p.period_end,false)
+  AND (c.collection_evidence->>'period_end')::timestamptz=p.period_end,false),
+ CASE WHEN pair.contract_id IS NOT NULL AND c.collection_has_overdue_balance IS FALSE
+  AND NOT EXISTS(SELECT 1 FROM billing_provider_pair_revocation r WHERE r.contract_id=c.id)
+  AND EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=c.id AND e.period_start=p.period_start AND e.state='issued')
+ THEN greatest(0,extract(epoch FROM $2::timestamptz-least(c.collection_valid_until,pair_waiver.authority_valid_until)))::double precision ELSE 0 END
 FROM page c LEFT JOIN LATERAL billing_contract_entitlement(c,$2) p ON true
+LEFT JOIN billing_contract_provider_binding pair ON pair.contract_id=c.id
+LEFT JOIN billing_provider_pair_waiver pair_waiver ON pair_waiver.contract_id=c.id
 LEFT JOIN LATERAL (SELECT paid_at FROM billing_contract_payment pay WHERE pay.contract_id=c.id
  AND pay.service_period_start<=p.period_start AND pay.service_period_end>=p.period_end
  AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=pay.invoice_id AND v.review_required)
@@ -100,7 +116,7 @@ ORDER BY c.id`, after, at, max(1, min(limit, 1000)))
 	var result []entitlementCoverageSample
 	for rows.Next() {
 		var row entitlementCoverageSample
-		if err := rows.Scan(&row.Contract, &row.Age, &row.Unknown); err != nil {
+		if err := rows.Scan(&row.Contract, &row.Age, &row.Unknown, &row.PairExpiryAge); err != nil {
 			return nil, err
 		}
 		result = append(result, row)

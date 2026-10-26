@@ -8,6 +8,7 @@ import (
 	"net/url"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type proPaymentReviewError struct {
@@ -110,8 +111,24 @@ func (h *Handlers) observeProPaymentReview(ctx context.Context, team uuid.UUID, 
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err = observeProPaymentReviewTx(ctx, tx, team, invoice, ev, verificationErr); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// observeProPaymentReviewTx records fresh verification within the caller's
+// financial transaction, after its exact immutable cash receipt is stored.
+func observeProPaymentReviewTx(ctx context.Context, tx pgx.Tx, team uuid.UUID, invoice string, ev proPaymentEvidence, verificationErr error) error {
+	var review *proPaymentReviewError
+	if verificationErr != nil && !errors.As(verificationErr, &review) {
+		return nil
+	}
+	if tx == nil {
+		return errors.New("payment review requires a transaction")
+	}
 	var contract uuid.UUID
-	err = tx.QueryRow(ctx, `SELECT c.id FROM billing_commercial_contract c JOIN billing_contract_payment p ON p.contract_id=c.id WHERE p.team_id=$1 AND p.invoice_id=$2 FOR UPDATE OF c`, team, invoice).Scan(&contract)
+	err := tx.QueryRow(ctx, `SELECT c.id FROM billing_commercial_contract c JOIN billing_contract_payment p ON p.contract_id=c.id WHERE p.team_id=$1 AND p.invoice_id=$2 FOR UPDATE OF c`, team, invoice).Scan(&contract)
 	if err != nil {
 		return err
 	}
@@ -131,8 +148,5 @@ func (h *Handlers) observeProPaymentReview(ctx context.Context, team uuid.UUID, 
 		return nil
 	}()})
 	_, err = tx.Exec(ctx, `INSERT INTO billing_pro_payment_verification(invoice_id,review_required,evidence) VALUES($1,$2,$3) ON CONFLICT(invoice_id) DO UPDATE SET review_required=EXCLUDED.review_required,evidence=EXCLUDED.evidence,observed_at=clock_timestamp()`, invoice, review != nil, evidence)
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return err
 }
