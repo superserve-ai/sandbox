@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,11 +40,14 @@ func TestProUpgradeProrationPreservesMonthEnd(t *testing.T) {
 }
 
 func TestProUpgradeCheckoutIsOneOffAndSavesCard(t *testing.T) {
+	quoted := time.Date(2027, 2, 14, 12, 0, 0, 0, time.UTC)
+	end := time.Date(2027, 2, 28, 12, 0, 0, 0, time.UTC)
+	description := proUpgradeCheckoutDescription(proOffer{Amount: 35789, Credit: 45678}, 17895, 22839, quoted, end, true)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatal(err)
 		}
-		for key, want := range map[string]string{"mode": "payment", "line_items[0][price_data][unit_amount]": "12500", "line_items[0][quantity]": "1", "payment_intent_data[setup_future_usage]": "off_session", "allow_promotion_codes": "true", "invoice_creation[enabled]": "true", "payment_intent_data[metadata][pro_upgrade_id]": "upgrade", "line_items[0][price_data][product]": "prod_pro"} {
+		for key, want := range map[string]string{"mode": "payment", "line_items[0][price_data][unit_amount]": "17895", "line_items[0][quantity]": "1", "payment_intent_data[setup_future_usage]": "off_session", "allow_promotion_codes": "true", "invoice_creation[enabled]": "true", "payment_intent_data[metadata][pro_upgrade_id]": "upgrade", "line_items[0][price_data][product]": "prod_pro"} {
 			if r.Form.Get(key) != want {
 				t.Errorf("%s=%s", key, r.Form.Get(key))
 			}
@@ -51,13 +55,41 @@ func TestProUpgradeCheckoutIsOneOffAndSavesCard(t *testing.T) {
 		if r.Form.Has("subscription_data[billing_mode][type]") || r.Form.Has("line_items[0][price]") {
 			t.Error("one-off checkout included recurring terms")
 		}
+		for _, key := range []string{"custom_text[submit][message]", "invoice_creation[invoice_data][description]"} {
+			if got := r.Form.Get(key); got != description {
+				t.Errorf("%s=%q, want payment explanation %q", key, got, description)
+			}
+		}
+		if r.Form.Has("line_items[0][price_data][product_data][name]") {
+			t.Error("payment explanation replaced the configured product identity")
+		}
 		_, _ = w.Write([]byte(`{"id":"cs_example","url":"https://checkout.stripe.com/example"}`))
 	}))
 	defer srv.Close()
 	c := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
-	_, err := c.CreateCheckoutSession(t.Context(), StripeCreateCheckoutSessionParams{OneOffAmount: 12500, OneOffProduct: "prod_pro", OneOffName: "Prorated Pro", CustomerID: "cus_example", BasePriceID: "price_pro", Flexible: true, AllowPromotionCodes: true, Metadata: map[string]string{"pro_upgrade_id": "upgrade"}})
+	_, err := c.CreateCheckoutSession(t.Context(), StripeCreateCheckoutSessionParams{OneOffAmount: 17895, OneOffProduct: "prod_pro", OneOffName: description, CustomerID: "cus_example", BasePriceID: "price_pro", Flexible: true, AllowPromotionCodes: true, Metadata: map[string]string{"pro_upgrade_id": "upgrade"}})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProUpgradeCheckoutDescriptionExplainsFrozenTerms(t *testing.T) {
+	zone := time.FixedZone("local", -6*60*60)
+	quoted := time.Date(2027, 2, 14, 6, 0, 0, 0, zone)
+	end := time.Date(2027, 2, 28, 6, 0, 0, 0, zone)
+	for _, promotions := range []bool{false, true} {
+		got := proUpgradeCheckoutDescription(proOffer{Amount: 35789, Credit: 45678}, 17895, 22839, quoted, end, promotions)
+		for _, want := range []string{"Prorated first payment", "$178.95 for Feb 14, 2027 12:00 UTC to Feb 28, 2027 12:00 UTC", "$228.39 non-expiring usage credit", "From Feb 28, 2027 12:00 UTC, renews at $357.89/month with $456.78 usage credit per billing month", "monthly credit expires at the end of that billing month"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("missing %q from %q", want, got)
+			}
+		}
+		if strings.Contains(got, "Promotion codes apply only to this first payment.") != promotions {
+			t.Errorf("promotion explanation mismatches availability: %q", got)
+		}
+		if len(got) > 1200 {
+			t.Fatalf("Checkout submit message exceeds Stripe's 1200-character limit: %d", len(got))
+		}
 	}
 }
 

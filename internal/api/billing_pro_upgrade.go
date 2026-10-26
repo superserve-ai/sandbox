@@ -66,6 +66,16 @@ func proratedProAmount(amount int64, start, end, at time.Time) (int64, error) {
 	return n.Int64(), nil
 }
 
+func proUpgradeCheckoutDescription(offer proOffer, amount, credit int64, quoted, end time.Time, promotionCodes bool) string {
+	money := func(cents int64) string { return fmt.Sprintf("$%d.%02d", cents/100, cents%100) }
+	date := func(at time.Time) string { return at.UTC().Format("Jan 2, 2006 15:04 MST") }
+	text := fmt.Sprintf("Prorated first payment (before any promotion): %s for %s to %s. Includes %s non-expiring usage credit. From %s, renews at %s/month with %s usage credit per billing month; monthly credit expires at the end of that billing month.", money(amount), date(quoted), date(end), money(credit), date(end), money(offer.Amount), money(offer.Credit))
+	if promotionCodes {
+		text += " Promotion codes apply only to this first payment."
+	}
+	return text
+}
+
 func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer proOffer, params StripeCreateCheckoutSessionParams, admission pricingPublicState) {
 	ctx := c.Request.Context()
 	tx, err := h.Pool.Begin(ctx)
@@ -198,7 +208,7 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 	params.PlanTerms.InitialAssignment = initial
 	params.PriceIDs = nil
 	params.OneOffAmount = amount
-	params.OneOffName = fmt.Sprintf("%s upgrade through %s; non-expiring usage credit", offer.Name, end.UTC().Format("2006-01-02 15:04 MST"))
+	params.OneOffName = proUpgradeCheckoutDescription(offer, amount, credit, now, end, params.AllowPromotionCodes)
 	params.Metadata = map[string]string{"pro_upgrade_id": id.String(), "team_id": team.String(), "actor_id": actor.String()}
 	params.IdempotencyKey = "pro-upgrade-checkout:" + id.String()
 	expires := now.Add(23 * time.Hour)
