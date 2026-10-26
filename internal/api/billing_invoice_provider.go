@@ -36,6 +36,13 @@ type invoiceSubscription struct {
 	BillingMode       struct {
 		Type string `json:"type"`
 	} `json:"billing_mode"`
+	BillingCycleAnchorConfig *struct {
+		DayOfMonth int  `json:"day_of_month"`
+		Hour       int  `json:"hour"`
+		Minute     int  `json:"minute"`
+		Second     int  `json:"second"`
+		Month      *int `json:"month"`
+	} `json:"billing_cycle_anchor_config"`
 	BillingCycleAnchor int64  `json:"billing_cycle_anchor"`
 	ID                 string `json:"id"`
 	Customer           string `json:"customer"`

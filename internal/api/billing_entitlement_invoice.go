@@ -468,6 +468,9 @@ func (h *Handlers) verifyOwnedEntitlementGrant(ctx context.Context, g entitlemen
  UNION ALL SELECT issuance_evidence FROM billing_matching_credit WHERE stripe_credit_grant_id=$1 AND customer_id=$2 AND state='issued'
  UNION ALL SELECT credit_evidence FROM billing_prepaid_purchase WHERE stripe_credit_grant_id=$1 AND customer_id=$2 AND credit_state='issued'`, g.ID, g.Customer).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if err := h.verifyOwnedFirstProCycleGrant(ctx, g); err != nil {
+			return err
+		}
 		if g.Metadata["entitlement_id"] != "" || g.Metadata["matching_credit_id"] != "" || g.Metadata["prepaid_purchase_id"] != "" {
 			return errors.New("unrecognized entitlement grant")
 		}

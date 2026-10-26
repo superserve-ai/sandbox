@@ -140,3 +140,24 @@ func TestInvoiceCalendarInitialPeriodUsesProviderStart(t *testing.T) {
 		})
 	}
 }
+
+func TestInvoiceCalendarRetainsUnmarkedConfiguredRenewal(t *testing.T) {
+	start := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	anchor := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	var sub invoiceSubscription
+	sub.StartDate, sub.BillingCycleAnchor = start.Unix(), anchor.Unix()
+	if err := json.Unmarshal([]byte(`{"day_of_month":1,"hour":0,"minute":0,"second":0}`), &sub.BillingCycleAnchorConfig); err != nil {
+		t.Fatal(err)
+	}
+	resource := invoiceSubscriptionItem{Start: anchor.Unix(), End: end.Unix()}
+	resource.Price.ID = "cpu"
+	sub.Items.Data = []invoiceSubscriptionItem{resource}
+	p := billing.ExportPeriod{Start: anchor, End: end}
+	if got, err := invoiceCalendarPeriod(p, sub, "round"); err != nil || got != p {
+		t.Fatalf("changed unmarked configured renewal: %+v %v", got, err)
+	}
+	if err := invoiceCalendarCompatible(anchor, sub, "round"); err != nil {
+		t.Fatalf("changed legacy configuration authority: %v", err)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -322,17 +323,31 @@ func TestProUpgradeCreditRecoversLostAcknowledgmentWithoutExpiry(t *testing.T) {
 		if credit != nil {
 			label = fmt.Sprint(*credit)
 		}
-		t.Run(label, func(t *testing.T) { testProUpgradeCreditRecovery(t, credit) })
+		t.Run(label, func(t *testing.T) { testProUpgradeCreditRecovery(t, credit, false) })
 	}
 }
 
 func ptrProCredit(n int64) *int64 { return &n }
 
-func testProUpgradeCreditRecovery(t *testing.T, credit *int64) {
+func TestProFirstCycleCreditRecoveryPreservesMonthlyExpiry(t *testing.T) {
+	for _, credit := range []int64{0, 25000, 50000} {
+		t.Run(fmt.Sprint(credit), func(t *testing.T) { testProUpgradeCreditRecovery(t, ptrProCredit(credit), true) })
+	}
+}
+
+func testProUpgradeCreditRecovery(t *testing.T, credit *int64, firstCycle bool) {
 	h, team := newPlanAssignmentFixture(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	u := proUpgrade{ID: uuid.New(), Team: team, Actor: uuid.New(), Customer: "cus_" + uuid.NewString(), Offer: "pro_monthly", Anchor: now, Start: now, End: now.Add(24 * time.Hour), Quoted: now, Amount: 12500, BridgeCredit: credit}
-	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,bridge_credit_cents) VALUES($1,$2,$3,$4,$5,'{}',$6,$6,$7,$6,$8,'paid','{}',$9)`, u.ID, team, u.Actor, u.Customer, u.Offer, now, u.End, u.Amount, credit); err != nil {
+	u.Payload = []byte(`{}`)
+	expectedExpiry := int64(0)
+	if firstCycle {
+		_, u.End, _ = billing.AnniversaryPeriod(now, now)
+		u.Amount = 25000
+		expectedExpiry = u.End.Unix() + 1
+		u.Payload, _ = json.Marshal(StripeCreateCheckoutSessionParams{FirstPaidProCycle: true, PlanTerms: &StripeCheckoutPlanTerms{Amount: u.Amount, Months: 1, Credit: *credit}})
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,bridge_credit_cents) VALUES($1,$2,$3,$4,$5,$10,$6,$6,$7,$6,$8,'paid','{}',$9)`, u.ID, team, u.Actor, u.Customer, u.Offer, now, u.End, u.Amount, credit, u.Payload); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := h.proUpgrade(t.Context(), team)
@@ -349,6 +364,7 @@ func testProUpgradeCreditRecovery(t *testing.T, credit *int64) {
 	g.Applicability.Scope.PriceType = "metered"
 	g.Metadata = map[string]string{"pro_upgrade_id": u.ID.String()}
 	g.EffectiveAt = now.Unix()
+	g.ExpiresAt = expectedExpiry
 	cash := int64(6250)
 	if credit != nil && *credit > u.Amount {
 		cash = 0
@@ -376,8 +392,8 @@ func testProUpgradeCreditRecovery(t *testing.T, credit *int64) {
 				if err := r.ParseForm(); err != nil {
 					t.Error(err)
 				}
-				if r.Form.Has("expires_at") || r.Form.Get("category") != "paid" || r.Form.Get("amount[monetary][value]") != fmt.Sprint(u.bridgeCreditAmount()) || r.Form.Get("applicability_config[scope][price_type]") != "metered" {
-					t.Error("credit is expiring, promotional, or mismatched")
+				if (r.Form.Get("expires_at") != "" && r.Form.Get("expires_at") != fmt.Sprint(expectedExpiry)) || (expectedExpiry != 0 && r.Form.Get("expires_at") != fmt.Sprint(expectedExpiry)) || r.Form.Get("category") != "paid" || r.Form.Get("amount[monetary][value]") != fmt.Sprint(u.bridgeCreditAmount()) || r.Form.Get("applicability_config[scope][price_type]") != "metered" {
+					t.Error("credit expiry, category, or amount differs from accepted terms")
 				}
 				http.Error(w, "lost acknowledgement", 503)
 			} else if creates == 0 {
@@ -406,6 +422,7 @@ func testProUpgradeCreditRecovery(t *testing.T, credit *int64) {
 		t.Fatal("expected lost acknowledgement")
 	}
 	u.Grant = nil
+	h.Now = func() time.Time { return now.Add(2 * time.Hour) }
 	if err = h.issueProUpgradeCredit(t.Context(), conn, &u, client); err != nil {
 		t.Fatal(err)
 	}
@@ -423,8 +440,37 @@ func testProUpgradeCreditRecovery(t *testing.T, credit *int64) {
 		t.Fatalf("duplicate paid credit: %d", creates)
 	}
 	var expires int64
-	if err = conn.QueryRow(t.Context(), `SELECT expires_at FROM billing_provider_credit WHERE customer_id=$1 AND grant_id=$2`, u.Customer, g.ID).Scan(&expires); err != nil || expires != 0 {
-		t.Fatalf("non-expiring credit inventory: %d %v", expires, err)
+	if err = conn.QueryRow(t.Context(), `SELECT expires_at FROM billing_provider_credit WHERE customer_id=$1 AND grant_id=$2`, u.Customer, g.ID).Scan(&expires); err != nil || expires != expectedExpiry {
+		t.Fatalf("accepted credit expiry: %d %v", expires, err)
+	}
+	if err = h.verifyOwnedEntitlementGrant(t.Context(), g); err != nil {
+		t.Fatalf("generic credit inventory rejected recognized upgrade terms: %v", err)
+	}
+	if !firstCycle {
+		// Historical bridge grants never expire and may be issued after the
+		// accepted stub ends when payment recovery or activation was delayed.
+		g.EffectiveAt = u.End.Add(time.Hour).Unix()
+		h.Now = func() time.Time { return u.End.Add(2 * time.Hour) }
+		if err = h.issueProUpgradeCredit(t.Context(), conn, &u, client); err != nil {
+			t.Fatalf("delayed legacy bridge recovery rejected: %v", err)
+		}
+		if err = h.verifyOwnedEntitlementGrant(t.Context(), g); err != nil {
+			t.Fatalf("generic credit inventory rejected delayed legacy bridge: %v", err)
+		}
+	}
+	orphan := g
+	orphan.ID = "cred_" + uuid.NewString()
+	orphan.Metadata = map[string]string{"pro_upgrade_id": uuid.NewString()}
+	if err = h.verifyOwnedEntitlementGrant(t.Context(), orphan); err == nil {
+		t.Fatal("generic credit inventory accepted unbound reserved upgrade marker")
+	}
+	orphan.Metadata = nil
+	if err = h.verifyOwnedEntitlementGrant(t.Context(), orphan); err != nil {
+		t.Fatalf("unmarked external credit rejected: %v", err)
+	}
+	g.ExpiresAt++
+	if err = h.issueProUpgradeCredit(t.Context(), conn, &u, client); err == nil {
+		t.Fatal("replay accepted a provider credit with changed expiry")
 	}
 }
 

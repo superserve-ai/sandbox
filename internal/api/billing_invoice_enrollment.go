@@ -129,6 +129,20 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 	if err = h.loadInvoiceBase(ctx, team, &a, tx); err != nil {
 		return err
 	}
+	var firstCycle bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND request_payload->>'FirstPaidProCycle'='true')`, team, a.Customer, a.Subscription).Scan(&firstCycle); err != nil {
+		return err
+	}
+	if firstCycle {
+		sub, e := client.invoiceSubscription(ctx, a.Subscription)
+		if e != nil {
+			return e
+		}
+		if e = h.verifyFirstProCycleProviderCalendar(ctx, tx, sub); e != nil {
+			return e
+		}
+	}
+
 	if !anchored {
 		return fmt.Errorf("commercial billing anchor is required before invoice enrollment")
 	}
@@ -183,7 +197,10 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 			err = client.ycGrantPreflight(ctx, a.Customer, ycContract, ycGrant)
 		} else if errors.Is(ycErr, pgx.ErrNoRows) {
 			var released bool
-			released, err = h.preflightReleasedFundingCredits(ctx, team, a, client, tx)
+			released, err = h.preflightFirstProCycleCredits(ctx, team, a, client, tx)
+			if err == nil && !released {
+				released, err = h.preflightReleasedFundingCredits(ctx, team, a, client, tx)
+			}
 			if err == nil && !released {
 				_, err = client.invoiceCreditLedger(ctx, a.Customer, time.Now().Unix())
 			}
@@ -324,6 +341,9 @@ func (h *Handlers) validateInvoiceEnrollment(ctx context.Context, team uuid.UUID
 }
 
 func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription, reader db.DBTX) error {
+	if err := h.verifyFirstProCycleProviderCalendar(ctx, reader, sub); err != nil {
+		return err
+	}
 	if a.Base.Item != "" {
 		o, err := h.sponsoredAnnualAuthority(ctx, team, reader)
 		if err != nil {
@@ -389,6 +409,9 @@ func (h *Handlers) validateInvoiceEnrollmentSubscription(ctx context.Context, te
 }
 
 func (h *Handlers) validateInvoiceResourceSubscription(ctx context.Context, team uuid.UUID, a invoiceAccount, c *stripeHTTPClient, sub invoiceSubscription, anchor time.Time, reader db.DBTX) error {
+	if err := h.verifyFirstProCycleProviderCalendar(ctx, reader, sub); err != nil {
+		return err
+	}
 	if err := invoiceCalendarCompatible(anchor, sub, a.Price); err != nil {
 		return err
 	}

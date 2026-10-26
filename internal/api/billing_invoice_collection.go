@@ -216,6 +216,10 @@ func (h *Handlers) collectInvoice(ctx context.Context, c *stripeHTTPClient, job 
 	if err != nil {
 		return job.State, "subscription retrieval unavailable"
 	}
+	if err = h.verifyFirstProCycleProviderCalendar(ctx, h.Pool, sub); err != nil {
+		return "review_required", "first Pro month subscription calendar requires review"
+	}
+
 	if sub.CollectionMethod != "charge_automatically" || sub.Customer != job.Customer || sub.LiveMode != job.LiveMode || (sub.Status != "canceled" && (sub.PauseCollection == nil || sub.PauseCollection.Behavior != "keep_as_draft" || sub.PauseCollection.ResumesAt != 0)) {
 		return "review_required", "subscription collection method or hold changed"
 	}

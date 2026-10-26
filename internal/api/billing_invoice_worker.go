@@ -427,6 +427,10 @@ func (h *Handlers) validateInvoicePlan(ctx context.Context, p billing.ExportPeri
 	if err != nil {
 		return err
 	}
+	if err = h.verifyFirstProCycleProviderCalendar(ctx, h.Pool, sub); err != nil {
+		return err
+	}
+
 	if plan.InvoiceStart != 0 || plan.InvoiceEnd != 0 {
 		var matches bool
 		if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_invoice_calendar WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND customer_id=$4 AND subscription_id=$5 AND invoice_start=$6 AND invoice_end=$7 AND billing_cycle_anchor=$8)`, p.TeamID, p.Start, p.End, a.Customer, a.Subscription, invoicePeriod.Start, invoicePeriod.End, sub.BillingCycleAnchor).Scan(&matches); err != nil {
@@ -710,7 +714,11 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 		return plan, err
 	}
 	if a.Base.Price != "" || sponsored {
-		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
+		var firstCycle bool
+		firstCycle, err = h.prepareFirstProCycleCredits(ctx, p, a, inv.ID, &plan, client)
+		if err == nil && !firstCycle {
+			err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
+		}
 	} else {
 		var released bool
 		released, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client)

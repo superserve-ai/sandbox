@@ -352,6 +352,10 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	if err == nil {
 		pending, err = pendingCustomerPlanChange(ctx, tx, team, "customer")
 	}
+	var proCheckout customerProCheckout
+	if err == nil {
+		proCheckout, err = customerProCheckoutTerms(ctx, tx, team, assigned && current.Kind == planKindFree, anchor.Valid)
+	}
 	if err == nil {
 		err = tx.Commit(ctx)
 	}
@@ -369,6 +373,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		"plan":           plan,
 		"period":         customerBillingPeriod{Start: start, End: end},
 		"pending_change": pending,
+		"pro_checkout":   proCheckout,
 	})
 }
 

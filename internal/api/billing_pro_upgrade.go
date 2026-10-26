@@ -66,6 +66,47 @@ func proratedProAmount(amount int64, start, end, at time.Time) (int64, error) {
 	return n.Int64(), nil
 }
 
+func proUpgradeCheckoutDescription(offer proOffer, amount, credit int64, quoted, end time.Time, promotionCodes bool) string {
+	money := func(cents int64) string { return fmt.Sprintf("$%d.%02d", cents/100, cents%100) }
+	date := func(at time.Time) string { return at.UTC().Format("Jan 2, 2006 15:04 MST") }
+	text := fmt.Sprintf("Prorated first payment (before any promotion): %s for %s to %s. Includes %s non-expiring usage credit. From %s, renews at %s/month with %s usage credit per billing month; monthly credit expires at the end of that billing month.", money(amount), date(quoted), date(end), money(credit), date(end), money(offer.Amount), money(offer.Credit))
+	if promotionCodes {
+		text += " Promotion codes apply only to this first payment."
+	}
+	return text
+}
+
+func proFirstCycleCheckoutDescription(offer proOffer, start, end time.Time, promotionCodes bool) string {
+	money := func(cents int64) string { return fmt.Sprintf("$%d.%02d", cents/100, cents%100) }
+	date := func(at time.Time) string { return at.UTC().Format("Jan 2, 2006 15:04 MST") }
+	text := fmt.Sprintf("First monthly payment (before any promotion): %s for %s to %s. Includes %s usage credit that expires at the end of this billing month. From %s, renews at %s/month with %s usage credit per billing month; monthly credit expires at the end of that billing month.", money(offer.Amount), date(start), date(end), money(offer.Credit), date(end), money(offer.Amount), money(offer.Credit))
+	if promotionCodes {
+		text += " Promotion codes apply only to this first payment."
+	}
+	return text
+}
+
+// Unmarked requests retain their accepted non-expiring bridge credit terms.
+func (u proUpgrade) creditExpiry() (int64, error) {
+	if len(u.Payload) == 0 {
+		return 0, nil
+	}
+	var params StripeCreateCheckoutSessionParams
+	if err := json.Unmarshal(u.Payload, &params); err != nil {
+		return 0, err
+	}
+	if !params.FirstPaidProCycle {
+		return 0, nil
+	}
+	_, end, ok := billing.AnniversaryPeriod(u.Anchor, u.Anchor)
+	if !ok || !u.Anchor.Equal(u.Start) || !u.Start.Equal(u.Quoted) || !u.End.Equal(end) || params.PlanTerms == nil || params.PlanTerms.Months != 1 || params.PlanTerms.Amount != u.Amount || params.PlanTerms.Credit != u.bridgeCreditAmount() {
+		return 0, errors.New("first Pro billing month differs from accepted terms")
+	}
+	// The closing usage invoice includes the boundary second; customer credit
+	// still expires at the logical month end, as with recurring allowances.
+	return u.End.Unix() + 1, nil
+}
+
 func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer proOffer, params StripeCreateCheckoutSessionParams, admission pricingPublicState) {
 	ctx := c.Request.Context()
 	tx, err := h.Pool.Begin(ctx)
@@ -138,9 +179,20 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		return
 	}
 	now := h.nowUTC().Truncate(time.Second)
+	firstPaidCycle, err := firstProCycleEligible(ctx, tx, team, assigned && plan.Kind == planKindFree, a.CommercialBillingAnchor.Valid, a.StripeSubscriptionID != nil)
+	if errors.Is(err, errProFirstCycleReconciliation) {
+		respondErrorMsg(c, "billing_reconciliation_required", err.Error(), http.StatusConflict)
+		return
+	}
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
 	anchor := now
 	start, end := billing.CurrentBillingPeriod(now)
-	if a.CommercialBillingAnchor.Valid {
+	if firstPaidCycle {
+		start, end, _ = billing.AnniversaryPeriod(now, now)
+	} else if a.CommercialBillingAnchor.Valid {
 		anchor = a.CommercialBillingAnchor.Time
 		var ok bool
 		start, end, ok = billing.AnniversaryPeriod(anchor, now)
@@ -198,7 +250,11 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 	params.PlanTerms.InitialAssignment = initial
 	params.PriceIDs = nil
 	params.OneOffAmount = amount
-	params.OneOffName = fmt.Sprintf("%s upgrade through %s; non-expiring usage credit", offer.Name, end.UTC().Format("2006-01-02 15:04 MST"))
+	params.FirstPaidProCycle = firstPaidCycle
+	params.OneOffName = proUpgradeCheckoutDescription(offer, amount, credit, now, end, params.AllowPromotionCodes)
+	if firstPaidCycle {
+		params.OneOffName = proFirstCycleCheckoutDescription(offer, now, end, params.AllowPromotionCodes)
+	}
 	params.Metadata = map[string]string{"pro_upgrade_id": id.String(), "team_id": team.String(), "actor_id": actor.String()}
 	params.IdempotencyKey = "pro-upgrade-checkout:" + id.String()
 	expires := now.Add(23 * time.Hour)
@@ -502,7 +558,14 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 				return invoiceSubscription{}, errors.New("upgrade subscription creation replay expired")
 			}
 			form := url.Values{"customer": {u.Customer}, "billing_mode[type]": {"flexible"}, "proration_behavior": {"none"}, "backdate_start_date": {strconv.FormatInt(u.Anchor.Unix(), 10)}, "metadata[pro_upgrade_id]": {u.ID.String()}}
-			if u.End.Day() == u.Anchor.Day() {
+			if p.FirstPaidProCycle {
+				form.Set("metadata[first_paid_pro_cycle]", "true")
+				anchor := u.Anchor.UTC()
+				form.Set("billing_cycle_anchor_config[day_of_month]", strconv.Itoa(anchor.Day()))
+				form.Set("billing_cycle_anchor_config[hour]", strconv.Itoa(anchor.Hour()))
+				form.Set("billing_cycle_anchor_config[minute]", strconv.Itoa(anchor.Minute()))
+				form.Set("billing_cycle_anchor_config[second]", strconv.Itoa(anchor.Second()))
+			} else if u.End.Day() == u.Anchor.Day() {
 				form.Set("billing_cycle_anchor", strconv.FormatInt(u.End.Unix(), 10))
 			}
 			for i, t := range p.ResourceTerms {
@@ -559,6 +622,11 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 }
 
 func validateProUpgradeSubscription(u proUpgrade, p StripeCreateCheckoutSessionParams, sub invoiceSubscription, rounding string, now time.Time) (time.Time, time.Time, error) {
+	if p.FirstPaidProCycle {
+		if err := validateFirstProCycleProviderCalendar(u.ID, u.Anchor, sub); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
 	if sub.ID != derefString(u.Subscription) || sub.Customer != u.Customer || sub.Status != "active" || sub.CancelAtPeriodEnd || sub.CancelAt != 0 || sub.PendingUpdate != nil || sub.Schedule != "" || len(sub.Discounts) != 0 || sub.AutomaticTax.Enabled || sub.BillingMode.Type != "flexible" {
 		return time.Time{}, time.Time{}, errors.New("subscription is unavailable for immediate Pro upgrade")
 	}

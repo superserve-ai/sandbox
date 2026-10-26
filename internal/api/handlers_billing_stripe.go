@@ -148,6 +148,8 @@ type StripeBillingCreditGrant struct {
 }
 
 type StripeCreateCheckoutSessionParams struct {
+	// FirstPaidProCycle distinguishes new monthly credit from historical bridge grants.
+	FirstPaidProCycle        bool       `json:",omitempty"`
 	ReleaseID                *uuid.UUID `json:",omitempty"`
 	OperationID              uuid.UUID  `json:",omitempty"`
 	OneOffProduct            string     `json:",omitempty"`

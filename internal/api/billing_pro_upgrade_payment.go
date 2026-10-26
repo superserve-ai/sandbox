@@ -88,6 +88,10 @@ func (c *stripeHTTPClient) verifyProUpgradePayment(ctx context.Context, u proUpg
 
 func (h *Handlers) issueProUpgradeCredit(ctx context.Context, conn *pgxpool.Conn, u *proUpgrade, c *stripeHTTPClient) error {
 	credit := u.bridgeCreditAmount()
+	expires, err := u.creditExpiry()
+	if err != nil {
+		return err
+	}
 	if credit == 0 {
 		tag, err := conn.Exec(ctx, `UPDATE billing_pro_upgrade SET state='credited' WHERE id=$1 AND bridge_credit_cents=0 AND payment_evidence IS NOT NULL`, u.ID)
 		if err == nil && tag.RowsAffected() != 1 {
@@ -135,6 +139,10 @@ func (h *Handlers) issueProUpgradeCredit(ctx context.Context, conn *pgxpool.Conn
 				return err
 			}
 			form := url.Values{"customer": {u.Customer}, "category": {"paid"}, "name": {"Prorated Pro usage credit"}, "amount[type]": {"monetary"}, "amount[monetary][currency]": {"usd"}, "amount[monetary][value]": {strconv.FormatInt(credit, 10)}, "priority": {"50"}, "applicability_config[scope][price_type]": {"metered"}, "metadata[pro_upgrade_id]": {u.ID.String()}}
+			if expires != 0 {
+				form.Set("name", "Pro monthly usage credit")
+				form.Set("expires_at", strconv.FormatInt(expires, 10))
+			}
 			var created entitlementGrant
 			if err := c.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &created, "pro-upgrade-credit:"+u.ID.String()); err != nil {
 				return err
@@ -146,8 +154,8 @@ func (h *Handlers) issueProUpgradeCredit(ctx context.Context, conn *pgxpool.Conn
 	if err != nil {
 		return err
 	}
-	if g.ID == "" || g.Customer != u.Customer || g.Category != "paid" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != credit || g.ExpiresAt != 0 || g.VoidedAt != 0 || g.Priority != 50 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Metadata["pro_upgrade_id"] != u.ID.String() || g.EffectiveAt > h.nowUTC().Unix() {
-		return errors.New("upgrade credit differs from non-expiring paid terms")
+	if g.ID == "" || g.Customer != u.Customer || g.Category != "paid" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != credit || g.ExpiresAt != expires || g.VoidedAt != 0 || g.Priority != 50 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Metadata["pro_upgrade_id"] != u.ID.String() || g.EffectiveAt > h.nowUTC().Unix() {
+		return errors.New("upgrade credit differs from accepted paid terms")
 	}
 	raw, err := json.Marshal(g)
 	if err != nil {
@@ -158,7 +166,7 @@ func (h *Handlers) issueProUpgradeCredit(ctx context.Context, conn *pgxpool.Conn
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, `INSERT INTO billing_provider_credit(customer_id,grant_id,evidence,effective_at,expires_at) VALUES($1,$2,$3,$4,0) ON CONFLICT(customer_id,grant_id) DO UPDATE SET evidence=EXCLUDED.evidence,observed_at=clock_timestamp()`, u.Customer, g.ID, raw, g.EffectiveAt); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO billing_provider_credit(customer_id,grant_id,evidence,effective_at,expires_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(customer_id,grant_id) DO UPDATE SET evidence=EXCLUDED.evidence,observed_at=clock_timestamp()`, u.Customer, g.ID, raw, g.EffectiveAt, expires); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_pro_upgrade SET grant_id=$2,state='credited' WHERE id=$1`, u.ID, g.ID); err != nil {
@@ -238,6 +246,18 @@ func (h *Handlers) commitProUpgrade(ctx context.Context, conn *pgxpool.Conn, u *
 	}
 	if derefString(a.StripeCustomerID) != u.Customer || derefString(a.StripeSubscriptionID) != sub.ID || !a.CommercialBillingAnchor.Valid || !a.CommercialBillingAnchor.Time.Equal(u.Anchor) {
 		return errors.New("upgrade billing association changed")
+	}
+	var accepted StripeCreateCheckoutSessionParams
+	if err = json.Unmarshal(u.Payload, &accepted); err != nil {
+		return err
+	}
+	if accepted.FirstPaidProCycle {
+		if err = validateFirstProCycleProviderCalendar(u.ID, u.Anchor, sub); err != nil {
+			return err
+		}
+		if err = retireFirstProCycleReportingPeriods(ctx, tx, *u); err != nil {
+			return err
+		}
 	}
 	offer.PredecessorKnown = true
 	offer.InitialAssignment = u.InitialAssignment

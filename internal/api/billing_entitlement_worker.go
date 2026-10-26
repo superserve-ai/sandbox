@@ -349,6 +349,10 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err != nil {
 		return next, err
 	}
+	if err = h.verifyFirstProCycleProviderCalendar(ctx, h.Pool, sub); err != nil {
+		return next, err
+	}
+
 	sub, err = a.Base.stripSubscription(sub)
 	if err != nil {
 		return next, err
