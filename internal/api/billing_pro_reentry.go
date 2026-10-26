@@ -27,7 +27,8 @@ func proReleaseForReentry(ctx context.Context, q db.DBTX, team uuid.UUID, custom
  AND EXISTS(SELECT 1 FROM billing_contract_payment p WHERE p.contract_id=c.id))
  OR EXISTS(SELECT 1 FROM billing_pro_upgrade u WHERE u.contract_id=c.id AND u.team_id=$1
  AND u.customer_id=r.customer_id AND u.subscription_id=r.subscription_id AND u.state='ended'
- AND u.grant_id IS NOT NULL AND u.payment_evidence IS NOT NULL AND NOT u.payment_review_required
+ AND (u.grant_id IS NOT NULL OR (u.bridge_credit_cents=0
+ AND r.provider_evidence#>>'{pro_upgrade,upgrade,BridgeCredit}'='0')) AND u.payment_evidence IS NOT NULL AND NOT u.payment_review_required
  AND r.provider_evidence->'pro_upgrade'->'upgrade'->>'ID'=u.id::text))
  AND NOT EXISTS(SELECT 1 FROM billing_commercial_contract other WHERE other.team_id=$1 AND other.status<>'ended')
  AND NOT EXISTS(SELECT 1 FROM team_plan_change pending WHERE pending.team_id=$1 AND pending.state IN ('scheduled','applied') AND pending.id<>ch.id)

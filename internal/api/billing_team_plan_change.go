@@ -327,10 +327,23 @@ func (h *Handlers) planChangeBoundary(ctx context.Context, team uuid.UUID, curre
 }
 
 // planChangeSubscription is the live Stripe subscription billing a team's
-// subscription plan and the end of its current period.
+// subscription plan and the end of its current period. A verified active upgrade
+// can stop renewal while its first recurring contract is still pending.
 func (h *Handlers) planChangeSubscription(ctx context.Context, team, contract uuid.UUID) (*string, time.Time, error) {
-	var subscription string
-	err := h.Pool.QueryRow(ctx, `SELECT subscription_id FROM billing_commercial_contract WHERE id=$1 AND team_id=$2 AND status='active' AND subscription_id IS NOT NULL`, contract, team).Scan(&subscription)
+	var subscription, customer, price string
+	var amount int64
+	var pending bool
+	var bridgeEnd time.Time
+	err := h.Pool.QueryRow(ctx, `SELECT c.subscription_id,c.customer_id,c.base_price_id,c.charge_amount_cents,c.status='pending',c.starts_at FROM billing_commercial_contract c
+ WHERE c.id=$1 AND c.team_id=$2 AND c.subscription_id IS NOT NULL
+ AND (c.status='active' OR (c.status='pending' AND c.starts_at>$3 AND EXISTS(
+ SELECT 1 FROM billing_pro_upgrade u JOIN team_plan_assignment p ON p.team_id=u.team_id AND p.contract_id=u.contract_id
+ WHERE u.contract_id=c.id AND u.team_id=c.team_id AND u.customer_id=c.customer_id AND u.subscription_id=c.subscription_id
+ AND u.offer_key=c.offer_key AND u.period_end=c.starts_at AND u.quoted_at<=$3 AND u.state='active'
+ AND u.payment_evidence IS NOT NULL AND (u.grant_id IS NOT NULL OR u.bridge_credit_cents=0)
+ AND EXISTS(SELECT 1 FROM team_billing_account a WHERE a.team_id=c.team_id AND a.stripe_customer_id=c.customer_id AND a.stripe_subscription_id=c.subscription_id)
+ AND p.plan_key=u.offer_key AND p.kind='subscription' AND p.effective_from<=$3 AND p.effective_to IS NULL
+ )))`, contract, team, h.nowUTC()).Scan(&subscription, &customer, &price, &amount, &pending, &bridgeEnd)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, time.Time{}, teamPlanChangeConflict("the team's subscription could not be found")
 	}
@@ -344,6 +357,14 @@ func (h *Handlers) planChangeSubscription(ctx context.Context, team, contract uu
 	sub, err := client.invoiceSubscription(ctx, subscription)
 	if err != nil {
 		return nil, time.Time{}, err
+	}
+	if pending {
+		if sub.ID != subscription || sub.Customer != customer || !subscriptionPeriodEnd(sub).Equal(bridgeEnd) {
+			return nil, time.Time{}, teamPlanChangeConflict("the paid upgrade subscription no longer matches its accepted period")
+		}
+		if _, err = (invoiceBase{Price: price, Amount: amount, Months: 1}).stripSubscription(sub); err != nil {
+			return nil, time.Time{}, err
+		}
 	}
 	if subscriptionEnded(sub) {
 		return nil, time.Time{}, teamPlanChangeConflict("the team's subscription has already ended")

@@ -134,7 +134,7 @@ WHERE ((c.status='active' AND c.starts_at<=$1) OR (c.status IN('pending','active
  SELECT 1 FROM billing_pro_upgrade u JOIN team_plan_assignment p ON p.team_id=u.team_id AND p.contract_id=u.contract_id
  WHERE u.contract_id=c.id AND u.team_id=c.team_id AND u.customer_id=c.customer_id AND u.subscription_id=c.subscription_id
   AND u.offer_key=c.offer_key AND u.period_end=c.starts_at AND u.quoted_at<=$1 AND u.state='active'
-  AND u.payment_evidence IS NOT NULL AND u.grant_id IS NOT NULL
+  AND u.payment_evidence IS NOT NULL AND (u.grant_id IS NOT NULL OR u.bridge_credit_cents=0)
   AND p.plan_key=u.offer_key AND p.kind='subscription' AND p.effective_from<=$1 AND p.effective_to IS NULL
  ))) AND (c.ends_at IS NULL OR c.ends_at>$1) AND t.home_region=$2
  AND t.id IS DISTINCT FROM NULLIF($3,'')::uuid

@@ -21,7 +21,7 @@ func (h *Handlers) proUpgradeRelease(ctx context.Context, tx pgx.Tx, c teamPlanC
 	if err != nil {
 		return nil, err
 	}
-	if u.State != "active" || u.Session == nil || u.Subscription == nil || *u.Subscription != sub.ID || u.Customer != sub.Customer || u.Grant == nil || len(u.Evidence) == 0 {
+	if u.State != "active" || u.Session == nil || u.Subscription == nil || *u.Subscription != sub.ID || u.Customer != sub.Customer || (u.Grant == nil && (u.BridgeCredit == nil || *u.BridgeCredit != 0)) || len(u.Evidence) == 0 {
 		return nil, errors.New("the source upgrade is not completely reconciled")
 	}
 	var params StripeCreateCheckoutSessionParams

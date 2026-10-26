@@ -1170,6 +1170,7 @@ type BillingProUpgrade struct {
 	ContractID             pgtype.UUID        `json:"contract_id"`
 	NextCheckAt            time.Time          `json:"next_check_at"`
 	LastError              *string            `json:"last_error"`
+	BridgeCreditCents      *int64             `json:"bridge_credit_cents"`
 }
 
 type BillingProUpgradeCatchup struct {

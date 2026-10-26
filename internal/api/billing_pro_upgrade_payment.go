@@ -87,6 +87,14 @@ func (c *stripeHTTPClient) verifyProUpgradePayment(ctx context.Context, u proUpg
 }
 
 func (h *Handlers) issueProUpgradeCredit(ctx context.Context, conn *pgxpool.Conn, u *proUpgrade, c *stripeHTTPClient) error {
+	credit := u.bridgeCreditAmount()
+	if credit == 0 {
+		tag, err := conn.Exec(ctx, `UPDATE billing_pro_upgrade SET state='credited' WHERE id=$1 AND bridge_credit_cents=0 AND payment_evidence IS NOT NULL`, u.ID)
+		if err == nil && tag.RowsAffected() != 1 {
+			return errors.New("upgrade zero credit lacks accepted payment proof")
+		}
+		return err
+	}
 	grant := derefString(u.Grant)
 	if grant == "" {
 		var closing bool
@@ -126,7 +134,7 @@ func (h *Handlers) issueProUpgradeCredit(ctx context.Context, conn *pgxpool.Conn
 			if err := conn.QueryRow(ctx, `UPDATE billing_pro_upgrade SET grant_attempted_at=COALESCE(grant_attempted_at,clock_timestamp()) WHERE id=$1 RETURNING grant_attempted_at`, u.ID).Scan(&u.GrantAttempt); err != nil {
 				return err
 			}
-			form := url.Values{"customer": {u.Customer}, "category": {"paid"}, "name": {"Prorated Pro usage credit"}, "amount[type]": {"monetary"}, "amount[monetary][currency]": {"usd"}, "amount[monetary][value]": {strconv.FormatInt(u.Amount, 10)}, "priority": {"50"}, "applicability_config[scope][price_type]": {"metered"}, "metadata[pro_upgrade_id]": {u.ID.String()}}
+			form := url.Values{"customer": {u.Customer}, "category": {"paid"}, "name": {"Prorated Pro usage credit"}, "amount[type]": {"monetary"}, "amount[monetary][currency]": {"usd"}, "amount[monetary][value]": {strconv.FormatInt(credit, 10)}, "priority": {"50"}, "applicability_config[scope][price_type]": {"metered"}, "metadata[pro_upgrade_id]": {u.ID.String()}}
 			var created entitlementGrant
 			if err := c.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &created, "pro-upgrade-credit:"+u.ID.String()); err != nil {
 				return err
@@ -138,7 +146,7 @@ func (h *Handlers) issueProUpgradeCredit(ctx context.Context, conn *pgxpool.Conn
 	if err != nil {
 		return err
 	}
-	if g.ID == "" || g.Customer != u.Customer || g.Category != "paid" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != u.Amount || g.ExpiresAt != 0 || g.VoidedAt != 0 || g.Priority != 50 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Metadata["pro_upgrade_id"] != u.ID.String() || g.EffectiveAt > h.nowUTC().Unix() {
+	if g.ID == "" || g.Customer != u.Customer || g.Category != "paid" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != credit || g.ExpiresAt != 0 || g.VoidedAt != 0 || g.Priority != 50 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Metadata["pro_upgrade_id"] != u.ID.String() || g.EffectiveAt > h.nowUTC().Unix() {
 		return errors.New("upgrade credit differs from non-expiring paid terms")
 	}
 	raw, err := json.Marshal(g)
@@ -254,7 +262,7 @@ func (h *Handlers) commitProUpgrade(ctx context.Context, conn *pgxpool.Conn, u *
 	if err = assignCheckoutPlan(ctx, tx, proChoice{Team: u.Team, Actor: u.Actor, Offer: u.Offer}, offer, contract.ID); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_pro_upgrade SET contract_id=$2 WHERE id=$1 AND grant_id IS NOT NULL AND payment_evidence IS NOT NULL`, u.ID, contract.ID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_pro_upgrade SET contract_id=$2 WHERE id=$1 AND (grant_id IS NOT NULL OR bridge_credit_cents=0) AND payment_evidence IS NOT NULL`, u.ID, contract.ID); err != nil {
 		return err
 	}
 	u.Contract = &contract.ID

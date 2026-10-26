@@ -27,17 +27,26 @@ type proUpgrade struct {
 	Payload                                     []byte
 	Anchor, Start, End, Quoted                  time.Time
 	Amount                                      int64
+	BridgeCredit                                *int64
 	GrantAttempt                                *time.Time
 	RecurringAttempt, BaseCreated               *time.Time
 	InitialAssignment                           *uuid.UUID
 	Evidence                                    []byte
 }
 
-const proUpgradeColumns = `id,team_id,actor_id,customer_id,subscription_id,offer_key,state,session_id,grant_id,payment_method_id,contract_id,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,grant_attempted_at,payment_evidence,recurring_attempted_at,base_created_at,initial_assignment_id`
+const proUpgradeColumns = `id,team_id,actor_id,customer_id,subscription_id,offer_key,state,session_id,grant_id,payment_method_id,contract_id,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,grant_attempted_at,payment_evidence,recurring_attempted_at,base_created_at,initial_assignment_id,bridge_credit_cents`
 
 func scanProUpgrade(row pgx.Row) (u proUpgrade, err error) {
-	err = row.Scan(&u.ID, &u.Team, &u.Actor, &u.Customer, &u.Subscription, &u.Offer, &u.State, &u.Session, &u.Grant, &u.PaymentMethod, &u.Contract, &u.Payload, &u.Anchor, &u.Start, &u.End, &u.Quoted, &u.Amount, &u.GrantAttempt, &u.Evidence, &u.RecurringAttempt, &u.BaseCreated, &u.InitialAssignment)
+	err = row.Scan(&u.ID, &u.Team, &u.Actor, &u.Customer, &u.Subscription, &u.Offer, &u.State, &u.Session, &u.Grant, &u.PaymentMethod, &u.Contract, &u.Payload, &u.Anchor, &u.Start, &u.End, &u.Quoted, &u.Amount, &u.GrantAttempt, &u.Evidence, &u.RecurringAttempt, &u.BaseCreated, &u.InitialAssignment, &u.BridgeCredit)
 	return
+}
+
+// NULL identifies accepted operations predating independent credit quotes.
+func (u proUpgrade) bridgeCreditAmount() int64 {
+	if u.BridgeCredit != nil {
+		return *u.BridgeCredit
+	}
+	return u.Amount
 }
 
 func (h *Handlers) proUpgrade(ctx context.Context, team uuid.UUID) (proUpgrade, error) {
@@ -46,13 +55,13 @@ func (h *Handlers) proUpgrade(ctx context.Context, team uuid.UUID) (proUpgrade, 
 
 func proratedProAmount(amount int64, start, end, at time.Time) (int64, error) {
 	duration, remaining := end.Unix()-start.Unix(), end.Unix()-at.Unix()
-	if amount <= 0 || duration <= 0 || remaining <= 0 || at.Before(start) || remaining > duration {
+	if amount < 0 || duration <= 0 || remaining <= 0 || at.Before(start) || remaining > duration {
 		return 0, errors.New("invalid Pro proration window")
 	}
 	n := new(big.Int).Mul(big.NewInt(amount), big.NewInt(remaining))
 	n.Add(n, big.NewInt(duration/2)).Quo(n, big.NewInt(duration))
-	if !n.IsInt64() || n.Int64() <= 0 {
-		return 0, errors.New("Pro proration rounds to zero; retry at the next billing date")
+	if !n.IsInt64() {
+		return 0, errors.New("Pro proration exceeds supported amount")
 	}
 	return n.Int64(), nil
 }
@@ -158,6 +167,11 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		respondErrorMsg(c, "billing_boundary", "The remaining prorated payment is below the card minimum or the billing date is too close. Retry after the next billing date.", 409)
 		return
 	}
+	credit, err := proratedProAmount(offer.Credit, start, end, now)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
 	id := params.OperationID
 	if id == uuid.Nil {
 		id = uuid.New()
@@ -184,7 +198,7 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 	params.PlanTerms.InitialAssignment = initial
 	params.PriceIDs = nil
 	params.OneOffAmount = amount
-	params.OneOffName = fmt.Sprintf("%s upgrade through %s; equal non-expiring usage credit", offer.Name, end.UTC().Format("2006-01-02 15:04 MST"))
+	params.OneOffName = fmt.Sprintf("%s upgrade through %s; non-expiring usage credit", offer.Name, end.UTC().Format("2006-01-02 15:04 MST"))
 	params.Metadata = map[string]string{"pro_upgrade_id": id.String(), "team_id": team.String(), "actor_id": actor.String()}
 	params.IdempotencyKey = "pro-upgrade-checkout:" + id.String()
 	expires := now.Add(23 * time.Hour)
@@ -197,7 +211,7 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		respondError(c, ErrInternal)
 		return
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,initial_assignment_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, team, actor, params.CustomerID, a.StripeSubscriptionID, offer.Key, payload, anchor, start, end, now, amount, initial)
+	_, err = tx.Exec(ctx, `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,initial_assignment_id,bridge_credit_cents) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, id, team, actor, params.CustomerID, a.StripeSubscriptionID, offer.Key, payload, anchor, start, end, now, amount, initial, credit)
 	if err == nil {
 		err = tx.Commit(ctx)
 	}
@@ -427,6 +441,10 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	if err = h.enrollInvoiceAccount(ctx, u.Team, nil); err != nil {
 		return "", err
 	}
+	return h.activateProUpgrade(ctx, u, params)
+}
+
+func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params StripeCreateCheckoutSessionParams) (string, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return "", err
