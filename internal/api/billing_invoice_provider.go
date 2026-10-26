@@ -44,8 +44,9 @@ type invoiceSubscription struct {
 		Behavior  string `json:"behavior"`
 		ResumesAt int64  `json:"resumes_at"`
 	} `json:"pause_collection"`
-	Discounts    []string `json:"discounts"`
-	AutomaticTax struct {
+	Discounts       []string          `json:"discounts"`
+	DefaultTaxRates []json.RawMessage `json:"default_tax_rates"`
+	AutomaticTax    struct {
 		Enabled bool `json:"enabled"`
 	} `json:"automatic_tax"`
 	BillingThresholds any `json:"billing_thresholds"`
@@ -56,14 +57,17 @@ type invoiceSubscription struct {
 }
 
 type invoiceSubscriptionItem struct {
-	ID       string       `json:"id"`
-	Quantity int64        `json:"quantity"`
-	Price    storagePrice `json:"price"`
-	Start    int64        `json:"current_period_start"`
-	End      int64        `json:"current_period_end"`
+	Discounts []json.RawMessage `json:"discounts"`
+	TaxRates  []json.RawMessage `json:"tax_rates"`
+	ID        string            `json:"id"`
+	Quantity  int64             `json:"quantity"`
+	Price     storagePrice      `json:"price"`
+	Start     int64             `json:"current_period_start"`
+	End       int64             `json:"current_period_end"`
 }
 
 type invoiceAccount struct {
+	Pair                                         *ContractProviderBinding
 	Base                                         invoiceBase
 	Customer, Subscription, Price, Event, Meter  string
 	EnrolledAt                                   time.Time
@@ -104,6 +108,14 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 	if err != nil {
 		return a, err
 	}
+	if a.Pair != nil {
+		if err = validatePairUsageSubscription(*a.Pair, a, s); err != nil {
+			return a, err
+		}
+		if s.PauseCollection == nil || s.PauseCollection.Behavior != "keep_as_draft" || s.PauseCollection.ResumesAt != 0 {
+			return a, fmt.Errorf("paired usage hold must be confirmed by provisioning")
+		}
+	}
 	if a.Base.Price != "" && s.Status == "canceled" {
 		if s.EndedAt <= 0 {
 			return a, fmt.Errorf("canceled Pro subscription has no termination timestamp")
@@ -133,10 +145,23 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 	if subscriptions.HasMore {
 		return a, fmt.Errorf("subscription inventory exceeds reconciliation limit")
 	}
-	found := false
+	found, foundFee := false, false
 	for _, other := range subscriptions.Data {
 		if other.ID == a.Subscription {
+			if a.Pair != nil && found {
+				return a, fmt.Errorf("duplicate paired usage subscription")
+			}
 			found = true
+			continue
+		}
+		if a.Pair != nil && other.ID == a.Pair.FeeSubscriptionID {
+			if foundFee {
+				return a, fmt.Errorf("duplicate paired fee sibling")
+			}
+			foundFee = true
+			if err = validatePairFeeSibling(*a.Pair, other); err != nil {
+				return a, err
+			}
 			continue
 		}
 		if other.Status != "canceled" && other.Status != "incomplete_expired" && other.ID != a.ReplacementSubscription {
@@ -146,6 +171,9 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 	if !found {
 		return a, fmt.Errorf("subscription is absent from customer inventory")
 	}
+	if a.Pair != nil && !foundFee {
+		return a, fmt.Errorf("paired fee sibling is absent from customer inventory")
+	}
 	refresh := func() error {
 		var e error
 		s, e = c.invoiceSubscription(ctx, a.Subscription)
@@ -154,6 +182,14 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 		}
 		if s.Customer != a.Customer || s.Status != "active" || s.AutomaticTax.Enabled || len(s.Discounts) != 0 || s.BillingThresholds != nil {
 			return fmt.Errorf("subscription changed during enrollment")
+		}
+		if a.Pair != nil {
+			if e = validatePairUsageSubscription(*a.Pair, a, s); e != nil {
+				return e
+			}
+			if s.PauseCollection == nil || s.PauseCollection.Behavior != "keep_as_draft" || s.PauseCollection.ResumesAt != 0 {
+				return fmt.Errorf("paired usage hold changed during enrollment")
+			}
 		}
 		if validate != nil {
 			return validate(s)

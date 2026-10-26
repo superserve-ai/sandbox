@@ -150,6 +150,7 @@ type HostRegistry interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
+	ProviderPairEntitlementAuthority ProviderPairEntitlementAuthority
 	// MachineCredentials is optional until the compatible machine-identity
 	// rollout is deployed. When set, hosted QM credentials use the separate
 	// machine middleware and never become human actor IDs.

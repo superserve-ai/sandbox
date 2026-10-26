@@ -705,20 +705,23 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if plan.AdjustmentCents > int64(len(items)) || plan.AdjustmentCents < -int64(len(items)) {
 		return plan, fmt.Errorf("invoice difference exceeds supported rounding correction")
 	}
-	var sponsored bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND charge_kind='sponsored_entitlement' AND starts_at<=$4 AND ends_at>=$5)`, p.TeamID, a.Customer, a.Subscription, p.Start, p.End).Scan(&sponsored); err != nil {
-		return plan, err
-	}
-	if a.Base.Price != "" || sponsored {
-		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
-	} else {
-		var released bool
-		released, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client)
-		if err == nil && !released {
-			plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
-		}
-	}
+	err = h.prepareInvoiceCredits(ctx, p, a, inv.ID, &plan, client)
 	return plan, err
+}
+
+func (h *Handlers) prepareInvoiceCredits(ctx context.Context, p billing.ExportPeriod, a invoiceAccount, invoiceID string, plan *billing.InvoiceClosePlan, client *stripeHTTPClient) error {
+	var commercial bool
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id=$1 AND c.customer_id=$2 AND c.subscription_id=$3 AND c.starts_at<=$4 AND (c.ends_at IS NULL OR c.ends_at>=$5) AND (c.charge_kind='sponsored_entitlement' OR EXISTS(SELECT 1 FROM billing_contract_provider_binding b WHERE b.contract_id=c.id)))`, p.TeamID, a.Customer, a.Subscription, p.Start, p.End).Scan(&commercial); err != nil {
+		return err
+	}
+	if a.Base.Price != "" || commercial {
+		return h.prepareEntitlementCredits(ctx, p, a, invoiceID, plan, client)
+	}
+	released, err := h.prepareReleasedFundingCredits(ctx, p, a, invoiceID, plan, client)
+	if err == nil && !released {
+		plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePlanPeriod(p, *plan).End.Unix())
+	}
+	return err
 }
 
 // Quantity drift is provisional only for accounts under a durable invoice hold.
