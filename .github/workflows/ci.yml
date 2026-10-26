@@ -191,6 +191,11 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
         run: go run -tags integration ./cmd/setup-integration-db
 
+      - name: Run offer provisioning journal race contracts
+        env:
+          PROVISIONING_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: go test -v -race -tags integration -count=1 -timeout 2m ./internal/billing/provisioning
+
       - name: Run billing worker load race contract
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable

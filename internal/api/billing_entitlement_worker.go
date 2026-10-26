@@ -28,6 +28,7 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	if h.Pool == nil {
 		return
 	}
+	h.startOfferProvisioning(ctx)
 	h.startSponsoredAnnualReconciliation(ctx)
 	if _, ok := h.Stripe.(*stripeHTTPClient); !ok {
 		return

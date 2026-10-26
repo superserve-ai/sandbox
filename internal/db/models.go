@@ -740,6 +740,67 @@ type BillingMeterReconciliation struct {
 	BucketPasses       []byte         `json:"bucket_passes"`
 }
 
+type BillingOfferFinancialFence struct {
+	ID                   uuid.UUID          `json:"id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	AssignmentID         uuid.UUID          `json:"assignment_id"`
+	Phase                string             `json:"phase"`
+	TargetID             uuid.UUID          `json:"target_id"`
+	AuthorizationReceipt []byte             `json:"authorization_receipt"`
+	FinalizedAt          pgtype.Timestamptz `json:"finalized_at"`
+	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt            time.Time          `json:"created_at"`
+}
+
+type BillingOfferFinancialRevocation struct {
+	ID                uuid.UUID `json:"id"`
+	AcknowledgementID uuid.UUID `json:"acknowledgement_id"`
+	TeamID            uuid.UUID `json:"team_id"`
+	AssignmentID      uuid.UUID `json:"assignment_id"`
+	Phase             string    `json:"phase"`
+	TargetID          uuid.UUID `json:"target_id"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+type BillingOfferProvisioningAudit struct {
+	ID          int64     `json:"id"`
+	OperationID uuid.UUID `json:"operation_id"`
+	ActorID     uuid.UUID `json:"actor_id"`
+	Action      string    `json:"action"`
+	Reason      string    `json:"reason"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type BillingOfferProvisioningOperation struct {
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	AssignmentID   uuid.UUID          `json:"assignment_id"`
+	AcceptedOffer  []byte             `json:"accepted_offer"`
+	State          string             `json:"state"`
+	Held           bool               `json:"held"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+	ControlReason  *string            `json:"control_reason"`
+	ControlActor   pgtype.UUID        `json:"control_actor"`
+	ControlPending bool               `json:"control_pending"`
+	FinalizedAt    pgtype.Timestamptz `json:"finalized_at"`
+	Verification   []byte             `json:"verification"`
+	LastError      *string            `json:"last_error"`
+	NextCheckAt    time.Time          `json:"next_check_at"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+}
+
+type BillingOfferProvisioningRequest struct {
+	OperationID    uuid.UUID          `json:"operation_id"`
+	Step           string             `json:"step"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	Request        []byte             `json:"request"`
+	State          string             `json:"state"`
+	DispatchedAt   pgtype.Timestamptz `json:"dispatched_at"`
+	Receipt        []byte             `json:"receipt"`
+	CreatedAt      time.Time          `json:"created_at"`
+}
+
 type BillingPeriodAnomaly struct {
 	ID          uuid.UUID          `json:"id"`
 	TeamID      uuid.UUID          `json:"team_id"`
