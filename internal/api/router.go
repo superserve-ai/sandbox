@@ -122,6 +122,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
 		api.GET("/billing/prepaid", h.GetPrepaidCredit)
 		api.POST("/billing/prepaid/checkout", h.CreatePrepaidCheckout)
+		api.POST("/billing/prepaid/checkout/recover", h.RecoverPendingStarterCheckout)
 		api.PUT("/billing/prepaid/auto-recharge", h.PutPrepaidAutoRecharge)
 
 		// RBAC Phase 2b customer-facing team management.

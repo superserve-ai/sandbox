@@ -1012,6 +1012,94 @@ paths:
           description: Prepaid plans are not active, the plan cannot buy credit, too many purchases are unspent, or operation_id is bound to a different authenticated team, actor, amount, or return URL.
         "503":
           description: Prepaid credit is temporarily at capacity.
+  /billing/prepaid/checkout/recover:
+    post:
+      operationId: recoverPendingStarterCheckout
+      tags: [Billing]
+      summary: Recover or explicitly cancel the original Starter checkout
+      description: |
+        Requires `billing:write` and the original checkout actor on the authenticated team.
+        Send an empty object to discover the Starter purchase holding the current checkout
+        fence, including purchases created without operation_id. Discovery returns its
+        purchase_id, amount_cents and checkout_generation, but no provider URL.
+        Send that exact purchase_id and checkout_generation together with cancel false
+        to resume the same recorded session. Set cancel true only after an explicit
+        customer request to cancel the unpaid checkout. The provider session must be
+        verified expired and unpaid before the original local fence can be released.
+        Recovery remains available when new-entry flags or redirect policy change.
+        Paid, mismatched or uncertain provider outcomes retain the fence and return
+        payment_confirmation_pending. Neither no_pending_starter_checkout nor retryable
+        proves that the current plan is Free; refresh the plan and ordinary offer APIs
+        before starting another purchase. Cancellation retries are idempotent.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              description: purchase_id and checkout_generation must either both be omitted or both be supplied. Cancellation requires both.
+              properties:
+                purchase_id:
+                  type: string
+                  format: uuid
+                checkout_generation:
+                  type: string
+                  format: date-time
+                cancel:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Original purchase discovered or resumed, verified expiration released the fence, no original fence remains, or payment confirmation is pending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [outcome]
+                properties:
+                  outcome:
+                    type: string
+                    enum: [pending_starter_checkout, recovered, retryable, no_pending_starter_checkout, payment_confirmation_pending]
+                  purchase_id:
+                    type: string
+                    format: uuid
+                    description: Present for discovery and matched actions; omitted when no original Starter fence remains.
+                  amount_cents:
+                    type: integer
+                    format: int64
+                  checkout_generation:
+                    type: string
+                    format: date-time
+                  url:
+                    type: string
+                    format: uri
+                    description: Present only for recovered, and identifies the same recorded provider session.
+        "202":
+          description: Provider verification, payment reconciliation, or exact tuple revalidation remains uncertain. Retain the original purchase and do not start another checkout.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [outcome]
+                properties:
+                  outcome:
+                    type: string
+                    enum: [payment_confirmation_pending]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: checkout_recovery_unavailable; the requested purchase or generation no longer matches the original Starter checkout.
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Provider checkout recovery is not configured.
   /billing/prepaid/auto-recharge:
     put:
       operationId: putPrepaidAutoRecharge
