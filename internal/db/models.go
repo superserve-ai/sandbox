@@ -2424,21 +2424,22 @@ type TeamMembership struct {
 }
 
 type TeamPlanAssignment struct {
-	ID             uuid.UUID          `json:"id"`
-	TeamID         uuid.UUID          `json:"team_id"`
-	PlanKey        string             `json:"plan_key"`
-	Kind           string             `json:"kind"`
-	PlanVersionID  pgtype.UUID        `json:"plan_version_id"`
-	Terms          []byte             `json:"terms"`
-	Limits         []byte             `json:"limits"`
-	EffectiveFrom  time.Time          `json:"effective_from"`
-	EffectiveTo    pgtype.Timestamptz `json:"effective_to"`
-	ContractID     pgtype.UUID        `json:"contract_id"`
-	Source         string             `json:"source"`
-	AssignedBy     pgtype.UUID        `json:"assigned_by"`
-	Reason         string             `json:"reason"`
-	IdempotencyKey *string            `json:"idempotency_key"`
-	CreatedAt      time.Time          `json:"created_at"`
+	ID                 uuid.UUID          `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	PlanKey            string             `json:"plan_key"`
+	Kind               string             `json:"kind"`
+	PlanVersionID      pgtype.UUID        `json:"plan_version_id"`
+	Terms              []byte             `json:"terms"`
+	Limits             []byte             `json:"limits"`
+	EffectiveFrom      time.Time          `json:"effective_from"`
+	EffectiveTo        pgtype.Timestamptz `json:"effective_to"`
+	ContractID         pgtype.UUID        `json:"contract_id"`
+	Source             string             `json:"source"`
+	AssignedBy         pgtype.UUID        `json:"assigned_by"`
+	Reason             string             `json:"reason"`
+	IdempotencyKey     *string            `json:"idempotency_key"`
+	CreatedAt          time.Time          `json:"created_at"`
+	FreeAllowanceSince pgtype.Timestamptz `json:"free_allowance_since"`
 }
 
 type TeamPlanChange struct {
