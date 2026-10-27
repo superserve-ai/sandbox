@@ -1773,6 +1773,16 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		respondErrorMsg(c, "bad_request", "success_url and cancel_url are required", http.StatusBadRequest)
 		return
 	}
+	if prepaid == nil {
+		if err := h.checkLegacyCheckoutPlan(c.Request.Context(), teamID); err != nil {
+			if errors.Is(err, errLegacyCheckoutPlan) {
+				respondErrorMsg(c, "conflict", err.Error(), http.StatusConflict)
+			} else {
+				respondError(c, ErrInternal)
+			}
+			return
+		}
+	}
 	var err error
 	successURL, cancelURL := req.SuccessURL, req.CancelURL
 	if prepaid == nil || !prepaid.acceptedRedirects {
@@ -1851,6 +1861,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 	var checkoutAccount db.TeamBillingAccount
 	if trusted {
 		requestKey += ":intent:" + req.OperationID.String()
+	}
+	if prepaid == nil {
+		checkoutAccount, err = h.beginLegacyCheckout(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, trusted)
+	} else if trusted {
 		checkoutAccount, err = h.beginCheckoutWithPublicationDecision(c.Request.Context(), teamID, actorID, req, requestKey, attemptID)
 	} else {
 		checkoutAccount, err = h.DB.BeginTeamBillingCheckout(c.Request.Context(), db.BeginTeamBillingCheckoutParams{
@@ -1870,6 +1884,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		}
 	}
 	if err != nil {
+		if errors.Is(err, errLegacyCheckoutPlan) {
+			respondErrorMsg(c, "conflict", err.Error(), http.StatusConflict)
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) || isCheckoutPublicationConflict(err) {
 			respondErrorMsg(c, "conflict", "another checkout is already in progress or the intent is closed", http.StatusConflict)
 			return
