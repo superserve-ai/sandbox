@@ -73,9 +73,41 @@ func (h *Handlers) prepaidTick(ctx context.Context, client *stripeHTTPClient) er
 	)
 }
 
+const prepaidAutoRechargeCapReason = "the recharge amount or threshold exceeds the $10,000 limit; update your settings before enabling it again"
+
+func (h *Handlers) disableOversizedAutoRecharges(ctx context.Context) error {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `SELECT t.id FROM team t JOIN billing_prepaid_auto_recharge a ON a.team_id=t.id
+ WHERE a.enabled AND (a.amount_cents>$1 OR a.threshold_cents>$1)
+ ORDER BY t.id LIMIT 50 FOR NO KEY UPDATE OF t SKIP LOCKED`, prepaidPurchaseMaxCents)
+	if err != nil {
+		return err
+	}
+	teams, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return err
+	}
+	// Recheck after taking the same team lock as settings edits. Never disable a
+	// corrected setting or reset a prior disable notification.
+	_, err = tx.Exec(ctx, `UPDATE billing_prepaid_auto_recharge SET enabled=false,
+ disabled_reason=$1,disabled_at=clock_timestamp(),disabled_by=NULL,notified_at=NULL,updated_at=clock_timestamp()
+ WHERE team_id=ANY($2) AND enabled AND (amount_cents>$3 OR threshold_cents>$3)`, prepaidAutoRechargeCapReason, teams, prepaidPurchaseMaxCents)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // A charge is created only from a balance observed after the team's latest
 // credit, so a purchase the observation has not yet seen never triggers another.
 func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
+	if err := h.disableOversizedAutoRecharges(ctx); err != nil {
+		return err
+	}
 	if _, err := h.Pool.Exec(ctx, `UPDATE billing_prepaid_auto_recharge a SET enabled=false,disabled_reason=$1,disabled_at=clock_timestamp(),notified_at=NULL
  WHERE a.enabled AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.source='auto_recharge' AND p.created_at>clock_timestamp()-interval '24 hours')>=$2`,
 		fmt.Sprintf("more than %d automatic recharges in 24 hours", prepaidAutoRechargeDailyCap), prepaidAutoRechargeDailyCap); err != nil {
@@ -90,7 +122,8 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
  JOIN team t ON t.id=a.team_id
  JOIN billing_funding_account f USING(team_id)
  JOIN team_billing_account b USING(team_id)
- WHERE a.enabled AND EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=a.team_id AND p.effective_to IS NULL AND p.kind='prepaid')
+ WHERE a.enabled AND a.amount_cents BETWEEN 500 AND $2 AND a.amount_cents%500=0
+ AND a.threshold_cents BETWEEN 500 AND $2 AND a.threshold_cents%500=0 AND EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=a.team_id AND p.effective_to IS NULL AND p.kind='prepaid')
  AND f.observe AND f.payment_method_ready AND f.payment_method_id IS NOT NULL
   AND f.observed_generation=f.generation AND f.customer_id=b.stripe_customer_id
   AND f.credit_checked_at>clock_timestamp()-interval '2 minutes' AND f.credit_usd*100<a.threshold_cents
@@ -100,7 +133,7 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
      AND NOT billing_prepaid_credit_withheld(p))))
   AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.payment_state<>'failed' AND p.credit_voided_at IS NULL
    AND NOT billing_prepaid_credit_withheld(p))<$1`
-	rows, err := tx.Query(ctx, `SELECT t.id`+selection+` ORDER BY t.id LIMIT 50 FOR NO KEY UPDATE OF t SKIP LOCKED`, prepaidLiveGrantLimit)
+	rows, err := tx.Query(ctx, `SELECT t.id`+selection+` ORDER BY t.id LIMIT 50 FOR NO KEY UPDATE OF t SKIP LOCKED`, prepaidLiveGrantLimit, prepaidPurchaseMaxCents)
 	if err != nil {
 		return err
 	}
@@ -111,7 +144,7 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
 	_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_idempotency_key,credit_idempotency_key,payment_request)
  SELECT a.team_id,b.stripe_customer_id,'auto_recharge',a.amount_cents,'','',
   jsonb_build_object('customer',b.stripe_customer_id,'payment_method',f.payment_method_id,'amount_cents',a.amount_cents)`+selection+`
- AND a.team_id=ANY($2) ON CONFLICT DO NOTHING`, prepaidLiveGrantLimit, teams)
+ AND a.team_id=ANY($3) ON CONFLICT DO NOTHING`, prepaidLiveGrantLimit, prepaidPurchaseMaxCents, teams)
 	if err != nil {
 		return err
 	}

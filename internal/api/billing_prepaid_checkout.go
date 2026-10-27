@@ -60,6 +60,12 @@ func prepaidCheckoutOneTimeLine(id uuid.UUID, amount int64) StripeCheckoutOneTim
 	return StripeCheckoutOneTimeLine{AmountCents: amount, Name: "Superserve prepaid credit", Metadata: map[string]string{"prepaid_purchase_id": id.String()}}
 }
 
+const prepaidPurchaseMaxCents int64 = 1000000
+
+func validNewPrepaidAmount(amount int64) bool {
+	return validPrepaidAmount(amount) && amount <= prepaidPurchaseMaxCents
+}
+
 func validPrepaidAmount(amount int64) bool {
 	return amount >= 500 && amount%500 == 0 && amount <= 100000000
 }

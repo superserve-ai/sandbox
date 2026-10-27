@@ -975,6 +975,7 @@ paths:
                 amount_cents:
                   type: integer
                   format: int64
+                  description: New purchases are limited to 1000000 cents ($10,000). Previously accepted operations retain their original amount when replayed.
                   minimum: 500
                   multipleOf: 500
                 success_url:
@@ -1123,11 +1124,13 @@ paths:
                 threshold_cents:
                   type: integer
                   format: int64
+                  maximum: 1000000
                   minimum: 500
                   multipleOf: 500
                 amount_cents:
                   type: integer
                   format: int64
+                  maximum: 1000000
                   minimum: 500
                   multipleOf: 500
       responses:

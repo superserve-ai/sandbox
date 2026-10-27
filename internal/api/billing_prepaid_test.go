@@ -72,3 +72,11 @@ func TestPrepaidCheckoutGenerationCreationBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestNewPrepaidAmountMaximum(t *testing.T) {
+	for amount, want := range map[int64]bool{-500: false, 0: false, 499: false, 500: true, 750: false, 999500: true, 1000000: true, 1000001: false, 1000500: false, 100000000: false} {
+		if got := validNewPrepaidAmount(amount); got != want {
+			t.Fatalf("amount %d: got %v want %v", amount, got, want)
+		}
+	}
+}

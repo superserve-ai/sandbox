@@ -38,8 +38,11 @@ const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'s
      'revoke_closed_unexecuted',d.revoked_at IS NULL AND d.revoke_retry_after IS NOT DISTINCT FROM 'infinity') ORDER BY d.version),'[]') FROM billing_prepaid_reversal_decision d WHERE d.purchase_id=r.purchase_id))
   FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id))`
 
-const prepaidAutoRechargeJSON = `jsonb_build_object('enabled',COALESCE(a.enabled,false),'threshold_cents',a.threshold_cents,'amount_cents',a.amount_cents,
- 'disabled_reason',a.disabled_reason,'disabled_at',a.disabled_at,
+const prepaidAutoRechargeCapExceededSQL = `(a.amount_cents>1000000 OR a.threshold_cents>1000000)`
+const prepaidAutoRechargeEnabledSQL = `(COALESCE(a.enabled,false) AND NOT ` + prepaidAutoRechargeCapExceededSQL + `)`
+
+const prepaidAutoRechargeJSON = `jsonb_build_object('enabled',` + prepaidAutoRechargeEnabledSQL + `,'threshold_cents',a.threshold_cents,'amount_cents',a.amount_cents,
+ 'disabled_reason',CASE WHEN a.enabled AND ` + prepaidAutoRechargeCapExceededSQL + ` THEN '` + prepaidAutoRechargeCapReason + `' ELSE a.disabled_reason END,'disabled_at',a.disabled_at,
  'in_flight',EXISTS(SELECT 1 FROM billing_prepaid_purchase q WHERE q.team_id=t.team_id AND q.source='auto_recharge' AND q.payment_state IN ('pending','uncertain','processing')))`
 
 func (h *Handlers) prepaidSummary(ctx context.Context, team uuid.UUID, purchases int) ([]byte, error) {
@@ -47,7 +50,7 @@ func (h *Handlers) prepaidSummary(ctx context.Context, team uuid.UUID, purchases
 	err := h.Pool.QueryRow(ctx, `SELECT jsonb_build_object(
  'checkout_idempotency_supported',true,
  'balance_cents',CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END,
- 'low_balance',(CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END)<500 AND NOT COALESCE(a.enabled,false),
+ 'low_balance',(CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END)<500 AND NOT `+prepaidAutoRechargeEnabledSQL+`,
  'auto_recharge',`+prepaidAutoRechargeJSON+`,
  'has_saved_card',COALESCE(f.payment_method_ready,false),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.created_at DESC),'[]') FROM
@@ -86,7 +89,7 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	}
 	var req prepaidCheckoutBody
 	if err = c.ShouldBindJSON(&req); err != nil || !validPrepaidAmount(req.AmountCents) {
-		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 100000000", http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 1000000", http.StatusBadRequest)
 		return
 	}
 	ctx := c.Request.Context()
@@ -118,6 +121,10 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		if acceptedRedirects && recoverOperation() {
 			return
 		}
+	}
+	if !acceptedRedirects && !validNewPrepaidAmount(req.AmountCents) {
+		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 1000000", http.StatusBadRequest)
+		return
 	}
 	// Managed billing and other entry policies govern new dispatch, while an
 	// already accepted payment remains recoverable under its immutable identity.
@@ -240,8 +247,8 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		return
 	}
 	if req.Enabled {
-		if !validPrepaidAmount(req.ThresholdCents) || !validPrepaidAmount(req.AmountCents) {
-			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 100000000", http.StatusBadRequest)
+		if !validNewPrepaidAmount(req.ThresholdCents) || !validNewPrepaidAmount(req.AmountCents) {
+			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 1000000", http.StatusBadRequest)
 			return
 		}
 	}

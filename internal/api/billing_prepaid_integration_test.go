@@ -1783,3 +1783,42 @@ func TestPrepaidEnforcementRejectsUnboundPostGrantZero(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepaidAutoRechargeAmountCapPreservesAcceptedPayment(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 1000500)
+	f.observe(1500, true)
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.rows()) != 0 {
+		t.Fatal("oversized saved settings created a new charge")
+	}
+	var enabled bool
+	var amount int64
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT enabled,amount_cents FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&enabled, &amount); err != nil || enabled || amount != 1000500 {
+		t.Fatal("oversized settings were not safely disabled with amount preserved", err)
+	}
+	f.enableAutoRecharge(2000, 1000000)
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(); len(rows) != 1 || rows[0].Amount != 1000000 {
+		t.Fatalf("inclusive cap charge: %+v", rows)
+	}
+	// A payment attempted before a settings safety-disable still settles.
+	var id uuid.UUID
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT id FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.chargeAutoRecharge(t.Context(), f.client, id); err != nil {
+		t.Fatal(err)
+	}
+	f.enableAutoRecharge(2000, 1000500)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(); len(rows) != 1 || rows[0].Payment != "succeeded" || rows[0].Credit != "issued" || rows[0].Amount != 1000000 {
+		t.Fatalf("accepted charge recovery: %+v", rows)
+	}
+}

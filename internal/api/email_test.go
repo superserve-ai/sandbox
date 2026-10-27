@@ -36,6 +36,7 @@ type smtpTestServer struct {
 	mu       sync.Mutex
 	from, to string
 	data     []byte
+	messages [][]byte
 	// Replies override the default 250 for a command ("MAIL", "RCPT", "DATA" end).
 	replies map[string]string
 }
@@ -98,6 +99,7 @@ func (s *smtpTestServer) serve(conn net.Conn) {
 			}
 			s.mu.Lock()
 			s.data = data
+			s.messages = append(s.messages, append([]byte(nil), data...))
 			s.mu.Unlock()
 			_ = tp.PrintfLine("%s", s.reply("DATA"))
 		case "QUIT":
