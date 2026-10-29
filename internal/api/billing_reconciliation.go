@@ -58,6 +58,8 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 		h.reconcileBillingPauses(ctx)
 		return
 	}
+	// Sampled on every holder tick, including one whose page failed to list.
+	defer h.recordTrialEligibilityBacklog(ctx)
 	teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{
 		AfterTeamID: afterID, BatchLimit: billingTrialEligibilityPageSize, IdleSeconds: trialEligibilityIdleRefreshSeconds,
 	})
@@ -75,7 +77,6 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 	if advance {
 		h.advanceSweepCursor(ctx, trialEligibilitySweepName, next)
 	}
-	h.recordTrialEligibilityBacklog(ctx)
 	// Refreshed teams are paused here, behind the consecutive-sweep gate.
 	h.reconcileBillingPauses(ctx)
 }

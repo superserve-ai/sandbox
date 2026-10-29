@@ -1391,7 +1391,9 @@ WITH grants AS (
   LEFT JOIN team_billing_account a ON a.team_id = g.team_id
   WHERE g.reason = 'signup trial credit' AND a.trial_ended_at IS NULL
 ), due AS (
-  SELECT team_id, MAX(since) AS since, bool_or(pending) AS pending
+  -- Work became pending at the earliest such grant; a later renewal must not
+  -- reset the clock.
+  SELECT team_id, MIN(since) AS since, bool_or(pending) AS pending
   FROM grants WHERE since IS NOT NULL GROUP BY team_id
 ), classified AS (
   SELECT since, pending OR EXISTS (

@@ -227,6 +227,8 @@ func TestIntegration_TrialEligibilityOverdueCount(t *testing.T) {
 	storageExec(t, `DELETE FROM team_trial_eligibility_cache WHERE team_id=$1`, uncached.id)
 	renewed := seedTrialVerdict(t, false, now.Add(-time.Hour))
 	storageExec(t, `INSERT INTO team_credit_grant(team_id,reason,amount_usd,remaining_usd,created_at) VALUES($1,'signup trial credit',5,5,$2)`, renewed.id, now.Add(-10*time.Minute))
+	// A second renewal moments ago does not reset the overdue clock.
+	storageExec(t, `INSERT INTO team_credit_grant(team_id,reason,amount_usd,remaining_usd,created_at) VALUES($1,'signup trial credit',5,5,$2)`, renewed.id, now.Add(-30*time.Second))
 	// Uncached but granted moments ago: due, not yet overdue.
 	fresh := seedTrialVerdict(t, true, now.Add(-time.Minute))
 	storageExec(t, `DELETE FROM team_trial_eligibility_cache WHERE team_id=$1`, fresh.id)
