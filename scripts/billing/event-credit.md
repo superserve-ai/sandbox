@@ -187,6 +187,17 @@ Stripe keeps idempotency keys for 24 hours; after that, the label lookup above
 is what prevents a second grant. After creating the grant, the script reads it
 back and checks it against the terms above.
 
+Just before each create, the script re-reads the team's routing state from the
+database. That covers plan, subscription status, contract, current customer and
+known customers. If anything differs from the state the run started with, the
+team is REFUSED with "billing state changed during the run; rerun" (exit 2) and
+nothing is granted. This narrows the window but cannot close it, because no
+database transaction can include the Stripe request. A change that commits
+between the re-read and the create is not caught. If a team's billing was
+changing during the run, compare the report with its current state. Trial grants need no extra check, because their insert
+re-checks the team's state under the billing account and team row locks in the
+same transaction.
+
 The database keeps no history of `team_billing_account.stripe_customer_id`;
 replacing it overwrites the old value. So the database alone cannot list every
 past customer. A replaced customer can still be missed when no other billing

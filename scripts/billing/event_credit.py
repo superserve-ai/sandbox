@@ -242,7 +242,7 @@ def check_grant(grant, customer, cents, live):
         raise SetupError(f"Credit grant {grant.get('id')} for {customer} does not have the event credit terms")
 
 
-def stripe_team(stripe, row, label, cents, api_version):
+def stripe_team(stripe, row, label, cents, api_version, reload_route):
     team, customer = row["team_id"], row["customer"]
     form, key = grant_form(team, customer, label, cents), grant_key(team, label)
     known = sorted(set(row.get("known_customers") or []) | {customer})
@@ -284,6 +284,8 @@ def stripe_team(stripe, row, label, cents, api_version):
         return {**result, "outcome": "already granted", "grant_id": grant["id"], "grant_customer": grant["customer"]}
     if not stripe.apply:
         return {**result, "outcome": "would grant", "command": curl_command(form, key, api_version)}
+    if reload_route(team) != row:
+        return {**result, "outcome": "REFUSED: billing state changed during the run; rerun", "conflict": True}
     try:
         created = stripe.request("POST", "/v1/billing/credit_grants", form, key)
     except IdempotencyConflict:
@@ -385,7 +387,8 @@ def main():
             stripe = Stripe(key, args.environment == "production", args.expected_account, args.apply, args.api_version)
             stripe.verify_account()
         for row in stripe_rows:
-            report.append(stripe_team(stripe, row, args.label, grants[row["team_id"]], args.api_version))
+            report.append(stripe_team(stripe, row, args.label, grants[row["team_id"]], args.api_version,
+                                      lambda team: next(iter(load_routes(args.database_url, [team], args.label)), None)))
 
         if trial:
             pairs = ",".join(f"{team}:{Decimal(grants[team]) / 100}" for team in trial)
@@ -402,8 +405,8 @@ def main():
         if report:
             print(json.dumps({"mode": "apply" if args.apply else "preview", "label": args.label, "teams": report}, indent=2))
     if trial_conflict or any(r.get("conflict") for r in report):
-        print("Event credit: REFUSED rows hold this label with a different amount or a voided grant; "
-              "nothing was added for them. Fix the CSV or use a new label.", file=sys.stderr)
+        print("Event credit: nothing was added for REFUSED rows (label conflict, voided grant, or billing state "
+              "changed during the run); see each row's outcome.", file=sys.stderr)
         return 2
     return 0
 

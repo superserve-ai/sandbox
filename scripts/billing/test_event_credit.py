@@ -82,7 +82,7 @@ def stripe():
 
 
 class EventCreditTest(unittest.TestCase):
-    def run_main(self, row, amount, fake):
+    def run_main(self, row, amount, fake, reloaded=None):
         grants = tempfile.NamedTemporaryFile("w", suffix=".csv")
         self.addCleanup(grants.close)
         grants.write(f"{TEAM},{amount}\n")
@@ -91,7 +91,7 @@ class EventCreditTest(unittest.TestCase):
                 "--environment", "staging", "--expected-account", ACCOUNT, "--apply"]
         out, err = io.StringIO(), io.StringIO()
         with patch("sys.argv", argv), patch.dict(os.environ, {"STRIPE_SECRET_KEY": "sk_test_example"}), \
-                patch.object(event_credit, "load_routes", return_value=[row]), \
+                patch.object(event_credit, "load_routes", side_effect=[[row], [reloaded or row]]), \
                 patch("urllib.request.urlopen", fake), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = event_credit.main()
         return code, json.loads(out.getvalue())["teams"][0]
@@ -103,6 +103,16 @@ class EventCreditTest(unittest.TestCase):
         code, team = self.run_main(paid_row(trial_event_usd=100), "80", fake)
         self.assertEqual((code, fake.posts), (2, 0))
         self.assertTrue(team["outcome"].startswith("REFUSED"))
+
+    def test_billing_state_changed_before_create_grants_nothing(self):
+        changes = {"customer": {"customer": "cus_example_new", "known_customers": [CUSTOMER, "cus_example_new"]},
+                   "status": {"subscription_status": "canceled"}, "plan": {"kind": "free", "plan_key": "free", "family": "free"}}
+        for name, change in changes.items():
+            with self.subTest(name):
+                fake = FakeStripe()
+                code, team = self.run_main(paid_row(), "100", fake, {**paid_row(), **change})
+                self.assertEqual((code, team["outcome"], fake.posts),
+                                 (2, "REFUSED: billing state changed during the run; rerun", 0))
 
     def credit_old_customer(self, fake):
         old = event_credit.grant_form(TEAM, OLD_CUSTOMER, LABEL, 10000)
@@ -132,7 +142,8 @@ class EventCreditTest(unittest.TestCase):
         results = {}
 
         def run(cents):
-            results[cents] = event_credit.stripe_team(stripe(), paid_row(), LABEL, cents, event_credit.API_VERSION)
+            results[cents] = event_credit.stripe_team(stripe(), paid_row(), LABEL, cents, event_credit.API_VERSION,
+                                                      lambda team: paid_row())
 
         with patch("urllib.request.urlopen", fake):
             threads = [threading.Thread(target=run, args=(cents,)) for cents in (8000, 10000)]
