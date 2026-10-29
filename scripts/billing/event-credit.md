@@ -228,7 +228,8 @@ grant again.
 
 When a trial team pays for Developer or Pro, paid activation ends the trial. It
 sets `trial_ended_at` and zeroes `remaining_usd` on every signup trial grant,
-including the event grant. Whatever was left of the event credit is forfeited.
+including event and manual top-up grants. Whatever trial credit was left is
+forfeited.
 The event copy tells participants that upgrading during the trial drops leftover
 trial credit and that staff restore it. Developer participants who check out
 with the event's 100%-off first-month code pay the 20 USD monthly fee from their
@@ -237,38 +238,41 @@ second month. That is intended: the restored credit pays for usage, not the fee.
 ### Report
 
 ```sh
-python3 scripts/billing/event_credit.py --report --label event-2026-11-01
+python3 scripts/billing/event_credit.py --report [--label event-2026-11-01] [--min-forfeit-usd 1]
 ```
 
-The report is read-only and makes no Stripe calls. It lists every team that
-holds this label's trial event grant (the deterministic ID above) and has
-`trial_ended_at` set. Each row shows:
+The report is read-only and makes no Stripe calls. It scans every team that has
+a `signup trial credit` grant and whose trial ended through paid activation
+(`trial_ended_at` set). For each team it computes the total trial credit
+forfeited at activation, then keeps the teams whose forfeit is strictly above
+`--min-forfeit-usd` (default 1 USD). A forfeit of exactly 1.00 USD is left out
+and 1.01 USD is kept. Ordinary signup trials (0.05 USD) fall below the
+threshold, so the report shows teams credited for an event and teams given a
+manual top-up alike. The event label does not decide who is found. A team that
+paid while `trial_ended_at` stayed NULL, which no current activation path does,
+would not appear.
 
-- the event grant
-- the trial pool and the usage charged against it
-- the grants created after the event grant
+`--label` adds a `holds_label_grant` column: whether the team holds that event's
+trial grant (the deterministic ID above). `--label-holders-only` limits the
+report to those teams. Each row also shows:
+
+- the trial grants and the usage charged against them
 - the forfeited amount in cents
 - the current plan, subscription status and Stripe customer
 
-The forfeit starts from `get_team_trial_balance`. That function returns one
-pooled balance and does not split it by grant. The pool is the sum of unexpired
-signup trial grants, with usage from the earliest unexpired grant's creation up
-to `trial_ended_at` charged against it. It is
+The forfeit comes from `get_team_trial_balance`, which returns one pooled
+balance. The pool is the sum of the team's unexpired signup trial grants, with
+usage from the earliest of them up to `trial_ended_at` charged against it. It is
 priced at the rates `get_team_trial_balance` uses, which are the current rates of
-the team's pricing plan. This script charges usage to the
-grants in creation order, which matches the order invoice finalization consumes
-credit grants when none expires. So the balance left at activation sits in the
-newest grants:
+the team's pricing plan.
 
 ```text
-remaining = max(0, pool_usd - consumed_usd)              # get_team_trial_balance grant_usd, consumed_usd
-forfeited = min(event_usd, max(0, remaining - later_usd)) # later_usd: signup grants created after the event grant
-forfeited_cents = floor(forfeited * 100)
+forfeited_cents = floor(max(0, grant_usd - consumed_usd) * 100)   # get_team_trial_balance, usage up to trial_ended_at
+included when forfeited_cents > min_forfeit_usd * 100
 ```
 
-For example, take a $0.05 signup grant and a $100 event grant, with $0.07 of
-usage before activation. The first $0.05 goes to the signup grant and $0.02 to
-the event grant, so the team forfeits $99.98.
+For example, take a 0.05 USD signup grant and a 100 USD event grant, with 0.07
+USD of usage before activation. The team forfeits 99.98 USD.
 
 ### Restore
 
@@ -279,27 +283,39 @@ python3 scripts/billing/event_credit.py --restore --label event-2026-11-01 \
   --environment production --expected-account acct_... --apply
 ```
 
-Restore recomputes the report and grants each forfeited amount as a Stripe credit
-grant on the team's current customer, under the label `<event>-restore`. It uses
-the Stripe route above with all its guards:
+Restore recomputes the report with the same threshold and filters. It grants
+each team its forfeited amount as a Stripe credit grant on the team's current
+customer. The label is the idempotency key: `<label>-restore`, or an explicit
+`--restore-label`. Use the same restore label for every run of an event.
+
+A trial ends once, so a team's forfeit is restored once, whatever the label.
+Restore grants carry `trial_forfeit_restore` metadata. A team that already holds
+an unvoided restore grant under another label is REFUSED (exit 2) and not paid
+again. A forfeit above 1000 USD is refused and must be restored by hand. Never
+run two restores at the same time: overlapping runs under different labels can
+both grant before either sees the other.
+
+Restore uses the Stripe route above with all its guards:
 
 - the team-and-label idempotency key
 - the check across the team's previous customers
 - preview by default
 - the account and live-key checks
 
-It refuses a forfeit of zero or less, and any team not on a Developer or Pro
-subscription that is active, trialing or past due. A rerun reports `already granted`. Forfeits are computed at
-the team's current rates. If those rates change between runs, the recomputed amount
-differs, and the rerun is REFUSED rather than granting the difference.
+It refuses any team not on a Developer or Pro subscription that is active,
+trialing or past due. Forfeits at or below the threshold are never granted. A
+rerun reports `already granted`. Forfeits are recomputed on every run, at the
+team's current rates, with grant expiry and storage billing evaluated now. If
+any of that changes between runs, the recomputed amount differs, and the rerun is
+REFUSED rather than granting the difference.
 
 ### Event-day routine
 
 Once a day during the event, and once after it ends:
 
-1. Run `--report` and check the list. It shows every team whose trial ended
-   while holding the event grant. A team on Free or a canceled subscription
+1. Run `--report` and check the list. A team on Free or a canceled subscription
    shows up but cannot be restored until it is on Developer or Pro.
-2. Run `--restore` as a preview, then with `--apply`.
+2. Run `--restore` as a preview, then with `--apply`, using the same restore
+   label every time.
 3. Rerun `--restore` and confirm every row reads `already granted` or a refusal
    you expect.

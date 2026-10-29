@@ -60,7 +60,7 @@ class FakeStripe:
                     "amount": {"type": "monetary", "monetary": {"currency": "usd",
                                                                 "value": int(params["amount[monetary][value]"][0])}},
                     "applicability_config": {"scope": {"price_type": params["applicability_config[scope][price_type]"][0]}},
-                    "metadata": {"event_label": params["metadata[event_label]"][0], "team_id": params["metadata[team_id]"][0]}}
+                    "metadata": {k[len("metadata["):-1]: v[0] for k, v in params.items() if k.startswith("metadata[")}}
                 self.keys[key] = (params, grant_id)
                 return response(self.grants[grant_id])
         if url.path.startswith("/v1/billing/credit_grants/") and method == "GET":
@@ -158,28 +158,39 @@ class EventCreditTest(unittest.TestCase):
         self.assertTrue(refused["conflict"])
 
 
+def ended_trial(team, grants_usd, consumed_usd, label_grant_usd=None):
+    return {"team_id": team, "trial_grants_usd": grants_usd, "consumed_usd": consumed_usd,
+            "label_grant_usd": label_grant_usd, "plan_key": "developer_monthly", "customer": CUSTOMER}
+
+
 class ForfeitTest(unittest.TestCase):
-    def test_usage_crossing_signup_credit_is_charged_to_the_event_grant(self):
-        self.assertEqual(event_credit.forfeit_cents("100", "100.05", "0.07", "0"), 9998)
+    def test_usage_crossing_signup_credit_is_netted_and_rounded_down(self):
+        self.assertEqual(event_credit.forfeit_cents("100.05", "0.07"), 9998)
+        self.assertEqual(event_credit.forfeit_cents("100.05", "0.0500055"), 9999)
+        self.assertEqual(event_credit.forfeit_cents("100.05", "150"), 0)
 
-    def test_overage_before_the_event_grant_is_charged_to_it_and_rounded_down(self):
-        self.assertEqual(event_credit.forfeit_cents("100", "100.05", "0.0500055", "0"), 9999)
+    def forfeits(self, rows, label=None, holders_only=False):
+        with patch.object(event_credit, "read_json", return_value=rows):
+            return [r["team_id"] for r in event_credit.load_forfeits("postgres://example", label, 100, holders_only)]
 
-    def test_unused_event_grant_is_forfeited_whole(self):
-        self.assertEqual(event_credit.forfeit_cents("100", "100.05", "0.02", "0"), 10000)
+    def test_threshold_is_strictly_above_one_dollar(self):
+        at, above, signup = (f"00000000-0000-4000-8000-00000000010{i}" for i in range(3))
+        rows = [ended_trial(at, "1.05", "0.05"), ended_trial(above, "1.06", "0.05"), ended_trial(signup, "0.05", "0")]
+        self.assertEqual(self.forfeits(rows), [above])
+        self.assertEqual(event_credit.parse_min_cents("1"), 100)
 
-    def test_spent_event_grant_forfeits_nothing(self):
-        self.assertEqual(event_credit.forfeit_cents("100", "100.05", "150", "0"), 0)
-
-    def test_later_grants_hold_the_remainder_first(self):
-        self.assertEqual(event_credit.forfeit_cents("100", "110.05", "0.05", "10"), 10000)
-        self.assertEqual(event_credit.forfeit_cents("100", "110.05", "100.05", "10"), 0)
+    def test_manual_top_up_without_the_event_label_is_included(self):
+        event, manual = "00000000-0000-4000-8000-000000000201", "00000000-0000-4000-8000-000000000202"
+        rows = [ended_trial(event, "100.05", "0.07", "100.000000"), ended_trial(manual, "100.05", "0.07")]
+        self.assertEqual(self.forfeits(rows), [event, manual])
+        self.assertEqual(self.forfeits(rows, LABEL), [event, manual])
+        self.assertEqual(self.forfeits(rows, LABEL, holders_only=True), [event])
 
 
 class RestoreTest(unittest.TestCase):
-    def run_restore(self, forfeits, rows, fake):
+    def run_restore(self, forfeits, rows, fake, extra=()):
         argv = ["event_credit.py", "--restore", "--label", LABEL, "--database-url", "postgres://example",
-                "--environment", "staging", "--expected-account", ACCOUNT, "--apply"]
+                "--environment", "staging", "--expected-account", ACCOUNT, "--apply", *extra]
         out, err = io.StringIO(), io.StringIO()
         with patch("sys.argv", argv), patch.dict(os.environ, {"STRIPE_SECRET_KEY": "sk_test_example"}), \
                 patch.object(event_credit, "load_forfeits", return_value=forfeits), \
@@ -198,14 +209,20 @@ class RestoreTest(unittest.TestCase):
         code, teams = self.run_restore(forfeits, [paid_row()], fake)
         self.assertEqual((code, teams[TEAM]["outcome"], fake.posts, len(fake.grants)), (0, "already granted", 1, 1))
 
-    def test_restore_refuses_nothing_forfeited_and_teams_off_developer_pro(self):
+    def test_a_second_restore_label_cannot_restore_the_same_forfeit_again(self):
+        fake = FakeStripe()
+        forfeits = [{"team_id": TEAM, "forfeited_cents": 9998}]
+        self.run_restore(forfeits, [paid_row()], fake)
+        code, teams = self.run_restore(forfeits, [paid_row()], fake, ["--restore-label", "another-event-restore"])
+        self.assertEqual((code, fake.posts, len(fake.grants)), (2, 1, 1))
+        self.assertIn("already restored under " + LABEL + "-restore", teams[TEAM]["outcome"])
+
+    def test_restore_refuses_teams_off_developer_pro(self):
         other = "00000000-0000-4000-8000-000000000007"
         free = {**paid_row(), "team_id": other, "kind": "free", "plan_key": "free", "family": "free"}
         fake = FakeStripe()
-        code, teams = self.run_restore([{"team_id": TEAM, "forfeited_cents": 0}, {"team_id": other, "forfeited_cents": 500}],
-                                       [free], fake)
+        code, teams = self.run_restore([{"team_id": other, "forfeited_cents": 500}], [free], fake)
         self.assertEqual((code, fake.posts), (0, 0))
-        self.assertEqual(teams[TEAM]["outcome"], "refused: nothing forfeited")
         self.assertTrue(teams[other]["outcome"].startswith("refused: not on Developer/Pro"))
 
 
