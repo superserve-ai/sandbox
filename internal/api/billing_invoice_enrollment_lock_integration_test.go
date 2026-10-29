@@ -3,7 +3,6 @@
 package api
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -94,6 +93,22 @@ func TestInvoiceEnrollmentRecordsOnlyUnchangedRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := invoiceEnrollmentPlan{account: invoiceAccount{Customer: customer, Subscription: sub, Price: "price_round", Event: "round", Meter: "mtr_round"}, attempt: attempt, boundary: attempt}
+	fingerprint, err := invoiceEnrollmentFingerprint(ctx, h.Pool, team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.fingerprint = fingerprint
+	// A transition that keeps the customer and subscription but rewrites the
+	// account row invalidates the plan.
+	if _, err := h.Pool.Exec(ctx, `UPDATE team_billing_account SET updated_at=now() WHERE team_id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.recordInvoiceEnrollment(ctx, team, plan); err != errInvoiceEnrollmentChanged {
+		t.Fatalf("plan from a rewritten account row was recorded: %v", err)
+	}
+	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := h.Pool.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=$2 WHERE team_id=$1`, team, "sub_other_"+team.String()); err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +131,9 @@ func TestInvoiceEnrollmentRecordsOnlyUnchangedRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan.boundary = plan.attempt
+	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.recordInvoiceEnrollment(ctx, team, plan); err != nil {
 		t.Fatal(err)
 	}
@@ -123,5 +141,4 @@ func TestInvoiceEnrollmentRecordsOnlyUnchangedRows(t *testing.T) {
 	if err := h.Pool.QueryRow(ctx, `SELECT a.subscription_id=$2 AND e.completed_at IS NOT NULL FROM billing_invoice_account a JOIN billing_invoice_enrollment e USING(team_id) WHERE a.team_id=$1`, team, sub).Scan(&completed); err != nil || !completed {
 		t.Fatalf("unchanged rows were not recorded: completed=%v err=%v", completed, err)
 	}
-	_ = context.Background
 }

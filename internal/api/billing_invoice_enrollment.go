@@ -95,6 +95,7 @@ type invoiceEnrollmentPlan struct {
 	replacement bool
 	attempt     time.Time
 	boundary    time.Time
+	fingerprint string
 }
 
 var errInvoiceEnrollmentChanged = errors.New("billing account changed during enrollment; retrying")
@@ -130,11 +131,16 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 // slow provider call blocks no other billing work on the team.
 func (h *Handlers) planInvoiceEnrollment(ctx context.Context, team uuid.UUID, requested *invoiceAccount, client *stripeHTTPClient) (invoiceEnrollmentPlan, error) {
 	var p invoiceEnrollmentPlan
-	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	// One snapshot for every read, so the fingerprint covers exactly the
+	// rows the provider validation below was computed from.
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return p, err
 	}
 	defer tx.Rollback(ctx)
+	if p.fingerprint, err = invoiceEnrollmentFingerprint(ctx, tx, team); err != nil {
+		return p, err
+	}
 	var a invoiceAccount
 	var anchored bool
 	err = tx.QueryRow(ctx, `SELECT stripe_customer_id,stripe_subscription_id,commercial_billing_anchor IS NOT NULL FROM team_billing_account WHERE team_id=$1 AND stripe_subscription_status='active' AND feature_enabled('billing_export_enabled',team_id)`, team).Scan(&a.Customer, &a.Subscription, &anchored)
@@ -287,7 +293,12 @@ func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, 
 	if err = tx.QueryRow(ctx, `SELECT started_at FROM billing_invoice_enrollment WHERE team_id=$1`, team).Scan(&attempt); err != nil {
 		return err
 	}
-	if current.Customer != p.account.Customer || current.Subscription != p.account.Subscription || !anchored ||
+	fingerprint, err := invoiceEnrollmentFingerprint(ctx, tx, team)
+	if err != nil {
+		return err
+	}
+	if fingerprint != p.fingerprint ||
+		current.Customer != p.account.Customer || current.Subscription != p.account.Subscription || !anchored ||
 		enrolled != p.enrolled || attempt == nil || !attempt.Equal(p.attempt) ||
 		existing.Customer != p.existing.Customer || existing.Subscription != p.existing.Subscription ||
 		existing.Price != p.existing.Price || existing.Event != p.existing.Event || existing.Meter != p.existing.Meter ||
@@ -330,6 +341,30 @@ func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, 
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// invoiceEnrollmentFingerprint hashes the versions of every team row the plan
+// reads: the account, contracts, upgrades, credits, plan assignments and
+// sponsored or YC operations. A transition that keeps the customer and
+// subscription IDs but changes any of that state still changes the hash, so
+// the record step refuses a plan validated against the previous state.
+func invoiceEnrollmentFingerprint(ctx context.Context, reader db.DBTX, team uuid.UUID) (string, error) {
+	var fingerprint string
+	err := reader.QueryRow(ctx, `SELECT md5(COALESCE(string_agg(v,',' ORDER BY v),'')) FROM (
+        SELECT 'a'||xmin::text FROM team_billing_account WHERE team_id=$1
+        UNION ALL SELECT 'i'||xmin::text FROM billing_invoice_account WHERE team_id=$1
+        UNION ALL SELECT 'c'||id::text||xmin::text FROM billing_commercial_contract WHERE team_id=$1
+        UNION ALL SELECT 'p'||id::text||xmin::text FROM billing_contract_payment WHERE team_id=$1
+        UNION ALL SELECT 'r'||id::text||xmin::text FROM billing_plan_release WHERE team_id=$1
+        UNION ALL SELECT 'u'||id::text||xmin::text FROM billing_pro_upgrade WHERE team_id=$1
+        UNION ALL SELECT 'k'||c.id::text||c.xmin::text FROM billing_pro_upgrade_catchup c JOIN billing_pro_upgrade u ON u.id=c.upgrade_id WHERE u.team_id=$1
+        UNION ALL SELECT 's'||offer_key||xmin::text FROM billing_signup_choice WHERE team_id=$1
+        UNION ALL SELECT 'n'||id::text||xmin::text FROM billing_sponsored_annual_authority WHERE team_id=$1
+        UNION ALL SELECT 'o'||id::text||xmin::text FROM billing_sponsored_operation WHERE team_id=$1
+        UNION ALL SELECT 't'||operation_id::text||xmin::text FROM billing_yc_calendar_transition WHERE team_id=$1
+        UNION ALL SELECT 'y'||id::text||xmin::text FROM billing_yc_operation WHERE team_id=$1
+        UNION ALL SELECT 'l'||id::text||xmin::text FROM team_plan_assignment WHERE team_id=$1) s(v)`, team).Scan(&fingerprint)
+	return fingerprint, err
 }
 
 // requireInvoiceCalendarReconciled refuses enrollment while a YC operation
