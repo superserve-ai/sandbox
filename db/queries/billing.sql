@@ -1396,14 +1396,17 @@ WITH grants AS (
   SELECT team_id, MIN(since) AS since, bool_or(pending) AS pending
   FROM grants WHERE since IS NOT NULL GROUP BY team_id
 ), classified AS (
-  SELECT since, pending OR EXISTS (
-      SELECT 1 FROM sandbox_compute_billing_interval i
+  -- Activity after the verdict puts the team on the fast tick from the moment
+  -- it began; an interval already running at the verdict counts from then.
+  SELECT since, pending, (
+      SELECT MIN(GREATEST(due.since, i.started_at)) FROM sandbox_compute_billing_interval i
       WHERE i.team_id = due.team_id AND (i.ended_at IS NULL OR i.ended_at > due.since)
-    ) AS consuming
+    ) AS active_since
   FROM due
 )
-SELECT COUNT(*) FILTER (WHERE consuming AND since < now() - make_interval(secs => sqlc.arg(consuming_seconds)::int))::int AS consuming,
-       COUNT(*) FILTER (WHERE NOT consuming AND since < now() - make_interval(secs => sqlc.arg(idle_seconds)::int))::int AS idle
+SELECT COUNT(*) FILTER (WHERE (pending AND since < now() - make_interval(secs => sqlc.arg(consuming_seconds)::int))
+                           OR active_since < now() - make_interval(secs => sqlc.arg(consuming_seconds)::int))::int AS consuming,
+       COUNT(*) FILTER (WHERE NOT pending AND active_since IS NULL AND since < now() - make_interval(secs => sqlc.arg(idle_seconds)::int))::int AS idle
 FROM classified;
 
 -- name: ListTeamsWithTrialCredits :many

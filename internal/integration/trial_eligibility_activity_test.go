@@ -218,6 +218,13 @@ func TestIntegration_TrialEligibilityOverdueCount(t *testing.T) {
 	consumingLate.usage(t, now.Add(-5*time.Minute), nil)
 	consumingFresh := seedTrialVerdict(t, true, now.Add(-30*time.Second))
 	consumingFresh.usage(t, now.Add(-20*time.Second), nil)
+	// Idle past the grace, active only moments ago: the fast tick has not
+	// missed it yet. An interval already running at the verdict counts from
+	// the verdict.
+	justActive := seedTrialVerdict(t, true, now.Add(-20*time.Minute))
+	justActive.usage(t, now.Add(-30*time.Second), nil)
+	activeAtVerdict := seedTrialVerdict(t, true, now.Add(-10*time.Minute))
+	activeAtVerdict.usage(t, now.Add(-15*time.Minute), nil)
 	seedTrialVerdict(t, true, now.Add(-20*time.Minute)) // idle, past the slow deadline
 	seedTrialVerdict(t, true, now.Add(-5*time.Minute))  // idle, within it
 	seedTrialVerdict(t, false, now.Add(-time.Hour))     // settled false verdict
@@ -237,7 +244,7 @@ func TestIntegration_TrialEligibilityOverdueCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if overdue.Consuming != 3 || overdue.Idle != 1 {
-		t.Fatalf("overdue consuming=%d idle=%d, want 3 and 1", overdue.Consuming, overdue.Idle)
+	if overdue.Consuming != 4 || overdue.Idle != 1 {
+		t.Fatalf("overdue consuming=%d idle=%d, want 4 and 1", overdue.Consuming, overdue.Idle)
 	}
 }
