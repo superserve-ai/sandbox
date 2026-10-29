@@ -2,6 +2,7 @@ package api
 
 import (
 	"github.com/gin-gonic/gin"
+	"github.com/rs/zerolog/log"
 	"net/http"
 )
 
@@ -14,6 +15,7 @@ func (h *Handlers) GetBillingCapabilities(c *gin.Context) {
 	}
 	state, err := h.teamPricingState(c.Request.Context(), team)
 	if err != nil {
+		log.Warn().Err(err).Str("team_id", team.String()).Msg("team pricing state unavailable")
 		respondErrorMsg(c, "service_unavailable", "team plan admission requires verification", http.StatusServiceUnavailable)
 		return
 	}

@@ -429,3 +429,13 @@ func TestHandleExecStream_BadCommand_EmitsErrorEvent(t *testing.T) {
 		t.Errorf("last event finished = %v, want true", last["finished"])
 	}
 }
+
+func TestExecRequest_UserReachesStartRequest(t *testing.T) {
+	var req execRequest
+	if err := json.Unmarshal([]byte(`{"command":"id","user":"root"}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	if got := req.toStartRequest().GetUser(); got != "root" {
+		t.Errorf("StartRequest.User = %q, want %q", got, "root")
+	}
+}

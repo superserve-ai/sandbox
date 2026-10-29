@@ -188,6 +188,7 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	if !acceptedRedirects && acceptedLease == nil {
 		admission, admissionErr := h.teamPricingState(ctx, team)
 		if admissionErr != nil {
+			log.Warn().Err(admissionErr).Str("team_id", team.String()).Msg("team pricing state unavailable")
 			respondErrorMsg(c, "service_unavailable", "team plan admission requires verification", 503)
 			return
 		}

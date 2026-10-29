@@ -57,16 +57,22 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")
 			return false
 		}
-		h.pauseBillingTeam(ctx, teamID)
 		return true
 	})
 	if advance {
 		h.advanceSweepCursor(ctx, trialEligibilitySweepName, next)
 	}
+	// Refreshed teams are paused here, behind the consecutive-sweep gate.
 	h.reconcileBillingPauses(ctx)
 }
 
+// A team must be ineligible on two consecutive sweeps before the sweep pauses
+// it, so a transient funding-observation failure (a renewal draft seen before
+// its close row exists) cannot stop running sandboxes. Explicit pause targets
+// are not debounced.
 func (h *Handlers) reconcileBillingPauses(ctx context.Context) {
+	seen := map[uuid.UUID]struct{}{}
+	defer func() { h.billingPauseSeen = seen }()
 	var after *uuid.UUID
 	for {
 		var afterID pgtype.UUID
@@ -81,10 +87,19 @@ func (h *Handlers) reconcileBillingPauses(ctx context.Context) {
 		if len(teams) == 0 {
 			return
 		}
-		dispatchBounded(ctx, teams, 10, func(teamID uuid.UUID) {
+		due := make([]uuid.UUID, 0, len(teams))
+		for _, t := range teams {
+			if _, again := h.billingPauseSeen[t.TeamID]; t.Targeted || again && t.Ineligible {
+				due = append(due, t.TeamID)
+			}
+			if t.Ineligible {
+				seen[t.TeamID] = struct{}{}
+			}
+		}
+		dispatchBounded(ctx, due, 10, func(teamID uuid.UUID) {
 			h.pauseBillingTeam(ctx, teamID)
 		})
-		last := teams[len(teams)-1]
+		last := teams[len(teams)-1].TeamID
 		after = &last
 		if len(teams) < 1000 {
 			return

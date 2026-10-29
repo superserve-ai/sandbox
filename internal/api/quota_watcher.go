@@ -84,6 +84,11 @@ func teamsOverPct(rows []db.ListTeamQuotaUsageRow, pct int) map[quotaKey]QuotaAl
 			if limit <= 0 || used*100 < limit*pct {
 				continue
 			}
+			// A one-sandbox cap is a plan tier, not a team outgrowing its quota;
+			// alerting would fire on every such team's first sandbox.
+			if c.name == "sandboxes" && limit == 1 {
+				continue
+			}
 			out[quotaKey{r.ID, c.name}] = QuotaAlert{
 				TeamID:   r.ID,
 				TeamName: r.Name,
@@ -270,14 +275,17 @@ type teamEmailLookup interface {
 // threshold. Disabled (no-op) when sender is nil or from is empty. Scoped to
 // the sandbox limit; it does not handle the template limit.
 type EmailQuotaNotifier struct {
-	sender     EmailSender
-	from       string
-	recipients teamEmailLookup
+	sender        EmailSender
+	from          string
+	consoleOrigin string
+	recipients    teamEmailLookup
 }
 
-// NewEmailQuotaNotifier builds a notifier; pass a nil sender or "" for from to disable.
-func NewEmailQuotaNotifier(sender EmailSender, from string, queries *db.Queries) *EmailQuotaNotifier {
-	return &EmailQuotaNotifier{sender: sender, from: from, recipients: queries}
+// NewEmailQuotaNotifier builds a notifier; pass a nil sender or "" for from to
+// disable. Mail links to plans under consoleOrigin, and omits that link when it
+// is empty.
+func NewEmailQuotaNotifier(sender EmailSender, from, consoleOrigin string, queries *db.Queries) *EmailQuotaNotifier {
+	return &EmailQuotaNotifier{sender: sender, from: from, consoleOrigin: consoleOrigin, recipients: queries}
 }
 
 func (n *EmailQuotaNotifier) Channel() string { return "email" }
@@ -302,8 +310,8 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	err = n.sender.SendEmail(ctx, EmailMessage{
 		From:    n.from,
 		To:      to,
-		Subject: "Verify your team on Superserve",
-		HTML:    quotaEmailHTML(a),
+		Subject: "You're close to your Superserve sandbox limit",
+		HTML:    quotaEmailHTML(a, consoleLink(n.consoleOrigin, "/plan-usage/upgrade")),
 	})
 	// A permanent rejection (e.g. a bad recipient) won't self-heal, so drop
 	// rather than spin. Everything else returns an error so the watcher retries.
@@ -319,24 +327,32 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	return nil
 }
 
-// quotaEmailHTML renders the team-verification email body inside the shared shell.
-func quotaEmailHTML(a QuotaAlert) string {
-	body := fmt.Sprintf(`<h1 style="font-family:'Instrument Sans',Helvetica,Arial,sans-serif;color:#e5e5e5;font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0 0 24px 0;">Verify your team on Superserve</h1>
-<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">We're glad to see increasing usage on your Superserve account. For security reasons, we limit the number of active sandboxes on new accounts to <strong style="color:#e5e5e5;">%d</strong>. To request a higher limit, book a meeting using the link below, or reply to this email with:</p>
-<ul style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;padding-left:20px;">
-<li>a link to your website or domain</li>
-<li>a company email address</li>
-<li>a brief description of your use case</li>
-</ul>
-<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">We review every request and aim to respond within 48 hours. Our goal is to provide infinite compute to power your agents, and this verification helps us allocate capacity safely and responsibly across all our customers.</p>
+// quotaEmailHTML renders the near-limit email body inside the shared shell.
+// plansLink may be empty, which leaves the meeting link as the only button.
+func quotaEmailHTML(a QuotaAlert, plansLink string) string {
+	const title = "You're close to your sandbox limit"
+	buttons := emailButton("Book a Meeting", emailMeetingURL)
+	if plansLink != "" {
+		buttons = emailButton("View Plans", plansLink) + emailSecondaryButton("Book a Meeting", emailMeetingURL)
+	}
+	body := fmt.Sprintf(`<h1 style="font-family:'Instrument Sans',Helvetica,Arial,sans-serif;color:#e5e5e5;font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0 0 24px 0;">%s</h1>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">Your team <strong style="color:#e5e5e5;">%s</strong> is running <strong style="color:#e5e5e5;">%d</strong> of <strong style="color:#e5e5e5;">%d</strong> active sandboxes. Once you reach the limit, you won't be able to create or resume sandboxes until you pause or delete some.</p>
+<p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">To raise your limit, upgrade your plan. If you need more than your plan includes, book a meeting with us or email <a href="mailto:%s" style="color:#e5e5e5;text-decoration:underline;text-underline-offset:2px;">%s</a>.</p>
 %s`,
-		a.Limit, emailButton("Book a Meeting", emailMeetingURL))
-	return emailShell("Verify your team on Superserve", body)
+		title, html.EscapeString(a.TeamName), a.Used, a.Limit, emailSupportAddr, emailSupportAddr, buttons)
+	return emailShell(title, body)
 }
 
 // emailButton renders the shell's full-width call-to-action link.
 func emailButton(label, href string) string {
 	return fmt.Sprintf(`<a href="%s" style="background-color:#e5e5e5;color:#0a0a0a;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:14px 24px;margin:28px 0 0 0;">%s</a>`,
+		html.EscapeString(href), html.EscapeString(label))
+}
+
+// emailSecondaryButton renders an outlined link to sit under an emailButton,
+// mirroring the console's secondary email button.
+func emailSecondaryButton(label, href string) string {
+	return fmt.Sprintf(`<a href="%s" style="background-color:transparent;color:#e5e5e5;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:13px 24px;margin:12px 0 0 0;border:1px dashed #404040;">%s</a>`,
 		html.EscapeString(href), html.EscapeString(label))
 }
 

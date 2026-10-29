@@ -1468,14 +1468,17 @@ WITH active_teams AS MATERIALIZED (
       AND s.status = 'active'
       AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 )
-SELECT a.team_id
-FROM active_teams a
-WHERE NOT team_sandbox_billing_eligible(a.team_id)
-   OR EXISTS (
-       SELECT 1 FROM billing_team_pause_target t
-       WHERE t.team_id = a.team_id AND t.done_at IS NULL
-   )
-ORDER BY a.team_id
+SELECT d.team_id, d.targeted, d.ineligible
+FROM (
+    SELECT a.team_id, EXISTS (
+        SELECT 1 FROM billing_team_pause_target t
+        WHERE t.team_id = a.team_id AND t.done_at IS NULL
+    ) AS targeted, (NOT COALESCE(team_sandbox_billing_eligible(a.team_id), true))::boolean AS ineligible
+    FROM active_teams a
+    OFFSET 0 -- keeps the subquery unflattened so eligibility runs once per team
+) d
+WHERE d.targeted OR d.ineligible
+ORDER BY d.team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ActivateTeamBilling :exec

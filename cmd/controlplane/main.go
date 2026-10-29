@@ -489,7 +489,7 @@ func run() error {
 		quotaNotifiers = append(quotaNotifiers, api.NewSlackQuotaNotifier(webhook))
 	}
 	if sender, from := handlers.EmailTransport.Sender(os.Getenv("RESEND_API_KEY")), os.Getenv("QUOTA_EMAIL_FROM"); sender != nil && from != "" {
-		quotaNotifiers = append(quotaNotifiers, api.NewEmailQuotaNotifier(sender, from, queries))
+		quotaNotifiers = append(quotaNotifiers, api.NewEmailQuotaNotifier(sender, from, handlers.ConsoleOrigin(), queries))
 	}
 	if len(quotaNotifiers) > 0 {
 		go api.StartQuotaWatcher(ctx, queries, quotaNotifiers)

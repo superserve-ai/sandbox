@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -200,6 +201,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	}
 	admission, err := h.teamPricingState(c.Request.Context(), team)
 	if err != nil {
+		log.Warn().Err(err).Str("team_id", team.String()).Msg("team pricing state unavailable")
 		respondError(c, ErrInternal)
 		return
 	}

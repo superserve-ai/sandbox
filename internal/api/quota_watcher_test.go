@@ -36,6 +36,7 @@ func TestComputeQuotaAlerts(t *testing.T) {
 	tmplDefault := uuid.New()  // templates 8/10 via default 10 = 80% -> alert
 	tmplOverride := uuid.New() // templates 10/200 (override) = 5% -> no
 	zeroLimit := uuid.New()    // max 0 -> must not alert or panic
+	singleCap := uuid.New()    // sandboxes 1/1 on a one-sandbox plan -> no
 
 	rows := []db.ListTeamQuotaUsageRow{
 		{ID: atThreshold, Name: "at", ActiveSandboxCount: 80, MaxSandboxes: 100},
@@ -43,6 +44,7 @@ func TestComputeQuotaAlerts(t *testing.T) {
 		{ID: tmplDefault, Name: "tdefault", MaxSandboxes: 100, MaxTemplates: 10, TemplateCount: 8},
 		{ID: tmplOverride, Name: "toverride", MaxSandboxes: 100, MaxTemplates: 200, TemplateCount: 10},
 		{ID: zeroLimit, Name: "zero", ActiveSandboxCount: 5, MaxSandboxes: 0},
+		{ID: singleCap, Name: "single", ActiveSandboxCount: 1, MaxSandboxes: 1},
 	}
 
 	got := computeQuotaAlerts(rows)
@@ -65,6 +67,7 @@ func TestComputeQuotaAlerts(t *testing.T) {
 		{below, "sandboxes"},
 		{tmplOverride, "templates"},
 		{zeroLimit, "sandboxes"},
+		{singleCap, "sandboxes"},
 	} {
 		if _, ok := got[neg]; ok {
 			t.Errorf("%v should not have alerted", neg)
@@ -90,7 +93,7 @@ func TestShouldRearm(t *testing.T) {
 }
 
 func TestEmailQuotaNotifierHandlesAndChannel(t *testing.T) {
-	n := NewEmailQuotaNotifier(NewResendEmailSender("k"), "from@superserve.ai", nil)
+	n := NewEmailQuotaNotifier(NewResendEmailSender("k"), "from@superserve.ai", "", nil)
 	if n.Channel() != "email" {
 		t.Errorf("channel = %q, want email", n.Channel())
 	}
@@ -113,7 +116,7 @@ func TestEmailQuotaNotifierSends(t *testing.T) {
 	defer srv.Close()
 
 	rcpt := &stubRecipient{email: "owner@acme.test"}
-	n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk_test", endpoint: srv.URL, client: srv.Client()}, from: "alerts@superserve.ai", recipients: rcpt}
+	n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk_test", endpoint: srv.URL, client: srv.Client()}, from: "alerts@superserve.ai", consoleOrigin: "https://console.example.test", recipients: rcpt}
 
 	alert := QuotaAlert{TeamID: uuid.New(), TeamName: "Acme", Resource: "sandboxes", Used: 16, Limit: 20, Pct: 80}
 	if err := n.Notify(context.Background(), alert); err != nil {
@@ -134,11 +137,13 @@ func TestEmailQuotaNotifierSends(t *testing.T) {
 	if len(payload.To) != 1 || payload.To[0] != "owner@acme.test" {
 		t.Errorf("to = %v, want [owner@acme.test]", payload.To)
 	}
-	if !strings.Contains(payload.Subject, "Verify your team") {
-		t.Errorf("subject = %q, want it to mention verification", payload.Subject)
+	if !strings.Contains(payload.Subject, "sandbox limit") {
+		t.Errorf("subject = %q, want it to mention the sandbox limit", payload.Subject)
 	}
-	if !strings.Contains(payload.HTML, "Verify your team on Superserve") || !strings.Contains(payload.HTML, "Book a Meeting") {
-		t.Errorf("html missing verification heading/CTA: %q", payload.HTML)
+	for _, want := range []string{"16</strong> of <strong", "20</strong> active sandboxes", `href="https://console.example.test/plan-usage/upgrade"`, "Book a Meeting"} {
+		if !strings.Contains(payload.HTML, want) {
+			t.Errorf("html missing %q: %q", want, payload.HTML)
+		}
 	}
 }
 
