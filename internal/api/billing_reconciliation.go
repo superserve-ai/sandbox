@@ -21,6 +21,10 @@ const (
 	billingPauseWorkers                   = 10
 	billingPauseCap                 int32 = 1000 // per pass; a follow-up pass picks up the rest
 	billingTrialEligibilityPageSize int32 = 256
+	// An idle trial team (no sandbox running, no usage since its last verdict)
+	// still drains on storage, so it is revisited this often rather than on
+	// every tick. Consuming teams are revisited on every tick.
+	trialEligibilityIdleRefreshSeconds int32 = 600
 	// Long enough that a slow page cannot let a second replica in behind the
 	// holder, short enough that a crashed one is replaced within a few ticks.
 	trialEligibilityLeaseSeconds = 120
@@ -47,7 +51,9 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 		h.reconcileBillingPauses(ctx)
 		return
 	}
-	teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{AfterTeamID: afterID, BatchLimit: billingTrialEligibilityPageSize})
+	teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{
+		AfterTeamID: afterID, BatchLimit: billingTrialEligibilityPageSize, IdleSeconds: trialEligibilityIdleRefreshSeconds,
+	})
 	if err != nil {
 		log.Error().Err(err).Msg("billing: list active trial teams failed")
 		return

@@ -2915,21 +2915,38 @@ LEFT JOIN team_billing_account a ON a.team_id = g.team_id
 LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
 WHERE g.reason = 'signup trial credit'
   AND a.trial_ended_at IS NULL
-  -- A false verdict is stable until a newer grant arrives. Avoid rescanning
-  -- exhausted/expired historical trials while still picking up renewals.
-  AND (c.team_id IS NULL OR c.eligible OR g.created_at > c.updated_at)
-  AND g.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+  AND (
+    -- Never refreshed, or a newer grant since the last verdict.
+    c.team_id IS NULL
+    OR g.created_at > c.updated_at
+    -- A false verdict is stable until a newer grant arrives. Avoid rescanning
+    -- exhausted/expired historical trials while still picking up renewals.
+    -- A true verdict is only revisited every pass while the team consumes
+    -- compute: a running sandbox or usage recorded since the last refresh.
+    -- Idle teams still drain on storage, so they get a slower full refresh.
+    OR (c.eligible AND (
+      c.updated_at < now() - make_interval(secs => $1::int)
+      OR EXISTS (
+        SELECT 1 FROM sandbox_compute_billing_interval i
+        WHERE i.team_id = g.team_id
+          AND (i.ended_at IS NULL OR i.ended_at > c.updated_at)
+      )
+    ))
+  )
+  AND g.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 ORDER BY g.team_id
-LIMIT $2
+LIMIT $3
 `
 
 type ListTeamsWithTrialCreditsParams struct {
+	IdleSeconds int32       `json:"idle_seconds"`
 	AfterTeamID pgtype.UUID `json:"after_team_id"`
 	BatchLimit  int32       `json:"batch_limit"`
 }
 
+// Teams whose trial verdict is due for a refresh on this pass.
 func (q *Queries) ListTeamsWithTrialCredits(ctx context.Context, arg ListTeamsWithTrialCreditsParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listTeamsWithTrialCredits, arg.AfterTeamID, arg.BatchLimit)
+	rows, err := q.db.Query(ctx, listTeamsWithTrialCredits, arg.IdleSeconds, arg.AfterTeamID, arg.BatchLimit)
 	if err != nil {
 		return nil, err
 	}
