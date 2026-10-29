@@ -55,22 +55,7 @@ WHERE c.table_schema = 'public' AND c.column_name IN ('customer_id', 'stripe_cus
 """
 IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]*")
 
-FORFEIT_SQL = """
-SELECT COALESCE(json_agg(json_build_object(
-  'team_id', a.team_id, 'trial_ended_at', a.trial_ended_at,
-  'trial_grants_usd', b.grant_usd::text, 'consumed_usd', b.consumed_usd::text,
-  'label_grant_usd', (SELECT g.amount_usd::text FROM team_credit_grant g
-    WHERE :'label' <> '' AND g.team_id = a.team_id AND g.reason = 'signup trial credit'
-      AND g.id = md5('trial-credit-topup:' || :'label' || ':' || a.team_id::text)::uuid),
-  'plan_key', p.plan_key, 'kind', p.kind, 'family', COALESCE(p.terms->>'family', v.family),
-  'customer', a.stripe_customer_id, 'subscription_status', a.stripe_subscription_status) ORDER BY a.team_id), '[]')
-FROM team_billing_account a
-CROSS JOIN LATERAL get_team_trial_balance(a.team_id) b
-LEFT JOIN team_plan_assignment p ON p.team_id = a.team_id AND p.effective_to IS NULL
-LEFT JOIN billing_plan_version v ON v.id = p.plan_version_id
-WHERE a.trial_ended_at IS NOT NULL
-  AND EXISTS(SELECT 1 FROM team_credit_grant s WHERE s.team_id = a.team_id AND s.reason = 'signup trial credit');
-"""
+FORFEIT_SQL = Path(__file__).with_name("trial-forfeit.sql")
 
 
 class SetupError(Exception):
@@ -126,15 +111,20 @@ def forfeit_cents(trial_grants_usd, consumed_usd):
     return int((forfeited * 100).to_integral_value(rounding=ROUND_FLOOR))
 
 
-def load_forfeits(database_url, label, min_cents, label_holders_only=False):
+def load_forfeits(database_url, label, min_cents, label_holders_only=False, team=None):
     rows = []
-    for row in read_json(database_url, FORFEIT_SQL, {"label": label or ""}):
+    for row in read_json(database_url, FORFEIT_SQL.read_text(), {"label": label or "", "team": team or ""}):
         row["forfeited_cents"] = forfeit_cents(row["trial_grants_usd"], row["consumed_usd"])
         if label:
             row["holds_label_grant"] = row["label_grant_usd"] is not None
         if row["forfeited_cents"] > min_cents and (row.get("holds_label_grant") or not label_holders_only):
             rows.append(row)
     return rows
+
+
+def current_forfeit(database_url, team):
+    rows = load_forfeits(database_url, None, 0, team=team)
+    return rows[0]["forfeited_cents"] if rows else 0
 
 
 def parse_min_cents(value):
@@ -283,7 +273,7 @@ def check_grant(grant, customer, cents, live):
         raise SetupError(f"Credit grant {grant.get('id')} for {customer} does not have the event credit terms")
 
 
-def stripe_team(stripe, row, label, cents, api_version, reload_route, restore=False):
+def stripe_team(stripe, row, label, cents, api_version, reload_route, restore=False, reload_cents=None):
     team, customer = row["team_id"], row["customer"]
     form, key = grant_form(team, customer, label, cents, restore), grant_key(team, label)
     known = sorted(set(row.get("known_customers") or []) | {customer})
@@ -312,10 +302,13 @@ def stripe_team(stripe, row, label, cents, api_version, reload_route, restore=Fa
         return {**result, "outcome": f"REFUSED: trial forfeit already restored under {restored[0]['metadata'].get('event_label')}",
                 "conflict": True, "grant_id": restored[0]["id"], "grant_customer": restored[0]["customer"]}
     if len(existing) > 1:
-        return {**result, "outcome": "refused: several grants carry this label; reconcile in Stripe"}
+        return {**result, "outcome": "REFUSED: several grants carry this label; reconcile in Stripe", "conflict": True}
     if labelled and not existing:
         return {**result, "outcome": "REFUSED: this label's grant was voided; use a new label", "conflict": True,
                 "grant_id": labelled[0]["id"]}
+    if existing and (existing[0]["metadata"].get("trial_forfeit_restore") == "true") != restore:
+        return {**result, "outcome": "REFUSED: this label is already used by a different kind of grant; use another label",
+                "conflict": True, "grant_id": existing[0]["id"], "grant_customer": existing[0]["customer"]}
     if existing:
         grant = existing[0]
         granted = ((grant.get("amount") or {}).get("monetary") or {}).get("value")
@@ -332,6 +325,8 @@ def stripe_team(stripe, row, label, cents, api_version, reload_route, restore=Fa
         return {**result, "outcome": "would grant", "command": curl_command(form, key, api_version)}
     if reload_route(team) != row:
         return {**result, "outcome": "REFUSED: billing state changed during the run; rerun", "conflict": True}
+    if reload_cents is not None and reload_cents(team) != cents:
+        return {**result, "outcome": "REFUSED: forfeit changed during the run; rerun", "conflict": True}
     try:
         created = stripe.request("POST", "/v1/billing/credit_grants", form, key)
     except IdempotencyConflict:
@@ -421,13 +416,13 @@ def restore(args, min_cents):
         for row in stripe_rows:
             report.append(stripe_team(stripe, row, label, forfeits[row["team_id"]]["forfeited_cents"], args.api_version,
                                       lambda team: next(iter(load_routes(args.database_url, [team], label)), None),
-                                      restore=True))
+                                      restore=True, reload_cents=lambda team: current_forfeit(args.database_url, team)))
     finally:
         print(json.dumps({"mode": "restore " + ("apply" if args.apply else "preview"), "label": label, "teams": report},
                          indent=2))
     if any(r.get("conflict") for r in report):
         print(f"Event credit: nothing was added for REFUSED rows under {label} (label conflict, voided grant, earlier "
-              "restore under another label, or billing state changed during the run); see each row's outcome.",
+              "restore under another label, or billing state or forfeit changed during the run); see each row's outcome.",
               file=sys.stderr)
         return 2
     return 0

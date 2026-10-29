@@ -193,7 +193,8 @@ class RestoreTest(unittest.TestCase):
                 "--environment", "staging", "--expected-account", ACCOUNT, "--apply", *extra]
         out, err = io.StringIO(), io.StringIO()
         with patch("sys.argv", argv), patch.dict(os.environ, {"STRIPE_SECRET_KEY": "sk_test_example"}), \
-                patch.object(event_credit, "load_forfeits", return_value=forfeits), \
+                (patch.object(event_credit, "load_forfeits", return_value=forfeits) if forfeits is not None
+                 else contextlib.nullcontext()), \
                 patch.object(event_credit, "load_routes", return_value=rows), \
                 patch("urllib.request.urlopen", fake), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = event_credit.main()
@@ -216,6 +217,24 @@ class RestoreTest(unittest.TestCase):
         code, teams = self.run_restore(forfeits, [paid_row()], fake, ["--restore-label", "another-event-restore"])
         self.assertEqual((code, fake.posts, len(fake.grants)), (2, 1, 1))
         self.assertIn("already restored under " + LABEL + "-restore", teams[TEAM]["outcome"])
+
+    def test_restore_label_held_by_an_ordinary_grant_is_a_conflict(self):
+        fake = FakeStripe()
+        ordinary = event_credit.grant_form(TEAM, CUSTOMER, LABEL + "-restore", 9998)
+        with patch("urllib.request.urlopen", fake):
+            stripe().request("POST", "/v1/billing/credit_grants", ordinary, "ordinary-grant")
+        fake.posts = 0
+        code, teams = self.run_restore([{"team_id": TEAM, "forfeited_cents": 9998}], [paid_row()], fake)
+        self.assertEqual((code, fake.posts, len(fake.grants)), (2, 0, 1))
+        self.assertIn("different kind of grant", teams[TEAM]["outcome"])
+
+    def test_forfeit_changed_before_create_grants_nothing(self):
+        fake = FakeStripe()
+        loads = [[{"team_id": TEAM, "forfeited_cents": 9998}], [{"team_id": TEAM, "forfeited_cents": 9000}]]
+        with patch.object(event_credit, "load_forfeits", side_effect=loads):
+            code, teams = self.run_restore(None, [paid_row()], fake)
+        self.assertEqual((code, fake.posts), (2, 0))
+        self.assertEqual(teams[TEAM]["outcome"], "REFUSED: forfeit changed during the run; rerun")
 
     def test_restore_refuses_teams_off_developer_pro(self):
         other = "00000000-0000-4000-8000-000000000007"

@@ -260,14 +260,26 @@ report to those teams. Each row also shows:
 - the forfeited amount in cents
 - the current plan, subscription status and Stripe customer
 
-The forfeit comes from `get_team_trial_balance`, which returns one pooled
-balance. The pool is the sum of the team's unexpired signup trial grants, with
-usage from the earliest of them up to `trial_ended_at` charged against it. It is
-priced at the rates `get_team_trial_balance` uses, which are the current rates of
-the team's pricing plan.
+The forfeit is the trial balance as it stood at activation, computed by
+`trial-forfeit.sql`. It uses the same accounting inputs as
+`get_team_trial_balance`, but evaluates them at `trial_ended_at`. The exception
+is whether a pricing plan is active, which has no history and is read now. It does
+not call the live-balance helper, which filters grants by expiry at `now()`. With
+that filter, a grant that expired after activation would drop out of the
+forfeit.
 
 ```text
-forfeited_cents = floor(max(0, grant_usd - consumed_usd) * 100)   # get_team_trial_balance, usage up to trial_ended_at
+T         = trial_ended_at
+pool      = signup trial credit grants with created_at <= T
+            and (expires_at IS NULL or expires_at > T)
+grant_usd = sum(pool.amount_usd)
+start     = min(pool.created_at)
+consumed  = round(cpu_seconds * vcpu_rate + memory_gib_seconds * memory_rate
+                  + storage_gib_seconds * storage_rate, 6)
+            usage: compute intervals clipped to [start, T]; storage counted only if
+            storage billing was active before T
+            rates: the team's pricing plan and its rates effective at T
+forfeited_cents = floor(max(0, grant_usd - consumed) * 100)
 included when forfeited_cents > min_forfeit_usd * 100
 ```
 
@@ -291,9 +303,12 @@ customer. The label is the idempotency key: `<label>-restore`, or an explicit
 A trial ends once, so a team's forfeit is restored once, whatever the label.
 Restore grants carry `trial_forfeit_restore` metadata. A team that already holds
 an unvoided restore grant under another label is REFUSED (exit 2) and not paid
-again. A forfeit above 1000 USD is refused and must be restored by hand. Never
-run two restores at the same time: overlapping runs under different labels can
-both grant before either sees the other.
+again. A grant under the restore label without that marker, such as an ordinary
+event grant that reused the name, is an idempotency conflict and is also
+REFUSED. The reverse holds as well: an event grant run (`--grants`) is refused
+if its label holds a restore grant. A forfeit above 1000 USD is refused and must
+be restored by hand. Never run two restores at the same time: overlapping runs
+under different labels can both grant before either sees the other.
 
 Restore uses the Stripe route above with all its guards:
 
@@ -304,10 +319,14 @@ Restore uses the Stripe route above with all its guards:
 
 It refuses any team not on a Developer or Pro subscription that is active,
 trialing or past due. Forfeits at or below the threshold are never granted. A
-rerun reports `already granted`. Forfeits are recomputed on every run, at the
-team's current rates, with grant expiry and storage billing evaluated now. If
-any of that changes between runs, the recomputed amount differs, and the rerun is
-REFUSED rather than granting the difference.
+rerun reports `already granted`. Every input except pricing-plan activity is
+evaluated at `trial_ended_at`, so a team's forfeit only changes if its
+historical records change, for example
+compute intervals recorded late. Just before each create, restore recomputes that
+team's forfeit, after re-checking its route. If the amount differs from the one
+loaded at the start, the team is REFUSED with "forfeit changed during the run;
+rerun" (exit 2) and nothing is granted. A rerun under the same label with a
+different amount is also REFUSED rather than granting the difference.
 
 ### Event-day routine
 
