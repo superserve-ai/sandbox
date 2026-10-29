@@ -635,6 +635,44 @@ func (q *Queries) CompleteTrialCreditWarning(ctx context.Context, arg CompleteTr
 	return err
 }
 
+const countOverdueTrialEligibility = `-- name: CountOverdueTrialEligibility :one
+WITH due AS (
+  SELECT DISTINCT g.team_id, c.updated_at,
+    EXISTS (
+      SELECT 1 FROM sandbox_compute_billing_interval i
+      WHERE i.team_id = g.team_id AND (i.ended_at IS NULL OR i.ended_at > c.updated_at)
+    ) AS consuming
+  FROM team_credit_grant g
+  JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
+  LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+  WHERE g.reason = 'signup trial credit' AND a.trial_ended_at IS NULL AND c.eligible
+)
+SELECT COUNT(*) FILTER (WHERE consuming AND updated_at < now() - make_interval(secs => $1::int))::int AS consuming,
+       COUNT(*) FILTER (WHERE NOT consuming AND updated_at < now() - make_interval(secs => $2::int))::int AS idle
+FROM due
+`
+
+type CountOverdueTrialEligibilityParams struct {
+	ConsumingSeconds int32 `json:"consuming_seconds"`
+	IdleSeconds      int32 `json:"idle_seconds"`
+}
+
+type CountOverdueTrialEligibilityRow struct {
+	Consuming int32 `json:"consuming"`
+	Idle      int32 `json:"idle"`
+}
+
+// Eligible trial teams whose cached verdict is older than its refresh deadline:
+// consuming teams (a running sandbox, or usage since the verdict) past the
+// fast deadline, idle teams past the slow one. A sweep that keeps up reports
+// zero for both.
+func (q *Queries) CountOverdueTrialEligibility(ctx context.Context, arg CountOverdueTrialEligibilityParams) (CountOverdueTrialEligibilityRow, error) {
+	row := q.db.QueryRow(ctx, countOverdueTrialEligibility, arg.ConsumingSeconds, arg.IdleSeconds)
+	var i CountOverdueTrialEligibilityRow
+	err := row.Scan(&i.Consuming, &i.Idle)
+	return i, err
+}
+
 const countPricingV2ActivationPending = `-- name: CountPricingV2ActivationPending :one
 SELECT count(*)::int FROM team t CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
 WHERE t.home_region=$1 AND t.id<>$2

@@ -143,6 +143,15 @@ type TeardownAttempt struct {
 	Result string
 }
 
+// TrialEligibilityBacklog counts trial teams whose cached verdict is past
+// its refresh deadline, sampled after each sweep pass: teams consuming
+// compute that the fast tick should have revisited, and idle teams the slow
+// pass should have.
+type TrialEligibilityBacklog struct {
+	Consuming int64
+	Idle      int64
+}
+
 // TeardownBacklog is the reclaims still owed, sampled after each sweep.
 type TeardownBacklog struct {
 	Total            int64
@@ -260,6 +269,7 @@ type Recorder interface {
 	RecordLauncherState(context.Context, LauncherState)
 	RecordTeardownAttempt(context.Context, TeardownAttempt)
 	RecordTeardownBacklog(context.Context, TeardownBacklog)
+	RecordTrialEligibilityBacklog(context.Context, TrialEligibilityBacklog)
 	RecordLatencyPhase(context.Context, LatencyPhase)
 	RecordPeerIngress(context.Context, PeerIngress)
 	RecordPeerEvent(context.Context, PeerEvent)
@@ -292,6 +302,7 @@ func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPr
 func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}
 func (noopRecorder) RecordTeardownAttempt(context.Context, TeardownAttempt)                 {}
 func (noopRecorder) RecordTeardownBacklog(context.Context, TeardownBacklog)                 {}
+func (noopRecorder) RecordTrialEligibilityBacklog(context.Context, TrialEligibilityBacklog) {}
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}
 func (noopRecorder) RecordPeerIngress(context.Context, PeerIngress)                         {}
 func (noopRecorder) RecordPeerEvent(context.Context, PeerEvent)                             {}

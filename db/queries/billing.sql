@@ -1374,6 +1374,26 @@ ON CONFLICT (team_id) DO UPDATE
 SET eligible = EXCLUDED.eligible,
     updated_at = EXCLUDED.updated_at;
 
+-- name: CountOverdueTrialEligibility :one
+-- Eligible trial teams whose cached verdict is older than its refresh deadline:
+-- consuming teams (a running sandbox, or usage since the verdict) past the
+-- fast deadline, idle teams past the slow one. A sweep that keeps up reports
+-- zero for both.
+WITH due AS (
+  SELECT DISTINCT g.team_id, c.updated_at,
+    EXISTS (
+      SELECT 1 FROM sandbox_compute_billing_interval i
+      WHERE i.team_id = g.team_id AND (i.ended_at IS NULL OR i.ended_at > c.updated_at)
+    ) AS consuming
+  FROM team_credit_grant g
+  JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
+  LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+  WHERE g.reason = 'signup trial credit' AND a.trial_ended_at IS NULL AND c.eligible
+)
+SELECT COUNT(*) FILTER (WHERE consuming AND updated_at < now() - make_interval(secs => sqlc.arg(consuming_seconds)::int))::int AS consuming,
+       COUNT(*) FILTER (WHERE NOT consuming AND updated_at < now() - make_interval(secs => sqlc.arg(idle_seconds)::int))::int AS idle
+FROM due;
+
 -- name: ListTeamsWithTrialCredits :many
 -- Teams whose trial verdict is due for a refresh on this pass.
 SELECT DISTINCT g.team_id

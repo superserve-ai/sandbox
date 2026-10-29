@@ -47,6 +47,8 @@ func (r *captureTelemetryRecorder) RecordTeardownAttempt(context.Context, teleme
 }
 func (r *captureTelemetryRecorder) RecordTeardownBacklog(context.Context, telemetry.TeardownBacklog) {
 }
+func (r *captureTelemetryRecorder) RecordTrialEligibilityBacklog(context.Context, telemetry.TrialEligibilityBacklog) {
+}
 func (r *captureTelemetryRecorder) RecordPeerIngress(context.Context, telemetry.PeerIngress) {}
 
 func TestSandboxLifecycleTelemetryUsesHostID(t *testing.T) {

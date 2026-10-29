@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 const (
@@ -25,6 +26,9 @@ const (
 	// still drains on storage, so it is revisited this often rather than on
 	// every tick. Consuming teams are revisited on every tick.
 	trialEligibilityIdleRefreshSeconds int32 = 600
+	// A consuming team is overdue once several fast ticks have passed without
+	// a refresh; an idle team once the slow window plus the same grace has.
+	trialEligibilityOverdueGraceSeconds int32 = 120
 	// Long enough that a slow page cannot let a second replica in behind the
 	// holder, short enough that a crashed one is replaced within a few ticks.
 	trialEligibilityLeaseSeconds = 120
@@ -68,8 +72,25 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 	if advance {
 		h.advanceSweepCursor(ctx, trialEligibilitySweepName, next)
 	}
+	h.recordTrialEligibilityBacklog(ctx)
 	// Refreshed teams are paused here, behind the consecutive-sweep gate.
 	h.reconcileBillingPauses(ctx)
+}
+
+// recordTrialEligibilityBacklog publishes how many trial teams the sweep has
+// fallen behind on, so a sweep that stops keeping up is visible.
+func (h *Handlers) recordTrialEligibilityBacklog(ctx context.Context) {
+	overdue, err := h.DB.CountOverdueTrialEligibility(ctx, db.CountOverdueTrialEligibilityParams{
+		ConsumingSeconds: trialEligibilityOverdueGraceSeconds,
+		IdleSeconds:      trialEligibilityIdleRefreshSeconds + trialEligibilityOverdueGraceSeconds,
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("billing: count overdue trial eligibility failed")
+		return
+	}
+	currentTelemetryRecorder().RecordTrialEligibilityBacklog(ctx, telemetry.TrialEligibilityBacklog{
+		Consuming: int64(overdue.Consuming), Idle: int64(overdue.Idle),
+	})
 }
 
 // A team must be ineligible on two consecutive sweeps before the sweep pauses

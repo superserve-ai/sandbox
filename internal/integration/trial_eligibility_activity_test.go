@@ -208,3 +208,24 @@ func TestIntegration_TrialEligibilitySweepLeavesIdleVerdictsAlone(t *testing.T) 
 		t.Fatalf("the sweep restamped an idle team's fresh verdict: %s -> %s", idleBefore, verdictAt(idle.id))
 	}
 }
+
+// The overdue count behind the sweep's gauge: a consuming team past the fast
+// deadline and an idle team past the slow one count, fresh verdicts and a
+// settled false verdict do not.
+func TestIntegration_TrialEligibilityOverdueCount(t *testing.T) {
+	now := time.Now()
+	consumingLate := seedTrialVerdict(t, true, now.Add(-10*time.Minute))
+	consumingLate.usage(t, now.Add(-5*time.Minute), nil)
+	consumingFresh := seedTrialVerdict(t, true, now.Add(-30*time.Second))
+	consumingFresh.usage(t, now.Add(-20*time.Second), nil)
+	seedTrialVerdict(t, true, now.Add(-20*time.Minute)) // idle, past the slow deadline
+	seedTrialVerdict(t, true, now.Add(-5*time.Minute))  // idle, within it
+	seedTrialVerdict(t, false, now.Add(-time.Hour))     // settled false verdict
+	overdue, err := testQueries.CountOverdueTrialEligibility(t.Context(), db.CountOverdueTrialEligibilityParams{ConsumingSeconds: 120, IdleSeconds: 720})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overdue.Consuming != 1 || overdue.Idle != 1 {
+		t.Fatalf("overdue consuming=%d idle=%d, want 1 and 1", overdue.Consuming, overdue.Idle)
+	}
+}
