@@ -83,6 +83,10 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 // recordTrialEligibilityBacklog publishes how many trial teams the sweep has
 // fallen behind on, so a sweep that stops keeping up is visible.
 func (h *Handlers) recordTrialEligibilityBacklog(ctx context.Context) {
+	// A page that used up the tick deadline must still be sampled, or a
+	// stalled sweep keeps exporting its last healthy value.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	overdue, err := h.DB.CountOverdueTrialEligibility(ctx, db.CountOverdueTrialEligibilityParams{
 		ConsumingSeconds: trialEligibilityOverdueGraceSeconds,
 		IdleSeconds:      trialEligibilityIdleRefreshSeconds + trialEligibilityOverdueGraceSeconds,
