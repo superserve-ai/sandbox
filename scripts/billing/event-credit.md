@@ -262,8 +262,10 @@ report to those teams. Each row also shows:
 
 The forfeit is the trial balance as it stood at activation, computed by
 `trial-forfeit.sql`. It uses the same accounting inputs as
-`get_team_trial_balance`, but evaluates them at `trial_ended_at`. The exception
-is whether a pricing plan is active, which has no history and is read now. It does
+`get_team_trial_balance`, but evaluates every one of them at `trial_ended_at`.
+That includes the pricing plan and its rates, chosen by effective dates alone.
+Unlike the live helper, it ignores a plan's current `active` flag, which has no
+history, so deactivating a plan later does not change the forfeit. It does
 not call the live-balance helper, which filters grants by expiry at `now()`. With
 that filter, a grant that expired after activation would drop out of the
 forfeit.
@@ -319,9 +321,8 @@ Restore uses the Stripe route above with all its guards:
 
 It refuses any team not on a Developer or Pro subscription that is active,
 trialing or past due. Forfeits at or below the threshold are never granted. A
-rerun reports `already granted`. Every input except pricing-plan activity is
-evaluated at `trial_ended_at`, so a team's forfeit only changes if its
-historical records change, for example
+rerun reports `already granted`. Every input is evaluated at `trial_ended_at`,
+so a team's forfeit only changes if its historical records change, for example
 compute intervals recorded late. Just before each create, restore recomputes that
 team's forfeit, after re-checking its route. If the amount differs from the one
 loaded at the start, the team is REFUSED with "forfeit changed during the run;

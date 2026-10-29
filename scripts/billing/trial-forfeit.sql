@@ -26,9 +26,8 @@ CROSS JOIN LATERAL (
          COALESCE(max(r.price_usd) FILTER (WHERE r.resource = 'storage_gib'), 0)::numeric AS storage
   FROM (SELECT r.*, row_number() OVER (PARTITION BY r.resource, r.unit
           ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC) AS rank
-        FROM pricing_rate r JOIN pricing_plan pp ON pp.key = r.plan_key AND pp.active
+        FROM pricing_rate r
         WHERE r.plan_key = COALESCE((SELECT tpp.plan_key FROM team_pricing_plan tpp
-            JOIN pricing_plan tppp ON tppp.key = tpp.plan_key AND tppp.active
             WHERE tpp.team_id = a.team_id AND tpp.effective_from <= a.trial_ended_at
               AND (tpp.effective_to IS NULL OR tpp.effective_to > a.trial_ended_at)
             ORDER BY tpp.effective_from DESC LIMIT 1), 'payg')
