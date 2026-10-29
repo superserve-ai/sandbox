@@ -158,5 +158,56 @@ class EventCreditTest(unittest.TestCase):
         self.assertTrue(refused["conflict"])
 
 
+class ForfeitTest(unittest.TestCase):
+    def test_usage_crossing_signup_credit_is_charged_to_the_event_grant(self):
+        self.assertEqual(event_credit.forfeit_cents("100", "100.05", "0.07", "0"), 9998)
+
+    def test_overage_before_the_event_grant_is_charged_to_it_and_rounded_down(self):
+        self.assertEqual(event_credit.forfeit_cents("100", "100.05", "0.0500055", "0"), 9999)
+
+    def test_unused_event_grant_is_forfeited_whole(self):
+        self.assertEqual(event_credit.forfeit_cents("100", "100.05", "0.02", "0"), 10000)
+
+    def test_spent_event_grant_forfeits_nothing(self):
+        self.assertEqual(event_credit.forfeit_cents("100", "100.05", "150", "0"), 0)
+
+    def test_later_grants_hold_the_remainder_first(self):
+        self.assertEqual(event_credit.forfeit_cents("100", "110.05", "0.05", "10"), 10000)
+        self.assertEqual(event_credit.forfeit_cents("100", "110.05", "100.05", "10"), 0)
+
+
+class RestoreTest(unittest.TestCase):
+    def run_restore(self, forfeits, rows, fake):
+        argv = ["event_credit.py", "--restore", "--label", LABEL, "--database-url", "postgres://example",
+                "--environment", "staging", "--expected-account", ACCOUNT, "--apply"]
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.argv", argv), patch.dict(os.environ, {"STRIPE_SECRET_KEY": "sk_test_example"}), \
+                patch.object(event_credit, "load_forfeits", return_value=forfeits), \
+                patch.object(event_credit, "load_routes", return_value=rows), \
+                patch("urllib.request.urlopen", fake), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = event_credit.main()
+        return code, {r["team_id"]: r for r in json.loads(out.getvalue())["teams"]}
+
+    def test_restore_grants_once_under_the_restore_label(self):
+        fake = FakeStripe()
+        forfeits = [{"team_id": TEAM, "forfeited_cents": 9998}]
+        code, teams = self.run_restore(forfeits, [paid_row()], fake)
+        self.assertEqual((code, teams[TEAM]["outcome"], fake.posts), (0, "granted", 1))
+        grant = next(iter(fake.grants.values()))
+        self.assertEqual((grant["metadata"]["event_label"], grant["amount"]["monetary"]["value"]), (LABEL + "-restore", 9998))
+        code, teams = self.run_restore(forfeits, [paid_row()], fake)
+        self.assertEqual((code, teams[TEAM]["outcome"], fake.posts, len(fake.grants)), (0, "already granted", 1, 1))
+
+    def test_restore_refuses_nothing_forfeited_and_teams_off_developer_pro(self):
+        other = "00000000-0000-4000-8000-000000000007"
+        free = {**paid_row(), "team_id": other, "kind": "free", "plan_key": "free", "family": "free"}
+        fake = FakeStripe()
+        code, teams = self.run_restore([{"team_id": TEAM, "forfeited_cents": 0}, {"team_id": other, "forfeited_cents": 500}],
+                                       [free], fake)
+        self.assertEqual((code, fake.posts), (0, 0))
+        self.assertEqual(teams[TEAM]["outcome"], "refused: nothing forfeited")
+        self.assertTrue(teams[other]["outcome"].startswith("refused: not on Developer/Pro"))
+
+
 if __name__ == "__main__":
     unittest.main()

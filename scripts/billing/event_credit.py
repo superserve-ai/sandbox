@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 
 API_VERSION = "2026-05-27.dahlia"
@@ -54,6 +54,24 @@ WHERE c.table_schema = 'public' AND c.column_name IN ('customer_id', 'stripe_cus
              AND k.column_name = 'team_id' AND k.data_type = 'uuid');
 """
 IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]*")
+
+FORFEIT_SQL = """
+SELECT COALESCE(json_agg(json_build_object(
+  'team_id', g.team_id, 'event_grant_usd', g.amount_usd::text, 'trial_ended_at', a.trial_ended_at,
+  'pool_usd', b.grant_usd::text, 'consumed_usd', b.consumed_usd::text,
+  'later_grants_usd', (SELECT COALESCE(sum(l.amount_usd), 0)::text FROM team_credit_grant l
+    WHERE l.team_id = g.team_id AND l.reason = 'signup trial credit' AND (l.expires_at IS NULL OR l.expires_at > now())
+      AND (l.created_at, l.id) > (g.created_at, g.id)),
+  'plan_key', p.plan_key, 'kind', p.kind, 'family', COALESCE(p.terms->>'family', v.family),
+  'customer', a.stripe_customer_id, 'subscription_status', a.stripe_subscription_status) ORDER BY g.team_id), '[]')
+FROM team_credit_grant g
+JOIN team_billing_account a ON a.team_id = g.team_id AND a.trial_ended_at IS NOT NULL
+CROSS JOIN LATERAL get_team_trial_balance(g.team_id) b
+LEFT JOIN team_plan_assignment p ON p.team_id = g.team_id AND p.effective_to IS NULL
+LEFT JOIN billing_plan_version v ON v.id = p.plan_version_id
+WHERE g.reason = 'signup trial credit'
+  AND g.id = md5('trial-credit-topup:' || :'label' || ':' || g.team_id::text)::uuid;
+"""
 
 
 class SetupError(Exception):
@@ -102,6 +120,20 @@ def psql(database_url, sql, variables, read_only):
         cmd += ["-v", f"{name}={value}"]
     return subprocess.run(cmd + ["-At", "-f", "-"] if read_only else cmd + ["-f", str(TRIAL_SQL)],
                           input=sql if read_only else None, capture_output=True, text=True, env=env, check=False)
+
+
+def forfeit_cents(event_usd, pool_usd, consumed_usd, later_usd):
+    remaining = max(Decimal(0), Decimal(pool_usd) - Decimal(consumed_usd))
+    forfeited = min(Decimal(event_usd), max(Decimal(0), remaining - Decimal(later_usd)))
+    return int((forfeited * 100).to_integral_value(rounding=ROUND_FLOOR))
+
+
+def load_forfeits(database_url, label):
+    rows = read_json(database_url, FORFEIT_SQL, {"label": label})
+    for row in rows:
+        row["forfeited_cents"] = forfeit_cents(row["event_grant_usd"], row["pool_usd"], row["consumed_usd"],
+                                               row["later_grants_usd"])
+    return rows
 
 
 def read_json(database_url, sql, variables):
@@ -332,9 +364,62 @@ def parse_grants(path):
     return grants
 
 
+def open_stripe(args):
+    if not (args.apply or args.environment):
+        return None
+    if not args.environment:
+        raise SetupError("--apply for Developer/Pro teams requires --environment and --expected-account")
+    if args.pass_entry:
+        secret = subprocess.run(["pass", "show", args.pass_entry], capture_output=True, text=True, check=False)
+        key = secret.stdout.splitlines()[0].strip() if secret.returncode == 0 and secret.stdout.strip() else ""
+    else:
+        key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+    if not key:
+        raise SetupError("No Stripe credential")
+    stripe = Stripe(key, args.environment == "production", args.expected_account, args.apply, args.api_version)
+    stripe.verify_account()
+    return stripe
+
+
+def restore(args):
+    label = args.label + "-restore"
+    if not LABEL.fullmatch(label):
+        raise SetupError("--label is too long to append -restore")
+    forfeits = {row["team_id"]: row for row in load_forfeits(args.database_url, args.label)}
+    report, stripe_rows = [], []
+    owed = sorted(team for team, row in forfeits.items() if row["forfeited_cents"] > 0)
+    for team, row in sorted(forfeits.items()):
+        if row["forfeited_cents"] <= 0:
+            report.append({"team_id": team, "route": "refused", "amount_cents": row["forfeited_cents"],
+                           "outcome": "refused: nothing forfeited"})
+    for row in load_routes(args.database_url, owed, label) if owed else []:
+        target, why = route(row)
+        if target != "stripe":
+            report.append({"team_id": row["team_id"], "route": "refused", "plan": row["plan_key"],
+                           "amount_cents": forfeits[row["team_id"]]["forfeited_cents"],
+                           "outcome": "refused: not on Developer/Pro: " + why})
+        else:
+            stripe_rows.append(row)
+    try:
+        stripe = open_stripe(args) if stripe_rows else None
+        for row in stripe_rows:
+            report.append(stripe_team(stripe, row, label, forfeits[row["team_id"]]["forfeited_cents"], args.api_version))
+    finally:
+        print(json.dumps({"mode": "restore " + ("apply" if args.apply else "preview"), "label": label, "teams": report},
+                         indent=2))
+    if any(r.get("conflict") for r in report):
+        print(f"Event credit: REFUSED rows already hold {label} with a different amount or a voided grant; "
+              "nothing was added for them.", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--grants", required=True, help="CSV of team_id,amount_usd rows (optional header)")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--grants", help="CSV of team_id,amount_usd rows (optional header)")
+    mode.add_argument("--report", action="store_true", help="Read-only: trial event credit forfeited by paid activation")
+    mode.add_argument("--restore", action="store_true", help="Grant each forfeited amount in Stripe under <label>-restore")
     parser.add_argument("--label", required=True, help="Event label, the idempotency key per team")
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument("--only", choices=["all", "trial", "stripe"], default="all")
@@ -346,11 +431,17 @@ def main():
     args = parser.parse_args()
     report, trial_conflict = [], False
     try:
-        grants = parse_grants(args.grants)
         if not LABEL.fullmatch(args.label):
             raise SetupError("--label must be 1-100 lowercase letters, digits, dot, dash or underscore")
         if not args.database_url:
             raise SetupError("Set DATABASE_URL or --database-url")
+        if args.report:
+            print(json.dumps({"mode": "report", "label": args.label, "teams": load_forfeits(args.database_url, args.label)},
+                             indent=2))
+            return 0
+        if args.restore:
+            return restore(args)
+        grants = parse_grants(args.grants)
         trial, stripe_rows = [], []
         for row in load_routes(args.database_url, sorted(grants), args.label):
             target, why = route(row)
@@ -373,19 +464,7 @@ def main():
                 report.append({"team_id": row["team_id"], "route": "refused", "plan": row["plan_key"],
                                "amount_cents": grants[row["team_id"]], "outcome": "refused: " + why})
 
-        stripe = None
-        if stripe_rows and (args.apply or args.environment):
-            if not args.environment:
-                raise SetupError("--apply for Developer/Pro teams requires --environment and --expected-account")
-            if args.pass_entry:
-                secret = subprocess.run(["pass", "show", args.pass_entry], capture_output=True, text=True, check=False)
-                key = secret.stdout.splitlines()[0].strip() if secret.returncode == 0 and secret.stdout.strip() else ""
-            else:
-                key = os.environ.get("STRIPE_SECRET_KEY", "").strip()
-            if not key:
-                raise SetupError("No Stripe credential")
-            stripe = Stripe(key, args.environment == "production", args.expected_account, args.apply, args.api_version)
-            stripe.verify_account()
+        stripe = open_stripe(args) if stripe_rows else None
         for row in stripe_rows:
             report.append(stripe_team(stripe, row, args.label, grants[row["team_id"]], args.api_version,
                                       lambda team: next(iter(load_routes(args.database_url, [team], args.label)), None)))
