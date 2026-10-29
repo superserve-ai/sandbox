@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -93,7 +94,7 @@ func TestInvoiceEnrollmentRecordsOnlyUnchangedRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := invoiceEnrollmentPlan{account: invoiceAccount{Customer: customer, Subscription: sub, Price: "price_round", Event: "round", Meter: "mtr_round"}, attempt: attempt, boundary: attempt}
-	fingerprint, err := invoiceEnrollmentFingerprint(ctx, h.Pool, team)
+	fingerprint, err := invoiceEnrollmentFingerprint(ctx, h.Pool, team, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +107,7 @@ func TestInvoiceEnrollmentRecordsOnlyUnchangedRows(t *testing.T) {
 	if err := h.recordInvoiceEnrollment(ctx, team, plan); err != errInvoiceEnrollmentChanged {
 		t.Fatalf("plan from a rewritten account row was recorded: %v", err)
 	}
-	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team); err != nil {
+	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.Pool.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=$2 WHERE team_id=$1`, team, "sub_other_"+team.String()); err != nil {
@@ -136,14 +137,14 @@ func TestInvoiceEnrollmentRecordsOnlyUnchangedRows(t *testing.T) {
 	if _, err := h.Pool.Exec(ctx, `INSERT INTO team_pricing_plan(team_id,plan_key,effective_from) VALUES($1,'payg',now()+interval '150 milliseconds')`, team); err != nil {
 		t.Fatal(err)
 	}
-	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team); err != nil {
+	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team, false); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
 	if err := h.recordInvoiceEnrollment(ctx, team, plan); err != errInvoiceEnrollmentChanged {
 		t.Fatalf("plan from before a pricing window opened was recorded: %v", err)
 	}
-	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team); err != nil {
+	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.recordInvoiceEnrollment(ctx, team, plan); err != nil {
@@ -152,5 +153,66 @@ func TestInvoiceEnrollmentRecordsOnlyUnchangedRows(t *testing.T) {
 	var completed bool
 	if err := h.Pool.QueryRow(ctx, `SELECT a.subscription_id=$2 AND e.completed_at IS NOT NULL FROM billing_invoice_account a JOIN billing_invoice_enrollment e USING(team_id) WHERE a.team_id=$1`, team, sub).Scan(&completed); err != nil || !completed {
 		t.Fatalf("unchanged rows were not recorded: completed=%v err=%v", completed, err)
+	}
+}
+
+// A record transaction that began before a pricing window opened, and only
+// got the lock after it did, must judge the window at the lock, not at its
+// transaction start.
+func TestInvoiceEnrollmentRecordJudgesWindowsAfterLockWait(t *testing.T) {
+	h, team, _, release := invoiceEnrollmentLockFixture(t)
+	release()
+	ctx := t.Context()
+	customer, sub := "cus_"+team.String(), "sub_"+team.String()
+	if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_invoice_enrollment(team_id,customer_id,subscription_id,started_at) VALUES($1,$2,$3,now()) ON CONFLICT(team_id) DO UPDATE SET started_at=COALESCE(billing_invoice_enrollment.started_at,now())`, team, customer, sub); err != nil {
+		t.Fatal(err)
+	}
+	plan := invoiceEnrollmentPlan{account: invoiceAccount{Customer: customer, Subscription: sub, Price: "price_round", Event: "round", Meter: "mtr_round"}}
+	if err := h.Pool.QueryRow(ctx, `SELECT started_at FROM billing_invoice_enrollment WHERE team_id=$1`, team).Scan(&plan.attempt); err != nil {
+		t.Fatal(err)
+	}
+	plan.boundary = plan.attempt
+	if _, err := h.Pool.Exec(ctx, `INSERT INTO team_pricing_plan(team_id,plan_key,effective_from) VALUES($1,'payg',now()+interval '500 milliseconds')`, team); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team, false); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := h.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()); err != nil {
+		t.Fatal(err)
+	}
+	recorded := make(chan error, 1)
+	go func() { recorded <- h.recordInvoiceEnrollment(context.WithoutCancel(ctx), team, plan) }()
+	waitFor(t, h, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)`)
+	waitFor(t, h, `SELECT EXISTS(SELECT 1 FROM team_pricing_plan WHERE team_id=$1 AND effective_from<statement_timestamp())`, team)
+	if err = holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-recorded; err != errInvoiceEnrollmentChanged {
+		t.Fatalf("plan from before a pricing window opened during the lock wait was recorded: %v", err)
+	}
+}
+
+func waitFor(t *testing.T, h *Handlers, query string, args ...any) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var ok bool
+		if err := h.Pool.QueryRow(t.Context(), query, args...).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("condition never held: %s", query)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

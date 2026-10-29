@@ -138,7 +138,7 @@ func (h *Handlers) planInvoiceEnrollment(ctx context.Context, team uuid.UUID, re
 		return p, err
 	}
 	defer tx.Rollback(ctx)
-	if p.fingerprint, err = invoiceEnrollmentFingerprint(ctx, tx, team); err != nil {
+	if p.fingerprint, err = invoiceEnrollmentFingerprint(ctx, tx, team, true); err != nil {
 		return p, err
 	}
 	var a invoiceAccount
@@ -293,7 +293,7 @@ func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, 
 	if err = tx.QueryRow(ctx, `SELECT started_at FROM billing_invoice_enrollment WHERE team_id=$1`, team).Scan(&attempt); err != nil {
 		return err
 	}
-	fingerprint, err := invoiceEnrollmentFingerprint(ctx, tx, team)
+	fingerprint, err := invoiceEnrollmentFingerprint(ctx, tx, team, true)
 	if err != nil {
 		return err
 	}
@@ -350,10 +350,13 @@ func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, 
 // now. A transition that keeps the customer and subscription IDs but changes
 // any of that state, or an effective boundary that passes meanwhile, still
 // changes the hash, so the record step refuses a plan validated against the
-// previous state.
-func invoiceEnrollmentFingerprint(ctx context.Context, reader db.DBTX, team uuid.UUID) (string, error) {
+// previous state. The plan judges the windows at its snapshot's now(); the
+// record step, whose transaction began before its lock wait, judges them at
+// the statement after the lock, since the wait may have spanned a boundary.
+func invoiceEnrollmentFingerprint(ctx context.Context, reader db.DBTX, team uuid.UUID, afterLockWait bool) (string, error) {
 	var fingerprint string
-	err := reader.QueryRow(ctx, `SELECT md5(COALESCE(string_agg(v,',' ORDER BY v),'')) FROM (
+	err := reader.QueryRow(ctx, `WITH t AS (SELECT CASE WHEN $2 THEN statement_timestamp() ELSE now() END AS at)
+        SELECT md5(COALESCE(string_agg(v,',' ORDER BY v),'')) FROM (
         SELECT 'a'||xmin::text FROM team_billing_account WHERE team_id=$1
         UNION ALL SELECT 'i'||xmin::text FROM billing_invoice_account WHERE team_id=$1
         UNION ALL SELECT 'c'||id::text||xmin::text FROM billing_commercial_contract WHERE team_id=$1
@@ -367,10 +370,10 @@ func invoiceEnrollmentFingerprint(ctx context.Context, reader db.DBTX, team uuid
         UNION ALL SELECT 't'||operation_id::text||xmin::text FROM billing_yc_calendar_transition WHERE team_id=$1
         UNION ALL SELECT 'y'||id::text||xmin::text FROM billing_yc_operation WHERE team_id=$1
         UNION ALL SELECT 'l'||id::text||xmin::text FROM team_plan_assignment WHERE team_id=$1
-        UNION ALL SELECT 'g'||plan_key||xmin::text||(effective_from<=now() AND (effective_to IS NULL OR effective_to>now()))::text FROM team_pricing_plan WHERE team_id=$1
-        UNION ALL SELECT 'b'||effective_at::text||xmin::text||(effective_at<now())::text FROM team_storage_billing_activation WHERE team_id=$1
+        UNION ALL SELECT 'g'||plan_key||xmin::text||(effective_from<=t.at AND (effective_to IS NULL OR effective_to>t.at))::text FROM team_pricing_plan, t WHERE team_id=$1
+        UNION ALL SELECT 'b'||effective_at::text||xmin::text||(effective_at<t.at)::text FROM team_storage_billing_activation, t WHERE team_id=$1
         UNION ALL SELECT 'q'||key||xmin::text FROM pricing_plan
-        UNION ALL SELECT 'e'||id::text||xmin::text||(effective_from<=now() AND (effective_to IS NULL OR effective_to>now()))::text FROM pricing_rate) s(v)`, team).Scan(&fingerprint)
+        UNION ALL SELECT 'e'||id::text||xmin::text||(effective_from<=t.at AND (effective_to IS NULL OR effective_to>t.at))::text FROM pricing_rate, t) s(v)`, team, afterLockWait).Scan(&fingerprint)
 	return fingerprint, err
 }
 
