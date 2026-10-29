@@ -15,6 +15,7 @@ import (
 )
 
 type captureTelemetryRecorder struct {
+	backlogs    []telemetry.TrialEligibilityBacklog
 	transitions []telemetry.SandboxTransition
 	phases      []telemetry.LatencyPhase
 }
@@ -47,7 +48,8 @@ func (r *captureTelemetryRecorder) RecordTeardownAttempt(context.Context, teleme
 }
 func (r *captureTelemetryRecorder) RecordTeardownBacklog(context.Context, telemetry.TeardownBacklog) {
 }
-func (r *captureTelemetryRecorder) RecordTrialEligibilityBacklog(context.Context, telemetry.TrialEligibilityBacklog) {
+func (r *captureTelemetryRecorder) RecordTrialEligibilityBacklog(_ context.Context, b telemetry.TrialEligibilityBacklog) {
+	r.backlogs = append(r.backlogs, b)
 }
 func (r *captureTelemetryRecorder) RecordPeerIngress(context.Context, telemetry.PeerIngress) {}
 

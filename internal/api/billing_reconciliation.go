@@ -52,6 +52,9 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 			log.Error().Err(err).Msg("billing: claim trial eligibility sweep lease failed")
 			return
 		}
+		// Only the holder knows the backlog; a replica that stopped holding
+		// the lease must not keep exporting the last one it measured.
+		currentTelemetryRecorder().RecordTrialEligibilityBacklog(ctx, telemetry.TrialEligibilityBacklog{})
 		h.reconcileBillingPauses(ctx)
 		return
 	}
