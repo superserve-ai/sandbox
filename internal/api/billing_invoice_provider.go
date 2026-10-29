@@ -188,8 +188,21 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 	// One key per subscription: a concurrent attempt that chose a different
 	// price is rejected by the provider instead of installing a second item.
 	if countItems(s) == 0 && add {
-		if err = c.doForm(ctx, http.MethodPost, "/v1/subscription_items", url.Values{"subscription": {a.Subscription}, "price": {a.Price}, "proration_behavior": {"none"}}, nil, "invoice-rounding-item:"+a.Subscription); err != nil {
+		var item invoiceSubscriptionItem
+		if err = c.doForm(ctx, http.MethodPost, "/v1/subscription_items", url.Values{"subscription": {a.Subscription}, "price": {a.Price}, "proration_behavior": {"none"}}, &item, "invoice-rounding-item:"+a.Subscription); err != nil {
 			return a, err
+		}
+		if s, err = c.invoiceSubscription(ctx, a.Subscription); err != nil {
+			return a, err
+		}
+		// A writer keyed differently can install the same price at the same
+		// time. Remove our copy so a retry finds one item, not a subscription
+		// nobody can enroll.
+		if countItems(s) > 1 {
+			if err = c.doForm(ctx, http.MethodDelete, "/v1/subscription_items/"+url.PathEscape(item.ID), url.Values{"proration_behavior": {"none"}}, nil, ""); err != nil {
+				return a, err
+			}
+			return a, fmt.Errorf("rounding item was installed concurrently; retrying")
 		}
 		if err = refresh(); err != nil {
 			return a, err
