@@ -185,8 +185,10 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 			return a, err
 		}
 	}
+	// One key per subscription: a concurrent attempt that chose a different
+	// price is rejected by the provider instead of installing a second item.
 	if countItems(s) == 0 && add {
-		if err = c.doForm(ctx, http.MethodPost, "/v1/subscription_items", url.Values{"subscription": {a.Subscription}, "price": {a.Price}, "proration_behavior": {"none"}}, nil, "invoice-rounding-item:"+a.Subscription+":"+a.Price); err != nil {
+		if err = c.doForm(ctx, http.MethodPost, "/v1/subscription_items", url.Values{"subscription": {a.Subscription}, "price": {a.Price}, "proration_behavior": {"none"}}, nil, "invoice-rounding-item:"+a.Subscription); err != nil {
 			return a, err
 		}
 		if err = refresh(); err != nil {
