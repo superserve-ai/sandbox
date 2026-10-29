@@ -131,6 +131,18 @@ func TestInvoiceEnrollmentRecordsOnlyUnchangedRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan.boundary = plan.attempt
+	// A pricing assignment whose window opens between planning and recording
+	// changes nothing in the rows themselves but still invalidates the plan.
+	if _, err := h.Pool.Exec(ctx, `INSERT INTO team_pricing_plan(team_id,plan_key,effective_from) VALUES($1,'payg',now()+interval '150 milliseconds')`, team); err != nil {
+		t.Fatal(err)
+	}
+	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := h.recordInvoiceEnrollment(ctx, team, plan); err != errInvoiceEnrollmentChanged {
+		t.Fatalf("plan from before a pricing window opened was recorded: %v", err)
+	}
 	if plan.fingerprint, err = invoiceEnrollmentFingerprint(ctx, h.Pool, team); err != nil {
 		t.Fatal(err)
 	}

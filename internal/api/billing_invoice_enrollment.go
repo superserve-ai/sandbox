@@ -346,9 +346,11 @@ func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, 
 // invoiceEnrollmentFingerprint hashes the versions of every row the plan
 // reads: the team's account, contracts, upgrades, credits, plan and pricing
 // assignments, storage activation, sponsored or YC operations, and the pricing
-// catalog. A transition that keeps the customer and subscription IDs but
-// changes any of that state still changes the hash, so the record step
-// refuses a plan validated against the previous state.
+// catalog, plus whether each time-bound pricing or storage row is in effect
+// now. A transition that keeps the customer and subscription IDs but changes
+// any of that state, or an effective boundary that passes meanwhile, still
+// changes the hash, so the record step refuses a plan validated against the
+// previous state.
 func invoiceEnrollmentFingerprint(ctx context.Context, reader db.DBTX, team uuid.UUID) (string, error) {
 	var fingerprint string
 	err := reader.QueryRow(ctx, `SELECT md5(COALESCE(string_agg(v,',' ORDER BY v),'')) FROM (
@@ -365,10 +367,10 @@ func invoiceEnrollmentFingerprint(ctx context.Context, reader db.DBTX, team uuid
         UNION ALL SELECT 't'||operation_id::text||xmin::text FROM billing_yc_calendar_transition WHERE team_id=$1
         UNION ALL SELECT 'y'||id::text||xmin::text FROM billing_yc_operation WHERE team_id=$1
         UNION ALL SELECT 'l'||id::text||xmin::text FROM team_plan_assignment WHERE team_id=$1
-        UNION ALL SELECT 'g'||plan_key||effective_from::text||xmin::text FROM team_pricing_plan WHERE team_id=$1
-        UNION ALL SELECT 'b'||effective_at::text||xmin::text FROM team_storage_billing_activation WHERE team_id=$1
+        UNION ALL SELECT 'g'||plan_key||xmin::text||(effective_from<=now() AND (effective_to IS NULL OR effective_to>now()))::text FROM team_pricing_plan WHERE team_id=$1
+        UNION ALL SELECT 'b'||effective_at::text||xmin::text||(effective_at<now())::text FROM team_storage_billing_activation WHERE team_id=$1
         UNION ALL SELECT 'q'||key||xmin::text FROM pricing_plan
-        UNION ALL SELECT 'e'||id::text||xmin::text FROM pricing_rate) s(v)`, team).Scan(&fingerprint)
+        UNION ALL SELECT 'e'||id::text||xmin::text||(effective_from<=now() AND (effective_to IS NULL OR effective_to>now()))::text FROM pricing_rate) s(v)`, team).Scan(&fingerprint)
 	return fingerprint, err
 }
 
