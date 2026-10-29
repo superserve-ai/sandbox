@@ -1375,24 +1375,34 @@ SET eligible = EXCLUDED.eligible,
     updated_at = EXCLUDED.updated_at;
 
 -- name: CountOverdueTrialEligibility :one
--- Eligible trial teams whose cached verdict is older than its refresh deadline:
--- consuming teams (a running sandbox, or usage since the verdict) past the
--- fast deadline, idle teams past the slow one. A sweep that keeps up reports
--- zero for both.
-WITH due AS (
-  SELECT DISTINCT g.team_id, c.updated_at,
-    EXISTS (
-      SELECT 1 FROM sandbox_compute_billing_interval i
-      WHERE i.team_id = g.team_id AND (i.ended_at IS NULL OR i.ended_at > c.updated_at)
-    ) AS consuming
+-- Trial teams whose refresh is overdue. A team is due at once when it has no
+-- verdict or a newer grant than a false one, so it is measured from the grant;
+-- an eligible verdict is measured from its stamp, and a settled false verdict
+-- is not due at all. Consuming teams (due at once, a running sandbox, or
+-- usage since the stamp) are overdue past the fast deadline, idle teams past
+-- the slow one. A sweep that keeps up reports zero for both.
+WITH grants AS (
+  SELECT g.team_id,
+    CASE WHEN c.team_id IS NULL OR (NOT c.eligible AND g.created_at > c.updated_at) THEN g.created_at
+         WHEN c.eligible THEN c.updated_at END AS since,
+    c.team_id IS NULL OR (NOT c.eligible AND g.created_at > c.updated_at) AS pending
   FROM team_credit_grant g
-  JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
+  LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
   LEFT JOIN team_billing_account a ON a.team_id = g.team_id
-  WHERE g.reason = 'signup trial credit' AND a.trial_ended_at IS NULL AND c.eligible
+  WHERE g.reason = 'signup trial credit' AND a.trial_ended_at IS NULL
+), due AS (
+  SELECT team_id, MAX(since) AS since, bool_or(pending) AS pending
+  FROM grants WHERE since IS NOT NULL GROUP BY team_id
+), classified AS (
+  SELECT since, pending OR EXISTS (
+      SELECT 1 FROM sandbox_compute_billing_interval i
+      WHERE i.team_id = due.team_id AND (i.ended_at IS NULL OR i.ended_at > due.since)
+    ) AS consuming
+  FROM due
 )
-SELECT COUNT(*) FILTER (WHERE consuming AND updated_at < now() - make_interval(secs => sqlc.arg(consuming_seconds)::int))::int AS consuming,
-       COUNT(*) FILTER (WHERE NOT consuming AND updated_at < now() - make_interval(secs => sqlc.arg(idle_seconds)::int))::int AS idle
-FROM due;
+SELECT COUNT(*) FILTER (WHERE consuming AND since < now() - make_interval(secs => sqlc.arg(consuming_seconds)::int))::int AS consuming,
+       COUNT(*) FILTER (WHERE NOT consuming AND since < now() - make_interval(secs => sqlc.arg(idle_seconds)::int))::int AS idle
+FROM classified;
 
 -- name: ListTeamsWithTrialCredits :many
 -- Teams whose trial verdict is due for a refresh on this pass.

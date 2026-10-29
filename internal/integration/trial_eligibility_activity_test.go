@@ -221,11 +221,21 @@ func TestIntegration_TrialEligibilityOverdueCount(t *testing.T) {
 	seedTrialVerdict(t, true, now.Add(-20*time.Minute)) // idle, past the slow deadline
 	seedTrialVerdict(t, true, now.Add(-5*time.Minute))  // idle, within it
 	seedTrialVerdict(t, false, now.Add(-time.Hour))     // settled false verdict
+	// Due at once, so measured from the grant: no verdict yet, and a false
+	// verdict with a newer grant behind it.
+	uncached := seedTrialVerdict(t, true, now.Add(-10*time.Minute))
+	storageExec(t, `DELETE FROM team_trial_eligibility_cache WHERE team_id=$1`, uncached.id)
+	renewed := seedTrialVerdict(t, false, now.Add(-time.Hour))
+	storageExec(t, `INSERT INTO team_credit_grant(team_id,reason,amount_usd,remaining_usd,created_at) VALUES($1,'signup trial credit',5,5,$2)`, renewed.id, now.Add(-10*time.Minute))
+	// Uncached but granted moments ago: due, not yet overdue.
+	fresh := seedTrialVerdict(t, true, now.Add(-time.Minute))
+	storageExec(t, `DELETE FROM team_trial_eligibility_cache WHERE team_id=$1`, fresh.id)
+	storageExec(t, `UPDATE team_credit_grant SET created_at=$2 WHERE team_id=$1`, fresh.id, now.Add(-30*time.Second))
 	overdue, err := testQueries.CountOverdueTrialEligibility(t.Context(), db.CountOverdueTrialEligibilityParams{ConsumingSeconds: 120, IdleSeconds: 720})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if overdue.Consuming != 1 || overdue.Idle != 1 {
-		t.Fatalf("overdue consuming=%d idle=%d, want 1 and 1", overdue.Consuming, overdue.Idle)
+	if overdue.Consuming != 3 || overdue.Idle != 1 {
+		t.Fatalf("overdue consuming=%d idle=%d, want 3 and 1", overdue.Consuming, overdue.Idle)
 	}
 }
