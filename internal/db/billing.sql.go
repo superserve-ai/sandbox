@@ -635,6 +635,59 @@ func (q *Queries) CompleteTrialCreditWarning(ctx context.Context, arg CompleteTr
 	return err
 }
 
+const countOverdueTrialEligibility = `-- name: CountOverdueTrialEligibility :one
+WITH grants AS (
+  SELECT g.team_id,
+    CASE WHEN c.team_id IS NULL OR (NOT c.eligible AND g.created_at > c.updated_at) THEN g.created_at
+         WHEN c.eligible THEN c.updated_at END AS since,
+    c.team_id IS NULL OR (NOT c.eligible AND g.created_at > c.updated_at) AS pending
+  FROM team_credit_grant g
+  LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
+  LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+  WHERE g.reason = 'signup trial credit' AND a.trial_ended_at IS NULL
+), due AS (
+  -- Work became pending at the earliest such grant; a later renewal must not
+  -- reset the clock.
+  SELECT team_id, MIN(since) AS since, bool_or(pending) AS pending
+  FROM grants WHERE since IS NOT NULL GROUP BY team_id
+), classified AS (
+  -- Activity after the verdict puts the team on the fast tick from the moment
+  -- it began; an interval already running at the verdict counts from then.
+  SELECT since, pending, (
+      SELECT MIN(GREATEST(due.since, i.started_at)) FROM sandbox_compute_billing_interval i
+      WHERE i.team_id = due.team_id AND (i.ended_at IS NULL OR i.ended_at > due.since)
+    ) AS active_since
+  FROM due
+)
+SELECT COUNT(*) FILTER (WHERE (pending AND since < now() - make_interval(secs => $1::int))
+                           OR active_since < now() - make_interval(secs => $1::int))::int AS consuming,
+       COUNT(*) FILTER (WHERE NOT pending AND active_since IS NULL AND since < now() - make_interval(secs => $2::int))::int AS idle
+FROM classified
+`
+
+type CountOverdueTrialEligibilityParams struct {
+	ConsumingSeconds int32 `json:"consuming_seconds"`
+	IdleSeconds      int32 `json:"idle_seconds"`
+}
+
+type CountOverdueTrialEligibilityRow struct {
+	Consuming int32 `json:"consuming"`
+	Idle      int32 `json:"idle"`
+}
+
+// Trial teams whose refresh is overdue. A team is due at once when it has no
+// verdict or a newer grant than a false one, so it is measured from the grant;
+// an eligible verdict is measured from its stamp, and a settled false verdict
+// is not due at all. Consuming teams (due at once, a running sandbox, or
+// usage since the stamp) are overdue past the fast deadline, idle teams past
+// the slow one. A sweep that keeps up reports zero for both.
+func (q *Queries) CountOverdueTrialEligibility(ctx context.Context, arg CountOverdueTrialEligibilityParams) (CountOverdueTrialEligibilityRow, error) {
+	row := q.db.QueryRow(ctx, countOverdueTrialEligibility, arg.ConsumingSeconds, arg.IdleSeconds)
+	var i CountOverdueTrialEligibilityRow
+	err := row.Scan(&i.Consuming, &i.Idle)
+	return i, err
+}
+
 const countPricingV2ActivationPending = `-- name: CountPricingV2ActivationPending :one
 SELECT count(*)::int FROM team t CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
 WHERE t.home_region=$1 AND t.id<>$2
@@ -2858,14 +2911,17 @@ WITH active_teams AS MATERIALIZED (
       AND s.status = 'active'
       AND s.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 )
-SELECT a.team_id
-FROM active_teams a
-WHERE NOT team_sandbox_billing_eligible(a.team_id)
-   OR EXISTS (
-       SELECT 1 FROM billing_team_pause_target t
-       WHERE t.team_id = a.team_id AND t.done_at IS NULL
-   )
-ORDER BY a.team_id
+SELECT d.team_id, d.targeted, d.ineligible
+FROM (
+    SELECT a.team_id, EXISTS (
+        SELECT 1 FROM billing_team_pause_target t
+        WHERE t.team_id = a.team_id AND t.done_at IS NULL
+    ) AS targeted, (NOT COALESCE(team_sandbox_billing_eligible(a.team_id), true))::boolean AS ineligible
+    FROM active_teams a
+    OFFSET 0 -- keeps the subquery unflattened so eligibility runs once per team
+) d
+WHERE d.targeted OR d.ineligible
+ORDER BY d.team_id
 LIMIT $1
 `
 
@@ -2874,24 +2930,30 @@ type ListTeamsWithBillingPauseDueParams struct {
 	AfterTeamID pgtype.UUID `json:"after_team_id"`
 }
 
+type ListTeamsWithBillingPauseDueRow struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Targeted   bool      `json:"targeted"`
+	Ineligible bool      `json:"ineligible"`
+}
+
 // MATERIALIZED fence, same reason as the rollup's interval_team_set: dedupe
 // the active-team set first so team_sandbox_billing_eligible() runs once per
 // team. Inlined in the WHERE clause the planner may evaluate it per active
 // sandbox row — the function does three reads, and this sweep runs on a
 // timer against every control-plane instance.
-func (q *Queries) ListTeamsWithBillingPauseDue(ctx context.Context, arg ListTeamsWithBillingPauseDueParams) ([]uuid.UUID, error) {
+func (q *Queries) ListTeamsWithBillingPauseDue(ctx context.Context, arg ListTeamsWithBillingPauseDueParams) ([]ListTeamsWithBillingPauseDueRow, error) {
 	rows, err := q.db.Query(ctx, listTeamsWithBillingPauseDue, arg.BatchLimit, arg.AfterTeamID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []uuid.UUID{}
+	items := []ListTeamsWithBillingPauseDueRow{}
 	for rows.Next() {
-		var team_id uuid.UUID
-		if err := rows.Scan(&team_id); err != nil {
+		var i ListTeamsWithBillingPauseDueRow
+		if err := rows.Scan(&i.TeamID, &i.Targeted, &i.Ineligible); err != nil {
 			return nil, err
 		}
-		items = append(items, team_id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -2906,21 +2968,38 @@ LEFT JOIN team_billing_account a ON a.team_id = g.team_id
 LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
 WHERE g.reason = 'signup trial credit'
   AND a.trial_ended_at IS NULL
-  -- A false verdict is stable until a newer grant arrives. Avoid rescanning
-  -- exhausted/expired historical trials while still picking up renewals.
-  AND (c.team_id IS NULL OR c.eligible OR g.created_at > c.updated_at)
-  AND g.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+  AND (
+    -- Never refreshed, or a newer grant since the last verdict.
+    c.team_id IS NULL
+    OR g.created_at > c.updated_at
+    -- A false verdict is stable until a newer grant arrives. Avoid rescanning
+    -- exhausted/expired historical trials while still picking up renewals.
+    -- A true verdict is only revisited every pass while the team consumes
+    -- compute: a running sandbox or usage recorded since the last refresh.
+    -- Idle teams still drain on storage, so they get a slower full refresh.
+    OR (c.eligible AND (
+      c.updated_at < now() - make_interval(secs => $1::int)
+      OR EXISTS (
+        SELECT 1 FROM sandbox_compute_billing_interval i
+        WHERE i.team_id = g.team_id
+          AND (i.ended_at IS NULL OR i.ended_at > c.updated_at)
+      )
+    ))
+  )
+  AND g.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 ORDER BY g.team_id
-LIMIT $2
+LIMIT $3
 `
 
 type ListTeamsWithTrialCreditsParams struct {
+	IdleSeconds int32       `json:"idle_seconds"`
 	AfterTeamID pgtype.UUID `json:"after_team_id"`
 	BatchLimit  int32       `json:"batch_limit"`
 }
 
+// Teams whose trial verdict is due for a refresh on this pass.
 func (q *Queries) ListTeamsWithTrialCredits(ctx context.Context, arg ListTeamsWithTrialCreditsParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listTeamsWithTrialCredits, arg.AfterTeamID, arg.BatchLimit)
+	rows, err := q.db.Query(ctx, listTeamsWithTrialCredits, arg.IdleSeconds, arg.AfterTeamID, arg.BatchLimit)
 	if err != nil {
 		return nil, err
 	}

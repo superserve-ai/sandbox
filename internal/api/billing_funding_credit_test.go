@@ -42,7 +42,7 @@ func TestFundingCreditOwnedDraftRequiresCompleteMeasuredCoverage(t *testing.T) {
 			case "unattributed reservation":
 				inv.PretaxCredits[0].Amount = 1000
 			}
-			err := validateFundingDraftCoverage(inv, p, a, plan, coverage)
+			err := validateFundingDraftCoverage(inv, p, a, &plan, coverage)
 			if (err == nil) != (mode == "owned") {
 				t.Fatalf("mode=%s err=%v", mode, err)
 			}
