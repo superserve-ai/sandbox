@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -185,13 +186,21 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 			return a, err
 		}
 	}
+	// One key per subscription: a concurrent attempt that chose a different
+	// price is rejected by the provider instead of installing a second item.
 	if countItems(s) == 0 && add {
-		if err = c.doForm(ctx, http.MethodPost, "/v1/subscription_items", url.Values{"subscription": {a.Subscription}, "price": {a.Price}, "proration_behavior": {"none"}}, nil, "invoice-rounding-item:"+a.Subscription+":"+a.Price); err != nil {
+		if err = c.doForm(ctx, http.MethodPost, "/v1/subscription_items", url.Values{"subscription": {a.Subscription}, "price": {a.Price}, "proration_behavior": {"none"}}, nil, "invoice-rounding-item:"+a.Subscription); err != nil {
 			return a, err
 		}
 		if err = refresh(); err != nil {
 			return a, err
 		}
+	}
+	// A writer keyed differently can install the same price alongside ours,
+	// whichever posted last. Keep the oldest copy so a retry finds one item,
+	// not a subscription nobody can enroll.
+	if countItems(s) > 1 {
+		return a, c.removeDuplicateRoundingItems(ctx, s, a.Price)
 	}
 	if countItems(s) != 1 {
 		return a, fmt.Errorf("subscription must include exactly one rounding adjustment item")
@@ -206,7 +215,7 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 		if countItems(s) != 1 {
 			return a, fmt.Errorf("rounding item changed before collection hold")
 		}
-		if err = c.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(a.Subscription), url.Values{"pause_collection[behavior]": {"keep_as_draft"}}, nil, ""); err != nil {
+		if err = c.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(a.Subscription), url.Values{"pause_collection[behavior]": {"keep_as_draft"}}, nil, "invoice-hold:"+a.Subscription); err != nil {
 			return a, err
 		}
 		s, err = c.invoiceSubscription(ctx, a.Subscription)
@@ -229,6 +238,29 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 		}
 	}
 	return a, nil
+}
+
+// removeDuplicateRoundingItems deletes every item carrying the rounding price
+// except the oldest, then asks the caller to retry on a clean read.
+func (c *stripeHTTPClient) removeDuplicateRoundingItems(ctx context.Context, s invoiceSubscription, price string) error {
+	var items []invoiceSubscriptionItem
+	for _, item := range s.Items.Data {
+		if item.Price.ID == price {
+			items = append(items, item)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Created != items[j].Created {
+			return items[i].Created < items[j].Created
+		}
+		return items[i].ID < items[j].ID
+	})
+	for _, item := range items[1:] {
+		if err := c.doForm(ctx, http.MethodDelete, "/v1/subscription_items/"+url.PathEscape(item.ID), url.Values{"proration_behavior": {"none"}}, nil, ""); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("duplicate rounding items removed; retrying")
 }
 
 // A tentative attempt timestamp is not proof that collection was held. Rescue

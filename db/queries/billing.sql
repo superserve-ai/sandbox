@@ -1374,16 +1374,67 @@ ON CONFLICT (team_id) DO UPDATE
 SET eligible = EXCLUDED.eligible,
     updated_at = EXCLUDED.updated_at;
 
+-- name: CountOverdueTrialEligibility :one
+-- Trial teams whose refresh is overdue. A team is due at once when it has no
+-- verdict or a newer grant than a false one, so it is measured from the grant;
+-- an eligible verdict is measured from its stamp, and a settled false verdict
+-- is not due at all. Consuming teams (due at once, a running sandbox, or
+-- usage since the stamp) are overdue past the fast deadline, idle teams past
+-- the slow one. A sweep that keeps up reports zero for both.
+WITH grants AS (
+  SELECT g.team_id,
+    CASE WHEN c.team_id IS NULL OR (NOT c.eligible AND g.created_at > c.updated_at) THEN g.created_at
+         WHEN c.eligible THEN c.updated_at END AS since,
+    c.team_id IS NULL OR (NOT c.eligible AND g.created_at > c.updated_at) AS pending
+  FROM team_credit_grant g
+  LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
+  LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+  WHERE g.reason = 'signup trial credit' AND a.trial_ended_at IS NULL
+), due AS (
+  -- Work became pending at the earliest such grant; a later renewal must not
+  -- reset the clock.
+  SELECT team_id, MIN(since) AS since, bool_or(pending) AS pending
+  FROM grants WHERE since IS NOT NULL GROUP BY team_id
+), classified AS (
+  -- Activity after the verdict puts the team on the fast tick from the moment
+  -- it began; an interval already running at the verdict counts from then.
+  SELECT since, pending, (
+      SELECT MIN(GREATEST(due.since, i.started_at)) FROM sandbox_compute_billing_interval i
+      WHERE i.team_id = due.team_id AND (i.ended_at IS NULL OR i.ended_at > due.since)
+    ) AS active_since
+  FROM due
+)
+SELECT COUNT(*) FILTER (WHERE (pending AND since < now() - make_interval(secs => sqlc.arg(consuming_seconds)::int))
+                           OR active_since < now() - make_interval(secs => sqlc.arg(consuming_seconds)::int))::int AS consuming,
+       COUNT(*) FILTER (WHERE NOT pending AND active_since IS NULL AND since < now() - make_interval(secs => sqlc.arg(idle_seconds)::int))::int AS idle
+FROM classified;
+
 -- name: ListTeamsWithTrialCredits :many
+-- Teams whose trial verdict is due for a refresh on this pass.
 SELECT DISTINCT g.team_id
 FROM team_credit_grant g
 LEFT JOIN team_billing_account a ON a.team_id = g.team_id
 LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
 WHERE g.reason = 'signup trial credit'
   AND a.trial_ended_at IS NULL
-  -- A false verdict is stable until a newer grant arrives. Avoid rescanning
-  -- exhausted/expired historical trials while still picking up renewals.
-  AND (c.team_id IS NULL OR c.eligible OR g.created_at > c.updated_at)
+  AND (
+    -- Never refreshed, or a newer grant since the last verdict.
+    c.team_id IS NULL
+    OR g.created_at > c.updated_at
+    -- A false verdict is stable until a newer grant arrives. Avoid rescanning
+    -- exhausted/expired historical trials while still picking up renewals.
+    -- A true verdict is only revisited every pass while the team consumes
+    -- compute: a running sandbox or usage recorded since the last refresh.
+    -- Idle teams still drain on storage, so they get a slower full refresh.
+    OR (c.eligible AND (
+      c.updated_at < now() - make_interval(secs => sqlc.arg(idle_seconds)::int)
+      OR EXISTS (
+        SELECT 1 FROM sandbox_compute_billing_interval i
+        WHERE i.team_id = g.team_id
+          AND (i.ended_at IS NULL OR i.ended_at > c.updated_at)
+      )
+    ))
+  )
   AND g.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 ORDER BY g.team_id
 LIMIT sqlc.arg(batch_limit);

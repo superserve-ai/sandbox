@@ -126,6 +126,7 @@ type OTelRecorder struct {
 	pausedNetworkSlotsTotal  metric.Int64Gauge
 	teardownAttempts         metric.Int64Counter
 	teardownBacklog          metric.Int64Gauge
+	trialEligibilityBacklog  metric.Int64Gauge
 	teardownOldestAge        metric.Float64Gauge
 	pausedNetworkSlotsUsed   metric.Int64Gauge
 	pausedNetworkSlotsAvail  metric.Int64Gauge
@@ -299,6 +300,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.teardownBacklog, err = meter.Int64Gauge("sandbox_teardown_backlog"); err != nil {
+		return nil, err
+	}
+	if r.trialEligibilityBacklog, err = meter.Int64Gauge("trial_eligibility_refresh_overdue_teams"); err != nil {
 		return nil, err
 	}
 	if r.teardownOldestAge, err = meter.Float64Gauge("sandbox_teardown_oldest_age_seconds"); err != nil {
@@ -673,6 +677,17 @@ func (r *OTelRecorder) RecordTeardownAttempt(ctx context.Context, a TeardownAtte
 		attribute.String("path", safeTeardownPath(a.Path)),
 		attribute.String("result", safeTeardownResult(a.Result)),
 	)...))
+}
+
+// RecordTrialEligibilityBacklog publishes the trial teams whose verdict is
+// past its refresh deadline, by what the sweep owes them.
+func (r *OTelRecorder) RecordTrialEligibilityBacklog(ctx context.Context, b TrialEligibilityBacklog) {
+	if r == nil {
+		return
+	}
+	for activity, n := range map[string]int64{"consuming": b.Consuming, "idle": b.Idle} {
+		r.trialEligibilityBacklog.Record(ctx, n, metric.WithAttributes(r.selfAttrs(attribute.String("activity", activity))...))
+	}
 }
 
 // RecordTeardownBacklog publishes the reclaims still owed: all of them, the
