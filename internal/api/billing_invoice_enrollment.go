@@ -86,8 +86,25 @@ func (c *stripeHTTPClient) ensureInvoiceCatalog(ctx context.Context) (invoiceAcc
 	return a, nil
 }
 
-// The account row serializes enrollment with association changes and other
-// replicas. A failed provider request rolls back enrollment, not its retry job.
+// invoiceEnrollmentPlan is what the provider work decided, computed without
+// the account lock from a snapshot of the team's billing rows.
+type invoiceEnrollmentPlan struct {
+	account     invoiceAccount
+	existing    invoiceAccount
+	enrolled    bool
+	replacement bool
+	attempt     time.Time
+	boundary    time.Time
+}
+
+var errInvoiceEnrollmentChanged = errors.New("billing account changed during enrollment; retrying")
+
+// The account lock serializes enrollment with association changes and other
+// replicas, but never spans a provider round trip: planInvoiceEnrollment does
+// the Stripe work against a snapshot of the rows, then recordInvoiceEnrollment
+// takes the lock, confirms the snapshot still holds, and writes. A change in
+// between fails this attempt and the retry job runs it again. A failed
+// provider request rolls back enrollment, not its retry job.
 func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, requested *invoiceAccount) error {
 	client, ok := h.Stripe.(*stripeHTTPClient)
 	if !ok {
@@ -101,70 +118,69 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 	if err != nil {
 		return err
 	}
-	tx, err := h.Pool.Begin(ctx)
+	plan, err := h.planInvoiceEnrollment(ctx, team, requested, client)
 	if err != nil {
 		return err
+	}
+	return h.recordInvoiceEnrollment(ctx, team, plan)
+}
+
+// planInvoiceEnrollment reads the team's billing rows in one read-only
+// transaction and consults the provider. It holds no advisory lock, so a
+// slow provider call blocks no other billing work on the team.
+func (h *Handlers) planInvoiceEnrollment(ctx context.Context, team uuid.UUID, requested *invoiceAccount, client *stripeHTTPClient) (invoiceEnrollmentPlan, error) {
+	var p invoiceEnrollmentPlan
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return p, err
 	}
 	defer tx.Rollback(ctx)
-	// Association transitions must not race a close using the previous enrollment.
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()); err != nil {
-		return err
-	}
 	var a invoiceAccount
 	var anchored bool
-	err = tx.QueryRow(ctx, `SELECT stripe_customer_id,stripe_subscription_id,commercial_billing_anchor IS NOT NULL FROM team_billing_account WHERE team_id=$1 AND stripe_subscription_status='active' AND feature_enabled('billing_export_enabled',team_id) FOR UPDATE`, team).Scan(&a.Customer, &a.Subscription, &anchored)
+	err = tx.QueryRow(ctx, `SELECT stripe_customer_id,stripe_subscription_id,commercial_billing_anchor IS NOT NULL FROM team_billing_account WHERE team_id=$1 AND stripe_subscription_status='active' AND feature_enabled('billing_export_enabled',team_id)`, team).Scan(&a.Customer, &a.Subscription, &anchored)
 	if err != nil {
-		return err
+		return p, err
 	}
-	var calendarPending bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation o
-        WHERE o.team_id=$1 AND (o.state IN ('approved','provider_pending','enrolling','active','renewal_pending','renewed')
-        OR (o.state='ended' AND o.starts_at IS NOT NULL AND o.customer_id=$2 AND o.subscription_id=$3))
-        AND NOT EXISTS(SELECT 1 FROM billing_yc_calendar_transition r WHERE r.operation_id=o.id))`, team, a.Customer, a.Subscription).Scan(&calendarPending); err != nil {
-		return err
-	}
-	if calendarPending {
-		return fmt.Errorf("YC calendar reconciliation is required before invoice enrollment; retry YC activation and follow the Billing plans, entitlements and calendar recovery runbook on conflict")
+	if err = h.requireInvoiceCalendarReconciled(ctx, tx, team, a); err != nil {
+		return p, err
 	}
 	if err = h.loadInvoiceBase(ctx, team, &a, tx); err != nil {
-		return err
+		return p, err
 	}
 	var firstCycle bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND request_payload->>'FirstPaidProCycle'='true')`, team, a.Customer, a.Subscription).Scan(&firstCycle); err != nil {
-		return err
+		return p, err
 	}
 	if firstCycle {
 		sub, e := client.invoiceSubscription(ctx, a.Subscription)
 		if e != nil {
-			return e
+			return p, e
 		}
 		if e = h.verifyFirstProCycleProviderCalendar(ctx, tx, sub); e != nil {
-			return e
+			return p, e
 		}
 	}
 
 	if !anchored {
-		return fmt.Errorf("commercial billing anchor is required before invoice enrollment")
+		return p, fmt.Errorf("commercial billing anchor is required before invoice enrollment")
 	}
-	var existing invoiceAccount
-	err = tx.QueryRow(ctx, `SELECT customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at FROM billing_invoice_account WHERE team_id=$1`, team).Scan(&existing.Customer, &existing.Subscription, &existing.Price, &existing.Event, &existing.Meter, &existing.EnrolledAt)
-	enrolled := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return err
+	existing, enrolled, err := readInvoiceAccount(ctx, tx, team)
+	if err != nil {
+		return p, err
 	}
 	replacement := enrolled && (existing.Customer != a.Customer || existing.Subscription != a.Subscription)
 	if enrolled {
 		if requested != nil && (requested.Price != existing.Price || requested.Event != existing.Event) {
-			return fmt.Errorf("existing rounding configuration differs; explicit recovery required")
+			return p, fmt.Errorf("existing rounding configuration differs; explicit recovery required")
 		}
 		a.Price, a.Event, a.Meter = existing.Price, existing.Event, existing.Meter
 		if replacement {
 			old, e := client.invoiceSubscription(ctx, existing.Subscription)
 			if e != nil {
-				return e
+				return p, e
 			}
 			if old.Customer != existing.Customer || (old.Status != "canceled" && old.Status != "incomplete_expired") {
-				return fmt.Errorf("previous subscription must be terminated before replacement enrollment")
+				return p, fmt.Errorf("previous subscription must be terminated before replacement enrollment")
 			}
 		}
 	} else {
@@ -174,19 +190,19 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		} else {
 			catalog, err = client.ensureInvoiceCatalog(ctx)
 			if err != nil {
-				return err
+				return p, err
 			}
 		}
 		a.Price, a.Event, a.Meter = catalog.Price, catalog.Event, catalog.Meter
 	}
 	for _, resource := range h.billingResourceStates(true) {
 		if a.Base.Price == "" && (a.Price == resource.StripePriceID || a.Event == resource.StripeEventName) {
-			return fmt.Errorf("rounding price and event must be separate from resource usage")
+			return p, fmt.Errorf("rounding price and event must be separate from resource usage")
 		}
 	}
 	if !enrolled || replacement {
 		if err = h.validateInvoiceEnrollment(ctx, team, a, client, tx); err != nil {
-			return err
+			return p, err
 		}
 	}
 	// Fail before changing collection for unsupported credit configurations.
@@ -208,7 +224,7 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 			err = ycErr
 		}
 		if err != nil {
-			return err
+			return p, err
 		}
 	}
 	var validate func(invoiceSubscription) error
@@ -219,25 +235,72 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 	}
 	a, err = client.ensureInvoiceSubscriptionValidated(ctx, a, !enrolled || replacement, false, validate)
 	if err != nil {
-		return err
+		return p, err
 	}
+	var attempt time.Time
+	if err = tx.QueryRow(ctx, `SELECT started_at FROM billing_invoice_enrollment WHERE team_id=$1`, team).Scan(&attempt); err != nil {
+		return p, err
+	}
+	boundary := attempt
 	if !enrolled || replacement {
-		var attempt time.Time
-		if err = tx.QueryRow(ctx, `SELECT started_at FROM billing_invoice_enrollment WHERE team_id=$1`, team).Scan(&attempt); err != nil {
-			return err
-		}
-		boundary, e := client.invoiceEnrollmentBoundary(ctx, a, attempt)
-		if e != nil {
-			return e
-		}
-		if _, err = tx.Exec(ctx, `UPDATE billing_invoice_enrollment SET started_at=$2 WHERE team_id=$1`, team, boundary); err != nil {
-			return err
+		if boundary, err = client.invoiceEnrollmentBoundary(ctx, a, attempt); err != nil {
+			return p, err
 		}
 		if _, err = client.ensureInvoiceSubscriptionValidated(ctx, a, false, false, validate); err != nil {
+			return p, err
+		}
+	}
+	p.account, p.existing, p.enrolled, p.replacement, p.attempt, p.boundary = a, existing, enrolled, replacement, attempt, boundary
+	return p, nil
+}
+
+// recordInvoiceEnrollment takes the account lock, confirms the rows the plan
+// was computed from are unchanged, and records the enrollment.
+func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, p invoiceEnrollmentPlan) error {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Association transitions must not race a close using the previous enrollment.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()); err != nil {
+		return err
+	}
+	var current invoiceAccount
+	var anchored bool
+	err = tx.QueryRow(ctx, `SELECT stripe_customer_id,stripe_subscription_id,commercial_billing_anchor IS NOT NULL FROM team_billing_account WHERE team_id=$1 AND stripe_subscription_status='active' AND feature_enabled('billing_export_enabled',team_id) FOR UPDATE`, team).Scan(&current.Customer, &current.Subscription, &anchored)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errInvoiceEnrollmentChanged
+	}
+	if err != nil {
+		return err
+	}
+	if err = h.requireInvoiceCalendarReconciled(ctx, tx, team, current); err != nil {
+		return err
+	}
+	existing, enrolled, err := readInvoiceAccount(ctx, tx, team)
+	if err != nil {
+		return err
+	}
+	// An association change clears the attempt, so it is read as nullable.
+	var attempt *time.Time
+	if err = tx.QueryRow(ctx, `SELECT started_at FROM billing_invoice_enrollment WHERE team_id=$1`, team).Scan(&attempt); err != nil {
+		return err
+	}
+	if current.Customer != p.account.Customer || current.Subscription != p.account.Subscription || !anchored ||
+		enrolled != p.enrolled || attempt == nil || !attempt.Equal(p.attempt) ||
+		existing.Customer != p.existing.Customer || existing.Subscription != p.existing.Subscription ||
+		existing.Price != p.existing.Price || existing.Event != p.existing.Event || existing.Meter != p.existing.Meter ||
+		!existing.EnrolledAt.Equal(p.existing.EnrolledAt) {
+		return errInvoiceEnrollmentChanged
+	}
+	a := p.account
+	if !enrolled || p.replacement {
+		if _, err = tx.Exec(ctx, `UPDATE billing_invoice_enrollment SET started_at=$2 WHERE team_id=$1`, team, p.boundary); err != nil {
 			return err
 		}
 	}
-	if replacement {
+	if p.replacement {
 		// Keep the replacement held even when old periods still need recovery.
 		// Never reinterpret their immutable plans or usage as the new subscription.
 		var pending bool
@@ -267,6 +330,32 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// requireInvoiceCalendarReconciled refuses enrollment while a YC operation
+// still owes a calendar transition for this association.
+func (h *Handlers) requireInvoiceCalendarReconciled(ctx context.Context, reader db.DBTX, team uuid.UUID, a invoiceAccount) error {
+	var calendarPending bool
+	if err := reader.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation o
+        WHERE o.team_id=$1 AND (o.state IN ('approved','provider_pending','enrolling','active','renewal_pending','renewed')
+        OR (o.state='ended' AND o.starts_at IS NOT NULL AND o.customer_id=$2 AND o.subscription_id=$3))
+        AND NOT EXISTS(SELECT 1 FROM billing_yc_calendar_transition r WHERE r.operation_id=o.id))`, team, a.Customer, a.Subscription).Scan(&calendarPending); err != nil {
+		return err
+	}
+	if calendarPending {
+		return fmt.Errorf("YC calendar reconciliation is required before invoice enrollment; retry YC activation and follow the Billing plans, entitlements and calendar recovery runbook on conflict")
+	}
+	return nil
+}
+
+// readInvoiceAccount returns the team's recorded enrollment, if any.
+func readInvoiceAccount(ctx context.Context, reader db.DBTX, team uuid.UUID) (invoiceAccount, bool, error) {
+	var existing invoiceAccount
+	err := reader.QueryRow(ctx, `SELECT customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at FROM billing_invoice_account WHERE team_id=$1`, team).Scan(&existing.Customer, &existing.Subscription, &existing.Price, &existing.Event, &existing.Meter, &existing.EnrolledAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return invoiceAccount{}, false, nil
+	}
+	return existing, err == nil, err
 }
 
 func (h *Handlers) invoiceEnrollmentTick(ctx context.Context) (bool, error) {
