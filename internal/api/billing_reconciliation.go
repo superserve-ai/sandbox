@@ -29,6 +29,9 @@ const (
 	// A consuming team is overdue once several fast ticks have passed without
 	// a refresh; an idle team once the slow window plus the same grace has.
 	trialEligibilityOverdueGraceSeconds int32 = 120
+	// The backlog count walks every trial grant, so it is sampled on a few
+	// ticks rather than all of them.
+	trialEligibilityBacklogSampleInterval = 5 * time.Minute
 	// Long enough that a slow page cannot let a second replica in behind the
 	// holder, short enough that a crashed one is replaced within a few ticks.
 	trialEligibilityLeaseSeconds = 120
@@ -55,6 +58,7 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 		// Only the holder knows the backlog; a replica that stopped holding
 		// the lease must not keep exporting the last one it measured.
 		currentTelemetryRecorder().RecordTrialEligibilityBacklog(ctx, telemetry.TrialEligibilityBacklog{})
+		h.trialBacklogSampledAt = time.Time{}
 		h.reconcileBillingPauses(ctx)
 		return
 	}
@@ -84,6 +88,10 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 // recordTrialEligibilityBacklog publishes how many trial teams the sweep has
 // fallen behind on, so a sweep that stops keeping up is visible.
 func (h *Handlers) recordTrialEligibilityBacklog(ctx context.Context) {
+	if time.Since(h.trialBacklogSampledAt) < trialEligibilityBacklogSampleInterval {
+		return
+	}
+	h.trialBacklogSampledAt = time.Now()
 	// A page that used up the tick deadline must still be sampled, or a
 	// stalled sweep keeps exporting its last healthy value.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)

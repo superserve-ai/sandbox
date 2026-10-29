@@ -58,6 +58,11 @@ func TestTrialEligibilityBacklogSampledAfterTickDeadline(t *testing.T) {
 	if len(rec.backlogs) != 1 || rec.backlogs[0] != want {
 		t.Fatalf("backlog = %v, want [%v]", rec.backlogs, want)
 	}
+	// The next tick is inside the sample interval and skips the count.
+	h.recordTrialEligibilityBacklog(ctx)
+	if len(rec.backlogs) != 1 {
+		t.Fatalf("resampled within the interval: %v", rec.backlogs)
+	}
 }
 
 // A holder whose page failed to list still samples the backlog.
