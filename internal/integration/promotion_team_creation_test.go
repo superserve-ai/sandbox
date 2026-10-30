@@ -574,6 +574,8 @@ func TestIntegration_DurableTeamCreationRollbackAndPrivileges(t *testing.T) {
 			"prepare_team_promotion_creation(uuid,uuid,text,text,boolean)",
 			"recover_team_promotion_creation(uuid,uuid,text)",
 			"complete_team_promotion_creation(uuid,uuid,uuid,uuid,text,text,boolean)",
+			"prepare_team_promotion_creation(uuid,uuid,text,text,boolean,boolean)",
+			"complete_team_promotion_creation(uuid,uuid,uuid,uuid,text,text,boolean,boolean)",
 			"discover_team_promotion_creations(uuid,text,uuid)",
 		} {
 			var execute, tableAccess bool

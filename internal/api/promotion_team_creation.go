@@ -62,6 +62,7 @@ type preparedTeamRequest struct {
 	Name                 string    `json:"name"`
 	HomeRegion           string    `json:"home_region"`
 	AuthorityUnavailable *bool     `json:"authority_unavailable"`
+	AdditionalTeam       *bool     `json:"additional_team"`
 	After                string    `json:"after"`
 }
 
@@ -100,9 +101,11 @@ func (h *Handlers) teamPromotionCreationOperation(c *gin.Context, operation stri
 	}
 	if operation == "prepare-team" || operation == "complete-team" {
 		valid = valid && input.Name == claims.Name && input.AuthorityUnavailable != nil &&
-			claims.AuthorityUnavailable != nil && *input.AuthorityUnavailable == *claims.AuthorityUnavailable
+			claims.AuthorityUnavailable != nil && *input.AuthorityUnavailable == *claims.AuthorityUnavailable &&
+			additionalTeam(input.AdditionalTeam) == additionalTeam(claims.AdditionalTeam)
 	} else {
-		valid = valid && input.Name == "" && input.AuthorityUnavailable == nil
+		valid = valid && input.Name == "" && input.AuthorityUnavailable == nil &&
+			input.AdditionalTeam == nil && claims.AdditionalTeam == nil
 	}
 	if operation == "complete-team" {
 		valid = valid && input.AttemptID.String() == claims.AttemptID && input.TeamID.String() == claims.TeamID
@@ -122,14 +125,14 @@ func (h *Handlers) teamPromotionCreationOperation(c *gin.Context, operation stri
 	var args []any
 	switch operation {
 	case "prepare-team":
-		query = `SELECT prepare_team_promotion_creation($1,$2,$3,$4,$5)`
-		args = []any{input.OperationID, input.UserID, input.Name, input.HomeRegion, *input.AuthorityUnavailable}
+		query = `SELECT prepare_team_promotion_creation($1,$2,$3,$4,$5,$6)`
+		args = []any{input.OperationID, input.UserID, input.Name, input.HomeRegion, *input.AuthorityUnavailable, additionalTeam(input.AdditionalTeam)}
 	case "recover-team":
 		query = `SELECT recover_team_promotion_creation($1,$2,$3)`
 		args = []any{input.OperationID, input.UserID, input.HomeRegion}
 	case "complete-team":
-		query = `SELECT complete_team_promotion_creation($1,$2,$3,$4,$5,$6,$7)`
-		args = []any{input.OperationID, input.AttemptID, input.TeamID, input.UserID, input.Name, input.HomeRegion, *input.AuthorityUnavailable}
+		query = `SELECT complete_team_promotion_creation($1,$2,$3,$4,$5,$6,$7,$8)`
+		args = []any{input.OperationID, input.AttemptID, input.TeamID, input.UserID, input.Name, input.HomeRegion, *input.AuthorityUnavailable, additionalTeam(input.AdditionalTeam)}
 	case "discover-team-creations":
 		query = `SELECT discover_team_promotion_creations($1,$2,$3)`
 		var after any
@@ -157,4 +160,10 @@ func (h *Handlers) teamPromotionCreationOperation(c *gin.Context, operation stri
 		return
 	}
 	c.Data(http.StatusOK, "application/json", result)
+}
+
+// Console sends the flag only for a user's second and later teams; an absent
+// flag is a first team, so older Console builds keep creating Free teams.
+func additionalTeam(flag *bool) bool {
+	return flag != nil && *flag
 }

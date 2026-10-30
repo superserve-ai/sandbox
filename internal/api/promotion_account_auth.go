@@ -26,6 +26,7 @@ type promotionAccountClaims struct {
 	TeamID               string `json:"team_id,omitempty"`
 	HomeRegion           string `json:"home_region,omitempty"`
 	AuthorityUnavailable *bool  `json:"authority_unavailable,omitempty"`
+	AdditionalTeam       *bool  `json:"additional_team,omitempty"`
 }
 
 // PromotionAccountAuth verifies Console's server-derived assertions. Console
