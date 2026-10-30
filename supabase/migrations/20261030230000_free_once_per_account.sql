@@ -156,18 +156,21 @@ BEGIN
    INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,initial_assignment_id,initial_free_version_id,creator_user_id,source)
     VALUES(p_id,p_region,g.epoch,gen_random_uuid(),f.id,p_actor,p_source);
   END IF;
- ELSIF (SELECT pricing_version FROM billing_pricing_switch WHERE singleton)='v2' AND g.region=p_region THEN
-  IF NOT additional THEN
-   additional:=NOT billing_claim_free_team(p_actor,p_id);
-  END IF;
-  IF additional THEN
-   INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,creator_user_id,source)
-    VALUES(p_id,p_region,g.epoch,p_actor,p_source);
-  END IF;
+ ELSIF (SELECT pricing_version FROM billing_pricing_switch WHERE singleton)='v2' AND NOT additional THEN
+  -- v2 serves every team, so the claim does not depend on the cohort gate.
+  PERFORM billing_claim_free_team(p_actor,p_id);
  END IF;
  INSERT INTO team(id,name,home_region) VALUES(p_id,p_name,p_region) RETURNING * INTO result;
  RETURN result;
 END $$;
+
+-- Under v2 an additional team awaits its plan without a cohort enrollment.
+CREATE OR REPLACE FUNCTION billing_team_awaiting_plan(p_team uuid) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ SELECT (EXISTS(SELECT 1 FROM billing_new_team_enrollment e WHERE e.team_id=p_team AND e.initial_assignment_id IS NULL)
+   OR (billing_pricing_version()='v2' AND billing_team_is_additional(p_team)))
+  AND NOT EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=p_team AND p.effective_to IS NULL);
+$$;
 
 -- A team that loses the Free claim on this path must not take a trial either.
 CREATE OR REPLACE FUNCTION create_team_with_signup_trial(
@@ -221,7 +224,7 @@ BEGIN
    PERFORM apply_assignment_limits(NEW.id,jsonb_build_object('max_concurrent',0));
    RETURN NULL;
   END IF;
- ELSIF e.team_id IS NOT NULL AND e.initial_assignment_id IS NULL THEN
+ ELSIF (e.team_id IS NOT NULL AND e.initial_assignment_id IS NULL) OR billing_team_is_additional(NEW.id) THEN
   PERFORM apply_assignment_limits(NEW.id,jsonb_build_object('max_concurrent',0));
   RETURN NULL;
  END IF;

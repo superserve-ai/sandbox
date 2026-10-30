@@ -102,3 +102,29 @@ func TestIntegration_FreeOncePerAccount(t *testing.T) {
 		t.Fatalf("v2 additional team: entry=%s free=%t eligible=%t", entry, free, eligible)
 	}
 }
+
+// v2 serves every team, so the claim holds in a cell whose new-team cohort
+// gate was never prepared.
+func TestIntegration_FreeOncePerAccountV2WithoutCohortGate(t *testing.T) {
+	pool, _, actor := cohortFixture(t)
+	rolloutExec(t, pool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
+
+	first := freeOnceCreate(t, pool, actor, false)
+	if entry, free, eligible := freeOnceState(t, pool, first); entry != "active" || !free || !eligible {
+		t.Fatalf("first team: entry=%s free=%t eligible=%t", entry, free, eligible)
+	}
+	for _, flagged := range []bool{false, true} {
+		team := freeOnceCreate(t, pool, actor, flagged)
+		if entry, free, eligible := freeOnceState(t, pool, team); entry != "plan_required" || free || eligible {
+			t.Fatalf("later team (flagged=%t): entry=%s free=%t eligible=%t", flagged, entry, free, eligible)
+		}
+		var maxSandboxes int
+		if err := pool.QueryRow(t.Context(), `SELECT max_sandboxes FROM team WHERE id=$1`, team).Scan(&maxSandboxes); err != nil || maxSandboxes != 0 {
+			t.Fatalf("later team admits sandboxes: %d %v", maxSandboxes, err)
+		}
+	}
+	var claims int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_account_free_team WHERE user_id=$1`, actor).Scan(&claims); err != nil || claims != 1 {
+		t.Fatalf("claims=%d %v", claims, err)
+	}
+}
