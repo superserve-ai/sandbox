@@ -105,7 +105,7 @@ func (h *Handlers) ensureProUpgradePaymentMethod(ctx context.Context, conn *pgxp
 	if err = c.doForm(ctx, http.MethodGet, "/v1/payment_methods/"+url.PathEscape(intent.PaymentMethod), nil, &pm, ""); err != nil {
 		return "", err
 	}
-	if pm.ID != intent.PaymentMethod || pm.Customer != u.Customer || pm.Type != "card" {
+	if pm.ID != intent.PaymentMethod || pm.Customer != u.Customer || (pm.Type != "card" && pm.Type != "link") {
 		return "", errors.New("upgrade saved card differs")
 	}
 	_, err = conn.Exec(ctx, `UPDATE billing_pro_upgrade_setup SET state='complete' WHERE id=$1`, id)

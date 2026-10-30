@@ -550,6 +550,8 @@ func (h *Handlers) verifyEntitlementForfeiture(ctx context.Context, contract uui
 	return h.discoverEntitlementForfeiture(ctx, contract, p, a, client)
 }
 
+var errRenewalInvoiceMissing = errors.New("waiting for the scheduled renewal invoice")
+
 // A scheduled cycle invoice cannot precede its service interval. There is no
 // upper creation cutoff: provider delays must remain discoverable after recovery.
 func (h *Handlers) billingCycleInvoice(ctx context.Context, a invoiceAccount, start, end int64, c *stripeHTTPClient) (StripeInvoiceAmounts, error) {
@@ -609,7 +611,7 @@ func (h *Handlers) billingCycleInvoice(ctx context.Context, a invoiceAccount, st
 		return empty, errors.New("invoice discovery continuing from saved cursor")
 	}
 	if match == "" {
-		return empty, errors.New("waiting for the scheduled renewal invoice")
+		return empty, errRenewalInvoiceMissing
 	}
 	inv, err := c.RetrieveBillingInvoice(ctx, match)
 	if err != nil {
