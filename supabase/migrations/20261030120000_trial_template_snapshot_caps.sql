@@ -1,6 +1,7 @@
 -- A team on its trial may build templates and keep snapshots up to caps set on
 -- the trial policy. Unset caps keep today's trial: no templates, and the
--- team's own snapshot cap. The caps are read, never written to the team, so a
+-- team's own snapshot cap. A team awaiting its plan whose trial is used up or
+-- was never granted may not build, since every build spends compute. The caps are read, never written to the team, so a
 -- plan bought later starts from its own caps.
 ALTER TABLE billing_trial_policy
  ADD COLUMN max_templates integer CHECK(max_templates>=0),
@@ -26,7 +27,8 @@ LANGUAGE sql STABLE AS $$
         COALESCE(t.max_template_vcpu, b.max_template_vcpu),
         COALESCE(t.max_template_memory_mib, b.max_template_memory_mib),
         COALESCE(t.max_template_disk_mib, b.max_template_disk_mib),
-        CASE WHEN p.pending THEN COALESCE((SELECT tp.max_templates FROM billing_trial_policy tp WHERE tp.singleton), 0)
+        CASE WHEN p.pending AND NOT billing_team_trial_active(p_team) THEN 0
+            WHEN p.pending THEN COALESCE((SELECT tp.max_templates FROM billing_trial_policy tp WHERE tp.singleton), 0)
             ELSE COALESCE(t.max_templates, (SELECT max_templates FROM assigned), (SELECT max_templates FROM frozen), b.max_templates) END
     FROM team t LEFT JOIN base b ON true CROSS JOIN pending p WHERE t.id = p_team;
 $$;

@@ -549,6 +549,22 @@ func TestIntegration_NewTeamCohortTrialTemplateAndSnapshotCaps(t *testing.T) {
 	if err := snapshot(); pgCode(err) != "SS002" {
 		t.Fatalf("trial snapshot cap not applied: %v", err)
 	}
+	var remaining string
+	if err := pool.QueryRow(t.Context(), `SELECT remaining_usd::text FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit'`, team).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, pool, `UPDATE team_credit_grant SET remaining_usd=0 WHERE team_id=$1 AND reason='signup trial credit'`, team)
+	if n := templates(); n != 0 {
+		t.Fatalf("an exhausted trial may still build %d templates", n)
+	}
+	rolloutExec(t, pool, `UPDATE team_credit_grant SET remaining_usd=$2::numeric WHERE team_id=$1 AND reason='signup trial credit'`, team, remaining)
+	if n := templates(); n != 1 {
+		t.Fatalf("restored trial lost its template cap: %d", n)
+	}
+	rolloutExec(t, pool, `INSERT INTO team_trial_eligibility_cache(team_id,eligible) VALUES($1,false) ON CONFLICT(team_id) DO UPDATE SET eligible=false`, team)
+	if n := templates(); n != 0 {
+		t.Fatalf("a team denied the trial may still build %d templates", n)
+	}
 	var cap int
 	if err := pool.QueryRow(t.Context(), `SELECT max_snapshots FROM team WHERE id=$1`, team).Scan(&cap); err != nil || cap != 5 {
 		t.Fatalf("the trial snapshot cap was written onto the team: %d %v", cap, err)
