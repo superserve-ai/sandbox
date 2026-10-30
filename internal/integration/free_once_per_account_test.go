@@ -128,3 +128,22 @@ func TestIntegration_FreeOncePerAccountV2WithoutCohortGate(t *testing.T) {
 		t.Fatalf("claims=%d %v", claims, err)
 	}
 }
+
+// A cell on legacy pricing with its cohort gate closed has no Free plan, but a
+// flagged team still takes no trial and gets no compute until it pays.
+func TestIntegration_FreeOncePerAccountLegacyClosedGate(t *testing.T) {
+	pool, _, actor := cohortFixture(t)
+	team := freeOnceCreate(t, pool, actor, true)
+	var outcome, reason string
+	var grants int
+	var eligible bool
+	if err := pool.QueryRow(t.Context(), `SELECT o.outcome,o.reason,
+  (SELECT count(*) FROM team_credit_grant g WHERE g.team_id=o.team_id),
+  team_sandbox_billing_eligible(o.team_id)
+ FROM team_signup_promotion_outcome o WHERE o.team_id=$1`, team).Scan(&outcome, &reason, &grants, &eligible); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != "promotion_ineligible" || reason != "additional_team" || grants != 0 || eligible {
+		t.Fatalf("flagged legacy team: %s/%s grants=%d eligible=%t", outcome, reason, grants, eligible)
+	}
+}

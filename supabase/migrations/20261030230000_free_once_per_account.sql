@@ -246,13 +246,14 @@ BEGIN
  RETURN NULL;
 END $$;
 
--- An additional team awaiting its plan never takes the trial: it records an
--- ineligible outcome, which the device claim then returns instead of a grant.
+-- An additional team never takes the trial, whatever the cell's pricing or
+-- cohort state: it records an ineligible outcome, which the device claim then
+-- returns instead of a grant.
 CREATE OR REPLACE FUNCTION claim_team_signup_trial(p_team_id uuid, p_user_id uuid)
 RETURNS TABLE(outcome text, reason text) LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public AS $$
 BEGIN
-    IF billing_team_is_additional(p_team_id) AND billing_team_awaiting_plan(p_team_id)
+    IF billing_team_is_additional(p_team_id)
        AND NOT EXISTS(SELECT 1 FROM team_signup_promotion_outcome o WHERE o.team_id=p_team_id) THEN
         INSERT INTO team_signup_trial_denial(team_id) VALUES(p_team_id) ON CONFLICT DO NOTHING;
         INSERT INTO team_signup_promotion_outcome(team_id, user_id, outcome, reason)
