@@ -1454,6 +1454,8 @@ type BillingTrialPolicy struct {
 	MaxMemoryMib *int32         `json:"max_memory_mib"`
 	MaxDiskMib   *int32         `json:"max_disk_mib"`
 	UpdatedAt    time.Time      `json:"updated_at"`
+	MaxTemplates *int32         `json:"max_templates"`
+	MaxSnapshots *int32         `json:"max_snapshots"`
 }
 
 type BillingUsageEntitlement struct {
