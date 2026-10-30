@@ -164,11 +164,12 @@ BEGIN
  RETURN result;
 END $$;
 
--- Under v2 an additional team awaits its plan without a cohort enrollment.
+-- An additional team awaits its plan without a cohort enrollment, and keeps
+-- awaiting it across a pricing rollback.
 CREATE OR REPLACE FUNCTION billing_team_awaiting_plan(p_team uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
  SELECT (EXISTS(SELECT 1 FROM billing_new_team_enrollment e WHERE e.team_id=p_team AND e.initial_assignment_id IS NULL)
-   OR (billing_pricing_version()='v2' AND billing_team_is_additional(p_team)))
+   OR billing_team_is_additional(p_team))
   AND NOT EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=p_team AND p.effective_to IS NULL);
 $$;
 

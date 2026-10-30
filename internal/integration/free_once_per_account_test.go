@@ -127,6 +127,13 @@ func TestIntegration_FreeOncePerAccountV2WithoutCohortGate(t *testing.T) {
 	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_account_free_team WHERE user_id=$1`, actor).Scan(&claims); err != nil || claims != 1 {
 		t.Fatalf("claims=%d %v", claims, err)
 	}
+
+	// A pricing rollback leaves a team created under v2 awaiting its plan.
+	later := freeOnceCreate(t, pool, actor, false)
+	rolloutExec(t, pool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	if entry, free, eligible := freeOnceState(t, pool, later); entry != "plan_required" || free || eligible {
+		t.Fatalf("after rollback: entry=%s free=%t eligible=%t", entry, free, eligible)
+	}
 }
 
 // A cell on legacy pricing with its cohort gate closed has no Free plan, but a
