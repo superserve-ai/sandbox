@@ -54,8 +54,12 @@ func (h *Handlers) RecoverProCheckout(c *gin.Context) {
 }
 
 // The console abandons a recovery call after ten seconds, so the call answers
-// within this budget and leaves a started reconciliation to finish on its own.
-const proRecoveryBudget = 8 * time.Second
+// within this budget and leaves a started reconciliation to finish on its own,
+// bounded like a reconciliation tick.
+const (
+	proRecoveryBudget    = 8 * time.Second
+	proRecoveryWorkLimit = 50 * time.Second
+)
 
 type proRecoveryResult struct {
 	outcome string
@@ -66,17 +70,19 @@ type proRecoveryResult struct {
 // that gives up does not abort an activation already under way. When another
 // worker holds the purchase, it waits for that worker's activation instead.
 func (h *Handlers) recoverProCheckoutWithin(ctx context.Context, team uuid.UUID, restart bool, budget time.Duration) (string, error) {
-	deadline := time.NewTimer(budget)
-	defer deadline.Stop()
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 	done := make(chan proRecoveryResult, 1)
 	go func() {
-		outcome, err := h.reconcileProCheckout(context.WithoutCancel(ctx), team, restart)
+		work, stop := context.WithTimeout(context.WithoutCancel(ctx), proRecoveryWorkLimit)
+		defer stop()
+		outcome, err := h.reconcileProCheckout(work, team, restart)
 		done <- proRecoveryResult{outcome, err}
 	}()
 	var result proRecoveryResult
 	select {
 	case result = <-done:
-	case <-deadline.C:
+	case <-ctx.Done():
 		return "", errors.New("Pro checkout recovery still running")
 	}
 	if result.err == nil {
@@ -91,8 +97,6 @@ func (h *Handlers) recoverProCheckoutWithin(ctx context.Context, team uuid.UUID,
 		}
 		select {
 		case <-ctx.Done():
-			return "", result.err
-		case <-deadline.C:
 			return "", result.err
 		case <-poll.C:
 		}
