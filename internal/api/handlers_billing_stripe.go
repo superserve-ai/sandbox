@@ -712,6 +712,13 @@ func preAutoReloadForm(form url.Values) (url.Values, bool) {
 		legacy[k] = append([]string(nil), v...)
 	}
 	changed := false
+	if legacy.Get("mode") == "payment" && legacy.Get("metadata[prepaid_purchase_id]") != "" && legacy.Get("invoice_creation[enabled]") == "" {
+		// Credit purchase Checkout sent no payment methods before they were
+		// limited to instant, card-backed ones.
+		legacy.Del("payment_method_types[0]")
+		legacy.Del("payment_method_types[1]")
+		return legacy, true
+	}
 	if legacy.Get("payment_method_types[1]") == "link" {
 		legacy.Del("payment_method_types[1]")
 		changed = true
