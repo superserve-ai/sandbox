@@ -318,8 +318,7 @@ func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, 
 		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_enrollment w USING(team_id) LEFT JOIN billing_invoice_close j USING(team_id,period_start,period_end)
             WHERE p.team_id=$1 AND p.period_end>$2 AND p.period_start<w.requested_at
               AND (p.period_end<=w.requested_at OR p.created_at<w.requested_at)
-              AND (p.finalized_at IS NULL OR COALESCE(j.state,'')<>'released')
-              AND NOT billing_invoice_period_absent(p.team_id,p.period_start,p.period_end))`, team, existing.EnrolledAt).Scan(&pending)
+              AND (p.finalized_at IS NULL OR COALESCE(j.state,'')<>'released'))`, team, existing.EnrolledAt).Scan(&pending)
 		if err != nil {
 			return err
 		}

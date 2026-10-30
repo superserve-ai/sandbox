@@ -1354,18 +1354,6 @@ type BillingSignupChoice struct {
 	AdmissionEpoch    pgtype.UUID        `json:"admission_epoch"`
 }
 
-type BillingSponsoredAbsentClose struct {
-	ContractID     uuid.UUID `json:"contract_id"`
-	TeamID         uuid.UUID `json:"team_id"`
-	PeriodStart    time.Time `json:"period_start"`
-	PeriodEnd      time.Time `json:"period_end"`
-	InvoiceStart   time.Time `json:"invoice_start"`
-	InvoiceEnd     time.Time `json:"invoice_end"`
-	CustomerID     string    `json:"customer_id"`
-	SubscriptionID string    `json:"subscription_id"`
-	ConfirmedAt    time.Time `json:"confirmed_at"`
-}
-
 type BillingSponsoredAnnualAuthority struct {
 	ID                uuid.UUID          `json:"id"`
 	TeamID            uuid.UUID          `json:"team_id"`

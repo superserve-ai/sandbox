@@ -666,8 +666,7 @@ func (h *Handlers) holdCreditIssuanceFence(ctx context.Context, team uuid.UUID) 
 	}
 	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account a USING(team_id)
  WHERE p.team_id=$1 AND p.period_end<=clock_timestamp() AND p.period_end>a.enrolled_at
-  AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE (j.team_id,j.period_start,j.period_end)=(p.team_id,p.period_start,p.period_end) AND j.state='released')
-  AND NOT billing_invoice_period_absent(p.team_id,p.period_start,p.period_end))`, team).Scan(&closing); err != nil {
+  AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE (j.team_id,j.period_start,j.period_end)=(p.team_id,p.period_start,p.period_end) AND j.state='released'))`, team).Scan(&closing); err != nil {
 		release()
 		return nil, err
 	}

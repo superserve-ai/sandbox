@@ -40,10 +40,6 @@ type entitlementFixture struct {
 	mu                 sync.Mutex
 	grant              *entitlementGrant
 	requests           []string
-	// subscriptionInvoices is what the provider lists for the subscription.
-	subscriptionInvoices []map[string]any
-	// onSubscriptionInvoices runs while the provider is listing them.
-	onSubscriptionInvoices func()
 }
 
 func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
@@ -232,15 +228,6 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 		case "/v1/invoices":
 			if r.URL.Query().Get("customer") != "" && r.URL.Query().Get("customer") != customer {
 				http.Error(w, "unavailable customer", 503)
-				return
-			}
-			if r.URL.Query().Get("subscription") != "" {
-				if f.onSubscriptionInvoices != nil {
-					f.onSubscriptionInvoices()
-				}
-				f.mu.Lock()
-				defer f.mu.Unlock()
-				json.NewEncoder(w).Encode(map[string]any{"data": f.subscriptionInvoices, "has_more": false})
 				return
 			}
 			if f.debt.Load() && r.URL.Query().Get("status") == "open" {

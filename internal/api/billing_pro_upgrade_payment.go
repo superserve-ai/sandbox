@@ -102,7 +102,7 @@ func (h *Handlers) issueProUpgradeCredit(ctx context.Context, conn *pgxpool.Conn
 	grant := derefString(u.Grant)
 	if grant == "" {
 		var closing bool
-		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account a USING(team_id) WHERE p.team_id=$1 AND p.period_end<=clock_timestamp() AND p.period_end>a.enrolled_at AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE j.team_id=p.team_id AND j.period_start=p.period_start AND j.period_end=p.period_end AND j.state='released') AND NOT billing_invoice_period_absent(p.team_id,p.period_start,p.period_end))`, u.Team).Scan(&closing); err != nil {
+		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account a USING(team_id) WHERE p.team_id=$1 AND p.period_end<=clock_timestamp() AND p.period_end>a.enrolled_at AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE j.team_id=p.team_id AND j.period_start=p.period_start AND j.period_end=p.period_end AND j.state='released'))`, u.Team).Scan(&closing); err != nil {
 			return err
 		}
 		if closing {

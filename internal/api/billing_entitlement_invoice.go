@@ -550,45 +550,10 @@ func (h *Handlers) verifyEntitlementForfeiture(ctx context.Context, contract uui
 	return h.discoverEntitlementForfeiture(ctx, contract, p, a, client)
 }
 
-// A scheduled cycle invoice cannot precede its service interval. There is no
-// upper creation cutoff: provider delays must remain discoverable after recovery.
 var errRenewalInvoiceMissing = errors.New("waiting for the scheduled renewal invoice")
 
-// subscriptionCycleInvoiceExists lists every invoice on the subscription since
-// the cycle started and reports whether a non-void subscription_cycle invoice
-// covers exactly that cycle. Drafts count.
-func (c *stripeHTTPClient) subscriptionCycleInvoiceExists(ctx context.Context, customer, subscription string, start, end int64) (bool, error) {
-	after := ""
-	for {
-		var list struct {
-			Data    []StripeInvoiceAmounts `json:"data"`
-			HasMore bool                   `json:"has_more"`
-		}
-		q := url.Values{"subscription": {subscription}, "limit": {"100"}, "created[gte]": {strconv.FormatInt(start, 10)}}
-		if after != "" {
-			q.Set("starting_after", after)
-		}
-		if err := c.doForm(ctx, http.MethodGet, "/v1/invoices?"+q.Encode(), nil, &list, ""); err != nil {
-			return false, err
-		}
-		for _, inv := range list.Data {
-			if inv.ID == "" || inv.Customer != customer {
-				return false, errors.New("invoice inventory ownership mismatch")
-			}
-			if inv.BillingReason == "subscription_cycle" && inv.Status != "void" && inv.PeriodStart == start && inv.PeriodEnd == end {
-				return true, nil
-			}
-		}
-		if !list.HasMore {
-			return false, nil
-		}
-		if len(list.Data) == 0 || list.Data[len(list.Data)-1].ID == after {
-			return false, errors.New("incomplete invoice inventory page")
-		}
-		after = list.Data[len(list.Data)-1].ID
-	}
-}
-
+// A scheduled cycle invoice cannot precede its service interval. There is no
+// upper creation cutoff: provider delays must remain discoverable after recovery.
 func (h *Handlers) billingCycleInvoice(ctx context.Context, a invoiceAccount, start, end int64, c *stripeHTTPClient) (StripeInvoiceAmounts, error) {
 	empty := StripeInvoiceAmounts{}
 	_, err := h.Pool.Exec(ctx, `INSERT INTO billing_invoice_discovery(customer_id,subscription_id,period_start,period_end) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, a.Customer, a.Subscription, start, end)

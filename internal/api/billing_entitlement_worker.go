@@ -499,15 +499,6 @@ func (h *Handlers) entitlementClosingInvoice(ctx context.Context, c db.BillingCo
 	}
 	var invoice string
 	err := h.Pool.QueryRow(ctx, `SELECT j.invoice_id FROM billing_invoice_close j JOIN team_billing_period p USING(team_id,period_start,period_end) WHERE j.team_id=$1 AND j.period_end=$2 AND j.state='released' AND p.finalized_at IS NOT NULL AND billing_invoice_close_matches(j.team_id,j.period_start,j.period_end)`, c.TeamID, start).Scan(&invoice)
-	if errors.Is(err, pgx.ErrNoRows) && c.ChargeKind == "sponsored_entitlement" {
-		absent, absentErr := h.sponsoredCycleInvoiceAbsent(ctx, c, start, client)
-		if absentErr != nil {
-			return absentErr
-		}
-		if absent {
-			return nil
-		}
-	}
 	if err != nil {
 		return fmt.Errorf("prior closing invoice is not reconciled and released: %w", err)
 	}
@@ -519,70 +510,6 @@ func (h *Handlers) entitlementClosingInvoice(ctx context.Context, c db.BillingCo
 		return errors.New("prior closing invoice is not settled")
 	}
 	return nil
-}
-
-// sponsoredRenewalInvoiceSettle is how long after a provider cycle ends a
-// missing subscription_cycle invoice is treated as absent rather than late.
-const sponsoredRenewalInvoiceSettle = time.Hour
-
-// sponsoredCycleInvoiceAbsent reports whether the sponsored period ending at
-// start has no subscription_cycle invoice to close, so the next grant need not
-// wait for one. The decision is recorded once and reused, so an invoice that
-// arrives later cannot reverse what an issued grant relied on.
-func (h *Handlers) sponsoredCycleInvoiceAbsent(ctx context.Context, c db.BillingCommercialContract, start time.Time, client *stripeHTTPClient) (bool, error) {
-	var recorded bool
-	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_absent_close WHERE contract_id=$1 AND period_end=$2 AND customer_id=$3 AND subscription_id=$4)`, c.ID, start, c.CustomerID, c.SubscriptionID).Scan(&recorded); err != nil {
-		return false, err
-	}
-	if recorded {
-		return true, nil
-	}
-	// A close row means an invoice was found, so it must close normally. The
-	// calendar row is written by the close worker once it starts looking, and
-	// the period must be finalized first: a recorded absence leaves the close
-	// queue, which is what would otherwise finalize it.
-	var periodStart, invoiceStart, invoiceEnd time.Time
-	err := h.Pool.QueryRow(ctx, `SELECT k.period_start,k.invoice_start,k.invoice_end FROM billing_invoice_calendar k JOIN team_billing_period p USING(team_id,period_start,period_end) WHERE k.team_id=$1 AND k.period_end=$2 AND k.customer_id=$3 AND k.subscription_id=$4 AND p.finalized_at IS NOT NULL
- AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE j.team_id=k.team_id AND j.period_start=k.period_start AND j.period_end=k.period_end)`, c.TeamID, start, c.CustomerID, c.SubscriptionID).Scan(&periodStart, &invoiceStart, &invoiceEnd)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if time.Since(invoiceEnd) < sponsoredRenewalInvoiceSettle {
-		return false, nil
-	}
-	found, err := client.subscriptionCycleInvoiceExists(ctx, c.CustomerID, c.SubscriptionID, invoiceStart.Unix(), invoiceEnd.Unix())
-	if err != nil || found {
-		return false, err
-	}
-	// The invoice close may have found a draft during the listing. Decide
-	// under its lock so a period is never both closing and absent.
-	tx, err := h.Pool.Begin(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback(context.WithoutCancel(ctx))
-	var locked, closing bool
-	if err = tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+c.TeamID.String()).Scan(&locked); err != nil {
-		return false, err
-	}
-	if !locked {
-		return false, errors.New("invoice reconciliation already running")
-	}
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_invoice_close WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`, c.TeamID, periodStart, start).Scan(&closing); err != nil || closing {
-		return false, err
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO billing_sponsored_absent_close(contract_id,team_id,period_start,period_end,invoice_start,invoice_end,customer_id,subscription_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, c.ID, c.TeamID, periodStart, start, invoiceStart, invoiceEnd, c.CustomerID, c.SubscriptionID); err != nil {
-		return false, err
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return false, err
-	}
-	log.Error().Str("contract_id", c.ID.String()).Str("team_id", c.TeamID.String()).Time("period_end", start).
-		Msg("sponsored renewal invoice missing; issuing the next grant without a closing invoice")
-	return true, nil
 }
 
 func (h *Handlers) discoverUsageEntitlement(ctx context.Context, c db.BillingCommercialContract, e db.BillingUsageEntitlement, client *stripeHTTPClient) error {

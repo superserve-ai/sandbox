@@ -12,42 +12,12 @@
 -- observes it. It lasts until a successful credit read after that grant was
 -- issued; a failed read also advances the generation, so it is not enough.
 --
+-- If the renewal draft never closes, the grace still ends after six hours; the
+-- invoice close alerts on a renewal invoice that is still missing.
+--
 -- Usage in the grace is billed on the new period's invoice, which the next
 -- grant applies to. The invoice close verifies what Stripe applied before it
 -- releases anything, so a difference holds the draft for review.
-
--- A sponsored period whose subscription_cycle invoice was confirmed absent
--- after its provider cycle ended. Recorded once and never rewritten, so a
--- later-arriving invoice cannot change a decision the next grant relied on.
-CREATE TABLE billing_sponsored_absent_close (
- contract_id uuid NOT NULL REFERENCES billing_commercial_contract(id),
- team_id uuid NOT NULL,
- period_start timestamptz NOT NULL,
- period_end timestamptz NOT NULL,
- invoice_start timestamptz NOT NULL,
- invoice_end timestamptz NOT NULL,
- customer_id text NOT NULL,
- subscription_id text NOT NULL,
- confirmed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- PRIMARY KEY(contract_id,period_end),
- UNIQUE(team_id,period_start,period_end),
- CHECK(period_end>period_start), CHECK(invoice_end>invoice_start)
-);
-ALTER TABLE billing_sponsored_absent_close ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON billing_sponsored_absent_close FROM PUBLIC;
-DO $$ DECLARE r text; BEGIN
- FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
-  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON billing_sponsored_absent_close FROM %I',r); END IF;
- END LOOP;
-END $$;
-CREATE TRIGGER billing_sponsored_absent_close_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON billing_sponsored_absent_close
- FOR EACH STATEMENT EXECUTE FUNCTION guard_billing_catalog_append_only();
-
--- A recorded absent period has nothing to close, so it does not hold the
--- periods after it.
-CREATE OR REPLACE FUNCTION billing_invoice_period_absent(p_team_id uuid,p_start timestamptz,p_end timestamptz) RETURNS boolean LANGUAGE sql STABLE AS $$
- SELECT EXISTS(SELECT 1 FROM billing_sponsored_absent_close WHERE team_id=p_team_id AND period_start=p_start AND period_end=p_end);
-$$;
 
 -- p_credit_checked_at is when the current funding observation last read
 -- credit successfully, or NULL; until it postdates the next grant's issuance,

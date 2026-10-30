@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/superserve-ai/sandbox/internal/billing"
 )
 
 // sponsoredRollFixture is a sponsored team without a payment method whose
@@ -92,86 +91,30 @@ func (f *sponsoredRollFixture) eligible() bool {
 	return ok
 }
 
-func (f *sponsoredRollFixture) absentRecorded() bool {
+// releasePriorClose records the prior period's $0 renewal draft as closed and
+// released, as the invoice close does once Stripe's draft is reconciled.
+func (f *sponsoredRollFixture) releasePriorClose() {
 	f.t.Helper()
-	var ok bool
-	if err := f.h.Pool.QueryRow(f.t.Context(), `SELECT EXISTS(SELECT 1 FROM billing_sponsored_absent_close WHERE contract_id=$1 AND period_end=$2)`, f.c.ID, f.start).Scan(&ok); err != nil {
-		f.t.Fatal(err)
-	}
-	return ok
-}
-
-func (f *sponsoredRollFixture) invoice(id, reason, status string) map[string]any {
-	return map[string]any{"id": id, "customer": f.c.CustomerID, "billing_reason": reason, "status": status, "period_start": f.prior.Unix(), "period_end": f.start.Unix()}
-}
-
-func TestSponsoredRollWithoutRenewalInvoice(t *testing.T) {
-	for _, shape := range []string{"none", "create_and_update", "void_cycle"} {
-		t.Run(shape, func(t *testing.T) {
-			f := newSponsoredRollFixture(t, 2*time.Hour)
-			switch shape {
-			case "create_and_update":
-				// Activation and a later change bill outside the cycle; neither closes a period.
-				f.subscriptionInvoices = []map[string]any{f.invoice("in_create", "subscription_create", "paid"), f.invoice("in_update", "subscription_update", "paid")}
-			case "void_cycle":
-				f.subscriptionInvoices = []map[string]any{f.invoice("in_void", "subscription_cycle", "void")}
-			}
-			if !f.eligible() {
-				t.Fatal("sponsored team paused at its period roll")
-			}
-			if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil {
-				t.Fatal("next grant blocked on a renewal invoice that does not exist:", err)
-			}
-			if f.grants.Load() != 1 || !f.absentRecorded() {
-				t.Fatal("absent renewal invoice not recorded with one grant", f.grants.Load(), f.absentRecorded())
-			}
-			// Issuing the grant moved the funding generation; the funding worker
-			// has not observed it yet.
-			if !f.eligible() {
-				t.Fatal("team paused before the issued grant was observed")
-			}
-			// The absent period must not hold the next period's invoice close.
-			if err := f.h.requireEarlierInvoicePeriodsReleased(t.Context(), billing.ExportPeriod{TeamID: f.c.TeamID, Start: f.start, End: f.end}, f.prior); err != nil {
-				t.Fatal("recorded absent period still holds later closes:", err)
-			}
-			// A cycle invoice that turns up later changes nothing already decided.
-			f.subscriptionInvoices = append(f.subscriptionInvoices, f.invoice("in_late", "subscription_cycle", "draft"))
-			if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil || f.grants.Load() != 1 || !f.absentRecorded() {
-				t.Fatal("late renewal invoice reopened the period", f.grants.Load(), err)
-			}
-			f.observe(30000)
-			if !f.eligible() {
-				t.Fatal("issued next grant left the team paused")
-			}
-		})
-	}
+	f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),jsonb_build_object('customer',$5::text,'subscription',$6::text,'expected_cents',0,'credit_before_cents',0,'resources',jsonb_build_array(jsonb_build_object('resource','cpu','expected_cents',0,'snapshot',billing_meter_accounting_snapshot($1,$2,$3,'cpu')))), '{"credit_applied_cents":0,"credit_remaining_cents":0,"net_cents":0}')`, f.c.TeamID, f.prior, f.start, "in_prior_"+f.c.TeamID.String(), f.c.CustomerID, f.c.SubscriptionID)
 }
 
 func TestSponsoredRollWaitsForDraftRenewalInvoice(t *testing.T) {
 	f := newSponsoredRollFixture(t, 2*time.Hour)
-	f.subscriptionInvoices = []map[string]any{f.invoice("in_cycle", "subscription_cycle", "draft")}
 	_, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID)
-	if err == nil || !strings.Contains(err.Error(), "prior closing invoice is not reconciled and released") || f.grants.Load() != 0 || f.absentRecorded() {
-		t.Fatal("existing renewal draft was skipped instead of closed", err, f.grants.Load())
+	if err == nil || !strings.Contains(err.Error(), "prior closing invoice is not reconciled and released") || f.grants.Load() != 0 {
+		t.Fatal("next grant issued before the renewal invoice closed", err, f.grants.Load())
 	}
 	if !f.eligible() {
-		t.Fatal("team paused while its renewal invoice closes")
+		t.Fatal("sponsored team paused while its renewal invoice closes")
 	}
-	invoice := "in_prior_" + f.c.TeamID.String()
-	f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),jsonb_build_object('customer',$5::text,'subscription',$6::text,'expected_cents',0,'credit_before_cents',0,'resources',jsonb_build_array(jsonb_build_object('resource','cpu','expected_cents',0,'snapshot',billing_meter_accounting_snapshot($1,$2,$3,'cpu')))), '{"credit_applied_cents":0,"credit_remaining_cents":0,"net_cents":0}')`, f.c.TeamID, f.prior, f.start, invoice, f.c.CustomerID, f.c.SubscriptionID)
-	if _, err = f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil || f.grants.Load() != 1 || f.absentRecorded() {
+	f.releasePriorClose()
+	if _, err = f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil || f.grants.Load() != 1 {
 		t.Fatal("released $0 renewal invoice did not issue the next grant", err, f.grants.Load())
 	}
-}
-
-func TestSponsoredRollRecentlyEndedCycleIsNotAbsent(t *testing.T) {
-	// Stripe may still be creating the renewal draft.
-	f := newSponsoredRollFixture(t, 10*time.Minute)
-	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil || f.grants.Load() != 0 || f.absentRecorded() {
-		t.Fatal("renewal invoice treated as absent before Stripe had time to create it", err)
-	}
+	// Issuing the grant moved the funding generation; the funding worker has
+	// not observed it yet.
 	if !f.eligible() {
-		t.Fatal("team paused while its renewal invoice is created")
+		t.Fatal("team paused before the issued grant was observed")
 	}
 }
 
@@ -231,6 +174,7 @@ func TestSponsoredRollGraceEndsWithContract(t *testing.T) {
 func TestSponsoredRollGraceWaitsForSuccessfulCreditRead(t *testing.T) {
 	f := newSponsoredRollFixture(t, 2*time.Hour)
 	ctx := t.Context()
+	f.releasePriorClose()
 	if _, err := f.h.reconcileUsageEntitlement(ctx, f.c.ID); err != nil || f.grants.Load() != 1 {
 		t.Fatal("next grant not issued", err)
 	}
@@ -254,88 +198,5 @@ func TestSponsoredRollGraceWaitsForSuccessfulCreditRead(t *testing.T) {
 	publish(&fundingCreditObservation{SpendableUSD: "0", ValidUntil: time.Now().Add(time.Minute), Evidence: []byte(`{"fixture":"credit"}`)}, nil)
 	if f.eligible() {
 		t.Fatal("grace outlived a successful read showing no credit")
-	}
-}
-
-func TestSponsoredRollAbsenceIsSerializedWithInvoiceClose(t *testing.T) {
-	closeKey := func(f *sponsoredRollFixture) string { return "invoice:" + f.c.TeamID.String() }
-	t.Run("close found during listing", func(t *testing.T) {
-		f := newSponsoredRollFixture(t, 2*time.Hour)
-		// The invoice close finds a draft and commits under its lock while the
-		// entitlement worker is still listing invoices.
-		f.onSubscriptionInvoices = func() {
-			f.onSubscriptionInvoices = nil
-			tx, err := f.h.Pool.Begin(context.Background())
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			defer tx.Rollback(context.Background())
-			if _, err = tx.Exec(context.Background(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, closeKey(f)); err != nil {
-				t.Error(err)
-				return
-			}
-			if _, err = tx.Exec(context.Background(), `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan) VALUES($1,$2,$3,$4,'{}')`, f.c.TeamID, f.prior, f.start, "in_found_"+f.c.TeamID.String()); err != nil {
-				t.Error(err)
-				return
-			}
-			if err = tx.Commit(context.Background()); err != nil {
-				t.Error(err)
-			}
-		}
-		if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil || f.grants.Load() != 0 || f.absentRecorded() {
-			t.Fatal("period recorded absent although its close was created", err, f.grants.Load())
-		}
-	})
-	t.Run("close running during decision", func(t *testing.T) {
-		f := newSponsoredRollFixture(t, 2*time.Hour)
-		tx, err := f.h.Pool.Begin(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer tx.Rollback(context.WithoutCancel(t.Context()))
-		if _, err = tx.Exec(t.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, closeKey(f)); err != nil {
-			t.Fatal(err)
-		}
-		if _, err = f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil || f.grants.Load() != 0 || f.absentRecorded() {
-			t.Fatal("absence decided while the invoice close held its lock", err)
-		}
-	})
-	t.Run("close after absence", func(t *testing.T) {
-		f := newSponsoredRollFixture(t, 2*time.Hour)
-		if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil || !f.absentRecorded() {
-			t.Fatal(err)
-		}
-		f.subscriptionInvoices = []map[string]any{f.invoice("in_late", "subscription_cycle", "draft")}
-		if err := f.h.reconcileInvoicePeriod(t.Context(), billing.ExportPeriod{TeamID: f.c.TeamID, Start: f.prior, End: f.start}); err != nil {
-			t.Fatal(err)
-		}
-		var closing bool
-		if err := f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM billing_invoice_close WHERE team_id=$1 AND period_end=$2)`, f.c.TeamID, f.start).Scan(&closing); err != nil || closing {
-			t.Fatal("absent period was also closed", closing, err)
-		}
-	})
-}
-
-func TestSponsoredRollAbsenceWaitsForFinalizedPeriod(t *testing.T) {
-	f := newSponsoredRollFixture(t, 2*time.Hour)
-	conn, err := f.h.Pool.Acquire(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Release()
-	if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Exec(context.WithoutCancel(t.Context()), `RESET session_replication_role`)
-	// Export and finalization are running late for the ended period.
-	if _, err = conn.Exec(t.Context(), `UPDATE team_billing_period SET status='open',finalized_at=NULL,gross_charges_usd=NULL,credits_applied_usd=NULL,net_invoice_amount_usd=NULL WHERE team_id=$1 AND period_end=$2`, f.c.TeamID, f.start); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil || f.grants.Load() != 0 || f.absentRecorded() {
-		t.Fatal("unfinalized period recorded absent", err)
-	}
-	if !f.eligible() {
-		t.Fatal("team paused while its period finalizes")
 	}
 }

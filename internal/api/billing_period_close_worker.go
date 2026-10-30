@@ -151,7 +151,6 @@ func (h *Handlers) discoverBillingPeriodCloseWork(ctx context.Context) error {
                OR (p.status IN ('exporting','exported','finalized') AND i.enrolled_at<p.period_end))
              AND (i.team_id IS NULL OR i.enrolled_at<p.period_end)
              AND (p.finalized_at IS NULL OR (c.state IS NOT NULL AND c.state<>'released')) AND COALESCE(c.state,'')<>'released'
-             AND NOT billing_invoice_period_absent(p.team_id,p.period_start,p.period_end)
             ON CONFLICT DO NOTHING`, first.TeamID, first.Start, first.End, last.TeamID, last.Start, last.End)
 		if err != nil {
 			return err
@@ -353,13 +352,7 @@ func (h *Handlers) advanceBillingPeriodClose(ctx context.Context, p billing.Expo
 		return hold("release", err)
 	}
 	var released bool
-	err = h.Pool.QueryRow(ctx, `SELECT state='released' FROM billing_invoice_close WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End).Scan(&released)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if released, err = h.invoicePeriodAbsent(ctx, p); err == nil && !released {
-			err = pgx.ErrNoRows
-		}
-	}
-	if err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT state='released' FROM billing_invoice_close WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End).Scan(&released); err != nil {
 		return hold("release", err)
 	}
 	if released {
