@@ -1,7 +1,60 @@
--- The Free allowance is once per account. The console marks every team after
--- a user's first as additional; those teams start awaiting a paid plan instead
--- of on Free, under either pricing switch.
+-- The Free allowance is once per account. Each cell claims a user's one Free
+-- team atomically; a later team, or one Console marks additional because the
+-- user holds a Free team in another cell, starts awaiting a paid plan instead,
+-- under either pricing switch.
 ALTER TABLE team_promotion_creation_attempt ADD COLUMN additional_team boolean NOT NULL DEFAULT false;
+
+-- The claim outlives its team, so deleting a team never frees a second Free.
+CREATE TABLE billing_account_free_team (
+ user_id uuid PRIMARY KEY,
+ team_id uuid NOT NULL UNIQUE,
+ claimed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE billing_additional_team (
+ team_id uuid PRIMARY KEY REFERENCES team(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+ marked_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+ALTER TABLE billing_account_free_team ENABLE ROW LEVEL SECURITY;
+ALTER TABLE billing_additional_team ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_account_free_team, billing_additional_team FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+   EXECUTE format('REVOKE ALL ON billing_account_free_team, billing_additional_team FROM %I',r);
+  END IF;
+ END LOOP;
+ -- Console reads other cells' claims before creating a team.
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT SELECT ON billing_account_free_team TO service_role;
+  CREATE POLICY account_free_team_backend_read ON billing_account_free_team FOR SELECT TO service_role USING(true);
+ END IF;
+END $$;
+
+-- Teams that already started on Free hold their creator's claim.
+INSERT INTO billing_account_free_team(user_id,team_id,claimed_at)
+SELECT DISTINCT ON (e.creator_user_id) e.creator_user_id,e.team_id,e.enrolled_at
+FROM billing_new_team_enrollment e
+WHERE e.initial_assignment_id IS NOT NULL
+ORDER BY e.creator_user_id,e.enrolled_at,e.team_id;
+
+CREATE FUNCTION billing_team_is_additional(p_team uuid) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ SELECT EXISTS(SELECT 1 FROM billing_additional_team WHERE team_id=p_team)
+  OR EXISTS(SELECT 1 FROM team_promotion_creation_attempt a WHERE a.team_id=p_team AND a.additional_team);
+$$;
+
+-- Returns whether p_team holds p_user's Free claim; a loser is marked additional.
+-- Only billing_insert_signup_team calls it, inside its own definer context.
+CREATE FUNCTION billing_claim_free_team(p_user uuid, p_team uuid) RETURNS boolean
+LANGUAGE plpgsql SET search_path=pg_catalog,public,pg_temp AS $$
+BEGIN
+ INSERT INTO billing_account_free_team(user_id,team_id) VALUES(p_user,p_team) ON CONFLICT (user_id) DO NOTHING;
+ IF EXISTS(SELECT 1 FROM billing_account_free_team WHERE user_id=p_user AND team_id=p_team) THEN
+  RETURN true;
+ END IF;
+ INSERT INTO billing_additional_team(team_id) VALUES(p_team) ON CONFLICT DO NOTHING;
+ RETURN false;
+END $$;
 
 CREATE FUNCTION prepare_team_promotion_creation(p_operation_id uuid, p_user_id uuid,
     p_name text, p_home_region text, p_authority_unavailable boolean, p_additional_team boolean)
@@ -62,14 +115,14 @@ $$;
 
 CREATE OR REPLACE FUNCTION billing_insert_signup_team(p_id uuid,p_name text,p_actor uuid,p_region text,p_source text)
 RETURNS team LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE g billing_new_team_gate; f billing_plan_version; result team; additional boolean;
+DECLARE g billing_new_team_gate; f billing_plan_version; result team; additional boolean; trial_first boolean;
 BEGIN
  IF p_id IS NULL OR p_actor IS NULL OR p_region IS NULL OR p_region NOT IN ('use','usw') OR p_source IS NULL OR p_source NOT IN ('trusted_signup','trusted_creation_attempt') THEN
   RAISE EXCEPTION 'trusted signup identity required' USING ERRCODE='22023';
  END IF;
  PERFORM 1 FROM billing_pricing_switch WHERE singleton FOR SHARE;
  SELECT * INTO STRICT g FROM billing_new_team_gate WHERE singleton FOR SHARE;
- additional:=EXISTS(SELECT 1 FROM team_promotion_creation_attempt a WHERE a.team_id=p_id AND a.additional_team);
+ additional:=billing_team_is_additional(p_id);
  IF (SELECT pricing_version FROM billing_pricing_switch WHERE singleton)='legacy' AND g.state='released' AND NOT billing_new_team_ready() THEN
   RAISE EXCEPTION 'new-team gate requires verified writer authority' USING ERRCODE='55000';
  END IF;
@@ -79,7 +132,11 @@ BEGIN
   END IF;
   PERFORM 1 FROM billing_plan_version WHERE family IN ('developer','pro','free') AND pricing_version='v2' AND state='published' FOR SHARE;
   PERFORM 1 FROM billing_trial_policy WHERE singleton FOR SHARE;
-  IF additional OR (billing_paid_first_sellable() AND billing_trial_configured()) THEN
+  trial_first:=billing_paid_first_sellable() AND billing_trial_configured();
+  IF NOT additional AND NOT trial_first THEN
+   additional:=NOT billing_claim_free_team(p_actor,p_id);
+  END IF;
+  IF additional OR trial_first THEN
    INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,creator_user_id,source)
     VALUES(p_id,p_region,g.epoch,p_actor,p_source);
   ELSE
@@ -87,13 +144,46 @@ BEGIN
    INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,initial_assignment_id,initial_free_version_id,creator_user_id,source)
     VALUES(p_id,p_region,g.epoch,gen_random_uuid(),f.id,p_actor,p_source);
   END IF;
- ELSIF (SELECT pricing_version FROM billing_pricing_switch WHERE singleton)='v2' AND additional AND g.region=p_region THEN
-  INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,creator_user_id,source)
-   VALUES(p_id,p_region,g.epoch,p_actor,p_source);
+ ELSIF (SELECT pricing_version FROM billing_pricing_switch WHERE singleton)='v2' AND g.region=p_region THEN
+  IF NOT additional THEN
+   additional:=NOT billing_claim_free_team(p_actor,p_id);
+  END IF;
+  IF additional THEN
+   INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,creator_user_id,source)
+    VALUES(p_id,p_region,g.epoch,p_actor,p_source);
+  END IF;
  END IF;
  INSERT INTO team(id,name,home_region) VALUES(p_id,p_name,p_region) RETURNING * INTO result;
  RETURN result;
 END $$;
+
+-- A team that loses the Free claim on this path must not take a trial either.
+CREATE OR REPLACE FUNCTION create_team_with_signup_trial(
+    p_name text,
+    p_user_id uuid,
+    p_home_region text,
+    p_policy_mode text
+)
+RETURNS team
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE
+    created_team team;
+BEGIN
+    IF p_user_id IS NULL THEN
+        RAISE EXCEPTION 'signup trial requires a creator' USING ERRCODE = '22023';
+    END IF;
+    IF p_policy_mode IS NULL OR p_policy_mode NOT IN ('first_team', 'additional_team') THEN
+        RAISE EXCEPTION 'unsupported team creation policy' USING ERRCODE = '22023';
+    END IF;
+    SELECT * INTO created_team FROM billing_insert_signup_team(gen_random_uuid(),p_name,p_user_id,p_home_region,'trusted_signup');
+    PERFORM claim_team_signup_trial(created_team.id, p_user_id);
+    DELETE FROM team_signup_trial_provenance WHERE team_id = created_team.id;
+    RETURN created_team;
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION assign_new_team_free_plan() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE v billing_plan_version; pricing text; g billing_new_team_gate; e billing_new_team_enrollment;
@@ -141,13 +231,13 @@ BEGIN
  RETURN NULL;
 END $$;
 
--- The trial is the account's too: an additional team records an ineligible
--- outcome, which the device claim then returns instead of granting credit.
+-- An additional team awaiting its plan never takes the trial: it records an
+-- ineligible outcome, which the device claim then returns instead of a grant.
 CREATE OR REPLACE FUNCTION claim_team_signup_trial(p_team_id uuid, p_user_id uuid)
 RETURNS TABLE(outcome text, reason text) LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public AS $$
 BEGIN
-    IF EXISTS(SELECT 1 FROM team_promotion_creation_attempt a WHERE a.team_id=p_team_id AND a.additional_team)
+    IF billing_team_is_additional(p_team_id) AND billing_team_awaiting_plan(p_team_id)
        AND NOT EXISTS(SELECT 1 FROM team_signup_promotion_outcome o WHERE o.team_id=p_team_id) THEN
         INSERT INTO team_signup_trial_denial(team_id) VALUES(p_team_id) ON CONFLICT DO NOTHING;
         INSERT INTO team_signup_promotion_outcome(team_id, user_id, outcome, reason)
@@ -169,14 +259,15 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp A
   WHEN billing_team_trial_active(p_team) THEN 'trial'
   WHEN EXISTS(SELECT 1 FROM billing_pro_upgrade_setup s JOIN billing_pro_upgrade u ON u.id=s.upgrade_id
    WHERE u.team_id=p_team AND u.state NOT IN ('expired','ended') AND s.state='open') THEN 'payment_failed'
-  WHEN EXISTS(SELECT 1 FROM team_promotion_creation_attempt a WHERE a.team_id=p_team AND a.additional_team) THEN 'plan_required'
+  WHEN billing_team_is_additional(p_team) THEN 'plan_required'
   ELSE 'trial_ended' END;
 $$;
 
 DO $$ DECLARE f text; r text; BEGIN
     FOREACH f IN ARRAY ARRAY[
         'prepare_team_promotion_creation(uuid,uuid,text,text,boolean,boolean)',
-        'complete_team_promotion_creation(uuid,uuid,uuid,uuid,text,text,boolean,boolean)'
+        'complete_team_promotion_creation(uuid,uuid,uuid,uuid,text,text,boolean,boolean)',
+        'billing_team_is_additional(uuid)'
     ] LOOP
         EXECUTE 'REVOKE ALL ON FUNCTION ' || f || ' FROM PUBLIC';
         FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
@@ -186,6 +277,15 @@ DO $$ DECLARE f text; r text; BEGIN
         END LOOP;
         IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
             EXECUTE 'GRANT EXECUTE ON FUNCTION ' || f || ' TO service_role';
+        END IF;
+    END LOOP;
+END $$;
+
+REVOKE ALL ON FUNCTION billing_claim_free_team(uuid,uuid) FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+    FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+        IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION billing_claim_free_team(uuid,uuid) FROM %I',r);
         END IF;
     END LOOP;
 END $$;

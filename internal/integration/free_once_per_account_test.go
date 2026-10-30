@@ -42,7 +42,7 @@ func freeOnceState(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) (entry stri
 
 func TestIntegration_FreeOncePerAccount(t *testing.T) {
 	pool, system, actor := cohortFixture(t)
-	// Production sells Pro alone, so signups start on Free rather than the trial.
+	// With one paid plan unsellable, signups start on Free rather than the trial.
 	rolloutExec(t, pool, `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='developer' AND pricing_version='v2' AND state='published'),NULL)`)
 	cohortRelease(t, pool, system)
 
@@ -50,9 +50,27 @@ func TestIntegration_FreeOncePerAccount(t *testing.T) {
 	if entry, free, eligible := freeOnceState(t, pool, first); entry != "active" || !free || !eligible {
 		t.Fatalf("first team: entry=%s free=%t eligible=%t", entry, free, eligible)
 	}
-	second := freeOnceCreate(t, pool, actor, true)
+	// The cell claims the account's Free team itself, whatever the caller sends.
+	second := freeOnceCreate(t, pool, actor, false)
 	if entry, free, eligible := freeOnceState(t, pool, second); entry != "plan_required" || free || eligible {
-		t.Fatalf("additional team: entry=%s free=%t eligible=%t", entry, free, eligible)
+		t.Fatalf("second team: entry=%s free=%t eligible=%t", entry, free, eligible)
+	}
+	var signupTeam uuid.UUID
+	if err := pool.QueryRow(t.Context(), `SELECT id FROM create_team_with_signup_trial('signup-path',$1,'use','first_team')`, actor).Scan(&signupTeam); err != nil {
+		t.Fatal(err)
+	}
+	if entry, free, _ := freeOnceState(t, pool, signupTeam); entry != "plan_required" || free {
+		t.Fatalf("signup-path team: entry=%s free=%t", entry, free)
+	}
+	var grants int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM team_credit_grant WHERE team_id IN ($1,$2)`, second, signupTeam).Scan(&grants); err != nil || grants != 0 {
+		t.Fatalf("additional teams took trial credit: %d %v", grants, err)
+	}
+	// A Free team held in another cell reaches this one as Console's flag.
+	elsewhere := uuid.New()
+	rolloutExec(t, pool, `INSERT INTO profile(id,email) VALUES($1,$2)`, elsewhere, elsewhere.String()+"@example.invalid")
+	if entry, free, _ := freeOnceState(t, pool, freeOnceCreate(t, pool, elsewhere, true)); entry != "plan_required" || free {
+		t.Fatalf("flagged team: entry=%s free=%t", entry, free)
 	}
 	var maxSandboxes int
 	if err := pool.QueryRow(t.Context(), `SELECT max_sandboxes FROM team WHERE id=$1`, second).Scan(&maxSandboxes); err != nil || maxSandboxes != 0 {
