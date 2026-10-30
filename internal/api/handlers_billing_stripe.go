@@ -691,6 +691,49 @@ func definitiveStripeRejection(err error) bool {
 }
 
 func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form url.Values, out any, idempotencyKey string) error {
+	err := c.sendForm(ctx, method, path, form, out, idempotencyKey)
+	var se *stripeRequestError
+	if idempotencyKey != "" && errors.As(err, &se) && strings.Contains(se.Message, "idempotency_error") {
+		if legacy, changed := preAutoReloadForm(form); changed {
+			return c.sendForm(ctx, method, path, legacy, out, idempotencyKey)
+		}
+	}
+	return err
+}
+
+// preAutoReloadForm rebuilds a request as binaries before the Auto Reload
+// rename sent it. A request whose response was lost before that deploy is
+// retried under its saved idempotency key, and Stripe only replays the
+// original result for identical parameters; rotating the key could charge
+// twice. Stripe forgets keys after 24 hours, after which this never applies.
+func preAutoReloadForm(form url.Values) (url.Values, bool) {
+	legacy := url.Values{}
+	for k, v := range form {
+		legacy[k] = append([]string(nil), v...)
+	}
+	changed := false
+	if legacy.Get("payment_method_types[1]") == "link" {
+		legacy.Del("payment_method_types[1]")
+		changed = true
+	}
+	if v := legacy["payment_method_types[]"]; len(v) == 2 && v[0] == "card" && v[1] == "link" {
+		legacy["payment_method_types[]"] = []string{"card"}
+		changed = true
+	}
+	if legacy.Get("description") == prepaidRechargeDescription {
+		legacy.Set("description", "Superserve prepaid credit (auto-recharge)")
+		changed = true
+	}
+	if legacy.Get("custom_fields[0][key]") == checkoutTopoffField {
+		legacy.Set("custom_fields[0][label][custom]", "Auto Topoff")
+		legacy.Set("custom_fields[0][dropdown][options][0][label]", "Auto Topoff")
+		legacy.Set("custom_fields[0][dropdown][options][1][label]", "Off")
+		changed = true
+	}
+	return legacy, changed
+}
+
+func (c *stripeHTTPClient) sendForm(ctx context.Context, method, path string, form url.Values, out any, idempotencyKey string) error {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err

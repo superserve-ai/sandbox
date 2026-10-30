@@ -151,6 +151,8 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
 	return tx.Commit(ctx)
 }
 
+const prepaidRechargeDescription = "Superserve prepaid credit (Auto Reload)"
+
 var errTopoffNotOffered = errors.New("the team's plan does not offer Auto Reload")
 
 // applyCheckoutTopoff records the Auto Topoff choice made at checkout for a
@@ -366,7 +368,7 @@ func (h *Handlers) chargeAutoRecharge(ctx context.Context, client *stripeHTTPCli
 		form := url.Values{
 			"amount": {strconv.FormatInt(req.AmountCents, 10)}, "currency": {"usd"}, "customer": {req.Customer},
 			"payment_method": {req.PaymentMethod}, "payment_method_types[]": {"card", "link"}, "off_session": {"true"}, "confirm": {"true"},
-			"description":                   {"Superserve prepaid credit (Auto Reload)"},
+			"description":                   {prepaidRechargeDescription},
 			"metadata[prepaid_purchase_id]": {id.String()}, "metadata[team_id]": {team.String()},
 		}
 		err = client.doForm(ctx, http.MethodPost, "/v1/payment_intents", form, &pi, key)
