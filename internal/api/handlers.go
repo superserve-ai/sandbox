@@ -225,6 +225,11 @@ type Handlers struct {
 	authzOnce sync.Once
 	authzSvc  *authz.Service
 
+	// proWake lets a Pro payment webhook start the reconciliation worker
+	// without waiting for its tick. Lazily created like activityGate.
+	proWakeOnce sync.Once
+	proWake     chan struct{}
+
 	// hostCaps is the positive-only host-capability attestation cache used by
 	// the standalone pre-flight checks (see hostcap_cache.go). Zero value is
 	// ready to use.

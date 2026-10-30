@@ -345,6 +345,8 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 	c.JSON(http.StatusOK, billingSessionResponse{URL: s.URL})
 }
 
+var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
+
 func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*pgxpool.Conn, func(), error) {
 	conn, err := h.Pool.Acquire(ctx)
 	if err != nil {
@@ -354,7 +356,10 @@ func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*
 	err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
 	if err != nil || !locked {
 		conn.Release()
-		return nil, nil, errors.New("invoice reconciliation is busy")
+		if err == nil {
+			err = errProReconciliationBusy
+		}
+		return nil, nil, err
 	}
 	release := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
@@ -376,7 +381,9 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 		return "", errors.New("Pro payment verification unavailable")
 	}
 	token := uuid.New()
-	if _, err := h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token}); err != nil {
+	if _, err := h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token}); errors.Is(err, pgx.ErrNoRows) {
+		return "", errProReconciliationBusy
+	} else if err != nil {
 		return "", err
 	}
 	defer func() {

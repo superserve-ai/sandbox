@@ -36,14 +36,16 @@ func (h *Handlers) RecoverProCheckout(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "invalid recovery request", 400)
 		return
 	}
-	outcome, err := h.reconcileProCheckout(c.Request.Context(), team, input.Restart)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), proRecoveryBudget)
+	defer cancel()
+	outcome, err := h.recoverProCheckoutWithin(ctx, team, input.Restart, proRecoveryBudget)
 	if err != nil {
 		log.Warn().Err(err).Str("team_id", team.String()).Msg("Pro checkout recovery pending")
 		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
 		return
 	}
 	if outcome == "payment_method_required" {
-		if target, e := h.proUpgradeSetupURL(c.Request.Context(), team); e == nil {
+		if target, e := h.proUpgradeSetupURL(ctx, team); e == nil {
 			c.JSON(http.StatusOK, gin.H{"outcome": outcome, "url": target})
 			return
 		}
@@ -51,6 +53,67 @@ func (h *Handlers) RecoverProCheckout(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"outcome": outcome})
+}
+
+// The console abandons a recovery call after ten seconds, so the call answers
+// within this budget and leaves a started reconciliation to finish on its own,
+// bounded like a reconciliation tick.
+const (
+	proRecoveryBudget    = 8 * time.Second
+	proRecoveryWorkLimit = 50 * time.Second
+)
+
+type proRecoveryResult struct {
+	outcome string
+	err     error
+}
+
+// recoverProCheckoutWithin reconciles detached from the caller, so a client
+// that gives up does not abort an activation already under way. When another
+// worker holds a purchase not yet active, it waits for that worker's
+// activation instead.
+func (h *Handlers) recoverProCheckoutWithin(ctx context.Context, team uuid.UUID, restart bool, budget time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	wasActive, err := h.proCheckoutActive(ctx, team)
+	if err != nil {
+		return "", err
+	}
+	done := make(chan proRecoveryResult, 1)
+	go func() {
+		work, stop := context.WithTimeout(context.WithoutCancel(ctx), proRecoveryWorkLimit)
+		defer stop()
+		outcome, err := h.reconcileProCheckout(work, team, restart)
+		done <- proRecoveryResult{outcome, err}
+	}()
+	var result proRecoveryResult
+	select {
+	case result = <-done:
+	case <-ctx.Done():
+		return "", errors.New("Pro checkout recovery still running")
+	}
+	if result.err == nil || wasActive || !errors.Is(result.err, errProReconciliationBusy) {
+		return result.outcome, result.err
+	}
+	poll := time.NewTicker(500 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		if active, err := h.proCheckoutActive(ctx, team); err == nil && active {
+			return "active", nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", result.err
+		case <-poll.C:
+		}
+	}
+}
+
+func (h *Handlers) proCheckoutActive(ctx context.Context, team uuid.UUID) (bool, error) {
+	var active bool
+	err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state='active')
+ OR EXISTS(SELECT 1 FROM billing_signup_choice c JOIN billing_commercial_contract k ON k.team_id=c.team_id AND k.subscription_id=c.subscription_id AND k.status='active' WHERE c.team_id=$1 AND c.offer_key IN `+paidPlanOffers+`)`, team).Scan(&active)
+	return active, err
 }
 
 func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, restart bool) (string, error) {
@@ -78,7 +141,9 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 	}
 	// Share the existing customer lease with legacy webhook processing.
 	token := uuid.New()
-	if _, err = h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: params.CustomerID, Token: token}); err != nil {
+	if _, err = h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: params.CustomerID, Token: token}); errors.Is(err, pgx.ErrNoRows) {
+		return "", errProReconciliationBusy
+	} else if err != nil {
 		return "", err
 	}
 	choice.LeaseToken = token
@@ -428,9 +493,24 @@ func (h *Handlers) StartProPaymentReconciliation(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+			case <-h.proPaymentWake():
 			}
 		}
 	}()
+}
+
+func (h *Handlers) proPaymentWake() chan struct{} {
+	h.proWakeOnce.Do(func() { h.proWake = make(chan struct{}, 1) })
+	return h.proWake
+}
+
+// wakeProPaymentReconciliation runs the reconciliation worker now rather than
+// at its next tick, so a paid checkout activates seconds after its webhook.
+func (h *Handlers) wakeProPaymentReconciliation() {
+	select {
+	case h.proPaymentWake() <- struct{}{}:
+	default:
+	}
 }
 func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error) {
 	released, err := h.releasedProInvoiceTick(ctx)

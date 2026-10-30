@@ -52,7 +52,7 @@ func prepaidUnspentPurchases(ctx context.Context, q db.DBTX, team uuid.UUID) (in
 
 // A fresh observation after grant issuance starts prepaid enforcement even at
 // zero: consumed credit or provider lag must not leave legacy PAYG access open.
-// A prepaid-funded subscription may never buy credit, so its issued monthly
+// A prepaid-funded subscription need not buy credit, so its issued monthly
 // grant counts as issuance too, as does the first-cycle grant of an upgrade,
 // whose recurring contract only starts at the period end.
 const prepaidEnforcementDue = ` f.observe AND NOT f.prepaid AND f.observed_generation=f.generation AND f.credit_usd>=0 AND f.credit_valid_until>clock_timestamp()

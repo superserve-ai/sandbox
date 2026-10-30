@@ -621,6 +621,7 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 				return true, err
 			}
 		}
+		h.wakeProPaymentReconciliation()
 		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
 		return true, err
 	}
