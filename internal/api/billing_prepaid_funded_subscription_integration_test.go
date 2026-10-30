@@ -353,11 +353,13 @@ func TestProInvoiceCashFundedUpgradeCollectsDespiteSettledTopoff(t *testing.T) {
 		name   string
 		funded bool
 		source string
+		retain bool
 		valid  bool
 	}{
-		{"funded top-off", true, "auto_recharge", true},
-		{"funded checkout purchase", true, "checkout", false},
-		{"postpaid top-off", false, "auto_recharge", false},
+		{"funded top-off", true, "auto_recharge", false, true},
+		{"funded checkout purchase", true, "checkout", false, false},
+		{"funded retained credit purchase", true, "checkout", true, true},
+		{"postpaid top-off", false, "auto_recharge", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, _ := newProCashFixtureMode(t, planKindPrepaid, 2, 30000, 25000, true)
@@ -381,7 +383,7 @@ func TestProInvoiceCashFundedUpgradeCollectsDespiteSettledTopoff(t *testing.T) {
 			if allowed, err := f.h.freezeProInvoiceCash(t.Context(), f.invoice); err != nil || !allowed {
 				t.Fatal("component proof unavailable", allowed, err)
 			}
-			id := insertProCashFundingPurchase(t, f.h, f.team, f.invoice.Customer, tc.source, "succeeded", f.start.Add(time.Hour))
+			id := insertProCashFundingPurchase(t, f.h, f.team, f.invoice.Customer, tc.source, "succeeded", f.start.Add(time.Hour), tc.retain)
 			request, err := prepaidCreditRequest(id, f.invoice.Customer, 500, tc.source)
 			if err != nil {
 				t.Fatal(err)
@@ -400,5 +402,61 @@ func TestProInvoiceCashFundedUpgradeCollectsDespiteSettledTopoff(t *testing.T) {
 				t.Fatalf("component proof valid=%v, want %v (%v)", valid, tc.valid, err)
 			}
 		})
+	}
+}
+
+func TestPrepaidFundedSubscriptionBuysCreditAndKeepsPlan(t *testing.T) {
+	f, contract := fundedSubscriptionFixture(t, nil)
+	assignStarterAfterPurchase = settlePrepaidPlan
+	f.issueIncludedGrant(contract)
+	before, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	balance := func() int64 {
+		t.Helper()
+		total, _, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return total
+	}
+	start := balance()
+	id, actor := uuid.New(), uuid.New()
+	// A second click with the same operation records nothing new.
+	for range 2 {
+		if err = f.h.recordCheckoutPurchase(t.Context(), id, f.team, f.customer, actor, 500, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.exec(`UPDATE billing_prepaid_purchase SET payment_state='succeeded',paid_at=clock_timestamp(),payment_evidence=jsonb_build_object('amount_cents',amount_cents,'customer',customer_id) WHERE id=$1`, id)
+	for range 2 {
+		if err = f.h.settlePrepaidPurchase(t.Context(), f.client, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r := f.rows(); len(r) != 1 || r[0].Source != "checkout" || r[0].Amount != 500 || r[0].Credit != "issued" || len(f.grantPosts) != 1 {
+		t.Fatalf("one purchase was not credited exactly once: %+v posts=%d", r, len(f.grantPosts))
+	}
+	if got := balance(); got != start+500 {
+		t.Fatal("purchased credit not observed", start, got)
+	}
+	after, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil || after.ID != before.ID || !after.prepaidFunded() {
+		t.Fatal("credit purchase replaced the funded subscription", after, err)
+	}
+	var starter bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND idempotency_key=$2)`, f.team, "prepaid-plan:v1:"+id.String()).Scan(&starter); err != nil || starter {
+		t.Fatal("credit purchase assigned Starter", starter, err)
+	}
+}
+
+func TestPrepaidPostpaidSubscriptionCannotBuyCredit(t *testing.T) {
+	f := newPrepaidFixture(t)
+	if _, err := assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("pro", planKindSubscription, 1, nil), Source: planSourceStaff, Reason: "postpaid fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.recordCheckoutPurchase(t.Context(), uuid.New(), f.team, f.customer, uuid.New(), 500, ""); !errors.Is(err, errPlanCannotBuyCredit) {
+		t.Fatal("postpaid subscription was allowed to buy credit", err)
 	}
 }

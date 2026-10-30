@@ -252,8 +252,11 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		respondErrorMsg(c, "service_unavailable", "prepaid credit is temporarily unavailable; try again later", http.StatusServiceUnavailable)
 		return
 	}
+	// Only a plan checkout still in progress conflicts. A committed one leaves
+	// the team on its plan, and preparePrepaidPurchase decides whether that plan
+	// can buy credit.
 	var proPending bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, team).Scan(&proPending); err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND state='pending' AND offer_key IN `+paidPlanOffers+`)`, team).Scan(&proPending); err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
@@ -297,6 +300,10 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		}
 		if errors.Is(err, errPricingV2Off) {
 			respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
+			return
+		}
+		if errors.Is(err, errPlanCannotBuyCredit) || errors.Is(err, errUnknownPlan) {
+			respondErrorMsg(c, "conflict", "this team's plan cannot buy credit", http.StatusConflict)
 			return
 		}
 		log.Error().Err(err).Str("team_id", team.String()).Msg("create prepaid checkout failed")
