@@ -33,7 +33,7 @@ func teamAwaitingPlan(ctx context.Context, q db.DBTX, team uuid.UUID) (bool, err
 
 func teamEntryState(ctx context.Context, q db.DBTX, team uuid.UUID) (string, error) {
 	var state string
-	err := q.QueryRow(ctx, `SELECT CASE WHEN s<>'active' AND EXISTS(SELECT 1 FROM billing_pro_upgrade u WHERE u.team_id=$1 AND u.state IN ('paid','credited')) THEN 'activating' ELSE s END FROM billing_team_entry_state($1) s`, team).Scan(&state)
+	err := q.QueryRow(ctx, `SELECT CASE WHEN s<>'active' AND EXISTS(SELECT 1 FROM billing_pro_upgrade u WHERE u.team_id=$1 AND u.state IN ('paid','credited') AND NOT EXISTS(SELECT 1 FROM billing_pro_upgrade_setup x WHERE x.upgrade_id=u.id AND x.state='open')) THEN 'activating' ELSE s END FROM billing_team_entry_state($1) s`, team).Scan(&state)
 	return state, err
 }
 

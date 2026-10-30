@@ -396,6 +396,15 @@ func TestNewTeamCohortPaidFirstCheckoutActivatesWithoutPicker(t *testing.T) {
 	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET state='credited',payment_evidence='{}',grant_id='credgr_local' WHERE id=$1`, accepted.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade_setup(id,upgrade_id,request_payload,created_at) VALUES(gen_random_uuid(),$1,'{}',now())`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryPaymentFailed {
+		t.Fatalf("paid checkout still needing a card hid its card setup: %s", state)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade_setup SET state='expired' WHERE upgrade_id=$1`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
 	if state, _ := f.entryState(t, f.team); state != entryActivating {
 		t.Fatalf("paid checkout awaiting its plan sent back to the picker: %s", state)
 	}
