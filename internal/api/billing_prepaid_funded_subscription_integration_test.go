@@ -353,11 +353,13 @@ func TestProInvoiceCashFundedUpgradeCollectsDespiteSettledTopoff(t *testing.T) {
 		name   string
 		funded bool
 		source string
+		retain bool
 		valid  bool
 	}{
-		{"funded top-off", true, "auto_recharge", true},
-		{"funded checkout purchase", true, "checkout", false},
-		{"postpaid top-off", false, "auto_recharge", false},
+		{"funded top-off", true, "auto_recharge", false, true},
+		{"funded checkout purchase", true, "checkout", false, false},
+		{"funded retained credit purchase", true, "checkout", true, true},
+		{"postpaid top-off", false, "auto_recharge", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, _ := newProCashFixtureMode(t, planKindPrepaid, 2, 30000, 25000, true)
@@ -381,7 +383,7 @@ func TestProInvoiceCashFundedUpgradeCollectsDespiteSettledTopoff(t *testing.T) {
 			if allowed, err := f.h.freezeProInvoiceCash(t.Context(), f.invoice); err != nil || !allowed {
 				t.Fatal("component proof unavailable", allowed, err)
 			}
-			id := insertProCashFundingPurchase(t, f.h, f.team, f.invoice.Customer, tc.source, "succeeded", f.start.Add(time.Hour))
+			id := insertProCashFundingPurchase(t, f.h, f.team, f.invoice.Customer, tc.source, "succeeded", f.start.Add(time.Hour), tc.retain)
 			request, err := prepaidCreditRequest(id, f.invoice.Customer, 500, tc.source)
 			if err != nil {
 				t.Fatal(err)
