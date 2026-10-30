@@ -188,6 +188,13 @@ const (
 	checkoutTopoffOff   = "off"
 )
 
+// Instant, card-backed methods only: cards (which carry Apple Pay and Google
+// Pay wallets) and Link. Each can be charged off session for Auto Reload.
+func setInstantPaymentMethods(form url.Values) {
+	form.Set("payment_method_types[0]", "card")
+	form.Set("payment_method_types[1]", "link")
+}
+
 func checkoutTopoffMessage(amount int64) string {
 	dollars := fmt.Sprintf("$%d", amount/100)
 	if amount%100 != 0 {
@@ -539,11 +546,11 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	form.Set("mode", "subscription")
 	if params.SetupOnly {
 		form.Set("mode", "setup")
-		form.Set("payment_method_types[0]", "card")
+		setInstantPaymentMethods(form)
 	}
 	if params.OneOffAmount > 0 {
 		form.Set("mode", "payment")
-		form.Set("payment_method_types[0]", "card")
+		setInstantPaymentMethods(form)
 		form.Set("payment_intent_data[setup_future_usage]", "off_session")
 		form.Set("invoice_creation[enabled]", "true")
 		form.Set("line_items[0][price_data][currency]", "usd")
@@ -592,10 +599,10 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 		form.Set("custom_fields[0][key]", checkoutTopoffField)
 		form.Set("custom_fields[0][type]", "dropdown")
 		form.Set("custom_fields[0][label][type]", "custom")
-		form.Set("custom_fields[0][label][custom]", "Auto Topoff")
-		form.Set("custom_fields[0][dropdown][options][0][label]", "Auto Topoff")
+		form.Set("custom_fields[0][label][custom]", "Auto Reload")
+		form.Set("custom_fields[0][dropdown][options][0][label]", "Enable")
 		form.Set("custom_fields[0][dropdown][options][0][value]", checkoutTopoffOn)
-		form.Set("custom_fields[0][dropdown][options][1][label]", "Off")
+		form.Set("custom_fields[0][dropdown][options][1][label]", "Disable")
 		form.Set("custom_fields[0][dropdown][options][1][value]", checkoutTopoffOff)
 		form.Set("custom_fields[0][dropdown][default_value]", def)
 		form.Set("custom_text[after_submit][message]", checkoutTopoffMessage(t.AmountCents))
