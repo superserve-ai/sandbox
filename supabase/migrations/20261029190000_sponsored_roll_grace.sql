@@ -19,6 +19,24 @@
 -- grant applies to. The invoice close verifies what Stripe applied before it
 -- releases anything, so a difference holds the draft for review.
 
+-- When the close last alerted on a period's missing renewal invoice; it
+-- retries every few minutes, so this bounds the alert's cadence.
+CREATE TABLE billing_renewal_invoice_alert (
+ team_id uuid NOT NULL,
+ period_start timestamptz NOT NULL,
+ period_end timestamptz NOT NULL,
+ alerted_at timestamptz NOT NULL,
+ PRIMARY KEY(team_id,period_start,period_end),
+ FOREIGN KEY(team_id,period_start,period_end) REFERENCES team_billing_period(team_id,period_start,period_end) ON DELETE CASCADE
+);
+ALTER TABLE billing_renewal_invoice_alert ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_renewal_invoice_alert FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON billing_renewal_invoice_alert FROM %I',r); END IF;
+ END LOOP;
+END $$;
+
 -- p_credit_checked_at is when the current funding observation last read
 -- credit successfully, or NULL; until it postdates the next grant's issuance,
 -- that grant does not end the grace.

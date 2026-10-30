@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/superserve-ai/sandbox/internal/billing"
 )
 
 // sponsoredRollFixture is a sponsored team without a payment method whose
@@ -198,5 +199,29 @@ func TestSponsoredRollGraceWaitsForSuccessfulCreditRead(t *testing.T) {
 	publish(&fundingCreditObservation{SpendableUSD: "0", ValidUntil: time.Now().Add(time.Minute), Evidence: []byte(`{"fixture":"credit"}`)}, nil)
 	if f.eligible() {
 		t.Fatal("grace outlived a successful read showing no credit")
+	}
+}
+
+func TestRenewalInvoiceMissingAlertIsRateLimited(t *testing.T) {
+	f := newSponsoredRollFixture(t, 2*time.Hour)
+	prior := billing.ExportPeriod{TeamID: f.c.TeamID, Start: f.prior, End: f.start}
+	alertedAt := func() time.Time {
+		t.Helper()
+		var at time.Time
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT alerted_at FROM billing_renewal_invoice_alert WHERE team_id=$1 AND period_end=$2`, f.c.TeamID, f.start).Scan(&at); err != nil {
+			t.Fatal("missing renewal invoice not alerted:", err)
+		}
+		return at
+	}
+	if err := f.h.reconcileInvoicePeriod(t.Context(), prior); !errors.Is(err, errRenewalInvoiceMissing) {
+		t.Fatal("expected the renewal invoice to be missing:", err)
+	}
+	first := alertedAt()
+	// The close retries every few minutes; the next attempt must not alert again.
+	if err := f.h.reconcileInvoicePeriod(t.Context(), prior); !errors.Is(err, errRenewalInvoiceMissing) {
+		t.Fatal(err)
+	}
+	if again := alertedAt(); !again.Equal(first) {
+		t.Fatal("alert repeated within its interval", first, again)
 	}
 }
