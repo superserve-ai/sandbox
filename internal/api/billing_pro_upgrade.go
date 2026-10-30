@@ -356,7 +356,10 @@ func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*
 	err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
 	if err != nil || !locked {
 		conn.Release()
-		return nil, nil, errProReconciliationBusy
+		if err == nil {
+			err = errProReconciliationBusy
+		}
+		return nil, nil, err
 	}
 	release := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
