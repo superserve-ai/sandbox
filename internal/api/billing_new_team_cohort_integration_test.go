@@ -978,3 +978,30 @@ func TestNewTeamCohortTrialTeamIsNotOfferedFree(t *testing.T) {
 		t.Fatalf("ended trial summary plan: %+v", plan)
 	}
 }
+
+func TestNewTeamCohortFirstCheckoutRejectsPlanThatCannotBuyCredit(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
+	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+	for _, sql := range []string{`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_postpaid_first')`, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`} {
+		if _, err := f.h.Pool.Exec(t.Context(), sql, f.team); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("pro", planKindSubscription, 1, nil), Source: planSourceStaff, Reason: "postpaid fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; http.Error(w, "must not dispatch", 500) }))
+	t.Cleanup(provider.Close)
+	f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client()}
+	r := gin.New()
+	r.POST("/checkout", func(c *gin.Context) {
+		f.h.createPAYGCheckout(c, f.team, f.actor, billingCheckoutSessionRequest{SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}, false, &prepaidCheckoutLine{AmountCents: 500})
+	})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/checkout", nil))
+	if rec.Code != http.StatusConflict || calls != 0 {
+		t.Fatalf("plan that cannot buy credit got %d %s (provider calls %d)", rec.Code, rec.Body, calls)
+	}
+}

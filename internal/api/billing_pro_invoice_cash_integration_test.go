@@ -612,11 +612,17 @@ func TestProFirstRenewalZeroRoundedUnmarkedBridge(t *testing.T) {
 	}
 }
 
-func insertProCashFundingPurchase(t *testing.T, h *Handlers, team uuid.UUID, customer, source, state string, at time.Time) uuid.UUID {
+// insertProCashFundingPurchase records a purchase; a retained one is a credit
+// purchase that kept the team's plan.
+func insertProCashFundingPurchase(t *testing.T, h *Handlers, team uuid.UUID, customer, source, state string, at time.Time, retained ...bool) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,created_at)
- VALUES($1,$2,$3,$4,500,$5,'','',$6)`, id, team, customer, source, uuid.New(), at); err != nil {
+	var snapshot any
+	if len(retained) > 0 && retained[0] {
+		snapshot = `{"retain":true}`
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,created_at,plan_snapshot)
+ VALUES($1,$2,$3,$4,500,$5,'','',$6,$7)`, id, team, customer, source, uuid.New(), at, snapshot); err != nil {
 		t.Fatal(err)
 	}
 	switch state {
