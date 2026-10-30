@@ -68,10 +68,15 @@ type proRecoveryResult struct {
 
 // recoverProCheckoutWithin reconciles detached from the caller, so a client
 // that gives up does not abort an activation already under way. When another
-// worker holds the purchase, it waits for that worker's activation instead.
+// worker holds a purchase not yet active, it waits for that worker's
+// activation instead.
 func (h *Handlers) recoverProCheckoutWithin(ctx context.Context, team uuid.UUID, restart bool, budget time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	wasActive, err := h.proCheckoutActive(ctx, team)
+	if err != nil {
+		return "", err
+	}
 	done := make(chan proRecoveryResult, 1)
 	go func() {
 		work, stop := context.WithTimeout(context.WithoutCancel(ctx), proRecoveryWorkLimit)
@@ -85,15 +90,13 @@ func (h *Handlers) recoverProCheckoutWithin(ctx context.Context, team uuid.UUID,
 	case <-ctx.Done():
 		return "", errors.New("Pro checkout recovery still running")
 	}
-	if result.err == nil {
-		return result.outcome, nil
+	if result.err == nil || wasActive || !errors.Is(result.err, errProReconciliationBusy) {
+		return result.outcome, result.err
 	}
 	poll := time.NewTicker(500 * time.Millisecond)
 	defer poll.Stop()
 	for {
-		var active bool
-		if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state='active')
- OR EXISTS(SELECT 1 FROM billing_signup_choice c JOIN billing_commercial_contract k ON k.team_id=c.team_id AND k.subscription_id=c.subscription_id AND k.status='active' WHERE c.team_id=$1 AND c.offer_key IN `+paidPlanOffers+`)`, team).Scan(&active); err == nil && active {
+		if active, err := h.proCheckoutActive(ctx, team); err == nil && active {
 			return "active", nil
 		}
 		select {
@@ -102,6 +105,13 @@ func (h *Handlers) recoverProCheckoutWithin(ctx context.Context, team uuid.UUID,
 		case <-poll.C:
 		}
 	}
+}
+
+func (h *Handlers) proCheckoutActive(ctx context.Context, team uuid.UUID) (bool, error) {
+	var active bool
+	err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state='active')
+ OR EXISTS(SELECT 1 FROM billing_signup_choice c JOIN billing_commercial_contract k ON k.team_id=c.team_id AND k.subscription_id=c.subscription_id AND k.status='active' WHERE c.team_id=$1 AND c.offer_key IN `+paidPlanOffers+`)`, team).Scan(&active)
+	return active, err
 }
 
 func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, restart bool) (string, error) {
@@ -129,7 +139,9 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 	}
 	// Share the existing customer lease with legacy webhook processing.
 	token := uuid.New()
-	if _, err = h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: params.CustomerID, Token: token}); err != nil {
+	if _, err = h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: params.CustomerID, Token: token}); errors.Is(err, pgx.ErrNoRows) {
+		return "", errProReconciliationBusy
+	} else if err != nil {
 		return "", err
 	}
 	choice.LeaseToken = token
