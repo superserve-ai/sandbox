@@ -4688,11 +4688,18 @@ components:
           description: Environment variables for the command.
         working_dir:
           type: string
-          description: Working directory (default `/home/user`).
+          description: Working directory (default the template's working directory, else the user's home, which is `/home/user` for root).
         timeout_s:
           type: integer
           default: 30
           description: Timeout in seconds.
+        user:
+          type: string
+          description: >
+            User to run the command as: a name, a uid, `name:group`, or
+            `uid:gid` (default the template's user). An unknown user or
+            group fails as `bad_request` (400 on `POST /exec`).
+          example: root
 
     ExecResult:
       type: object

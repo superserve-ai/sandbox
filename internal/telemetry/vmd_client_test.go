@@ -78,3 +78,4 @@ func TestInstrumentedVMDClientRecordsHostID(t *testing.T) {
 		t.Errorf("Duration = %s, want positive duration", got.Duration)
 	}
 }
+func (r *captureRecorder) RecordTrialEligibilityBacklog(context.Context, TrialEligibilityBacklog) {}

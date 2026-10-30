@@ -68,6 +68,7 @@ type execWSStart struct {
 	Env        map[string]string `json:"env,omitempty"`
 	WorkingDir string            `json:"working_dir,omitempty"`
 	TimeoutS   int               `json:"timeout_s,omitempty"`
+	User       string            `json:"user,omitempty"`
 }
 
 // execWSControl is a post-start client text frame. Binary frames carry I/O
@@ -107,6 +108,7 @@ func (s *execWSStart) toStartRequest() *pb.StartRequest {
 		Envs:      s.Env,
 		Cwd:       s.WorkingDir,
 		TimeoutMs: timeoutMs,
+		User:      s.User,
 		Stdin:     true, // interactive
 	}
 }

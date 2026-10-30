@@ -426,9 +426,10 @@ func lookPathIn(file, pathEnv, cwd string) (string, error) {
 // and the credential to run under. The spec takes the forms an image's USER
 // does: a name or uid, optionally with ":group" (a name or gid). A uid with
 // no passwd entry still runs, with HOME at "/", as it would under Docker.
-// Returns (nil, nil) for "" and "root", so the child inherits boxd's uid.
+// Returns (nil, nil) for "", "root", and "0", so the child inherits boxd's
+// uid and the sandbox's defaults for root.
 func resolveUser(spec string) (*user.User, *syscall.Credential, error) {
-	if spec == "" || spec == "root" {
+	if spec == "" || spec == "root" || spec == "0" {
 		return nil, nil, nil
 	}
 	name, group, hasGroup := strings.Cut(spec, ":")

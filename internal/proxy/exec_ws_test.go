@@ -167,6 +167,16 @@ func TestExecWSStart_RequestsStdin(t *testing.T) {
 	}
 }
 
+func TestExecWSStart_UserReachesStartRequest(t *testing.T) {
+	var start execWSStart
+	if err := json.Unmarshal([]byte(`{"command":"id","user":"root"}`), &start); err != nil {
+		t.Fatal(err)
+	}
+	if got := start.toStartRequest().GetUser(); got != "root" {
+		t.Errorf("StartRequest.User = %q, want %q", got, "root")
+	}
+}
+
 func TestExecWS_StdoutForwarded(t *testing.T) {
 	env := newExecWSTestEnv(t)
 	env.sendStart(7, "echo hi")

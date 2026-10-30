@@ -241,6 +241,13 @@ type Handlers struct {
 	// activationRecheck coalesces the per-team post-activation eligibility
 	// recheck: a 100-create burst asks the same question 100 times.
 	activationRecheck singleflight.Group
+
+	// billingPauseSeen holds the teams the previous pause sweep found
+	// ineligible. Only the single sweep loop reads or replaces it.
+	billingPauseSeen map[uuid.UUID]struct{}
+	// trialBacklogSampledAt is when this replica last counted the trial
+	// refresh backlog; the same single sweep loop owns it.
+	trialBacklogSampledAt time.Time
 }
 
 // asyncBookkeeping runs fire-and-forget post-VMD work in a background

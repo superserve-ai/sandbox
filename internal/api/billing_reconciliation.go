@@ -15,12 +15,23 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 const (
 	billingPauseWorkers                   = 10
 	billingPauseCap                 int32 = 1000 // per pass; a follow-up pass picks up the rest
 	billingTrialEligibilityPageSize int32 = 256
+	// An idle trial team (no sandbox running, no usage since its last verdict)
+	// still drains on storage, so it is revisited this often rather than on
+	// every tick. Consuming teams are revisited on every tick.
+	trialEligibilityIdleRefreshSeconds int32 = 600
+	// A consuming team is overdue once several fast ticks have passed without
+	// a refresh; an idle team once the slow window plus the same grace has.
+	trialEligibilityOverdueGraceSeconds int32 = 120
+	// The backlog count walks every trial grant, so it is sampled on a few
+	// ticks rather than all of them.
+	trialEligibilityBacklogSampleInterval = 5 * time.Minute
 	// Long enough that a slow page cannot let a second replica in behind the
 	// holder, short enough that a crashed one is replaced within a few ticks.
 	trialEligibilityLeaseSeconds = 120
@@ -44,10 +55,18 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 			log.Error().Err(err).Msg("billing: claim trial eligibility sweep lease failed")
 			return
 		}
+		// Only the holder knows the backlog; a replica that stopped holding
+		// the lease must not keep exporting the last one it measured.
+		currentTelemetryRecorder().RecordTrialEligibilityBacklog(ctx, telemetry.TrialEligibilityBacklog{})
+		h.trialBacklogSampledAt = time.Time{}
 		h.reconcileBillingPauses(ctx)
 		return
 	}
-	teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{AfterTeamID: afterID, BatchLimit: billingTrialEligibilityPageSize})
+	// Sampled on every holder tick, including one whose page failed to list.
+	defer h.recordTrialEligibilityBacklog(ctx)
+	teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{
+		AfterTeamID: afterID, BatchLimit: billingTrialEligibilityPageSize, IdleSeconds: trialEligibilityIdleRefreshSeconds,
+	})
 	if err != nil {
 		log.Error().Err(err).Msg("billing: list active trial teams failed")
 		return
@@ -57,16 +76,46 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")
 			return false
 		}
-		h.pauseBillingTeam(ctx, teamID)
 		return true
 	})
 	if advance {
 		h.advanceSweepCursor(ctx, trialEligibilitySweepName, next)
 	}
+	// Refreshed teams are paused here, behind the consecutive-sweep gate.
 	h.reconcileBillingPauses(ctx)
 }
 
+// recordTrialEligibilityBacklog publishes how many trial teams the sweep has
+// fallen behind on, so a sweep that stops keeping up is visible.
+func (h *Handlers) recordTrialEligibilityBacklog(ctx context.Context) {
+	if time.Since(h.trialBacklogSampledAt) < trialEligibilityBacklogSampleInterval {
+		return
+	}
+	h.trialBacklogSampledAt = time.Now()
+	// A page that used up the tick deadline must still be sampled, or a
+	// stalled sweep keeps exporting its last healthy value.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	overdue, err := h.DB.CountOverdueTrialEligibility(ctx, db.CountOverdueTrialEligibilityParams{
+		ConsumingSeconds: trialEligibilityOverdueGraceSeconds,
+		IdleSeconds:      trialEligibilityIdleRefreshSeconds + trialEligibilityOverdueGraceSeconds,
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("billing: count overdue trial eligibility failed")
+		return
+	}
+	currentTelemetryRecorder().RecordTrialEligibilityBacklog(ctx, telemetry.TrialEligibilityBacklog{
+		Consuming: int64(overdue.Consuming), Idle: int64(overdue.Idle),
+	})
+}
+
+// A team must be ineligible on two consecutive sweeps before the sweep pauses
+// it, so a transient funding-observation failure (a renewal draft seen before
+// its close row exists) cannot stop running sandboxes. Explicit pause targets
+// are not debounced.
 func (h *Handlers) reconcileBillingPauses(ctx context.Context) {
+	seen := map[uuid.UUID]struct{}{}
+	defer func() { h.billingPauseSeen = seen }()
 	var after *uuid.UUID
 	for {
 		var afterID pgtype.UUID
@@ -81,10 +130,19 @@ func (h *Handlers) reconcileBillingPauses(ctx context.Context) {
 		if len(teams) == 0 {
 			return
 		}
-		dispatchBounded(ctx, teams, 10, func(teamID uuid.UUID) {
+		due := make([]uuid.UUID, 0, len(teams))
+		for _, t := range teams {
+			if _, again := h.billingPauseSeen[t.TeamID]; t.Targeted || again && t.Ineligible {
+				due = append(due, t.TeamID)
+			}
+			if t.Ineligible {
+				seen[t.TeamID] = struct{}{}
+			}
+		}
+		dispatchBounded(ctx, due, 10, func(teamID uuid.UUID) {
 			h.pauseBillingTeam(ctx, teamID)
 		})
-		last := teams[len(teams)-1]
+		last := teams[len(teams)-1].TeamID
 		after = &last
 		if len(teams) < 1000 {
 			return
