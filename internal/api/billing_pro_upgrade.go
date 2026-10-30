@@ -800,6 +800,9 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 	if err = conn.QueryRow(ctx, `SELECT COALESCE((SELECT adjustment_price_id FROM billing_invoice_account WHERE team_id=$1),'')`, u.Team).Scan(&rounding); err != nil {
 		return sub, err
 	}
+	if rounding, err = pendingInvoiceRounding(sub, rounding); err != nil {
+		return sub, err
+	}
 	expectedStart, expectedEnd, err := validateProUpgradeSubscription(*u, p, sub, rounding, h.nowUTC())
 	if err != nil {
 		return sub, err

@@ -353,6 +353,8 @@ func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, 
 // previous state. The plan judges the windows at its snapshot's now(); the
 // record step, whose transaction began before its lock wait, judges them at
 // the statement after the lock, since the wait may have spanned a boundary.
+// Checkout recovery rewrites retry bookkeeping on every poll; enrollment never
+// reads those columns, so they are left out rather than invalidating the plan.
 func invoiceEnrollmentFingerprint(ctx context.Context, reader db.DBTX, team uuid.UUID, afterLockWait bool) (string, error) {
 	var fingerprint string
 	err := reader.QueryRow(ctx, `WITH t AS (SELECT CASE WHEN $2 THEN statement_timestamp() ELSE now() END AS at)
@@ -362,9 +364,9 @@ func invoiceEnrollmentFingerprint(ctx context.Context, reader db.DBTX, team uuid
         UNION ALL SELECT 'c'||id::text||xmin::text FROM billing_commercial_contract WHERE team_id=$1
         UNION ALL SELECT 'p'||id::text||xmin::text FROM billing_contract_payment WHERE team_id=$1
         UNION ALL SELECT 'r'||id::text||xmin::text FROM billing_plan_release WHERE team_id=$1
-        UNION ALL SELECT 'u'||id::text||xmin::text FROM billing_pro_upgrade WHERE team_id=$1
+        UNION ALL SELECT 'u'||id::text||md5((to_jsonb(u)-'{next_check_at,last_error}'::text[])::text) FROM billing_pro_upgrade u WHERE team_id=$1
         UNION ALL SELECT 'k'||c.id::text||c.xmin::text FROM billing_pro_upgrade_catchup c JOIN billing_pro_upgrade u ON u.id=c.upgrade_id WHERE u.team_id=$1
-        UNION ALL SELECT 's'||offer_key||xmin::text FROM billing_signup_choice WHERE team_id=$1
+        UNION ALL SELECT 's'||offer_key||md5((to_jsonb(s)-'{next_check_at,last_error,paid_observed_at,paid_observed_until,invoice_cursor}'::text[])::text) FROM billing_signup_choice s WHERE team_id=$1
         UNION ALL SELECT 'n'||id::text||xmin::text FROM billing_sponsored_annual_authority WHERE team_id=$1
         UNION ALL SELECT 'o'||id::text||xmin::text FROM billing_sponsored_operation WHERE team_id=$1
         UNION ALL SELECT 't'||operation_id::text||xmin::text FROM billing_yc_calendar_transition WHERE team_id=$1

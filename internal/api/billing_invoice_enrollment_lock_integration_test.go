@@ -216,3 +216,35 @@ func waitFor(t *testing.T, h *Handlers, query string, args ...any) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// Checkout recovery rewrites retry bookkeeping on every poll; that must not
+// invalidate an enrollment plan, while a real choice change still does.
+func TestInvoiceEnrollmentFingerprintIgnoresCheckoutRetryBookkeeping(t *testing.T) {
+	h, team, _, release := invoiceEnrollmentLockFixture(t)
+	release()
+	ctx := t.Context()
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := h.Pool.Exec(ctx, sql, team); err != nil {
+			t.Fatal(err)
+		}
+	}
+	print := func() string {
+		t.Helper()
+		f, err := invoiceEnrollmentFingerprint(ctx, h.Pool, team, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	exec(`INSERT INTO billing_signup_choice(team_id,offer_key,state,generation,actor_id,base_price_id,request_payload) VALUES($1,'pro_monthly','pending',clock_timestamp(),gen_random_uuid(),'price_example','{}') ON CONFLICT(team_id) DO UPDATE SET offer_key=excluded.offer_key,state=excluded.state,generation=excluded.generation,actor_id=excluded.actor_id,base_price_id=excluded.base_price_id,request_payload=excluded.request_payload`)
+	before := print()
+	exec(`UPDATE billing_signup_choice SET last_error='paid purchase is awaiting invoice enrollment',next_check_at=clock_timestamp()+interval '2 minutes',paid_observed_at=clock_timestamp(),paid_observed_until=clock_timestamp()+interval '1 month',invoice_cursor='in_example' WHERE team_id=$1`)
+	if print() != before {
+		t.Fatal("checkout retry bookkeeping invalidated the enrollment plan")
+	}
+	exec(`UPDATE billing_signup_choice SET base_price_id='price_changed' WHERE team_id=$1`)
+	if print() == before {
+		t.Fatal("a changed checkout choice left the enrollment plan valid")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -235,6 +236,42 @@ func TestFrozenProResourceMappingsAreUnique(t *testing.T) {
 			}
 			if err := validateFrozenProResources(sub, terms, ""); err == nil {
 				t.Fatal("accepted duplicate resource mapping")
+			}
+		})
+	}
+}
+
+func TestPendingInvoiceRoundingAcceptsOnlyTheRoundingItem(t *testing.T) {
+	terms := []StripeCheckoutResourceTerms{{PriceID: "price_cpu", UnitAmountDecimal: "5", MeterID: "meter_cpu", EventName: "cpu"}}
+	item := func(id, product, unit, meter string) string {
+		return fmt.Sprintf(`{"price":{"id":%q,"product":%q,"active":true,"currency":"usd","billing_scheme":"per_unit","unit_amount_decimal":%q,"recurring":{"usage_type":"metered","interval":"month","interval_count":1,"meter":%q}}}`, id, product, unit, meter)
+	}
+	cpu := item("price_cpu", "prod_cpu", "5", "meter_cpu")
+	rounding := item("price_rounding", invoiceRoundingProduct, "1", "meter_rounding")
+	for _, tc := range []struct {
+		name, recorded string
+		items          []string
+		ok             bool
+	}{
+		{"pending rounding item", "", []string{cpu, rounding}, true},
+		{"no rounding item yet", "", []string{cpu}, true},
+		{"recorded price", "price_rounding", []string{cpu, rounding}, true},
+		{"different extra item", "", []string{cpu, rounding, item("price_other", "prod_other", "1", "meter_other")}, false},
+		{"extra item without rounding", "", []string{cpu, item("price_other", "prod_other", "1", "meter_other")}, false},
+		{"two rounding items", "", []string{cpu, rounding, item("price_rounding_2", invoiceRoundingProduct, "1", "meter_rounding")}, false},
+		{"rounding product at another amount", "", []string{cpu, item("price_rounding", invoiceRoundingProduct, "2", "meter_rounding")}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sub invoiceSubscription
+			if err := json.Unmarshal([]byte(`{"items":{"data":[`+strings.Join(tc.items, ",")+`]}}`), &sub); err != nil {
+				t.Fatal(err)
+			}
+			r, err := pendingInvoiceRounding(sub, tc.recorded)
+			if err == nil {
+				err = validateFrozenProResources(sub, terms, r)
+			}
+			if (err == nil) != tc.ok {
+				t.Fatalf("accepted=%v, want %v (%v)", err == nil, tc.ok, err)
 			}
 		})
 	}
