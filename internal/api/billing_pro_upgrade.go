@@ -347,18 +347,39 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 
 var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
 
+// lockSection reserves room for a section that holds a lock transaction while
+// writing on a second connection. Admitting at most MaxConns-1 of them leaves
+// a connection free, so concurrent holders cannot all wait for their second.
+func (h *Handlers) lockSection(ctx context.Context) (func(), error) {
+	h.lockSectionsOnce.Do(func() {
+		h.lockSections = make(chan struct{}, max(1, int(h.Pool.Config().MaxConns)-1))
+	})
+	select {
+	case h.lockSections <- struct{}{}:
+		return func() { <-h.lockSections }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*pgxpool.Conn, func(), error) {
 	// A transaction pins its backend through the transaction pooler and its
 	// lock ends with it; a session lock can outlive the attempt on a pooled
 	// backend and block the team. Writes run on a separate connection.
+	leave, err := h.lockSection(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	lockTx, err := h.Pool.Begin(ctx)
 	if err != nil {
+		leave()
 		return nil, nil, err
 	}
 	unlock := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
 		_ = lockTx.Rollback(cleanup)
+		leave()
 	}
 	var locked bool
 	err = lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)

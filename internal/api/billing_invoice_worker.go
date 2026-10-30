@@ -175,6 +175,11 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 	}
 	// Transaction ownership pins the backend through transaction poolers and
 	// shares enrollment's lock key. A separate connection runs existing writes.
+	leave, err := h.lockSection(ctx)
+	if err != nil {
+		return err
+	}
+	defer leave()
 	lockTx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err

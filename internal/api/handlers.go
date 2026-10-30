@@ -163,7 +163,9 @@ type Handlers struct {
 	PromotionAuthPool     *pgxpool.Pool                         // shared Auth source of original signup evidence
 	legacyStorageAccepted sync.Map                              // legacyStorageAckKey -> last durably accepted report ID
 	legacyStorageInFlight sync.Map                              // legacyStorageAckKey -> report ID with an active inline attempt or retry
-	BackupGC              backup.BlobAdmin                      // deletes from the cell's backup bucket; nil leaves the purge job off
+	lockSectionsOnce      sync.Once
+	lockSections          chan struct{}    // bounds sections holding a lock transaction while writing on a second connection
+	BackupGC              backup.BlobAdmin // deletes from the cell's backup bucket; nil leaves the purge job off
 	Config                *config.Config
 	Hosts                 HostRegistry // when set, routes VMD calls via host_id
 	Scheduler             Scheduler    // when set, picks host on create

@@ -3,8 +3,14 @@
 package api
 
 import (
+	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Through a transaction pooler a session lock can stay on an idle pooled
@@ -50,4 +56,45 @@ func TestProUpgradeInvoiceLockIsTransactionScoped(t *testing.T) {
 		t.Fatalf("lock not reusable after release: %v", err)
 	}
 	release()
+}
+
+// Each holder needs a lock transaction and a write connection. Concurrent
+// holders for different teams must not fill the pool with lock transactions
+// and then wait on each other for the second connection.
+func TestProUpgradeInvoiceLocksDoNotExhaustThePool(t *testing.T) {
+	h, _ := newPlanAssignmentFixture(t)
+	cfg := h.Pool.Config()
+	cfg.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h = &Handlers{Pool: pool}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	errs := make(chan error, 40)
+	for range 40 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, release, err := h.proUpgradeInvoiceLock(ctx, uuid.New())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer release()
+			_, err = conn.Exec(ctx, `SELECT pg_sleep(0.01)`)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent lock holder: %v", err)
+		}
+	}
 }
