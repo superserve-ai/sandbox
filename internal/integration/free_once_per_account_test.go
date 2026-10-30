@@ -1,0 +1,156 @@
+//go:build integration
+
+package integration
+
+import (
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func freeOnceCreate(t *testing.T, pool *pgxpool.Pool, user uuid.UUID, additional bool) uuid.UUID {
+	t.Helper()
+	op, name := uuid.New(), "team-"+uuid.NewString()
+	var raw []byte
+	if err := pool.QueryRow(t.Context(), `SELECT prepare_team_promotion_creation($1,$2,$3,'use',false,$4)`, op, user, name, additional).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var prepared struct {
+		AttemptID uuid.UUID `json:"attempt_id"`
+		TeamID    uuid.UUID `json:"team_id"`
+	}
+	if err := json.Unmarshal(raw, &prepared); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, pool, `SELECT complete_team_promotion_creation($1,$2,$3,$4,$5,'use',false,$6)`, op, prepared.AttemptID, prepared.TeamID, user, name, additional)
+	return prepared.TeamID
+}
+
+func freeOnceState(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) (entry string, free, eligible bool) {
+	t.Helper()
+	if err := pool.QueryRow(t.Context(), `SELECT billing_team_entry_state($1),
+  EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL AND kind='free'),
+  team_sandbox_billing_eligible($1)`, team).Scan(&entry, &free, &eligible); err != nil {
+		t.Fatal(err)
+	}
+	return entry, free, eligible
+}
+
+func TestIntegration_FreeOncePerAccount(t *testing.T) {
+	pool, system, actor := cohortFixture(t)
+	// With one paid plan unsellable, signups start on Free rather than the trial.
+	rolloutExec(t, pool, `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='developer' AND pricing_version='v2' AND state='published'),NULL)`)
+	cohortRelease(t, pool, system)
+
+	first := freeOnceCreate(t, pool, actor, false)
+	if entry, free, eligible := freeOnceState(t, pool, first); entry != "active" || !free || !eligible {
+		t.Fatalf("first team: entry=%s free=%t eligible=%t", entry, free, eligible)
+	}
+	// The cell claims the account's Free team itself, whatever the caller sends.
+	second := freeOnceCreate(t, pool, actor, false)
+	if entry, free, eligible := freeOnceState(t, pool, second); entry != "plan_required" || free || eligible {
+		t.Fatalf("second team: entry=%s free=%t eligible=%t", entry, free, eligible)
+	}
+	var signupTeam uuid.UUID
+	if err := pool.QueryRow(t.Context(), `SELECT id FROM create_team_with_signup_trial('signup-path',$1,'use','first_team')`, actor).Scan(&signupTeam); err != nil {
+		t.Fatal(err)
+	}
+	if entry, free, _ := freeOnceState(t, pool, signupTeam); entry != "plan_required" || free {
+		t.Fatalf("signup-path team: entry=%s free=%t", entry, free)
+	}
+	var grants int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM team_credit_grant WHERE team_id IN ($1,$2)`, second, signupTeam).Scan(&grants); err != nil || grants != 0 {
+		t.Fatalf("additional teams took trial credit: %d %v", grants, err)
+	}
+	// A Free team held in another cell reaches this one as Console's flag.
+	elsewhere := uuid.New()
+	rolloutExec(t, pool, `INSERT INTO profile(id,email) VALUES($1,$2)`, elsewhere, elsewhere.String()+"@example.invalid")
+	if entry, free, _ := freeOnceState(t, pool, freeOnceCreate(t, pool, elsewhere, true)); entry != "plan_required" || free {
+		t.Fatalf("flagged team: entry=%s free=%t", entry, free)
+	}
+	var maxSandboxes int
+	if err := pool.QueryRow(t.Context(), `SELECT max_sandboxes FROM team WHERE id=$1`, second).Scan(&maxSandboxes); err != nil || maxSandboxes != 0 {
+		t.Fatalf("additional team admits sandboxes: %d %v", maxSandboxes, err)
+	}
+
+	// A retry cannot change which kind of team an operation creates.
+	op := uuid.New()
+	rolloutExec(t, pool, `SELECT prepare_team_promotion_creation($1,$2,'retried','use',false,true)`, op, actor)
+	for _, call := range []string{
+		`SELECT prepare_team_promotion_creation($1,$2,'retried','use',false,false)`,
+		`SELECT prepare_team_promotion_creation($1,$2,'retried','use',false)`,
+	} {
+		_, err := pool.Exec(t.Context(), call, op, actor)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+			t.Fatalf("flag change accepted by %q: %v", call, err)
+		}
+	}
+
+	// The same rule holds once every team is on the v2 switch.
+	rolloutExec(t, pool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
+	other := uuid.New()
+	rolloutExec(t, pool, `INSERT INTO profile(id,email) VALUES($1,$2)`, other, other.String()+"@example.invalid")
+	if entry, free, _ := freeOnceState(t, pool, freeOnceCreate(t, pool, other, false)); entry != "active" || !free {
+		t.Fatalf("v2 first team: entry=%s free=%t", entry, free)
+	}
+	if entry, free, eligible := freeOnceState(t, pool, freeOnceCreate(t, pool, other, true)); entry != "plan_required" || free || eligible {
+		t.Fatalf("v2 additional team: entry=%s free=%t eligible=%t", entry, free, eligible)
+	}
+}
+
+// v2 serves every team, so the claim holds in a cell whose new-team cohort
+// gate was never prepared.
+func TestIntegration_FreeOncePerAccountV2WithoutCohortGate(t *testing.T) {
+	pool, _, actor := cohortFixture(t)
+	rolloutExec(t, pool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
+
+	first := freeOnceCreate(t, pool, actor, false)
+	if entry, free, eligible := freeOnceState(t, pool, first); entry != "active" || !free || !eligible {
+		t.Fatalf("first team: entry=%s free=%t eligible=%t", entry, free, eligible)
+	}
+	for _, flagged := range []bool{false, true} {
+		team := freeOnceCreate(t, pool, actor, flagged)
+		if entry, free, eligible := freeOnceState(t, pool, team); entry != "plan_required" || free || eligible {
+			t.Fatalf("later team (flagged=%t): entry=%s free=%t eligible=%t", flagged, entry, free, eligible)
+		}
+		var maxSandboxes int
+		if err := pool.QueryRow(t.Context(), `SELECT max_sandboxes FROM team WHERE id=$1`, team).Scan(&maxSandboxes); err != nil || maxSandboxes != 0 {
+			t.Fatalf("later team admits sandboxes: %d %v", maxSandboxes, err)
+		}
+	}
+	var claims int
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_account_free_team WHERE user_id=$1`, actor).Scan(&claims); err != nil || claims != 1 {
+		t.Fatalf("claims=%d %v", claims, err)
+	}
+
+	// A pricing rollback leaves a team created under v2 awaiting its plan.
+	later := freeOnceCreate(t, pool, actor, false)
+	rolloutExec(t, pool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	if entry, free, eligible := freeOnceState(t, pool, later); entry != "plan_required" || free || eligible {
+		t.Fatalf("after rollback: entry=%s free=%t eligible=%t", entry, free, eligible)
+	}
+}
+
+// A cell on legacy pricing with its cohort gate closed has no Free plan, but a
+// flagged team still takes no trial and gets no compute until it pays.
+func TestIntegration_FreeOncePerAccountLegacyClosedGate(t *testing.T) {
+	pool, _, actor := cohortFixture(t)
+	team := freeOnceCreate(t, pool, actor, true)
+	var outcome, reason string
+	var grants int
+	var eligible bool
+	if err := pool.QueryRow(t.Context(), `SELECT o.outcome,o.reason,
+  (SELECT count(*) FROM team_credit_grant g WHERE g.team_id=o.team_id),
+  team_sandbox_billing_eligible(o.team_id)
+ FROM team_signup_promotion_outcome o WHERE o.team_id=$1`, team).Scan(&outcome, &reason, &grants, &eligible); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != "promotion_ineligible" || reason != "additional_team" || grants != 0 || eligible {
+		t.Fatalf("flagged legacy team: %s/%s grants=%d eligible=%t", outcome, reason, grants, eligible)
+	}
+}

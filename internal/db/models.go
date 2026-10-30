@@ -344,6 +344,17 @@ type BackupWalk struct {
 	StartedAt time.Time `json:"started_at"`
 }
 
+type BillingAccountFreeTeam struct {
+	UserID    uuid.UUID `json:"user_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	ClaimedAt time.Time `json:"claimed_at"`
+}
+
+type BillingAdditionalTeam struct {
+	TeamID   uuid.UUID `json:"team_id"`
+	MarkedAt time.Time `json:"marked_at"`
+}
+
 type BillingCatalogAudit struct {
 	ID        uuid.UUID `json:"id"`
 	ActorID   uuid.UUID `json:"actor_id"`
@@ -2581,6 +2592,7 @@ type TeamPromotionCreationAttempt struct {
 	Reason               *string     `json:"reason"`
 	CreatedAt            time.Time   `json:"created_at"`
 	OperationID          pgtype.UUID `json:"operation_id"`
+	AdditionalTeam       bool        `json:"additional_team"`
 }
 
 type TeamSandboxCounter struct {

@@ -111,7 +111,11 @@ func TestPromotionAccountAssertions(t *testing.T) {
 						assertionCase{"changed name", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.Name = "other-team" }, http.StatusForbidden},
 						assertionCase{"missing decision", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.AuthorityUnavailable = nil }, http.StatusForbidden},
 						assertionCase{"changed decision", func(c *promotionAccountClaims, _ *promotionAccountRequest) { *c.AuthorityUnavailable = false }, http.StatusForbidden},
+						assertionCase{"unsigned additional team", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.AdditionalTeam = nil }, http.StatusForbidden},
 					)
+				} else {
+					additional := true
+					cases = append(cases, assertionCase{"additional team on another operation", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.AdditionalTeam = &additional }, http.StatusForbidden})
 				}
 				if operation == "complete-team" {
 					cases = append(cases, assertionCase{"changed team", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.TeamID = uuid.NewString() }, http.StatusForbidden})
@@ -153,6 +157,8 @@ func TestPromotionAccountAssertions(t *testing.T) {
 							unavailable, bodyUnavailable := true, true
 							claims.Name, claims.AuthorityUnavailable = "example-team", &unavailable
 							preparedBody.Name, preparedBody.AuthorityUnavailable = "example-team", &bodyUnavailable
+							additional, bodyAdditional := true, true
+							claims.AdditionalTeam, preparedBody.AdditionalTeam = &additional, &bodyAdditional
 						}
 						if operation == "complete-team" {
 							claims.AttemptID, claims.TeamID = attempt.String(), team.String()

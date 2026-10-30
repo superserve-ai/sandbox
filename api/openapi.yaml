@@ -3964,12 +3964,13 @@ components:
           example: Pro Annual
         status:
           type: string
-          enum: [active, pending, trial, trial_ended, payment_failed, activating]
+          enum: [active, pending, trial, trial_ended, payment_failed, activating, plan_required]
           description: >-
             pending until the plan's first payment is confirmed. A new team
             that has not bought a plan reports key trial with its entry state:
-            trial, trial_ended, payment_failed, or activating once its first
-            payment is confirmed and the plan is being assigned.
+            trial, trial_ended, payment_failed, activating once its first
+            payment is confirmed and the plan is being assigned, or
+            plan_required for a team created after the account's Free team.
         price_usd:
           type: number
           format: double
@@ -5960,14 +5961,16 @@ components:
       properties:
         entry_state:
           type: string
-          enum: [trial, trial_ended, payment_failed, activating, active]
+          enum: [trial, trial_ended, payment_failed, activating, plan_required, active]
           description: >-
             Whether the team has paid for a plan. A new team is on its trial
             with compute until the trial credit runs out (trial_ended), or a
             checkout still needs a usable card (payment_failed). activating
             means its first payment is confirmed and the plan is being
             assigned, usually within seconds; show progress rather than the
-            plan picker. active covers every team with a plan.
+            plan picker. A team created after the account's Free team has no
+            compute until it buys a plan (plan_required). active covers every
+            team with a plan.
         plan:
           type: object
           nullable: true
