@@ -83,6 +83,12 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 	}
 	_, end, _ := billing.AnniversaryPeriod(start, now)
 	anchor, coverageEnd, amount, months, offer, interval := start, end, int64(120000), int32(1), "pro_monthly", "month"
+	// A rolled sponsorship began a period earlier, so the current period is
+	// its second and needs the first one's closing invoice.
+	rolled := len(annual) > 6 && annual[6]
+	if rolled {
+		anchor = start.AddDate(0, -1, 0)
+	}
 	if len(annual) > 0 && annual[0] {
 		anchor = start.AddDate(0, -1, 0)
 		coverageEnd = anchor.AddDate(1, 0, 0)
@@ -187,7 +193,7 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 	if !yc && !sponsored {
 		exec(`UPDATE billing_signup_choice SET offer_key=$6,state='committed',generation=$2,actor_id=$3,base_price_id='price_base',request_payload=$4,subscription_id=$5 WHERE team_id=$1`, team.ID, start, uuid.New(), payload, subscription, offer)
 	}
-	exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_price_round',$4)`, team.ID, customer, subscription, start)
+	exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_price_round',$4)`, team.ID, customer, subscription, map[bool]time.Time{true: anchor, false: start}[rolled])
 	sub := map[string]any{"id": subscription, "customer": customer, "status": "active", "billing_mode": map[string]any{"type": "flexible"}, "billing_cycle_anchor": anchor.Unix(), "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": items}}
 	f := &entitlementFixture{h: h, c: c, start: start, end: end}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
