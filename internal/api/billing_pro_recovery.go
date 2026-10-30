@@ -92,7 +92,8 @@ func (h *Handlers) recoverProCheckoutWithin(ctx context.Context, team uuid.UUID,
 	defer poll.Stop()
 	for {
 		var active bool
-		if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state='active')`, team).Scan(&active); err == nil && active {
+		if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state='active')
+ OR EXISTS(SELECT 1 FROM billing_signup_choice c JOIN billing_commercial_contract k ON k.team_id=c.team_id AND k.subscription_id=c.subscription_id AND k.status='active' WHERE c.team_id=$1 AND c.offer_key IN `+paidPlanOffers+`)`, team).Scan(&active); err == nil && active {
 			return "active", nil
 		}
 		select {
