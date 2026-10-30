@@ -1963,6 +1963,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 				respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 				return
 			}
+			if errors.Is(err, errPlanCannotBuyCredit) || errors.Is(err, errUnknownPlan) {
+				respondErrorMsg(c, "conflict", "this team's plan cannot buy credit", http.StatusConflict)
+				return
+			}
 			if errors.Is(err, errPrepaidPaymentPending) {
 				if prepaid.OperationID != uuid.Nil {
 					c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: purchaseID, State: "pending"})
