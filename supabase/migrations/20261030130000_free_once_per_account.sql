@@ -30,12 +30,24 @@ DO $$ DECLARE r text; BEGIN
  END IF;
 END $$;
 
--- Teams that already started on Free hold their creator's claim.
+-- Teams that already started on Free hold their creator's claim, whether the
+-- cohort enrolled them or the v2 switch assigned Free directly.
 INSERT INTO billing_account_free_team(user_id,team_id,claimed_at)
-SELECT DISTINCT ON (e.creator_user_id) e.creator_user_id,e.team_id,e.enrolled_at
-FROM billing_new_team_enrollment e
-WHERE e.initial_assignment_id IS NOT NULL
-ORDER BY e.creator_user_id,e.enrolled_at,e.team_id;
+SELECT DISTINCT ON (c.user_id) c.user_id,c.team_id,c.claimed_at
+FROM (
+ SELECT e.creator_user_id AS user_id,e.team_id,e.enrolled_at AS claimed_at
+ FROM billing_new_team_enrollment e WHERE e.initial_assignment_id IS NOT NULL
+ UNION
+ SELECT creator.user_id,a.team_id,a.effective_from
+ FROM team_plan_assignment a
+ JOIN LATERAL (
+  SELECT o.user_id FROM team_signup_promotion_outcome o WHERE o.team_id=a.team_id
+  UNION SELECT t.user_id FROM team_promotion_creation_attempt t WHERE t.team_id=a.team_id
+ ) creator ON true
+ WHERE a.kind='free' AND a.source='signup'
+) c
+ORDER BY c.user_id,c.claimed_at,c.team_id
+ON CONFLICT DO NOTHING;
 
 CREATE FUNCTION billing_team_is_additional(p_team uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
