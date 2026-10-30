@@ -324,7 +324,7 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 	}
 	var req prepaidAutoRechargeBody
 	if err = c.ShouldBindJSON(&req); err != nil {
-		respondErrorMsg(c, "bad_request", "invalid auto-recharge settings", http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", "invalid Auto Reload settings", http.StatusBadRequest)
 		return
 	}
 	if req.Enabled {
@@ -380,7 +380,7 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 				return
 			}
 			if !ok || !plan.prepaidFunded() {
-				respondErrorMsg(c, "conflict", "auto-recharge requires a prepaid plan", http.StatusConflict)
+				respondErrorMsg(c, "conflict", "Auto Reload requires a prepaid plan", http.StatusConflict)
 				return
 			}
 			var ready bool
@@ -389,7 +389,7 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 				return
 			}
 			if !ready {
-				respondErrorMsg(c, "conflict", "auto-recharge needs a card saved by an earlier credit purchase", http.StatusConflict)
+				respondErrorMsg(c, "conflict", "Auto Reload needs a payment method saved by an earlier credit purchase", http.StatusConflict)
 				return
 			}
 			_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by,admission_source,admission_epoch) VALUES($1,true,$2,$3,$4,$5,$6)
@@ -446,7 +446,7 @@ func (h *Handlers) DisablePlatformAutoRecharge(c *gin.Context) {
 	err = h.Pool.QueryRow(c.Request.Context(), `UPDATE billing_prepaid_auto_recharge SET enabled=false,disabled_reason=$2,disabled_at=clock_timestamp(),disabled_by=$3,notified_at=clock_timestamp(),updated_at=clock_timestamp()
  WHERE team_id=$1 AND enabled RETURNING disabled_at`, team, "disabled by staff: "+reason, actor).Scan(&disabled)
 	if errors.Is(err, pgx.ErrNoRows) {
-		respondErrorMsg(c, "not_found", "auto-recharge is not enabled for this team", http.StatusNotFound)
+		respondErrorMsg(c, "not_found", "Auto Reload is not enabled for this team", http.StatusNotFound)
 		return
 	}
 	if err != nil {

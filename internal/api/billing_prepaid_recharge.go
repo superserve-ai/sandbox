@@ -151,7 +151,9 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
 	return tx.Commit(ctx)
 }
 
-var errTopoffNotOffered = errors.New("the team's plan does not offer Auto Topoff")
+const prepaidRechargeDescription = "Superserve prepaid credit (Auto Reload)"
+
+var errTopoffNotOffered = errors.New("the team's plan does not offer Auto Reload")
 
 // applyCheckoutTopoff records the Auto Topoff choice made at checkout for a
 // prepaid-funded subscription, inside the caller's settlement transaction and
@@ -365,8 +367,8 @@ func (h *Handlers) chargeAutoRecharge(ctx context.Context, client *stripeHTTPCli
 	default:
 		form := url.Values{
 			"amount": {strconv.FormatInt(req.AmountCents, 10)}, "currency": {"usd"}, "customer": {req.Customer},
-			"payment_method": {req.PaymentMethod}, "payment_method_types[]": {"card"}, "off_session": {"true"}, "confirm": {"true"},
-			"description":                   {"Superserve prepaid credit (auto-recharge)"},
+			"payment_method": {req.PaymentMethod}, "payment_method_types[]": {"card", "link"}, "off_session": {"true"}, "confirm": {"true"},
+			"description":                   {prepaidRechargeDescription},
 			"metadata[prepaid_purchase_id]": {id.String()}, "metadata[team_id]": {team.String()},
 		}
 		err = client.doForm(ctx, http.MethodPost, "/v1/payment_intents", form, &pi, key)
@@ -530,8 +532,8 @@ func (h *Handlers) notifyDisabledAutoRecharges(ctx context.Context) error {
 		}
 		sent := true
 		for _, to := range dedupeWarningRecipients(recipients) {
-			err = sender.SendEmail(ctx, EmailMessage{From: from, To: to, Subject: "Superserve auto-recharge was turned off",
-				Text:           "Automatic recharge of your Superserve prepaid credit was turned off: " + d.Reason + ".\n\nYour sandboxes keep running while you have credit left. To keep them running, add credit or update your card and turn auto-recharge back on from the billing page.",
+			err = sender.SendEmail(ctx, EmailMessage{From: from, To: to, Subject: "Superserve Auto Reload was turned off",
+				Text:           "Auto Reload of your Superserve prepaid credit was turned off: " + d.Reason + ".\n\nYour sandboxes keep running while you have credit left. To keep them running, add credit or update your payment method and turn Auto Reload back on from the billing page.",
 				IdempotencyKey: fmt.Sprintf("prepaid-auto-recharge-off:%s:%d:%s", d.Team, d.At.Unix(), to)})
 			var rejected *rejectedEmailError
 			if err != nil && !errors.As(err, &rejected) {
