@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
 func cohortFixture(t *testing.T) (*pgxpool.Pool, uuid.UUID, uuid.UUID) {
@@ -510,5 +512,61 @@ func TestIntegration_NewTeamCohortFallbackChecksSerialize(t *testing.T) {
 		if _, err = pool.Exec(t.Context(), sql); err == nil {
 			t.Fatalf("%s removed the trial policy after Free was retired", sql)
 		}
+	}
+}
+
+func TestIntegration_NewTeamCohortTrialTemplateAndSnapshotCaps(t *testing.T) {
+	pool, system, actor := cohortFixture(t)
+	cohortRelease(t, pool, system)
+	team := cohortCreate(t, pool, actor)
+	templates := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(t.Context(), `SELECT max_templates FROM team_effective_limits($1)`, team).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := templates(); n != 0 {
+		t.Fatalf("an unset trial template cap allowed %d templates", n)
+	}
+	rolloutExec(t, pool, `UPDATE team SET max_snapshots=5 WHERE id=$1`, team)
+	sandbox := uuid.New()
+	if _, err := db.New(pool).CreateSandbox(t.Context(), db.CreateSandboxParams{ID: sandbox, TeamID: team, Name: "trial-snap", Status: db.SandboxStatusStarting, VcpuCount: 1, MemoryMib: 1, HostID: "default", Metadata: []byte(`{}`), PreviewAccess: preview.AccessPublic}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := func() error {
+		_, err := pool.Exec(t.Context(), `INSERT INTO sandbox_snapshot(team_id,sandbox_id,kind,host_id,vcpu_count,memory_mib,disk_mib,base_path) VALUES($1,$2,'mem+fs','default',1,1024,4096,'/base.ext4')`, team, sandbox)
+		return err
+	}
+	if err := snapshot(); err != nil {
+		t.Fatalf("an unset trial snapshot cap refused the team's own cap: %v", err)
+	}
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET max_templates=1,max_snapshots=1 WHERE singleton`)
+	if n := templates(); n != 1 {
+		t.Fatalf("trial template cap not applied: %d", n)
+	}
+	if err := snapshot(); pgCode(err) != "SS002" {
+		t.Fatalf("trial snapshot cap not applied: %v", err)
+	}
+	var remaining string
+	if err := pool.QueryRow(t.Context(), `SELECT remaining_usd::text FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit'`, team).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, pool, `UPDATE team_credit_grant SET remaining_usd=0 WHERE team_id=$1 AND reason='signup trial credit'`, team)
+	if n := templates(); n != 0 {
+		t.Fatalf("an exhausted trial may still build %d templates", n)
+	}
+	rolloutExec(t, pool, `UPDATE team_credit_grant SET remaining_usd=$2::numeric WHERE team_id=$1 AND reason='signup trial credit'`, team, remaining)
+	if n := templates(); n != 1 {
+		t.Fatalf("restored trial lost its template cap: %d", n)
+	}
+	rolloutExec(t, pool, `INSERT INTO team_trial_eligibility_cache(team_id,eligible) VALUES($1,false) ON CONFLICT(team_id) DO UPDATE SET eligible=false`, team)
+	if n := templates(); n != 0 {
+		t.Fatalf("a team denied the trial may still build %d templates", n)
+	}
+	var cap int
+	if err := pool.QueryRow(t.Context(), `SELECT max_snapshots FROM team WHERE id=$1`, team).Scan(&cap); err != nil || cap != 5 {
+		t.Fatalf("the trial snapshot cap was written onto the team: %d %v", cap, err)
 	}
 }
