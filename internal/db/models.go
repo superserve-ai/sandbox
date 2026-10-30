@@ -1299,6 +1299,13 @@ type BillingProviderCredit struct {
 	ObservedAt    time.Time `json:"observed_at"`
 }
 
+type BillingRenewalInvoiceAlert struct {
+	TeamID      uuid.UUID `json:"team_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	AlertedAt   time.Time `json:"alerted_at"`
+}
+
 type BillingRollupBackfillState struct {
 	Name          string    `json:"name"`
 	NextHourStart time.Time `json:"next_hour_start"`
