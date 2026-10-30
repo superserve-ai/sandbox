@@ -359,6 +359,83 @@ func TestNewTeamCohortFirstProUsesFullMonthAndRetainsAcceptedQuote(t *testing.T)
 	}
 }
 
+func TestNewTeamCohortPaidFirstCheckoutActivatesWithoutPicker(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	f.h.Now = func() time.Time { return now }
+	customer := "cus_local_activating"
+	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, f.team, customer); err != nil {
+		t.Fatal(err)
+	}
+	terms, err := f.h.planTermsForPricingVersion(t.Context(), "pro_monthly", "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer := proOffer{Key: terms.OfferKey, Name: terms.DisplayName, Price: "price_local_pro", Amount: terms.FeeCents, Months: 1, Credit: terms.MonthlyCreditCents, VersionID: terms.VersionID, Version: terms.Version, Family: terms.Family, Pricing: "v2", PricingV2: true, Limits: &terms.Limits, Grants: terms.Grants}
+	params := StripeCreateCheckoutSessionParams{CustomerID: customer, OperationID: uuid.New(), ClientReferenceID: f.team.String(), BasePriceID: offer.Price, OneOffProduct: "prod_local_pro", PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: 1, Credit: offer.Credit, VersionID: offer.VersionID, Version: offer.Version, Family: offer.Family, PricingV2: true, Limits: offer.Limits, Grants: offer.Grants}}
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "test unavailable", 503) }))
+	t.Cleanup(provider.Close)
+	f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+	admission, err := f.h.teamPricingState(t.Context(), f.team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/quote", nil)
+	f.h.createProUpgrade(c, f.team, f.actor, offer, params, admission)
+	accepted, err := f.h.proUpgrade(t.Context(), f.team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE team_trial_eligibility_cache SET eligible=false WHERE team_id=$1`, f.team); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryTrialEnded {
+		t.Fatalf("unpaid checkout after the trial: %s", state)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET state='credited',payment_evidence='{}',grant_id='credgr_local' WHERE id=$1`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade_setup(id,upgrade_id,request_payload,created_at) VALUES(gen_random_uuid(),$1,'{}',now())`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryPaymentFailed {
+		t.Fatalf("paid checkout still needing a card hid its card setup: %s", state)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade_setup SET state='expired' WHERE upgrade_id=$1`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryActivating {
+		t.Fatalf("paid checkout awaiting its plan sent back to the picker: %s", state)
+	}
+
+	holder := uuid.New()
+	if _, err = f.h.DB.ClaimStripeWebhookProcessingLease(t.Context(), db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: customer, Token: holder}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.h.recoverProCheckoutWithin(t.Context(), f.team, false, time.Second); err == nil {
+		t.Fatal("recovery behind a busy worker reported an outcome before activation")
+	}
+	activated := make(chan error, 1)
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		contract := uuid.New()
+		if _, e := f.h.Pool.Exec(context.Background(), `UPDATE team_billing_account SET stripe_subscription_id='sub_local',stripe_subscription_status='active',commercial_billing_anchor=$2 WHERE team_id=$1`, f.team, accepted.Anchor); e != nil {
+			activated <- e
+			return
+		}
+		_, e := f.h.Pool.Exec(context.Background(), `WITH c AS (INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'pro_monthly',$3,$4,'sub_local','price_local_pro',25000,1,25000,'monthly',$3) RETURNING id) UPDATE billing_pro_upgrade SET state='active',contract_id=(SELECT id FROM c) WHERE id=$5`, contract, f.team, accepted.Anchor, customer, accepted.ID)
+		activated <- e
+	}()
+	outcome, err := f.h.recoverProCheckoutWithin(t.Context(), f.team, false, 5*time.Second)
+	if e := <-activated; e != nil {
+		t.Fatal(e)
+	}
+	if err != nil || outcome != "active" {
+		t.Fatalf("recovery behind a busy worker did not wait for its activation: %q %v", outcome, err)
+	}
+}
+
 func TestNewTeamCohortStarterLeaseRetainsIdentityAfterClose(t *testing.T) {
 	f := newTeamCohortTestFixture(t)
 	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_cohort_lease')`, f.team); err != nil {
