@@ -16,8 +16,17 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
+)
+
+// Stripe creates the renewal draft at the cycle boundary, so one still missing
+// this long after the provider cycle ended needs a person. The close retries
+// every few minutes; the alert repeats at most once per interval.
+const (
+	renewalInvoiceAlertDelay    = time.Hour
+	renewalInvoiceAlertInterval = 6 * time.Hour
 )
 
 var errInvoiceAssociationChanged = errors.New("invoice account association changed")
@@ -136,6 +145,19 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 			message = &v
 		}
 		_, _ = h.Pool.Exec(ack, `UPDATE billing_invoice_account SET last_attempt_at=clock_timestamp(),last_error=$2 WHERE team_id=$1`, p.TeamID, message)
+		// Without it the period cannot close, and a sponsored team's next grant waits.
+		if errors.Is(resultErr, errRenewalInvoiceMissing) {
+			var invoiceEnd time.Time
+			if h.Pool.QueryRow(ack, `INSERT INTO billing_renewal_invoice_alert(team_id,period_start,period_end,alerted_at)
+ SELECT k.team_id,k.period_start,k.period_end,clock_timestamp() FROM billing_invoice_calendar k
+ WHERE k.team_id=$1 AND k.period_start=$2 AND k.period_end=$3 AND k.invoice_end<clock_timestamp()-$4::interval
+ ON CONFLICT(team_id,period_start,period_end) DO UPDATE SET alerted_at=EXCLUDED.alerted_at
+ WHERE billing_renewal_invoice_alert.alerted_at<clock_timestamp()-$5::interval
+ RETURNING (SELECT invoice_end FROM billing_invoice_calendar WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`,
+				p.TeamID, p.Start, p.End, renewalInvoiceAlertDelay.String(), renewalInvoiceAlertInterval.String()).Scan(&invoiceEnd) == nil {
+				log.Error().Str("team_id", p.TeamID.String()).Time("invoice_end", invoiceEnd).Msg("renewal invoice still missing after its cycle ended")
+			}
+		}
 		if resultErr != nil {
 			_, _ = h.Pool.Exec(ack, `UPDATE billing_invoice_close SET last_error=$4,updated_at=clock_timestamp() WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End, resultErr.Error())
 		}
