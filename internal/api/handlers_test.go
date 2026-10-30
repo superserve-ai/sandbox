@@ -3288,6 +3288,11 @@ func TestCreateSandbox_MissingTeamID(t *testing.T) {
 }
 
 func TestCreateSandbox_QuotaExceeded(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := log.Logger
+	log.Logger = zerolog.New(&logs)
+	t.Cleanup(func() { log.Logger = previousLogger })
+
 	teamID := uuid.New()
 	vmd := &stubVMD{}
 
@@ -3334,6 +3339,27 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 	}
 	if !destroyCalled {
 		t.Error("orphan VM was not destroyed after quota rejection")
+	}
+
+	decoder := json.NewDecoder(&logs)
+	var quotaLogged bool
+	for decoder.More() {
+		var event map[string]any
+		if err := decoder.Decode(&event); err != nil {
+			t.Fatalf("decode log: %v", err)
+		}
+		if event["level"] == "error" || event["level"] == "fatal" || event["level"] == "panic" {
+			t.Errorf("quota rejection emitted an alerting log: %v", event)
+		}
+		if event["message"] == "CreateSandbox: quota exceeded" {
+			quotaLogged = true
+			if event["level"] != "info" || event["team_id"] != teamID.String() {
+				t.Errorf("quota log missing info level or team: %v", event)
+			}
+		}
+	}
+	if !quotaLogged {
+		t.Error("quota rejection was not logged")
 	}
 }
 

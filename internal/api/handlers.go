@@ -3848,16 +3848,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	case dbErr != nil:
 		// DB insert failed but VMD succeeded or failed independently — the VM
 		// was already cleaned up best-effort above.
+		if quotaExceeded {
+			l.Info().Err(dbErr).Str("team_id", teamID.String()).Msg("CreateSandbox: quota exceeded")
+			h.respondQuotaExceeded(c, teamID)
+			return
+		}
 		l.Error().Err(dbErr).Str("reason", transientReason).Msg("CreateSandbox: INSERT failed")
 		if sourceRace {
 			respondSourceGone()
 			return
 		}
 		if respondSandboxAdmissionError(c, dbErr) {
-			return
-		}
-		if quotaExceeded {
-			h.respondQuotaExceeded(c, teamID)
 			return
 		}
 		if isVMDFileMissing(vmdErr) {
