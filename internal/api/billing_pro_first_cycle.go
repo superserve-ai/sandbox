@@ -14,11 +14,14 @@ import (
 var errProFirstCycleReconciliation = errors.New("An earlier billing setup requires reconciliation before starting a new Pro billing month.")
 
 // Team entry states. A new team is on its trial, with compute while the
-// trial credit lasts, until its first checkout assigns a plan.
+// trial credit lasts, until its first checkout assigns a plan. A team whose
+// first payment is confirmed but whose plan is still being assigned is
+// activating, so it is neither sent back to the plan picker nor shown as paid.
 const (
 	entryTrial         = "trial"
 	entryTrialEnded    = "trial_ended"
 	entryPaymentFailed = "payment_failed"
+	entryActivating    = "activating"
 	entryActive        = "active"
 )
 
@@ -30,7 +33,7 @@ func teamAwaitingPlan(ctx context.Context, q db.DBTX, team uuid.UUID) (bool, err
 
 func teamEntryState(ctx context.Context, q db.DBTX, team uuid.UUID) (string, error) {
 	var state string
-	err := q.QueryRow(ctx, `SELECT billing_team_entry_state($1)`, team).Scan(&state)
+	err := q.QueryRow(ctx, `SELECT CASE WHEN s<>'active' AND EXISTS(SELECT 1 FROM billing_pro_upgrade u WHERE u.team_id=$1 AND u.state IN ('paid','credited')) THEN 'activating' ELSE s END FROM billing_team_entry_state($1) s`, team).Scan(&state)
 	return state, err
 }
 

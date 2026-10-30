@@ -36,7 +36,7 @@ func (h *Handlers) RecoverProCheckout(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "invalid recovery request", 400)
 		return
 	}
-	outcome, err := h.reconcileProCheckout(c.Request.Context(), team, input.Restart)
+	outcome, err := h.recoverProCheckoutWithin(c.Request.Context(), team, input.Restart, proRecoveryBudget)
 	if err != nil {
 		log.Warn().Err(err).Str("team_id", team.String()).Msg("Pro checkout recovery pending")
 		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
@@ -51,6 +51,52 @@ func (h *Handlers) RecoverProCheckout(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"outcome": outcome})
+}
+
+// The console abandons a recovery call after ten seconds, so the call answers
+// within this budget and leaves a started reconciliation to finish on its own.
+const proRecoveryBudget = 8 * time.Second
+
+type proRecoveryResult struct {
+	outcome string
+	err     error
+}
+
+// recoverProCheckoutWithin reconciles detached from the caller, so a client
+// that gives up does not abort an activation already under way. When another
+// worker holds the purchase, it waits for that worker's activation instead.
+func (h *Handlers) recoverProCheckoutWithin(ctx context.Context, team uuid.UUID, restart bool, budget time.Duration) (string, error) {
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+	done := make(chan proRecoveryResult, 1)
+	go func() {
+		outcome, err := h.reconcileProCheckout(context.WithoutCancel(ctx), team, restart)
+		done <- proRecoveryResult{outcome, err}
+	}()
+	var result proRecoveryResult
+	select {
+	case result = <-done:
+	case <-deadline.C:
+		return "", errors.New("Pro checkout recovery still running")
+	}
+	if result.err == nil {
+		return result.outcome, nil
+	}
+	poll := time.NewTicker(500 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		var active bool
+		if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state='active')`, team).Scan(&active); err == nil && active {
+			return "active", nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", result.err
+		case <-deadline.C:
+			return "", result.err
+		case <-poll.C:
+		}
+	}
 }
 
 func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, restart bool) (string, error) {
@@ -428,9 +474,24 @@ func (h *Handlers) StartProPaymentReconciliation(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+			case <-h.proPaymentWake():
 			}
 		}
 	}()
+}
+
+func (h *Handlers) proPaymentWake() chan struct{} {
+	h.proWakeOnce.Do(func() { h.proWake = make(chan struct{}, 1) })
+	return h.proWake
+}
+
+// wakeProPaymentReconciliation runs the reconciliation worker now rather than
+// at its next tick, so a paid checkout activates seconds after its webhook.
+func (h *Handlers) wakeProPaymentReconciliation() {
+	select {
+	case h.proPaymentWake() <- struct{}{}:
+	default:
+	}
 }
 func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error) {
 	released, err := h.releasedProInvoiceTick(ctx)
