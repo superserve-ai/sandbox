@@ -497,6 +497,9 @@ func (h *Handlers) validateProResourceIdentities(ctx context.Context, team uuid.
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
+	if rounding, err = pendingInvoiceRounding(sub, rounding); err != nil {
+		return err
+	}
 	for _, item := range sub.Items.Data {
 		if item.Price.ID == params.BasePriceID || (rounding != "" && item.Price.ID == rounding) {
 			continue

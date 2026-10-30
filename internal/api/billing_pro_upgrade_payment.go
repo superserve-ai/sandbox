@@ -227,6 +227,9 @@ func (h *Handlers) commitProUpgrade(ctx context.Context, conn *pgxpool.Conn, u *
 		if e := conn.QueryRow(ctx, `SELECT COALESCE((SELECT adjustment_price_id FROM billing_invoice_account WHERE team_id=$1),'')`, u.Team).Scan(&rounding); e != nil {
 			return e
 		}
+		if rounding, err = pendingInvoiceRounding(resources, rounding); err != nil {
+			return err
+		}
 		if err = invoiceCalendarCompatible(u.Anchor, resources, rounding); err != nil {
 			return err
 		}
