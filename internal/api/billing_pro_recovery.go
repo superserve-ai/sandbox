@@ -36,14 +36,16 @@ func (h *Handlers) RecoverProCheckout(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "invalid recovery request", 400)
 		return
 	}
-	outcome, err := h.recoverProCheckoutWithin(c.Request.Context(), team, input.Restart, proRecoveryBudget)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), proRecoveryBudget)
+	defer cancel()
+	outcome, err := h.recoverProCheckoutWithin(ctx, team, input.Restart, proRecoveryBudget)
 	if err != nil {
 		log.Warn().Err(err).Str("team_id", team.String()).Msg("Pro checkout recovery pending")
 		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
 		return
 	}
 	if outcome == "payment_method_required" {
-		if target, e := h.proUpgradeSetupURL(c.Request.Context(), team); e == nil {
+		if target, e := h.proUpgradeSetupURL(ctx, team); e == nil {
 			c.JSON(http.StatusOK, gin.H{"outcome": outcome, "url": target})
 			return
 		}
