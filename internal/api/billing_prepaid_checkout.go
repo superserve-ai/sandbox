@@ -194,6 +194,7 @@ func (h *Handlers) dispatchPrepaidPaymentCheckout(ctx context.Context, client *s
 		"payment_intent_data[metadata][prepaid_purchase_id]":                     {id.String()},
 		"metadata[prepaid_purchase_id]":                                          {id.String()},
 	}
+	setInstantPaymentMethods(form)
 	var session prepaidCheckoutSession
 	if err := client.doForm(ctx, http.MethodPost, "/v1/checkout/sessions", form, &session, key); err != nil {
 		return session, err

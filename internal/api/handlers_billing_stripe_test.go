@@ -892,3 +892,45 @@ func TestStripeReplaysPreAutoReloadRequestUnderSavedKey(t *testing.T) {
 		t.Fatalf("retry charged %d times", charges)
 	}
 }
+
+func TestStripeReplaysCreditCheckoutSentBeforeInstantMethods(t *testing.T) {
+	keys := map[string]string{}
+	sessions := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		body := r.PostForm.Encode()
+		key := r.Header.Get("Idempotency-Key")
+		if prior, ok := keys[key]; ok {
+			if prior != body {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"type":"idempotency_error","message":"Keys for idempotent requests can only be used with the same parameters they were first used with."}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"cs_local"}`))
+			return
+		}
+		sessions++
+		keys[key] = body
+		_, _ = w.Write([]byte(`{"id":"cs_local"}`))
+	}))
+	t.Cleanup(provider.Close)
+	client := &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+	before := url.Values{"mode": {"payment"}, "customer": {"cus_local"}, "metadata[prepaid_purchase_id]": {"purchase-local"}, "payment_intent_data[setup_future_usage]": {"off_session"}}
+	after := url.Values{}
+	for k, v := range before {
+		after[k] = v
+	}
+	setInstantPaymentMethods(after)
+	if err := client.sendForm(t.Context(), http.MethodPost, "/v1/checkout/sessions", before, nil, "credit-key"); err != nil {
+		t.Fatal(err)
+	}
+	var session struct {
+		ID string `json:"id"`
+	}
+	if err := client.doForm(t.Context(), http.MethodPost, "/v1/checkout/sessions", after, &session, "credit-key"); err != nil || session.ID != "cs_local" {
+		t.Fatalf("retry of a credit Checkout sent before instant methods did not recover it: %q %v", session.ID, err)
+	}
+	if sessions != 1 {
+		t.Fatalf("retry created %d sessions", sessions)
+	}
+}
