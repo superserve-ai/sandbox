@@ -402,3 +402,59 @@ func TestProInvoiceCashFundedUpgradeCollectsDespiteSettledTopoff(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepaidFundedSubscriptionBuysCreditAndKeepsPlan(t *testing.T) {
+	f, contract := fundedSubscriptionFixture(t, nil)
+	assignStarterAfterPurchase = settlePrepaidPlan
+	f.issueIncludedGrant(contract)
+	before, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	balance := func() int64 {
+		t.Helper()
+		total, _, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return total
+	}
+	start := balance()
+	id, actor := uuid.New(), uuid.New()
+	// A second click with the same operation records nothing new.
+	for range 2 {
+		if err = f.h.recordCheckoutPurchase(t.Context(), id, f.team, f.customer, actor, 500, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.exec(`UPDATE billing_prepaid_purchase SET payment_state='succeeded',paid_at=clock_timestamp(),payment_evidence=jsonb_build_object('amount_cents',amount_cents,'customer',customer_id) WHERE id=$1`, id)
+	for range 2 {
+		if err = f.h.settlePrepaidPurchase(t.Context(), f.client, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r := f.rows(); len(r) != 1 || r[0].Source != "checkout" || r[0].Amount != 500 || r[0].Credit != "issued" || len(f.grantPosts) != 1 {
+		t.Fatalf("one purchase was not credited exactly once: %+v posts=%d", r, len(f.grantPosts))
+	}
+	if got := balance(); got != start+500 {
+		t.Fatal("purchased credit not observed", start, got)
+	}
+	after, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil || after.ID != before.ID || !after.prepaidFunded() {
+		t.Fatal("credit purchase replaced the funded subscription", after, err)
+	}
+	var starter bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND idempotency_key=$2)`, f.team, "prepaid-plan:v1:"+id.String()).Scan(&starter); err != nil || starter {
+		t.Fatal("credit purchase assigned Starter", starter, err)
+	}
+}
+
+func TestPrepaidPostpaidSubscriptionCannotBuyCredit(t *testing.T) {
+	f := newPrepaidFixture(t)
+	if _, err := assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("pro", planKindSubscription, 1, nil), Source: planSourceStaff, Reason: "postpaid fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.recordCheckoutPurchase(t.Context(), uuid.New(), f.team, f.customer, uuid.New(), 500, ""); !errors.Is(err, errPlanCannotBuyCredit) {
+		t.Fatal("postpaid subscription was allowed to buy credit", err)
+	}
+}
