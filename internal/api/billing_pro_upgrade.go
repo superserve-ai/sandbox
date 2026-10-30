@@ -348,29 +348,36 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
 
 func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*pgxpool.Conn, func(), error) {
-	conn, err := h.Pool.Acquire(ctx)
+	// A transaction pins its backend through the transaction pooler and its
+	// lock ends with it; a session lock can outlive the attempt on a pooled
+	// backend and block the team. Writes run on a separate connection.
+	lockTx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	unlock := func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		_ = lockTx.Rollback(cleanup)
+	}
 	var locked bool
-	err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
+	err = lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
 	if err != nil || !locked {
-		conn.Release()
+		unlock()
 		if err == nil {
 			err = errProReconciliationBusy
 		}
 		return nil, nil, err
 	}
-	release := func() {
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-		defer cancel()
-		var unlocked bool
-		if e := conn.QueryRow(cleanup, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&unlocked); e != nil || !unlocked {
-			_ = conn.Conn().Close(cleanup)
-		}
-		conn.Release()
+	conn, err := h.Pool.Acquire(ctx)
+	if err != nil {
+		unlock()
+		return nil, nil, err
 	}
-	return conn, release, nil
+	return conn, func() {
+		conn.Release()
+		unlock()
+	}, nil
 }
 
 func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restart bool) (string, error) {
