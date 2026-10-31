@@ -14,9 +14,8 @@
 -- written only for a platform failure does not end it. Debt and withheld rows
 -- are written only for an active contract, so a first renewal that fails
 -- while its contract is still pending ends the grace once the funding worker
--- observes that period's closing invoice unpaid. Only that invoice counts: the
--- observed debt can be any unpaid invoice of the customer, and it is kept
--- unchanged while the provider cannot be read.
+-- reads that period's closing invoice from Stripe and finds it unpaid. The
+-- customer's other unpaid invoices do not count for or against it.
 --
 -- Usage in the grace is billed on the new period's invoice, which the next
 -- grant applies to; the invoice close verifies what Stripe applied.
@@ -46,7 +45,7 @@ CREATE OR REPLACE FUNCTION billing_renewal_roll_grace(p_team_id uuid,p_credit_ch
    AND NOT EXISTS(SELECT 1 FROM billing_entitlement_debt d WHERE d.contract_id=c.id AND d.period_start>=r.period_end)
    AND NOT EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start>=r.period_end AND w.evidence ? 'unpaid_invoice')
    AND NOT (r.first_renewal AND EXISTS(SELECT 1 FROM billing_funding_account f
-    JOIN billing_invoice_close j ON j.team_id=f.team_id AND j.period_end=r.period_end AND j.invoice_id=f.provider_evidence->>'DebtInvoiceID'
+    JOIN billing_invoice_close j ON j.team_id=f.team_id AND j.period_end=r.period_end AND j.invoice_id=f.provider_evidence->>'UnpaidRenewalInvoiceID'
     WHERE f.team_id=p_team_id)));
 $$;
 

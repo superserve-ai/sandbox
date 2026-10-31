@@ -237,7 +237,7 @@ func TestPrepaidFirstRenewalRollStaysEligible(t *testing.T) {
 		}, 0, false},
 		{"failed renewal ends it", 2 * time.Hour, func(f *firstRenewalFixture) {
 			invoice := f.closeFirstPeriod("in_failed_renewal")
-			f.exec(`UPDATE billing_funding_account SET provider_evidence=jsonb_build_object('DebtInvoiceID',$2::text) WHERE team_id=$1`, f.team, invoice)
+			f.exec(`UPDATE billing_funding_account SET provider_evidence=jsonb_build_object('UnpaidRenewalInvoiceID',$2::text) WHERE team_id=$1`, f.team, invoice)
 		}, 0, false},
 		{"another unpaid invoice keeps it", 2 * time.Hour, func(f *firstRenewalFixture) {
 			f.closeFirstPeriod("in_renewal")
@@ -316,32 +316,55 @@ func TestPrepaidRenewalRollGraceHoldsAutoRecharge(t *testing.T) {
 }
 
 func TestPrepaidFirstRenewalRollEndsOnObservedUnpaidRenewal(t *testing.T) {
-	f := newFirstRenewalFixture(t, 2*time.Hour)
-	invoice := f.closeFirstPeriod("in_failed_renewal")
-	f.enableAutoRecharge(1000, 1500)
-	if !f.eligible() {
-		t.Fatal("first renewal not in its grace")
-	}
-	j, s := claimFundingTestJob(t, f.h, f.team)
-	provider := &fundingProviderObservation{PaymentMethodID: "pm_saved", PaymentMethodReusable: true, CollectionReady: true, DebtInvoiceID: invoice, ValidUntil: s.At.Add(5 * time.Minute)}
-	evidence, err := json.Marshal(provider)
-	if err != nil {
-		t.Fatal(err)
-	}
-	provider.Evidence = evidence
-	credit := &fundingCreditObservation{SpendableUSD: "0", ValidUntil: s.At.Add(time.Minute), Evidence: []byte(`{"fixture":"credit"}`)}
-	if err = f.h.publishFundingObservation(t.Context(), j, s, credit, provider, nil); err != nil {
-		t.Fatal(err)
-	}
-	if f.eligible() {
-		t.Fatal("failed first renewal kept the team running in its grace")
-	}
-	if err = f.h.recordAutoRecharges(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	var n int
-	if err = f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND source='auto_recharge'`, f.team).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("Auto Reload stayed held after the failed first renewal: %d %v", n, err)
+	for _, tc := range []struct {
+		name, renewal, other string
+		eligible             bool
+	}{
+		{"unpaid renewal ends it", "open", "", false},
+		{"open behind another open invoice ends it", "open", "open", false},
+		{"uncollectible beside another open invoice ends it", "uncollectible", "open", false},
+		{"paid renewal beside another open invoice keeps it", "paid", "open", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFirstRenewalFixture(t, 2*time.Hour)
+			invoice := f.closeFirstPeriod("in_renewal")
+			f.enableAutoRecharge(1000, 1500)
+			f.mu.Lock()
+			f.invoices[invoice] = StripeInvoiceAmounts{ID: invoice, Customer: f.customer, Status: tc.renewal}
+			other := ""
+			if tc.other != "" {
+				other = "in_other_" + f.team.String()
+				f.invoices[other] = StripeInvoiceAmounts{ID: other, Customer: f.customer, Status: tc.other}
+			}
+			f.mu.Unlock()
+			unpaid, err := f.h.unpaidFirstRenewalInvoice(t.Context(), f.team, f.customer, f.client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			j, s := claimFundingTestJob(t, f.h, f.team)
+			provider := &fundingProviderObservation{PaymentMethodID: "pm_saved", PaymentMethodReusable: true, CollectionReady: true, DebtInvoiceID: other, UnpaidRenewalInvoiceID: unpaid, ValidUntil: s.At.Add(5 * time.Minute)}
+			if provider.Evidence, err = json.Marshal(provider); err != nil {
+				t.Fatal(err)
+			}
+			credit := &fundingCreditObservation{SpendableUSD: "0", ValidUntil: s.At.Add(time.Minute), Evidence: []byte(`{"fixture":"credit"}`)}
+			if err = f.h.publishFundingObservation(t.Context(), j, s, credit, provider, nil); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.eligible(); got != tc.eligible {
+				t.Fatalf("eligible = %v, want %v", got, tc.eligible)
+			}
+			if err = f.h.recordAutoRecharges(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			want := 1
+			if tc.eligible {
+				want = 0
+			}
+			var n int
+			if err = f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND source='auto_recharge'`, f.team).Scan(&n); err != nil || n != want {
+				t.Fatalf("automatic recharges = %d, want %d (%v)", n, want, err)
+			}
+		})
 	}
 }
 
