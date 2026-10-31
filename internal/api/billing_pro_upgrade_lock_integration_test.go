@@ -98,3 +98,60 @@ func TestProUpgradeInvoiceLocksDoNotExhaustThePool(t *testing.T) {
 		}
 	}
 }
+
+// Concurrent checkouts for one team, as when a customer retries while the
+// webhook and the recovery worker reconcile it, take the invoice lock in turn.
+// Each must wait for its turn rather than fail busy, and waiting must not
+// exhaust a two-connection pool.
+func TestProUpgradeCheckoutsWaitForTheInvoiceLock(t *testing.T) {
+	base, team := newPlanAssignmentFixture(t)
+	withPool := func(maxConns int32) *Handlers {
+		cfg := base.Pool.Config()
+		cfg.MaxConns = maxConns
+		pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		return &Handlers{Pool: pool}
+	}
+	run := func(h *Handlers, wait time.Duration) (busy int, other error) {
+		reconcile := func() (string, error) {
+			conn, release, err := h.proUpgradeInvoiceLock(t.Context(), team)
+			if err != nil {
+				return "", err
+			}
+			defer release()
+			_, err = conn.Exec(t.Context(), `SELECT pg_sleep(0.05)`)
+			return "active", err
+		}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := waitWhileReconciliationBusy(t.Context(), wait, reconcile)
+				mu.Lock()
+				defer mu.Unlock()
+				if errors.Is(err, errProReconciliationBusy) {
+					busy++
+				} else if err != nil && other == nil {
+					other = err
+				}
+			}()
+		}
+		wg.Wait()
+		return busy, other
+	}
+	wide := withPool(16)
+	// Without waiting, contention surfaces to the customer as busy.
+	if busy, err := run(wide, 0); err != nil || busy == 0 {
+		t.Fatalf("contention not reproduced: busy=%d err=%v", busy, err)
+	}
+	for _, h := range []*Handlers{wide, withPool(2)} {
+		if busy, err := run(h, proReconciliationWait); err != nil || busy != 0 {
+			t.Fatalf("checkouts failed while waiting their turn: busy=%d err=%v", busy, err)
+		}
+	}
+}

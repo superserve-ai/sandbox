@@ -317,7 +317,13 @@ func (h *Handlers) respondUpgradeUnsettled(c *gin.Context, team uuid.UUID, cause
 }
 
 func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
-	outcome, err := h.reconcileProUpgrade(c.Request.Context(), u, false)
+	outcome, err := waitWhileReconciliationBusy(c.Request.Context(), proReconciliationWait, func() (string, error) {
+		latest, err := h.proUpgrade(c.Request.Context(), u.Team)
+		if err != nil {
+			return "", err
+		}
+		return h.reconcileProUpgrade(c.Request.Context(), latest, false)
+	})
 	if err != nil {
 		h.respondUpgradeUnsettled(c, u.Team, err)
 		return
@@ -346,6 +352,31 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 }
 
 var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
+
+// The webhook, the recovery worker and the invoice close reconcile a team one
+// at a time, so a customer's checkout routinely finds one of them mid-run. It
+// waits briefly for its turn instead of failing.
+const proReconciliationWait = 5 * time.Second
+
+// waitWhileReconciliationBusy retries attempt with backoff while it reports
+// errProReconciliationBusy, for at most wait. Each attempt releases its lock,
+// lock section and lease before returning, so nothing is held while waiting.
+func waitWhileReconciliationBusy(ctx context.Context, wait time.Duration, attempt func() (string, error)) (string, error) {
+	deadline := time.Now().Add(wait)
+	delay := 50 * time.Millisecond
+	for {
+		outcome, err := attempt()
+		if !errors.Is(err, errProReconciliationBusy) || time.Now().Add(delay).After(deadline) {
+			return outcome, err
+		}
+		select {
+		case <-ctx.Done():
+			return outcome, err
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, time.Second)
+	}
+}
 
 // lockSection reserves room for a section that holds or waits on the invoice
 // lock while it needs another connection or holds one. Admitting at most
