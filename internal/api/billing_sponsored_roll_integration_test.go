@@ -100,6 +100,11 @@ func (f *sponsoredRollFixture) releasePriorClose() {
 }
 
 func TestSponsoredRollWaitsForDraftRenewalInvoice(t *testing.T) {
+	// The rolled fixture anchors one month before its start with AddDate, which
+	// only lands on the prior anniversary on days every month has.
+	if time.Now().UTC().Day() > 28 {
+		t.Skip("rolled sponsorship fixture needs a start day every month has")
+	}
 	f := newSponsoredRollFixture(t, 2*time.Hour)
 	_, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID)
 	if err == nil || !strings.Contains(err.Error(), "prior closing invoice is not reconciled and released") || f.grants.Load() != 0 {
@@ -173,6 +178,11 @@ func TestSponsoredRollGraceEndsWithContract(t *testing.T) {
 }
 
 func TestSponsoredRollGraceWaitsForSuccessfulCreditRead(t *testing.T) {
+	// The rolled fixture anchors one month before its start with AddDate, which
+	// only lands on the prior anniversary on days every month has.
+	if time.Now().UTC().Day() > 28 {
+		t.Skip("rolled sponsorship fixture needs a start day every month has")
+	}
 	f := newSponsoredRollFixture(t, 2*time.Hour)
 	ctx := t.Context()
 	f.releasePriorClose()
