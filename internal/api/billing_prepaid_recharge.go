@@ -127,6 +127,7 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
  AND f.observe AND f.payment_method_ready AND f.payment_method_id IS NOT NULL
   AND f.observed_generation=f.generation AND f.customer_id=b.stripe_customer_id
   AND f.credit_checked_at>clock_timestamp()-interval '2 minutes' AND f.credit_usd*100<a.threshold_cents
+  AND NOT billing_renewal_roll_grace(a.team_id,f.credit_checked_at)
   AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id
    AND ((p.source='auto_recharge' AND p.payment_state IN ('pending','uncertain','processing'))
     OR (p.payment_state='succeeded' AND (p.credit_state<>'issued' OR p.credited_at>=f.credit_checked_at)

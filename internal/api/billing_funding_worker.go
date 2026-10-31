@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -214,20 +216,54 @@ func (h *Handlers) observeFundingProvider(ctx context.Context, team uuid.UUID, a
 		return fundingProviderObservation{}, err
 	}
 	out, err := client.observeFundingPage(ctx, *account.StripeCustomerID, derefString(account.StripeSubscriptionID), live, previous, cursor)
-	if err != nil || !out.CollectionReady {
+	if err != nil {
+		return out, err
+	}
+	if out.UnpaidRenewalInvoiceID, err = h.unpaidFirstRenewalInvoice(ctx, team, *account.StripeCustomerID, client); err != nil {
 		return out, err
 	}
 	// The current export scheduler enrolls new usage only for active mappings.
 	// Credit access remains independent of this payment-only prerequisite.
-	if derefString(account.StripeSubscriptionStatus) != "active" || out.Subscription.Status != "active" {
+	if out.CollectionReady && (derefString(account.StripeSubscriptionStatus) != "active" || out.Subscription.Status != "active") {
 		out.CollectionReady = false
-	} else {
+	} else if out.CollectionReady {
 		out.CollectionReady, err = h.fundingCollectionEnrolled(ctx, team, account, out.Subscription, client)
 	}
 	if err == nil {
 		out.Evidence, err = json.Marshal(out)
 	}
 	return out, err
+}
+
+// unpaidFirstRenewalInvoice reports the closing invoice of a first paid month
+// that ended within the renewal grace when Stripe shows it unpaid or closed
+// without payment; a held draft is still on its way to collection. The
+// contract is still pending then, so no entitlement debt is recorded, and the
+// customer's other unpaid invoices must not stand in for this one.
+func (h *Handlers) unpaidFirstRenewalInvoice(ctx context.Context, team uuid.UUID, customer string, client *stripeHTTPClient) (string, error) {
+	rows, err := h.Pool.Query(ctx, `SELECT j.invoice_id FROM billing_invoice_close j
+ JOIN billing_pro_upgrade u ON u.team_id=j.team_id AND u.period_end=j.period_end AND u.state='active' AND u.request_payload->>'FirstPaidProCycle'='true'
+ WHERE j.team_id=$1 AND j.period_end<=clock_timestamp() AND j.period_end>clock_timestamp()-interval '6 hours' ORDER BY j.period_end DESC`, team)
+	if err != nil {
+		return "", err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", err
+	}
+	for _, id := range ids {
+		var inv StripeInvoiceAmounts
+		if err = client.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(id), nil, &inv, ""); err != nil {
+			return "", err
+		}
+		if inv.ID != id || inv.Customer != customer {
+			return "", errors.New("renewal invoice identity mismatch")
+		}
+		if inv.Status == "open" || inv.Status == "uncollectible" || inv.Status == "void" {
+			return id, nil
+		}
+	}
+	return "", nil
 }
 
 func fundingStripeMode(key string) (bool, error) {

@@ -18,6 +18,7 @@ type fundingProviderObservation struct {
 	CashCollected            bool
 	CollectionReady          bool
 	DebtInvoiceID            string
+	UnpaidRenewalInvoiceID   string
 	ChargeScanComplete       bool
 	NextChargeCursor         string
 	Subscription             invoiceSubscription
