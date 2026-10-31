@@ -121,7 +121,7 @@ func (h *Handlers) issueEventCredit(ctx context.Context, client *stripeHTTPClien
 	if err != nil {
 		return err
 	}
-	grant, err := existingEventGrant(grants, team, label, cents)
+	grant, err := existingEventGrant(grants, team, customer, label, cents)
 	if err != nil || grant != "" {
 		if grant != "" {
 			_, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='issued',stripe_credit_grant_id=$2,issued_at=clock_timestamp(),first_attempt_at=COALESCE(first_attempt_at,clock_timestamp()) WHERE contract_id=$1 AND state<>'issued'`, contract, grant)
@@ -240,9 +240,9 @@ func (c *stripeHTTPClient) customerCreditGrants(ctx context.Context, customer st
 }
 
 // existingEventGrant returns the team's grant for this event, if any. A grant
-// that was voided or differs from the event's terms needs an operator rather
-// than a second grant.
-func existingEventGrant(grants []entitlementGrant, team uuid.UUID, label string, cents int64) (string, error) {
+// that was voided, differs from the event's terms, or sits on another customer
+// (which cannot fund this one's invoices) needs an operator, not a second grant.
+func existingEventGrant(grants []entitlementGrant, team uuid.UUID, customer, label string, cents int64) (string, error) {
 	var found []entitlementGrant
 	for _, g := range grants {
 		if g.Metadata["event_label"] == label && g.Metadata["team_id"] == team.String() {
@@ -253,7 +253,7 @@ func existingEventGrant(grants []entitlementGrant, team uuid.UUID, label string,
 		return "", nil
 	}
 	g := found[0]
-	if len(found) > 1 || g.VoidedAt != 0 || g.ExpiresAt != 0 || g.Category != "promotional" || g.Priority != 50 ||
+	if len(found) > 1 || g.Customer != customer || g.VoidedAt != 0 || g.ExpiresAt != 0 || g.Category != "promotional" || g.Priority != 50 ||
 		g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != cents ||
 		g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 {
 		return "", fmt.Errorf("event credit %s already has a grant that differs from its terms; operator review required", label)

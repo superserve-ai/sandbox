@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -28,6 +29,7 @@ func TestEventPromotionCreditIsQueuedOnceAndIssuedOnce(t *testing.T) {
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
 	active, label := "promo_"+suffix, "event-"+suffix[:12]
 	exec(`INSERT INTO billing_event_promotion(promotion_code,label,credit_cents) VALUES($1,$2,8000)`, active, label)
+	cleanupEventCredits(t, h, team)
 	queue := func(code string) {
 		t.Helper()
 		tx, err := h.Pool.Begin(ctx)
@@ -149,8 +151,9 @@ func TestEventCheckoutSkipsTheCardOnlyForAFreeListedCode(t *testing.T) {
 }
 
 // A grant the team received on an earlier customer, for example from a manual
-// event_credit.py run, settles the credit instead of a second grant.
-func TestEventPromotionCreditSettlesOnAPriorCustomersGrant(t *testing.T) {
+// event_credit.py run, cannot fund the current customer: it stops for an
+// operator rather than being counted or duplicated.
+func TestEventPromotionCreditStopsOnAPriorCustomersGrant(t *testing.T) {
 	f := newEntitlementFixture(t)
 	h, ctx := f.h, t.Context()
 	team, contract, customer := f.c.TeamID, f.c.ID, f.c.CustomerID
@@ -159,6 +162,7 @@ func TestEventPromotionCreditSettlesOnAPriorCustomersGrant(t *testing.T) {
 	if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_event_promotion(promotion_code,label,credit_cents) VALUES($1,$2,8000)`, code, label); err != nil {
 		t.Fatal(err)
 	}
+	cleanupEventCredits(t, h, team)
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -191,14 +195,24 @@ func TestEventPromotionCreditSettlesOnAPriorCustomersGrant(t *testing.T) {
 	}))
 	defer srv.Close()
 	client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
-	if err = h.issueDueEventCredits(ctx, client); err != nil {
+	if err = h.issueDueEventCredits(ctx, client); err == nil || !strings.Contains(err.Error(), "operator review") {
+		t.Fatalf("prior customer's grant did not stop issuance: %v", err)
+	}
+	var state string
+	var issued bool
+	var lastError *string
+	if err = h.Pool.QueryRow(ctx, `SELECT state,stripe_credit_grant_id IS NOT NULL,last_error FROM billing_event_credit WHERE contract_id=$1`, contract).Scan(&state, &issued, &lastError); err != nil {
 		t.Fatal(err)
 	}
-	var state, grant string
-	if err = h.Pool.QueryRow(ctx, `SELECT state,stripe_credit_grant_id FROM billing_event_credit WHERE contract_id=$1`, contract).Scan(&state, &grant); err != nil {
-		t.Fatal(err)
+	if state == "issued" || issued || lastError == nil || posts.Load() != 0 {
+		t.Fatalf("state=%s issued=%t last_error=%v other requests=%d", state, issued, lastError, posts.Load())
 	}
-	if state != "issued" || grant != "credgr_manual" || posts.Load() != 0 {
-		t.Fatalf("state=%s grant=%s other requests=%d", state, grant, posts.Load())
-	}
+}
+
+// The billing worker issues due event credits across all teams, so a row left
+// pending must not reach later tests that share the database.
+func cleanupEventCredits(t *testing.T, h *Handlers, team uuid.UUID) {
+	t.Cleanup(func() {
+		_, _ = h.Pool.Exec(context.Background(), `DELETE FROM billing_event_credit WHERE team_id=$1`, team)
+	})
 }
