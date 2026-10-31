@@ -885,3 +885,27 @@ func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) 
 	}
 	return &vmdpb.ReviveVMResponse{DiskPath: diskPath, HostIp: hostIP}, nil
 }
+
+// ReshapeVM cold-boots a paused sandbox at a new shape; see
+// Manager.ReshapeVM.
+func (a *GRPCAdapter) ReshapeVM(ctx context.Context, req *vmdpb.ReshapeVMRequest) (*vmdpb.ReshapeVMResponse, error) {
+	// Fail closed: a request that omits the policy would bring a
+	// restricted sandbox back open.
+	egress := req.GetSandboxNetwork().GetEgress()
+	if egress == nil {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_network.egress is required: the cold boot must restate the sandbox's egress policy")
+	}
+	rules := &sandboxNetworkRules{
+		allowedCIDRs:   egress.GetAllowedCidrs(),
+		deniedCIDRs:    egress.GetDeniedCidrs(),
+		allowedDomains: egress.GetAllowedDomains(),
+	}
+	inst, err := a.mgr.ReshapeVM(ctx, req.GetVmId(), req.GetVcpu(), req.GetMemMib(), rules)
+	if err != nil {
+		return nil, err
+	}
+	inst.mu.RLock()
+	hostIP, vcpu, memMiB := inst.IP, inst.Config.VCPU, inst.Config.MemoryMiB
+	inst.mu.RUnlock()
+	return &vmdpb.ReshapeVMResponse{HostIp: hostIP, Vcpu: vcpu, MemMib: memMiB}, nil
+}

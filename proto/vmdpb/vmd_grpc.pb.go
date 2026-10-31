@@ -36,6 +36,7 @@ const (
 	VMDaemon_GetVMInfo_FullMethodName                  = "/superserve.vmd.v1.VMDaemon/GetVMInfo"
 	VMDaemon_SetupNetwork_FullMethodName               = "/superserve.vmd.v1.VMDaemon/SetupNetwork"
 	VMDaemon_ReviveVM_FullMethodName                   = "/superserve.vmd.v1.VMDaemon/ReviveVM"
+	VMDaemon_ReshapeVM_FullMethodName                  = "/superserve.vmd.v1.VMDaemon/ReshapeVM"
 	VMDaemon_UpdateSandboxNetwork_FullMethodName       = "/superserve.vmd.v1.VMDaemon/UpdateSandboxNetwork"
 	VMDaemon_UpdateSandboxPreviewPolicy_FullMethodName = "/superserve.vmd.v1.VMDaemon/UpdateSandboxPreviewPolicy"
 	VMDaemon_InvalidateSecret_FullMethodName           = "/superserve.vmd.v1.VMDaemon/InvalidateSecret"
@@ -109,6 +110,10 @@ type VMDaemonClient interface {
 	// carries the sandbox's identity, so nothing is re-injected, and any
 	// residue of the dead VM is force-torn-down first.
 	ReviveVM(ctx context.Context, in *ReviveVMRequest, opts ...grpc.CallOption) (*ReviveVMResponse, error)
+	// ReshapeVM cold-boots a paused sandbox from its own disk at a new
+	// vCPU count and memory size. Files survive; memory and processes do
+	// not, because a snapshot can only restore at the shape it was taken.
+	ReshapeVM(ctx context.Context, in *ReshapeVMRequest, opts ...grpc.CallOption) (*ReshapeVMResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error)
 	// UpdateSandboxPreviewPolicy replaces the explicit public-port allowlist on
@@ -320,6 +325,16 @@ func (c *vMDaemonClient) ReviveVM(ctx context.Context, in *ReviveVMRequest, opts
 	return out, nil
 }
 
+func (c *vMDaemonClient) ReshapeVM(ctx context.Context, in *ReshapeVMRequest, opts ...grpc.CallOption) (*ReshapeVMResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReshapeVMResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_ReshapeVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vMDaemonClient) UpdateSandboxNetwork(ctx context.Context, in *UpdateSandboxNetworkRequest, opts ...grpc.CallOption) (*UpdateSandboxNetworkResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(UpdateSandboxNetworkResponse)
@@ -481,6 +496,10 @@ type VMDaemonServer interface {
 	// carries the sandbox's identity, so nothing is re-injected, and any
 	// residue of the dead VM is force-torn-down first.
 	ReviveVM(context.Context, *ReviveVMRequest) (*ReviveVMResponse, error)
+	// ReshapeVM cold-boots a paused sandbox from its own disk at a new
+	// vCPU count and memory size. Files survive; memory and processes do
+	// not, because a snapshot can only restore at the shape it was taken.
+	ReshapeVM(context.Context, *ReshapeVMRequest) (*ReshapeVMResponse, error)
 	// UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
 	UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error)
 	// UpdateSandboxPreviewPolicy replaces the explicit public-port allowlist on
@@ -572,6 +591,9 @@ func (UnimplementedVMDaemonServer) SetupNetwork(context.Context, *SetupNetworkRe
 }
 func (UnimplementedVMDaemonServer) ReviveVM(context.Context, *ReviveVMRequest) (*ReviveVMResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReviveVM not implemented")
+}
+func (UnimplementedVMDaemonServer) ReshapeVM(context.Context, *ReshapeVMRequest) (*ReshapeVMResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReshapeVM not implemented")
 }
 func (UnimplementedVMDaemonServer) UpdateSandboxNetwork(context.Context, *UpdateSandboxNetworkRequest) (*UpdateSandboxNetworkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateSandboxNetwork not implemented")
@@ -927,6 +949,24 @@ func _VMDaemon_ReviveVM_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VMDaemon_ReshapeVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReshapeVMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).ReshapeVM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_ReshapeVM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).ReshapeVM(ctx, req.(*ReshapeVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VMDaemon_UpdateSandboxNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpdateSandboxNetworkRequest)
 	if err := dec(in); err != nil {
@@ -1156,6 +1196,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReviveVM",
 			Handler:    _VMDaemon_ReviveVM_Handler,
+		},
+		{
+			MethodName: "ReshapeVM",
+			Handler:    _VMDaemon_ReshapeVM_Handler,
 		},
 		{
 			MethodName: "UpdateSandboxNetwork",

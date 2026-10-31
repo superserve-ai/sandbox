@@ -59,7 +59,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath, blockM
 		return nil, err
 	}
 	defer unlock()
-	return m.reviveVMLocked(ctx, vmID, diskPath, basePath, blockMap, standaloneDisk, allowRecordless, teamID, ownerID, vcpu, memMiB, rules, "")
+	return m.reviveVMLocked(ctx, vmID, diskPath, basePath, blockMap, standaloneDisk, allowRecordless, false, teamID, ownerID, vcpu, memMiB, rules, "")
 }
 
 // reviveVMLocked is ReviveVM under the caller's per-VM op lock. A non-empty
@@ -67,7 +67,9 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath, blockM
 // record from its first durable write, so a retry after a crash still
 // recognizes the boot as its own. blockMap, when non-empty, is the
 // snapshot's saved overlay block map and boots with the disk.
-func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, blockMap string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules, backupGeneration string) (*VMInstance, error) {
+// replacePaused lets a reshape cold-boot over a healthy paused VM whose
+// disk it has already staged outside the run directory.
+func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, blockMap string, standaloneDisk, allowRecordless, replacePaused bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules, backupGeneration string) (*VMInstance, error) {
 	// Never revive over a live or healthy VM. A paused VM with its
 	// snapshot is healthy at rest and refused: resume owns that path.
 	if inst, err := m.getInstance(vmID); err == nil {
@@ -138,7 +140,7 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, 
 				}
 			}
 		}
-		if st == StatusPaused && snap != "" {
+		if st == StatusPaused && snap != "" && !replacePaused {
 			// The refusal delegates to resume, so it only holds when
 			// resume is actually possible: every recorded pause artifact
 			// must still exist. A paused record whose snapshot or memory
