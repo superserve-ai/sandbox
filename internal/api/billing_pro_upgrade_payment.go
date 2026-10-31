@@ -73,7 +73,7 @@ func (c *stripeHTTPClient) verifyProUpgradePayment(ctx context.Context, u proUpg
 		if err := c.doForm(ctx, http.MethodGet, "/v1/payment_methods/"+url.PathEscape(method), nil, &pm, ""); err != nil {
 			return "", nil, err
 		}
-		if pm.ID != method || pm.Customer != u.Customer || pm.Type != "card" {
+		if pm.ID != method || pm.Customer != u.Customer || (pm.Type != "card" && pm.Type != "link") {
 			return "", nil, errors.New("upgrade saved payment method differs")
 		}
 	}
@@ -226,6 +226,9 @@ func (h *Handlers) commitProUpgrade(ctx context.Context, conn *pgxpool.Conn, u *
 		var rounding string
 		if e := conn.QueryRow(ctx, `SELECT COALESCE((SELECT adjustment_price_id FROM billing_invoice_account WHERE team_id=$1),'')`, u.Team).Scan(&rounding); e != nil {
 			return e
+		}
+		if rounding, err = pendingInvoiceRounding(resources, rounding); err != nil {
+			return err
 		}
 		if err = invoiceCalendarCompatible(u.Anchor, resources, rounding); err != nil {
 			return err

@@ -735,15 +735,26 @@ WITH contract AS MATERIALIZED (
         AND (b.ends_at IS NULL OR b.ends_at > clock_timestamp())
 ), period AS MATERIALIZED (
     SELECT c.id AS contract_id, p.period_start::timestamptz AS period_start,
-        p.period_end::timestamptz AS period_end, p.amount_cents::bigint AS amount_cents
+        p.period_end::timestamptz AS period_end, p.amount_cents::bigint AS amount_cents, NULL::text AS upgrade_state
     FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) AS p(period_start, period_end, amount_cents)
+    UNION ALL
+    -- The first month an upgrade paid for runs before its recurring contract
+    -- starts; its own credit is what that month includes. A prorated upgrade's
+    -- credit starts partway through a period already in progress, so the
+    -- period's usage cannot be measured against it.
+    SELECT u.contract_id, u.period_start, u.period_end, COALESCE(u.bridge_credit_cents, u.amount_cents),
+        CASE WHEN u.grant_id IS NOT NULL OR COALESCE(u.bridge_credit_cents, u.amount_cents) = 0 THEN 'issued' ELSE 'pending' END
+    FROM billing_pro_upgrade u JOIN contract c ON c.id = u.contract_id
+    WHERE u.state IN ('credited', 'active') AND u.request_payload->>'FirstPaidProCycle' = 'true'
+        AND u.period_start <= clock_timestamp() AND u.period_end > clock_timestamp()
+        AND NOT EXISTS (SELECT 1 FROM billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()))
 )
 SELECT c.offer_key,
     CASE WHEN c.status = 'pending' AND EXISTS (SELECT 1 FROM team_plan_assignment a WHERE a.contract_id = c.id
         AND a.effective_to IS NULL AND a.effective_from <= clock_timestamp()) THEN 'active' ELSE c.status END::text AS status,
     c.starts_at, c.ends_at, c.charge_amount_cents, c.charge_interval_months,
     period.period_start, period.period_end, period.amount_cents AS period_amount_cents, e.state AS entitlement_state,
-    e.stripe_credit_grant_id AS entitlement_grant_id,
+    e.stripe_credit_grant_id AS entitlement_grant_id, period.upgrade_state,
     COALESCE((SELECT bp.display_name FROM billing_plan bp WHERE bp.offer_key = c.offer_key),
         (SELECT a.terms->>'display_name' FROM team_plan_assignment a WHERE a.contract_id = c.id ORDER BY a.effective_from DESC LIMIT 1), '')::text AS plan_display_name
 FROM contract c
@@ -752,7 +763,7 @@ LEFT JOIN billing_usage_entitlement e ON e.team_id = c.team_id AND e.contract_id
     AND e.kind = c.entitlement_kind AND e.period_start = period.period_start
 UNION ALL
 SELECT 'pro_annual'::text,'active'::text,a.starts_at,a.waiver_ends_at,0::bigint,12::integer,
- p.period_start::timestamptz,p.period_end::timestamptz,p.amount_cents::bigint,e.state,e.stripe_credit_grant_id,
+ p.period_start::timestamptz,p.period_end::timestamptz,p.amount_cents::bigint,e.state,e.stripe_credit_grant_id,NULL::text,
  COALESCE((SELECT bp.display_name FROM billing_plan bp WHERE bp.offer_key='pro_annual'), '')::text
 FROM billing_sponsored_annual_authority a JOIN billing_commercial_contract c ON c.id=a.contract_id
 LEFT JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract,clock_timestamp()) AS p(period_start,period_end,amount_cents) ON true
@@ -773,6 +784,7 @@ type GetCurrentCommercialPlanRow struct {
 	PeriodAmountCents    *int64             `json:"period_amount_cents"`
 	EntitlementState     *string            `json:"entitlement_state"`
 	EntitlementGrantID   *string            `json:"entitlement_grant_id"`
+	UpgradeState         *string            `json:"upgrade_state"`
 	PlanDisplayName      string             `json:"plan_display_name"`
 }
 
@@ -793,6 +805,7 @@ func (q *Queries) GetCurrentCommercialPlan(ctx context.Context, teamID uuid.UUID
 		&i.PeriodAmountCents,
 		&i.EntitlementState,
 		&i.EntitlementGrantID,
+		&i.UpgradeState,
 		&i.PlanDisplayName,
 	)
 	return i, err

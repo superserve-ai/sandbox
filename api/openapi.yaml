@@ -3558,7 +3558,7 @@ components:
 
     PrepaidCreditSummary:
       type: object
-      required: [balance_cents, low_balance, auto_recharge, has_saved_card, purchases]
+      required: [balance_cents, balance_observed, low_balance, auto_recharge, has_saved_card, purchases]
       properties:
         checkout_idempotency_supported:
           type: boolean
@@ -3566,9 +3566,13 @@ components:
         balance_cents:
           type: integer
           format: int64
+          description: The observed balance; 0 when `balance_observed` is false.
+        balance_observed:
+          type: boolean
+          description: Whether `balance_cents` is a current observation. It is false before funding observation starts, once the observation is stale, and beyond the observation capacity; a 0 balance then means unknown, not used up.
         low_balance:
           type: boolean
-          description: Balance is below $5 and auto-recharge is off.
+          description: Auto-recharge is off and the balance is below the configured low-credit level on a prepaid-funded subscription (once the period's included grant and any top-off since have been observed), or below $5 on the legacy prepaid plan. Never true while `balance_observed` is false.
         has_saved_card:
           type: boolean
         auto_recharge:
@@ -3960,11 +3964,12 @@ components:
           example: Pro Annual
         status:
           type: string
-          enum: [active, pending, trial, trial_ended, payment_failed]
+          enum: [active, pending, trial, trial_ended, payment_failed, activating]
           description: >-
             pending until the plan's first payment is confirmed. A new team
             that has not bought a plan reports key trial with its entry state:
-            trial, trial_ended or payment_failed.
+            trial, trial_ended, payment_failed, or activating once its first
+            payment is confirmed and the plan is being assigned.
         price_usd:
           type: number
           format: double
@@ -4168,7 +4173,8 @@ components:
           format: double
         state:
           type: string
-          enum: [no_grant, active, exhausted, expired, ended_by_billing_activation]
+          enum: [no_grant, active, exhausted, expired, ended_by_billing_activation, auto_topoff, unknown]
+          description: "On a prepaid-funded plan this describes the funded credit: `auto_topoff` while Auto Topoff is on, `unknown` until the balance has been observed after the period's included grant and any later top-off. A trial awaiting its first plan is `exhausted` once it has ended, or `ended_by_billing_activation` while a paid checkout settles."
         eligible:
           type: boolean
 
@@ -4683,11 +4689,18 @@ components:
           description: Environment variables for the command.
         working_dir:
           type: string
-          description: Working directory (default `/home/user`).
+          description: Working directory (default the template's working directory, else the user's home, which is `/home/user` for root).
         timeout_s:
           type: integer
           default: 30
           description: Timeout in seconds.
+        user:
+          type: string
+          description: >
+            User to run the command as: a name, a uid, `name:group`, or
+            `uid:gid` (default the template's user). An unknown user or
+            group fails as `bad_request` (400 on `POST /exec`).
+          example: root
 
     ExecResult:
       type: object
@@ -5947,16 +5960,18 @@ components:
       properties:
         entry_state:
           type: string
-          enum: [trial, trial_ended, payment_failed, active]
+          enum: [trial, trial_ended, payment_failed, activating, active]
           description: >-
             Whether the team has paid for a plan. A new team is on its trial
             with compute until the trial credit runs out (trial_ended), or a
-            checkout still needs a usable card (payment_failed); active covers
-            every team with a plan.
+            checkout still needs a usable card (payment_failed). activating
+            means its first payment is confirmed and the plan is being
+            assigned, usually within seconds; show progress rather than the
+            plan picker. active covers every team with a plan.
         plan:
           type: object
           nullable: true
-          required: [plan_key, kind, display_name, limits, effective_from]
+          required: [plan_key, kind, display_name, limits, effective_from, funding_policy, topoff]
           properties:
             plan_key:
               type: string
@@ -5970,6 +5985,14 @@ components:
             effective_from:
               type: string
               format: date-time
+            funding_policy:
+              description: From the assignment's frozen terms. `prepaid` only for a subscription frozen as prepaid-funded; every other plan, including the legacy prepaid kind, reports `postpaid`.
+              allOf:
+                - $ref: "#/components/schemas/BillingFundingPolicy"
+            topoff:
+              description: The top-off frozen into the assignment's terms; null for postpaid plans.
+              allOf:
+                - $ref: "#/components/schemas/BillingPlanTopoff"
         period:
           type: object
           required: [start, end]

@@ -244,6 +244,7 @@ module "api" {
     STRIPE_PRO_ANNUAL_PRICE_ID            = "price_1UQiPzPyzR3Q9AgfHvQaYI5q"
     STRIPE_PORTAL_NO_CANCEL_CONFIGURATION = "bpc_1UVRHpPyzR3Q9Agfhk2O0aDP"
     APP_ALLOWED_ORIGINS                   = "https://console.superserve.ai"
+    CONSOLE_URL                           = "https://console.superserve.ai"
 
     # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
 
@@ -312,7 +313,7 @@ module "cloud_ids" {
   network_self_link          = module.network.network_self_link
   endpoint_name              = "superserve-ids-${local.resource_suffix}"
   mirrored_subnet_self_links = local.cloud_ids_mirrored_subnet_self_links
-  notification_channel_ids   = var.notification_channel_ids
+  notification_channel_ids   = var.cloud_ids_notification_channel_ids
   runbook_base_url           = var.cloud_ids_runbook_base_url
   labels                     = local.common_labels
 }

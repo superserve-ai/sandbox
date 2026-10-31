@@ -22,12 +22,33 @@ type ycMailJob struct {
 }
 
 func (h *Handlers) ycConsoleOrigin() (string, error) {
-	u, e := url.Parse(os.Getenv("YC_CONSOLE_URL"))
-	if e != nil || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+	origin, err := h.mailConsoleOrigin(os.Getenv("YC_CONSOLE_URL"))
+	if err != nil {
 		return "", errors.New("YC console origin is not configured")
 	}
+	return origin, nil
+}
+
+// ConsoleOrigin is the console origin billing mail links to, from
+// CONSOLE_URL, or empty when it is not configured.
+func (h *Handlers) ConsoleOrigin() string {
+	if h.Config == nil {
+		return ""
+	}
+	origin, err := h.mailConsoleOrigin(h.Config.ConsoleURL)
+	if err != nil {
+		return ""
+	}
+	return origin
+}
+
+func (h *Handlers) mailConsoleOrigin(raw string) (string, error) {
+	u, e := url.Parse(raw)
+	if e != nil || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("console origin is not configured")
+	}
 	if u.Scheme != "https" && !(u.Scheme == "http" && h.ycLocalMailConfigured() && ycLoopbackOrigin(u)) {
-		return "", errors.New("YC console origin is not configured")
+		return "", errors.New("console origin is not configured")
 	}
 	return u.Scheme + "://" + u.Host, nil
 }

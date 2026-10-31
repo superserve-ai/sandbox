@@ -684,6 +684,8 @@ func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryP
 			if *row.EntitlementState == "issued" {
 				status = "issued"
 			}
+		} else if row.UpgradeState != nil {
+			status = *row.UpgradeState
 		}
 		plan.IncludedUsage = &billingSummaryIncludedUsage{
 			AmountCents: *row.PeriodAmountCents,

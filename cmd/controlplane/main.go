@@ -155,6 +155,12 @@ func run() error {
 			poolCfg.MaxConns = int32(n)
 		}
 	}
+	// Invoice and Pro upgrade reconciliation hold a lock transaction while
+	// writing on a second connection, so one connection would deadlock them.
+	if poolCfg.MaxConns < 2 {
+		log.Warn().Int32("requested", poolCfg.MaxConns).Msg("DB_MAX_CONNS below 2; using 2")
+		poolCfg.MaxConns = 2
+	}
 	// Lifetime + jitter bound how long any one connection can persist and
 	// stagger recycling so a pool's worth of connections never expires (and
 	// redials) in the same instant. ConnectTimeout bounds the dial itself, so
@@ -166,10 +172,7 @@ func run() error {
 	poolCfg.MaxConnLifetimeJitter = 5 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 30 * time.Second
-	// Clamped to the cap: a DB_MAX_CONNS below 2 is a valid override, and
-	// pgxpool rejects (rather than clamps) a minimum above the maximum,
-	// which would fail startup instead of running with a smaller pool.
-	poolCfg.MinIdleConns = min(2, poolCfg.MaxConns)
+	poolCfg.MinIdleConns = 2
 	poolCfg.ConnConfig.ConnectTimeout = 5 * time.Second
 	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -238,7 +241,7 @@ func run() error {
 	handlers.MachineCredentials = machineAuthority
 	handlers.EmailTransport = api.EmailTransport{SMTPAddr: cfg.SMTPAddr}
 	if sender, from := handlers.EmailTransport.Sender(os.Getenv("RESEND_API_KEY")), os.Getenv("QUOTA_EMAIL_FROM"); sender != nil && from != "" {
-		handlers.TrialWarningSender = api.NewEmailTrialCreditWarningSender(sender, from, queries)
+		handlers.TrialWarningSender = api.NewEmailTrialCreditWarningSender(sender, from, handlers.ConsoleOrigin(), queries)
 	}
 	handlers.Pool = dbPool
 	handlers.PromotionAuthPool = newPromotionAuthPool(ctx, os.Getenv("PROMOTION_AUTH_DATABASE_URL"))
@@ -489,7 +492,7 @@ func run() error {
 		quotaNotifiers = append(quotaNotifiers, api.NewSlackQuotaNotifier(webhook))
 	}
 	if sender, from := handlers.EmailTransport.Sender(os.Getenv("RESEND_API_KEY")), os.Getenv("QUOTA_EMAIL_FROM"); sender != nil && from != "" {
-		quotaNotifiers = append(quotaNotifiers, api.NewEmailQuotaNotifier(sender, from, queries))
+		quotaNotifiers = append(quotaNotifiers, api.NewEmailQuotaNotifier(sender, from, handlers.ConsoleOrigin(), queries))
 	}
 	if len(quotaNotifiers) > 0 {
 		go api.StartQuotaWatcher(ctx, queries, quotaNotifiers)

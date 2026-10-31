@@ -20,5 +20,5 @@ func RefreshActiveTrialEligibilityForTest(h *Handlers, ctx context.Context) {
 }
 
 func NewTrialCreditWarningSenderForTest(q *db.Queries, endpoint string, client *http.Client) *EmailTrialCreditWarningSender {
-	return NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: endpoint, client: client}, "team@example.com", q)
+	return NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: endpoint, client: client}, "team@example.com", "", q)
 }

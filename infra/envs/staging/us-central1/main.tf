@@ -274,6 +274,7 @@ module "api" {
     ])
     STRIPE_API_VERSION  = "2026-05-27.dahlia"
     APP_ALLOWED_ORIGINS = "https://console-staging.superserve.ai"
+    CONSOLE_URL         = "https://console-staging.superserve.ai"
 
     # Cloud Run front-end hop; staging has no load balancer in front of the API.
     TRUSTED_PROXY_CIDRS = "169.254.0.0/16"

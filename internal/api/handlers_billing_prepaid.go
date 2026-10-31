@@ -38,6 +38,19 @@ const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'s
      'revoke_closed_unexecuted',d.revoked_at IS NULL AND d.revoke_retry_after IS NOT DISTINCT FROM 'infinity') ORDER BY d.version),'[]') FROM billing_prepaid_reversal_decision d WHERE d.purchase_id=r.purchase_id))
   FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id))`
 
+// prepaidBalanceObservedSQL is whether balance_cents is a current observation;
+// before enrolment, once stale, or beyond the observation cap it is not, and a
+// zero balance then means unknown rather than used up.
+const prepaidBalanceObservedSQL = `COALESCE(f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp(),false)`
+
+// prepaidLowBalanceSQL compares a prepaid-funded subscription's balance, once
+// low-credit messaging may read it, with the configured low-credit level, and
+// the legacy prepaid kind's observed balance with its fixed level.
+const prepaidLowBalanceSQL = `(SELECT CASE WHEN bool_or(p.kind='subscription' AND billing_assignment_prepaid_funded(p))
+  THEN billing_prepaid_warning_balance_ready(t.team_id) AND f.credit_usd*100<(SELECT low_credit_warning_cents FROM billing_funding_policy WHERE singleton)
+  ELSE ` + prepaidBalanceObservedSQL + ` AND floor(f.credit_usd*100)<500 END
+ FROM team_plan_assignment p WHERE p.team_id=t.team_id AND p.effective_to IS NULL)`
+
 const prepaidAutoRechargeCapExceededSQL = `(a.amount_cents>1000000 OR a.threshold_cents>1000000)`
 const prepaidAutoRechargeEnabledSQL = `(COALESCE(a.enabled,false) AND NOT ` + prepaidAutoRechargeCapExceededSQL + `)`
 
@@ -49,8 +62,9 @@ func (h *Handlers) prepaidSummary(ctx context.Context, team uuid.UUID, purchases
 	var raw []byte
 	err := h.Pool.QueryRow(ctx, `SELECT jsonb_build_object(
  'checkout_idempotency_supported',true,
- 'balance_cents',CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END,
- 'low_balance',(CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END)<500 AND NOT `+prepaidAutoRechargeEnabledSQL+`,
+ 'balance_cents',CASE WHEN `+prepaidBalanceObservedSQL+` THEN floor(f.credit_usd*100)::bigint ELSE 0 END,
+ 'balance_observed',`+prepaidBalanceObservedSQL+`,
+ 'low_balance',COALESCE(`+prepaidLowBalanceSQL+` AND NOT `+prepaidAutoRechargeEnabledSQL+`,false),
  'auto_recharge',`+prepaidAutoRechargeJSON+`,
  'has_saved_card',COALESCE(f.payment_method_ready,false),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.created_at DESC),'[]') FROM
@@ -174,6 +188,7 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	if !acceptedRedirects && acceptedLease == nil {
 		admission, admissionErr := h.teamPricingState(ctx, team)
 		if admissionErr != nil {
+			log.Warn().Err(admissionErr).Str("team_id", team.String()).Msg("team pricing state unavailable")
 			respondErrorMsg(c, "service_unavailable", "team plan admission requires verification", 503)
 			return
 		}
@@ -237,8 +252,11 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		respondErrorMsg(c, "service_unavailable", "prepaid credit is temporarily unavailable; try again later", http.StatusServiceUnavailable)
 		return
 	}
+	// Only a plan checkout still in progress conflicts. A committed one leaves
+	// the team on its plan, and preparePrepaidPurchase decides whether that plan
+	// can buy credit.
 	var proPending bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, team).Scan(&proPending); err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND state='pending' AND offer_key IN `+paidPlanOffers+`)`, team).Scan(&proPending); err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
@@ -284,6 +302,10 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 			respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 			return
 		}
+		if errors.Is(err, errPlanCannotBuyCredit) || errors.Is(err, errUnknownPlan) {
+			respondErrorMsg(c, "conflict", "this team's plan cannot buy credit", http.StatusConflict)
+			return
+		}
 		log.Error().Err(err).Str("team_id", team.String()).Msg("create prepaid checkout failed")
 		respondErrorMsg(c, "bad_gateway", "checkout could not be created; try again", http.StatusBadGateway)
 		return
@@ -309,7 +331,7 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 	}
 	var req prepaidAutoRechargeBody
 	if err = c.ShouldBindJSON(&req); err != nil {
-		respondErrorMsg(c, "bad_request", "invalid auto-recharge settings", http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", "invalid Auto Reload settings", http.StatusBadRequest)
 		return
 	}
 	if req.Enabled {
@@ -365,7 +387,7 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 				return
 			}
 			if !ok || !plan.prepaidFunded() {
-				respondErrorMsg(c, "conflict", "auto-recharge requires a prepaid plan", http.StatusConflict)
+				respondErrorMsg(c, "conflict", "Auto Reload requires a prepaid plan", http.StatusConflict)
 				return
 			}
 			var ready bool
@@ -374,7 +396,7 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 				return
 			}
 			if !ready {
-				respondErrorMsg(c, "conflict", "auto-recharge needs a card saved by an earlier credit purchase", http.StatusConflict)
+				respondErrorMsg(c, "conflict", "Auto Reload needs a payment method saved by an earlier credit purchase", http.StatusConflict)
 				return
 			}
 			_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by,admission_source,admission_epoch) VALUES($1,true,$2,$3,$4,$5,$6)
@@ -431,7 +453,7 @@ func (h *Handlers) DisablePlatformAutoRecharge(c *gin.Context) {
 	err = h.Pool.QueryRow(c.Request.Context(), `UPDATE billing_prepaid_auto_recharge SET enabled=false,disabled_reason=$2,disabled_at=clock_timestamp(),disabled_by=$3,notified_at=clock_timestamp(),updated_at=clock_timestamp()
  WHERE team_id=$1 AND enabled RETURNING disabled_at`, team, "disabled by staff: "+reason, actor).Scan(&disabled)
 	if errors.Is(err, pgx.ErrNoRows) {
-		respondErrorMsg(c, "not_found", "auto-recharge is not enabled for this team", http.StatusNotFound)
+		respondErrorMsg(c, "not_found", "Auto Reload is not enabled for this team", http.StatusNotFound)
 		return
 	}
 	if err != nil {

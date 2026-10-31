@@ -163,7 +163,9 @@ type Handlers struct {
 	PromotionAuthPool     *pgxpool.Pool                         // shared Auth source of original signup evidence
 	legacyStorageAccepted sync.Map                              // legacyStorageAckKey -> last durably accepted report ID
 	legacyStorageInFlight sync.Map                              // legacyStorageAckKey -> report ID with an active inline attempt or retry
-	BackupGC              backup.BlobAdmin                      // deletes from the cell's backup bucket; nil leaves the purge job off
+	lockSectionsOnce      sync.Once
+	lockSections          chan struct{}    // bounds sections holding a lock transaction while writing on a second connection
+	BackupGC              backup.BlobAdmin // deletes from the cell's backup bucket; nil leaves the purge job off
 	Config                *config.Config
 	Hosts                 HostRegistry // when set, routes VMD calls via host_id
 	Scheduler             Scheduler    // when set, picks host on create
@@ -225,6 +227,11 @@ type Handlers struct {
 	authzOnce sync.Once
 	authzSvc  *authz.Service
 
+	// proWake lets a Pro payment webhook start the reconciliation worker
+	// without waiting for its tick. Lazily created like activityGate.
+	proWakeOnce sync.Once
+	proWake     chan struct{}
+
 	// hostCaps is the positive-only host-capability attestation cache used by
 	// the standalone pre-flight checks (see hostcap_cache.go). Zero value is
 	// ready to use.
@@ -241,6 +248,13 @@ type Handlers struct {
 	// activationRecheck coalesces the per-team post-activation eligibility
 	// recheck: a 100-create burst asks the same question 100 times.
 	activationRecheck singleflight.Group
+
+	// billingPauseSeen holds the teams the previous pause sweep found
+	// ineligible. Only the single sweep loop reads or replaces it.
+	billingPauseSeen map[uuid.UUID]struct{}
+	// trialBacklogSampledAt is when this replica last counted the trial
+	// refresh backlog; the same single sweep loop owns it.
+	trialBacklogSampledAt time.Time
 }
 
 // asyncBookkeeping runs fire-and-forget post-VMD work in a background
@@ -3841,16 +3855,17 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	case dbErr != nil:
 		// DB insert failed but VMD succeeded or failed independently — the VM
 		// was already cleaned up best-effort above.
+		if quotaExceeded {
+			l.Info().Err(dbErr).Str("team_id", teamID.String()).Msg("CreateSandbox: quota exceeded")
+			h.respondQuotaExceeded(c, teamID)
+			return
+		}
 		l.Error().Err(dbErr).Str("reason", transientReason).Msg("CreateSandbox: INSERT failed")
 		if sourceRace {
 			respondSourceGone()
 			return
 		}
 		if respondSandboxAdmissionError(c, dbErr) {
-			return
-		}
-		if quotaExceeded {
-			h.respondQuotaExceeded(c, teamID)
 			return
 		}
 		if isVMDFileMissing(vmdErr) {

@@ -20,6 +20,10 @@ func assertPrepaidEntry(ctx context.Context, tx pgx.Tx, team uuid.UUID) error {
 	return err
 }
 
+// errPlanCannotBuyCredit rejects a credit purchase for a plan that is not
+// funded by credit, such as a postpaid subscription.
+var errPlanCannotBuyCredit = errors.New("this team's plan cannot buy credit")
+
 type prepaidPurchasePlan struct {
 	Terms       planTerms  `json:"terms"`
 	Predecessor *uuid.UUID `json:"predecessor"`
@@ -63,23 +67,37 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if err != nil {
 		return err
 	}
-	if !ok || (current.Kind != planKindFree && current.Kind != planKindPrepaid) {
-		return errors.New("this team's plan cannot buy prepaid credit")
+	if !ok || (current.Kind != planKindFree && !current.prepaidFunded()) {
+		return errPlanCannotBuyCredit
 	}
-	terms, err := h.planTermsForPricingVersion(ctx, "starter", admission.Version, tx)
-	if err != nil {
-		return err
+	// A credit-funded plan keeps its plan and buys credit on top of it; only a
+	// Free team moves to Starter, so only it needs Starter on sale.
+	retain := current.prepaidFunded()
+	terms := retainedPlanTerms(current)
+	if current.Kind != planKindSubscription {
+		if terms, err = h.planTermsForPricingVersion(ctx, "starter", admission.Version, tx); err != nil {
+			return err
+		}
+		if terms.Kind != planKindPrepaid || (terms.Retired && !retain) {
+			return errUnknownPlan
+		}
 	}
-	if terms.Kind != planKindPrepaid || terms.Retired {
-		return errUnknownPlan
-	}
-	snapshot, err := json.Marshal(prepaidPurchasePlan{Terms: terms, Predecessor: &current.ID, Retain: current.Kind == planKindPrepaid})
+	snapshot, err := json.Marshal(prepaidPurchasePlan{Terms: terms, Predecessor: &current.ID, Retain: retain})
 	if err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,plan_snapshot,admission_source,admission_epoch)
  VALUES($1,$2,$3,'checkout',$4,$5,'','',$6,$7,$8)`, id, team, customer, amount, actor, snapshot, pricingSource(admission), pricingEpoch(admission))
 	return err
+}
+
+// retainedPlanTerms records the subscription a credit purchase leaves in place.
+func retainedPlanTerms(p teamPlan) planTerms {
+	t := p.Terms
+	return planTerms{OfferKey: t.OfferKey, DisplayName: t.DisplayName, FeeCents: t.FeeCents, IntervalMonths: t.IntervalMonths,
+		MonthlyCreditCents: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, PricingVersion: t.PricingVersion, Family: t.Family,
+		Kind: t.Kind, Grants: t.Grants, Matching: t.Matching, Allowance: t.Allowance, Limits: p.Limits,
+		PrepaidFunded: t.FundingPolicy == fundingPolicyPrepaid, Topoff: t.Topoff}
 }
 
 var assignStarterAfterPurchase = settlePrepaidPlan
@@ -113,6 +131,9 @@ func settlePrepaidPlan(ctx context.Context, h *Handlers, team, purchase uuid.UUI
 	if err = json.Unmarshal(raw, &snapshot); err != nil {
 		return err
 	}
+	if snapshot.Retain {
+		return tx.Commit(ctx)
+	}
 	if snapshot.Terms.Kind != planKindPrepaid || snapshot.Terms.Retired {
 		return errors.New("paid purchase has invalid frozen Starter terms")
 	}
@@ -120,7 +141,7 @@ func settlePrepaidPlan(ctx context.Context, h *Handlers, team, purchase uuid.UUI
 	if err != nil {
 		return err
 	}
-	if snapshot.Retain || (ok && (snapshot.Predecessor == nil || current.ID != *snapshot.Predecessor)) || (!ok && snapshot.Predecessor != nil) {
+	if (ok && (snapshot.Predecessor == nil || current.ID != *snapshot.Predecessor)) || (!ok && snapshot.Predecessor != nil) {
 		return tx.Commit(ctx)
 	}
 	if _, err = assignTeamPlan(ctx, tx, planAssignment{Team: team, Terms: snapshot.Terms, Source: planSourceCreditPurchase, Actor: actor, Reason: "paid prepaid credit purchase", Key: key}); err != nil {

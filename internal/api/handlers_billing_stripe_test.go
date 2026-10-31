@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -845,5 +846,91 @@ func TestBillingExportRetryPreservesLegacyPayload(t *testing.T) {
 		if gotKey := stripeMeterEventIdempotencyKey(storedIdentifier, row.StripeEventName, derefString(row.StripeCustomerID), got, end.Add(-time.Second).Unix()); gotKey != key {
 			t.Fatal("legacy retry payload changed its idempotency key")
 		}
+	}
+}
+
+func TestStripeReplaysPreAutoReloadRequestUnderSavedKey(t *testing.T) {
+	type stored struct{ body, response string }
+	keys := map[string]stored{}
+	charges := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		body := r.PostForm.Encode()
+		key := r.Header.Get("Idempotency-Key")
+		if prior, ok := keys[key]; ok {
+			if prior.body != body {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"type":"idempotency_error","message":"Keys for idempotent requests can only be used with the same parameters they were first used with."}}`))
+				return
+			}
+			_, _ = w.Write([]byte(prior.response))
+			return
+		}
+		charges++
+		response := `{"id":"pi_local","status":"succeeded"}`
+		keys[key] = stored{body, response}
+		_, _ = w.Write([]byte(response))
+	}))
+	t.Cleanup(provider.Close)
+	client := &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+	base := url.Values{"amount": {"2500"}, "currency": {"usd"}, "customer": {"cus_local"}, "payment_method": {"pm_local"}, "off_session": {"true"}, "confirm": {"true"}}
+	before := url.Values{"payment_method_types[]": {"card"}, "description": {"Superserve prepaid credit (auto-recharge)"}}
+	after := url.Values{"payment_method_types[]": {"card", "link"}, "description": {prepaidRechargeDescription}}
+	for k, v := range base {
+		before[k], after[k] = v, v
+	}
+	if err := client.sendForm(t.Context(), http.MethodPost, "/v1/payment_intents", before, nil, "recharge-key"); err != nil {
+		t.Fatal(err)
+	}
+	var pi struct {
+		ID string `json:"id"`
+	}
+	if err := client.doForm(t.Context(), http.MethodPost, "/v1/payment_intents", after, &pi, "recharge-key"); err != nil || pi.ID != "pi_local" {
+		t.Fatalf("retry of a charge dispatched before the rename did not recover it: %q %v", pi.ID, err)
+	}
+	if charges != 1 {
+		t.Fatalf("retry charged %d times", charges)
+	}
+}
+
+func TestStripeReplaysCreditCheckoutSentBeforeInstantMethods(t *testing.T) {
+	keys := map[string]string{}
+	sessions := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		body := r.PostForm.Encode()
+		key := r.Header.Get("Idempotency-Key")
+		if prior, ok := keys[key]; ok {
+			if prior != body {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"type":"idempotency_error","message":"Keys for idempotent requests can only be used with the same parameters they were first used with."}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"cs_local"}`))
+			return
+		}
+		sessions++
+		keys[key] = body
+		_, _ = w.Write([]byte(`{"id":"cs_local"}`))
+	}))
+	t.Cleanup(provider.Close)
+	client := &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+	before := url.Values{"mode": {"payment"}, "customer": {"cus_local"}, "metadata[prepaid_purchase_id]": {"purchase-local"}, "payment_intent_data[setup_future_usage]": {"off_session"}}
+	after := url.Values{}
+	for k, v := range before {
+		after[k] = v
+	}
+	setInstantPaymentMethods(after)
+	if err := client.sendForm(t.Context(), http.MethodPost, "/v1/checkout/sessions", before, nil, "credit-key"); err != nil {
+		t.Fatal(err)
+	}
+	var session struct {
+		ID string `json:"id"`
+	}
+	if err := client.doForm(t.Context(), http.MethodPost, "/v1/checkout/sessions", after, &session, "credit-key"); err != nil || session.ID != "cs_local" {
+		t.Fatalf("retry of a credit Checkout sent before instant methods did not recover it: %q %v", session.ID, err)
+	}
+	if sessions != 1 {
+		t.Fatalf("retry created %d sessions", sessions)
 	}
 }

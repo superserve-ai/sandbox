@@ -33,14 +33,23 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 				now = time.Date(2026, 10, 31, 23, 50, 0, 0, time.UTC)
 			}
 			h, team, offer, params := newFirstCycleQuoteFixture(t, now, tc.offer)
+			// Quoting reconciles under the invoice lock, which holds a lock
+			// transaction beside its write connection; the settlement below
+			// stays on one connection.
 			poolConfig := h.Pool.Config()
+			poolConfig.MaxConns = 2
+			quotePool, err := pgxpool.NewWithConfig(t.Context(), poolConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(quotePool.Close)
 			poolConfig.MaxConns = 1
 			pool, err := pgxpool.NewWithConfig(t.Context(), poolConfig)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(pool.Close)
-			h.Pool, h.DB = pool, db.New(pool)
+			h.Pool, h.DB = quotePool, db.New(quotePool)
 			params.ResourceTerms = []StripeCheckoutResourceTerms{{ResourceKey: "vcpu", PriceID: "price_cpu", UnitAmountDecimal: "1", MeterID: "mtr_cpu", EventName: "cpu"}}
 			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 			u, err := h.proUpgrade(t.Context(), team)
@@ -73,6 +82,7 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 					t.Fatalf("cross-month recovery changed accepted quote: %+v %v", replay, e)
 				}
 			}
+			h.Pool, h.DB = pool, db.New(pool)
 			paidAt := h.nowUTC().Truncate(time.Second)
 			exec := func(sql string, args ...any) {
 				t.Helper()
@@ -267,8 +277,12 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 					t.Fatalf("Developer contract shows %q %q %v", shown.Name, shown.Status, e)
 				}
 			}
-			if current, e := h.DB.GetCurrentCommercialPlan(t.Context(), team); e != nil || current.Status != "active" {
+			current, e := h.DB.GetCurrentCommercialPlan(t.Context(), team)
+			if e != nil || current.Status != "active" {
 				t.Fatalf("activated first month reads %q in the billing summary: %v", current.Status, e)
+			}
+			if included := billingPlanFromContract(current).IncludedUsage; !tc.delayed && (included == nil || included.Status != "issued" || included.AmountCents != u.bridgeCreditAmount() || !included.PeriodStart.Equal(u.Start) || !included.PeriodEnd.Equal(u.End)) {
+				t.Fatalf("paid first month shows no included usage: %+v", included)
 			}
 			if tc.offer == "pro_monthly" && (settled != "pro_monthly/postpaid" || recharge != "none") {
 				t.Fatalf("Pro settled with prepaid funding: plan=%s recharge=%s", settled, recharge)

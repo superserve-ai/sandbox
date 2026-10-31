@@ -502,6 +502,30 @@ type BillingEntitlementWork struct {
 	LeaseGeneration    int64              `json:"lease_generation"`
 }
 
+type BillingEventCredit struct {
+	ContractID          uuid.UUID          `json:"contract_id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	CustomerID          string             `json:"customer_id"`
+	PromotionCode       string             `json:"promotion_code"`
+	Label               string             `json:"label"`
+	CreditCents         int64              `json:"credit_cents"`
+	State               string             `json:"state"`
+	StripeCreditGrantID *string            `json:"stripe_credit_grant_id"`
+	FirstAttemptAt      pgtype.Timestamptz `json:"first_attempt_at"`
+	NextAttemptAt       time.Time          `json:"next_attempt_at"`
+	Failures            int32              `json:"failures"`
+	LastError           *string            `json:"last_error"`
+	CreatedAt           time.Time          `json:"created_at"`
+	IssuedAt            pgtype.Timestamptz `json:"issued_at"`
+}
+
+type BillingEventPromotion struct {
+	PromotionCode string    `json:"promotion_code"`
+	Label         string    `json:"label"`
+	CreditCents   int64     `json:"credit_cents"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
 type BillingExportAllocation struct {
 	ID              uuid.UUID      `json:"id"`
 	TeamID          uuid.UUID      `json:"team_id"`
@@ -690,9 +714,11 @@ type BillingFundingAccount struct {
 }
 
 type BillingFundingPolicy struct {
-	Singleton        bool  `json:"singleton"`
-	MaxObservedTeams int32 `json:"max_observed_teams"`
-	BatchSize        int32 `json:"batch_size"`
+	Singleton             bool            `json:"singleton"`
+	MaxObservedTeams      int32           `json:"max_observed_teams"`
+	BatchSize             int32           `json:"batch_size"`
+	LowCreditGrantGrace   pgtype.Interval `json:"low_credit_grant_grace"`
+	LowCreditWarningCents int64           `json:"low_credit_warning_cents"`
 }
 
 type BillingIncrementalPeriod struct {
@@ -1297,6 +1323,13 @@ type BillingProviderCredit struct {
 	ObservedAt    time.Time `json:"observed_at"`
 }
 
+type BillingRenewalInvoiceAlert struct {
+	TeamID      uuid.UUID `json:"team_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	AlertedAt   time.Time `json:"alerted_at"`
+}
+
 type BillingRollupBackfillState struct {
 	Name          string    `json:"name"`
 	NextHourStart time.Time `json:"next_hour_start"`
@@ -1452,6 +1485,8 @@ type BillingTrialPolicy struct {
 	MaxMemoryMib *int32         `json:"max_memory_mib"`
 	MaxDiskMib   *int32         `json:"max_disk_mib"`
 	UpdatedAt    time.Time      `json:"updated_at"`
+	MaxTemplates *int32         `json:"max_templates"`
+	MaxSnapshots *int32         `json:"max_snapshots"`
 }
 
 type BillingUsageEntitlement struct {

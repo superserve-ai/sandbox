@@ -305,7 +305,7 @@ func TestTrialCreditWarningSenderReturnsRecoverableFailure(t *testing.T) {
 }
 
 func TestResendTrialCreditWarningRequiresProviderConfiguration(t *testing.T) {
-	sender := NewEmailTrialCreditWarningSender(nil, "", nil)
+	sender := NewEmailTrialCreditWarningSender(nil, "", "", nil)
 	if err := sender.SendTrialCreditWarning(context.Background(), uuid.New(), 1); err == nil {
 		t.Fatal("missing provider configuration must not be treated as a successful send")
 	}
@@ -464,58 +464,69 @@ func TestTrialCreditWarningSuppressesInactiveTrialStates(t *testing.T) {
 	}
 }
 
-func TestTrialCreditWarningProcessingDoesNotSendForInactiveTrials(t *testing.T) {
-	for _, state := range []string{"exhausted", "ended_by_billing_activation"} {
-		t.Run(state, func(t *testing.T) {
-			sent := false
-			if err := sendTrialCreditWarningIfEligible(false, state, func() error {
-				sent = true
-				return nil
-			}); err != nil {
-				t.Fatalf("unexpected processing error: %v", err)
-			}
-			if sent {
-				t.Fatal("inactive trial must not invoke the warning sender")
+func TestCreditWarningOpenByKind(t *testing.T) {
+	usd := func(cents int64) pgtype.Numeric { return pgtype.Numeric{Int: big.NewInt(cents), Exp: -2, Valid: true} }
+	for _, tc := range []struct {
+		name string
+		row  db.GetTeamTrialBalanceRow
+		want bool
+	}{
+		{"legacy active trial", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "active", Eligible: true, RemainingUsd: usd(100)}, true},
+		{"legacy exhausted trial", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "exhausted", RemainingUsd: usd(0)}, false},
+		{"legacy trial ended by billing", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "ended_by_billing_activation", RemainingUsd: usd(0)}, false},
+		{"trial still running", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "active", Eligible: true, RemainingUsd: usd(1)}, false},
+		{"trial ended", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "exhausted", RemainingUsd: usd(0)}, true},
+		{"trial never granted", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "no_grant", RemainingUsd: usd(0)}, false},
+		{"prepaid at the low-credit level", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(100), LowCreditUsd: usd(100)}, false},
+		{"prepaid below the low-credit level", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(99), LowCreditUsd: usd(100)}, true},
+		{"prepaid used up", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "exhausted", RemainingUsd: usd(0), LowCreditUsd: usd(100)}, true},
+		{"prepaid with auto top-off", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "auto_topoff", RemainingUsd: usd(100), LowCreditUsd: usd(100)}, false},
+		{"prepaid unobserved", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "unknown", RemainingUsd: usd(0), LowCreditUsd: usd(100)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, got := creditWarningOpen(tc.row); got != tc.want {
+				t.Fatalf("creditWarningOpen = %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestTrialCreditWarningDeliveryPropagatesProviderOutcome(t *testing.T) {
-	called := 0
-	want := errors.New("provider rejected request")
-	if err := sendTrialCreditWarningIfEligible(true, "active", func() error {
-		called++
-		return want
-	}); !errors.Is(err, want) {
-		t.Fatalf("provider error = %v, want %v", err, want)
+func TestCreditWarningEmailCopyIsPlanNeutral(t *testing.T) {
+	const origin = "https://console.example.com"
+	for _, kind := range []string{"legacy_trial", creditWarningTrial, creditWarningPrepaid} {
+		subject, body := creditWarningEmail(kind, "example-team", 1.234, origin)
+		if subject == "" || !strings.Contains(body, "example-team") {
+			t.Fatalf("%s email missing subject or team: %q %s", kind, subject, body)
+		}
+		if strings.Contains(body, "$95") || strings.Contains(body, "Nothing is deleted") {
+			t.Fatalf("%s email names a plan-specific offer or promises the future: %s", kind, body)
+		}
+		if kind != creditWarningTrial && strings.Contains(strings.ToLower(subject+body), "trial") {
+			t.Fatalf("%s low-credit email names the trial: %q %s", kind, subject, body)
+		}
 	}
-	if called != 1 {
-		t.Fatalf("provider calls = %d, want 1", called)
+	if _, legacy := creditWarningEmail("legacy_trial", "example-team", 1.234, origin); strings.Contains(legacy, "Buy usage") || !strings.Contains(legacy, "$1.23") {
+		t.Fatalf("legacy trial email must quote the balance and offer nothing to buy: %s", legacy)
 	}
-
-	called = 0
-	if err := sendTrialCreditWarningIfEligible(true, "active", func() error {
-		called++
-		return nil
-	}); err != nil {
-		t.Fatalf("accepted provider outcome = %v", err)
+	for _, tc := range []struct {
+		kind string
+		want []string
+	}{
+		{creditWarningTrial, []string{"paused", "Nothing has been deleted", "Choose a plan", origin + "/\""}},
+		{creditWarningPrepaid, []string{"Your credit balance is too low. Buy usage to continue running sandboxes.", "Buy usage", origin + "/plan-usage/\""}},
+	} {
+		subject, body := creditWarningEmail(tc.kind, "example-team", 0.5, origin)
+		for _, want := range tc.want {
+			if !strings.Contains(subject+body, want) {
+				t.Fatalf("%s email missing %q: %q %s", tc.kind, want, subject, body)
+			}
+		}
+		if _, unlinked := creditWarningEmail(tc.kind, "example-team", 0.5, ""); strings.Contains(unlinked, "text-transform:uppercase") {
+			t.Fatalf("%s email links somewhere without a configured console: %s", tc.kind, unlinked)
+		}
 	}
-	if called != 1 {
-		t.Fatalf("provider calls after acceptance = %d, want 1", called)
-	}
-}
-
-func TestTrialCreditWarningDeliverySkipsProviderForIneligibleState(t *testing.T) {
-	called := 0
-	if err := sendTrialCreditWarningIfEligible(false, "ended_by_billing_activation", func() error {
-		called++
-		return errors.New("must not send")
-	}); err != nil {
-		t.Fatalf("ineligible delivery = %v, want nil", err)
-	}
-	if called != 0 {
-		t.Fatalf("provider calls for ended trial = %d, want 0", called)
+	if _, prepaid := creditWarningEmail(creditWarningPrepaid, "example-team", 0.5, origin); strings.Contains(prepaid, "$") {
+		t.Fatalf("low-credit email quotes an amount: %s", prepaid)
 	}
 }
 
@@ -589,7 +600,7 @@ func TestTrialCreditWarningSenderKeepsRecipientsPrivate(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
-	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
+	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", "", queries)
 	if err := sender.SendTrialCreditWarningWithKey(context.Background(), uuid.New(), 1.23, uuid.New()); err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +705,7 @@ func TestTrialCreditWarningPartialDeliverySurvivesNewClaim(t *testing.T) {
 				w.WriteHeader(http.StatusAccepted)
 			}))
 			defer server.Close()
-			sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
+			sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", "", queries)
 			err := sender.SendTrialCreditWarningWithKey(context.Background(), teamID, 1.23, claimToken)
 			var unknown *unknownEmailOutcomeError
 			var permanent *rejectedEmailError
@@ -957,7 +968,7 @@ func TestTrialCreditWarningAllRecipientsRevokedRemainsRetryable(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
-	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
+	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", "", queries)
 	err := sender.SendTrialCreditWarningWithKey(context.Background(), uuid.New(), 1, uuid.New())
 	var unknown *unknownEmailOutcomeError
 	var permanent *rejectedEmailError

@@ -74,6 +74,7 @@ type execRequest struct {
 	Env        map[string]string `json:"env,omitempty"`
 	WorkingDir string            `json:"working_dir,omitempty"`
 	TimeoutS   int               `json:"timeout_s,omitempty"`
+	User       string            `json:"user,omitempty"`
 }
 
 type execResponse struct {
@@ -103,6 +104,7 @@ func (r *execRequest) toStartRequest() *pb.StartRequest {
 		Envs:      r.Env,
 		Cwd:       r.WorkingDir,
 		TimeoutMs: timeoutMs,
+		User:      r.User,
 	}
 }
 

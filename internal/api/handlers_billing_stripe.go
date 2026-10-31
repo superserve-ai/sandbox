@@ -188,6 +188,13 @@ const (
 	checkoutTopoffOff   = "off"
 )
 
+// Instant, card-backed methods only: cards (which carry Apple Pay and Google
+// Pay wallets) and Link. Each can be charged off session for Auto Reload.
+func setInstantPaymentMethods(form url.Values) {
+	form.Set("payment_method_types[0]", "card")
+	form.Set("payment_method_types[1]", "link")
+}
+
 func checkoutTopoffMessage(amount int64) string {
 	dollars := fmt.Sprintf("$%d", amount/100)
 	if amount%100 != 0 {
@@ -539,11 +546,11 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	form.Set("mode", "subscription")
 	if params.SetupOnly {
 		form.Set("mode", "setup")
-		form.Set("payment_method_types[0]", "card")
+		setInstantPaymentMethods(form)
 	}
 	if params.OneOffAmount > 0 {
 		form.Set("mode", "payment")
-		form.Set("payment_method_types[0]", "card")
+		setInstantPaymentMethods(form)
 		form.Set("payment_intent_data[setup_future_usage]", "off_session")
 		form.Set("invoice_creation[enabled]", "true")
 		form.Set("line_items[0][price_data][currency]", "usd")
@@ -592,10 +599,10 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 		form.Set("custom_fields[0][key]", checkoutTopoffField)
 		form.Set("custom_fields[0][type]", "dropdown")
 		form.Set("custom_fields[0][label][type]", "custom")
-		form.Set("custom_fields[0][label][custom]", "Auto Topoff")
-		form.Set("custom_fields[0][dropdown][options][0][label]", "Auto Topoff")
+		form.Set("custom_fields[0][label][custom]", "Auto Reload")
+		form.Set("custom_fields[0][dropdown][options][0][label]", "Enable")
 		form.Set("custom_fields[0][dropdown][options][0][value]", checkoutTopoffOn)
-		form.Set("custom_fields[0][dropdown][options][1][label]", "Off")
+		form.Set("custom_fields[0][dropdown][options][1][label]", "Disable")
 		form.Set("custom_fields[0][dropdown][options][1][value]", checkoutTopoffOff)
 		form.Set("custom_fields[0][dropdown][default_value]", def)
 		form.Set("custom_text[after_submit][message]", checkoutTopoffMessage(t.AmountCents))
@@ -684,6 +691,56 @@ func definitiveStripeRejection(err error) bool {
 }
 
 func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form url.Values, out any, idempotencyKey string) error {
+	err := c.sendForm(ctx, method, path, form, out, idempotencyKey)
+	var se *stripeRequestError
+	if idempotencyKey != "" && errors.As(err, &se) && strings.Contains(se.Message, "idempotency_error") {
+		if legacy, changed := preAutoReloadForm(form); changed {
+			return c.sendForm(ctx, method, path, legacy, out, idempotencyKey)
+		}
+	}
+	return err
+}
+
+// preAutoReloadForm rebuilds a request as binaries before the Auto Reload
+// rename sent it. A request whose response was lost before that deploy is
+// retried under its saved idempotency key, and Stripe only replays the
+// original result for identical parameters; rotating the key could charge
+// twice. Stripe forgets keys after 24 hours, after which this never applies.
+func preAutoReloadForm(form url.Values) (url.Values, bool) {
+	legacy := url.Values{}
+	for k, v := range form {
+		legacy[k] = append([]string(nil), v...)
+	}
+	changed := false
+	if legacy.Get("mode") == "payment" && legacy.Get("metadata[prepaid_purchase_id]") != "" && legacy.Get("invoice_creation[enabled]") == "" {
+		// Credit purchase Checkout sent no payment methods before they were
+		// limited to instant, card-backed ones.
+		legacy.Del("payment_method_types[0]")
+		legacy.Del("payment_method_types[1]")
+		return legacy, true
+	}
+	if legacy.Get("payment_method_types[1]") == "link" {
+		legacy.Del("payment_method_types[1]")
+		changed = true
+	}
+	if v := legacy["payment_method_types[]"]; len(v) == 2 && v[0] == "card" && v[1] == "link" {
+		legacy["payment_method_types[]"] = []string{"card"}
+		changed = true
+	}
+	if legacy.Get("description") == prepaidRechargeDescription {
+		legacy.Set("description", "Superserve prepaid credit (auto-recharge)")
+		changed = true
+	}
+	if legacy.Get("custom_fields[0][key]") == checkoutTopoffField {
+		legacy.Set("custom_fields[0][label][custom]", "Auto Topoff")
+		legacy.Set("custom_fields[0][dropdown][options][0][label]", "Auto Topoff")
+		legacy.Set("custom_fields[0][dropdown][options][1][label]", "Off")
+		changed = true
+	}
+	return legacy, changed
+}
+
+func (c *stripeHTTPClient) sendForm(ctx context.Context, method, path string, form url.Values, out any, idempotencyKey string) error {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
@@ -1961,6 +2018,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 			}
 			if errors.Is(err, errPricingV2Off) {
 				respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
+				return
+			}
+			if errors.Is(err, errPlanCannotBuyCredit) || errors.Is(err, errUnknownPlan) {
+				respondErrorMsg(c, "conflict", "this team's plan cannot buy credit", http.StatusConflict)
 				return
 			}
 			if errors.Is(err, errPrepaidPaymentPending) {

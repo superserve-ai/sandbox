@@ -267,6 +267,9 @@ func testProUpgradeFutureCredit(t *testing.T, monthlyCredit int64) {
 	if outcome, e := h.activateProUpgrade(t.Context(), u, params, StripeRetrievedCheckoutSession{}); e != nil || outcome != "active" {
 		t.Fatalf("activation: %s %v", outcome, e)
 	}
+	if current, e := h.DB.GetCurrentCommercialPlan(t.Context(), team); e != nil || billingPlanFromContract(current).IncludedUsage != nil {
+		t.Fatalf("a prorated upgrade measured the whole period's usage against its partial credit: %v", e)
+	}
 	conn, err = h.Pool.Acquire(t.Context())
 	if err != nil {
 		t.Fatal(err)

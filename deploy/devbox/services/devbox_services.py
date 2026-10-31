@@ -242,6 +242,7 @@ def api_env(env, runtime):
         "SMTP_PORT": "1025",
         "QUOTA_EMAIL_FROM": need(env, "EMAIL_FROM"),
         "APP_ALLOWED_ORIGINS": need(env, "CONSOLE_URL"),
+        "CONSOLE_URL": need(env, "CONSOLE_URL"),
         "EDGE_PROXY_DOMAIN": need(env, "EDGE_PROXY_DOMAIN"),
         "COMPUTE_RESTRICTIONS_SOURCE": "database",
         "TEMPLATE_BUILD_REGION": need(runtime, "host_region"),

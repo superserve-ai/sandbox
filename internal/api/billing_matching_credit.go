@@ -142,6 +142,7 @@ func (h *Handlers) matchingCreditTick(ctx context.Context, client *stripeHTTPCli
 	return runBillingPhases(ctx, time.Minute,
 		func(ctx context.Context) error { return h.recordPaidMatchingInvoices(ctx, client) },
 		func(ctx context.Context) error { return h.issueDueMatchingCredits(ctx, client) },
+		func(ctx context.Context) error { return h.issueDueEventCredits(ctx, client) },
 		func(ctx context.Context) error { return h.reviewMatchedInvoices(ctx, client) },
 	)
 }
@@ -646,14 +647,21 @@ func (h *Handlers) withoutLedgerOwnedGrants(ctx context.Context, grants []billin
 // set for its period, so a grant appearing before release could wedge it. A
 // grant issued while no period awaits closing simply funds the next invoice.
 func (h *Handlers) holdCreditIssuanceFence(ctx context.Context, team uuid.UUID) (func(), error) {
+	// The fence holds the invoice lock while querying on another connection.
+	leave, err := h.lockSection(ctx)
+	if err != nil {
+		return nil, err
+	}
 	lock, err := h.Pool.Begin(ctx)
 	if err != nil {
+		leave()
 		return nil, err
 	}
 	release := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_ = lock.Rollback(cleanup)
+		leave()
 	}
 	var locked, closing bool
 	if err = lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked); err != nil {

@@ -123,15 +123,23 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 			if !o.Start.Valid || sub.ID != o.Subscription || sub.StartDate != o.Start.Time.Unix() || sub.BillingCycleAnchor != sub.StartDate {
 				return errors.New("adopted subscription association or anniversary changed")
 			}
-			tx, err := h.Pool.Begin(ctx)
+			leave, err := h.lockSection(ctx)
 			if err != nil {
 				return err
 			}
-			defer tx.Rollback(ctx)
-			if err = h.lockAndReconcileYCCalendar(ctx, tx, o, token); err != nil {
-				return err
-			}
-			if err = tx.Commit(ctx); err != nil {
+			err = func() error {
+				tx, err := h.Pool.Begin(ctx)
+				if err != nil {
+					return err
+				}
+				defer tx.Rollback(ctx)
+				if err = h.lockAndReconcileYCCalendar(ctx, tx, o, token); err != nil {
+					return err
+				}
+				return tx.Commit(ctx)
+			}()
+			leave()
+			if err != nil {
 				return err
 			}
 		}
@@ -475,6 +483,11 @@ func (h *Handlers) persistYCContract(ctx context.Context, o ycOperation, sub inv
 	if err != nil {
 		return err
 	}
+	leave, err := h.lockSection(ctx)
+	if err != nil {
+		return err
+	}
+	defer leave()
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err

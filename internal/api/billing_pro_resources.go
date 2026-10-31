@@ -95,6 +95,28 @@ func (h *Handlers) freezeProResourceTerms(ctx context.Context, team uuid.UUID, p
 func proResourceShape(p storagePrice) bool {
 	return p.Currency == "usd" && p.BillingScheme == "per_unit" && p.TransformQuantity == nil && p.Recurring.UsageType == "metered" && p.Recurring.Interval == "month" && p.Recurring.IntervalCount == 1
 }
+
+// Enrollment adds the rounding item before it records the price. Until then a
+// reader accepts exactly one item with the rounding product and price shape.
+func pendingInvoiceRounding(sub invoiceSubscription, recorded string) (string, error) {
+	if recorded != "" {
+		return recorded, nil
+	}
+	found := ""
+	for _, item := range sub.Items.Data {
+		p := item.Price
+		if p.Product != invoiceRoundingProduct {
+			continue
+		}
+		unit, err := meterDecimal(p.UnitAmountDecimal)
+		if found != "" || err != nil || unit.Cmp(big.NewRat(1, 1)) != 0 || !p.Active || !proResourceShape(p) || p.Recurring.Meter == "" {
+			return "", errors.New("pending invoice rounding item is ambiguous")
+		}
+		found = p.ID
+	}
+	return found, nil
+}
+
 func validateFrozenProResources(sub invoiceSubscription, terms []StripeCheckoutResourceTerms, rounding string) error {
 	expected := map[string]StripeCheckoutResourceTerms{}
 	seenEvents, seenMeters := map[string]bool{}, map[string]bool{}

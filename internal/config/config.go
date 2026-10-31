@@ -46,6 +46,7 @@ type Config struct {
 	StripeCheckoutPriceIDs        []string          // STRIPE_CHECKOUT_PRICE_IDS, required for checkout sessions
 	BillingResources              []BillingResourceConfig
 	AppAllowedOrigins             []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
+	ConsoleURL                    string   // CONSOLE_URL, the console origin linked from billing email; unset sends no link
 
 	// STRIPE_PORTAL_NO_CANCEL_CONFIGURATION, the customer portal configuration
 	// for teams on a catalog plan, whose cancellation goes through plan changes
@@ -179,6 +180,7 @@ func Load() (*Config, error) {
 		StripePlanPriceIDs:            planPrices,
 		BillingResources:              billingResources(checkoutPriceIDs),
 		AppAllowedOrigins:             splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
+		ConsoleURL:                    strings.TrimSpace(os.Getenv("CONSOLE_URL")),
 		SandboxAccessTokenSeed:        seed,
 		EdgeProxyDomain:               envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		TemplateBuildRegion:           buildRegion,

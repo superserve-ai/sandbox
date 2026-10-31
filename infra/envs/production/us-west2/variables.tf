@@ -113,6 +113,12 @@ variable "notification_channel_ids" {
   default     = []
 }
 
+variable "cloud_ids_notification_channel_ids" {
+  description = "Notification channel resource names for Cloud IDS alert policies, separate from notification_channel_ids."
+  type        = list(string)
+  default     = ["projects/rayai-prod/notificationChannels/2291252479812746679", "projects/rayai-prod/notificationChannels/17044408421759047225"]
+}
+
 variable "create_network" {
   type    = bool
   default = false

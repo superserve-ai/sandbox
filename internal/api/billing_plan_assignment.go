@@ -314,6 +314,10 @@ type customerPlan struct {
 	DisplayName   string     `json:"display_name"`
 	Limits        planLimits `json:"limits"`
 	EffectiveFrom time.Time  `json:"effective_from"`
+	// From the assignment's frozen terms, so a later catalog edit, retirement
+	// or rollback never changes how the team is funded.
+	FundingPolicy string      `json:"funding_policy"`
+	Topoff        *planTopoff `json:"topoff"`
 }
 
 type customerPendingPlanChange struct {
@@ -385,7 +389,11 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	var plan *customerPlan
 	if assigned {
 		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
-			Limits: planLimits{MaxConcurrent: &limits.MaxConcurrent, MaxVCPU: &limits.MaxVCPU, MaxMemoryMiB: &limits.MaxMemoryMiB, MaxDiskMiB: &limits.MaxDiskMiB, MaxTemplates: &limits.MaxTemplates}}
+			Limits:        planLimits{MaxConcurrent: &limits.MaxConcurrent, MaxVCPU: &limits.MaxVCPU, MaxMemoryMiB: &limits.MaxMemoryMiB, MaxDiskMiB: &limits.MaxDiskMiB, MaxTemplates: &limits.MaxTemplates},
+			FundingPolicy: fundingPolicyPostpaid}
+		if current.Terms.FundingPolicy == fundingPolicyPrepaid {
+			plan.FundingPolicy, plan.Topoff = fundingPolicyPrepaid, current.Terms.Topoff
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,

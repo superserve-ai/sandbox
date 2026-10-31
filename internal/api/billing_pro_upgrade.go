@@ -345,25 +345,59 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 	c.JSON(http.StatusOK, billingSessionResponse{URL: s.URL})
 }
 
+var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
+
+// lockSection reserves room for a section that holds or waits on the invoice
+// lock while it needs another connection or holds one. Admitting at most
+// MaxConns-1 leaves a connection free, so holders and waiters cannot all wait
+// on each other.
+func (h *Handlers) lockSection(ctx context.Context) (func(), error) {
+	h.lockSectionsOnce.Do(func() {
+		h.lockSections = make(chan struct{}, max(1, int(h.Pool.Config().MaxConns)-1))
+	})
+	select {
+	case h.lockSections <- struct{}{}:
+		return func() { <-h.lockSections }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*pgxpool.Conn, func(), error) {
-	conn, err := h.Pool.Acquire(ctx)
+	// A transaction pins its backend through the transaction pooler and its
+	// lock ends with it; a session lock can outlive the attempt on a pooled
+	// backend and block the team. Writes run on a separate connection, taken
+	// before the lock: a waiter for the lock may hold the pool's last slot.
+	leave, err := h.lockSection(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	var locked bool
-	err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
-	if err != nil || !locked {
+	conn, err := h.Pool.Acquire(ctx)
+	if err != nil {
+		leave()
+		return nil, nil, err
+	}
+	lockTx, err := h.Pool.Begin(ctx)
+	if err != nil {
 		conn.Release()
-		return nil, nil, errors.New("invoice reconciliation is busy")
+		leave()
+		return nil, nil, err
 	}
 	release := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
-		var unlocked bool
-		if e := conn.QueryRow(cleanup, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&unlocked); e != nil || !unlocked {
-			_ = conn.Conn().Close(cleanup)
-		}
+		_ = lockTx.Rollback(cleanup)
 		conn.Release()
+		leave()
+	}
+	var locked bool
+	err = lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
+	if err != nil || !locked {
+		release()
+		if err == nil {
+			err = errProReconciliationBusy
+		}
+		return nil, nil, err
 	}
 	return conn, release, nil
 }
@@ -376,7 +410,9 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 		return "", errors.New("Pro payment verification unavailable")
 	}
 	token := uuid.New()
-	if _, err := h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token}); err != nil {
+	if _, err := h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token}); errors.Is(err, pgx.ErrNoRows) {
+		return "", errProReconciliationBusy
+	} else if err != nil {
 		return "", err
 	}
 	defer func() {
@@ -516,7 +552,13 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	if err = h.issueProUpgradeCredit(ctx, conn, &u, client); err != nil {
 		return "", err
 	}
+	cardless := false
 	if method == "" {
+		if cardless, err = eventCheckout(ctx, conn, session, u.Team, u.Customer); err != nil {
+			return "", err
+		}
+	}
+	if method == "" && !cardless {
 		method, err = h.ensureProUpgradePaymentMethod(ctx, conn, u, params, client)
 		if err != nil {
 			return "", err
@@ -557,8 +599,11 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 	if derefString(a.StripeCustomerID) != u.Customer || derefString(a.StripeSubscriptionID) != derefString(u.Subscription) {
 		return "", errors.New("upgrade billing association changed during enrollment")
 	}
-	var completed uuid.UUID
-	if err = tx.QueryRow(ctx, `UPDATE billing_pro_upgrade SET state='active',last_error=NULL WHERE id=$1 AND state='credited' AND EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.id=billing_pro_upgrade.contract_id AND c.status<>'ended') RETURNING id`, u.ID).Scan(&completed); err != nil {
+	var contract uuid.UUID
+	if err = tx.QueryRow(ctx, `UPDATE billing_pro_upgrade SET state='active',last_error=NULL WHERE id=$1 AND state='credited' AND EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.id=billing_pro_upgrade.contract_id AND c.status<>'ended') RETURNING contract_id`, u.ID).Scan(&contract); err != nil {
+		return "", err
+	}
+	if err = recordEventCredit(ctx, tx, u.Team, contract, u.Customer, session.promotionCode()); err != nil {
 		return "", err
 	}
 	if err = h.DB.WithTx(tx).ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: u.Team, StripeGrantID: ""}); err != nil {
@@ -798,6 +843,9 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 	}
 	var rounding string
 	if err = conn.QueryRow(ctx, `SELECT COALESCE((SELECT adjustment_price_id FROM billing_invoice_account WHERE team_id=$1),'')`, u.Team).Scan(&rounding); err != nil {
+		return sub, err
+	}
+	if rounding, err = pendingInvoiceRounding(sub, rounding); err != nil {
 		return sub, err
 	}
 	expectedStart, expectedEnd, err := validateProUpgradeSubscription(*u, p, sub, rounding, h.nowUTC())
