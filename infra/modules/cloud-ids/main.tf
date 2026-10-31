@@ -33,10 +33,11 @@ locals {
 
   # Every extracted label contributes to incident identity. Keep variable
   # evidence in raw logs so it cannot split a related burst into new timelines.
+  # The IDS source address is often a rotating Google load balancer hop, so it
+  # stays out of identity; one scanner otherwise opens an incident per hop.
   ids_label_extractors = {
-    threat_name       = "EXTRACT(jsonPayload.name)"
-    threat_id         = "EXTRACT(jsonPayload.threat_id)"
-    source_ip_address = "EXTRACT(jsonPayload.source_ip_address)"
+    threat_name = "EXTRACT(jsonPayload.name)"
+    threat_id   = "EXTRACT(jsonPayload.threat_id)"
   }
 
   ids_logs_url = "https://console.cloud.google.com/logs/query;query=${urlencode(local.ids_log_filter)};duration=PT1H?project=${urlencode(var.project_id)}"
@@ -133,14 +134,17 @@ resource "google_monitoring_alert_policy" "ids_triage" {
 
       Threat name: $${log.extracted_label.threat_name}
       Threat ID: $${log.extracted_label.threat_id}
-      Observed source IP: $${log.extracted_label.source_ip_address}
+      Source IP: not part of this alert. The source address on an IDS finding is often a Google load balancer hop
+      (35.191.x or 130.211.x), not the real client; get the real client from load balancer request logs.
       Traffic direction: unknown (inbound/outbound/internal is not established).
       Sandbox/team attribution: unknown; host/platform origin is also unproven.
 
       [Investigate raw IDS findings in Logs Explorer](${local.ids_logs_url}).
       The link opens the last hour; for delayed triage, set an absolute time range around the incident event time.
-      Filter by the threat ID/name and observed source above. Inspect IDS severity, destination IP/port,
+      Filter by the threat ID/name above. Inspect IDS severity, source and destination IP/port,
       URI/filename, and protocol direction in the matching raw entries. Client/server direction does not establish inbound/outbound.
+      When the IDS source is a load balancer hop, match the finding's timestamp and URI/filename against
+      load balancer request logs (httpRequest.remoteIp) to identify the real client.
       Correlate the event timestamp and both addresses/ports with available network and host logs, then
       event-time sandbox lifecycle records to establish sandbox/team ownership. A translated IP or current
       host mapping alone is insufficient; keep attribution unknown when historical evidence is missing.
@@ -149,7 +153,7 @@ resource "google_monitoring_alert_policy" "ids_triage" {
       A finding can suppress notifications for unrelated activity during that interval; extracted labels
       do not provide independent notification limits. Inactive incidents auto-close after 30 minutes.
       Changing destinations, filenames, URIs, or detector severity does not create separate activity labels.
-      Unrelated activity sharing a signature and translated source can share a timeline;
+      Unrelated activity sharing a signature can share a timeline, even from different sources;
       policy-wide quotas also limit notifications for distinct activity. Raw findings remain queryable.
       Unknown attribution is not evidence of safety. If independent evidence shows platform compromise,
       customer impact, or another immediate security impact, manually contact the on-call responder and
