@@ -62,6 +62,20 @@ type proProviderFixture struct {
 	promotionCodes                                    bool
 }
 
+// A Pro upgrade is refused once the prorated charge for the rest of the
+// calendar period falls below the card minimum, so fixtures that buy Pro run
+// their handler clock at least proUpgradeLead before the period ends.
+const proUpgradeLead = 3 * time.Hour
+
+func (f *proProviderFixture) useProUpgradeClock() {
+	var offset time.Duration
+	now := time.Now().UTC()
+	if _, end := billing.CurrentBillingPeriod(now); end.Sub(now) < proUpgradeLead {
+		offset = proUpgradeLead - end.Sub(now)
+	}
+	f.handlers.Now = func() time.Time { return time.Now().UTC().Add(-offset) }
+}
+
 func newProFixture(t *testing.T, offer string) (*proProviderFixture, *gin.Engine, string) {
 	t.Helper()
 	team, key, _ := seedTeamAndKeyWithRole(t, "team_owner")
