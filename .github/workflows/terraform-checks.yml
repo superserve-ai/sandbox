@@ -68,6 +68,9 @@ jobs:
       - name: Test managed host logging configuration
         run: python3 -m unittest scripts.test_host_logging_config scripts.test_host_logging_plan scripts.test_host_logging_legacy_migration
 
+      - name: Test OS Login metadata reconciliation
+        run: python3 -m unittest discover -s infra/scripts -p 'test_oslogin_2fa.py'
+
       - name: Validate Terraform roots
         run: scripts/terraform-validate.sh
 
