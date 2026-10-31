@@ -323,6 +323,8 @@ func TestPrepaidFirstRenewalRollEndsOnObservedUnpaidRenewal(t *testing.T) {
 		{"unpaid renewal ends it", "open", "", false},
 		{"open behind another open invoice ends it", "open", "open", false},
 		{"uncollectible beside another open invoice ends it", "uncollectible", "open", false},
+		{"void renewal ends it", "void", "", false},
+		{"held draft renewal keeps it", "draft", "open", true},
 		{"paid renewal beside another open invoice keeps it", "paid", "open", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -376,4 +378,36 @@ func (f *firstRenewalFixture) closeFirstPeriod(name string) string {
 	f.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',$3,0,0,0) ON CONFLICT DO NOTHING`, f.team, f.start, f.end)
 	f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),jsonb_build_object('customer',$5::text,'subscription',$6::text,'expected_cents',0,'credit_before_cents',0,'resources','[]'::jsonb),'{"credit_applied_cents":0,"credit_remaining_cents":0,"net_cents":0}')`, f.team, f.start, f.end, invoice, f.customer, f.sub)
 	return invoice
+}
+
+func TestPrepaidFirstRenewalRollStaysEndedWhenUnpaidRenewalIsVoided(t *testing.T) {
+	f := newFirstRenewalFixture(t, 2*time.Hour)
+	invoice := f.closeFirstPeriod("in_renewal")
+	publish := func(status string) {
+		t.Helper()
+		f.mu.Lock()
+		f.invoices[invoice] = StripeInvoiceAmounts{ID: invoice, Customer: f.customer, Status: status}
+		f.mu.Unlock()
+		unpaid, err := f.h.unpaidFirstRenewalInvoice(t.Context(), f.team, f.customer, f.client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		j, s := claimFundingTestJob(t, f.h, f.team)
+		provider := &fundingProviderObservation{PaymentMethodID: "pm_saved", PaymentMethodReusable: true, CollectionReady: true, UnpaidRenewalInvoiceID: unpaid, ValidUntil: s.At.Add(5 * time.Minute)}
+		if provider.Evidence, err = json.Marshal(provider); err != nil {
+			t.Fatal(err)
+		}
+		credit := &fundingCreditObservation{SpendableUSD: "0", ValidUntil: s.At.Add(time.Minute), Evidence: []byte(`{"fixture":"credit"}`)}
+		if err = f.h.publishFundingObservation(t.Context(), j, s, credit, provider, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	publish("open")
+	if f.eligible() {
+		t.Fatal("unpaid first renewal kept the team running")
+	}
+	publish("void")
+	if f.eligible() {
+		t.Fatal("voiding the unpaid first renewal restored its grace")
+	}
 }

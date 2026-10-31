@@ -14,7 +14,8 @@
 -- written only for a platform failure does not end it. Debt and withheld rows
 -- are written only for an active contract, so a first renewal that fails
 -- while its contract is still pending ends the grace once the funding worker
--- reads that period's closing invoice from Stripe and finds it unpaid. The
+-- reads that period's closing invoice from Stripe and finds it unpaid or
+-- closed without payment (open, uncollectible or void). The
 -- customer's other unpaid invoices do not count for or against it.
 --
 -- Usage in the grace is billed on the new period's invoice, which the next

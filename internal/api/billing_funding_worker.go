@@ -236,7 +236,8 @@ func (h *Handlers) observeFundingProvider(ctx context.Context, team uuid.UUID, a
 }
 
 // unpaidFirstRenewalInvoice reports the closing invoice of a first paid month
-// that ended within the renewal grace when Stripe shows it unpaid. The
+// that ended within the renewal grace when Stripe shows it unpaid or closed
+// without payment; a held draft is still on its way to collection. The
 // contract is still pending then, so no entitlement debt is recorded, and the
 // customer's other unpaid invoices must not stand in for this one.
 func (h *Handlers) unpaidFirstRenewalInvoice(ctx context.Context, team uuid.UUID, customer string, client *stripeHTTPClient) (string, error) {
@@ -258,7 +259,7 @@ func (h *Handlers) unpaidFirstRenewalInvoice(ctx context.Context, team uuid.UUID
 		if inv.ID != id || inv.Customer != customer {
 			return "", errors.New("renewal invoice identity mismatch")
 		}
-		if inv.Status == "open" || inv.Status == "uncollectible" {
+		if inv.Status == "open" || inv.Status == "uncollectible" || inv.Status == "void" {
 			return id, nil
 		}
 	}
