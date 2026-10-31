@@ -305,11 +305,10 @@ func (fw *Firewall) installRules() error {
 //   7. TCP (dport ≠ 80,443): userDenySet  → drop
 //   8. Default: accept (TCP/80,443 goes to proxy via REDIRECT)
 //
-// Rules 6–7 exist because the host only redirects TCP 80/443 to the egress
-// proxy (hostfw.go); without them, customer allow/deny rules were silently
-// ignored for TCP on every other port. 80/443 stay excluded here so their
-// enforcement remains at the proxy. Infra destinations (gateway, secrets
-// proxy) sit in predefinedAllowSet and are accepted by rule 2 first.
+// The host redirects only TCP 80/443 to the egress proxy (hostfw.go), so
+// rules 6–7 apply the user sets to all other TCP while 80/443 enforcement
+// stays at the proxy. The gateway (rule 2) and the secrets proxy (rule 2b)
+// are accepted before any user rule.
 
 func (fw *Firewall) installFilterRules() {
 	// Rule 0: drop all IPv6 traffic from the TAP interface.
