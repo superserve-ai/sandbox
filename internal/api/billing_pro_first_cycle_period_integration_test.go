@@ -122,7 +122,13 @@ func TestProFirstCycleReportingTransitionPreservesFreeUsage(t *testing.T) {
 // Discovery may have already read an eligible Free bucket before retirement.
 // Its delayed insert must conflict with a completed sentinel, never queue work.
 func TestProFirstCycleRetirementFencesStaleCloseDiscovery(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second).AddDate(0, -1, 0)
+	// One month ago, clamped: AddDate would roll the 31st into this month.
+	now := time.Now().UTC().Truncate(time.Second)
+	if prior := now.AddDate(0, -1, 0); prior.Month() != now.Month() {
+		now = prior
+	} else {
+		now = time.Date(now.Year(), now.Month(), 0, now.Hour(), now.Minute(), now.Second(), 0, time.UTC)
+	}
 	h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
 	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 	u, err := h.proUpgrade(t.Context(), team)

@@ -134,6 +134,11 @@ func TestSponsoredEligibilityConfirmedExpiryAndConflicts(t *testing.T) {
 }
 
 func TestSponsoredCanceledPendingDoesNotPoisonInvoice(t *testing.T) {
+	// The fixture re-anchors on the current period's start, which is clamped
+	// on days some months lack, so its boundary is not near on those days.
+	if time.Now().UTC().Add(5*time.Minute).Day() > 28 {
+		t.Skip("fixture boundary is only near on days every month has")
+	}
 	at := time.Now().UTC().Add(5*time.Minute).AddDate(-4, 0, 0).Truncate(time.Second)
 	f := newEntitlementFixtureAt(t, at, false, false, false, false, true)
 	ctx := t.Context()

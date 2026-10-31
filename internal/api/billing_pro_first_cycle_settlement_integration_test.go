@@ -33,14 +33,23 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 				now = time.Date(2026, 10, 31, 23, 50, 0, 0, time.UTC)
 			}
 			h, team, offer, params := newFirstCycleQuoteFixture(t, now, tc.offer)
+			// Quoting reconciles under the invoice lock, which holds a lock
+			// transaction beside its write connection; the settlement below
+			// stays on one connection.
 			poolConfig := h.Pool.Config()
+			poolConfig.MaxConns = 2
+			quotePool, err := pgxpool.NewWithConfig(t.Context(), poolConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(quotePool.Close)
 			poolConfig.MaxConns = 1
 			pool, err := pgxpool.NewWithConfig(t.Context(), poolConfig)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Cleanup(pool.Close)
-			h.Pool, h.DB = pool, db.New(pool)
+			h.Pool, h.DB = quotePool, db.New(quotePool)
 			params.ResourceTerms = []StripeCheckoutResourceTerms{{ResourceKey: "vcpu", PriceID: "price_cpu", UnitAmountDecimal: "1", MeterID: "mtr_cpu", EventName: "cpu"}}
 			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 			u, err := h.proUpgrade(t.Context(), team)
@@ -73,6 +82,7 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 					t.Fatalf("cross-month recovery changed accepted quote: %+v %v", replay, e)
 				}
 			}
+			h.Pool, h.DB = pool, db.New(pool)
 			paidAt := h.nowUTC().Truncate(time.Second)
 			exec := func(sql string, args ...any) {
 				t.Helper()

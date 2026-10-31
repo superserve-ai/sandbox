@@ -347,28 +347,57 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 
 var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
 
+// lockSection reserves room for a section that holds or waits on the invoice
+// lock while it needs another connection or holds one. Admitting at most
+// MaxConns-1 leaves a connection free, so holders and waiters cannot all wait
+// on each other.
+func (h *Handlers) lockSection(ctx context.Context) (func(), error) {
+	h.lockSectionsOnce.Do(func() {
+		h.lockSections = make(chan struct{}, max(1, int(h.Pool.Config().MaxConns)-1))
+	})
+	select {
+	case h.lockSections <- struct{}{}:
+		return func() { <-h.lockSections }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*pgxpool.Conn, func(), error) {
-	conn, err := h.Pool.Acquire(ctx)
+	// A transaction pins its backend through the transaction pooler and its
+	// lock ends with it; a session lock can outlive the attempt on a pooled
+	// backend and block the team. Writes run on a separate connection, taken
+	// before the lock: a waiter for the lock may hold the pool's last slot.
+	leave, err := h.lockSection(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	var locked bool
-	err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
-	if err != nil || !locked {
+	conn, err := h.Pool.Acquire(ctx)
+	if err != nil {
+		leave()
+		return nil, nil, err
+	}
+	lockTx, err := h.Pool.Begin(ctx)
+	if err != nil {
 		conn.Release()
-		if err == nil {
-			err = errProReconciliationBusy
-		}
+		leave()
 		return nil, nil, err
 	}
 	release := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
-		var unlocked bool
-		if e := conn.QueryRow(cleanup, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&unlocked); e != nil || !unlocked {
-			_ = conn.Conn().Close(cleanup)
-		}
+		_ = lockTx.Rollback(cleanup)
 		conn.Release()
+		leave()
+	}
+	var locked bool
+	err = lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
+	if err != nil || !locked {
+		release()
+		if err == nil {
+			err = errProReconciliationBusy
+		}
+		return nil, nil, err
 	}
 	return conn, release, nil
 }
