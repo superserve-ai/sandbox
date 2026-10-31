@@ -22,8 +22,8 @@
 #
 # Public values (NEXT_PUBLIC_*) are compiled into the browser bundle at build
 # time; everything else is only given to the server at runtime. The browser
-# reaches the box through SSH port forwarding on the same ports; see the
-# console README ("Private single-box environments").
+# reaches the box through SSH port forwarding on the same ports; see the Set
+# up and operate a sandbox devbox runbook.
 #
 # Usage: install-ui.sh [--dry-run]
 #   --dry-run  print the build arguments, runtime variable names and unit
