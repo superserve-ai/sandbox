@@ -111,3 +111,35 @@ func TestEventPromotionCreditIsQueuedOnceAndIssuedOnce(t *testing.T) {
 		t.Fatalf("state=%s grant=%s posts=%d", state, grant, posts.Load())
 	}
 }
+
+func TestEventCheckoutSkipsTheCardOnlyForAFreeListedCode(t *testing.T) {
+	h, _ := newPlanAssignmentFixture(t)
+	code := "promo_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_event_promotion(promotion_code,label,credit_cents) VALUES($1,$2,8000)`, code, "event-"+code[6:18]); err != nil {
+		t.Fatal(err)
+	}
+	session := func(promotion string, total int64) StripeRetrievedCheckoutSession {
+		var s StripeRetrievedCheckoutSession
+		s.AmountTotal = total
+		if promotion != "" {
+			s.Discounts = append(s.Discounts, struct {
+				PromotionCode string `json:"promotion_code"`
+			}{promotion})
+		}
+		return s
+	}
+	for name, tc := range map[string]struct {
+		s    StripeRetrievedCheckoutSession
+		want bool
+	}{
+		"free listed code": {session(code, 0), true},
+		"paid listed code": {session(code, 2000), false},
+		"unlisted code":    {session("promo_other", 0), false},
+		"no code":          {session("", 0), false},
+	} {
+		got, err := eventCheckout(t.Context(), h.Pool, tc.s)
+		if err != nil || got != tc.want {
+			t.Fatalf("%s: %v %v", name, got, err)
+		}
+	}
+}

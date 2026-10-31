@@ -552,7 +552,13 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	if err = h.issueProUpgradeCredit(ctx, conn, &u, client); err != nil {
 		return "", err
 	}
+	cardless := false
 	if method == "" {
+		if cardless, err = eventCheckout(ctx, conn, session); err != nil {
+			return "", err
+		}
+	}
+	if method == "" && !cardless {
 		method, err = h.ensureProUpgradePaymentMethod(ctx, conn, u, params, client)
 		if err != nil {
 			return "", err

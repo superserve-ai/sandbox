@@ -359,6 +359,10 @@ INSERT INTO billing_event_promotion(promotion_code, label, credit_cents)
 VALUES ('promo_...', 'event-2026-11-01', 8000);
 ```
 
+A checkout the code makes free activates without a saved card; usage runs on
+the plan's included credit and the event credit, and a later renewal without a
+card is collected like any other unpaid invoice.
+
 Each team gets one credit per label. Before issuing, the worker looks for a
 grant the team already has under that label, from this script or an earlier
 attempt, and settles on it; one with different terms waits for an operator. Issued

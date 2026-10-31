@@ -30,6 +30,21 @@ func recordEventCredit(ctx context.Context, tx pgx.Tx, team, contract uuid.UUID,
 	return err
 }
 
+// eventCheckout reports whether a checkout an event code made free may skip
+// the saved card: the event credit funds usage, and a renewal without a card
+// is unpaid like any other.
+func eventCheckout(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, session StripeRetrievedCheckoutSession) (bool, error) {
+	code := session.promotionCode()
+	if code == "" || session.AmountTotal != 0 {
+		return false, nil
+	}
+	var listed bool
+	err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_event_promotion WHERE promotion_code=$1)`, code).Scan(&listed)
+	return listed, err
+}
+
 // The grant matches scripts/billing/event_credit.py, including its key, so a
 // manual run for the same team and label cannot add a second credit.
 func eventGrantForm(team uuid.UUID, customer, label string, cents int64) url.Values {
