@@ -263,6 +263,13 @@ func (h *Handlers) planInvoiceEnrollment(ctx context.Context, team uuid.UUID, re
 // recordInvoiceEnrollment takes the account lock, confirms the rows the plan
 // was computed from are unchanged, and records the enrollment.
 func (h *Handlers) recordInvoiceEnrollment(ctx context.Context, team uuid.UUID, p invoiceEnrollmentPlan) error {
+	// Waiting on the invoice lock while holding a connection counts as a
+	// lock section, so a holder always has a connection left to finish.
+	leave, err := h.lockSection(ctx)
+	if err != nil {
+		return err
+	}
+	defer leave()
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err

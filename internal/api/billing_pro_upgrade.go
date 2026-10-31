@@ -347,9 +347,10 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 
 var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
 
-// lockSection reserves room for a section that holds a lock transaction while
-// writing on a second connection. Admitting at most MaxConns-1 of them leaves
-// a connection free, so concurrent holders cannot all wait for their second.
+// lockSection reserves room for a section that holds or waits on the invoice
+// lock while it needs another connection or holds one. Admitting at most
+// MaxConns-1 leaves a connection free, so holders and waiters cannot all wait
+// on each other.
 func (h *Handlers) lockSection(ctx context.Context) (func(), error) {
 	h.lockSectionsOnce.Do(func() {
 		h.lockSections = make(chan struct{}, max(1, int(h.Pool.Config().MaxConns)-1))
