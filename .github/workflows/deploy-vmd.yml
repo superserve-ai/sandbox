@@ -332,6 +332,7 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.cell == 'use4'
         env:
           DEPLOY_CELL: use4
+          PEER_INGRESS_ENABLED: ${{ vars.PEER_INGRESS_ENABLED_PROD }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
@@ -415,6 +416,7 @@ jobs:
         if: (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '') || (github.event_name == 'workflow_dispatch' && (inputs.cell == 'usw2' || inputs.cell == ''))
         env:
           DEPLOY_CELL: usw2
+          PEER_INGRESS_ENABLED: ${{ vars.PEER_INGRESS_ENABLED_USW }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
