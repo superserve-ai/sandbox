@@ -28,7 +28,8 @@ func newSponsoredRollFixture(t *testing.T, rolledAgo time.Duration) *sponsoredRo
 	at := time.Now().UTC().Add(-rolledAgo).Truncate(time.Second)
 	f := &sponsoredRollFixture{entitlementFixture: newEntitlementFixtureAt(t, at, false, false, false, false, true, false, true), t: t}
 	ctx := t.Context()
-	f.prior = f.start.AddDate(0, -1, 0)
+	anchor := priorAnniversaryAnchor(f.start)
+	f.prior, _, _ = billing.AnniversaryPeriod(anchor, f.start.Add(-time.Second))
 	if err := f.h.Pool.QueryRow(ctx, `SELECT id FROM billing_sponsored_operation WHERE contract_id=$1`, f.c.ID).Scan(&f.operation); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +51,7 @@ func newSponsoredRollFixture(t *testing.T, rolledAgo time.Duration) *sponsoredRo
 		{`INSERT INTO billing_usage_entitlement(team_id,contract_id,sponsorship_id,kind,period_start,period_end,amount_cents,currency,state,first_attempt_at,request_payload,provider_invoice_start,provider_invoice_end,stripe_credit_grant_id,issuance_evidence,issued_at)
  VALUES($1,$2,$3,'metered_usage',$4,$5,3000000,'usd','issued',$4,'{}',$4,$5,$6,'{"fixture":true}',$4)`, []any{f.c.TeamID, f.c.ID, f.operation, f.prior, f.start, grant}},
 		{`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',$3,0,0,0)`, []any{f.c.TeamID, f.prior, f.start}},
-		{`INSERT INTO billing_invoice_calendar(team_id,period_start,period_end,customer_id,subscription_id,invoice_start,invoice_end,billing_cycle_anchor) VALUES($1,$2,$3,$4,$5,$2,$3,$6)`, []any{f.c.TeamID, f.prior, f.start, f.c.CustomerID, f.c.SubscriptionID, f.prior.Unix()}},
+		{`INSERT INTO billing_invoice_calendar(team_id,period_start,period_end,customer_id,subscription_id,invoice_start,invoice_end,billing_cycle_anchor) VALUES($1,$2,$3,$4,$5,$2,$3,$6)`, []any{f.c.TeamID, f.prior, f.start, f.c.CustomerID, f.c.SubscriptionID, anchor.Unix()}},
 	} {
 		if _, err = conn.Exec(ctx, step.q, step.args...); err != nil {
 			t.Fatal(err)
@@ -97,6 +98,16 @@ func (f *sponsoredRollFixture) eligible() bool {
 func (f *sponsoredRollFixture) releasePriorClose() {
 	f.t.Helper()
 	f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),jsonb_build_object('customer',$5::text,'subscription',$6::text,'expected_cents',0,'credit_before_cents',0,'resources',jsonb_build_array(jsonb_build_object('resource','cpu','expected_cents',0,'snapshot',billing_meter_accounting_snapshot($1,$2,$3,'cpu')))), '{"credit_applied_cents":0,"credit_remaining_cents":0,"net_cents":0}')`, f.c.TeamID, f.prior, f.start, "in_prior_"+f.c.TeamID.String(), f.c.CustomerID, f.c.SubscriptionID)
+}
+
+// priorAnniversaryAnchor is the latest earlier month with start's day, so a
+// start on the 29th-31st is a clamped anniversary the way Stripe bills it.
+func priorAnniversaryAnchor(start time.Time) time.Time {
+	anchor := start.AddDate(0, -1, 0)
+	for k := 2; anchor.Day() != start.Day(); k++ {
+		anchor = start.AddDate(0, -k, 0)
+	}
+	return anchor
 }
 
 func TestSponsoredRollWaitsForDraftRenewalInvoice(t *testing.T) {

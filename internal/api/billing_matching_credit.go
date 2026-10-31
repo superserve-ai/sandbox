@@ -142,6 +142,7 @@ func (h *Handlers) matchingCreditTick(ctx context.Context, client *stripeHTTPCli
 	return runBillingPhases(ctx, time.Minute,
 		func(ctx context.Context) error { return h.recordPaidMatchingInvoices(ctx, client) },
 		func(ctx context.Context) error { return h.issueDueMatchingCredits(ctx, client) },
+		func(ctx context.Context) error { return h.issueDueEventCredits(ctx, client) },
 		func(ctx context.Context) error { return h.reviewMatchedInvoices(ctx, client) },
 	)
 }

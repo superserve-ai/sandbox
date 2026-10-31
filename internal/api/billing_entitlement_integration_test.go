@@ -87,7 +87,7 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 	// its second and needs the first one's closing invoice.
 	rolled := len(annual) > 6 && annual[6]
 	if rolled {
-		anchor = start.AddDate(0, -1, 0)
+		anchor = priorAnniversaryAnchor(start)
 	}
 	if len(annual) > 0 && annual[0] {
 		anchor = start.AddDate(0, -1, 0)

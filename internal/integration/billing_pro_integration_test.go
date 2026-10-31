@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -67,7 +68,7 @@ func newProFixture(t *testing.T, offer string) (*proProviderFixture, *gin.Engine
 	f := &proProviderFixture{team: team, customer: "cus_" + team.String(), sub: "sub_" + team.String(), session: "cs_" + strings.ReplaceAll(team.String(), "-", ""), offer: offer, price: "price_" + offer, interval: "month", amount: 120000, status: "open"}
 	f.resourcesAttached = offer != "pro_annual"
 	anchor := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
-	f.anchor, f.baseStart, f.baseEnd = anchor.Unix(), anchor.Unix(), anchor.AddDate(0, 1, 0).Unix()
+	f.anchor, f.baseStart, f.baseEnd = anchor.Unix(), anchor.Unix(), monthAfter(anchor).Unix()
 	if offer == "pro_annual" {
 		f.interval = "year"
 		f.amount = 1200000
@@ -155,7 +156,7 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			f.resourcesAttached = true
 			if f.cancelAtPeriodEnd {
-				f.cancelAt = time.Unix(f.anchor, 0).UTC().AddDate(0, 1, 0).Unix()
+				f.cancelAt = monthAfter(time.Unix(f.anchor, 0).UTC()).Unix()
 			}
 			f.metadata["pro_usage_attached"] = r.Form.Get("metadata[pro_usage_attached]")
 			if f.loseAttachResponse {
@@ -243,7 +244,7 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 			resourcePrices = append(resourcePrices, "price_round")
 		}
 		for _, p := range resourcePrices {
-			items = append(items, map[string]any{"id": "si_" + p, "price": map[string]any{"id": p, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": f.resourceRate(p), "recurring": map[string]any{"usage_type": "metered", "interval": "month", "interval_count": 1, "meter": f.resourceMeter(p)}}, "current_period_start": f.anchor, "current_period_end": time.Unix(f.anchor, 0).UTC().AddDate(0, 1, 0).Unix()})
+			items = append(items, map[string]any{"id": "si_" + p, "price": map[string]any{"id": p, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": f.resourceRate(p), "recurring": map[string]any{"usage_type": "metered", "interval": "month", "interval_count": 1, "meter": f.resourceMeter(p)}}, "current_period_start": f.anchor, "current_period_end": monthAfter(time.Unix(f.anchor, 0).UTC()).Unix()})
 		}
 		discounts := []string{}
 		if f.subDiscount {
@@ -278,6 +279,9 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 			months = 12
 		}
 		invoiceEnd := time.Unix(invoiceStart, 0).UTC().AddDate(0, months, 0).Unix()
+		if months == 1 {
+			invoiceEnd = anniversaryEnd(f.anchor, invoiceStart)
+		}
 		reason, discount := "subscription_cycle", f.renewalDiscount
 		if invoiceStart == f.anchor {
 			reason, discount = "subscription_create", f.discount
@@ -370,7 +374,7 @@ func TestIntegration_ProPaidActivationAndRenewal(t *testing.T) {
 			if offer == "pro_annual" {
 				f.baseEnd = time.Unix(f.baseStart, 0).UTC().AddDate(1, 0, 0).Unix()
 			} else {
-				f.baseEnd = time.Unix(f.baseStart, 0).UTC().AddDate(0, 1, 0).Unix()
+				f.baseEnd = anniversaryEnd(f.anchor, f.baseStart)
 			}
 			f.mu.Unlock()
 			for range 2 {
@@ -790,7 +794,7 @@ func TestIntegration_ProPaymentReviewsDoNotStarveOtherPeriods(t *testing.T) {
 	assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
 	f.mu.Lock()
 	f.baseStart = f.baseEnd
-	f.baseEnd = time.Unix(f.baseStart, 0).UTC().AddDate(0, 1, 0).Unix()
+	f.baseEnd = anniversaryEnd(f.anchor, f.baseStart)
 	f.mu.Unlock()
 	assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
 	f.mu.Lock()
@@ -1053,7 +1057,7 @@ func TestIntegration_AnnualAttachmentPreservesScheduledCancellation(t *testing.T
 				t.Fatalf("annual deadline or attachment replay changed: cancel=%d end=%d relative=%v keys=%v", f.cancelAt, f.baseEnd, f.cancelAtPeriodEnd, f.attachKeys)
 			}
 			var preserved bool
-			if err := testPool.QueryRow(t.Context(), `SELECT a.cancel_at_period_end AND a.current_period_start=$2 AND a.current_period_end=$3 AND c.status='active' AND c.charge_amount_cents=1200000 AND (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1)=1 FROM team_billing_account a JOIN billing_commercial_contract c USING(team_id) WHERE a.team_id=$1`, f.team, time.Unix(f.anchor, 0), time.Unix(f.anchor, 0).UTC().AddDate(0, 1, 0)).Scan(&preserved); err != nil || !preserved {
+			if err := testPool.QueryRow(t.Context(), `SELECT a.cancel_at_period_end AND a.current_period_start=$2 AND a.current_period_end=$3 AND c.status='active' AND c.charge_amount_cents=1200000 AND (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1)=1 FROM team_billing_account a JOIN billing_commercial_contract c USING(team_id) WHERE a.team_id=$1`, f.team, time.Unix(f.anchor, 0), monthAfter(time.Unix(f.anchor, 0).UTC())).Scan(&preserved); err != nil || !preserved {
 				t.Fatalf("scheduled cancellation forfeited paid term or enabled renewal: %v %v", preserved, err)
 			}
 		})
@@ -1089,4 +1093,18 @@ func TestIntegration_AnnualAttachmentRespectsChangedCancellation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// anniversaryEnd is the end of the monthly period that starts at start, counted
+// from anchor, so a 31st anchor returns to the 31st after a shorter month.
+func anniversaryEnd(anchor, start int64) int64 {
+	_, end, _ := billing.AnniversaryPeriod(time.Unix(anchor, 0).UTC(), time.Unix(start, 0).UTC())
+	return end.Unix()
+}
+
+// monthAfter is one monthly period after t, clamped to the month's last day as
+// Stripe and the billing calendar do; time.AddDate would roll the 31st over.
+func monthAfter(t time.Time) time.Time {
+	_, end, _ := billing.AnniversaryPeriod(t, t)
+	return end
 }
