@@ -647,8 +647,11 @@ func recordPaymentPromotion(ctx context.Context, tx pgx.Tx, team, contract uuid.
 		percent = &d.PercentOff
 	}
 	tag, err := tx.Exec(ctx, `INSERT INTO billing_contract_promotion(contract_id,team_id,discount_id,promotion_code,coupon_id,coupon_duration,amount_off_cents,percent_off,checkout_invoice_id,discounted_cents) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (contract_id) DO NOTHING`, contract, team, d.ID, d.PromotionCode, d.Coupon, d.Duration, d.AmountOffCents, percent, receipt.Invoice.ID, d.DiscountedCents)
-	if err != nil || tag.RowsAffected() == 1 {
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return recordEventCredit(ctx, tx, team, contract, receipt.Invoice.Customer, d.PromotionCode)
 	}
 	var same bool
 	if err = tx.QueryRow(ctx, `SELECT discount_id=$2 AND checkout_invoice_id=$3 AND discounted_cents=$4 FROM billing_contract_promotion WHERE contract_id=$1`, contract, d.ID, receipt.Invoice.ID, d.DiscountedCents).Scan(&same); err != nil {

@@ -502,6 +502,31 @@ type BillingEntitlementWork struct {
 	LeaseGeneration    int64              `json:"lease_generation"`
 }
 
+type BillingEventCredit struct {
+	ContractID          uuid.UUID          `json:"contract_id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	CustomerID          string             `json:"customer_id"`
+	PromotionCode       string             `json:"promotion_code"`
+	Label               string             `json:"label"`
+	CreditCents         int64              `json:"credit_cents"`
+	State               string             `json:"state"`
+	StripeCreditGrantID *string            `json:"stripe_credit_grant_id"`
+	FirstAttemptAt      pgtype.Timestamptz `json:"first_attempt_at"`
+	NextAttemptAt       time.Time          `json:"next_attempt_at"`
+	Failures            int32              `json:"failures"`
+	LastError           *string            `json:"last_error"`
+	CreatedAt           time.Time          `json:"created_at"`
+	IssuedAt            pgtype.Timestamptz `json:"issued_at"`
+}
+
+type BillingEventPromotion struct {
+	PromotionCode string    `json:"promotion_code"`
+	Label         string    `json:"label"`
+	CreditCents   int64     `json:"credit_cents"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
 type BillingExportAllocation struct {
 	ID              uuid.UUID      `json:"id"`
 	TeamID          uuid.UUID      `json:"team_id"`

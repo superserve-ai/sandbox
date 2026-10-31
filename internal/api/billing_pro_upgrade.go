@@ -593,8 +593,11 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 	if derefString(a.StripeCustomerID) != u.Customer || derefString(a.StripeSubscriptionID) != derefString(u.Subscription) {
 		return "", errors.New("upgrade billing association changed during enrollment")
 	}
-	var completed uuid.UUID
-	if err = tx.QueryRow(ctx, `UPDATE billing_pro_upgrade SET state='active',last_error=NULL WHERE id=$1 AND state='credited' AND EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.id=billing_pro_upgrade.contract_id AND c.status<>'ended') RETURNING id`, u.ID).Scan(&completed); err != nil {
+	var contract uuid.UUID
+	if err = tx.QueryRow(ctx, `UPDATE billing_pro_upgrade SET state='active',last_error=NULL WHERE id=$1 AND state='credited' AND EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.id=billing_pro_upgrade.contract_id AND c.status<>'ended') RETURNING contract_id`, u.ID).Scan(&contract); err != nil {
+		return "", err
+	}
+	if err = recordEventCredit(ctx, tx, u.Team, contract, u.Customer, session.promotionCode()); err != nil {
 		return "", err
 	}
 	if err = h.DB.WithTx(tx).ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: u.Team, StripeGrantID: ""}); err != nil {

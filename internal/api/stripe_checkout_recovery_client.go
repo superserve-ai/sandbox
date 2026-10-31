@@ -34,12 +34,25 @@ type StripeRetrievedCheckoutSession struct {
 	Mode              string            `json:"mode"`
 	ExpiresAt         int64             `json:"expires_at"`
 	Metadata          map[string]string `json:"metadata"`
-	CustomFields      []struct {
+	Discounts         []struct {
+		PromotionCode string `json:"promotion_code"`
+	} `json:"discounts"`
+	CustomFields []struct {
 		Key      string `json:"key"`
 		Dropdown *struct {
 			Value *string `json:"value"`
 		} `json:"dropdown"`
 	} `json:"custom_fields"`
+}
+
+// promotionCode is the promotion code the customer entered at checkout, if any.
+func (s StripeRetrievedCheckoutSession) promotionCode() string {
+	for _, d := range s.Discounts {
+		if d.PromotionCode != "" {
+			return d.PromotionCode
+		}
+	}
+	return ""
 }
 
 // topoffChosen reports the customer's checkout top-off answer. A completed

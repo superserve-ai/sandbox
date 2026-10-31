@@ -339,3 +339,26 @@ Once a day during the event, and once after it ends:
    label every time.
 3. Rerun `--restore` and confirm every row reads `already granted` or a refusal
    you expect.
+
+## Event promotion codes
+
+For a self-serve event, participants can enter a code at Developer or Pro
+checkout instead of being listed. A checkout that completes with a listed
+Stripe promotion code queues the event's extra usage credit for that team, and
+the billing worker issues it as the same grant this script creates, with the
+same idempotency key, so a later manual run with the same label reports
+`already granted`.
+
+1. In Stripe, create a coupon (for example 100% off, once) and a customer-facing
+   promotion code for it, and note the promotion code ID (`promo_...`).
+2. List it, with the credit to add on top of the plan's included credit:
+
+```sql
+INSERT INTO billing_event_promotion(promotion_code, label, credit_cents, expires_at)
+VALUES ('promo_...', 'event-2026-11-01', 8000, '2026-11-02 08:00+00');
+```
+
+The code works until `expires_at`. Each team gets one credit per label. Issued
+credits are in `billing_event_credit`; a row with `last_error` set needs
+attention. Issuance runs with the matching credit worker, which requires
+`BILLING_USAGE_ENTITLEMENTS_ENABLED`.
