@@ -337,18 +337,18 @@ func (h *Handlers) respondUpgradeUnsettled(c *gin.Context, team uuid.UUID, cause
 
 func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 	first := true
-	outcome, err := waitWhileReconciliationBusy(c.Request.Context(), proReconciliationWait, func() (string, error) {
+	outcome, err := waitWhileReconciliationBusy(c.Request.Context(), proReconciliationWait, func(ctx context.Context) (string, error) {
 		attempt := u
 		if !first {
 			// The busy reconciler may have advanced this upgrade.
-			latest, err := h.openProUpgrade(c.Request.Context(), u)
+			latest, err := h.openProUpgrade(ctx, u)
 			if err != nil {
 				return "", err
 			}
 			attempt = latest
 		}
 		first = false
-		return h.reconcileProUpgrade(c.Request.Context(), attempt, false)
+		return h.reconcileProUpgrade(ctx, attempt, false)
 	})
 	if err != nil {
 		h.respondUpgradeUnsettled(c, u.Team, err)
@@ -384,14 +384,18 @@ var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
 // waits briefly for its turn instead of failing.
 const proReconciliationWait = 5 * time.Second
 
+type lockAcquireDeadlineKey struct{}
+
 // waitWhileReconciliationBusy retries attempt with backoff while it reports
-// errProReconciliationBusy, for at most wait. Each attempt releases its lock,
-// lock section and lease before returning, so nothing is held while waiting.
-func waitWhileReconciliationBusy(ctx context.Context, wait time.Duration, attempt func() (string, error)) (string, error) {
+// errProReconciliationBusy, for at most wait. Waiting to acquire the lock
+// section, connections and lock is bounded by the same deadline; work already
+// under the lock is not. Each attempt releases what it holds before returning.
+func waitWhileReconciliationBusy(ctx context.Context, wait time.Duration, attempt func(context.Context) (string, error)) (string, error) {
 	deadline := time.Now().Add(wait)
+	attemptCtx := context.WithValue(ctx, lockAcquireDeadlineKey{}, deadline)
 	delay := 50 * time.Millisecond
 	for {
-		outcome, err := attempt()
+		outcome, err := attempt(attemptCtx)
 		if !errors.Is(err, errProReconciliationBusy) || time.Now().Add(delay).After(deadline) {
 			return outcome, err
 		}
@@ -400,7 +404,7 @@ func waitWhileReconciliationBusy(ctx context.Context, wait time.Duration, attemp
 			return outcome, err
 		case <-time.After(delay):
 		}
-		delay = min(2*delay, time.Second)
+		delay = min(2*delay, 250*time.Millisecond)
 	}
 }
 
@@ -425,20 +429,34 @@ func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*
 	// lock ends with it; a session lock can outlive the attempt on a pooled
 	// backend and block the team. Writes run on a separate connection, taken
 	// before the lock: a waiter for the lock may hold the pool's last slot.
-	leave, err := h.lockSection(ctx)
-	if err != nil {
-		return nil, nil, err
+	acquire := ctx
+	if deadline, ok := ctx.Value(lockAcquireDeadlineKey{}).(time.Time); ok {
+		var cancel context.CancelFunc
+		acquire, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
 	}
-	conn, err := h.Pool.Acquire(ctx)
+	// A caller still able to wait gets busy, not a deadline error, when its
+	// acquisition budget runs out.
+	busyIfExpired := func(err error) error {
+		if acquire.Err() != nil && ctx.Err() == nil {
+			return errProReconciliationBusy
+		}
+		return err
+	}
+	leave, err := h.lockSection(acquire)
+	if err != nil {
+		return nil, nil, busyIfExpired(err)
+	}
+	conn, err := h.Pool.Acquire(acquire)
 	if err != nil {
 		leave()
-		return nil, nil, err
+		return nil, nil, busyIfExpired(err)
 	}
-	lockTx, err := h.Pool.Begin(ctx)
+	lockTx, err := h.Pool.Begin(acquire)
 	if err != nil {
 		conn.Release()
 		leave()
-		return nil, nil, err
+		return nil, nil, busyIfExpired(err)
 	}
 	release := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)

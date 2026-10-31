@@ -123,13 +123,13 @@ func TestProUpgradeCheckoutsWaitForTheInvoiceLock(t *testing.T) {
 		return &Handlers{Pool: pool}
 	}
 	run := func(h *Handlers, wait time.Duration) (busy int, other error) {
-		reconcile := func() (string, error) {
-			conn, release, err := h.proUpgradeInvoiceLock(t.Context(), team)
+		reconcile := func(ctx context.Context) (string, error) {
+			conn, release, err := h.proUpgradeInvoiceLock(ctx, team)
 			if err != nil {
 				return "", err
 			}
 			defer release()
-			_, err = conn.Exec(t.Context(), `SELECT pg_sleep(0.05)`)
+			_, err = conn.Exec(t.Context(), `SELECT pg_sleep(0.02)`)
 			return "active", err
 		}
 		var wg sync.WaitGroup
@@ -229,5 +229,37 @@ func TestProUpgradeCheckoutWaitKeepsTheAcceptedUpgrade(t *testing.T) {
 	h.resumeProUpgradeCheckout(c, accepted)
 	if response.Code != http.StatusServiceUnavailable || calls.Load() != 0 {
 		t.Fatalf("waiting checkout moved to the successor: %d %s (provider calls %d)", response.Code, response.Body.String(), calls.Load())
+	}
+}
+
+// Waiting is bounded even when a retry cannot get a lock section or a
+// connection: the checkout gives up as busy at the deadline instead of waiting
+// out the reconciliation timeout.
+func TestProUpgradeCheckoutWaitBoundsAcquisition(t *testing.T) {
+	base, team := newPlanAssignmentFixture(t)
+	cfg := base.Pool.Config()
+	cfg.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h := &Handlers{Pool: pool}
+	// Another section holds the pool's only lock-section slot throughout.
+	leave, err := h.lockSection(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(leave)
+	started := time.Now()
+	_, err = waitWhileReconciliationBusy(t.Context(), 300*time.Millisecond, func(ctx context.Context) (string, error) {
+		_, release, err := h.proUpgradeInvoiceLock(ctx, team)
+		if err == nil {
+			release()
+		}
+		return "", err
+	})
+	if !errors.Is(err, errProReconciliationBusy) || time.Since(started) > 2*time.Second {
+		t.Fatalf("acquisition outlived the wait: %v after %s", err, time.Since(started))
 	}
 }
