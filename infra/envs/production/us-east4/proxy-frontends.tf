@@ -194,6 +194,7 @@ resource "google_compute_target_ssl_proxy" "proxy" {
   name            = "sandbox-proxy-ssl"
   project         = local.project_id
   backend_service = local.use4_proxy_tcp_backend
+  ssl_policy      = google_compute_ssl_policy.https.id
   certificate_map = "https://certificatemanager.googleapis.com/v1/projects/${local.project_id}/locations/global/certificateMaps/sandbox-proxy-cert-map"
 
   lifecycle {
