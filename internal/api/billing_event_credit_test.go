@@ -20,14 +20,15 @@ func TestExistingEventGrantSettlesOnMatchingTermsOnly(t *testing.T) {
 		return g
 	}
 	other := grant("credgr_other", 8000, func(g *entitlementGrant) { g.Metadata["team_id"] = uuid.NewString() })
-	if id, err := existingEventGrant([]entitlementGrant{other}, team, "cus_current", "event-label", 8000); id != "" || err != nil {
+	if id, err := existingEventGrant([]entitlementGrant{other}, team, "cus_current", "event-label", 8000, 100); id != "" || err != nil {
 		t.Fatalf("another team's grant settled: %q %v", id, err)
 	}
-	if id, err := existingEventGrant([]entitlementGrant{other, grant("credgr_manual", 8000, nil)}, team, "cus_current", "event-label", 8000); id != "credgr_manual" || err != nil {
+	if id, err := existingEventGrant([]entitlementGrant{other, grant("credgr_manual", 8000, nil)}, team, "cus_current", "event-label", 8000, 100); id != "credgr_manual" || err != nil {
 		t.Fatalf("manual grant not reused: %q %v", id, err)
 	}
 	for name, g := range map[string][]entitlementGrant{
 		"voided":         {grant("a", 8000, func(g *entitlementGrant) { g.VoidedAt = 1 })},
+		"future":         {grant("a", 8000, func(g *entitlementGrant) { g.EffectiveAt = 101 })},
 		"amount":         {grant("a", 10000, nil)},
 		"expiring":       {grant("a", 8000, func(g *entitlementGrant) { g.ExpiresAt = 1 })},
 		"duplicate":      {grant("a", 8000, nil), grant("b", 8000, nil)},
@@ -35,7 +36,7 @@ func TestExistingEventGrantSettlesOnMatchingTermsOnly(t *testing.T) {
 		"restore":        {grant("a", 8000, func(g *entitlementGrant) { g.Metadata["trial_forfeit_restore"] = "true" })},
 		"other flow":     {grant("a", 8000, func(g *entitlementGrant) { g.Metadata["matching_credit_id"] = "x" })},
 	} {
-		if id, err := existingEventGrant(g, team, "cus_current", "event-label", 8000); id != "" || err == nil || !strings.Contains(err.Error(), "operator review") {
+		if id, err := existingEventGrant(g, team, "cus_current", "event-label", 8000, 100); id != "" || err == nil || !strings.Contains(err.Error(), "operator review") {
 			t.Fatalf("%s grant settled: %q %v", name, id, err)
 		}
 	}
