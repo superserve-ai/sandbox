@@ -194,10 +194,7 @@ func (h *Handlers) commitProUpgrade(ctx context.Context, conn *pgxpool.Conn, u *
 		if err := conn.QueryRow(ctx, `UPDATE billing_pro_upgrade SET recurring_attempted_at=COALESCE(recurring_attempted_at,clock_timestamp()) WHERE id=$1 RETURNING recurring_attempted_at`, u.ID).Scan(&u.RecurringAttempt); err != nil {
 			return err
 		}
-		form := url.Values{"proration_behavior": {"none"}, "billing_cycle_anchor": {"unchanged"}, "pause_collection[behavior]": {"keep_as_draft"}, "items[0][price]": {offer.Price}, "items[0][quantity]": {"1"}, "items[0][metadata][pro_upgrade_id]": {u.ID.String()}}
-		if method != "" {
-			form.Set("default_payment_method", method)
-		}
+		form := url.Values{"default_payment_method": {method}, "proration_behavior": {"none"}, "billing_cycle_anchor": {"unchanged"}, "pause_collection[behavior]": {"keep_as_draft"}, "items[0][price]": {offer.Price}, "items[0][quantity]": {"1"}, "items[0][metadata][pro_upgrade_id]": {u.ID.String()}}
 		var changed invoiceSubscription
 		if err := c.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(sub.ID), form, &changed, "pro-upgrade-recurring:"+u.ID.String()); err != nil {
 			return err
