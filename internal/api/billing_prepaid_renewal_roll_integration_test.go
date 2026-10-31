@@ -110,9 +110,9 @@ func TestPrepaidRenewalRollStaysEligible(t *testing.T) {
 		{"platform failure keeps it", 2 * time.Hour, func(f *sponsoredRollFixture) {
 			f.exec(`INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence,platform_failure_at) VALUES($1,$2,$3,'{}',clock_timestamp())`, f.c.ID, f.start, f.end)
 		}, 0, true},
-		{"observed unpaid invoice ends it", 2 * time.Hour, func(f *sponsoredRollFixture) {
-			f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_failed_renewal"}' WHERE team_id=$1`, f.c.TeamID)
-		}, 0, false},
+		{"observed debt evidence alone keeps it", 2 * time.Hour, func(f *sponsoredRollFixture) {
+			f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_older_unpaid"}' WHERE team_id=$1`, f.c.TeamID)
+		}, 0, true},
 		{"unpaid invoice ends it", 2 * time.Hour, func(f *sponsoredRollFixture) {
 			f.exec(`INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence) VALUES($1,$2,$3,'{"unpaid_invoice":"in_unpaid"}')`, f.c.ID, f.start, f.end)
 		}, 0, false},
@@ -236,8 +236,13 @@ func TestPrepaidFirstRenewalRollStaysEligible(t *testing.T) {
 			f.exec(`UPDATE billing_pro_upgrade SET state='ended' WHERE id=$1`, f.upgrade)
 		}, 0, false},
 		{"failed renewal ends it", 2 * time.Hour, func(f *firstRenewalFixture) {
-			f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_failed_renewal"}' WHERE team_id=$1`, f.team)
+			invoice := f.closeFirstPeriod("in_failed_renewal")
+			f.exec(`UPDATE billing_funding_account SET provider_evidence=jsonb_build_object('DebtInvoiceID',$2::text) WHERE team_id=$1`, f.team, invoice)
 		}, 0, false},
+		{"another unpaid invoice keeps it", 2 * time.Hour, func(f *firstRenewalFixture) {
+			f.closeFirstPeriod("in_renewal")
+			f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_older_unpaid"}' WHERE team_id=$1`, f.team)
+		}, 0, true},
 		{"ended contract ends it", 2 * time.Hour, func(f *firstRenewalFixture) {
 			f.exec(`UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1`, f.contract.ID)
 		}, 0, false},
@@ -286,21 +291,16 @@ func TestPrepaidRenewalRollGraceHoldsAutoRecharge(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		rolledAgo time.Duration
-		debt      bool
 		want      int
 	}{
-		{"in the grace", 2 * time.Hour, false, 0},
-		{"after the grace", 7 * time.Hour, false, 1},
-		{"failed renewal", 2 * time.Hour, true, 1},
+		{"in the grace", 2 * time.Hour, 0},
+		{"after the grace", 7 * time.Hour, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newPrepaidRollFixture(t, tc.rolledAgo)
 			f.exec(`INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents) VALUES($1,true,1000,1500)`, f.c.TeamID)
 			f.exec(`UPDATE billing_funding_account SET payment_method_id='pm_saved' WHERE team_id=$1`, f.c.TeamID)
 			observePrepaidCredit(t, f.entitlementFixture, 0)
-			if tc.debt {
-				f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_failed_renewal"}' WHERE team_id=$1`, f.c.TeamID)
-			}
 			if err := f.h.recordAutoRecharges(t.Context()); err != nil {
 				t.Fatal(err)
 			}
@@ -317,11 +317,13 @@ func TestPrepaidRenewalRollGraceHoldsAutoRecharge(t *testing.T) {
 
 func TestPrepaidFirstRenewalRollEndsOnObservedUnpaidRenewal(t *testing.T) {
 	f := newFirstRenewalFixture(t, 2*time.Hour)
+	invoice := f.closeFirstPeriod("in_failed_renewal")
+	f.enableAutoRecharge(1000, 1500)
 	if !f.eligible() {
 		t.Fatal("first renewal not in its grace")
 	}
 	j, s := claimFundingTestJob(t, f.h, f.team)
-	provider := &fundingProviderObservation{PaymentMethodID: "pm_saved", PaymentMethodReusable: true, CollectionReady: true, DebtInvoiceID: "in_failed_renewal", ValidUntil: s.At.Add(5 * time.Minute)}
+	provider := &fundingProviderObservation{PaymentMethodID: "pm_saved", PaymentMethodReusable: true, CollectionReady: true, DebtInvoiceID: invoice, ValidUntil: s.At.Add(5 * time.Minute)}
 	evidence, err := json.Marshal(provider)
 	if err != nil {
 		t.Fatal(err)
@@ -334,4 +336,21 @@ func TestPrepaidFirstRenewalRollEndsOnObservedUnpaidRenewal(t *testing.T) {
 	if f.eligible() {
 		t.Fatal("failed first renewal kept the team running in its grace")
 	}
+	if err = f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND source='auto_recharge'`, f.team).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("Auto Reload stayed held after the failed first renewal: %d %v", n, err)
+	}
+}
+
+// closeFirstPeriod records the first month's closing invoice, which bills the
+// first renewal.
+func (f *firstRenewalFixture) closeFirstPeriod(name string) string {
+	f.t.Helper()
+	invoice := name + "_" + f.team.String()
+	f.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',$3,0,0,0) ON CONFLICT DO NOTHING`, f.team, f.start, f.end)
+	f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),jsonb_build_object('customer',$5::text,'subscription',$6::text,'expected_cents',0,'credit_before_cents',0,'resources','[]'::jsonb),'{"credit_applied_cents":0,"credit_remaining_cents":0,"net_cents":0}')`, f.team, f.start, f.end, invoice, f.customer, f.sub)
+	return invoice
 }

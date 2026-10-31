@@ -13,15 +13,17 @@
 -- that period, or once the team is no longer prepaid-funded. A withheld row
 -- written only for a platform failure does not end it. Debt and withheld rows
 -- are written only for an active contract, so a first renewal that fails
--- while its contract is still pending ends the grace through the unpaid
--- invoice the funding worker observes instead.
+-- while its contract is still pending ends the grace once the funding worker
+-- observes that period's closing invoice unpaid. Only that invoice counts: the
+-- observed debt can be any unpaid invoice of the customer, and it is kept
+-- unchanged while the provider cannot be read.
 --
 -- Usage in the grace is billed on the new period's invoice, which the next
 -- grant applies to; the invoice close verifies what Stripe applied.
 
 CREATE OR REPLACE FUNCTION billing_renewal_roll_grace(p_team_id uuid,p_credit_checked_at timestamptz) RETURNS boolean LANGUAGE sql STABLE AS $$
  WITH roll AS (
-  SELECT c.id contract_id, e.period_end
+  SELECT c.id contract_id, e.period_end, false first_renewal
   FROM billing_commercial_contract c
   JOIN team_billing_account a ON a.team_id=c.team_id AND a.stripe_customer_id=c.customer_id AND a.stripe_subscription_id=c.subscription_id
   JOIN billing_usage_entitlement e ON e.team_id=c.team_id AND e.contract_id=c.id AND e.state='issued'
@@ -30,7 +32,7 @@ CREATE OR REPLACE FUNCTION billing_renewal_roll_grace(p_team_id uuid,p_credit_ch
     THEN EXISTS(SELECT 1 FROM billing_funding_account f WHERE f.team_id=p_team_id AND f.prepaid)
     ELSE EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.id=e.sponsorship_id AND o.contract_id=c.id AND o.state='active' AND o.revoked_at IS NULL) END
   UNION ALL
-  SELECT c.id, u.period_end
+  SELECT c.id, u.period_end, true
   FROM billing_pro_upgrade u
   JOIN billing_commercial_contract c ON c.id=u.contract_id AND c.team_id=u.team_id AND c.status IN ('pending','active') AND c.starts_at=u.period_end
   JOIN team_billing_account a ON a.team_id=c.team_id AND a.stripe_customer_id=c.customer_id AND a.stripe_subscription_id=c.subscription_id
@@ -43,7 +45,9 @@ CREATE OR REPLACE FUNCTION billing_renewal_roll_grace(p_team_id uuid,p_credit_ch
    AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement n WHERE n.team_id=c.team_id AND n.contract_id=c.id AND n.period_start=r.period_end AND n.state='issued' AND n.issued_at<=p_credit_checked_at)
    AND NOT EXISTS(SELECT 1 FROM billing_entitlement_debt d WHERE d.contract_id=c.id AND d.period_start>=r.period_end)
    AND NOT EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start>=r.period_end AND w.evidence ? 'unpaid_invoice')
-   AND NOT EXISTS(SELECT 1 FROM billing_funding_account f WHERE f.team_id=p_team_id AND COALESCE(f.provider_evidence->>'DebtInvoiceID','')<>''));
+   AND NOT (r.first_renewal AND EXISTS(SELECT 1 FROM billing_funding_account f
+    JOIN billing_invoice_close j ON j.team_id=f.team_id AND j.period_end=r.period_end AND j.invoice_id=f.provider_evidence->>'DebtInvoiceID'
+    WHERE f.team_id=p_team_id)));
 $$;
 
 CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$

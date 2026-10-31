@@ -143,6 +143,9 @@ func TestSponsoredRollGrace(t *testing.T) {
 		{"unpaid invoice ends it", 2 * time.Hour, func(f *sponsoredRollFixture) {
 			f.exec(`INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence) VALUES($1,$2,$3,'{"unpaid_invoice":"in_unpaid"}')`, f.c.ID, f.start, f.end)
 		}, false},
+		{"observed debt evidence alone keeps it", 2 * time.Hour, func(f *sponsoredRollFixture) {
+			f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_older_unpaid"}' WHERE team_id=$1`, f.c.TeamID)
+		}, true},
 		{"debt ends it", 2 * time.Hour, func(f *sponsoredRollFixture) {
 			f.exec(`INSERT INTO billing_entitlement_debt(contract_id,period_start,invoice_id) VALUES($1,$2,'in_unpaid')`, f.c.ID, f.start)
 		}, false},
