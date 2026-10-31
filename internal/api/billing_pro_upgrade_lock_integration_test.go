@@ -5,9 +5,14 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -153,5 +158,65 @@ func TestProUpgradeCheckoutsWaitForTheInvoiceLock(t *testing.T) {
 		if busy, err := run(h, proReconciliationWait); err != nil || busy != 0 {
 			t.Fatalf("checkouts failed while waiting their turn: busy=%d err=%v", busy, err)
 		}
+	}
+}
+
+// A checkout waiting its turn stays bound to the upgrade it accepted. If that
+// upgrade ends meanwhile and another actor starts a successor, the waiting
+// request must not reconcile or return the successor's checkout.
+func TestProUpgradeCheckoutWaitKeepsTheAcceptedUpgrade(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	insert := func(state string) proUpgrade {
+		t.Helper()
+		id, actor := uuid.New(), uuid.New()
+		conn, err := h.Pool.Acquire(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Exec(context.WithoutCancel(t.Context()), `RESET session_replication_role`)
+		if _, err = conn.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state)
+ VALUES($1,$2,$3,'cus_example','pro_monthly','{}',clock_timestamp()-interval '1 minute',clock_timestamp()-interval '1 minute',clock_timestamp()+interval '1 day',clock_timestamp(),100,$4)`, id, team, actor, state); err != nil {
+			t.Fatal(err)
+		}
+		u, err := scanProUpgrade(h.Pool.QueryRow(t.Context(), `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE id=$1`, id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	accepted := insert("expired")
+	// The accepted upgrade was still open when its request read it.
+	accepted.State = "prepared"
+	insert("prepared")
+	var calls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	t.Cleanup(provider.Close)
+	h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+
+	// Another reconciler holds the team for the first attempt.
+	holder, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = holder.Exec(t.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_ = holder.Rollback(context.Background())
+	}()
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodPost, "/stripe/pro-checkout", nil).WithContext(t.Context())
+	h.resumeProUpgradeCheckout(c, accepted)
+	if response.Code != http.StatusServiceUnavailable || calls.Load() != 0 {
+		t.Fatalf("waiting checkout moved to the successor: %d %s (provider calls %d)", response.Code, response.Body.String(), calls.Load())
 	}
 }

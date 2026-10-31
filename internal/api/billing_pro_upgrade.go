@@ -55,6 +55,19 @@ func (h *Handlers) proUpgrade(ctx context.Context, team uuid.UUID) (proUpgrade, 
 	return scanProUpgrade(h.Pool.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE team_id=$1 AND state NOT IN ('expired','ended')`, team))
 }
 
+// errProUpgradeSuperseded reports that an accepted upgrade ended while its
+// checkout request was waiting; a successor belongs to its own request.
+var errProUpgradeSuperseded = errors.New("accepted upgrade is no longer open")
+
+// openProUpgrade reloads one accepted upgrade, never another for the team.
+func (h *Handlers) openProUpgrade(ctx context.Context, u proUpgrade) (proUpgrade, error) {
+	latest, err := scanProUpgrade(h.Pool.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE id=$1 AND team_id=$2 AND state NOT IN ('expired','ended')`, u.ID, u.Team))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return latest, errProUpgradeSuperseded
+	}
+	return latest, err
+}
+
 func proratedProAmount(amount int64, start, end, at time.Time) (int64, error) {
 	duration, remaining := end.Unix()-start.Unix(), end.Unix()-at.Unix()
 	if amount < 0 || duration <= 0 || remaining <= 0 || at.Before(start) || remaining > duration {
@@ -317,12 +330,19 @@ func (h *Handlers) respondUpgradeUnsettled(c *gin.Context, team uuid.UUID, cause
 }
 
 func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
+	first := true
 	outcome, err := waitWhileReconciliationBusy(c.Request.Context(), proReconciliationWait, func() (string, error) {
-		latest, err := h.proUpgrade(c.Request.Context(), u.Team)
-		if err != nil {
-			return "", err
+		attempt := u
+		if !first {
+			// The busy reconciler may have advanced this upgrade.
+			latest, err := h.openProUpgrade(c.Request.Context(), u)
+			if err != nil {
+				return "", err
+			}
+			attempt = latest
 		}
-		return h.reconcileProUpgrade(c.Request.Context(), latest, false)
+		first = false
+		return h.reconcileProUpgrade(c.Request.Context(), attempt, false)
 	})
 	if err != nil {
 		h.respondUpgradeUnsettled(c, u.Team, err)
@@ -338,7 +358,7 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 			return
 		}
 	}
-	latest, err := h.proUpgrade(c.Request.Context(), u.Team)
+	latest, err := h.openProUpgrade(c.Request.Context(), u)
 	if err != nil || latest.Session == nil {
 		h.respondUpgradeUnsettled(c, u.Team, fmt.Errorf("upgrade %s has no checkout session: %w", outcome, err))
 		return
