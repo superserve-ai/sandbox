@@ -34,9 +34,8 @@ type StripeRetrievedCheckoutSession struct {
 	Mode              string            `json:"mode"`
 	ExpiresAt         int64             `json:"expires_at"`
 	Metadata          map[string]string `json:"metadata"`
-	Discounts         []struct {
-		PromotionCode string `json:"promotion_code"`
-	} `json:"discounts"`
+	// Raw so that an unexpected shape never fails decoding the whole session.
+	Discounts    json.RawMessage `json:"discounts"`
 	CustomFields []struct {
 		Key      string `json:"key"`
 		Dropdown *struct {
@@ -45,11 +44,19 @@ type StripeRetrievedCheckoutSession struct {
 	} `json:"custom_fields"`
 }
 
-// promotionCode is the promotion code the customer entered at checkout, if any.
+// promotionCode is the promotion code ID the customer entered at checkout, if
+// any. Anything but a list of discounts carrying a string code reads as none.
 func (s StripeRetrievedCheckoutSession) promotionCode() string {
-	for _, d := range s.Discounts {
-		if d.PromotionCode != "" {
-			return d.PromotionCode
+	var discounts []struct {
+		PromotionCode json.RawMessage `json:"promotion_code"`
+	}
+	if json.Unmarshal(s.Discounts, &discounts) != nil {
+		return ""
+	}
+	for _, d := range discounts {
+		var code string
+		if json.Unmarshal(d.PromotionCode, &code) == nil && code != "" {
+			return code
 		}
 	}
 	return ""

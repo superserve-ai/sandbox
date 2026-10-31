@@ -239,6 +239,17 @@ func (c *stripeHTTPClient) customerCreditGrants(ctx context.Context, customer st
 	return nil, errors.New("customer credit grants exceed the inspection bound")
 }
 
+// otherCreditKind reports metadata that marks a grant as belonging to another
+// credit flow, as event_credit.py's reserved keys and restore marker do.
+func otherCreditKind(metadata map[string]string) bool {
+	for _, key := range []string{"entitlement_id", "matching_credit_id", "prepaid_purchase_id", "pro_upgrade_id", "activation_identity", "trial_forfeit_restore"} {
+		if _, ok := metadata[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // existingEventGrant returns the team's grant for this event, if any. A grant
 // that was voided, differs from the event's terms, or sits on another customer
 // (which cannot fund this one's invoices) needs an operator, not a second grant.
@@ -253,7 +264,7 @@ func existingEventGrant(grants []entitlementGrant, team uuid.UUID, customer, lab
 		return "", nil
 	}
 	g := found[0]
-	if len(found) > 1 || g.Customer != customer || g.VoidedAt != 0 || g.ExpiresAt != 0 || g.Category != "promotional" || g.Priority != 50 ||
+	if len(found) > 1 || g.Customer != customer || g.VoidedAt != 0 || otherCreditKind(g.Metadata) || g.ExpiresAt != 0 || g.Category != "promotional" || g.Priority != 50 ||
 		g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != cents ||
 		g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 {
 		return "", fmt.Errorf("event credit %s already has a grant that differs from its terms; operator review required", label)

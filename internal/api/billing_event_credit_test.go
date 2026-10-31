@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -31,9 +32,31 @@ func TestExistingEventGrantSettlesOnMatchingTermsOnly(t *testing.T) {
 		"expiring":       {grant("a", 8000, func(g *entitlementGrant) { g.ExpiresAt = 1 })},
 		"duplicate":      {grant("a", 8000, nil), grant("b", 8000, nil)},
 		"other customer": {grant("a", 8000, func(g *entitlementGrant) { g.Customer = "cus_prior" })},
+		"restore":        {grant("a", 8000, func(g *entitlementGrant) { g.Metadata["trial_forfeit_restore"] = "true" })},
+		"other flow":     {grant("a", 8000, func(g *entitlementGrant) { g.Metadata["matching_credit_id"] = "x" })},
 	} {
 		if id, err := existingEventGrant(g, team, "cus_current", "event-label", 8000); id != "" || err == nil || !strings.Contains(err.Error(), "operator review") {
 			t.Fatalf("%s grant settled: %q %v", name, id, err)
+		}
+	}
+}
+
+func TestCheckoutSessionPromotionCodeNeverBreaksDecoding(t *testing.T) {
+	for raw, want := range map[string]string{
+		`{"id":"cs_1","discounts":[{"coupon":"co_1","promotion_code":"promo_1"}]}`:        "promo_1",
+		`{"id":"cs_1","discounts":[{"coupon":"co_1","promotion_code":null}]}`:             "",
+		`{"id":"cs_1","discounts":[{"coupon":"co_1","promotion_code":{"id":"promo_1"}}]}`: "",
+		`{"id":"cs_1","discounts":[]}`:                                                    "",
+		`{"id":"cs_1","discounts":null}`:                                                  "",
+		`{"id":"cs_1","discounts":"unexpected"}`:                                          "",
+		`{"id":"cs_1"}`:                                                                   "",
+	} {
+		var s StripeRetrievedCheckoutSession
+		if err := json.Unmarshal([]byte(raw), &s); err != nil || s.ID != "cs_1" {
+			t.Fatalf("%s: decode failed: %v", raw, err)
+		}
+		if got := s.promotionCode(); got != want {
+			t.Fatalf("%s: promotion code %q, want %q", raw, got, want)
 		}
 	}
 }

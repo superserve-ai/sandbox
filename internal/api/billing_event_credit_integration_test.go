@@ -128,9 +128,7 @@ func TestEventCheckoutSkipsTheCardOnlyForAFreeListedCode(t *testing.T) {
 		var s StripeRetrievedCheckoutSession
 		s.AmountTotal = total
 		if promotion != "" {
-			s.Discounts = append(s.Discounts, struct {
-				PromotionCode string `json:"promotion_code"`
-			}{promotion})
+			s.Discounts = json.RawMessage(`[{"coupon":"co_x","promotion_code":"` + promotion + `"}]`)
 		}
 		return s
 	}
