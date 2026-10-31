@@ -440,9 +440,10 @@ module "sandbox_host" {
   can_ip_forward        = true
 
   metadata = {
-    enable-osconfig = "TRUE"
-    enable-oslogin  = "TRUE"
-    startup-script  = <<-EOT
+    enable-osconfig    = "TRUE"
+    enable-oslogin     = "TRUE"
+    enable-oslogin-2fa = "TRUE"
+    startup-script     = <<-EOT
       #!/bin/bash
       # Restore runtime and private configuration before admission.
       # Identity-gated units prevent activation until identity is installed.
@@ -516,8 +517,9 @@ module "sandbox_host_b" {
   can_ip_forward = true
 
   metadata = {
-    enable-osconfig = "TRUE"
-    enable-oslogin  = "TRUE"
+    enable-osconfig    = "TRUE"
+    enable-oslogin     = "TRUE"
+    enable-oslogin-2fa = "TRUE"
     # cloud-init runs bootcmd on every boot before any service starts, so
     # the identity is already this host's own by the time vmd can launch.
     # A daemon that came up under another host's HOST_ID would heartbeat

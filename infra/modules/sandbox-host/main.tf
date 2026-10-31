@@ -96,6 +96,10 @@ resource "google_compute_instance" "this" {
       # scratch disks: a plan must never detach a live disk it didn't create.
       attached_disk,
       boot_disk,
+      # Keep the complete metadata map protected until the pinned provider's
+      # key-only ownership/update behavior is proven. Callers still place the
+      # OS Login 2FA policy in creation metadata; existing-host reconciliation
+      # remains an explicit rollout blocker rather than risking key loss.
       metadata,
       network_interface[0].access_config,
       scheduling,

@@ -98,6 +98,23 @@ run "preserve_caller_cloud_config" {
   }
 }
 
+run "preserve_oslogin_policy_with_unrelated_metadata" {
+  command = plan
+  variables {
+    metadata = {
+      enable-oslogin-2fa = "TRUE"
+      unrelated-policy   = "preserve-me"
+    }
+  }
+  assert {
+    condition = (
+      google_compute_instance.this.metadata["enable-oslogin-2fa"] == "TRUE" &&
+      google_compute_instance.this.metadata["unrelated-policy"] == "preserve-me"
+    )
+    error_message = "The OS Login 2FA policy must coexist with unrelated caller metadata."
+  }
+}
+
 run "forward_boot_image_unchanged" {
   command = plan
   assert {

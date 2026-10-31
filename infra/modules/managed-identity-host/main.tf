@@ -108,6 +108,10 @@ resource "google_compute_instance" "this" {
       boot_disk,
       # Admission is controlled by the operator, independently of deployment labels.
       labels["sandbox_status"],
+      # Keep the complete metadata map protected until the pinned provider's
+      # key-only ownership/update behavior is proven. Callers still place the
+      # OS Login 2FA policy in creation metadata; existing-host reconciliation
+      # remains an explicit rollout blocker rather than risking key loss.
       metadata,
       network_interface[0].access_config,
       scheduling,
