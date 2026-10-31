@@ -314,6 +314,12 @@ const upgradeExpiryClockMargin = 5 * time.Minute
 // error the customer can retry, never a pending payment without a session.
 func (h *Handlers) respondUpgradeUnsettled(c *gin.Context, team uuid.UUID, cause error) {
 	ctx := c.Request.Context()
+	// A successor belongs to another request; its payment is not this one's.
+	if errors.Is(cause, errProUpgradeSuperseded) {
+		log.Warn().Err(cause).Str("team_id", team.String()).Msg("upgrade checkout unavailable")
+		respondErrorMsg(c, "checkout_unavailable", "Checkout could not be opened. Please try again.", http.StatusServiceUnavailable)
+		return
+	}
 	latest, err := h.proUpgrade(ctx, team)
 	paid := err == nil && (latest.State == "paid" || latest.State == "credited" || latest.State == "active")
 	if !paid && err == nil && latest.Session != nil {

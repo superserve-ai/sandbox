@@ -5,8 +5,10 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -191,10 +193,19 @@ func TestProUpgradeCheckoutWaitKeepsTheAcceptedUpgrade(t *testing.T) {
 	accepted := insert("expired")
 	// The accepted upgrade was still open when its request read it.
 	accepted.State = "prepared"
-	insert("prepared")
+	successor := insert("prepared")
+	// The successor's own checkout has completed.
+	session := "cs_successor_" + strings.ReplaceAll(successor.ID.String(), "-", "")
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET session_id=$2 WHERE id=$1`, successor.ID, session); err != nil {
+		t.Fatal(err)
+	}
 	var calls atomic.Int32
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
+		if r.URL.Path == "/v1/checkout/sessions/"+session {
+			fmt.Fprintf(w, `{"id":%q,"status":"complete"}`, session)
+			return
+		}
 		http.Error(w, "unexpected", http.StatusInternalServerError)
 	}))
 	t.Cleanup(provider.Close)
