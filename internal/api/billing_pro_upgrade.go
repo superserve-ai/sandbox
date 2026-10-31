@@ -365,40 +365,40 @@ func (h *Handlers) lockSection(ctx context.Context) (func(), error) {
 func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*pgxpool.Conn, func(), error) {
 	// A transaction pins its backend through the transaction pooler and its
 	// lock ends with it; a session lock can outlive the attempt on a pooled
-	// backend and block the team. Writes run on a separate connection.
+	// backend and block the team. Writes run on a separate connection, taken
+	// before the lock: a waiter for the lock may hold the pool's last slot.
 	leave, err := h.lockSection(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	lockTx, err := h.Pool.Begin(ctx)
+	conn, err := h.Pool.Acquire(ctx)
 	if err != nil {
 		leave()
 		return nil, nil, err
 	}
-	unlock := func() {
+	lockTx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		conn.Release()
+		leave()
+		return nil, nil, err
+	}
+	release := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
 		_ = lockTx.Rollback(cleanup)
+		conn.Release()
 		leave()
 	}
 	var locked bool
 	err = lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
 	if err != nil || !locked {
-		unlock()
+		release()
 		if err == nil {
 			err = errProReconciliationBusy
 		}
 		return nil, nil, err
 	}
-	conn, err := h.Pool.Acquire(ctx)
-	if err != nil {
-		unlock()
-		return nil, nil, err
-	}
-	return conn, func() {
-		conn.Release()
-		unlock()
-	}, nil
+	return conn, release, nil
 }
 
 func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restart bool) (string, error) {
