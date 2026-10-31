@@ -141,7 +141,7 @@ func TestEventCheckoutSkipsTheCardOnlyForAFreeListedCode(t *testing.T) {
 		"unlisted code":    {session("promo_other", 0), false},
 		"no code":          {session("", 0), false},
 	} {
-		got, err := eventCheckout(t.Context(), h.Pool, tc.s)
+		got, err := eventCheckout(t.Context(), h.Pool, tc.s, uuid.New(), "cus_event")
 		if err != nil || got != tc.want {
 			t.Fatalf("%s: %v %v", name, got, err)
 		}
@@ -170,6 +170,13 @@ func TestEventPromotionCreditStopsOnAPriorCustomersGrant(t *testing.T) {
 	}
 	if err = tx.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+	var free StripeRetrievedCheckoutSession
+	free.Discounts = json.RawMessage(`[{"promotion_code":"` + code + `"}]`)
+	for other, want := range map[string]bool{customer: true, "cus_other": false} {
+		if got, err := eventCheckout(ctx, h.Pool, free, team, other); err != nil || got != want {
+			t.Fatalf("checkout on %s skips the card=%v err=%v", other, got, err)
+		}
 	}
 	var posts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

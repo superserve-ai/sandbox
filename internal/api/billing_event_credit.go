@@ -24,9 +24,22 @@ func recordEventCredit(ctx context.Context, tx pgx.Tx, team, contract uuid.UUID,
 	if promotionCode == "" {
 		return nil
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO billing_event_credit(contract_id,team_id,customer_id,promotion_code,label,credit_cents)
+	tag, err := tx.Exec(ctx, `INSERT INTO billing_event_credit(contract_id,team_id,customer_id,promotion_code,label,credit_cents)
  SELECT $1,$2,$3,p.promotion_code,p.label,p.credit_cents FROM billing_event_promotion p WHERE p.promotion_code=$4
  ON CONFLICT DO NOTHING`, contract, team, customer, promotionCode)
+	if err != nil || tag.RowsAffected() == 1 {
+		return err
+	}
+	var prior string
+	err = tx.QueryRow(ctx, `SELECT c.customer_id FROM billing_event_credit c JOIN billing_event_promotion p ON p.label=c.label
+ WHERE p.promotion_code=$1 AND c.team_id=$2 AND c.customer_id<>$3`, promotionCode, team, customer).Scan(&prior)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err == nil {
+		log.Error().Str("team_id", team.String()).Str("contract_id", contract.String()).Str("prior_customer", prior).Str("customer", customer).
+			Msg("event credit already queued on another customer; operator review required")
+	}
 	return err
 }
 
@@ -35,13 +48,17 @@ func recordEventCredit(ctx context.Context, tx pgx.Tx, team, contract uuid.UUID,
 // is unpaid like any other.
 func eventCheckout(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
-}, session StripeRetrievedCheckoutSession) (bool, error) {
+}, session StripeRetrievedCheckoutSession, team uuid.UUID, customer string) (bool, error) {
 	code := session.promotionCode()
 	if code == "" || session.AmountTotal != 0 {
 		return false, nil
 	}
+	// A team whose credit for this event sits on another customer gets no new
+	// credit here, so its checkout needs a card like any other free one.
 	var listed bool
-	err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_event_promotion WHERE promotion_code=$1)`, code).Scan(&listed)
+	err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_event_promotion WHERE promotion_code=$1)
+ AND NOT EXISTS(SELECT 1 FROM billing_event_credit c JOIN billing_event_promotion p ON p.label=c.label
+  WHERE p.promotion_code=$1 AND c.team_id=$2 AND c.customer_id<>$3)`, code, team, customer).Scan(&listed)
 	return listed, err
 }
 
