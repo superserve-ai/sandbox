@@ -391,8 +391,9 @@ module "sandbox_host_c" {
   ]
 
   metadata = {
-    enable-osconfig = "TRUE"
-    enable-oslogin  = "TRUE"
+    enable-osconfig    = "TRUE"
+    enable-oslogin     = "TRUE"
+    enable-oslogin-2fa = "TRUE"
     startup-script = join("\n\n", [
       templatefile("${path.module}/../../../../deploy/host-bootstrap/sandbox-host-bootstrap.sh.tftpl", {
         localssd_script     = file("${path.module}/../../../../deploy/host-bootstrap/sandbox-localssd.sh")
