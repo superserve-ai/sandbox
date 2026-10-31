@@ -350,15 +350,18 @@ same idempotency key, so a later manual run with the same label reports
 `already granted`.
 
 1. In Stripe, create a coupon (for example 100% off, once) and a customer-facing
-   promotion code for it, and note the promotion code ID (`promo_...`).
+   promotion code for it with the event's expiry, and note the promotion code
+   ID (`promo_...`). Stripe refuses the code after it expires.
 2. List it, with the credit to add on top of the plan's included credit:
 
 ```sql
-INSERT INTO billing_event_promotion(promotion_code, label, credit_cents, expires_at)
-VALUES ('promo_...', 'event-2026-11-01', 8000, '2026-11-02 08:00+00');
+INSERT INTO billing_event_promotion(promotion_code, label, credit_cents)
+VALUES ('promo_...', 'event-2026-11-01', 8000);
 ```
 
-The code works until `expires_at`. Each team gets one credit per label. Issued
+Each team gets one credit per label. Before issuing, the worker looks for a
+grant the team already has under that label, from this script or an earlier
+attempt, and settles on it; one with different terms waits for an operator. Issued
 credits are in `billing_event_credit`; a row with `last_error` set needs
 attention. Issuance runs with the matching credit worker, which requires
 `BILLING_USAGE_ENTITLEMENTS_ENABLED`.

@@ -26,9 +26,8 @@ func TestEventPromotionCreditIsQueuedOnceAndIssuedOnce(t *testing.T) {
 		}
 	}
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
-	active, expired, label := "promo_"+suffix, "promo_x"+suffix, "haunted-"+suffix[:12]
-	exec(`INSERT INTO billing_event_promotion(promotion_code,label,credit_cents,expires_at) VALUES
- ($1,$3,8000,clock_timestamp()+interval '1 day'),($2,'old-'||$3,8000,clock_timestamp()-interval '1 minute')`, active, expired, label)
+	active, label := "promo_"+suffix, "event-"+suffix[:12]
+	exec(`INSERT INTO billing_event_promotion(promotion_code,label,credit_cents) VALUES($1,$2,8000)`, active, label)
 	queue := func(code string) {
 		t.Helper()
 		tx, err := h.Pool.Begin(ctx)
@@ -50,7 +49,7 @@ func TestEventPromotionCreditIsQueuedOnceAndIssuedOnce(t *testing.T) {
 		}
 		return n
 	}
-	for _, code := range []string{"", "promo_unknown", expired} {
+	for _, code := range []string{"", "promo_unknown"} {
 		if queue(code); queued() != 0 {
 			t.Fatalf("code %q queued credit", code)
 		}
@@ -66,6 +65,17 @@ func TestEventPromotionCreditIsQueuedOnceAndIssuedOnce(t *testing.T) {
 	wantKey := "event-credit-" + hex.EncodeToString(sum[:])
 	var posts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/billing/credit_grants" {
+			data := []any{}
+			if posts.Load() > 0 {
+				data = append(data, map[string]any{"id": "credgr_event", "customer": customer, "category": "promotional", "priority": 50,
+					"amount":               map[string]any{"type": "monetary", "monetary": map[string]any{"currency": "usd", "value": 8000}},
+					"applicability_config": map[string]any{"scope": map[string]any{"price_type": "metered"}},
+					"metadata":             map[string]string{"event_label": label, "team_id": team.String()}})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "has_more": false})
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/billing/credit_grants" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)

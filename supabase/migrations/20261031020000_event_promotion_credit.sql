@@ -1,10 +1,10 @@
 -- Event promotion codes add usage credit to the Developer or Pro checkout that
--- used them, on top of the plan's included credit. Staff list the codes.
+-- used them, on top of the plan's included credit. Staff list the codes; the
+-- Stripe promotion code's own expiry bounds when a checkout can use one.
 CREATE TABLE billing_event_promotion (
  promotion_code text PRIMARY KEY CHECK (promotion_code ~ '^promo_[A-Za-z0-9]+$'),
  label text NOT NULL CHECK (label ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
  credit_cents bigint NOT NULL CHECK (credit_cents > 0 AND credit_cents <= 100000),
- expires_at timestamptz NOT NULL,
  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 

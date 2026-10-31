@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"time"
@@ -16,14 +17,15 @@ import (
 )
 
 // recordEventCredit queues an event's extra usage credit when a checkout used
-// one of its unexpired promotion codes. A team gets one credit per event.
+// one of its promotion codes. Stripe refuses an expired code at checkout, so a
+// completed checkout carrying one is eligible however late it is processed. A
+// team gets one credit per event.
 func recordEventCredit(ctx context.Context, tx pgx.Tx, team, contract uuid.UUID, customer, promotionCode string) error {
 	if promotionCode == "" {
 		return nil
 	}
 	_, err := tx.Exec(ctx, `INSERT INTO billing_event_credit(contract_id,team_id,customer_id,promotion_code,label,credit_cents)
- SELECT $1,$2,$3,p.promotion_code,p.label,p.credit_cents FROM billing_event_promotion p
- WHERE p.promotion_code=$4 AND p.expires_at>clock_timestamp()
+ SELECT $1,$2,$3,p.promotion_code,p.label,p.credit_cents FROM billing_event_promotion p WHERE p.promotion_code=$4
  ON CONFLICT DO NOTHING`, contract, team, customer, promotionCode)
 	return err
 }
@@ -98,33 +100,77 @@ func (h *Handlers) issueEventCredit(ctx context.Context, client *stripeHTTPClien
 		return err
 	}
 	defer release()
-	var first time.Time
-	if err = h.Pool.QueryRow(ctx, `UPDATE billing_event_credit SET state='uncertain',first_attempt_at=COALESCE(first_attempt_at,clock_timestamp())
- WHERE contract_id=$1 AND state<>'issued' RETURNING first_attempt_at`, contract).Scan(&first); err != nil {
-		return err
-	}
-	// Past Stripe's idempotency window a replay could create a second grant,
-	// so only the provider inventory can settle the outcome.
-	if time.Since(first) >= 23*time.Hour {
-		if err = h.syncCreditInventory(ctx, contract, customer, client); err != nil {
-			return err
-		}
-		var grant string
-		err = h.Pool.QueryRow(ctx, `SELECT grant_id FROM billing_provider_credit WHERE customer_id=$1
- AND evidence->'metadata'->>'event_label'=$2 AND evidence->'metadata'->>'team_id'=$3`, customer, label, team.String()).Scan(&grant)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return errors.New("event credit outcome unknown after the replay window; operator recovery required")
-		}
-		if err != nil {
-			return err
-		}
-		_, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='issued',stripe_credit_grant_id=$2,issued_at=clock_timestamp() WHERE contract_id=$1 AND state='uncertain'`, contract, grant)
-		return err
-	}
-	grant, err := client.createCreditGrant(ctx, eventGrantForm(team, customer, label, cents), eventGrantKey(team, label))
+	// An earlier attempt, or a manual event_credit.py run whose idempotency key
+	// Stripe has since forgotten, may already have granted this credit.
+	grants, err := client.customerCreditGrants(ctx, customer)
 	if err != nil {
 		return err
 	}
-	_, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='issued',stripe_credit_grant_id=$2,issued_at=clock_timestamp() WHERE contract_id=$1 AND state='uncertain'`, contract, grant.ID)
+	grant, err := existingEventGrant(grants, team, label, cents)
+	if err != nil || grant != "" {
+		if grant != "" {
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='issued',stripe_credit_grant_id=$2,issued_at=clock_timestamp(),first_attempt_at=COALESCE(first_attempt_at,clock_timestamp()) WHERE contract_id=$1 AND state<>'issued'`, contract, grant)
+		}
+		return err
+	}
+	if _, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='uncertain',first_attempt_at=COALESCE(first_attempt_at,clock_timestamp()) WHERE contract_id=$1 AND state<>'issued'`, contract); err != nil {
+		return err
+	}
+	created, err := client.createCreditGrant(ctx, eventGrantForm(team, customer, label, cents), eventGrantKey(team, label))
+	if err != nil {
+		return err
+	}
+	_, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='issued',stripe_credit_grant_id=$2,issued_at=clock_timestamp() WHERE contract_id=$1 AND state='uncertain'`, contract, created.ID)
 	return err
+}
+
+// customerCreditGrants lists every credit grant on a customer, bounded like
+// the event credit script's inspection.
+func (c *stripeHTTPClient) customerCreditGrants(ctx context.Context, customer string) ([]entitlementGrant, error) {
+	var all []entitlementGrant
+	after := ""
+	for range 10 {
+		q := url.Values{"customer": {customer}, "limit": {"100"}}
+		if after != "" {
+			q.Set("starting_after", after)
+		}
+		var page struct {
+			Data    []entitlementGrant `json:"data"`
+			HasMore bool               `json:"has_more"`
+		}
+		if err := c.doForm(ctx, http.MethodGet, "/v1/billing/credit_grants?"+q.Encode(), nil, &page, ""); err != nil {
+			return nil, err
+		}
+		all = append(all, page.Data...)
+		if !page.HasMore {
+			return all, nil
+		}
+		if len(page.Data) == 0 {
+			return nil, errors.New("empty incomplete credit grant page")
+		}
+		after = page.Data[len(page.Data)-1].ID
+	}
+	return nil, errors.New("customer credit grants exceed the inspection bound")
+}
+
+// existingEventGrant returns the team's grant for this event, if any. A grant
+// that was voided or differs from the event's terms needs an operator rather
+// than a second grant.
+func existingEventGrant(grants []entitlementGrant, team uuid.UUID, label string, cents int64) (string, error) {
+	var found []entitlementGrant
+	for _, g := range grants {
+		if g.Metadata["event_label"] == label && g.Metadata["team_id"] == team.String() {
+			found = append(found, g)
+		}
+	}
+	if len(found) == 0 {
+		return "", nil
+	}
+	g := found[0]
+	if len(found) > 1 || g.VoidedAt != 0 || g.ExpiresAt != 0 || g.Category != "promotional" || g.Priority != 50 ||
+		g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != cents ||
+		g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 {
+		return "", fmt.Errorf("event credit %s already has a grant that differs from its terms; operator review required", label)
+	}
+	return g.ID, nil
 }

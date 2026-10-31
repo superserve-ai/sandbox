@@ -523,7 +523,6 @@ type BillingEventPromotion struct {
 	PromotionCode string    `json:"promotion_code"`
 	Label         string    `json:"label"`
 	CreditCents   int64     `json:"credit_cents"`
-	ExpiresAt     time.Time `json:"expires_at"`
 	CreatedAt     time.Time `json:"created_at"`
 }
 
