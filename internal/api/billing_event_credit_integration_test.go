@@ -65,6 +65,10 @@ func TestEventPromotionCreditIsQueuedOnceAndIssuedOnce(t *testing.T) {
 	wantKey := "event-credit-" + hex.EncodeToString(sum[:])
 	var posts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/customers/search" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}, "has_more": false})
+			return
+		}
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/billing/credit_grants" {
 			data := []any{}
 			if posts.Load() > 0 {
@@ -141,5 +145,60 @@ func TestEventCheckoutSkipsTheCardOnlyForAFreeListedCode(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Fatalf("%s: %v %v", name, got, err)
 		}
+	}
+}
+
+// A grant the team received on an earlier customer, for example from a manual
+// event_credit.py run, settles the credit instead of a second grant.
+func TestEventPromotionCreditSettlesOnAPriorCustomersGrant(t *testing.T) {
+	f := newEntitlementFixture(t)
+	h, ctx := f.h, t.Context()
+	team, contract, customer := f.c.TeamID, f.c.ID, f.c.CustomerID
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	code, label := "promo_"+suffix, "event-"+suffix[:12]
+	if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_event_promotion(promotion_code,label,credit_cents) VALUES($1,$2,8000)`, code, label); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = recordEventCredit(ctx, tx, team, contract, customer, code); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/customers/search":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "cus_prior"}}, "has_more": false})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/billing/credit_grants":
+			data := []any{}
+			if r.URL.Query().Get("customer") == "cus_prior" {
+				data = append(data, map[string]any{"id": "credgr_manual", "customer": "cus_prior", "category": "promotional", "priority": 50,
+					"amount":               map[string]any{"type": "monetary", "monetary": map[string]any{"currency": "usd", "value": 8000}},
+					"applicability_config": map[string]any{"scope": map[string]any{"price_type": "metered"}},
+					"metadata":             map[string]string{"event_label": label, "team_id": team.String()}})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "has_more": false})
+		default:
+			posts.Add(1)
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+	if err = h.issueDueEventCredits(ctx, client); err != nil {
+		t.Fatal(err)
+	}
+	var state, grant string
+	if err = h.Pool.QueryRow(ctx, `SELECT state,stripe_credit_grant_id FROM billing_event_credit WHERE contract_id=$1`, contract).Scan(&state, &grant); err != nil {
+		t.Fatal(err)
+	}
+	if state != "issued" || grant != "credgr_manual" || posts.Load() != 0 {
+		t.Fatalf("state=%s grant=%s other requests=%d", state, grant, posts.Load())
 	}
 }

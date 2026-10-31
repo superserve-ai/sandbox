@@ -117,7 +117,7 @@ func (h *Handlers) issueEventCredit(ctx context.Context, client *stripeHTTPClien
 	defer release()
 	// An earlier attempt, or a manual event_credit.py run whose idempotency key
 	// Stripe has since forgotten, may already have granted this credit.
-	grants, err := client.customerCreditGrants(ctx, customer)
+	grants, err := h.teamCreditGrants(ctx, client, team, customer)
 	if err != nil {
 		return err
 	}
@@ -137,6 +137,77 @@ func (h *Handlers) issueEventCredit(ctx context.Context, client *stripeHTTPClien
 	}
 	_, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='issued',stripe_credit_grant_id=$2,issued_at=clock_timestamp() WHERE contract_id=$1 AND state='uncertain'`, contract, created.ID)
 	return err
+}
+
+// teamCreditGrants lists the grants on every customer the team has had, known
+// locally or tagged with the team in Stripe, as event_credit.py inspects them.
+func (h *Handlers) teamCreditGrants(ctx context.Context, client *stripeHTTPClient, team uuid.UUID, customer string) ([]entitlementGrant, error) {
+	customers := map[string]bool{customer: true}
+	rows, err := h.Pool.Query(ctx, `SELECT stripe_customer_id FROM team_billing_account WHERE team_id=$1 AND stripe_customer_id IS NOT NULL
+ UNION SELECT customer_id FROM billing_commercial_contract WHERE team_id=$1`, team)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		customers[id] = true
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	tagged, err := client.teamCustomers(ctx, team)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range tagged {
+		customers[id] = true
+	}
+	var all []entitlementGrant
+	for id := range customers {
+		grants, err := client.customerCreditGrants(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, grants...)
+	}
+	return all, nil
+}
+
+func (c *stripeHTTPClient) teamCustomers(ctx context.Context, team uuid.UUID) ([]string, error) {
+	var ids []string
+	page := ""
+	for range 20 {
+		q := url.Values{"query": {fmt.Sprintf("metadata['team_id']:'%s'", team)}, "limit": {"100"}}
+		if page != "" {
+			q.Set("page", page)
+		}
+		var result struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+			HasMore  bool   `json:"has_more"`
+			NextPage string `json:"next_page"`
+		}
+		if err := c.doForm(ctx, http.MethodGet, "/v1/customers/search?"+q.Encode(), nil, &result, ""); err != nil {
+			return nil, err
+		}
+		for _, d := range result.Data {
+			ids = append(ids, d.ID)
+		}
+		if !result.HasMore {
+			return ids, nil
+		}
+		if result.NextPage == "" {
+			return nil, errors.New("customer search page is incomplete")
+		}
+		page = result.NextPage
+	}
+	return nil, errors.New("customers for the team exceed the inspection bound")
 }
 
 // customerCreditGrants lists every credit grant on a customer, bounded like
