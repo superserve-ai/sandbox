@@ -11,7 +11,10 @@
 -- until a successful credit read after the next grant was issued. It ends early
 -- on debt, on withheld unpaid-invoice evidence, when the contract ends with
 -- that period, or once the team is no longer prepaid-funded. A withheld row
--- written only for a platform failure does not end it.
+-- written only for a platform failure does not end it. Debt and withheld rows
+-- are written only for an active contract, so a first renewal that fails
+-- while its contract is still pending ends the grace through the unpaid
+-- invoice the funding worker observes instead.
 --
 -- Usage in the grace is billed on the new period's invoice, which the next
 -- grant applies to; the invoice close verifies what Stripe applied.
@@ -39,7 +42,8 @@ CREATE OR REPLACE FUNCTION billing_renewal_roll_grace(p_team_id uuid,p_credit_ch
    AND (c.ends_at IS NULL OR c.ends_at>r.period_end)
    AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement n WHERE n.team_id=c.team_id AND n.contract_id=c.id AND n.period_start=r.period_end AND n.state='issued' AND n.issued_at<=p_credit_checked_at)
    AND NOT EXISTS(SELECT 1 FROM billing_entitlement_debt d WHERE d.contract_id=c.id AND d.period_start>=r.period_end)
-   AND NOT EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start>=r.period_end AND w.evidence ? 'unpaid_invoice'));
+   AND NOT EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start>=r.period_end AND w.evidence ? 'unpaid_invoice')
+   AND NOT EXISTS(SELECT 1 FROM billing_funding_account f WHERE f.team_id=p_team_id AND COALESCE(f.provider_evidence->>'DebtInvoiceID','')<>''));
 $$;
 
 CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$

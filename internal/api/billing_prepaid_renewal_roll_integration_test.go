@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -109,6 +110,9 @@ func TestPrepaidRenewalRollStaysEligible(t *testing.T) {
 		{"platform failure keeps it", 2 * time.Hour, func(f *sponsoredRollFixture) {
 			f.exec(`INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence,platform_failure_at) VALUES($1,$2,$3,'{}',clock_timestamp())`, f.c.ID, f.start, f.end)
 		}, 0, true},
+		{"observed unpaid invoice ends it", 2 * time.Hour, func(f *sponsoredRollFixture) {
+			f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_failed_renewal"}' WHERE team_id=$1`, f.c.TeamID)
+		}, 0, false},
 		{"unpaid invoice ends it", 2 * time.Hour, func(f *sponsoredRollFixture) {
 			f.exec(`INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence) VALUES($1,$2,$3,'{"unpaid_invoice":"in_unpaid"}')`, f.c.ID, f.start, f.end)
 		}, 0, false},
@@ -231,6 +235,9 @@ func TestPrepaidFirstRenewalRollStaysEligible(t *testing.T) {
 		{"ended upgrade ends it", 2 * time.Hour, func(f *firstRenewalFixture) {
 			f.exec(`UPDATE billing_pro_upgrade SET state='ended' WHERE id=$1`, f.upgrade)
 		}, 0, false},
+		{"failed renewal ends it", 2 * time.Hour, func(f *firstRenewalFixture) {
+			f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_failed_renewal"}' WHERE team_id=$1`, f.team)
+		}, 0, false},
 		{"ended contract ends it", 2 * time.Hour, func(f *firstRenewalFixture) {
 			f.exec(`UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1`, f.contract.ID)
 		}, 0, false},
@@ -279,16 +286,21 @@ func TestPrepaidRenewalRollGraceHoldsAutoRecharge(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		rolledAgo time.Duration
+		debt      bool
 		want      int
 	}{
-		{"in the grace", 2 * time.Hour, 0},
-		{"after the grace", 7 * time.Hour, 1},
+		{"in the grace", 2 * time.Hour, false, 0},
+		{"after the grace", 7 * time.Hour, false, 1},
+		{"failed renewal", 2 * time.Hour, true, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newPrepaidRollFixture(t, tc.rolledAgo)
 			f.exec(`INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents) VALUES($1,true,1000,1500)`, f.c.TeamID)
 			f.exec(`UPDATE billing_funding_account SET payment_method_id='pm_saved' WHERE team_id=$1`, f.c.TeamID)
 			observePrepaidCredit(t, f.entitlementFixture, 0)
+			if tc.debt {
+				f.exec(`UPDATE billing_funding_account SET provider_evidence='{"DebtInvoiceID":"in_failed_renewal"}' WHERE team_id=$1`, f.c.TeamID)
+			}
 			if err := f.h.recordAutoRecharges(t.Context()); err != nil {
 				t.Fatal(err)
 			}
@@ -300,5 +312,26 @@ func TestPrepaidRenewalRollGraceHoldsAutoRecharge(t *testing.T) {
 				t.Fatalf("automatic recharges = %d, want %d", n, tc.want)
 			}
 		})
+	}
+}
+
+func TestPrepaidFirstRenewalRollEndsOnObservedUnpaidRenewal(t *testing.T) {
+	f := newFirstRenewalFixture(t, 2*time.Hour)
+	if !f.eligible() {
+		t.Fatal("first renewal not in its grace")
+	}
+	j, s := claimFundingTestJob(t, f.h, f.team)
+	provider := &fundingProviderObservation{PaymentMethodID: "pm_saved", PaymentMethodReusable: true, CollectionReady: true, DebtInvoiceID: "in_failed_renewal", ValidUntil: s.At.Add(5 * time.Minute)}
+	evidence, err := json.Marshal(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.Evidence = evidence
+	credit := &fundingCreditObservation{SpendableUSD: "0", ValidUntil: s.At.Add(time.Minute), Evidence: []byte(`{"fixture":"credit"}`)}
+	if err = f.h.publishFundingObservation(t.Context(), j, s, credit, provider, nil); err != nil {
+		t.Fatal(err)
+	}
+	if f.eligible() {
+		t.Fatal("failed first renewal kept the team running in its grace")
 	}
 }
