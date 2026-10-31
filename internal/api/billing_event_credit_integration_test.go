@@ -104,6 +104,13 @@ func TestEventPromotionCreditIsQueuedOnceAndIssuedOnce(t *testing.T) {
 	defer srv.Close()
 	client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
 
+	// Past Stripe's idempotency window an unconfirmed attempt is not replayed.
+	exec(`UPDATE billing_event_credit SET state='uncertain',first_attempt_at=clock_timestamp()-interval '24 hours' WHERE contract_id=$1`, contract)
+	if err := h.issueEventCredit(ctx, client, contract); err == nil || !strings.Contains(err.Error(), "operator review") || posts.Load() != 0 {
+		t.Fatalf("stale uncertain credit replayed: %v posts=%d", err, posts.Load())
+	}
+	exec(`UPDATE billing_event_credit SET state='pending',first_attempt_at=NULL WHERE contract_id=$1`, contract)
+
 	for range 2 {
 		if err := h.issueDueEventCredits(ctx, client); err != nil {
 			t.Fatal(err)

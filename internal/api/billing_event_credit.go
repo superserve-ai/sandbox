@@ -119,9 +119,10 @@ func (h *Handlers) issueDueEventCredits(ctx context.Context, client *stripeHTTPC
 
 func (h *Handlers) issueEventCredit(ctx context.Context, client *stripeHTTPClient, contract uuid.UUID) error {
 	var team uuid.UUID
-	var customer, label string
+	var customer, label, state string
 	var cents int64
-	if err := h.Pool.QueryRow(ctx, `SELECT team_id,customer_id,label,credit_cents FROM billing_event_credit WHERE contract_id=$1 AND state<>'issued'`, contract).Scan(&team, &customer, &label, &cents); err != nil {
+	var first *time.Time
+	if err := h.Pool.QueryRow(ctx, `SELECT team_id,customer_id,label,credit_cents,state,first_attempt_at FROM billing_event_credit WHERE contract_id=$1 AND state<>'issued'`, contract).Scan(&team, &customer, &label, &cents, &state, &first); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -144,6 +145,11 @@ func (h *Handlers) issueEventCredit(ctx context.Context, client *stripeHTTPClien
 			_, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='issued',stripe_credit_grant_id=$2,issued_at=clock_timestamp(),first_attempt_at=COALESCE(first_attempt_at,clock_timestamp()) WHERE contract_id=$1 AND state<>'issued'`, contract, grant)
 		}
 		return err
+	}
+	// Stripe forgets the idempotency key after a day, so a replay past then
+	// could grant twice.
+	if state == "uncertain" && first != nil && h.nowUTC().Sub(*first) >= 23*time.Hour {
+		return fmt.Errorf("event credit %s has an unconfirmed grant past its replay window; operator review required", label)
 	}
 	if _, err = h.Pool.Exec(ctx, `UPDATE billing_event_credit SET state='uncertain',first_attempt_at=COALESCE(first_attempt_at,clock_timestamp()) WHERE contract_id=$1 AND state<>'issued'`, contract); err != nil {
 		return err
