@@ -25,6 +25,17 @@ def latest_alert_run(repository):
     return runs[0] if runs else None
 
 
+def superseded(latest, run, sha):
+    # Run ids increase monotonically, so a latest-run read that lands behind the
+    # run we already found is a stale page, not a newer revision. Treating it as
+    # one refused a rollout in 35s on 2026-10-07 with nothing to supersede it.
+    if latest is None or latest['id'] < run['id']:
+        return False
+    if latest['id'] == run['id']:
+        return latest['head_sha'] != sha
+    return True
+
+
 def alert_applies_ready(repository, sha, required_jobs):
     pages = api(f'repos/{repository}/actions/workflows/terraform-cd.yml/runs'
                 f'?head_sha={sha}&event=push&branch=main&per_page=100')
@@ -33,8 +44,7 @@ def alert_applies_ready(repository, sha, required_jobs):
     if not runs:
         return False
     run = max(runs, key=lambda item: item['id'])
-    latest = latest_alert_run(repository)
-    if not latest or latest['id'] != run['id'] or latest['head_sha'] != sha:
+    if superseded(latest_alert_run(repository), run, sha):
         raise RuntimeError('A newer applicable Terraform revision supersedes this collector; refusing stale rollout')
     pages = api(f'repos/{repository}/actions/runs/{run["id"]}/jobs?filter=latest&per_page=100')
     jobs = {job['name']: job for page in pages for job in page['jobs']}
@@ -45,8 +55,7 @@ def alert_applies_ready(repository, sha, required_jobs):
     if all(name in jobs and jobs[name]['status'] == 'completed' and
            jobs[name]['conclusion'] == 'success' for name in required_jobs):
         # A new run may have appeared while the job results were fetched.
-        latest = latest_alert_run(repository)
-        if not latest or latest['id'] != run['id'] or latest['head_sha'] != sha:
+        if superseded(latest_alert_run(repository), run, sha):
             raise RuntimeError('Terraform revision changed during the alert check; refusing stale rollout')
         return True
     if run['status'] == 'completed':
