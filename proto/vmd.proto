@@ -78,6 +78,11 @@ service VMDaemon {
   // residue of the dead VM is force-torn-down first.
   rpc ReviveVM(ReviveVMRequest) returns (ReviveVMResponse);
 
+  // ReshapeVM cold-boots a paused sandbox from its own disk at a new
+  // vCPU count and memory size. Files survive; memory and processes do
+  // not, because a snapshot can only restore at the shape it was taken.
+  rpc ReshapeVM(ReshapeVMRequest) returns (ReshapeVMResponse);
+
   // UpdateSandboxNetwork atomically replaces the egress allow/deny rules for a running VM.
   rpc UpdateSandboxNetwork(UpdateSandboxNetworkRequest) returns (UpdateSandboxNetworkResponse);
 
@@ -332,6 +337,26 @@ message ReviveVMRequest {
   // takes it as the record of which blocks the disk holds. Empty derives
   // the map from the disk's allocation.
   string block_map_path = 15;
+}
+
+message ReshapeVMRequest {
+  string vm_id = 1;
+  uint32 vcpu = 2;
+  uint32 mem_mib = 3;
+  // Required, egress included: the host does not record egress policy
+  // and a cold boot comes up open, so the request must restate it. An
+  // egress config with no rules is the explicit statement that the
+  // sandbox is unrestricted.
+  SandboxNetworkConfig sandbox_network = 4;
+}
+
+message ReshapeVMResponse {
+  // A cold boot starts boxd with an empty context: the caller re-injects
+  // env and secrets through InjectSandboxEnv, minting the secrets token
+  // for this address, which may differ from the one before the reshape.
+  string host_ip = 1;
+  uint32 vcpu = 2;
+  uint32 mem_mib = 3;
 }
 
 message ReviveVMResponse {

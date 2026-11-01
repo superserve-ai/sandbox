@@ -485,7 +485,7 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	m.log.Info().Str("vm_id", vmID).Str("generation", generation).
 		Msg("resume: pause artifacts missing on host; reviving from backup")
 	tBoot := time.Now()
-	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.BlockMap, r.Standalone, false, teamID, ownerID, vcpu, memMiB, rules, generation)
+	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.BlockMap, r.Standalone, false, false, teamID, ownerID, vcpu, memMiB, rules, generation)
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_boot": time.Since(tBoot)})
 	if err != nil {
 		m.restorePausedAnchor(vmID)
