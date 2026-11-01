@@ -1,5 +1,6 @@
 -- Adds signup trial credit to explicit trial teams. Dry-run unless -v commit=yes.
--- See event-credit.md for inputs, refusals and evidence.
+-- See the Event credit runbook (formerly scripts/billing/event-credit.md) for
+-- inputs, refusals and evidence.
 \set ON_ERROR_STOP on
 \if :{?commit}
 \else

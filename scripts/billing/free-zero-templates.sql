@@ -1,5 +1,6 @@
 -- Session-local operator helpers, never installed as application RPCs.
--- Load only inside BEGIN; dry-run with ROLLBACK. See free-zero-templates.md.
+-- Load only inside BEGIN; dry-run with ROLLBACK. See the Free template-cap
+-- correction runbook (formerly scripts/billing/free-zero-templates.md).
 CREATE FUNCTION pg_temp.publish_free_zero_templates(p_from uuid,p_new uuid,p_actor uuid,p_reason text,p_zero_aware_console_verified boolean)
 RETURNS uuid LANGUAGE plpgsql AS $$
 DECLARE old billing_plan_version; fresh billing_plan_version; payload jsonb;
