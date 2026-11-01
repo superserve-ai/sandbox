@@ -55,6 +55,19 @@ func (h *Handlers) proUpgrade(ctx context.Context, team uuid.UUID) (proUpgrade, 
 	return scanProUpgrade(h.Pool.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE team_id=$1 AND state NOT IN ('expired','ended')`, team))
 }
 
+// errProUpgradeSuperseded reports that an accepted upgrade ended while its
+// checkout request was waiting; a successor belongs to its own request.
+var errProUpgradeSuperseded = errors.New("accepted upgrade is no longer open")
+
+// openProUpgrade reloads one accepted upgrade, never another for the team.
+func (h *Handlers) openProUpgrade(ctx context.Context, u proUpgrade) (proUpgrade, error) {
+	latest, err := scanProUpgrade(h.Pool.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE id=$1 AND team_id=$2 AND state NOT IN ('expired','ended')`, u.ID, u.Team))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return latest, errProUpgradeSuperseded
+	}
+	return latest, err
+}
+
 func proratedProAmount(amount int64, start, end, at time.Time) (int64, error) {
 	duration, remaining := end.Unix()-start.Unix(), end.Unix()-at.Unix()
 	if amount < 0 || duration <= 0 || remaining <= 0 || at.Before(start) || remaining > duration {
@@ -301,6 +314,12 @@ const upgradeExpiryClockMargin = 5 * time.Minute
 // error the customer can retry, never a pending payment without a session.
 func (h *Handlers) respondUpgradeUnsettled(c *gin.Context, team uuid.UUID, cause error) {
 	ctx := c.Request.Context()
+	// A successor belongs to another request; its payment is not this one's.
+	if errors.Is(cause, errProUpgradeSuperseded) {
+		log.Warn().Err(cause).Str("team_id", team.String()).Msg("upgrade checkout unavailable")
+		respondErrorMsg(c, "checkout_unavailable", "Checkout could not be opened. Please try again.", http.StatusServiceUnavailable)
+		return
+	}
 	latest, err := h.proUpgrade(ctx, team)
 	paid := err == nil && (latest.State == "paid" || latest.State == "credited" || latest.State == "active")
 	if !paid && err == nil && latest.Session != nil {
@@ -317,7 +336,20 @@ func (h *Handlers) respondUpgradeUnsettled(c *gin.Context, team uuid.UUID, cause
 }
 
 func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
-	outcome, err := h.reconcileProUpgrade(c.Request.Context(), u, false)
+	first := true
+	outcome, err := waitWhileReconciliationBusy(c.Request.Context(), proReconciliationWait, func(ctx context.Context) (string, error) {
+		attempt := u
+		if !first {
+			// The busy reconciler may have advanced this upgrade.
+			var latest proUpgrade
+			if err := acquireWithin(ctx, func(a context.Context) (e error) { latest, e = h.openProUpgrade(a, u); return e }); err != nil {
+				return "", err
+			}
+			attempt = latest
+		}
+		first = false
+		return h.reconcileProUpgrade(ctx, attempt, false)
+	})
 	if err != nil {
 		h.respondUpgradeUnsettled(c, u.Team, err)
 		return
@@ -332,7 +364,7 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 			return
 		}
 	}
-	latest, err := h.proUpgrade(c.Request.Context(), u.Team)
+	latest, err := h.openProUpgrade(c.Request.Context(), u)
 	if err != nil || latest.Session == nil {
 		h.respondUpgradeUnsettled(c, u.Team, fmt.Errorf("upgrade %s has no checkout session: %w", outcome, err))
 		return
@@ -346,6 +378,52 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 }
 
 var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
+
+// The webhook, the recovery worker and the invoice close reconcile a team one
+// at a time, so a customer's checkout routinely finds one of them mid-run. It
+// waits briefly for its turn instead of failing.
+const proReconciliationWait = 5 * time.Second
+
+type lockAcquireDeadlineKey struct{}
+
+// acquireWithin runs a step that only waits to acquire something, bounded by
+// the caller's acquisition deadline when it has one. A caller still able to
+// wait gets busy, not a deadline error, when that budget runs out.
+func acquireWithin(ctx context.Context, step func(context.Context) error) error {
+	deadline, ok := ctx.Value(lockAcquireDeadlineKey{}).(time.Time)
+	if !ok {
+		return step(ctx)
+	}
+	acquire, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	err := step(acquire)
+	if err != nil && acquire.Err() != nil && ctx.Err() == nil {
+		return errProReconciliationBusy
+	}
+	return err
+}
+
+// waitWhileReconciliationBusy retries attempt with backoff while it reports
+// errProReconciliationBusy, for at most wait. Waiting to acquire the lock
+// section, connections and lock is bounded by the same deadline; work already
+// under the lock is not. Each attempt releases what it holds before returning.
+func waitWhileReconciliationBusy(ctx context.Context, wait time.Duration, attempt func(context.Context) (string, error)) (string, error) {
+	deadline := time.Now().Add(wait)
+	attemptCtx := context.WithValue(ctx, lockAcquireDeadlineKey{}, deadline)
+	delay := 50 * time.Millisecond
+	for {
+		outcome, err := attempt(attemptCtx)
+		if !errors.Is(err, errProReconciliationBusy) || time.Now().Add(delay).After(deadline) {
+			return outcome, err
+		}
+		select {
+		case <-ctx.Done():
+			return outcome, err
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, 250*time.Millisecond)
+	}
+}
 
 // lockSection reserves room for a section that holds or waits on the invoice
 // lock while it needs another connection or holds one. Admitting at most
@@ -368,17 +446,17 @@ func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*
 	// lock ends with it; a session lock can outlive the attempt on a pooled
 	// backend and block the team. Writes run on a separate connection, taken
 	// before the lock: a waiter for the lock may hold the pool's last slot.
-	leave, err := h.lockSection(ctx)
-	if err != nil {
+	var leave func()
+	if err := acquireWithin(ctx, func(a context.Context) (e error) { leave, e = h.lockSection(a); return e }); err != nil {
 		return nil, nil, err
 	}
-	conn, err := h.Pool.Acquire(ctx)
-	if err != nil {
+	var conn *pgxpool.Conn
+	if err := acquireWithin(ctx, func(a context.Context) (e error) { conn, e = h.Pool.Acquire(a); return e }); err != nil {
 		leave()
 		return nil, nil, err
 	}
-	lockTx, err := h.Pool.Begin(ctx)
-	if err != nil {
+	var lockTx pgx.Tx
+	if err := acquireWithin(ctx, func(a context.Context) (e error) { lockTx, e = h.Pool.Begin(a); return e }); err != nil {
 		conn.Release()
 		leave()
 		return nil, nil, err
@@ -391,7 +469,7 @@ func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*
 		leave()
 	}
 	var locked bool
-	err = lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
+	err := lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
 	if err != nil || !locked {
 		release()
 		if err == nil {
@@ -410,7 +488,10 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 		return "", errors.New("Pro payment verification unavailable")
 	}
 	token := uuid.New()
-	if _, err := h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token}); errors.Is(err, pgx.ErrNoRows) {
+	if err := acquireWithin(ctx, func(a context.Context) error {
+		_, e := h.DB.ClaimStripeWebhookProcessingLease(a, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token})
+		return e
+	}); errors.Is(err, pgx.ErrNoRows) {
 		return "", errProReconciliationBusy
 	} else if err != nil {
 		return "", err

@@ -5,9 +5,16 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -96,5 +103,190 @@ func TestProUpgradeInvoiceLocksDoNotExhaustThePool(t *testing.T) {
 		if err != nil {
 			t.Fatalf("concurrent lock holder: %v", err)
 		}
+	}
+}
+
+// Concurrent checkouts for one team, as when a customer retries while the
+// webhook and the recovery worker reconcile it, take the invoice lock in turn.
+// Each must wait for its turn rather than fail busy, and waiting must not
+// exhaust a two-connection pool.
+func TestProUpgradeCheckoutsWaitForTheInvoiceLock(t *testing.T) {
+	base, team := newPlanAssignmentFixture(t)
+	withPool := func(maxConns int32) *Handlers {
+		cfg := base.Pool.Config()
+		cfg.MaxConns = maxConns
+		pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		return &Handlers{Pool: pool}
+	}
+	run := func(h *Handlers, wait time.Duration) (busy int, other error) {
+		reconcile := func(ctx context.Context) (string, error) {
+			conn, release, err := h.proUpgradeInvoiceLock(ctx, team)
+			if err != nil {
+				return "", err
+			}
+			defer release()
+			_, err = conn.Exec(t.Context(), `SELECT pg_sleep(0.02)`)
+			return "active", err
+		}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := waitWhileReconciliationBusy(t.Context(), wait, reconcile)
+				mu.Lock()
+				defer mu.Unlock()
+				if errors.Is(err, errProReconciliationBusy) {
+					busy++
+				} else if err != nil && other == nil {
+					other = err
+				}
+			}()
+		}
+		wg.Wait()
+		return busy, other
+	}
+	wide := withPool(16)
+	// Without waiting, contention surfaces to the customer as busy.
+	if busy, err := run(wide, 0); err != nil || busy == 0 {
+		t.Fatalf("contention not reproduced: busy=%d err=%v", busy, err)
+	}
+	for _, h := range []*Handlers{wide, withPool(2)} {
+		if busy, err := run(h, proReconciliationWait); err != nil || busy != 0 {
+			t.Fatalf("checkouts failed while waiting their turn: busy=%d err=%v", busy, err)
+		}
+	}
+}
+
+// A checkout waiting its turn stays bound to the upgrade it accepted. If that
+// upgrade ends meanwhile and another actor starts a successor, the waiting
+// request must not reconcile or return the successor's checkout.
+func TestProUpgradeCheckoutWaitKeepsTheAcceptedUpgrade(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	insert := func(state string) proUpgrade {
+		t.Helper()
+		id, actor := uuid.New(), uuid.New()
+		conn, err := h.Pool.Acquire(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Exec(context.WithoutCancel(t.Context()), `RESET session_replication_role`)
+		if _, err = conn.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state)
+ VALUES($1,$2,$3,'cus_example','pro_monthly','{}',clock_timestamp()-interval '1 minute',clock_timestamp()-interval '1 minute',clock_timestamp()+interval '1 day',clock_timestamp(),100,$4)`, id, team, actor, state); err != nil {
+			t.Fatal(err)
+		}
+		u, err := scanProUpgrade(h.Pool.QueryRow(t.Context(), `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE id=$1`, id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	accepted := insert("expired")
+	// The accepted upgrade was still open when its request read it.
+	accepted.State = "prepared"
+	successor := insert("prepared")
+	// The successor's own checkout has completed.
+	session := "cs_successor_" + strings.ReplaceAll(successor.ID.String(), "-", "")
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET session_id=$2 WHERE id=$1`, successor.ID, session); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path == "/v1/checkout/sessions/"+session {
+			fmt.Fprintf(w, `{"id":%q,"status":"complete"}`, session)
+			return
+		}
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	t.Cleanup(provider.Close)
+	h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+
+	// Another reconciler holds the team for the first attempt.
+	holder, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = holder.Exec(t.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		_ = holder.Rollback(context.Background())
+	}()
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodPost, "/stripe/pro-checkout", nil).WithContext(t.Context())
+	h.resumeProUpgradeCheckout(c, accepted)
+	if response.Code != http.StatusServiceUnavailable || calls.Load() != 0 {
+		t.Fatalf("waiting checkout moved to the successor: %d %s (provider calls %d)", response.Code, response.Body.String(), calls.Load())
+	}
+}
+
+// Waiting is bounded even when a retry cannot get a lock section or a
+// connection: the checkout gives up as busy at the deadline instead of waiting
+// out the reconciliation timeout.
+func TestProUpgradeCheckoutWaitBoundsAcquisition(t *testing.T) {
+	base, team := newPlanAssignmentFixture(t)
+	cfg := base.Pool.Config()
+	cfg.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h := &Handlers{Pool: pool}
+	// Another section holds the pool's only lock-section slot throughout.
+	leave, err := h.lockSection(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(leave)
+	started := time.Now()
+	_, err = waitWhileReconciliationBusy(t.Context(), 300*time.Millisecond, func(ctx context.Context) (string, error) {
+		_, release, err := h.proUpgradeInvoiceLock(ctx, team)
+		if err == nil {
+			release()
+		}
+		return "", err
+	})
+	if !errors.Is(err, errProReconciliationBusy) || time.Since(started) > 2*time.Second {
+		t.Fatalf("acquisition outlived the wait: %v after %s", err, time.Since(started))
+	}
+}
+
+// The lease claim is the first wait in a checkout's reconciliation. When
+// another transaction holds the customer's lease row, the checkout gives up
+// as busy at its deadline instead of waiting out the reconciliation timeout.
+func TestProUpgradeCheckoutWaitBoundsTheLeaseClaim(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	h.Stripe = &stripeHTTPClient{}
+	customer := "cus_lease_" + strings.ReplaceAll(team.String(), "-", "")
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO stripe_webhook_processing_lease(customer_id,token,expires_at) VALUES($1,$2,now()-interval '1 minute')`, customer, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = holder.Rollback(context.Background()) })
+	if _, err = holder.Exec(t.Context(), `SELECT 1 FROM stripe_webhook_processing_lease WHERE customer_id=$1 FOR UPDATE`, customer); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = waitWhileReconciliationBusy(t.Context(), 300*time.Millisecond, func(ctx context.Context) (string, error) {
+		return h.reconcileProUpgrade(ctx, proUpgrade{ID: uuid.New(), Team: team, Customer: customer}, false)
+	})
+	if !errors.Is(err, errProReconciliationBusy) || time.Since(started) > 2*time.Second {
+		t.Fatalf("lease claim outlived the wait: %v after %s", err, time.Since(started))
 	}
 }

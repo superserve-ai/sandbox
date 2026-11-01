@@ -549,6 +549,11 @@ func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error
 			for team := range jobs {
 				started := time.Now()
 				_, e := h.reconcileProCheckout(ctx, team, false)
+				if errors.Is(e, errProReconciliationBusy) {
+					// Another reconciler holds the team; it records its own outcome.
+					currentBillingRecorder().RecordBillingWork(ctx, "pro_payment", false, time.Since(started), 1)
+					continue
+				}
 				var message *string
 				if e != nil {
 					s := e.Error()
