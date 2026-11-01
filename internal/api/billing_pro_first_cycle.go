@@ -22,6 +22,7 @@ const (
 	entryTrialEnded    = "trial_ended"
 	entryPaymentFailed = "payment_failed"
 	entryActivating    = "activating"
+	entryPlanRequired  = "plan_required"
 	entryActive        = "active"
 )
 

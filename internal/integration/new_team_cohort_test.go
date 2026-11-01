@@ -258,7 +258,10 @@ func TestIntegration_NewTeamCohortPaidFirstNeedsSellableSubscriptions(t *testing
 	cohortRequireCatalogFree(t, pool, onFree)
 	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=NULL WHERE singleton`)
 	cohortPublishSubscription(t, pool, "developer")
-	unconfigured := cohortCreate(t, pool, actor)
+	// A separate signup: the Free allowance is once per account.
+	other := uuid.New()
+	rolloutExec(t, pool, `INSERT INTO profile(id,email) VALUES($1,$2)`, other, other.String()+"@example.invalid")
+	unconfigured := cohortCreate(t, pool, other)
 	if err := pool.QueryRow(t.Context(), `SELECT a.kind,billing_team_awaiting_plan($1) FROM team_plan_assignment a WHERE a.team_id=$1 AND a.effective_to IS NULL`, unconfigured).Scan(&kind, &pending); err != nil || kind != "free" || pending {
 		t.Fatalf("signup without a configured trial was not kept on Free: %s %v %v", kind, pending, err)
 	}

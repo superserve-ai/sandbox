@@ -338,6 +338,9 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			}
 			if entry != entryActive {
 				plan = billingSummaryPlan{Key: "trial", Name: "Free trial", Status: entry}
+				if entry == entryPlanRequired {
+					plan.Name = "No plan"
+				}
 				return nil
 			}
 			plan = billingSummaryPlan{Key: "free", Name: "Free", Status: "active"}
