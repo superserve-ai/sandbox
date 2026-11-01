@@ -41,7 +41,8 @@ func withReleasedProPricing(t *testing.T) {
 func sellProWithPricingV2(t *testing.T, f *proProviderFixture, r *gin.Engine, key string) {
 	t.Helper()
 	f.upgrade = &proUpgradeProviderFixture{t: t}
-	now := time.Now().UTC().Truncate(time.Second)
+	f.useProUpgradeClock()
+	now := f.handlers.Now().Truncate(time.Second)
 	f.handlers.Now = func() time.Time { return now }
 	withReleasedProPricing(t)
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 200, f.session)
@@ -154,6 +155,7 @@ func TestIntegration_ProPromotionRenewalRejectsDiscounts(t *testing.T) {
 func TestIntegration_ProPricingV2RefusesAnnualAndAcceptsCommittedFreeUpgrade(t *testing.T) {
 	f, r, key := newProFixture(t, "pro_monthly")
 	f.upgrade = &proUpgradeProviderFixture{t: t}
+	f.useProUpgradeClock()
 	withReleasedProPricing(t)
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_annual"), 400, "invalid_offer")
 	if _, err := testPool.Exec(t.Context(), `UPDATE billing_signup_choice SET state='committed',offer_key='free' WHERE team_id=$1`, f.team); err != nil {
@@ -257,6 +259,7 @@ func TestIntegration_ProRejectsNewLegacyCheckoutForAssignedTeam(t *testing.T) {
 func TestIntegration_ProUpgradeHoldPrecedesCheckoutAndRecoversLostResponse(t *testing.T) {
 	f, r, key := newProFixture(t, "pro_monthly")
 	f.upgrade = &proUpgradeProviderFixture{t: t, loseHoldResponse: true}
+	f.useProUpgradeClock()
 	withReleasedProPricing(t)
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 503, "checkout_unavailable")
 	f.mu.Lock()
@@ -278,7 +281,8 @@ func TestIntegration_ProRejectsIncompatibleExistingSubscriptionWithoutHoldingCol
 	for _, failure := range []string{"calendar", "resource"} {
 		t.Run(failure, func(t *testing.T) {
 			f, r, key := newProFixture(t, "pro_monthly")
-			now := time.Now().UTC().Truncate(time.Second)
+			f.useProUpgradeClock()
+			now := f.handlers.Now().Truncate(time.Second)
 			start, end := billing.CurrentBillingPeriod(now)
 			f.handlers.Now = func() time.Time { return now }
 			f.anchor, f.baseStart, f.baseEnd = start.Unix(), start.Unix(), end.Unix()
@@ -301,6 +305,7 @@ func TestIntegration_ProUpgradeLostCheckoutResponseRecoversFrozenPurchaseOff(t *
 	f, r, key := newProFixture(t, "pro_monthly")
 	f.upgrade = &proUpgradeProviderFixture{t: t}
 	f.failCreate = true
+	f.useProUpgradeClock()
 	withReleasedProPricing(t)
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 503, "checkout_unavailable")
 	f.mu.Lock()
