@@ -45,12 +45,13 @@ func recordEventCredit(ctx context.Context, tx pgx.Tx, team, contract uuid.UUID,
 
 // eventCheckout reports whether a checkout an event code made free may skip
 // the saved card: the event credit funds usage, and a renewal without a card
-// is unpaid like any other.
+// is unpaid like any other. Only a prepaid plan stops at its credit; a
+// postpaid plan bills usage beyond it, so it always needs a card.
 func eventCheckout(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
-}, session StripeRetrievedCheckoutSession, team uuid.UUID, customer string) (bool, error) {
+}, session StripeRetrievedCheckoutSession, prepaid bool, team uuid.UUID, customer string) (bool, error) {
 	code := session.promotionCode()
-	if code == "" || session.AmountTotal != 0 {
+	if !prepaid || code == "" || session.AmountTotal != 0 {
 		return false, nil
 	}
 	// A team whose credit for this event sits on another customer gets no new

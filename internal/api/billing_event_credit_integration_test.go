@@ -140,15 +140,17 @@ func TestEventCheckoutSkipsTheCardOnlyForAFreeListedCode(t *testing.T) {
 		return s
 	}
 	for name, tc := range map[string]struct {
-		s    StripeRetrievedCheckoutSession
-		want bool
+		s       StripeRetrievedCheckoutSession
+		prepaid bool
+		want    bool
 	}{
-		"free listed code": {session(code, 0), true},
-		"paid listed code": {session(code, 2000), false},
-		"unlisted code":    {session("promo_other", 0), false},
-		"no code":          {session("", 0), false},
+		"free listed code":                {session(code, 0), true, true},
+		"free listed code, postpaid plan": {session(code, 0), false, false},
+		"paid listed code":                {session(code, 2000), true, false},
+		"unlisted code":                   {session("promo_other", 0), true, false},
+		"no code":                         {session("", 0), true, false},
 	} {
-		got, err := eventCheckout(t.Context(), h.Pool, tc.s, uuid.New(), "cus_event")
+		got, err := eventCheckout(t.Context(), h.Pool, tc.s, tc.prepaid, uuid.New(), "cus_event")
 		if err != nil || got != tc.want {
 			t.Fatalf("%s: %v %v", name, got, err)
 		}
@@ -181,7 +183,7 @@ func TestEventPromotionCreditStopsOnAPriorCustomersGrant(t *testing.T) {
 	var free StripeRetrievedCheckoutSession
 	free.Discounts = json.RawMessage(`[{"promotion_code":"` + code + `"}]`)
 	for other, want := range map[string]bool{customer: true, "cus_other": false} {
-		if got, err := eventCheckout(ctx, h.Pool, free, team, other); err != nil || got != want {
+		if got, err := eventCheckout(ctx, h.Pool, free, true, team, other); err != nil || got != want {
 			t.Fatalf("checkout on %s skips the card=%v err=%v", other, got, err)
 		}
 	}
