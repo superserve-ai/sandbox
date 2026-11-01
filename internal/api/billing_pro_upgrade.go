@@ -341,8 +341,8 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 		attempt := u
 		if !first {
 			// The busy reconciler may have advanced this upgrade.
-			latest, err := h.openProUpgrade(ctx, u)
-			if err != nil {
+			var latest proUpgrade
+			if err := acquireWithin(ctx, func(a context.Context) (e error) { latest, e = h.openProUpgrade(a, u); return e }); err != nil {
 				return "", err
 			}
 			attempt = latest
@@ -385,6 +385,23 @@ var errProReconciliationBusy = errors.New("invoice reconciliation is busy")
 const proReconciliationWait = 5 * time.Second
 
 type lockAcquireDeadlineKey struct{}
+
+// acquireWithin runs a step that only waits to acquire something, bounded by
+// the caller's acquisition deadline when it has one. A caller still able to
+// wait gets busy, not a deadline error, when that budget runs out.
+func acquireWithin(ctx context.Context, step func(context.Context) error) error {
+	deadline, ok := ctx.Value(lockAcquireDeadlineKey{}).(time.Time)
+	if !ok {
+		return step(ctx)
+	}
+	acquire, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	err := step(acquire)
+	if err != nil && acquire.Err() != nil && ctx.Err() == nil {
+		return errProReconciliationBusy
+	}
+	return err
+}
 
 // waitWhileReconciliationBusy retries attempt with backoff while it reports
 // errProReconciliationBusy, for at most wait. Waiting to acquire the lock
@@ -429,34 +446,20 @@ func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*
 	// lock ends with it; a session lock can outlive the attempt on a pooled
 	// backend and block the team. Writes run on a separate connection, taken
 	// before the lock: a waiter for the lock may hold the pool's last slot.
-	acquire := ctx
-	if deadline, ok := ctx.Value(lockAcquireDeadlineKey{}).(time.Time); ok {
-		var cancel context.CancelFunc
-		acquire, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
+	var leave func()
+	if err := acquireWithin(ctx, func(a context.Context) (e error) { leave, e = h.lockSection(a); return e }); err != nil {
+		return nil, nil, err
 	}
-	// A caller still able to wait gets busy, not a deadline error, when its
-	// acquisition budget runs out.
-	busyIfExpired := func(err error) error {
-		if acquire.Err() != nil && ctx.Err() == nil {
-			return errProReconciliationBusy
-		}
-		return err
-	}
-	leave, err := h.lockSection(acquire)
-	if err != nil {
-		return nil, nil, busyIfExpired(err)
-	}
-	conn, err := h.Pool.Acquire(acquire)
-	if err != nil {
+	var conn *pgxpool.Conn
+	if err := acquireWithin(ctx, func(a context.Context) (e error) { conn, e = h.Pool.Acquire(a); return e }); err != nil {
 		leave()
-		return nil, nil, busyIfExpired(err)
+		return nil, nil, err
 	}
-	lockTx, err := h.Pool.Begin(acquire)
-	if err != nil {
+	var lockTx pgx.Tx
+	if err := acquireWithin(ctx, func(a context.Context) (e error) { lockTx, e = h.Pool.Begin(a); return e }); err != nil {
 		conn.Release()
 		leave()
-		return nil, nil, busyIfExpired(err)
+		return nil, nil, err
 	}
 	release := func() {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
@@ -466,7 +469,7 @@ func (h *Handlers) proUpgradeInvoiceLock(ctx context.Context, team uuid.UUID) (*
 		leave()
 	}
 	var locked bool
-	err = lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
+	err := lockTx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked)
 	if err != nil || !locked {
 		release()
 		if err == nil {
@@ -485,7 +488,10 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 		return "", errors.New("Pro payment verification unavailable")
 	}
 	token := uuid.New()
-	if _, err := h.DB.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token}); errors.Is(err, pgx.ErrNoRows) {
+	if err := acquireWithin(ctx, func(a context.Context) error {
+		_, e := h.DB.ClaimStripeWebhookProcessingLease(a, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token})
+		return e
+	}); errors.Is(err, pgx.ErrNoRows) {
 		return "", errProReconciliationBusy
 	} else if err != nil {
 		return "", err

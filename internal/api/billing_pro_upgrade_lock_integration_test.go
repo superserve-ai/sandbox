@@ -263,3 +263,30 @@ func TestProUpgradeCheckoutWaitBoundsAcquisition(t *testing.T) {
 		t.Fatalf("acquisition outlived the wait: %v after %s", err, time.Since(started))
 	}
 }
+
+// The lease claim is the first wait in a checkout's reconciliation. When
+// another transaction holds the customer's lease row, the checkout gives up
+// as busy at its deadline instead of waiting out the reconciliation timeout.
+func TestProUpgradeCheckoutWaitBoundsTheLeaseClaim(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	h.Stripe = &stripeHTTPClient{}
+	customer := "cus_lease_" + strings.ReplaceAll(team.String(), "-", "")
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO stripe_webhook_processing_lease(customer_id,token,expires_at) VALUES($1,$2,now()-interval '1 minute')`, customer, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = holder.Rollback(context.Background()) })
+	if _, err = holder.Exec(t.Context(), `SELECT 1 FROM stripe_webhook_processing_lease WHERE customer_id=$1 FOR UPDATE`, customer); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = waitWhileReconciliationBusy(t.Context(), 300*time.Millisecond, func(ctx context.Context) (string, error) {
+		return h.reconcileProUpgrade(ctx, proUpgrade{ID: uuid.New(), Team: team, Customer: customer}, false)
+	})
+	if !errors.Is(err, errProReconciliationBusy) || time.Since(started) > 2*time.Second {
+		t.Fatalf("lease claim outlived the wait: %v after %s", err, time.Since(started))
+	}
+}
