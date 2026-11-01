@@ -40,6 +40,49 @@ class ProvisionPlanTests(unittest.TestCase):
         for operation in ('create', 'replace'):
             self.assertEqual(self.validate(fixture(operation), operation)['image'], 'opaque-image')
 
+    def test_oslogin_reconciliation_is_bound_to_new_host_and_reviewed_policy(self):
+        for region, hosts in provision.HOSTS.items():
+            for host in hosts:
+                for operation in ('create', 'replace'):
+                    with self.subTest(region=region, host=host, operation=operation):
+                        plan = fixture(operation, region, host)
+                        vm = plan['resource_changes'][0]['change']
+                        vm['after']['metadata'] = {'enable-oslogin': 'TRUE', 'enable-oslogin-2fa': 'TRUE'}
+                        vm['after_unknown'] = {'instance_id': True}
+                        policy = dict(desired='TRUE', observed=vm['after']['metadata'].copy(),
+                                      script=provision.digest(ROOT/'infra/scripts/oslogin-2fa.py'))
+                        plan['resource_changes'].append(dict(
+                            address=f'module.{host}.terraform_data.oslogin_2fa[0]',
+                            change=dict(actions=['create'] if operation == 'create' else ['delete', 'create'],
+                                        after={'triggers_replace': policy},
+                                        after_unknown={'triggers_replace': {'instance_id': True}})))
+                        resource = dict(address='terraform_data.oslogin_2fa', expressions={
+                            'triggers_replace': {'references': ['google_compute_instance.this.instance_id']}})
+                        plan['configuration'] = {'root_module': {'module_calls': {
+                            host: {'module': {'resources': [resource]}}}}}
+                        provision.validate_plan(plan, host, 'opaque-image', operation, region)
+                        for mutation in ('disabled', 'script', 'unknown_policy', 'wrong_host', 'reference', 'old_id', 'delete'):
+                            bad = copy.deepcopy(plan)
+                            item = bad['resource_changes'][-1]
+                            value = item['change']['after']['triggers_replace']
+                            if mutation == 'disabled':
+                                value['desired'] = 'FALSE'
+                            elif mutation == 'script':
+                                value['script'] = 'unreviewed'
+                            elif mutation == 'unknown_policy':
+                                item['change']['after_unknown']['triggers_replace']['desired'] = True
+                            elif mutation == 'wrong_host':
+                                item['address'] = 'module.unselected.terraform_data.oslogin_2fa[0]'
+                            elif mutation == 'reference':
+                                bad['configuration']['root_module']['module_calls'][host]['module']['resources'][0]['expressions']['triggers_replace']['references'] = ['google_compute_instance.other.instance_id']
+                            elif mutation == 'old_id':
+                                value['instance_id'] = 'old-incarnation'
+                                item['change']['after_unknown']['triggers_replace']['instance_id'] = False
+                            else:
+                                item['change']['actions'] = ['delete']
+                            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                                provision.validate_plan(bad, host, 'opaque-image', operation, region)
+
     def identity_plan(self, region):
         plan = fixture(region=region)
         plan['resource_changes'][0]['change']['before'] = {'instance_id': '123456'}
@@ -715,6 +758,10 @@ class ProvisionPlanTests(unittest.TestCase):
                     self.assertEqual(list(override['module']), ['sandbox_host_b'])
                     self.assertEqual(override['module']['sandbox_host_b']['boot_disk_image'], 'opaque-image')
                     copied = directory/'.provision-host-module'
+                    self.assertEqual((copied/'oslogin-2fa.py').read_bytes(),
+                                     (ROOT/'infra/scripts/oslogin-2fa.py').read_bytes())
+                    self.assertNotIn('../../scripts/', (copied/'oslogin.tf').read_text())
+                    self.assertIn('${path.module}/oslogin-2fa.py', (copied/'oslogin.tf').read_text())
                     expected = original.replace('prevent_destroy = true', 'prevent_destroy = false') if operation == 'replace' else original
                     self.assertEqual((copied/'main.tf').read_text(), expected)
                     self.assertFalse((copied/'operation_override.tf.json').exists())

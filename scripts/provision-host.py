@@ -486,6 +486,38 @@ def validate_host_logging_update(change, vm_change, config, host, region):
                 'Host logging policy/artifact replacement is destructive')
 
 
+def validate_oslogin_reconciliation(change, vm_change, config, host):
+    require(change['actions'] in (['create'], ['delete', 'create']),
+            'OS Login reconciliation must create or replace only its data resource')
+    vm = vm_change['after']
+    policy = {'enable-oslogin': 'TRUE', 'enable-oslogin-2fa': 'TRUE'}
+    require(all(vm.get('metadata', {}).get(k) == v for k, v in policy.items()),
+            'New hosts must enable OS Login and 2FA in creation metadata')
+    after = change.get('after') or {}
+    triggers = after.get('triggers_replace') or {}
+    unknown = (change.get('after_unknown') or {}).get('triggers_replace') or {}
+    require(set(triggers) | set(unknown) == {'instance_id', 'desired', 'observed', 'script'},
+            'Unexpected OS Login reconciliation inputs')
+    require(triggers.get('desired') == 'TRUE' and triggers.get('observed') == policy and
+            triggers.get('script') == digest(ROOT/'infra/scripts/oslogin-2fa.py'),
+            'OS Login reconciliation must retain the reviewed policy and helper')
+    require(not any(unknown.get(key) for key in ('desired', 'observed', 'script')),
+            'OS Login policy and helper must be known')
+    resources = config.get('module_calls', {}).get(host, {}).get('module', {}).get('resources', [])
+    resource = next((r for r in resources if r.get('address') == 'terraform_data.oslogin_2fa'), {})
+    references = _references(resource.get('expressions', {}).get('triggers_replace', {}))
+    require('google_compute_instance.this.instance_id' in references,
+            'OS Login reconciliation must reference the selected VM incarnation')
+    new_id = vm.get('instance_id')
+    if new_id:
+        require(triggers.get('instance_id') == new_id and not unknown.get('instance_id'),
+                'OS Login reconciliation targets the wrong VM incarnation')
+    else:
+        require(unknown.get('instance_id') is True and
+                (vm_change.get('after_unknown') or {}).get('instance_id') is True,
+                'OS Login reconciliation must await the new VM incarnation')
+
+
 def validate_plan(plan, host, image, operation, region, run_id=None):
     """Reject mutations outside the selected host and its validated dependencies."""
     require(plan.get('errored') is not True, 'Terraform plan errored')
@@ -536,6 +568,9 @@ def validate_plan(plan, host, image, operation, region, run_id=None):
         if actions in (['no-op'], ['read']) or addr == address or addr == disk_address and disk_creation:
             continue
         if addr == attachment:
+            continue
+        if addr == f'module.{host}.terraform_data.oslogin_2fa[0]':
+            validate_oslogin_reconciliation(item['change'], change, config, host)
             continue
         # Reconcile the existing provider identity adapter only for Host 2.
         if host == 'sandbox_host_b' and addr == 'module.peer_identity.terraform_data.managed_identity':
@@ -613,6 +648,11 @@ def prepare(directory, host, image, operation, run_id=""):
     require(not copied.exists() and not override.exists(), 'Provisioning scratch paths already exist')
     shutil.copytree(ROOT / 'infra/modules' / source, copied,
                     ignore=shutil.ignore_patterns('.terraform', '*.tfstate*', 'tests', '.terraform.lock.hcl'))
+    # The shared helper must remain inside the relocated module's source tree.
+    shutil.copy2(ROOT/'infra/scripts/oslogin-2fa.py', copied/'oslogin-2fa.py')
+    policy = copied/'oslogin.tf'
+    policy.write_text(policy.read_text().replace(
+        '${path.module}/../../scripts/oslogin-2fa.py', '${path.module}/oslogin-2fa.py'))
     if operation == 'replace':
         # A lifecycle override replaces the whole block, losing ignore_changes.
         main = copied / 'main.tf'

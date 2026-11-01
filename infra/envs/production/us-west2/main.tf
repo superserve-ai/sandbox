@@ -313,8 +313,9 @@ module "sandbox_host_b" {
   on_host_maintenance = "TERMINATE"
 
   metadata = {
-    enable-osconfig = "TRUE"
-    enable-oslogin  = "TRUE"
+    enable-osconfig    = "TRUE"
+    enable-oslogin     = "TRUE"
+    enable-oslogin-2fa = "TRUE"
   }
 }
 
