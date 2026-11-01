@@ -40,8 +40,12 @@ func testProUpgradeFutureCredit(t *testing.T, monthlyCredit int64) {
 	t.Cleanup(pool.Close)
 	h.Pool, h.DB = pool, db.New(pool)
 	now := time.Now().UTC().Truncate(time.Second)
-	anchor := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	end := anchor.AddDate(0, 1, 0)
+	// Plan changes read the wall clock and move to the next period inside its
+	// last hour, so the fixture period is anchored well before now.
+	anchor, end, ok := billing.AnniversaryPeriod(now.AddDate(0, 0, -10), now)
+	if !ok {
+		t.Fatal("invalid fixture billing period")
+	}
 	h.Now = func() time.Time { return now }
 	if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='v2' WHERE singleton`); err != nil {
 		t.Fatal(err)

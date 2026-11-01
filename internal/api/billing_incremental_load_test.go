@@ -605,6 +605,11 @@ func testOlderPeriodFailure(t *testing.T, pool *pgxpool.Pool, recovery bool) {
 	}
 	now := time.Now().UTC().Truncate(time.Hour)
 	current := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	// A period's export runs through the minute before now, so a clock at the
+	// period start has nothing to export for it yet.
+	if now.Equal(current) {
+		now = now.Add(time.Hour)
+	}
 	anchor := current.AddDate(0, -1, 0)
 	provider := &olderPeriodFailureStripe{failedStart: anchor, recovery: recovery, failure: errors.New("example summary unavailable")}
 	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
@@ -659,6 +664,11 @@ func testPeriodAttemptFairness(t *testing.T, pool *pgxpool.Pool) {
 	}
 	now := time.Now().UTC().Truncate(time.Hour)
 	current := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	// A period's export runs through the minute before now, so a clock at the
+	// period start has nothing to export for it yet.
+	if now.Equal(current) {
+		now = now.Add(time.Hour)
+	}
 	anchor := current.AddDate(0, -3, 0)
 	provider := &olderPeriodFailureStripe{failedStart: current.AddDate(0, -1, 0), failure: errors.New("example summary unavailable")}
 	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}

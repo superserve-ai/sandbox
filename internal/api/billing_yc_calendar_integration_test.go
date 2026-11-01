@@ -44,10 +44,11 @@ func newYCCalendarFixture(t *testing.T, monthsAgo int, deferredAnniversary ...bo
 	}
 	now := time.Now().UTC()
 	// A non-midnight boundary also exercises exact, half-open attribution.
-	anchor := time.Date(now.Year(), now.Month(), 1, 4, 34, 43, 0, time.UTC).AddDate(0, -monthsAgo, 0)
+	anchor := time.Date(now.Year(), now.Month(), 1, 4, 34, 43, 0, time.UTC)
 	if anchor.After(now) {
 		anchor = anchor.AddDate(0, -1, 0)
 	}
+	anchor = anchor.AddDate(0, -monthsAgo, 0)
 	sub, params, _ := ycTestSubscription()
 	sub.Customer, sub.ID = "cus_"+team.ID.String(), "sub_"+team.ID.String()
 	sub.StartDate, sub.BillingCycleAnchor = anchor.Unix(), anchor.Unix()
