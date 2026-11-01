@@ -255,6 +255,35 @@ def history_row(cli, database_url, project, deadline=None):
                  f"FROM supabase_migrations.schema_migrations WHERE version='{VERSION}'", "history_query")
 
 
+def history_divergence(cli, database_url, project, local_versions, deadline=None):
+    """Name the versions each side holds alone; nothing but 14-digit versions is logged.
+
+    A refused preview says only that the CLI exited; this read-only query is what
+    turns that into an actionable difference. It must never mask the original
+    failure, so any error here degrades to no detail at all.
+    """
+    try:
+        result = invoke_cli([cli, "db", "query",
+                             "SELECT version FROM supabase_migrations.schema_migrations ORDER BY version",
+                             "--db-url", database_url, "--workdir", str(project), "--output", "json"],
+                            deadline, "history_divergence")
+        remote = {str(row.get("version")) for row in query_rows(result, "history_divergence")}
+    except Exception:
+        # Deliberately broad: the caller is already failing, and a surprise here
+        # must cost detail, never replace the refusal it is describing.
+        return ""
+    if not all(re.fullmatch(r"[0-9]{14}", version) for version in remote):
+        return ""
+
+    def listed(versions):
+        ordered = sorted(versions)
+        shown = ",".join(ordered[:10])
+        return (shown + f",+{len(ordered) - 10}" if len(ordered) > 10 else shown) or "none"
+
+    return (f" remote_only={listed(remote - local_versions)}"
+            f" local_only={listed(local_versions - remote)}")
+
+
 def verify_history(rows, target):
     if target == "use4":
         expected = [{"version": VERSION, "name": NAME, "statement_count": 1, "sha256": SHA256}]
@@ -334,7 +363,17 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
         import retained_storage_recovery as recovery
         ordinary_guard = recovery.ordinary_guard(target, database_url, root, cli, deadline)
         (project / "supabase/roles.sql").write_text(EXECUTION_GUARD + ordinary_guard)
-        preview = cli_run(cli, database_url, project, ["db", "push", "--dry-run", "--yes"], deadline)
+        try:
+            preview = cli_run(cli, database_url, project, ["db", "push", "--dry-run", "--yes"], deadline)
+        except MigrationError as error:
+            local = versions | ({VERSION} if target == "use4" else set())
+            try:
+                detail = history_divergence(cli, database_url, project, local, deadline)
+            except Exception:
+                # The refusal is the message that matters. A surprise raised while
+                # describing it may cost the detail, never the refusal itself.
+                detail = ""
+            raise MigrationError(f"{error}{detail}") from None
         if AGGREGATE in preview:
             raise MigrationError("CLI proposed replaying the shared-Auth aggregate")
         # Recheck before executing against the same composed snapshot. No path
