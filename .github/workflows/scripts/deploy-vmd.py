@@ -76,6 +76,11 @@ Env vars:
                        bottleneck at high pause rates), never total egress.
                        Staged rollout: staging first, production after the
                        staging soak.
+  PEER_INGRESS_ENABLED optional — "1" upserts PEER_PROXY_LISTEN_ADDR=<host IP>:5009
+                       so vmd advertises the proxy's peer listener; the
+                       proxy deploy refuses to enable that listener until vmd
+                       advertises it. Anything else leaves the host's setting
+                       alone, since withdrawing it is an ordered manual change.
   OTEL_ENVIRONMENT     optional — enables vmd's OTLP backup-metrics exporter
                        by upserting OTEL_METRICS_ENABLED=true and this value
                        as OTEL_ENVIRONMENT into vmd.env. Empty = skip,
@@ -449,6 +454,7 @@ def main() -> int:
     check_bundle_parity()
     egress_preflight = egress_capacity_preflight(os.environ)
     egress_update = egress_capacity_update(os.environ)
+    peer_update = peer_ingress_update(os.environ)
     try:
         local = local_instance(os.environ)
     except ValueError as e:
@@ -1190,6 +1196,7 @@ def main() -> int:
 
             # Egress capacity was validated before uploading or modifying the host.
             {egress_update}
+            {peer_update}
 
             # Upsert the paused-network reclaim policy. These values are
             # supplied by deployment config so the daemon never bakes in host
@@ -1680,6 +1687,20 @@ def egress_capacity_update(env):
             commands.append(f"echo {shlex.quote(key + '=' + value)} | sudo tee -a /etc/sandbox/vmd.env > /dev/null")
     return "\n".join(commands)
 
+
+def peer_ingress_update(env):
+    if env.get("PEER_INGRESS_ENABLED", "") != "1":
+        return ""
+    # Same address the proxy deploy derives for its "auto" peer listener.
+    return "\n".join([
+        "peer_ip=$(curl -sf --max-time 5 -H 'Metadata-Flavor: Google' "
+        "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip) "
+        "|| { echo 'ERROR: cannot read the host IP for the peer listener' >&2; exit 1; }",
+        "if ! [[ \"$peer_ip\" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then "
+        "echo 'ERROR: unexpected host IP for the peer listener' >&2; exit 1; fi",
+        "sudo sed -i '/^PEER_PROXY_LISTEN_ADDR=/d' /etc/sandbox/vmd.env",
+        "echo \"PEER_PROXY_LISTEN_ADDR=$peer_ip:5009\" | sudo tee -a /etc/sandbox/vmd.env > /dev/null",
+    ])
 
 
 if __name__ == "__main__":
