@@ -139,18 +139,27 @@ func TestEventCheckoutSkipsTheCardOnlyForAFreeListedCode(t *testing.T) {
 		}
 		return s
 	}
+	prepaid := StripeCreateCheckoutSessionParams{PlanTerms: &StripeCheckoutPlanTerms{FundingPolicy: fundingPolicyPrepaid}, Topoff: &StripeCheckoutTopoff{}}
+	postpaid := StripeCreateCheckoutSessionParams{PlanTerms: &StripeCheckoutPlanTerms{}}
+	withTopoff := func(s StripeRetrievedCheckoutSession, choice string) StripeRetrievedCheckoutSession {
+		if err := json.Unmarshal([]byte(`{"custom_fields":[{"key":"`+checkoutTopoffField+`","dropdown":{"value":"`+choice+`"}}]}`), &s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
 	for name, tc := range map[string]struct {
-		s       StripeRetrievedCheckoutSession
-		prepaid bool
-		want    bool
+		s      StripeRetrievedCheckoutSession
+		params StripeCreateCheckoutSessionParams
+		want   bool
 	}{
-		"free listed code":                {session(code, 0), true, true},
-		"free listed code, postpaid plan": {session(code, 0), false, false},
-		"paid listed code":                {session(code, 2000), true, false},
-		"unlisted code":                   {session("promo_other", 0), true, false},
-		"no code":                         {session("", 0), true, false},
+		"free listed code":                  {withTopoff(session(code, 0), checkoutTopoffOff), prepaid, true},
+		"free listed code with Auto Reload": {withTopoff(session(code, 0), checkoutTopoffOn), prepaid, false},
+		"free listed code, postpaid plan":   {session(code, 0), postpaid, false},
+		"paid listed code":                  {withTopoff(session(code, 2000), checkoutTopoffOff), prepaid, false},
+		"unlisted code":                     {withTopoff(session("promo_other", 0), checkoutTopoffOff), prepaid, false},
+		"no code":                           {withTopoff(session("", 0), checkoutTopoffOff), prepaid, false},
 	} {
-		got, err := eventCheckout(t.Context(), h.Pool, tc.s, tc.prepaid, uuid.New(), "cus_event")
+		got, err := eventCheckout(t.Context(), h.Pool, tc.s, tc.params, uuid.New(), "cus_event")
 		if err != nil || got != tc.want {
 			t.Fatalf("%s: %v %v", name, got, err)
 		}
@@ -182,8 +191,9 @@ func TestEventPromotionCreditStopsOnAPriorCustomersGrant(t *testing.T) {
 	}
 	var free StripeRetrievedCheckoutSession
 	free.Discounts = json.RawMessage(`[{"promotion_code":"` + code + `"}]`)
+	prepaid := StripeCreateCheckoutSessionParams{PlanTerms: &StripeCheckoutPlanTerms{FundingPolicy: fundingPolicyPrepaid}}
 	for other, want := range map[string]bool{customer: true, "cus_other": false} {
-		if got, err := eventCheckout(ctx, h.Pool, free, true, team, other); err != nil || got != want {
+		if got, err := eventCheckout(ctx, h.Pool, free, prepaid, team, other); err != nil || got != want {
 			t.Fatalf("checkout on %s skips the card=%v err=%v", other, got, err)
 		}
 	}

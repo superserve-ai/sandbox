@@ -635,7 +635,7 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	}
 	cardless := false
 	if method == "" {
-		if cardless, err = eventCheckout(ctx, conn, session, offer.PrepaidFunded, u.Team, u.Customer); err != nil {
+		if cardless, err = eventCheckout(ctx, conn, session, params, u.Team, u.Customer); err != nil {
 			return "", err
 		}
 	}
